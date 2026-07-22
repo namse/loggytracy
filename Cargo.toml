@@ -2,5 +2,20 @@
 name = "loggytracy"
 version = "0.1.0"
 edition = "2024"
+default-run = "loggytracy"
 
 [dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+bytes = "1"
+prost = "0.13"
+prost-types = "0.13"
+snap = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crc32fast = "1"
+url = "2"
+chrono = "0.4"
