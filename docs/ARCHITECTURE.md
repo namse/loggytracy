@@ -10,6 +10,17 @@ Rust로 만드는 싱글 머신 log + trace 엔진. VictoriaLogs의 논리 설�
 | Source of truth | S3 호환 오브젝트 스토리지 |
 | 로컬 디스크 | 캐시 (LRU eviction) |
 | 내구성 | 저널(append-only) + group commit + fsync 후 ack. Alloy WAL을 안전망으로 전제 |
+
+## 내구성/복구 시맨스
+
+- **WAL + checkpoint 불변량**: ack된 레코드는 항상 WAL에 있고 동시에 memtable에 insert된다(insert는 writer 태스크가 write 성공 후 ack 직전에 수행). 따라서 `checkpoint()`가 캡처하는 (offset, memtable snapshot)은 원자적으로 일치한다.
+- **복구**: 시작 시 WAL의 `[checkpoint..replay_end]`만 replay하여 memtable에 적재하고, corrupt/partial tail은 `replay_end`로 truncate한다. checkpoint는 복구 단계에서 전진시키지 않는다 — in-flight 데이터는 아직 memtable에만 있으므로, 다음 flush의 `checkpoint()`가 올바른 offset을 잡을 때까지 checkpoint를 그대로 둔다. 따라서 "재시작 → 재시작"을 반복해도 in-flight 데이터가 유실되지 않는다.
+- **at-least-once (flush 경계)**: flush가 part 디스크 writes 완료 후 `set_checkpoint` 직전에 크래시하면, 해당 part와 다음 replay가 같은 데이터를 모두 포함하게 되어 중복이 발생할 수 있다. 이는 정확성보다 내구성 우선의 의도적 트레이드오프이며, 중복은 쿼리 결과에 나타날 수 있고 중복 제거는 후속 마일스톤에서 다룬다.
+- **flush 가시성 윈도우 (M1 known issue)**: 통합 쿼리는 memtable과 part registry를 서로 다른 시점에 읽는다. 쿼리가 memtable 데이터를 캡처한 뒤 같은 데이터의 part 등록까지 걸쳐 실행되거나, part 등록 후 flushing 버퍼 commit 전 실행되면 두 복사본을 함께 볼 수 있다. 순서를 반대로 하면 일시적인 누락이 생기므로, M1에서는 flush와 겹치는 쿼리의 중복 가능성을 허용하고 후속 마일스톤에서 원자적 가시성 경계를 다룬다.
+- **merge 교체 불변량**: merge tombstone은 새 part 디렉터리가 `.tmp`에서 최종 위치로 rename되기 전에 기록된다. 재시작 복구는 새 part를 성공적으로 open한 경우에만 old part를 삭제하며, 새 part 검증에 실패하면 old part를 유지한다.
+- **merge tombstone 연쇄 복구**: 재시작 시 모든 tombstone 관계를 먼저 수집하고 이전 세대까지 폐쇄적으로 추적한 뒤 old part를 정리한다. 따라서 삭제 실패 후 여러 세대의 merge가 겹쳐도 중간 tombstone 삭제로 이전 세대 part가 부활하지 않는다.
+- **WAL 증가**: flush/checkpoint 후에도 WAL을 truncate/rotate하지 않는다(M2에서 object_store manifest 연동 후 rotate 예정). checkpoint 이전 구간은 replay 대상이 아니므로 증가만 하고 소비하지 않는다.
+
 | 물리 포맷 | Parquet (dictionary + zstd) + 사이드카 인덱스 파일 |
 | 인덱스 | stream index + 블록별 trigram bloom filter (역인덱스 없음) |
 | 쿼리 언어 | LogQL — 사용 빈도 높은 subset만, 미지원 문법은 명확한 에러 |
@@ -53,7 +64,7 @@ part는 immutable 디렉터리 하나:
 - `data.parquet` — 해당 part에 실제 존재하는 필드로 스키마 구성 (part별 동적 스키마). 희귀 필드는 map 컬럼으로.
 - trigram bloom filter 사이드카 — row group 단위. `_msg` 등 텍스트 컬럼의 3-gram. 부분문자열 검색(`|=`) 프루닝용. 단어 쿼리도 trigram으로 커버됨.
 - stream index 사이드카 — stream fields → row group posting (roaring bitmap).
-- 메타 파일 — 시간 범위, row 수, 필드 목록, min/max.
+- 메타 파일 — 시간 범위, row 수, 필드 목록, min/max와 part 파일별 CRC32. 메타 자체도 CRC32로 검증하며, 불일치한 part는 로드하지 않는다.
 
 bloom은 프루닝 전용이며 최종 판정은 항상 블록 스캔이므로 정확성은 스캔이 보장한다.
 

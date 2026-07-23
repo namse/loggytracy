@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use axum::Json;
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Serialize;
 
-use crate::logql;
-use crate::memtable::StreamResult;
 use crate::AppState;
+use crate::logql::{self};
+use crate::memtable::{Labels, LogEntry, StreamResult};
+use crate::part;
 
 #[derive(Serialize)]
 pub struct LokiResponse<T: Serialize> {
@@ -63,15 +65,25 @@ fn parse_time_ns(s: &str) -> Result<i64, String> {
     if s.is_empty() {
         return Err("empty timestamp".to_string());
     }
-    if s.bytes().all(|b| b.is_ascii_digit()) {
+    let numeric_digits = s.strip_prefix('-').unwrap_or(s);
+    if !numeric_digits.is_empty() && numeric_digits.bytes().all(|b| b.is_ascii_digit()) {
         let n: i64 = s
             .parse()
             .map_err(|e| format!("invalid timestamp '{}': {}", s, e))?;
-        if s.len() >= 19 {
-            Ok(n)
-        } else {
-            Ok(n.saturating_mul(1_000_000_000))
-        }
+        let multiplier = match numeric_digits.len() {
+            1..=10 => 1_000_000_000i64,
+            13 => 1_000_000i64,
+            16 => 1_000i64,
+            19 => 1i64,
+            _ => {
+                return Err(format!(
+                    "unsupported numeric timestamp precision (expected seconds, milliseconds, microseconds, or nanoseconds): '{}'",
+                    s
+                ));
+            }
+        };
+        n.checked_mul(multiplier)
+            .ok_or_else(|| format!("timestamp '{}' is out of range", s))
     } else {
         let dt = chrono::DateTime::parse_from_rfc3339(s)
             .map_err(|e| format!("invalid RFC3339 timestamp '{}': {}", s, e))?;
@@ -114,6 +126,74 @@ fn is_forward(direction: &Option<String>) -> bool {
         .unwrap_or(false)
 }
 
+fn distinct_stream_count(state: &AppState) -> usize {
+    let mut streams = std::collections::BTreeSet::new();
+    streams.extend(state.memtable.series(&[]));
+    streams.extend(state.parts.series(&[]));
+    streams.len()
+}
+
+fn unified_query(
+    state: &AppState,
+    parsed: &logql::LogQuery,
+    start_ns: i64,
+    end_ns: i64,
+    limit: usize,
+    forward: bool,
+) -> Result<Vec<StreamResult>, String> {
+    let mut all: Vec<(Labels, LogEntry)> = Vec::new();
+
+    for sr in state.memtable.query(
+        &parsed.matchers,
+        &parsed.line_filters,
+        start_ns,
+        end_ns,
+        limit,
+        forward,
+    ) {
+        for e in sr.entries {
+            all.push((sr.labels.clone(), e));
+        }
+    }
+
+    for sr in state.parts.query(
+        &parsed.matchers,
+        &parsed.line_filters,
+        start_ns,
+        end_ns,
+        limit,
+        forward,
+    )? {
+        for e in sr.entries {
+            all.push((sr.labels.clone(), e));
+        }
+    }
+
+    if forward {
+        all.sort_by_key(|e| e.1.timestamp_ns);
+    } else {
+        all.sort_by_key(|e| std::cmp::Reverse(e.1.timestamp_ns));
+    }
+    all.truncate(limit);
+
+    Ok(part::group_by_labels(all))
+}
+
+async fn run_unified_query(
+    state: Arc<AppState>,
+    parsed: logql::LogQuery,
+    start_ns: i64,
+    end_ns: i64,
+    limit: usize,
+    forward: bool,
+) -> Result<Vec<StreamResult>, String> {
+    tokio::task::spawn_blocking(move || {
+        unified_query(&state, &parsed, start_ns, end_ns, limit, forward)
+    })
+    .await
+    .map_err(|error| format!("query task failed: {error}"))?
+}
+
 pub async fn query_range(
     State(state): State<Arc<AppState>>,
     Query(params): Query<QueryRangeParams>,
@@ -138,10 +218,9 @@ pub async fn query_range(
     let limit = params.limit.unwrap_or(100);
     let forward = is_forward(&params.direction);
 
-    let results = state
-        .memtable
-        .query(&parsed.matchers, &parsed.line_filters, start_ns, end_ns, limit, forward);
-
+    let results = run_unified_query(state, parsed, start_ns, end_ns, limit, forward)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let stream_data = build_stream_data(results);
 
     Ok(Json(LokiResponse {
@@ -178,10 +257,9 @@ pub async fn query(
     let limit = params.limit.unwrap_or(100);
     let forward = is_forward(&params.direction);
 
-    let results = state
-        .memtable
-        .query(&parsed.matchers, &parsed.line_filters, 0, end_ns, limit, forward);
-
+    let results = run_unified_query(state, parsed, 0, end_ns, limit, forward)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let stream_data = build_stream_data(results);
 
     Ok(Json(LokiResponse {
@@ -198,13 +276,17 @@ pub async fn query(
     }))
 }
 
-pub async fn labels(
-    State(state): State<Arc<AppState>>,
-) -> Json<LokiResponse<Vec<String>>> {
-    let names = state.memtable.label_names();
+pub async fn labels(State(state): State<Arc<AppState>>) -> Json<LokiResponse<Vec<String>>> {
+    let mut names = std::collections::BTreeSet::new();
+    for n in state.memtable.label_names() {
+        names.insert(n);
+    }
+    for n in state.parts.label_names() {
+        names.insert(n);
+    }
     Json(LokiResponse {
         status: "success",
-        data: names,
+        data: names.into_iter().collect(),
     })
 }
 
@@ -212,15 +294,41 @@ pub async fn label_values(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Json<LokiResponse<Vec<String>>> {
-    let values = state.memtable.label_values(&name);
+    let mut values = std::collections::BTreeSet::new();
+    for v in state.memtable.label_values(&name) {
+        values.insert(v);
+    }
+    for v in state.parts.label_values(&name) {
+        values.insert(v);
+    }
     Json(LokiResponse {
         status: "success",
-        data: values,
+        data: values.into_iter().collect(),
     })
 }
 
-pub async fn ready() -> &'static str {
-    "ready"
+pub async fn ready(
+    State(state): State<Arc<AppState>>,
+) -> Result<&'static str, (StatusCode, String)> {
+    let mut unavailable = Vec::new();
+    if !state.journal.is_healthy() {
+        unavailable.push("journal writer");
+    }
+    if !state.flush_healthy.load(Ordering::Acquire) {
+        unavailable.push("flush worker");
+    }
+    if !state.merge_healthy.load(Ordering::Acquire) {
+        unavailable.push("merge worker");
+    }
+
+    if unavailable.is_empty() {
+        Ok("ready")
+    } else {
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{} unavailable", unavailable.join(", ")),
+        ))
+    }
 }
 
 pub async fn buildinfo() -> Json<serde_json::Value> {
@@ -235,16 +343,16 @@ pub async fn buildinfo() -> Json<serde_json::Value> {
     }))
 }
 
-pub async fn index_stats(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    let stats = state.memtable.stats();
+pub async fn index_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let mem = state.memtable.stats();
+    let disk = state.parts.stats();
+    let stream_count = distinct_stream_count(&state);
     Json(serde_json::json!({
         "status": "success",
         "data": {
-            "streams": stats.streams,
-            "entries": stats.entries,
-            "bytes": stats.bytes
+            "streams": stream_count,
+            "entries": mem.entries + disk.entries,
+            "bytes": mem.bytes + disk.bytes
         }
     }))
 }
@@ -264,11 +372,12 @@ pub async fn series(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<LokiResponse<Vec<HashMap<String, String>>>>, (StatusCode, String)> {
     let matchers = extract_match_params(&raw);
-    let mut all_series: Vec<crate::memtable::Labels> = Vec::new();
+    let mut all_series: Vec<Labels> = Vec::new();
     for matcher_str in &matchers {
         let parsed = logql::parse(matcher_str)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
         all_series.extend(state.memtable.series(&parsed.matchers));
+        all_series.extend(state.parts.series(&parsed.matchers));
     }
     all_series.sort();
     all_series.dedup();
@@ -287,10 +396,30 @@ pub async fn series(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::journal::Journal;
+    use crate::memtable::{LogEntry, MemTable};
+    use crate::part::{self, Row};
+    use crate::part_registry::PartRegistry;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "loggytracy-query-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn extracts_repeated_match_params() {
-        let raw = Some("match%5B%5D=%7Bapp%3D%22a%22%7D&match%5B%5D=%7Bapp%3D%22b%22%7D".to_string());
+        let raw =
+            Some("match%5B%5D=%7Bapp%3D%22a%22%7D&match%5B%5D=%7Bapp%3D%22b%22%7D".to_string());
         let v = extract_match_params(&raw);
         assert_eq!(v, vec![r#"{app="a"}"#, r#"{app="b"}"#]);
     }
@@ -311,13 +440,36 @@ mod tests {
     #[test]
     fn parse_time_ns_unix_seconds() {
         assert_eq!(parse_time_ns("0").unwrap(), 0);
-        assert_eq!(parse_time_ns("1700000000").unwrap(), 1_700_000_000_000_000_000);
+        assert_eq!(
+            parse_time_ns("1700000000").unwrap(),
+            1_700_000_000_000_000_000
+        );
+    }
+
+    #[test]
+    fn parse_time_ns_negative_unix_seconds() {
+        assert_eq!(
+            parse_time_ns("-1700000000").unwrap(),
+            -1_700_000_000_000_000_000
+        );
     }
 
     #[test]
     fn parse_time_ns_unix_nanos() {
         assert_eq!(
             parse_time_ns("1700000000000000000").unwrap(),
+            1_700_000_000_000_000_000
+        );
+    }
+
+    #[test]
+    fn parse_time_ns_unix_millis_and_micros() {
+        assert_eq!(
+            parse_time_ns("1700000000000").unwrap(),
+            1_700_000_000_000_000_000
+        );
+        assert_eq!(
+            parse_time_ns("1700000000000000").unwrap(),
             1_700_000_000_000_000_000
         );
     }
@@ -338,5 +490,79 @@ mod tests {
     fn parse_time_ns_invalid() {
         assert!(parse_time_ns("not-a-time").is_err());
         assert!(parse_time_ns("").is_err());
+    }
+
+    #[tokio::test]
+    async fn distinct_stream_count_deduplicates_memtable_and_parts() {
+        let data_dir = temp_dir();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+        let labels: Labels = [("app".to_string(), "same-stream".to_string())]
+            .into_iter()
+            .collect();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            labels.clone(),
+            vec![LogEntry {
+                timestamp_ns: 2,
+                line: "in memory".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+        let parts_root = data_dir.join("parts");
+        let parts = Arc::new(PartRegistry::new());
+        parts
+            .register(
+                part::flush_rows(
+                    vec![Row {
+                        timestamp_ns: 1,
+                        labels,
+                        line: "on disk".to_string(),
+                        structured_metadata: Vec::new(),
+                    }],
+                    &parts_root,
+                    config.row_group_size,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+        let state = AppState {
+            memtable,
+            journal,
+            parts,
+            flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+
+        assert_eq!(distinct_stream_count(&state), 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_reflects_background_worker_health() {
+        let data_dir = temp_dir();
+        let config = Config {
+            data_dir,
+            ..Config::default()
+        };
+        let memtable = Arc::new(MemTable::new());
+        let state = Arc::new(AppState {
+            journal: Arc::new(Journal::spawn(&config, memtable.clone()).unwrap()),
+            memtable,
+            parts: Arc::new(PartRegistry::new()),
+            flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+
+        assert_eq!(ready(State(state.clone())).await.unwrap(), "ready");
+
+        state.flush_healthy.store(false, Ordering::Release);
+        state.merge_healthy.store(false, Ordering::Release);
+        let error = ready(State(state)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.contains("flush worker"));
+        assert!(error.1.contains("merge worker"));
     }
 }

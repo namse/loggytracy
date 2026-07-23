@@ -33,10 +33,20 @@ pub struct EntryAdapter {
 }
 
 impl EntryAdapter {
-    pub fn timestamp_ns(&self) -> i64 {
+    pub fn timestamp_ns(&self) -> Result<i64, String> {
         match &self.timestamp {
-            Some(ts) => ts.seconds * 1_000_000_000 + ts.nanos as i64,
-            None => 0,
+            Some(ts) => {
+                if !(0..1_000_000_000).contains(&ts.nanos) {
+                    return Err(format!(
+                        "timestamp nanos must be between 0 and 999999999, got {}",
+                        ts.nanos
+                    ));
+                }
+                let nanos = i128::from(ts.seconds) * 1_000_000_000 + i128::from(ts.nanos);
+                i64::try_from(nanos)
+                    .map_err(|_| "timestamp is outside the supported nanosecond range".to_string())
+            }
+            None => Ok(0),
         }
     }
 }
@@ -61,7 +71,15 @@ pub fn validate_label_name(name: &str) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    // 예약 컬럼명 거부: 라벨 이름이 _msg/timestamp_ns/structured_metadata와 충돌하면
+    // Parquet 스키마에서 중복 컬럼이 생기는 것을 막는다.
+    match name {
+        "_msg" | "timestamp_ns" | "structured_metadata" => Err(format!(
+            "invalid label name '{}': reserved column name",
+            name
+        )),
+        _ => Ok(()),
+    }
 }
 
 pub fn parse_labels(s: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
@@ -127,7 +145,9 @@ pub fn parse_labels(s: &str) -> Result<std::collections::BTreeMap<String, String
                 None => return Err(format!("unterminated value for label '{}'", name)),
             }
         }
-        map.insert(name, value);
+        if map.insert(name.clone(), value).is_some() {
+            return Err(format!("duplicate label name '{}'", name));
+        }
         while chars.peek().is_some_and(|c| c.is_whitespace()) {
             chars.next();
         }
@@ -162,6 +182,11 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_label_name() {
+        assert!(parse_labels(r#"{app="a", app="b"}"#).is_err());
+    }
+
+    #[test]
     fn rejects_unterminated_value() {
         assert!(parse_labels(r#"{app="unterminated}"#).is_err());
     }
@@ -190,5 +215,65 @@ mod tests {
     #[test]
     fn accepts_label_name_with_underscore() {
         assert!(parse_labels(r#"{_app="x", app_2="y"}"#).is_ok());
+    }
+
+    #[test]
+    fn rejects_reserved_column_names() {
+        assert!(validate_label_name("_msg").is_err());
+        assert!(validate_label_name("timestamp_ns").is_err());
+        assert!(validate_label_name("structured_metadata").is_err());
+    }
+
+    #[test]
+    fn parse_labels_rejects_reserved_names() {
+        assert!(parse_labels(r#"{_msg="hi"}"#).is_err());
+        assert!(parse_labels(r#"{timestamp_ns="123"}"#).is_err());
+        assert!(parse_labels(r#"{structured_metadata="x"}"#).is_err());
+    }
+
+    #[test]
+    fn timestamp_ns_accepts_i64_boundaries() {
+        let max = EntryAdapter {
+            timestamp: Some(prost_types::Timestamp {
+                seconds: 9_223_372_036,
+                nanos: 854_775_807,
+            }),
+            line: String::new(),
+            structured_metadata: Vec::new(),
+        };
+        assert_eq!(max.timestamp_ns().unwrap(), i64::MAX);
+
+        let min = EntryAdapter {
+            timestamp: Some(prost_types::Timestamp {
+                seconds: -9_223_372_037,
+                nanos: 145_224_192,
+            }),
+            line: String::new(),
+            structured_metadata: Vec::new(),
+        };
+        assert_eq!(min.timestamp_ns().unwrap(), i64::MIN);
+    }
+
+    #[test]
+    fn timestamp_ns_rejects_overflow_and_invalid_nanos() {
+        let overflow = EntryAdapter {
+            timestamp: Some(prost_types::Timestamp {
+                seconds: 9_223_372_037,
+                nanos: 0,
+            }),
+            line: String::new(),
+            structured_metadata: Vec::new(),
+        };
+        assert!(overflow.timestamp_ns().is_err());
+
+        let invalid_nanos = EntryAdapter {
+            timestamp: Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: -1,
+            }),
+            line: String::new(),
+            structured_metadata: Vec::new(),
+        };
+        assert!(invalid_nanos.timestamp_ns().is_err());
     }
 }

@@ -81,8 +81,7 @@ pub struct LogQuery {
 pub fn parse(input: &str) -> Result<LogQuery, String> {
     let input = input.trim();
     let (matchers_str, rest) = if input.starts_with('{') {
-        let end = find_matchers_close(input)
-            .ok_or("closing '}' not found in label matcher")?;
+        let end = find_matchers_close(input).ok_or("closing '}' not found in label matcher")?;
         (&input[1..end], &input[end + 1..])
     } else {
         return Err("query must start with '{' label matchers".to_string());
@@ -127,7 +126,7 @@ fn parse_matchers(s: &str) -> Result<Vec<LabelMatcher>, String> {
     let bytes = s.as_bytes();
 
     while pos < bytes.len() {
-        while pos < bytes.len() && (bytes[pos].is_ascii_whitespace() || bytes[pos] == b',') {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
             pos += 1;
         }
         if pos >= bytes.len() {
@@ -135,7 +134,11 @@ fn parse_matchers(s: &str) -> Result<Vec<LabelMatcher>, String> {
         }
 
         let name_start = pos;
-        while pos < bytes.len() && bytes[pos] != b'=' && bytes[pos] != b'!' && !bytes[pos].is_ascii_whitespace() {
+        while pos < bytes.len()
+            && bytes[pos] != b'='
+            && bytes[pos] != b'!'
+            && !bytes[pos].is_ascii_whitespace()
+        {
             pos += 1;
         }
         let name = s[name_start..pos].to_string();
@@ -184,6 +187,22 @@ fn parse_matchers(s: &str) -> Result<Vec<LabelMatcher>, String> {
         pos = new_pos;
 
         matchers.push(LabelMatcher::new(name, op, value)?);
+
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos < bytes.len() {
+            if bytes[pos] != b',' {
+                return Err("expected ',' between label matchers".to_string());
+            }
+            pos += 1;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos >= bytes.len() {
+                return Err("trailing ',' in label matchers".to_string());
+            }
+        }
     }
 
     Ok(matchers)
@@ -207,26 +226,25 @@ fn parse_line_filters(s: &str) -> Result<Vec<LineFilter>, String> {
             break;
         }
 
-        let (op_len, op): (usize, MatcherOp) =
-            if s[pos..].starts_with("|=") {
-                (2, MatcherOp::Eq)
-            } else if s[pos..].starts_with("!=") {
-                (2, MatcherOp::Neq)
-            } else if s[pos..].starts_with("|~") {
-                (2, MatcherOp::Re)
-            } else if s[pos..].starts_with("!~") {
-                (2, MatcherOp::NRe)
-            } else if s[pos..].starts_with('|') {
-                return Err(format!(
-                    "unsupported LogQL stage: '{}...' (M0 supports only |=, !=, |~, !~ line filters)",
-                    &s[pos..s.len().min(pos + 20)]
-                ));
-            } else {
-                return Err(format!(
-                    "unexpected token in line filter position: '{}...'",
-                    &s[pos..s.len().min(pos + 20)]
-                ));
-            };
+        let (op_len, op): (usize, MatcherOp) = if s[pos..].starts_with("|=") {
+            (2, MatcherOp::Eq)
+        } else if s[pos..].starts_with("!=") {
+            (2, MatcherOp::Neq)
+        } else if s[pos..].starts_with("|~") {
+            (2, MatcherOp::Re)
+        } else if s[pos..].starts_with("!~") {
+            (2, MatcherOp::NRe)
+        } else if s[pos..].starts_with('|') {
+            return Err(format!(
+                "unsupported LogQL stage: '{}...' (M0 supports only |=, !=, |~, !~ line filters)",
+                input_preview(s, pos)
+            ));
+        } else {
+            return Err(format!(
+                "unexpected token in line filter position: '{}...'",
+                input_preview(s, pos)
+            ));
+        };
 
         pos += op_len;
         while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
@@ -263,18 +281,24 @@ fn parse_line_filters(s: &str) -> Result<Vec<LineFilter>, String> {
     Ok(filters)
 }
 
+fn input_preview(s: &str, start: usize) -> String {
+    s[start..].chars().take(20).collect()
+}
+
 fn build_line_filter(op: MatcherOp, value: String) -> Result<LineFilter, String> {
     match op {
         MatcherOp::Eq => Ok(LineFilter::Contains(value)),
         MatcherOp::Neq => Ok(LineFilter::NotContains(value)),
-        MatcherOp::Re => Ok(LineFilter::Regex(
-            Regex::new(&value)
-                .map_err(|e| format!("invalid regular expression '{}': {}", value, e))?,
-        )),
-        MatcherOp::NRe => Ok(LineFilter::NotRegex(
-            Regex::new(&value)
-                .map_err(|e| format!("invalid regular expression '{}': {}", value, e))?,
-        )),
+        MatcherOp::Re => {
+            Ok(LineFilter::Regex(Regex::new(&value).map_err(|e| {
+                format!("invalid regular expression '{}': {}", value, e)
+            })?))
+        }
+        MatcherOp::NRe => {
+            Ok(LineFilter::NotRegex(Regex::new(&value).map_err(|e| {
+                format!("invalid regular expression '{}': {}", value, e)
+            })?))
+        }
     }
 }
 
@@ -344,9 +368,10 @@ mod tests {
         let q = parse(r#"{app=~".{3}"}"#).expect("parse");
         assert_eq!(q.matchers.len(), 1);
         assert_eq!(q.matchers[0].value, ".{3}");
-        assert!(q.matchers[0].matches(
-            &std::iter::once(("app".to_string(), "abc".to_string())).collect()
-        ));
+        assert!(
+            q.matchers[0]
+                .matches(&std::iter::once(("app".to_string(), "abc".to_string())).collect())
+        );
     }
 
     #[test]
@@ -387,5 +412,21 @@ mod tests {
     fn rejects_invalid_matcher_label_name() {
         assert!(parse(r#"{1app="x"}"#).is_err());
         assert!(parse(r#"{app-name="x"}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_or_extra_matcher_commas() {
+        assert!(parse(r#"{app="x" env="prod"}"#).is_err());
+        assert!(parse(r#"{app="x",}"#).is_err());
+        assert!(parse(r#"{app="x",,env="prod"}"#).is_err());
+    }
+
+    #[test]
+    fn unsupported_unicode_stage_returns_error_instead_of_panicking() {
+        let error = parse("{} |가가가가가가가").expect_err("unsupported stage must fail");
+        assert!(error.contains("unsupported LogQL stage"));
+
+        let error = parse("{} 가가가가가가가").expect_err("unexpected token must fail");
+        assert!(error.contains("unexpected token"));
     }
 }
