@@ -156,6 +156,7 @@ mod tests {
             parts,
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            remote_cache: None,
         });
 
         let now = std::time::SystemTime::now()
@@ -192,6 +193,7 @@ mod tests {
             parts: Arc::new(PartRegistry::new()),
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            remote_cache: None,
         });
         let body = build_snappy_push("bad-time", "must be rejected", 9_223_372_037);
         let mut headers = HeaderMap::new();
@@ -227,6 +229,7 @@ mod tests {
             parts: parts.clone(),
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            remote_cache: None,
         });
 
         let flush_handle = {
@@ -236,7 +239,7 @@ mod tests {
             let config = std::sync::Arc::new(config.clone());
             let healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
             tokio::spawn(async move {
-                crate::flush::flush_loop(memtable, journal, parts, config, healthy).await;
+                crate::flush::flush_loop(memtable, journal, parts, None, config, healthy).await;
             })
         };
 

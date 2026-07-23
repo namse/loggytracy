@@ -187,11 +187,64 @@ async fn run_unified_query(
     limit: usize,
     forward: bool,
 ) -> Result<Vec<StreamResult>, String> {
+    let part_guard = pin_query_parts(&state, &parsed, start_ns, end_ns).await?;
     tokio::task::spawn_blocking(move || {
+        let _part_guard = part_guard;
         unified_query(&state, &parsed, start_ns, end_ns, limit, forward)
     })
     .await
     .map_err(|error| format!("query task failed: {error}"))?
+}
+
+async fn pin_query_parts(
+    state: &AppState,
+    parsed: &logql::LogQuery,
+    start_ns: i64,
+    end_ns: i64,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
+    pin_query_parts_with_gap_hook(state, parsed, start_ns, end_ns, || Ok(())).await
+}
+
+async fn pin_query_parts_with_gap_hook<F>(
+    state: &AppState,
+    parsed: &logql::LogQuery,
+    start_ns: i64,
+    end_ns: i64,
+    after_read_guard: F,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let operation_lock = state.parts.operation_lock();
+    let read_guard = operation_lock.clone().read_owned().await;
+    let Some(remote) = &state.remote_cache else {
+        return Ok(read_guard);
+    };
+    let required = state
+        .parts
+        .candidate_part_ids(&parsed.matchers, start_ns, end_ns);
+    let missing = state.parts.missing_data_ids(&required);
+    if missing.is_empty() {
+        return Ok(read_guard);
+    }
+    drop(read_guard);
+    after_read_guard()?;
+
+    let write_guard = operation_lock.write_owned().await;
+    // A merge may have replaced the registry generation while this query was
+    // queued for the exclusive guard. Re-plan against the protected current
+    // generation instead of restoring only IDs captured before the gap.
+    let required = state
+        .parts
+        .candidate_part_ids(&parsed.matchers, start_ns, end_ns);
+    let missing = state.parts.missing_data_ids(&required);
+    if !missing.is_empty() {
+        remote
+            .storage
+            .restore_parts(&remote.parts_root, &missing)
+            .await?;
+    }
+    Ok(tokio::sync::OwnedRwLockWriteGuard::downgrade(write_guard))
 }
 
 pub async fn query_range(
@@ -535,6 +588,7 @@ mod tests {
             parts,
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            remote_cache: None,
         };
 
         assert_eq!(distinct_stream_count(&state), 1);
@@ -554,6 +608,7 @@ mod tests {
             parts: Arc::new(PartRegistry::new()),
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            remote_cache: None,
         });
 
         assert_eq!(ready(State(state.clone())).await.unwrap(), "ready");
@@ -564,5 +619,148 @@ mod tests {
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.contains("flush worker"));
         assert!(error.1.contains("merge worker"));
+    }
+
+    #[tokio::test]
+    async fn query_restores_evicted_part_from_object_store() {
+        let data_dir = temp_dir();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+        let parts_root = data_dir.join("parts");
+        let storage = Arc::new(crate::object_storage::ObjectStorage::in_memory());
+        let labels: Labels = [("app".to_string(), "remote".to_string())]
+            .into_iter()
+            .collect();
+        let local_parts = part::flush_rows(
+            vec![Row {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                labels,
+                line: "restored after eviction".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        let other_labels: Labels = [("app".to_string(), "other".to_string())]
+            .into_iter()
+            .collect();
+        let other_parts = part::flush_rows(
+            vec![Row {
+                timestamp_ns: 1_700_000_000_000_000_001,
+                labels: other_labels,
+                line: "must remain remote".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        let other_data_path = other_parts[0].data_path();
+        let mut published_parts = local_parts.clone();
+        published_parts.extend(other_parts);
+        storage.publish(&published_parts, &[]).await.unwrap();
+        let parts = Arc::new(PartRegistry::load_from_disk(&parts_root).unwrap());
+        storage
+            .evict_cache(&parts_root, 0, &parts.part_ids())
+            .unwrap();
+        assert!(parts.has_missing_cache_files());
+
+        let memtable = Arc::new(MemTable::new());
+        let state = Arc::new(AppState {
+            journal: Arc::new(Journal::spawn(&config, memtable.clone()).unwrap()),
+            memtable,
+            parts,
+            flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            remote_cache: Some(Arc::new(crate::object_storage::RemoteCache::new(
+                storage, parts_root,
+            ))),
+        });
+        let parsed = logql::parse(r#"{app="remote"}"#).unwrap();
+        let result = run_unified_query(state, parsed, i64::MIN, i64::MAX, 10, true)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].entries[0].line, "restored after eviction");
+        assert!(
+            !other_data_path.exists(),
+            "query restored an unrelated part"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_replans_restore_after_registry_changes_in_lock_gap() {
+        let data_dir = temp_dir();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+        let parts_root = data_dir.join("parts");
+        let storage = Arc::new(crate::object_storage::ObjectStorage::in_memory());
+        let labels: Labels = [("app".to_string(), "remote".to_string())]
+            .into_iter()
+            .collect();
+        let old = part::flush_rows(
+            vec![Row {
+                timestamp_ns: 1,
+                labels: labels.clone(),
+                line: "old generation".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        storage.publish(&old, &[]).await.unwrap();
+        let parts = Arc::new(PartRegistry::load_from_disk(&parts_root).unwrap());
+
+        let new = part::flush_rows(
+            vec![Row {
+                timestamp_ns: 2,
+                labels,
+                line: "new generation".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        let manifest = storage
+            .publish(&new, &[old[0].meta.id.clone()])
+            .await
+            .unwrap();
+        let eligible = [old[0].meta.id.clone(), new[0].meta.id.clone()]
+            .into_iter()
+            .collect();
+        storage.evict_cache(&parts_root, 0, &eligible).unwrap();
+
+        let memtable = Arc::new(MemTable::new());
+        let state = AppState {
+            journal: Arc::new(Journal::spawn(&config, memtable.clone()).unwrap()),
+            memtable,
+            parts: parts.clone(),
+            flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            remote_cache: Some(Arc::new(crate::object_storage::RemoteCache::new(
+                storage,
+                parts_root.clone(),
+            ))),
+        };
+        let parsed = logql::parse(r#"{app="remote"}"#).unwrap();
+        let guard = pin_query_parts_with_gap_hook(&state, &parsed, i64::MIN, i64::MAX, || {
+            parts.reload_from_manifest(&parts_root, &manifest)
+        })
+        .await
+        .unwrap();
+        let result = unified_query(&state, &parsed, i64::MIN, i64::MAX, 10, true).unwrap();
+        drop(guard);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].entries[0].line, "new generation");
+        assert!(new[0].data_path().exists());
     }
 }

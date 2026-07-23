@@ -7,11 +7,13 @@ use tokio::time::interval;
 
 use crate::config::Config;
 use crate::memtable::Labels;
+use crate::object_storage::RemoteCache;
 use crate::part::{self, PartReader};
 use crate::part_registry::PartRegistry;
 
 pub async fn merge_loop(
     registry: Arc<PartRegistry>,
+    remote_cache: Option<Arc<RemoteCache>>,
     config: Arc<Config>,
     healthy: Arc<AtomicBool>,
 ) {
@@ -20,7 +22,7 @@ pub async fn merge_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        match merge_once(&registry, &config).await {
+        match merge_once(&registry, remote_cache.as_deref(), &config).await {
             Ok(()) => healthy.store(true, Ordering::Release),
             Err(e) => {
                 healthy.store(false, Ordering::Release);
@@ -30,7 +32,11 @@ pub async fn merge_loop(
     }
 }
 
-async fn merge_once(registry: &PartRegistry, config: &Config) -> Result<(), String> {
+async fn merge_once(
+    registry: &PartRegistry,
+    remote_cache: Option<&RemoteCache>,
+    config: &Config,
+) -> Result<(), String> {
     let readers = registry.snapshot();
     if readers.is_empty() {
         return Ok(());
@@ -61,6 +67,23 @@ async fn merge_once(registry: &PartRegistry, config: &Config) -> Result<(), Stri
             let old_ids: Vec<String> = group.iter().map(|r| r.meta().id.clone()).collect();
             let old_dirs: Vec<std::path::PathBuf> =
                 group.iter().map(|r| r.part().dir.clone()).collect();
+
+            // A merge removes its input directories after swapping the
+            // registry generation. Hold the exclusive lifecycle guard for the
+            // complete transaction so a query cannot retain an old reader and
+            // then try to open its Parquet file after deletion. This lock is
+            // also shared with remote cache restoration and eviction.
+            let _part_guard = registry.operation_lock().write_owned().await;
+            if let Some(cache) = remote_cache {
+                let required: std::collections::HashSet<String> = old_ids.iter().cloned().collect();
+                let missing = registry.missing_data_ids(&required);
+                if !missing.is_empty() {
+                    cache
+                        .storage
+                        .restore_parts(&cache.parts_root, &missing)
+                        .await?;
+                }
+            }
 
             let rows_result = tokio::task::spawn_blocking({
                 let group = group.clone();
@@ -127,6 +150,22 @@ async fn merge_once(registry: &PartRegistry, config: &Config) -> Result<(), Stri
                             continue;
                         }
                     };
+                    if let Some(cache) = remote_cache
+                        && let Err(error) = cache.storage.publish(&new_parts, &old_ids).await
+                    {
+                        tracing::error!(
+                            %error,
+                            partition = %partition,
+                            "merged parts could not be published; keeping old parts"
+                        );
+                        if let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs) {
+                            tracing::warn!(%cleanup_error, "failed to remove unpublished merged parts");
+                        }
+                        errors.push(format!(
+                            "object-store merge publish failed for partition {partition}: {error}"
+                        ));
+                        continue;
+                    }
                     match registry.replace(&old_ids, new_parts) {
                         Ok(_) => {
                             if let Err(error) = part::remove_part_dirs(&cleanup_old_dirs) {
@@ -162,7 +201,9 @@ async fn merge_once(registry: &PartRegistry, config: &Config) -> Result<(), Stri
                                 partition = %partition,
                                 "merged part validation failed; keeping old parts"
                             );
-                            if let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs) {
+                            if remote_cache.is_none()
+                                && let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs)
+                            {
                                 tracing::warn!(
                                     error = %cleanup_error,
                                     "failed to remove invalid merged parts"
@@ -351,7 +392,7 @@ mod tests {
         }
         assert_eq!(registry.part_count(), 5);
 
-        merge_once(&registry, &config).await.unwrap();
+        merge_once(&registry, None, &config).await.unwrap();
 
         assert_eq!(registry.part_count(), 1);
 
@@ -360,6 +401,50 @@ mod tests {
             .expect("part query");
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 50);
+    }
+
+    #[tokio::test]
+    async fn merge_waits_for_active_query_lifecycle_guard_before_deleting_inputs() {
+        let dir = tmp_dir("query_lifecycle");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 2,
+            merge_target_part_rows: 1000,
+            merge_max_part_rows: 10000,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        for batch in 0..2u64 {
+            let rows = make_rows(10, (batch * 1000) as i64, &format!("b{batch}"));
+            registry
+                .register(part::flush_rows(rows, &parts_root, config.row_group_size).unwrap())
+                .unwrap();
+        }
+        let old_dirs: Vec<_> = registry
+            .snapshot()
+            .iter()
+            .map(|reader| reader.part().dir.clone())
+            .collect();
+
+        let query_guard = registry.operation_lock().read_owned().await;
+        let merge_registry = registry.clone();
+        let merge_config = config.clone();
+        let mut merge =
+            tokio::spawn(async move { merge_once(&merge_registry, None, &merge_config).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut merge)
+                .await
+                .is_err(),
+            "merge deleted inputs while a query lifecycle guard was active"
+        );
+        assert!(old_dirs.iter().all(|dir| dir.exists()));
+
+        drop(query_guard);
+        merge.await.unwrap().unwrap();
+        assert!(old_dirs.iter().all(|dir| !dir.exists()));
+        assert_eq!(registry.part_count(), 1);
     }
 
     #[tokio::test]
@@ -383,7 +468,7 @@ mod tests {
         }
         assert_eq!(registry.part_count(), 2);
 
-        merge_once(&registry, &config).await.unwrap();
+        merge_once(&registry, None, &config).await.unwrap();
 
         assert_eq!(registry.part_count(), 2);
     }
@@ -454,7 +539,7 @@ mod tests {
         }
         assert_eq!(registry.part_count(), 4);
 
-        merge_once(&registry, &config).await.unwrap();
+        merge_once(&registry, None, &config).await.unwrap();
 
         assert_eq!(registry.part_count(), 1);
         let results = registry
@@ -489,7 +574,7 @@ mod tests {
             registry.register(parts).unwrap();
         }
 
-        merge_once(&registry, &config).await.unwrap();
+        merge_once(&registry, None, &config).await.unwrap();
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.len(), 2);
@@ -524,7 +609,7 @@ mod tests {
             let parts = part::flush_rows(rows, &parts_root, config.row_group_size).unwrap();
             registry.register(parts).unwrap();
         }
-        merge_once(&registry, &config).await.unwrap();
+        merge_once(&registry, None, &config).await.unwrap();
         assert_eq!(registry.part_count(), 1);
 
         // bloom prune after merge
@@ -586,7 +671,7 @@ mod tests {
             registry.register(parts).unwrap();
         }
 
-        merge_once(&registry, &config).await.unwrap();
+        merge_once(&registry, None, &config).await.unwrap();
 
         assert_eq!(registry.part_count(), 1);
         let rows = read_all_rows(&registry.snapshot()).unwrap();

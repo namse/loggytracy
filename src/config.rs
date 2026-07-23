@@ -15,6 +15,12 @@ pub struct Config {
     pub merge_target_part_rows: u64,
     pub merge_max_part_rows: u64,
     pub merge_interval: Duration,
+    /// Object-store URL, for example `s3://bucket/loggytracy` or
+    /// `file:///var/lib/loggytracy-remote`. When unset, the engine keeps the
+    /// M1 local-only behaviour.
+    pub object_store_url: Option<String>,
+    pub cache_max_bytes: u64,
+    pub cache_eviction_interval: Duration,
 }
 
 impl Default for Config {
@@ -32,6 +38,28 @@ impl Default for Config {
             merge_target_part_rows: 1_000_000,
             merge_max_part_rows: 4_000_000,
             merge_interval: Duration::from_secs(30),
+            object_store_url: None,
+            cache_max_bytes: 10 * 1024 * 1024 * 1024,
+            cache_eviction_interval: Duration::from_secs(30),
         }
+    }
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self, String> {
+        let object_store_url = std::env::var("LOGGYTRACY_OBJECT_STORE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let cache_max_bytes = match std::env::var("LOGGYTRACY_CACHE_MAX_BYTES") {
+            Ok(value) => value.parse().map_err(|error| {
+                format!("invalid LOGGYTRACY_CACHE_MAX_BYTES {value:?}: {error}")
+            })?,
+            Err(_) => Self::default().cache_max_bytes,
+        };
+        Ok(Self {
+            object_store_url,
+            cache_max_bytes,
+            ..Self::default()
+        })
     }
 }

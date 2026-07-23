@@ -6,6 +6,7 @@ mod journal;
 mod logql;
 mod memtable;
 mod merge;
+mod object_storage;
 mod part;
 mod part_registry;
 mod proto;
@@ -20,6 +21,7 @@ use axum::routing::{get, post};
 use config::Config;
 use journal::Journal;
 use memtable::MemTable;
+use object_storage::{ObjectStorage, RemoteCache};
 use part::cleanup_tmp;
 use part_registry::PartRegistry;
 
@@ -29,12 +31,13 @@ pub struct AppState {
     pub parts: Arc<PartRegistry>,
     pub flush_healthy: Arc<AtomicBool>,
     pub merge_healthy: Arc<AtomicBool>,
+    pub remote_cache: Option<Arc<RemoteCache>>,
 }
 
 fn recover(config: &Config, memtable: &MemTable) -> Result<(), String> {
     let parts_root = config.data_dir.join("parts");
     std::fs::create_dir_all(&parts_root).map_err(|e| e.to_string())?;
-    cleanup_tmp(&parts_root);
+    cleanup_tmp(&parts_root)?;
 
     let wal_path = config.data_dir.join("journal.wal");
     let ckpt_path = config.data_dir.join("journal.ckpt");
@@ -72,7 +75,9 @@ async fn main() {
         .with_env_filter("loggytracy=debug,info")
         .init();
 
-    let config = Arc::new(Config::default());
+    let config = Arc::new(
+        Config::from_env().unwrap_or_else(|error| panic!("invalid configuration: {error}")),
+    );
 
     if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
         panic!("failed to create data dir: {}", e);
@@ -82,10 +87,39 @@ async fn main() {
 
     recover(&config, &memtable).unwrap_or_else(|e| panic!("recovery failed: {e}"));
 
+    let object_storage = config
+        .object_store_url
+        .as_deref()
+        .map(ObjectStorage::from_url)
+        .transpose()
+        .unwrap_or_else(|error| panic!("object-store initialization failed: {error}"))
+        .map(Arc::new);
+    let remote_manifest = if let Some(storage) = &object_storage {
+        let restored = storage
+            .reconcile_local_cache(&config.data_dir.join("parts"))
+            .await
+            .unwrap_or_else(|error| panic!("object-store recovery failed: {error}"));
+        tracing::info!(
+            generation = restored.generation,
+            parts = restored.parts.len(),
+            "restored object-store manifest"
+        );
+        Some(restored)
+    } else {
+        None
+    };
+
+    let parts_root = config.data_dir.join("parts");
     let parts = Arc::new(
-        PartRegistry::load_from_disk(&config.data_dir.join("parts"))
-            .unwrap_or_else(|e| panic!("failed to load parts: {e}")),
+        match &remote_manifest {
+            Some(manifest) => PartRegistry::load_from_manifest(&parts_root, manifest),
+            None => PartRegistry::load_from_disk(&parts_root),
+        }
+        .unwrap_or_else(|e| panic!("failed to load parts: {e}")),
     );
+    let remote_cache = object_storage
+        .as_ref()
+        .map(|storage| Arc::new(RemoteCache::new(storage.clone(), parts_root.clone())));
 
     let journal =
         Arc::new(Journal::spawn(&config, memtable.clone()).expect("failed to initialize journal"));
@@ -100,8 +134,9 @@ async fn main() {
         let config = config.clone();
         let task_health = flush_healthy.clone();
         let monitor_health = flush_healthy.clone();
+        let cache = remote_cache.clone();
         let handle = tokio::spawn(async move {
-            flush::flush_loop(memtable, journal, registry, config, task_health).await;
+            flush::flush_loop(memtable, journal, registry, cache, config, task_health).await;
         });
         tokio::spawn(async move {
             match handle.await {
@@ -117,8 +152,9 @@ async fn main() {
         let config = config.clone();
         let task_health = merge_healthy.clone();
         let monitor_health = merge_healthy.clone();
+        let cache = remote_cache.clone();
         let handle = tokio::spawn(async move {
-            merge::merge_loop(registry, config, task_health).await;
+            merge::merge_loop(registry, cache, config, task_health).await;
         });
         tokio::spawn(async move {
             match handle.await {
@@ -129,12 +165,35 @@ async fn main() {
         });
     }
 
+    if let Some(cache) = remote_cache.clone() {
+        let config = config.clone();
+        let registry = parts.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(config.cache_eviction_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let _guard = registry.operation_lock().write_owned().await;
+                let eligible = registry.part_ids();
+                match cache.storage.evict_cache(
+                    &cache.parts_root,
+                    config.cache_max_bytes,
+                    &eligible,
+                ) {
+                    Ok(bytes) => tracing::debug!(bytes, "local part cache eviction complete"),
+                    Err(error) => tracing::warn!(%error, "local part cache eviction failed"),
+                }
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         memtable,
         journal,
         parts,
         flush_healthy,
         merge_healthy,
+        remote_cache,
     });
 
     let app = Router::new()

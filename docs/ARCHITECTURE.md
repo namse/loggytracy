@@ -19,7 +19,7 @@ Rust로 만드는 싱글 머신 log + trace 엔진. VictoriaLogs의 논리 설�
 - **flush 가시성 윈도우 (M1 known issue)**: 통합 쿼리는 memtable과 part registry를 서로 다른 시점에 읽는다. 쿼리가 memtable 데이터를 캡처한 뒤 같은 데이터의 part 등록까지 걸쳐 실행되거나, part 등록 후 flushing 버퍼 commit 전 실행되면 두 복사본을 함께 볼 수 있다. 순서를 반대로 하면 일시적인 누락이 생기므로, M1에서는 flush와 겹치는 쿼리의 중복 가능성을 허용하고 후속 마일스톤에서 원자적 가시성 경계를 다룬다.
 - **merge 교체 불변량**: merge tombstone은 새 part 디렉터리가 `.tmp`에서 최종 위치로 rename되기 전에 기록된다. 재시작 복구는 새 part를 성공적으로 open한 경우에만 old part를 삭제하며, 새 part 검증에 실패하면 old part를 유지한다.
 - **merge tombstone 연쇄 복구**: 재시작 시 모든 tombstone 관계를 먼저 수집하고 이전 세대까지 폐쇄적으로 추적한 뒤 old part를 정리한다. 따라서 삭제 실패 후 여러 세대의 merge가 겹쳐도 중간 tombstone 삭제로 이전 세대 part가 부활하지 않는다.
-- **WAL 증가**: flush/checkpoint 후에도 WAL을 truncate/rotate하지 않는다(M2에서 object_store manifest 연동 후 rotate 예정). checkpoint 이전 구간은 replay 대상이 아니므로 증가만 하고 소비하지 않는다.
+- **WAL compaction**: object store가 활성화된 경우 part 업로드와 manifest CAS가 성공한 뒤 writer 태스크가 checkpoint 이전 WAL 구간을 제거한다. 교체 전에 checkpoint를 0으로 되돌리므로 compaction 도중 크래시는 이전 WAL 전체 또는 새 WAL suffix를 재생하며, 중복은 가능하지만 유실은 없다. 로컬 전용 모드는 기존 offset checkpoint를 유지한다.
 
 | 물리 포맷 | Parquet (dictionary + zstd) + 사이드카 인덱스 파일 |
 | 인덱스 | stream index + 블록별 trigram bloom filter (역인덱스 없음) |
@@ -83,9 +83,16 @@ LogQL 파싱(chumsky) → 플랜 → 프루닝 단계 순서:
 ## S3와 manifest
 
 - part 업로드 완료 후 manifest 갱신. manifest는 버전 번호가 있는 파일이며 S3 conditional write(If-None-Match)로 compare-and-swap.
-- 로컬 디스크는 part 캐시. eviction 후에도 S3 range read로 쿼리 가능.
+- 로컬 디스크는 part 캐시. 작은 metadata/bloom/stream index catalog는 유지하고, `data.parquet` 본문만 LRU eviction한다. 쿼리와 merge는 시간·라벨 프루닝으로 선택된 part 본문만 검증된 임시 디렉터리로 내려받고 읽는 동안 eviction으로부터 pin한다. Parquet range read 최적화는 후속 단계로 남긴다.
 - 장비 교체: 새 장비가 manifest를 읽어 복구, 미ack 데이터는 Alloy가 재전송.
 - read replica: manifest 폴링으로 새 part 추적 (S3 반영 지연만큼 최신 데이터 지연). master 승격은 manifest generation 번호로 fencing.
+
+### Object store 설정
+
+- `LOGGYTRACY_OBJECT_STORE_URL`: `s3://bucket/prefix` 형식. 개발/테스트에는 단일 프로세스 전용인 `file:///absolute/path`도 사용할 수 있다. `file://` manifest 갱신은 프로세스 내부 직렬화와 atomic rename을 사용하며 다중 writer CAS를 제공하지 않는다. 미설정 시 로컬 전용 모드로 동작한다.
+- S3 credential, region, endpoint, path-style 옵션은 `object_store`가 읽는 AWS/OBJECT_STORE 환경 변수를 사용한다.
+- `LOGGYTRACY_CACHE_MAX_BYTES`: 로컬 Parquet 본문 캐시 상한(기본 10 GiB, 작은 catalog 파일은 제외). 오래 접근하지 않은 본문부터 제거하며, 이후 필요한 쿼리에서 manifest를 기준으로 다시 내려받는다.
+- 시작 시 먼저 manifest catalog를 복구한다. 최초 object store 활성화로 manifest가 비어 있으면 로컬 tombstone 복구가 계산한 최종 active part 전체를 한 번의 CAS로 게시한다. 기존 manifest가 있으면 중단된 merge tombstone을 오래된 세대부터 재개한 뒤 일반 로컬 part를 업로드한다. 업로드 전에는 durable marker를 남겨 manifest 반영 전 중단된 작업을 다음 시작에서 검증·재개한다. marker 없이 완전한 원격 object set만 남은 part는 비활성 generation으로 판단해 되살리지 않는다. registry 밖의 로컬 디렉터리는 자동 삭제하지 않고 후속 retention 대상으로 보존한다.
 
 ## LogQL 지원 범위 (subset)
 

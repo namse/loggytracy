@@ -4,35 +4,128 @@ use std::sync::{Arc, RwLock};
 
 use crate::logql::{LabelMatcher, LineFilter};
 use crate::memtable::{IndexStats, Labels, StreamResult};
+use crate::object_storage::Manifest;
 use crate::part::{Part, PartReader, discover_parts};
 
 pub struct PartRegistry {
     inner: RwLock<HashMap<String, Arc<PartReader>>>,
+    operation_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl PartRegistry {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            operation_lock: Arc::new(tokio::sync::RwLock::new(())),
         }
+    }
+
+    pub fn operation_lock(&self) -> Arc<tokio::sync::RwLock<()>> {
+        self.operation_lock.clone()
     }
 
     pub fn load_from_disk(parts_root: &Path) -> Result<Self, String> {
         let registry = Self::new();
+        registry.reload_from_disk(parts_root)?;
+        Ok(registry)
+    }
+
+    pub fn reload_from_disk(&self, parts_root: &Path) -> Result<(), String> {
         let parts = discover_parts(parts_root)?;
+        self.replace_all(parts, false)
+    }
+
+    pub fn load_from_manifest(parts_root: &Path, manifest: &Manifest) -> Result<Self, String> {
+        let registry = Self::new();
+        registry.reload_from_manifest(parts_root, manifest)?;
+        Ok(registry)
+    }
+
+    pub fn reload_from_manifest(
+        &self,
+        parts_root: &Path,
+        manifest: &Manifest,
+    ) -> Result<(), String> {
+        let mut parts = Vec::with_capacity(manifest.parts.len());
+        for descriptor in &manifest.parts {
+            let dir = parts_root.join(&descriptor.partition).join(&descriptor.id);
+            let part = crate::part::load_part(&dir).map_err(|error| {
+                format!("failed to load manifest part {}: {error}", descriptor.id)
+            })?;
+            if part.meta.id != descriptor.id || part.meta.partition != descriptor.partition {
+                return Err(format!(
+                    "cached part metadata does not match manifest descriptor {}/{}",
+                    descriptor.partition, descriptor.id
+                ));
+            }
+            parts.push(part);
+        }
+        self.replace_all(parts, true)
+    }
+
+    fn replace_all(&self, parts: Vec<Part>, allow_missing_data: bool) -> Result<(), String> {
         let mut opened = Vec::with_capacity(parts.len());
         for part in parts {
             let id = part.meta.id.clone();
-            let reader = PartReader::open(part)
-                .map_err(|e| format!("failed to open part {id} during startup: {e}"))?;
+            let reader = if allow_missing_data {
+                PartReader::open_cached(part)
+            } else {
+                PartReader::open(part)
+            }
+            .map_err(|e| format!("failed to open part {id} during startup: {e}"))?;
             opened.push((id, Arc::new(reader)));
         }
         let count = opened.len();
-        registry.inner.write().unwrap().extend(opened);
+        *self.inner.write().unwrap() = opened.into_iter().collect();
         if count > 0 {
             tracing::info!(parts = count, "loaded parts from disk");
         }
-        Ok(registry)
+        Ok(())
+    }
+
+    pub fn has_missing_cache_files(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .values()
+            .any(|reader| !reader.part().data_path().exists())
+    }
+
+    pub fn candidate_part_ids(
+        &self,
+        matchers: &[LabelMatcher],
+        start_ns: i64,
+        end_ns: i64,
+    ) -> std::collections::HashSet<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, reader)| {
+                let meta = reader.meta();
+                meta.max_ts_ns >= start_ns
+                    && meta.min_ts_ns <= end_ns
+                    && (matchers.is_empty()
+                        || meta
+                            .streams
+                            .iter()
+                            .any(|labels| matchers.iter().all(|matcher| matcher.matches(labels))))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    pub fn missing_data_ids(
+        &self,
+        ids: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(id, reader)| ids.contains(*id) && !reader.part().data_path().exists())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     pub fn register(&self, parts: Vec<Part>) -> Result<Vec<String>, String> {
@@ -88,6 +181,10 @@ impl PartRegistry {
         self.inner.read().unwrap().len()
     }
 
+    pub fn part_ids(&self) -> std::collections::HashSet<String> {
+        self.inner.read().unwrap().keys().cloned().collect()
+    }
+
     pub fn query(
         &self,
         matchers: &[LabelMatcher],
@@ -121,6 +218,18 @@ impl PartRegistry {
 
         let mut all: Vec<(Labels, crate::memtable::LogEntry)> = Vec::new();
         for reader in &candidates {
+            let access_marker = reader.part().dir.join(".access");
+            match std::fs::symlink_metadata(&access_marker) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    tracing::warn!(
+                        path = %access_marker.display(),
+                        "refusing to follow symlinked cache access marker"
+                    );
+                }
+                Ok(_) | Err(_) => {
+                    let _ = std::fs::write(&access_marker, []);
+                }
+            }
             let results = reader
                 .query(matchers, line_filters, start_ns, end_ns, limit, forward)
                 .map_err(|error| {

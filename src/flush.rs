@@ -7,6 +7,7 @@ use tokio::time::interval;
 use crate::config::Config;
 use crate::journal::Journal;
 use crate::memtable::MemTable;
+use crate::object_storage::RemoteCache;
 use crate::part::{self};
 use crate::part_registry::PartRegistry;
 
@@ -14,6 +15,7 @@ pub async fn flush_loop(
     memtable: Arc<MemTable>,
     journal: Arc<Journal>,
     registry: Arc<PartRegistry>,
+    remote_cache: Option<Arc<RemoteCache>>,
     config: Arc<Config>,
     healthy: Arc<AtomicBool>,
 ) {
@@ -57,6 +59,7 @@ pub async fn flush_loop(
             &memtable,
             &journal,
             &registry,
+            remote_cache.as_deref(),
             &config,
             &mut pending_checkpoint,
         )
@@ -92,20 +95,29 @@ async fn flush_once(
     memtable: &MemTable,
     journal: &Journal,
     registry: &PartRegistry,
+    remote_cache: Option<&RemoteCache>,
     config: &Config,
     pending_checkpoint: &mut Option<u64>,
 ) -> Result<(), String> {
     let ckpt = journal.checkpoint().await.map_err(|e| e.to_string())?;
     if ckpt.snapshot.is_empty() {
         memtable.commit_flush();
-        if let Err(error) = journal.set_checkpoint(ckpt.offset) {
-            *pending_checkpoint = Some(ckpt.offset);
+        if let Err(error) = advance_checkpoint(journal, ckpt.offset, remote_cache.is_some()).await {
+            if remote_cache.is_none() {
+                *pending_checkpoint = Some(ckpt.offset);
+            }
             return Err(error.to_string());
         }
         return Ok(());
     }
     let rows = part::rows_from_snapshot(&ckpt.snapshot);
     let total_rows = rows.len();
+    // Prevent eviction from observing a freshly committed directory before
+    // it has been published and installed in the registry.
+    let _cache_guard = match remote_cache {
+        Some(_) => Some(registry.operation_lock().read_owned().await),
+        None => None,
+    };
     let parts_root = config.data_dir.join("parts");
     if let Err(error) = std::fs::create_dir_all(&parts_root) {
         memtable.abort_flush(ckpt.snapshot);
@@ -130,8 +142,28 @@ async fn flush_once(
         Ok(new_parts) => {
             let n = new_parts.len();
             let new_part_dirs: Vec<_> = new_parts.iter().map(|part| part.dir.clone()).collect();
-            if let Err(error) = registry.register(new_parts) {
+            if let Some(cache) = remote_cache
+                && let Err(error) = cache.storage.publish(&new_parts, &[]).await
+            {
                 let cleanup_error = part::remove_part_dirs(&new_part_dirs).err();
+                memtable.abort_flush(ckpt.snapshot);
+                return Err(match cleanup_error {
+                    Some(cleanup_error) => format!(
+                        "object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
+                    ),
+                    None => format!("object-store publish failed: {error}"),
+                });
+            }
+            if let Err(error) = registry.register(new_parts) {
+                // Once a remote manifest has made these parts visible it is
+                // unsafe to delete them. Recovery will reopen them from the
+                // manifest; reinserting the snapshot preserves at-least-once
+                // semantics until then.
+                let cleanup_error = if remote_cache.is_none() {
+                    part::remove_part_dirs(&new_part_dirs).err()
+                } else {
+                    None
+                };
                 memtable.abort_flush(ckpt.snapshot);
                 return Err(match cleanup_error {
                     Some(cleanup_error) => {
@@ -140,7 +172,9 @@ async fn flush_once(
                     None => error,
                 });
             }
-            if let Err(error) = journal.set_checkpoint(ckpt.offset) {
+            if let Err(error) =
+                advance_checkpoint(journal, ckpt.offset, remote_cache.is_some()).await
+            {
                 // The part is already durable and visible. A checkpoint error
                 // is ambiguous: rename may have succeeded before a directory
                 // fsync failed. Rolling the part back could therefore lose
@@ -149,7 +183,9 @@ async fn flush_once(
                 // Commit the in-memory side and retain this offset for the
                 // flush loop to retry before it attempts any later flush.
                 memtable.commit_flush();
-                *pending_checkpoint = Some(ckpt.offset);
+                if remote_cache.is_none() {
+                    *pending_checkpoint = Some(ckpt.offset);
+                }
                 return Err(format!(
                     "parts were committed but journal checkpoint could not be advanced: {error}"
                 ));
@@ -168,6 +204,18 @@ async fn flush_once(
             memtable.abort_flush(ckpt.snapshot);
             Err(e.to_string())
         }
+    }
+}
+
+async fn advance_checkpoint(
+    journal: &Journal,
+    offset: u64,
+    compact: bool,
+) -> Result<(), std::io::Error> {
+    if compact {
+        journal.compact_checkpoint(offset).await
+    } else {
+        journal.set_checkpoint(offset)
     }
 }
 
@@ -220,6 +268,7 @@ mod tests {
             &memtable,
             &journal,
             &registry,
+            None,
             &config,
             &mut pending_checkpoint,
         )

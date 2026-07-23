@@ -100,17 +100,10 @@ pub fn partition_of(ts_ns: i64) -> String {
     dt.format("%Y-%m-%d").to_string()
 }
 
-static PART_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 fn gen_part_id(min_ts_ns: i64) -> String {
     let secs = min_ts_ns.div_euclid(1_000_000_000);
     let dt = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
-    let c = PART_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    format!("{}-{:06x}-{:08x}", dt.format("%Y%m%dT%H%M%S"), c, nanos)
+    format!("{}-{}", dt.format("%Y%m%dT%H%M%S"), uuid::Uuid::new_v4())
 }
 
 pub fn rows_from_snapshot(snapshot: &HashMap<Labels, Vec<LogEntry>>) -> Vec<Row> {
@@ -1006,13 +999,33 @@ pub fn discover_parts(parts_root: &Path) -> Result<Vec<Part>, String> {
     Ok(parts)
 }
 
-pub fn cleanup_tmp(parts_root: &Path) {
-    let tmp = parts_root.join(".tmp");
-    if tmp.exists()
-        && let Err(e) = fs::remove_dir_all(&tmp)
-    {
-        tracing::warn!(error = %e, "failed to clean tmp dir");
+pub fn cleanup_tmp(parts_root: &Path) -> Result<(), String> {
+    let root_metadata = fs::symlink_metadata(parts_root).map_err(|error| error.to_string())?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(format!(
+            "refusing unsafe parts root {}",
+            parts_root.display()
+        ));
     }
+    let canonical_root = fs::canonicalize(parts_root).map_err(|error| error.to_string())?;
+    let tmp = parts_root.join(".tmp");
+    let metadata = match fs::symlink_metadata(&tmp) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("refusing unsafe tmp directory {}", tmp.display()));
+    }
+    let canonical_tmp = fs::canonicalize(&tmp).map_err(|error| error.to_string())?;
+    if !canonical_tmp.starts_with(&canonical_root) {
+        return Err(format!(
+            "tmp directory escapes parts root: {}",
+            tmp.display()
+        ));
+    }
+    fs::remove_dir_all(&tmp).map_err(|error| error.to_string())?;
+    fsync_dir(parts_root).map_err(|error| error.to_string())
 }
 
 #[derive(Clone)]
@@ -1081,13 +1094,10 @@ pub struct PartReader {
     bloom: Vec<BloomFilter>,
     stream_index: StreamMap,
     stream_labels: Vec<String>,
-    data_file: PreadReader,
-    arrow_reader_metadata: ArrowReaderMetadata,
 }
 
-fn validate_part_files(part: &Part) -> Result<(), String> {
+fn validate_sidecar_files(part: &Part) -> Result<(), String> {
     let files = [
-        (DATA_FILE, part.data_path(), part.meta.integrity.data_crc32),
         (
             BLOOM_FILE,
             part.bloom_path(),
@@ -1114,6 +1124,65 @@ fn validate_part_files(part: &Part) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn open_part_data(
+    part: &Part,
+    validate_checksum: bool,
+) -> Result<(PreadReader, ArrowReaderMetadata), String> {
+    if validate_checksum {
+        let actual = file_crc32(&part.data_path()).map_err(|error| {
+            format!(
+                "failed to checksum {DATA_FILE} for part {}: {error}",
+                part.meta.id
+            )
+        })?;
+        if actual != part.meta.integrity.data_crc32 {
+            return Err(format!(
+                "{DATA_FILE} checksum mismatch for part {}: expected {}, got {actual}",
+                part.meta.id, part.meta.integrity.data_crc32
+            ));
+        }
+    }
+
+    let data_file =
+        PreadReader::new(fs::File::open(part.data_path()).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let arrow_reader_metadata =
+        ArrowReaderMetadata::load(&data_file, Default::default()).map_err(|e| e.to_string())?;
+
+    let parquet_rg_count = arrow_reader_metadata.metadata().num_row_groups();
+    if parquet_rg_count != part.meta.row_group_count as usize {
+        return Err(format!(
+            "row group count mismatch for part {}: parquet footer says {}, meta says {}",
+            part.meta.id, parquet_rg_count, part.meta.row_group_count
+        ));
+    }
+    let parquet_row_count = arrow_reader_metadata.metadata().file_metadata().num_rows();
+    if parquet_row_count != part.meta.row_count as i64 {
+        return Err(format!(
+            "row count mismatch for part {}: parquet footer says {}, meta says {}",
+            part.meta.id, parquet_row_count, part.meta.row_count
+        ));
+    }
+    let mut expected_fields = vec![
+        Field::new("timestamp_ns", DataType::Int64, false),
+        Field::new("_msg", DataType::Utf8, false),
+    ];
+    for label in &part.meta.stream_labels {
+        expected_fields.push(Field::new(label, DataType::Utf8, true));
+    }
+    expected_fields.push(Field::new("structured_metadata", DataType::Utf8, true));
+    let expected_schema = Schema::new(expected_fields);
+    if arrow_reader_metadata.schema().fields() != expected_schema.fields() {
+        return Err(format!(
+            "parquet schema does not match metadata for part {}: expected {:?}, got {:?}",
+            part.meta.id,
+            expected_schema.fields(),
+            arrow_reader_metadata.schema().fields()
+        ));
+    }
+    Ok((data_file, arrow_reader_metadata))
 }
 
 fn validate_stream_index(part: &Part, index: &StreamMap) -> Result<(), String> {
@@ -1150,7 +1219,18 @@ fn validate_stream_index(part: &Part, index: &StreamMap) -> Result<(), String> {
 
 impl PartReader {
     pub fn open(part: Part) -> Result<Self, String> {
-        validate_part_files(&part)?;
+        Self::open_internal(part, true)
+    }
+
+    /// Opens the metadata and indexes for an object-store cached part. The
+    /// Parquet body may have been evicted and is opened only while a query is
+    /// actively reading it.
+    pub fn open_cached(part: Part) -> Result<Self, String> {
+        Self::open_internal(part, false)
+    }
+
+    fn open_internal(part: Part, require_data: bool) -> Result<Self, String> {
+        validate_sidecar_files(&part)?;
         if part.meta.row_group_count == 0
             || part.meta.row_group_min_ts.len() != part.meta.row_group_count as usize
             || part.meta.row_group_max_ts.len() != part.meta.row_group_count as usize
@@ -1174,52 +1254,14 @@ impl PartReader {
             decode_stream_index(&fs::read(part.stream_index_path()).map_err(|e| e.to_string())?)?;
         validate_stream_index(&part, &stream_index)?;
         let stream_labels = part.meta.stream_labels.clone();
-        let data_file =
-            PreadReader::new(fs::File::open(part.data_path()).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
-        // parquet footer의 row group 수와 meta.row_group_count 일치 검증.
-        // bloom/stream index가 row group 경계를 parquet 실제 row group과 정렬한다는
-        // 암묵적 가정에 대한 안전망.
-        let arrow_reader_metadata =
-            ArrowReaderMetadata::load(&data_file, Default::default()).map_err(|e| e.to_string())?;
-        let parquet_rg_count = arrow_reader_metadata.metadata().num_row_groups();
-        if parquet_rg_count != part.meta.row_group_count as usize {
-            return Err(format!(
-                "row group count mismatch for part {}: parquet footer says {}, meta says {}",
-                part.meta.id, parquet_rg_count, part.meta.row_group_count
-            ));
-        }
-        let parquet_row_count = arrow_reader_metadata.metadata().file_metadata().num_rows();
-        if parquet_row_count != part.meta.row_count as i64 {
-            return Err(format!(
-                "row count mismatch for part {}: parquet footer says {}, meta says {}",
-                part.meta.id, parquet_row_count, part.meta.row_count
-            ));
-        }
-        let mut expected_fields = vec![
-            Field::new("timestamp_ns", DataType::Int64, false),
-            Field::new("_msg", DataType::Utf8, false),
-        ];
-        for label in &stream_labels {
-            expected_fields.push(Field::new(label, DataType::Utf8, true));
-        }
-        expected_fields.push(Field::new("structured_metadata", DataType::Utf8, true));
-        let expected_schema = Schema::new(expected_fields);
-        if arrow_reader_metadata.schema().fields() != expected_schema.fields() {
-            return Err(format!(
-                "parquet schema does not match metadata for part {}: expected {:?}, got {:?}",
-                part.meta.id,
-                expected_schema.fields(),
-                arrow_reader_metadata.schema().fields()
-            ));
+        if require_data || part.data_path().exists() {
+            open_part_data(&part, true)?;
         }
         Ok(Self {
             part,
             bloom,
             stream_index,
             stream_labels,
-            data_file,
-            arrow_reader_metadata,
         })
     }
 
@@ -1337,10 +1379,12 @@ impl PartReader {
 
         let mut collected: Vec<(Labels, LogEntry)> = Vec::new();
 
-        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
-            self.data_file.clone(),
-            self.arrow_reader_metadata.clone(),
-        );
+        // Keep the file descriptor local to this query. Eviction is
+        // coordinated with active queries, so dropping the query releases the
+        // final filesystem reference and immediately reclaims disk space.
+        let (data_file, arrow_reader_metadata) = open_part_data(&self.part, false)?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(data_file, arrow_reader_metadata);
         let row_group_indices: Vec<usize> = sorted_selected.iter().map(|&rg| rg as usize).collect();
         let reader = builder
             .with_row_groups(row_group_indices)
@@ -1861,6 +1905,32 @@ mod tests {
         ));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_tmp_rejects_symlinked_root_and_tmp_directory() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile_dir();
+        let outside_tmp = outside.join(".tmp");
+        fs::create_dir_all(&outside_tmp).unwrap();
+        let sentinel = outside_tmp.join("sentinel");
+        fs::write(&sentinel, b"must survive").unwrap();
+
+        let link_parent = tempfile_dir();
+        let linked_root = link_parent.join("parts");
+        symlink(&outside, &linked_root).unwrap();
+        let error = cleanup_tmp(&linked_root).unwrap_err();
+        assert!(error.contains("unsafe parts root"));
+        assert!(sentinel.exists());
+
+        let normal_root = tempfile_dir();
+        let linked_tmp = normal_root.join(".tmp");
+        symlink(&outside_tmp, &linked_tmp).unwrap();
+        let error = cleanup_tmp(&normal_root).unwrap_err();
+        assert!(error.contains("unsafe tmp directory"));
+        assert!(sentinel.exists());
     }
 
     #[test]

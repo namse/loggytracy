@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use prost::Message;
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
@@ -33,6 +33,10 @@ enum JournalCmd {
     },
     Checkpoint {
         done: oneshot::Sender<Result<CheckpointSnapshot, IoError>>,
+    },
+    Compact {
+        offset: u64,
+        done: oneshot::Sender<Result<(), IoError>>,
     },
 }
 
@@ -75,10 +79,18 @@ impl Journal {
         let healthy = Arc::new(AtomicBool::new(true));
 
         let wal_path_clone = wal_path.clone();
+        let ckpt_path_clone = ckpt_path.clone();
         let writer_health = healthy.clone();
         tokio::spawn(async move {
-            let result =
-                writer_loop(rx, &wal_path_clone, memtable, max_batch_bytes, max_batch_ms).await;
+            let result = writer_loop(
+                rx,
+                &wal_path_clone,
+                &ckpt_path_clone,
+                memtable,
+                max_batch_bytes,
+                max_batch_ms,
+            )
+            .await;
             writer_health.store(false, Ordering::Release);
             if let Err(e) = result {
                 tracing::error!(error = %e, "journal writer terminated");
@@ -143,6 +155,26 @@ impl Journal {
 
     pub fn set_checkpoint(&self, offset: u64) -> Result<(), IoError> {
         write_checkpoint(&self.ckpt_path, offset)
+    }
+
+    /// Drops the durable WAL prefix through `offset`. This command runs in
+    /// the writer task, so appends that arrived after the flush snapshot are
+    /// copied into the replacement WAL before new appends can proceed.
+    pub async fn compact_checkpoint(&self, offset: u64) -> Result<(), IoError> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.tx
+            .send(JournalCmd::Compact {
+                offset,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| IoError::new(std::io::ErrorKind::BrokenPipe, "journal writer closed"))?;
+        done_rx.await.map_err(|_| {
+            IoError::new(
+                std::io::ErrorKind::BrokenPipe,
+                "journal writer dropped during compaction",
+            )
+        })?
     }
 
     pub fn wal_path(&self) -> &Path {
@@ -320,6 +352,7 @@ fn replay_from(wal_path: &Path, checkpoint: u64, memtable: &MemTable) -> Result<
 async fn writer_loop(
     mut rx: mpsc::Receiver<JournalCmd>,
     path: &Path,
+    ckpt_path: &Path,
     memtable: Arc<MemTable>,
     max_batch_bytes: usize,
     max_batch_ms: u64,
@@ -340,6 +373,7 @@ async fn writer_loop(
 
         let mut pending_checkpoint: Option<oneshot::Sender<Result<CheckpointSnapshot, IoError>>> =
             None;
+        let mut pending_compact: Option<(u64, oneshot::Sender<Result<(), IoError>>)> = None;
 
         let mut batch: Vec<AppendBatchItem> = Vec::new();
         let mut batch_bytes = 0usize;
@@ -368,6 +402,10 @@ async fn writer_loop(
                             pending_checkpoint = Some(done);
                             break;
                         }
+                        Ok(Some(JournalCmd::Compact { offset, done })) => {
+                            pending_compact = Some((offset, done));
+                            break;
+                        }
                         Ok(None) => {
                             closed = true;
                             break;
@@ -378,6 +416,9 @@ async fn writer_loop(
             }
             JournalCmd::Checkpoint { done } => {
                 pending_checkpoint = Some(done);
+            }
+            JournalCmd::Compact { offset, done } => {
+                pending_compact = Some((offset, done));
             }
         }
 
@@ -441,11 +482,77 @@ async fn writer_loop(
             let _ = done.send(Ok(CheckpointSnapshot { offset, snapshot }));
         }
 
+        if let Some((offset, done)) = pending_compact {
+            let result = compact_wal(&mut file, path, ckpt_path, offset, &mut good_len).await;
+            match result {
+                Ok(()) => {
+                    let _ = done.send(Ok(()));
+                }
+                Err(error) => {
+                    let error_for_caller = IoError::new(error.kind(), error.to_string());
+                    let _ = done.send(Err(error_for_caller));
+                    return Err(error);
+                }
+            }
+        }
+
         if closed {
             break;
         }
     }
 
+    Ok(())
+}
+
+async fn compact_wal(
+    file: &mut tokio::fs::File,
+    wal_path: &Path,
+    ckpt_path: &Path,
+    offset: u64,
+    good_len: &mut u64,
+) -> Result<(), IoError> {
+    if offset > *good_len {
+        return Err(IoError::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("WAL compaction offset {offset} exceeds durable length {good_len}"),
+        ));
+    }
+    file.sync_all().await?;
+    let retained_len = *good_len - offset;
+    let tmp_path = wal_path.with_extension("wal.compact.tmp");
+    let mut source = OpenOptions::new().read(true).open(wal_path).await?;
+    source.seek(SeekFrom::Start(offset)).await?;
+    let mut tmp = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp_path)
+        .await?;
+    let copied = tokio::io::copy(&mut source.take(retained_len), &mut tmp).await?;
+    if copied != retained_len {
+        return Err(IoError::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("copied {copied} of {retained_len} WAL bytes during compaction"),
+        ));
+    }
+    tmp.flush().await?;
+    tmp.sync_all().await?;
+    drop(tmp);
+
+    // Resetting the checkpoint before replacing the WAL makes every crash
+    // point at-least-once safe: a crash before rename replays the old WAL,
+    // while a crash after rename replays only the retained suffix.
+    write_checkpoint(ckpt_path, 0)?;
+    tokio::fs::rename(&tmp_path, wal_path).await?;
+    if let Some(parent) = wal_path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    *file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(wal_path)
+        .await?;
+    *good_len = retained_len;
     Ok(())
 }
 
@@ -557,19 +664,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_checkpoint_retains_appends_after_snapshot() {
+        let h = harness("compact_retains_suffix").await;
+        push(
+            &h,
+            make_push_req(&[("{app=\"flushed\"}", vec![("old", 100)])]),
+        )
+        .await;
+        let checkpoint = h.journal.checkpoint().await.unwrap();
+        h.memtable.commit_flush();
+
+        push(
+            &h,
+            make_push_req(&[("{app=\"inflight\"}", vec![("new", 200)])]),
+        )
+        .await;
+        let before = std::fs::metadata(h.journal.wal_path()).unwrap().len();
+        h.journal
+            .compact_checkpoint(checkpoint.offset)
+            .await
+            .unwrap();
+
+        assert_eq!(read_checkpoint(h.journal.ckpt_path()).unwrap(), 0);
+        let after = std::fs::metadata(h.journal.wal_path()).unwrap().len();
+        assert!(after < before);
+        let restored = MemTable::new();
+        replay(h.journal.wal_path(), h.journal.ckpt_path(), &restored).unwrap();
+        let results = restored.query(&[], &[], i64::MIN, i64::MAX, 10, true);
+        let lines: Vec<_> = results
+            .iter()
+            .flat_map(|stream| stream.entries.iter().map(|entry| entry.line.as_str()))
+            .collect();
+        assert_eq!(lines, vec!["new"]);
+    }
+
+    #[tokio::test]
     async fn health_turns_false_when_writer_stops() {
         let h = harness("writer_health").await;
         let health = h.journal.healthy.clone();
 
         drop(h.journal);
-        for _ in 0..100 {
-            if !health.load(Ordering::Acquire) {
-                return;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while health.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
-
-        panic!("journal health did not reflect writer shutdown");
+        })
+        .await
+        .expect("journal health did not reflect writer shutdown");
     }
 
     #[tokio::test]
