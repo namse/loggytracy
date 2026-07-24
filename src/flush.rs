@@ -10,11 +10,17 @@ use crate::memtable::MemTable;
 use crate::object_storage::RemoteCache;
 use crate::part::{self};
 use crate::part_registry::PartRegistry;
+use crate::trace::TraceMemTable;
+use crate::trace_part;
+use crate::trace_registry::TraceRegistry;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn flush_loop(
     memtable: Arc<MemTable>,
+    trace_memtable: Arc<TraceMemTable>,
     journal: Arc<Journal>,
     registry: Arc<PartRegistry>,
+    trace_registry: Arc<TraceRegistry>,
     remote_cache: Option<Arc<RemoteCache>>,
     config: Arc<Config>,
     healthy: Arc<AtomicBool>,
@@ -53,18 +59,22 @@ pub async fn flush_loop(
                 }
             }
         }
-        if memtable.is_empty() {
+        if memtable.is_empty() && trace_memtable.is_empty() {
             continue;
         }
-        let size = memtable.approximate_size();
+        let size = memtable
+            .approximate_size()
+            .saturating_add(trace_memtable.approximate_size());
         let elapsed = last_flush.elapsed();
         if (size as u64) < config.flush_max_bytes && elapsed < config.flush_max_interval {
             continue;
         }
         match flush_once(
             &memtable,
+            &trace_memtable,
             &journal,
             &registry,
+            &trace_registry,
             remote_cache.as_deref(),
             &config,
             &mut pending_checkpoint,
@@ -105,17 +115,21 @@ async fn retry_pending_checkpoint(
     Ok(offset)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_once(
     memtable: &MemTable,
+    trace_memtable: &TraceMemTable,
     journal: &Journal,
     registry: &PartRegistry,
+    trace_registry: &TraceRegistry,
     remote_cache: Option<&RemoteCache>,
     config: &Config,
     pending_checkpoint: &mut Option<u64>,
 ) -> Result<(), String> {
     let ckpt = journal.checkpoint().await.map_err(|e| e.to_string())?;
-    if ckpt.snapshot.is_empty() {
+    if ckpt.snapshot.is_empty() && ckpt.trace_snapshot.is_empty() {
         memtable.commit_flush();
+        trace_memtable.commit_flush();
         if let Err(error) = advance_checkpoint(journal, ckpt.offset, remote_cache.is_some()).await {
             // The part/WAL boundary is ambiguous for both local checkpoint
             // writes and remote WAL compaction. Retain the offset so a
@@ -126,7 +140,9 @@ async fn flush_once(
         return Ok(());
     }
     let rows = part::rows_from_snapshot(&ckpt.snapshot);
-    let total_rows = rows.len();
+    let trace_spans = ckpt.trace_snapshot;
+    let trace_spans_for_flush = trace_spans.clone();
+    let total_rows = rows.len().saturating_add(trace_spans.len());
     // Prevent eviction from observing a freshly committed directory before
     // it has been published and installed in the registry.
     let cache_guard = match remote_cache {
@@ -136,38 +152,82 @@ async fn flush_once(
     let parts_root = config.data_dir.join("parts");
     if let Err(error) = std::fs::create_dir_all(&parts_root) {
         memtable.abort_flush(ckpt.snapshot);
+        trace_memtable.abort_flush(trace_spans);
         return Err(error.to_string());
     }
 
     let row_group_size = config.row_group_size;
     let result = match tokio::task::spawn_blocking({
         let parts_root = parts_root.clone();
-        move || part::flush_rows(rows, &parts_root, row_group_size)
+        let traces_root = config.data_dir.join("traces");
+        move || {
+            let log_parts = part::flush_rows(rows, &parts_root, row_group_size)?;
+            let trace_parts = match trace_part::flush_trace_spans(
+                trace_spans_for_flush,
+                &traces_root,
+                row_group_size,
+            ) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    let log_dirs: Vec<_> = log_parts.iter().map(|part| part.dir.clone()).collect();
+                    let cleanup = part::remove_part_dirs(&log_dirs);
+                    return Err(match cleanup {
+                        Ok(()) => std::io::Error::other(format!("trace flush failed: {error}")),
+                        Err(cleanup_error) => std::io::Error::other(format!(
+                            "trace flush failed: {error}; log-part rollback failed: {cleanup_error}"
+                        )),
+                    });
+                }
+            };
+            Ok::<_, std::io::Error>((log_parts, trace_parts))
+        }
     })
     .await
     {
         Ok(result) => result,
         Err(error) => {
             memtable.abort_flush(ckpt.snapshot);
+            trace_memtable.abort_flush(trace_spans);
             return Err(format!("flush task join failed: {}", error));
         }
     };
 
     match result {
-        Ok(new_parts) => {
+        Ok((new_parts, new_trace_parts)) => {
             let n = new_parts.len();
             let new_part_dirs: Vec<_> = new_parts.iter().map(|part| part.dir.clone()).collect();
+            let new_trace_part_dirs: Vec<_> = new_trace_parts
+                .iter()
+                .map(|part| part.dir.clone())
+                .collect();
             if let Some(cache) = remote_cache {
                 let epoch = cache.remote_operation_epoch();
                 if let Err(error) = cache.storage.publish(&new_parts, &[]).await {
                     cache.mark_remote_unhealthy();
-                    let cleanup_error = part::remove_part_dirs(&new_part_dirs).err();
+                    let mut cleanup_dirs = new_part_dirs.clone();
+                    cleanup_dirs.extend(new_trace_part_dirs.clone());
+                    let cleanup_error = part::remove_part_dirs(&cleanup_dirs).err();
                     memtable.abort_flush(ckpt.snapshot);
+                    trace_memtable.abort_flush(trace_spans);
                     return Err(match cleanup_error {
                         Some(cleanup_error) => format!(
                             "object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
                         ),
                         None => format!("object-store publish failed: {error}"),
+                    });
+                }
+                if let Err(error) = cache.storage.publish_trace_parts(&new_trace_parts).await {
+                    cache.mark_remote_unhealthy();
+                    let mut cleanup_dirs = new_part_dirs.clone();
+                    cleanup_dirs.extend(new_trace_part_dirs.clone());
+                    let cleanup_error = part::remove_part_dirs(&cleanup_dirs).err();
+                    memtable.abort_flush(ckpt.snapshot);
+                    trace_memtable.abort_flush(trace_spans);
+                    return Err(match cleanup_error {
+                        Some(cleanup_error) => format!(
+                            "trace object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
+                        ),
+                        None => format!("trace object-store publish failed: {error}"),
                     });
                 }
                 cache.mark_remote_healthy_since(epoch);
@@ -179,17 +239,41 @@ async fn flush_once(
             // the flushing snapshot and its newly registered part together.
             drop(cache_guard);
             let _visibility_guard = registry.operation_lock().write_owned().await;
-            if let Err(error) = registry.register(new_parts) {
-                // Once a remote manifest has made these parts visible it is
-                // unsafe to delete them. Recovery will reopen them from the
-                // manifest; reinserting the snapshot preserves at-least-once
-                // semantics until then.
+            let registered_log_ids = match registry.register(new_parts) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    // Once a remote manifest has made these parts visible it is
+                    // unsafe to delete them. Recovery will reopen them from the
+                    // manifest; reinserting the snapshot preserves at-least-once
+                    // semantics until then.
+                    let cleanup_error = if remote_cache.is_none() {
+                        let mut cleanup_dirs = new_part_dirs.clone();
+                        cleanup_dirs.extend(new_trace_part_dirs.clone());
+                        part::remove_part_dirs(&cleanup_dirs).err()
+                    } else {
+                        None
+                    };
+                    memtable.abort_flush(ckpt.snapshot);
+                    trace_memtable.abort_flush(trace_spans);
+                    return Err(match cleanup_error {
+                        Some(cleanup_error) => {
+                            format!("{error}; failed to clean rejected parts: {cleanup_error}")
+                        }
+                        None => error,
+                    });
+                }
+            };
+            if let Err(error) = trace_registry.register(new_trace_parts) {
+                registry.unregister(&registered_log_ids);
                 let cleanup_error = if remote_cache.is_none() {
-                    part::remove_part_dirs(&new_part_dirs).err()
+                    let mut cleanup_dirs = new_part_dirs.clone();
+                    cleanup_dirs.extend(new_trace_part_dirs.clone());
+                    part::remove_part_dirs(&cleanup_dirs).err()
                 } else {
                     None
                 };
                 memtable.abort_flush(ckpt.snapshot);
+                trace_memtable.abort_flush(trace_spans);
                 return Err(match cleanup_error {
                     Some(cleanup_error) => {
                         format!("{error}; failed to clean rejected parts: {cleanup_error}")
@@ -208,12 +292,14 @@ async fn flush_once(
                 // Commit the in-memory side and retain this offset for the
                 // flush loop to retry before it attempts any later flush.
                 memtable.commit_flush();
+                trace_memtable.commit_flush();
                 *pending_checkpoint = Some(ckpt.offset);
                 return Err(format!(
                     "parts were committed but journal checkpoint could not be advanced: {error}"
                 ));
             }
             memtable.commit_flush();
+            trace_memtable.commit_flush();
             tracing::info!(
                 offset = ckpt.offset,
                 rows = total_rows,
@@ -225,6 +311,7 @@ async fn flush_once(
         Err(e) => {
             tracing::error!(error = %e, "flush_rows failed, reinserting into memtable");
             memtable.abort_flush(ckpt.snapshot);
+            trace_memtable.abort_flush(trace_spans);
             Err(e.to_string())
         }
     }
@@ -282,6 +369,8 @@ mod tests {
         );
         let journal = Journal::spawn(&config, memtable.clone()).unwrap();
         let registry = PartRegistry::new();
+        let trace_memtable = journal.trace_memtable();
+        let trace_registry = TraceRegistry::new(registry.operation_lock());
         let mut pending_checkpoint = None;
 
         // Force write_checkpoint's temporary-file creation to fail.
@@ -289,8 +378,10 @@ mod tests {
 
         let first = flush_once(
             &memtable,
+            &trace_memtable,
             &journal,
             &registry,
+            &trace_registry,
             None,
             &config,
             &mut pending_checkpoint,

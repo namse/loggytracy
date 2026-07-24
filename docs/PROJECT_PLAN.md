@@ -10,7 +10,7 @@ new Codex context can continue without relying on chat history.
 | M1 | Complete locally (`2b51b29`) | Parquet parts, bloom/stream indexes, restart recovery, unified query, and merge |
 | M2 | Complete | Object-store publication, conditional manifest updates, local cache eviction, and query restoration |
 | M3 | Complete (review remediated) | JSON/logfmt parsing, metric queries, field-filter push-down, and bounded query execution sufficient for real dashboards |
-| M4 | Pending | OTLP trace ingest, trace-ID lookup, and Tempo-compatible APIs |
+| M4 | In progress | OTLP trace ingest, trace-ID lookup, and Tempo-compatible APIs |
 | M5 | Pending | Compaction tuning, retention, resource limits, and load validation against explicit targets |
 | M6 | Pending | Graceful shutdown for machine replacement (SIGTERM handling, forced flush-to-S3, drain-status readiness) and a machine-replacement rehearsal |
 
@@ -98,6 +98,24 @@ in metric grouping. Query limits include a 5,000,000-row scan budget, bounded
 metric output, eight concurrent log scans, four concurrent metric evaluations,
 and a 30-second execution/restore timeout. Object-store and journal failures
 are reflected in readiness and retried without requiring new ingest.
+
+## M4 acceptance checklist
+
+The detailed English implementation plan and design decisions are recorded in
+[`docs/M4_IMPLEMENTATION_PLAN.md`](M4_IMPLEMENTATION_PLAN.md).
+
+- [x] OTLP gRPC accepts valid ResourceSpans/ScopeSpans and preserves span data.
+- [x] Invalid IDs, timestamps, and oversized requests are rejected without partial ingestion.
+- [x] OTLP acknowledgement follows durable WAL append.
+- [x] Legacy Loki WAL records replay after the WAL format extension.
+- [x] Trace data survives flush and process restart.
+- [x] Trace-ID Bloom pruning never produces false negatives.
+- [x] Lookup combines memtable and immutable parts across partitions.
+- [x] Evicted trace bodies restore from the object store on demand.
+- [x] Tempo trace-by-ID and bounded search APIs match the implemented compatibility shape.
+- [x] Existing Loki ingest, LogQL, object-store, and readiness tests remain green.
+- [ ] A fresh-context review reports no blocking findings.
+- [ ] The complete validation set passes after the final review fix.
 
 ## Completion protocol
 

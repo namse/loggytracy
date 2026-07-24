@@ -101,7 +101,7 @@ pub struct QueryParams {
     direction: Option<String>,
 }
 
-fn parse_time_ns(s: &str) -> Result<i64, String> {
+pub(crate) fn parse_time_ns(s: &str) -> Result<i64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty timestamp".to_string());
@@ -1314,6 +1314,9 @@ pub async fn ready(
     if !state.merge_healthy.load(Ordering::Acquire) {
         unavailable.push("merge worker");
     }
+    if !state.otlp_healthy.load(Ordering::Acquire) {
+        unavailable.push("OTLP gRPC server");
+    }
     if let Some(cache) = &state.remote_cache {
         if !cache.is_remote_healthy() {
             unavailable.push("object store");
@@ -1426,12 +1429,17 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             ..Config::default()
         };
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
         Arc::new(AppState {
             journal: Arc::new(Journal::spawn(&config, memtable.clone()).unwrap()),
             memtable,
             parts,
+            trace_parts,
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             remote_cache,
         })
     }
@@ -1689,12 +1697,17 @@ mod tests {
             )
             .unwrap();
         let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
         let state = AppState {
             memtable,
             journal,
             parts,
+            trace_parts,
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             remote_cache: None,
         };
 
@@ -1713,8 +1726,10 @@ mod tests {
             journal: Arc::new(Journal::spawn(&config, memtable.clone()).unwrap()),
             memtable,
             parts: Arc::new(PartRegistry::new()),
+            trace_parts: Arc::new(crate::trace_registry::TraceRegistry::standalone()),
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             remote_cache: None,
         });
 
@@ -1722,10 +1737,12 @@ mod tests {
 
         state.flush_healthy.store(false, Ordering::Release);
         state.merge_healthy.store(false, Ordering::Release);
+        state.otlp_healthy.store(false, Ordering::Release);
         let error = ready(State(state)).await.unwrap_err();
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.contains("flush worker"));
         assert!(error.1.contains("merge worker"));
+        assert!(error.1.contains("OTLP gRPC server"));
     }
 
     #[tokio::test]
@@ -1746,8 +1763,10 @@ mod tests {
             journal: Arc::new(Journal::spawn(&config, memtable.clone()).unwrap()),
             memtable,
             parts: Arc::new(PartRegistry::new()),
+            trace_parts: Arc::new(crate::trace_registry::TraceRegistry::standalone()),
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             remote_cache: Some(remote.clone()),
         });
 
@@ -1761,8 +1780,10 @@ mod tests {
             journal: Arc::new(Journal::spawn(&config, Arc::new(MemTable::new())).unwrap()),
             memtable: Arc::new(MemTable::new()),
             parts: Arc::new(PartRegistry::new()),
+            trace_parts: Arc::new(crate::trace_registry::TraceRegistry::standalone()),
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             remote_cache: Some(remote),
         });
         let error = ready(State(state)).await.unwrap_err();
@@ -1817,12 +1838,17 @@ mod tests {
         assert!(parts.has_missing_cache_files());
 
         let memtable = Arc::new(MemTable::new());
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
         let state = Arc::new(AppState {
             journal: Arc::new(Journal::spawn(&config, memtable.clone()).unwrap()),
             memtable,
             parts,
+            trace_parts,
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             remote_cache: Some(Arc::new(crate::object_storage::RemoteCache::new(
                 storage, parts_root,
             ))),
@@ -1887,12 +1913,17 @@ mod tests {
         storage.evict_cache(&parts_root, 0, &eligible).unwrap();
 
         let memtable = Arc::new(MemTable::new());
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
         let state = AppState {
             journal: Arc::new(Journal::spawn(&config, memtable.clone()).unwrap()),
             memtable,
             parts: parts.clone(),
+            trace_parts,
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             remote_cache: Some(Arc::new(crate::object_storage::RemoteCache::new(
                 storage,
                 parts_root.clone(),

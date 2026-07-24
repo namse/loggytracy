@@ -8,12 +8,19 @@ use object_store::{ObjectStore, PutMode, PutOptions, UpdateVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::part::{self, BLOOM_FILE, DATA_FILE, META_FILE, Part, STREAM_INDEX_FILE};
+use crate::trace_part::{
+    TRACE_BLOOM_FILE, TRACE_DATA_FILE, TRACE_META_FILE, TracePart, TracePartReader,
+    discover_trace_parts,
+};
 
 const MANIFEST_FILE: &str = "manifest.json";
 const UPLOAD_MARKER_FILE: &str = ".object-store-uploading";
 const PART_FILES: [&str; 4] = [DATA_FILE, BLOOM_FILE, STREAM_INDEX_FILE, META_FILE];
 const CATALOG_FILES: [&str; 3] = [BLOOM_FILE, STREAM_INDEX_FILE, META_FILE];
 const MANIFEST_FORMAT_VERSION: u32 = 1;
+const TRACE_MANIFEST_FILE: &str = "trace-manifest.json";
+const TRACE_PART_FILES: [&str; 3] = [TRACE_DATA_FILE, TRACE_BLOOM_FILE, TRACE_META_FILE];
+const TRACE_CATALOG_FILES: [&str; 2] = [TRACE_BLOOM_FILE, TRACE_META_FILE];
 const MAX_CAS_ATTEMPTS: usize = 16;
 
 fn normalized_object_store_options<I>(variables: I) -> Vec<(String, String)>
@@ -60,6 +67,29 @@ pub struct Manifest {
     pub format_version: u32,
     pub generation: u64,
     pub parts: Vec<ManifestPart>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TraceManifestPart {
+    pub id: String,
+    pub partition: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TraceManifest {
+    pub format_version: u32,
+    pub generation: u64,
+    pub parts: Vec<TraceManifestPart>,
+}
+
+impl Default for TraceManifest {
+    fn default() -> Self {
+        Self {
+            format_version: MANIFEST_FORMAT_VERSION,
+            generation: 0,
+            parts: Vec::new(),
+        }
+    }
 }
 
 impl Default for Manifest {
@@ -328,6 +358,13 @@ impl RemoteCache {
         self.cache_healthy.store(false, Ordering::Release);
     }
 
+    pub fn trace_parts_root(&self) -> PathBuf {
+        self.parts_root
+            .parent()
+            .map(|parent| parent.join("traces"))
+            .unwrap_or_else(|| PathBuf::from("traces"))
+    }
+
     #[cfg(test)]
     pub fn mark_unhealthy(&self) {
         self.mark_remote_unhealthy();
@@ -372,8 +409,19 @@ impl ObjectStorage {
         self.path(MANIFEST_FILE)
     }
 
+    fn trace_manifest_path(&self) -> ObjectPath {
+        self.path(TRACE_MANIFEST_FILE)
+    }
+
     fn part_path(&self, part: &ManifestPart, file: &str) -> ObjectPath {
         self.path(&format!("parts/{}/{}/{}", part.partition, part.id, file))
+    }
+
+    fn trace_part_path(&self, part: &TraceManifestPart, file: &str) -> ObjectPath {
+        self.path(&format!(
+            "trace_parts/{}/{}/{}",
+            part.partition, part.id, file
+        ))
     }
 
     async fn load_manifest_versioned(&self) -> Result<LoadedManifest, String> {
@@ -409,6 +457,344 @@ impl ObjectStorage {
 
     pub async fn load_manifest(&self) -> Result<Manifest, String> {
         Ok(self.load_manifest_versioned().await?.manifest)
+    }
+
+    async fn load_trace_manifest_versioned(
+        &self,
+    ) -> Result<(TraceManifest, Option<UpdateVersion>), String> {
+        match self.store.get(&self.trace_manifest_path()).await {
+            Ok(result) => {
+                let version = Some(UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                });
+                let bytes = result
+                    .bytes()
+                    .await
+                    .map_err(|error| format!("failed to read trace manifest body: {error}"))?;
+                let manifest: TraceManifest = serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("invalid trace object-store manifest: {error}"))?;
+                if manifest.format_version != MANIFEST_FORMAT_VERSION {
+                    return Err(format!(
+                        "unsupported trace manifest format version {}",
+                        manifest.format_version
+                    ));
+                }
+                validate_trace_manifest(&manifest)?;
+                Ok((manifest, version))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok((TraceManifest::default(), None)),
+            Err(error) => Err(format!(
+                "failed to load trace object-store manifest: {error}"
+            )),
+        }
+    }
+
+    pub async fn load_trace_manifest(&self) -> Result<TraceManifest, String> {
+        Ok(self.load_trace_manifest_versioned().await?.0)
+    }
+
+    pub async fn publish_trace_parts(&self, added: &[TracePart]) -> Result<TraceManifest, String> {
+        for part in added {
+            let id = part.meta.id.clone();
+            TracePartReader::open(part.clone())
+                .map_err(|error| format!("refusing to publish invalid trace part {id}: {error}"))?;
+        }
+        for part in added {
+            self.upload_trace_part(part).await?;
+        }
+
+        let _guard = self.manifest_update.lock().await;
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let (loaded, version) = self.load_trace_manifest_versioned().await?;
+            let mut next = loaded.clone();
+            for part in added {
+                let descriptor = TraceManifestPart {
+                    id: part.meta.id.clone(),
+                    partition: part.meta.partition.clone(),
+                };
+                if let Some(existing) = next.parts.iter().find(|item| item.id == descriptor.id) {
+                    if existing != &descriptor {
+                        return Err(format!(
+                            "trace manifest part ID collision: {}",
+                            descriptor.id
+                        ));
+                    }
+                } else {
+                    next.parts.push(descriptor);
+                }
+            }
+            next.parts.sort_by(|left, right| {
+                (&left.partition, &left.id).cmp(&(&right.partition, &right.id))
+            });
+            if next.parts == loaded.parts {
+                return Ok(loaded);
+            }
+            next.generation = loaded
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| "trace manifest generation overflow".to_string())?;
+            let body = serde_json::to_vec_pretty(&next)
+                .map_err(|error| format!("failed to encode trace manifest: {error}"))?;
+            let mode = match version {
+                Some(_) if self.local_manifest_overwrite => PutMode::Overwrite,
+                Some(version) => PutMode::Update(version),
+                None => PutMode::Create,
+            };
+            match self
+                .store
+                .put_opts(
+                    &self.trace_manifest_path(),
+                    body.into(),
+                    PutOptions {
+                        mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => return Ok(next),
+                Err(object_store::Error::Precondition { .. })
+                | Err(object_store::Error::AlreadyExists { .. }) => continue,
+                Err(error) => return Err(format!("failed to update trace manifest: {error}")),
+            }
+        }
+        Err("trace manifest compare-and-swap retry limit exceeded".to_string())
+    }
+
+    async fn upload_trace_part(&self, part: &TracePart) -> Result<(), String> {
+        let descriptor = TraceManifestPart {
+            id: part.meta.id.clone(),
+            partition: part.meta.partition.clone(),
+        };
+        for file in TRACE_PART_FILES {
+            let local_path = part.dir.join(file);
+            let metadata = std::fs::symlink_metadata(&local_path).map_err(|error| {
+                format!(
+                    "failed to inspect trace part file {}: {error}",
+                    local_path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "refusing unsafe trace part file {}",
+                    local_path.display()
+                ));
+            }
+            let bytes = tokio::fs::read(&local_path).await.map_err(|error| {
+                format!(
+                    "failed to read trace part file {}: {error}",
+                    local_path.display()
+                )
+            })?;
+            match self
+                .store
+                .put_opts(
+                    &self.trace_part_path(&descriptor, file),
+                    bytes.clone().into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    let remote = self
+                        .store
+                        .get(&self.trace_part_path(&descriptor, file))
+                        .await
+                        .map_err(|error| {
+                            format!("failed to verify existing trace object: {error}")
+                        })?
+                        .bytes()
+                        .await
+                        .map_err(|error| {
+                            format!("failed to read existing trace object: {error}")
+                        })?;
+                    if remote.as_ref() != bytes.as_slice() {
+                        return Err(format!(
+                            "immutable object collision for trace part {} file {file}",
+                            part.meta.id
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "failed to upload trace part {} file {file}: {error}",
+                        part.meta.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn restore_trace_catalog(&self, traces_root: &Path) -> Result<TraceManifest, String> {
+        let manifest = self.load_trace_manifest().await?;
+        std::fs::create_dir_all(traces_root).map_err(|error| error.to_string())?;
+        for descriptor in &manifest.parts {
+            let dir = trace_cache_part_dir(traces_root, descriptor)?;
+            if crate::trace_part::load_trace_part(&dir)
+                .ok()
+                .and_then(|part| TracePartReader::open_cached(part).ok())
+                .is_some()
+            {
+                continue;
+            }
+            self.download_trace_part(descriptor, traces_root, false)
+                .await?;
+        }
+        Ok(manifest)
+    }
+
+    /// Restores the remote trace catalog and publishes trace parts left by a
+    /// local-only run or by a crash before the trace manifest CAS. Trace parts
+    /// are immutable, so retrying an interrupted upload is safe: existing
+    /// remote objects are verified byte-for-byte by `upload_trace_part`.
+    pub async fn reconcile_trace_local_cache(
+        &self,
+        traces_root: &Path,
+    ) -> Result<TraceManifest, String> {
+        let manifest = self.restore_trace_catalog(traces_root).await?;
+        validate_cache_tree_no_symlinks(traces_root)?;
+        let active: HashMap<&str, &TraceManifestPart> = manifest
+            .parts
+            .iter()
+            .map(|part| (part.id.as_str(), part))
+            .collect();
+        let mut unpublished = Vec::new();
+        for part in discover_trace_parts(traces_root)? {
+            let descriptor = TraceManifestPart {
+                id: part.meta.id.clone(),
+                partition: part.meta.partition.clone(),
+            };
+            if let Some(existing) = active.get(descriptor.id.as_str()) {
+                if **existing != descriptor {
+                    return Err(format!(
+                        "local trace part {} conflicts with the remote manifest",
+                        descriptor.id
+                    ));
+                }
+                continue;
+            }
+            TracePartReader::open(part.clone()).map_err(|error| {
+                format!(
+                    "local trace part {} is not fully cached and is absent from the remote manifest: {error}",
+                    descriptor.id
+                )
+            })?;
+            unpublished.push(part);
+        }
+        if !unpublished.is_empty() {
+            self.publish_trace_parts(&unpublished).await?;
+        }
+        self.restore_trace_catalog(traces_root).await
+    }
+
+    pub async fn restore_trace_parts(
+        &self,
+        traces_root: &Path,
+        ids: &HashSet<String>,
+    ) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let manifest = self.load_trace_manifest().await?;
+        let mut restored = HashSet::new();
+        for descriptor in &manifest.parts {
+            if !ids.contains(&descriptor.id) {
+                continue;
+            }
+            let dir = trace_cache_part_dir(traces_root, descriptor)?;
+            if crate::trace_part::load_trace_part(&dir)
+                .ok()
+                .and_then(|part| TracePartReader::open(part).ok())
+                .is_none()
+            {
+                self.download_trace_part(descriptor, traces_root, true)
+                    .await?;
+            }
+            restored.insert(descriptor.id.clone());
+        }
+        let missing: Vec<_> = ids.difference(&restored).cloned().collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "trace parts are no longer present in the object-store manifest: {}",
+                missing.join(", ")
+            ))
+        }
+    }
+
+    async fn download_trace_part(
+        &self,
+        descriptor: &TraceManifestPart,
+        traces_root: &Path,
+        include_data: bool,
+    ) -> Result<(), String> {
+        let final_dir = trace_cache_part_dir(traces_root, descriptor)?;
+        let temp_dir = ensure_safe_directory_chain(
+            traces_root,
+            &[".tmp", "remote", &descriptor.partition, &descriptor.id],
+        )?;
+        std::fs::remove_dir_all(&temp_dir).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&temp_dir).map_err(|error| error.to_string())?;
+        let files: &[&str] = if include_data {
+            &TRACE_PART_FILES
+        } else {
+            &TRACE_CATALOG_FILES
+        };
+        for file in files {
+            let bytes = self
+                .store
+                .get(&self.trace_part_path(descriptor, file))
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to download trace part {} file {file}: {error}",
+                        descriptor.id
+                    )
+                })?
+                .bytes()
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to read trace part {} file {file}: {error}",
+                        descriptor.id
+                    )
+                })?;
+            tokio::fs::write(temp_dir.join(file), bytes)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to cache trace part {} file {file}: {error}",
+                        descriptor.id
+                    )
+                })?;
+        }
+        let downloaded = crate::trace_part::load_trace_part(&temp_dir)?;
+        if downloaded.meta.id != descriptor.id || downloaded.meta.partition != descriptor.partition
+        {
+            return Err(format!(
+                "downloaded trace part {} metadata mismatch",
+                descriptor.id
+            ));
+        }
+        TracePartReader::open_cached(downloaded)?;
+        if include_data {
+            TracePartReader::open(crate::trace_part::load_trace_part(&temp_dir)?)?;
+        }
+        if final_dir.exists() {
+            std::fs::remove_dir_all(&final_dir).map_err(|error| error.to_string())?;
+        }
+        if let Some(parent) = final_dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        std::fs::rename(&temp_dir, &final_dir).map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     /// Publishes local parts that are not yet visible in the manifest.
@@ -1017,6 +1403,106 @@ impl ObjectStorage {
         }
         Ok(total)
     }
+
+    pub fn evict_trace_cache(
+        &self,
+        traces_root: &Path,
+        max_bytes: u64,
+        eligible_part_ids: &HashSet<String>,
+    ) -> Result<u64, String> {
+        let canonical_root = match std::fs::symlink_metadata(traces_root) {
+            Ok(_) => validate_cache_root(traces_root)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut cached = Vec::new();
+        let mut total = 0u64;
+        for partition in std::fs::read_dir(traces_root).map_err(|error| error.to_string())? {
+            let partition = partition.map_err(|error| error.to_string())?;
+            if partition.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let metadata =
+                std::fs::symlink_metadata(partition.path()).map_err(|error| error.to_string())?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing symlinked trace cache partition {}",
+                    partition.path().display()
+                ));
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            ensure_existing_cache_dir(&canonical_root, &partition.path())?;
+            for entry in std::fs::read_dir(partition.path()).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let metadata =
+                    std::fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "refusing symlinked trace cache part {}",
+                        entry.path().display()
+                    ));
+                }
+                if !metadata.is_dir() {
+                    continue;
+                }
+                ensure_existing_cache_dir(&canonical_root, &entry.path())?;
+                validate_trace_cache_files(&entry.path())?;
+                let id = entry.file_name().to_string_lossy().into_owned();
+                if !eligible_part_ids.contains(&id) {
+                    continue;
+                }
+                let data_path = entry.path().join(TRACE_DATA_FILE);
+                let bytes = match std::fs::symlink_metadata(&data_path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "refusing symlinked trace data file {}",
+                            data_path.display()
+                        ));
+                    }
+                    Ok(metadata) if metadata.is_file() => metadata.len(),
+                    Ok(_) => {
+                        return Err(format!(
+                            "trace cache data path is not a file: {}",
+                            data_path.display()
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(error) => return Err(error.to_string()),
+                };
+                total = total.saturating_add(bytes);
+                if bytes > 0 {
+                    cached.push((
+                        metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                        bytes,
+                        data_path,
+                    ));
+                }
+            }
+        }
+        cached.sort_by_key(|(accessed, _, _)| *accessed);
+        for (_, bytes, data_path) in cached {
+            if total <= max_bytes {
+                break;
+            }
+            match std::fs::remove_file(&data_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "failed to evict trace data file {}: {error}",
+                        data_path.display()
+                    ));
+                }
+            }
+            if let Some(parent) = data_path.parent() {
+                part::fsync_dir(parent).map_err(|error| error.to_string())?;
+            }
+            total = total.saturating_sub(bytes);
+        }
+        Ok(total)
+    }
 }
 
 fn write_upload_marker(part: &Part) -> Result<(), String> {
@@ -1257,6 +1743,85 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
             || !ids.insert(part.id.as_str())
         {
             return Err("manifest contains an invalid or duplicate part".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_trace_manifest(manifest: &TraceManifest) -> Result<(), String> {
+    let mut ids = HashSet::new();
+    for part in &manifest.parts {
+        if !is_safe_path_component(&part.id)
+            || !is_safe_path_component(&part.partition)
+            || !ids.insert(part.id.as_str())
+        {
+            return Err("trace manifest contains an invalid or duplicate part".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn trace_cache_part_dir(
+    traces_root: &Path,
+    descriptor: &TraceManifestPart,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(traces_root).map_err(|error| error.to_string())?;
+    let canonical_root = validate_cache_root(traces_root)?;
+    let mut current = traces_root.to_path_buf();
+    for component in [&descriptor.partition, &descriptor.id] {
+        if !is_safe_path_component(component) {
+            return Err(format!("unsafe trace cache path component {component:?}"));
+        }
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked trace cache directory {}",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "trace cache path is not a directory: {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|error| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        let canonical = std::fs::canonicalize(&current).map_err(|error| error.to_string())?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(format!(
+                "trace cache directory escapes root: {}",
+                current.display()
+            ));
+        }
+    }
+    validate_trace_cache_files(&current)?;
+    Ok(current)
+}
+
+fn validate_trace_cache_files(dir: &Path) -> Result<(), String> {
+    for file in [
+        TRACE_DATA_FILE,
+        TRACE_BLOOM_FILE,
+        TRACE_META_FILE,
+        ".access",
+    ] {
+        let path = dir.join(file);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked trace cache file {}",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
         }
     }
     Ok(())
@@ -1968,6 +2533,140 @@ mod tests {
             .unwrap_err();
         assert!(reconcile_error.contains("unsafe cache root"));
         assert!(outside_data.exists());
+    }
+
+    #[tokio::test]
+    async fn trace_parts_publish_restore_and_eviction_round_trip() {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("trace-round-trip").join("traces");
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![1; 16],
+                        span_id: vec![2; 8],
+                        start_time_unix_nano: 1_700_000_000_000_000_000,
+                        end_time_unix_nano: 1_700_000_000_000_000_100,
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let spans = crate::trace::normalize_request(request).unwrap();
+        let parts = crate::trace_part::flush_trace_spans(spans, &root, 100).unwrap();
+        let manifest = storage.publish_trace_parts(&parts).await.unwrap();
+        assert_eq!(manifest.parts.len(), 1);
+
+        let id = manifest.parts[0].id.clone();
+        std::fs::remove_file(parts[0].data_path()).unwrap();
+        storage.restore_trace_catalog(&root).await.unwrap();
+        assert!(
+            storage
+                .restore_trace_parts(&root, &std::iter::once(id.clone()).collect())
+                .await
+                .is_ok()
+        );
+        assert!(parts[0].data_path().exists());
+
+        storage
+            .evict_trace_cache(&root, 0, &std::iter::once(id.clone()).collect())
+            .unwrap();
+        assert!(!parts[0].data_path().exists());
+        storage
+            .restore_trace_parts(&root, &std::iter::once(id).collect())
+            .await
+            .unwrap();
+        let reader = crate::trace_part::TracePartReader::open(
+            crate::trace_part::load_trace_part(&parts[0].dir).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reader.query_trace_id(&"01".repeat(16)).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn trace_reconciliation_publishes_local_only_parts() {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("trace-local-migration").join("traces");
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![7; 16],
+                        span_id: vec![8; 8],
+                        start_time_unix_nano: 1_700_000_000_000_000_000,
+                        end_time_unix_nano: 1_700_000_000_000_000_100,
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let spans = crate::trace::normalize_request(request).unwrap();
+        let parts = crate::trace_part::flush_trace_spans(spans, &root, 100).unwrap();
+
+        let manifest = storage.reconcile_trace_local_cache(&root).await.unwrap();
+
+        assert_eq!(manifest.parts.len(), 1);
+        assert_eq!(manifest.parts[0].id, parts[0].meta.id);
+        assert_eq!(storage.load_trace_manifest().await.unwrap().parts.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trace_cache_rejects_symlinked_immutable_files() {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+        use std::os::unix::fs::symlink;
+
+        let storage = ObjectStorage::in_memory();
+        let source = temp_dir("trace-symlink-source").join("traces");
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![9; 16],
+                        span_id: vec![1; 8],
+                        start_time_unix_nano: 1,
+                        end_time_unix_nano: 2,
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let spans = crate::trace::normalize_request(request).unwrap();
+        let parts = crate::trace_part::flush_trace_spans(spans, &source, 100).unwrap();
+        let manifest = storage.publish_trace_parts(&parts).await.unwrap();
+        let root = temp_dir("trace-symlink-cache").join("traces");
+        let descriptor = &manifest.parts[0];
+        let cache_part = root.join(&descriptor.partition).join(&descriptor.id);
+        std::fs::create_dir_all(&cache_part).unwrap();
+        let outside = temp_dir("trace-symlink-target").join(TRACE_DATA_FILE);
+        std::fs::write(&outside, b"must survive").unwrap();
+        symlink(&outside, cache_part.join(TRACE_DATA_FILE)).unwrap();
+
+        let restore_error = storage.restore_trace_catalog(&root).await.unwrap_err();
+        assert!(restore_error.contains("symlinked trace cache file"));
+        let eligible = std::iter::once(descriptor.id.clone()).collect();
+        let eviction_error = storage.evict_trace_cache(&root, 0, &eligible).unwrap_err();
+        assert!(eviction_error.contains("symlinked trace cache file"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"must survive");
     }
 
     #[test]

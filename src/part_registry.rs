@@ -155,6 +155,13 @@ impl PartRegistry {
         Ok(ids)
     }
 
+    pub fn unregister(&self, ids: &[String]) {
+        let mut inner = self.inner.write().unwrap();
+        for id in ids {
+            inner.remove(id);
+        }
+    }
+
     pub fn replace(&self, old_ids: &[String], new_parts: Vec<Part>) -> Result<Vec<String>, String> {
         if new_parts.is_empty() {
             return Err("cannot replace parts with an empty part set".to_string());

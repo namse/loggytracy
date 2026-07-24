@@ -1,0 +1,670 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
+use serde::{Deserialize, Serialize};
+
+use crate::bloom::BloomFilter;
+use crate::part::partition_of;
+use crate::trace::TraceSpan;
+
+pub const TRACE_DATA_FILE: &str = "data.parquet";
+pub const TRACE_BLOOM_FILE: &str = "trace.bloom";
+pub const TRACE_META_FILE: &str = "meta.json";
+
+const TRACE_BLOOM_MAGIC: &[u8; 4] = b"TBF1";
+
+#[derive(Clone, Debug)]
+pub struct TracePartMeta {
+    pub id: String,
+    pub partition: String,
+    pub min_ts_ns: i64,
+    pub max_ts_ns: i64,
+    pub row_count: u64,
+    pub row_group_count: u32,
+    pub row_group_min_ts: Vec<i64>,
+    pub row_group_max_ts: Vec<i64>,
+    #[allow(dead_code)]
+    integrity: TracePartIntegrity,
+}
+
+#[derive(Clone, Debug)]
+pub struct TracePart {
+    pub dir: PathBuf,
+    pub meta: TracePartMeta,
+}
+
+impl TracePart {
+    pub fn data_path(&self) -> PathBuf {
+        self.dir.join(TRACE_DATA_FILE)
+    }
+
+    pub fn bloom_path(&self) -> PathBuf {
+        self.dir.join(TRACE_BLOOM_FILE)
+    }
+
+    pub fn meta_path(&self) -> PathBuf {
+        self.dir.join(TRACE_META_FILE)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TraceSpanFile {
+    trace_id: String,
+    span_id: String,
+    start_time_ns: i64,
+    end_time_ns: i64,
+    span: opentelemetry_proto::tonic::trace::v1::Span,
+    resource: Option<opentelemetry_proto::tonic::resource::v1::Resource>,
+    resource_schema_url: String,
+    scope: Option<opentelemetry_proto::tonic::common::v1::InstrumentationScope>,
+    scope_schema_url: String,
+}
+
+impl From<&TraceSpan> for TraceSpanFile {
+    fn from(span: &TraceSpan) -> Self {
+        Self {
+            trace_id: span.trace_id.clone(),
+            span_id: span.span_id.clone(),
+            start_time_ns: span.start_time_ns,
+            end_time_ns: span.end_time_ns,
+            span: span.span.clone(),
+            resource: span.resource.clone(),
+            resource_schema_url: span.resource_schema_url.clone(),
+            scope: span.scope.clone(),
+            scope_schema_url: span.scope_schema_url.clone(),
+        }
+    }
+}
+
+impl From<TraceSpanFile> for TraceSpan {
+    fn from(span: TraceSpanFile) -> Self {
+        Self {
+            trace_id: span.trace_id,
+            span_id: span.span_id,
+            start_time_ns: span.start_time_ns,
+            end_time_ns: span.end_time_ns,
+            span: span.span,
+            resource: span.resource,
+            resource_schema_url: span.resource_schema_url,
+            scope: span.scope,
+            scope_schema_url: span.scope_schema_url,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TracePartIntegrity {
+    data_crc32: u32,
+    bloom_crc32: u32,
+    metadata_crc32: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TraceMetaFile {
+    id: String,
+    partition: String,
+    min_ts_ns: i64,
+    max_ts_ns: i64,
+    row_count: u64,
+    row_group_count: u32,
+    row_group_min_ts: Vec<i64>,
+    row_group_max_ts: Vec<i64>,
+    integrity: TracePartIntegrity,
+}
+
+pub fn flush_trace_spans(
+    spans: Vec<TraceSpan>,
+    traces_root: &Path,
+    row_group_size: usize,
+) -> io::Result<Vec<TracePart>> {
+    if spans.is_empty() {
+        return Ok(Vec::new());
+    }
+    if row_group_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "trace row group size must be positive",
+        ));
+    }
+    fs::create_dir_all(traces_root.join(".tmp"))?;
+    let mut by_partition: BTreeMap<String, Vec<TraceSpan>> = BTreeMap::new();
+    for span in spans {
+        by_partition
+            .entry(partition_of(span.start_time_ns))
+            .or_default()
+            .push(span);
+    }
+
+    let mut parts = Vec::new();
+    let mut committed_dirs = Vec::new();
+    for (partition, mut partition_spans) in by_partition {
+        partition_spans.sort_by(|left, right| {
+            left.trace_id
+                .cmp(&right.trace_id)
+                .then_with(|| left.start_time_ns.cmp(&right.start_time_ns))
+                .then_with(|| left.span_id.cmp(&right.span_id))
+        });
+        let id = format!("{}-{}", partition.replace('-', ""), uuid::Uuid::new_v4());
+        let tmp_dir = traces_root.join(".tmp").join(&id);
+        let final_dir = traces_root.join(&partition).join(&id);
+        let result = (|| -> io::Result<TracePart> {
+            if tmp_dir.exists() {
+                fs::remove_dir_all(&tmp_dir)?;
+            }
+            fs::create_dir_all(&tmp_dir)?;
+            write_trace_part_files(&tmp_dir, &id, &partition, &partition_spans, row_group_size)?;
+            if let Some(parent) = final_dir.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&tmp_dir, &final_dir)?;
+            committed_dirs.push(final_dir.clone());
+            sync_dir(final_dir.parent().unwrap_or(traces_root))?;
+            sync_dir(traces_root)?;
+            load_trace_part(&final_dir).map_err(io::Error::other)
+        })();
+
+        match result {
+            Ok(part) => parts.push(part),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&tmp_dir);
+                let cleanup = crate::part::remove_part_dirs(&committed_dirs);
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup_error) => io::Error::other(format!(
+                        "trace part flush failed: {error}; rollback failed: {cleanup_error}"
+                    )),
+                });
+            }
+        }
+    }
+    Ok(parts)
+}
+
+fn write_trace_part_files(
+    dir: &Path,
+    id: &str,
+    partition: &str,
+    spans: &[TraceSpan],
+    row_group_size: usize,
+) -> io::Result<()> {
+    write_trace_parquet(&dir.join(TRACE_DATA_FILE), spans, row_group_size)?;
+    write_trace_bloom(&dir.join(TRACE_BLOOM_FILE), spans, row_group_size)?;
+
+    let bounds = row_group_bounds(spans.len(), row_group_size);
+    let min_ts = spans.iter().map(|span| span.start_time_ns).min().unwrap();
+    let max_ts = spans.iter().map(|span| span.end_time_ns).max().unwrap();
+    let meta_without_crc = TraceMetaFile {
+        id: id.to_string(),
+        partition: partition.to_string(),
+        min_ts_ns: min_ts,
+        max_ts_ns: max_ts,
+        row_count: spans.len() as u64,
+        row_group_count: bounds.len() as u32,
+        row_group_min_ts: bounds
+            .iter()
+            .map(|(start, end)| {
+                spans[*start..*end]
+                    .iter()
+                    .map(|span| span.start_time_ns)
+                    .min()
+                    .unwrap()
+            })
+            .collect(),
+        row_group_max_ts: bounds
+            .iter()
+            .map(|(start, end)| {
+                spans[*start..*end]
+                    .iter()
+                    .map(|span| span.end_time_ns)
+                    .max()
+                    .unwrap()
+            })
+            .collect(),
+        integrity: TracePartIntegrity {
+            data_crc32: file_crc32(&dir.join(TRACE_DATA_FILE))?,
+            bloom_crc32: file_crc32(&dir.join(TRACE_BLOOM_FILE))?,
+            metadata_crc32: 0,
+        },
+    };
+    let mut meta = meta_without_crc;
+    meta.integrity.metadata_crc32 = metadata_crc32(&meta).map_err(io::Error::other)?;
+    let encoded = serde_json::to_vec_pretty(&meta).map_err(io::Error::other)?;
+    fs::write(dir.join(TRACE_META_FILE), encoded)?;
+    sync_file(&dir.join(TRACE_META_FILE))?;
+    Ok(())
+}
+
+fn write_trace_parquet(path: &Path, spans: &[TraceSpan], row_group_size: usize) -> io::Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("start_time_ns", DataType::Int64, false),
+        Field::new("end_time_ns", DataType::Int64, false),
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("span_id", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let starts: Vec<i64> = spans.iter().map(|span| span.start_time_ns).collect();
+    let ends: Vec<i64> = spans.iter().map(|span| span.end_time_ns).collect();
+    let trace_ids: Vec<&str> = spans.iter().map(|span| span.trace_id.as_str()).collect();
+    let span_ids: Vec<&str> = spans.iter().map(|span| span.span_id.as_str()).collect();
+    let payloads: Vec<String> = spans
+        .iter()
+        .map(|span| serde_json::to_string(&TraceSpanFile::from(span)).map_err(io::Error::other))
+        .collect::<io::Result<_>>()?;
+    let payload_refs: Vec<&str> = payloads.iter().map(String::as_str).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(starts)) as ArrayRef,
+            Arc::new(Int64Array::from(ends)) as ArrayRef,
+            Arc::new(StringArray::from(trace_ids)) as ArrayRef,
+            Arc::new(StringArray::from(span_ids)) as ArrayRef,
+            Arc::new(StringArray::from(payload_refs)) as ArrayRef,
+        ],
+    )
+    .map_err(io::Error::other)?;
+    let file = fs::File::create(path)?;
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(row_group_size))
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(file, schema, Some(properties)).map_err(io::Error::other)?;
+    writer.write(&batch).map_err(io::Error::other)?;
+    writer.close().map_err(io::Error::other)?;
+    sync_file(path)
+}
+
+fn write_trace_bloom(path: &Path, spans: &[TraceSpan], row_group_size: usize) -> io::Result<()> {
+    let bounds = row_group_bounds(spans.len(), row_group_size);
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(TRACE_BLOOM_MAGIC);
+    encoded.extend_from_slice(&(bounds.len() as u32).to_le_bytes());
+    for (start, end) in bounds {
+        let mut ids = std::collections::BTreeSet::new();
+        for span in &spans[start..end] {
+            ids.insert(span.trace_id.as_bytes());
+        }
+        let mut bloom = BloomFilter::with_capacity(ids.len().max(1), 0.01);
+        for id in ids {
+            bloom.insert(id);
+        }
+        let bytes = bloom.encode();
+        encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(&bytes);
+    }
+    fs::write(path, encoded)?;
+    sync_file(path)
+}
+
+fn row_group_bounds(row_count: usize, row_group_size: usize) -> Vec<(usize, usize)> {
+    (0..row_count)
+        .step_by(row_group_size)
+        .map(|start| (start, (start + row_group_size).min(row_count)))
+        .collect()
+}
+
+pub fn load_trace_part(dir: &Path) -> Result<TracePart, String> {
+    let dir_metadata = fs::symlink_metadata(dir).map_err(|error| error.to_string())?;
+    if dir_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlinked trace part directory {}",
+            dir.display()
+        ));
+    }
+    for file in [TRACE_META_FILE, TRACE_BLOOM_FILE, TRACE_DATA_FILE] {
+        let path = dir.join(file);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("refusing symlinked trace file {}", path.display()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let bytes = fs::read(dir.join(TRACE_META_FILE)).map_err(|error| error.to_string())?;
+    let meta: TraceMetaFile = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if metadata_crc32(&meta)? != meta.integrity.metadata_crc32 {
+        return Err(format!(
+            "trace metadata checksum mismatch in {}",
+            dir.display()
+        ));
+    }
+    if dir.join(TRACE_DATA_FILE).exists() {
+        validate_file_crc(
+            &dir.join(TRACE_DATA_FILE),
+            meta.integrity.data_crc32,
+            "trace parquet",
+        )?;
+    }
+    validate_file_crc(
+        &dir.join(TRACE_BLOOM_FILE),
+        meta.integrity.bloom_crc32,
+        "trace bloom",
+    )?;
+    if meta.row_group_count as usize != meta.row_group_min_ts.len()
+        || meta.row_group_count as usize != meta.row_group_max_ts.len()
+    {
+        return Err(format!(
+            "trace row-group metadata mismatch in {}",
+            dir.display()
+        ));
+    }
+    Ok(TracePart {
+        dir: dir.to_path_buf(),
+        meta: TracePartMeta {
+            id: meta.id,
+            partition: meta.partition,
+            min_ts_ns: meta.min_ts_ns,
+            max_ts_ns: meta.max_ts_ns,
+            row_count: meta.row_count,
+            row_group_count: meta.row_group_count,
+            row_group_min_ts: meta.row_group_min_ts,
+            row_group_max_ts: meta.row_group_max_ts,
+            integrity: meta.integrity,
+        },
+    })
+}
+
+pub fn discover_trace_parts(root: &Path) -> Result<Vec<TracePart>, String> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut parts = Vec::new();
+    for partition in fs::read_dir(root).map_err(|error| error.to_string())? {
+        let partition = partition.map_err(|error| error.to_string())?;
+        if !partition
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+            || partition.file_name() == ".tmp"
+        {
+            continue;
+        }
+        for part_dir in fs::read_dir(partition.path()).map_err(|error| error.to_string())? {
+            let part_dir = part_dir.map_err(|error| error.to_string())?;
+            if part_dir
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+            {
+                parts.push(load_trace_part(&part_dir.path())?);
+            }
+        }
+    }
+    Ok(parts)
+}
+
+pub struct TracePartReader {
+    part: TracePart,
+    blooms: Vec<BloomFilter>,
+}
+
+impl TracePartReader {
+    pub fn open(part: TracePart) -> Result<Self, String> {
+        Self::open_internal(part, true)
+    }
+
+    pub fn open_cached(part: TracePart) -> Result<Self, String> {
+        Self::open_internal(part, false)
+    }
+
+    fn open_internal(part: TracePart, require_data: bool) -> Result<Self, String> {
+        if require_data && !part.data_path().exists() {
+            return Err(format!(
+                "trace parquet is missing: {}",
+                part.data_path().display()
+            ));
+        }
+        let bytes = fs::read(part.bloom_path()).map_err(|error| error.to_string())?;
+        let blooms = decode_trace_blooms(&bytes, part.meta.row_group_count as usize)?;
+        Ok(Self { part, blooms })
+    }
+
+    pub fn part(&self) -> &TracePart {
+        &self.part
+    }
+
+    pub fn may_match_trace_id(&self, trace_id: &str) -> bool {
+        self.blooms
+            .iter()
+            .any(|bloom| bloom.contains(trace_id.as_bytes()))
+    }
+
+    pub fn query_trace_id(&self, trace_id: &str) -> Result<Vec<TraceSpan>, String> {
+        self.query_trace_id_limited(trace_id, usize::MAX, None)
+    }
+
+    pub fn query_trace_id_limited(
+        &self,
+        trace_id: &str,
+        limit: usize,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Vec<TraceSpan>, String> {
+        let selected: Vec<usize> = self
+            .blooms
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bloom)| bloom.contains(trace_id.as_bytes()).then_some(index))
+            .collect();
+        self.query_selected(selected, Some(trace_id), limit, cancellation)
+    }
+
+    pub fn query_all(&self) -> Result<Vec<TraceSpan>, String> {
+        self.query_all_limited(usize::MAX, None)
+    }
+
+    pub fn query_all_limited(
+        &self,
+        limit: usize,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Vec<TraceSpan>, String> {
+        self.query_selected((0..self.blooms.len()).collect(), None, limit, cancellation)
+    }
+
+    fn query_selected(
+        &self,
+        selected: Vec<usize>,
+        trace_id: Option<&str>,
+        limit: usize,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Vec<TraceSpan>, String> {
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let file = fs::File::open(self.part.data_path()).map_err(|error| error.to_string())?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|error| error.to_string())?
+            .with_batch_size(1024)
+            .with_row_groups(selected)
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mut spans: Vec<TraceSpan> = Vec::new();
+        for batch in reader {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err("trace query timed out".to_string());
+            }
+            let batch = batch.map_err(|error| error.to_string())?;
+            let trace_ids = batch.column(2).as_string::<i32>();
+            let payloads = batch.column(4).as_string::<i32>();
+            for index in 0..batch.num_rows() {
+                if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    return Err("trace query timed out".to_string());
+                }
+                if trace_id.is_some_and(|wanted| trace_ids.value(index) != wanted) {
+                    continue;
+                }
+                if spans.len() >= limit {
+                    return Err(format!("trace query exceeds the maximum of {limit} spans"));
+                }
+                let payload: TraceSpanFile =
+                    serde_json::from_str(payloads.value(index)).map_err(|error| {
+                        format!("invalid trace payload in {}: {error}", self.part.meta.id)
+                    })?;
+                spans.push(payload.into());
+            }
+        }
+        spans.sort_by(|left, right| {
+            left.start_time_ns
+                .cmp(&right.start_time_ns)
+                .then_with(|| left.span_id.cmp(&right.span_id))
+        });
+        Ok(spans)
+    }
+}
+
+fn decode_trace_blooms(bytes: &[u8], expected_count: usize) -> Result<Vec<BloomFilter>, String> {
+    if bytes.len() < 8 || &bytes[..4] != TRACE_BLOOM_MAGIC {
+        return Err("trace bloom magic or header mismatch".to_string());
+    }
+    let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if count != expected_count {
+        return Err(format!(
+            "trace bloom row-group count mismatch: {count} != {expected_count}"
+        ));
+    }
+    let mut offset: usize = 8;
+    let mut blooms = Vec::with_capacity(count);
+    for _ in 0..count {
+        let end = offset
+            .checked_add(4)
+            .ok_or_else(|| "trace bloom length overflow".to_string())?;
+        if end > bytes.len() {
+            return Err("trace bloom length is truncated".to_string());
+        }
+        let length = u32::from_le_bytes(bytes[offset..end].try_into().unwrap()) as usize;
+        offset = end;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| "trace bloom payload overflow".to_string())?;
+        if end > bytes.len() {
+            return Err("trace bloom payload is truncated".to_string());
+        }
+        blooms.push(BloomFilter::decode(&bytes[offset..end])?);
+        offset = end;
+    }
+    if offset != bytes.len() {
+        return Err("trace bloom has trailing bytes".to_string());
+    }
+    Ok(blooms)
+}
+
+fn metadata_crc32(meta: &TraceMetaFile) -> Result<u32, String> {
+    let mut canonical = meta.clone();
+    canonical.integrity.metadata_crc32 = 0;
+    let bytes = serde_json::to_vec(&canonical).map_err(|error| error.to_string())?;
+    Ok(crc32fast::hash(&bytes))
+}
+
+fn file_crc32(path: &Path) -> io::Result<u32> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize())
+}
+
+fn validate_file_crc(path: &Path, expected: u32, label: &str) -> Result<(), String> {
+    let actual = file_crc32(path).map_err(|error| format!("failed to read {label}: {error}"))?;
+    if actual != expected {
+        return Err(format!("{label} checksum mismatch: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn sync_file(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_dir(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::normalize_request;
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+    fn spans() -> Vec<TraceSpan> {
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![
+                        Span {
+                            trace_id: vec![1; 16],
+                            span_id: vec![2; 8],
+                            start_time_unix_nano: 100,
+                            end_time_unix_nano: 200,
+                            ..Default::default()
+                        },
+                        Span {
+                            trace_id: vec![3; 16],
+                            span_id: vec![4; 8],
+                            start_time_unix_nano: 300,
+                            end_time_unix_nano: 400,
+                            ..Default::default()
+                        },
+                    ],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        normalize_request(request).unwrap()
+    }
+
+    #[test]
+    fn trace_part_round_trip_and_bloom_pruning() {
+        let root =
+            std::env::temp_dir().join(format!("loggytracy-trace-part-{}", uuid::Uuid::new_v4()));
+        let parts = flush_trace_spans(spans(), &root, 1).unwrap();
+        assert_eq!(parts.len(), 1);
+        let reader = TracePartReader::open(parts.into_iter().next().unwrap()).unwrap();
+        assert!(reader.may_match_trace_id(&"01".repeat(16)));
+        let negative = ["09", "0a", "0b", "0c", "f0", "ff"]
+            .into_iter()
+            .map(|prefix| prefix.repeat(16))
+            .find(|id| !reader.may_match_trace_id(id))
+            .expect("test ID should be absent from the small bloom");
+        assert!(reader.query_trace_id(&negative).unwrap().is_empty());
+        let result = reader.query_trace_id(&"01".repeat(16)).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].span_id, "02".repeat(8));
+    }
+
+    #[test]
+    fn trace_catalog_can_open_without_parquet_body() {
+        let root =
+            std::env::temp_dir().join(format!("loggytracy-trace-catalog-{}", uuid::Uuid::new_v4()));
+        let parts = flush_trace_spans(spans(), &root, 2).unwrap();
+        let part = parts.into_iter().next().unwrap();
+        fs::remove_file(part.data_path()).unwrap();
+        let reader = TracePartReader::open_cached(load_trace_part(&part.dir).unwrap()).unwrap();
+        assert!(reader.may_match_trace_id(&"01".repeat(16)));
+        assert!(reader.query_trace_id(&"01".repeat(16)).is_err());
+    }
+}

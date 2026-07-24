@@ -154,8 +154,10 @@ mod tests {
             memtable: memtable.clone(),
             journal: journal.clone(),
             parts,
+            trace_parts: Arc::new(crate::trace_registry::TraceRegistry::standalone()),
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             remote_cache: None,
         });
 
@@ -191,8 +193,10 @@ mod tests {
             memtable: memtable.clone(),
             journal,
             parts: Arc::new(PartRegistry::new()),
+            trace_parts: Arc::new(crate::trace_registry::TraceRegistry::standalone()),
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             remote_cache: None,
         });
         let body = build_snappy_push("bad-time", "must be rejected", 9_223_372_037);
@@ -222,13 +226,18 @@ mod tests {
         std::fs::create_dir_all(&parts_root).unwrap();
         let parts = Arc::new(PartRegistry::new());
         let journal = Arc::new(journal::Journal::spawn(&config, memtable.clone()).unwrap());
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
 
         let state = Arc::new(AppState {
             memtable: memtable.clone(),
             journal: journal.clone(),
             parts: parts.clone(),
+            trace_parts: trace_parts.clone(),
             flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             remote_cache: None,
         });
 
@@ -236,10 +245,22 @@ mod tests {
             let memtable = memtable.clone();
             let journal = journal.clone();
             let parts = parts.clone();
+            let trace_memtable = journal.trace_memtable();
+            let trace_parts = trace_parts.clone();
             let config = std::sync::Arc::new(config.clone());
             let healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
             tokio::spawn(async move {
-                crate::flush::flush_loop(memtable, journal, parts, None, config, healthy).await;
+                crate::flush::flush_loop(
+                    memtable,
+                    trace_memtable,
+                    journal,
+                    parts,
+                    trace_parts,
+                    None,
+                    config,
+                    healthy,
+                )
+                .await;
             })
         };
 

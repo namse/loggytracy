@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use prost::Message;
+use prost014::Message as Prost014Message;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -14,6 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::config::Config;
 use crate::memtable::{Labels, LogEntry, MemTable};
 use crate::proto::{self, PushRequest};
+use crate::trace::{ExportTraceServiceRequest, TraceMemTable, TraceSpan, normalize_request};
 
 const RECORD_HEADER_SIZE: usize = 8;
 const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
@@ -21,6 +23,8 @@ const WAL_FILE: &str = "journal.wal";
 const CKPT_FILE: &str = "journal.ckpt";
 const COMPACTION_STATE_FILE: &str = "journal.wal.compact.state";
 const COMPACTION_STATE_VERSION: u8 = 1;
+const TRACE_RECORD_MAGIC: &[u8; 4] = b"LGY2";
+const TRACE_RECORD_VERSION: u8 = 1;
 
 #[cfg(test)]
 static FAIL_AFTER_COMPACTION_RENAME: AtomicBool = AtomicBool::new(false);
@@ -28,12 +32,14 @@ static FAIL_AFTER_COMPACTION_RENAME: AtomicBool = AtomicBool::new(false);
 pub struct CheckpointSnapshot {
     pub offset: u64,
     pub snapshot: HashMap<Labels, Vec<LogEntry>>,
+    pub trace_snapshot: Vec<TraceSpan>,
 }
 
 enum JournalCmd {
     Append {
         data: Vec<u8>,
         streams: Vec<(Labels, Vec<LogEntry>)>,
+        traces: Vec<TraceSpan>,
         done: oneshot::Sender<Result<(), IoError>>,
     },
     Checkpoint {
@@ -48,6 +54,7 @@ enum JournalCmd {
 type AppendBatchItem = (
     Vec<u8>,
     Vec<(Labels, Vec<LogEntry>)>,
+    Vec<TraceSpan>,
     oneshot::Sender<Result<(), IoError>>,
 );
 
@@ -56,10 +63,19 @@ pub struct Journal {
     wal_path: PathBuf,
     ckpt_path: PathBuf,
     healthy: Arc<AtomicBool>,
+    trace_memtable: Arc<TraceMemTable>,
 }
 
 impl Journal {
     pub fn spawn(config: &Config, memtable: Arc<MemTable>) -> Result<Self, IoError> {
+        Self::spawn_with_traces(config, memtable, Arc::new(TraceMemTable::new()))
+    }
+
+    pub fn spawn_with_traces(
+        config: &Config,
+        memtable: Arc<MemTable>,
+        trace_memtable: Arc<TraceMemTable>,
+    ) -> Result<Self, IoError> {
         let dir = &config.data_dir;
         std::fs::create_dir_all(dir)?;
         let wal_path = dir.join(WAL_FILE);
@@ -86,12 +102,14 @@ impl Journal {
         let wal_path_clone = wal_path.clone();
         let ckpt_path_clone = ckpt_path.clone();
         let writer_health = healthy.clone();
+        let trace_memtable_clone = trace_memtable.clone();
         tokio::spawn(async move {
             let result = writer_loop(
                 rx,
                 &wal_path_clone,
                 &ckpt_path_clone,
                 memtable,
+                trace_memtable_clone,
                 max_batch_bytes,
                 max_batch_ms,
             )
@@ -107,6 +125,7 @@ impl Journal {
             wal_path,
             ckpt_path,
             healthy,
+            trace_memtable,
         })
     }
 
@@ -130,6 +149,7 @@ impl Journal {
             .send(JournalCmd::Append {
                 data,
                 streams,
+                traces: Vec::new(),
                 done: done_tx,
             })
             .await
@@ -141,6 +161,44 @@ impl Journal {
                 "journal writer dropped",
             )),
         }
+    }
+
+    pub async fn append_trace(&self, data: Vec<u8>, spans: Vec<TraceSpan>) -> Result<(), IoError> {
+        let mut framed = Vec::with_capacity(TRACE_RECORD_MAGIC.len() + 1 + data.len());
+        framed.extend_from_slice(TRACE_RECORD_MAGIC);
+        framed.push(TRACE_RECORD_VERSION);
+        framed.extend_from_slice(&data);
+        if framed.len() > MAX_RECORD_BYTES {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "journal record is too large: {} bytes (maximum {})",
+                    framed.len(),
+                    MAX_RECORD_BYTES
+                ),
+            ));
+        }
+        let (done_tx, done_rx) = oneshot::channel();
+        self.tx
+            .send(JournalCmd::Append {
+                data: framed,
+                streams: Vec::new(),
+                traces: spans,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| IoError::new(std::io::ErrorKind::BrokenPipe, "journal writer closed"))?;
+        match done_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(IoError::new(
+                std::io::ErrorKind::BrokenPipe,
+                "journal writer dropped",
+            )),
+        }
+    }
+
+    pub fn trace_memtable(&self) -> Arc<TraceMemTable> {
+        self.trace_memtable.clone()
     }
 
     pub async fn checkpoint(&self) -> Result<CheckpointSnapshot, IoError> {
@@ -228,14 +286,25 @@ pub fn write_checkpoint(ckpt_path: &Path, offset: u64) -> Result<(), IoError> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn replay(
     wal_path: &Path,
     ckpt_path: &Path,
     memtable: &MemTable,
 ) -> Result<(u64, u64), String> {
+    let traces = TraceMemTable::new();
+    replay_with_traces(wal_path, ckpt_path, memtable, &traces)
+}
+
+pub fn replay_with_traces(
+    wal_path: &Path,
+    ckpt_path: &Path,
+    memtable: &MemTable,
+    trace_memtable: &TraceMemTable,
+) -> Result<(u64, u64), String> {
     recover_unfinished_compaction(wal_path, ckpt_path).map_err(|e| e.to_string())?;
     let checkpoint = read_checkpoint(ckpt_path).map_err(|e| e.to_string())?;
-    replay_from(wal_path, checkpoint, memtable).map(|end| (checkpoint, end))
+    replay_from(wal_path, checkpoint, memtable, trace_memtable).map(|end| (checkpoint, end))
 }
 
 fn recover_unfinished_compaction(wal_path: &Path, ckpt_path: &Path) -> Result<(), IoError> {
@@ -264,7 +333,12 @@ fn recover_unfinished_compaction(wal_path: &Path, ckpt_path: &Path) -> Result<()
     Ok(())
 }
 
-fn replay_from(wal_path: &Path, checkpoint: u64, memtable: &MemTable) -> Result<u64, String> {
+fn replay_from(
+    wal_path: &Path,
+    checkpoint: u64,
+    memtable: &MemTable,
+    trace_memtable: &TraceMemTable,
+) -> Result<u64, String> {
     if !wal_path.exists() {
         if checkpoint == 0 {
             return Ok(0);
@@ -332,18 +406,25 @@ fn replay_from(wal_path: &Path, checkpoint: u64, memtable: &MemTable) -> Result<
             }
             return Err(format!("journal record crc mismatch at offset {offset}"));
         }
-        match PushRequest::decode(data.as_slice()) {
-            Ok(req) => {
-                for stream in &req.streams {
-                    let labels = match proto::parse_labels(&stream.labels) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            return Err(format!(
-                                "journal record has invalid labels at offset {offset}: {e}"
-                            ));
-                        }
-                    };
-                    let entries: Vec<LogEntry> = stream
+        if let Some(trace_data) = decode_trace_record(&data)? {
+            let request = ExportTraceServiceRequest::decode(trace_data)
+                .map_err(|e| format!("trace protobuf decode failed at offset {offset}: {e}"))?;
+            let spans = normalize_request(request)
+                .map_err(|e| format!("trace record invalid at offset {offset}: {e}"))?;
+            trace_memtable.insert(spans);
+        } else {
+            match PushRequest::decode(data.as_slice()) {
+                Ok(req) => {
+                    for stream in &req.streams {
+                        let labels = match proto::parse_labels(&stream.labels) {
+                            Ok(l) => l,
+                            Err(e) => {
+                                return Err(format!(
+                                    "journal record has invalid labels at offset {offset}: {e}"
+                                ));
+                            }
+                        };
+                        let entries: Vec<LogEntry> = stream
                         .entries
                         .iter()
                         .map(|e| {
@@ -363,13 +444,14 @@ fn replay_from(wal_path: &Path, checkpoint: u64, memtable: &MemTable) -> Result<
                             })
                         })
                         .collect::<Result<_, String>>()?;
-                    memtable.insert(labels, entries);
+                        memtable.insert(labels, entries);
+                    }
                 }
-            }
-            Err(e) => {
-                return Err(format!(
-                    "journal protobuf decode failed at offset {offset}: {e}"
-                ));
+                Err(e) => {
+                    return Err(format!(
+                        "journal protobuf decode failed at offset {offset}: {e}"
+                    ));
+                }
             }
         }
         offset += (RECORD_HEADER_SIZE + len) as u64;
@@ -381,11 +463,28 @@ fn replay_from(wal_path: &Path, checkpoint: u64, memtable: &MemTable) -> Result<
     Ok(offset)
 }
 
+fn decode_trace_record(data: &[u8]) -> Result<Option<&[u8]>, String> {
+    if !data.starts_with(TRACE_RECORD_MAGIC) {
+        return Ok(None);
+    }
+    if data.len() <= TRACE_RECORD_MAGIC.len() {
+        return Err("trace journal record is missing its version".to_string());
+    }
+    if data[TRACE_RECORD_MAGIC.len()] != TRACE_RECORD_VERSION {
+        return Err(format!(
+            "unsupported trace journal record version {}",
+            data[TRACE_RECORD_MAGIC.len()]
+        ));
+    }
+    Ok(Some(&data[TRACE_RECORD_MAGIC.len() + 1..]))
+}
+
 async fn writer_loop(
     mut rx: mpsc::Receiver<JournalCmd>,
     path: &Path,
     ckpt_path: &Path,
     memtable: Arc<MemTable>,
+    trace_memtable: Arc<TraceMemTable>,
     max_batch_bytes: usize,
     max_batch_ms: u64,
 ) -> Result<(), IoError> {
@@ -415,20 +514,22 @@ async fn writer_loop(
             JournalCmd::Append {
                 data,
                 streams,
+                traces,
                 done,
             } => {
                 batch_bytes += data.len();
-                batch.push((data, streams, done));
+                batch.push((data, streams, traces, done));
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(max_batch_ms);
                 while batch_bytes < max_batch_bytes {
                     match tokio::time::timeout_at(deadline, rx.recv()).await {
                         Ok(Some(JournalCmd::Append {
                             data,
                             streams,
+                            traces,
                             done,
                         })) => {
                             batch_bytes += data.len();
-                            batch.push((data, streams, done));
+                            batch.push((data, streams, traces, done));
                         }
                         Ok(Some(JournalCmd::Checkpoint { done })) => {
                             pending_checkpoint = Some(done);
@@ -456,7 +557,7 @@ async fn writer_loop(
 
         if !batch.is_empty() {
             let mut buf = Vec::with_capacity(batch_bytes + batch.len() * RECORD_HEADER_SIZE);
-            for (data, _, _) in &batch {
+            for (data, _, _, _) in &batch {
                 let len = u32::try_from(data.len()).map_err(|_| {
                     IoError::new(
                         std::io::ErrorKind::InvalidInput,
@@ -479,16 +580,17 @@ async fn writer_loop(
             match write_result {
                 Ok(()) => {
                     good_len += buf.len() as u64;
-                    for (_, streams, done) in batch.drain(..) {
+                    for (_, streams, traces, done) in batch.drain(..) {
                         for (labels, entries) in streams {
                             memtable.insert(labels, entries);
                         }
+                        trace_memtable.insert(traces);
                         let _ = done.send(Ok(()));
                     }
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "journal write failed, truncating partial record");
-                    for (_, _, done) in batch.drain(..) {
+                    for (_, _, _, done) in batch.drain(..) {
                         let _ = done.send(Err(IoError::new(e.kind(), e.to_string())));
                     }
                     let recovered = async {
@@ -511,7 +613,12 @@ async fn writer_loop(
             }
             let offset = good_len;
             let snapshot = memtable.begin_flush();
-            let _ = done.send(Ok(CheckpointSnapshot { offset, snapshot }));
+            let trace_snapshot = trace_memtable.begin_flush();
+            let _ = done.send(Ok(CheckpointSnapshot {
+                offset,
+                snapshot,
+                trace_snapshot,
+            }));
         }
 
         if let Some((offset, done)) = pending_compact {

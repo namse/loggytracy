@@ -4,6 +4,7 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct Config {
     pub listen_addr: String,
+    pub otlp_grpc_addr: String,
     pub data_dir: PathBuf,
     pub max_batch_bytes: usize,
     pub max_batch_ms: u64,
@@ -27,6 +28,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:3100".to_string(),
+            otlp_grpc_addr: "0.0.0.0:4317".to_string(),
             data_dir: PathBuf::from("./data"),
             max_batch_bytes: 1024 * 1024,
             max_batch_ms: 200,
@@ -50,6 +52,8 @@ impl Config {
         let object_store_url = std::env::var("LOGGYTRACY_OBJECT_STORE_URL")
             .ok()
             .filter(|value| !value.trim().is_empty());
+        let otlp_grpc_addr = std::env::var("LOGGYTRACY_OTLP_GRPC_ADDR")
+            .unwrap_or_else(|_| Self::default().otlp_grpc_addr);
         let cache_max_bytes = match std::env::var("LOGGYTRACY_CACHE_MAX_BYTES") {
             Ok(value) => value.parse().map_err(|error| {
                 format!("invalid LOGGYTRACY_CACHE_MAX_BYTES {value:?}: {error}")
@@ -57,6 +61,7 @@ impl Config {
             Err(_) => Self::default().cache_max_bytes,
         };
         Ok(Self {
+            otlp_grpc_addr,
             object_store_url,
             cache_max_bytes,
             ..Self::default()
