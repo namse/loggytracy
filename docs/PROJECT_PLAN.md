@@ -12,7 +12,7 @@ new Codex context can continue without relying on chat history.
 | M3 | Complete (review remediated) | JSON/logfmt parsing, metric queries, field-filter push-down, and bounded query execution sufficient for real dashboards |
 | M4 | Pending | OTLP trace ingest, trace-ID lookup, and Tempo-compatible APIs |
 | M5 | Pending | Compaction tuning, retention, resource limits, and load validation against explicit targets |
-| M6 | Pending | Read replica, manifest following, fenced promotion, and a machine-replacement rehearsal |
+| M6 | Pending | Graceful shutdown for machine replacement (SIGTERM handling, forced flush-to-S3, drain-status readiness) and a machine-replacement rehearsal |
 
 ## Repository state note
 

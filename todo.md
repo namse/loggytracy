@@ -26,9 +26,10 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
 - [ ] 명시적인 처리량·지연시간·메모리 목표를 정하고 부하 테스트 수행
 - [ ] 부하 테스트 결과와 병목 구간을 문서화
 
-## P4 — M6 고가용성
+## P4 — M6 장비 교체
 
-- [ ] read replica와 manifest following 구현
-- [ ] fenced promotion을 포함한 master 승격 절차 구현
-- [ ] 장비 교체 및 장애 복구 리허설 수행
+- [ ] graceful shutdown 핸들러 구현 (SIGTERM 수신 시 ingest 엔드포인트 차단 + in-flight 요청 drain)
+- [ ] 강제 flush(force-flush) 함수 구현 및 S3 업로드/manifest 갱신 완료 대기
+- [ ] drain-status readiness 신호 노출 (pending bytes/flush 완료 여부를 외부에서 확인 가능하게)
+- [ ] 장비 교체 리허설 수행
 

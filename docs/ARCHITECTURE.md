@@ -10,6 +10,7 @@ Rust로 만드는 싱글 머신 log + trace 엔진. VictoriaLogs의 논리 설�
 | Source of truth | S3 호환 오브젝트 스토리지 |
 | 로컬 디스크 | 캐시 (LRU eviction) |
 | 내구성 | 저널(append-only) + group commit + fsync 후 ack. Alloy WAL을 안전망으로 전제 |
+| 복제 | 레플리카 없음. 예상치 못한 서버/디스크 손실 시 손실 허용 윈도우(RPO)는 flush 주기(`flush_max_bytes`/`flush_max_interval`, 기본 1MiB/5초 중 먼저 도달하는 쪽)로 결정되며 이를 의도적으로 수용한다 |
 
 ## 내구성/복구 시맨스
 
@@ -20,6 +21,7 @@ Rust로 만드는 싱글 머신 log + trace 엔진. VictoriaLogs의 논리 설�
 - **merge 교체 불변량**: merge tombstone은 새 part 디렉터리가 `.tmp`에서 최종 위치로 rename되기 전에 기록된다. 재시작 복구는 새 part를 성공적으로 open한 경우에만 old part를 삭제하며, 새 part 검증에 실패하면 old part를 유지한다.
 - **merge tombstone 연쇄 복구**: 재시작 시 모든 tombstone 관계를 먼저 수집하고 이전 세대까지 폐쇄적으로 추적한 뒤 old part를 정리한다. 따라서 삭제 실패 후 여러 세대의 merge가 겹쳐도 중간 tombstone 삭제로 이전 세대 part가 부활하지 않는다.
 - **WAL compaction**: object store가 활성화된 경우 part 업로드와 manifest CAS가 성공한 뒤 writer 태스크가 checkpoint 이전 WAL 구간을 제거한다. 교체 전에 checkpoint를 0으로 되돌리므로 compaction 도중 크래시는 이전 WAL 전체 또는 새 WAL suffix를 재생하며, 중복은 가능하지만 유실은 없다. 로컬 전용 모드는 기존 offset checkpoint를 유지한다.
+- **예상치 못한 디스크 손실**: 로컬 디스크가 통째로 소실되면, 마지막으로 성공한 flush(S3 업로드 + manifest 갱신) 이후 아직 flush되지 않은 WAL/MemTable 데이터는 서버 쪽에서 복구할 수 없다. 이 손실 허용 윈도우는 `flush_max_bytes`/`flush_max_interval`(기본 1MiB/5초, 둘 중 먼저 도달하는 쪽)로 결정되며, 레플리카 없이 이 정도 손실은 의도적으로 수용한다. 계획된 장비 교체는 이 윈도우가 적용되지 않도록 아래 graceful shutdown 절차를 따른다.
 
 | 물리 포맷 | Parquet (dictionary + zstd) + 사이드카 인덱스 파일 |
 | 인덱스 | stream index + 블록별 trigram bloom filter (역인덱스 없음) |
@@ -84,8 +86,7 @@ LogQL 파싱(chumsky) → 플랜 → 프루닝 단계 순서:
 
 - part 업로드 완료 후 manifest 갱신. manifest는 버전 번호가 있는 파일이며 S3 conditional write(If-None-Match)로 compare-and-swap.
 - 로컬 디스크는 part 캐시. 작은 metadata/bloom/stream index catalog는 유지하고, `data.parquet` 본문만 LRU eviction한다. 쿼리와 merge는 시간·라벨 프루닝으로 선택된 part 본문만 검증된 임시 디렉터리로 내려받고 읽는 동안 eviction으로부터 pin한다. Parquet range read 최적화는 후속 단계로 남긴다.
-- 장비 교체: 새 장비가 manifest를 읽어 복구, 미ack 데이터는 Alloy가 재전송.
-- read replica: manifest 폴링으로 새 part 추적 (S3 반영 지연만큼 최신 데이터 지연). master 승격은 manifest generation 번호로 fencing.
+- 장비 교체 (graceful shutdown): 1) SIGTERM 수신 시 ingest 엔드포인트를 즉시 차단(신규 요청 거부) 2) 이미 accept된 in-flight 요청의 WAL append/ack 완료까지 대기(drain) 3) 그 시점까지 쌓인 MemTable을 강제 flush하여 S3 업로드 및 manifest 갱신 완료를 확인 4) 프로세스 종료 후 디스크 폐기/새 장비 전환. 차단 이후 Alloy가 보내려던 데이터는 ack를 받지 못하므로 Alloy 자체 버퍼에서 재시도되며, 새 장비가 같은 엔드포인트로 서비스를 재개하면 그쪽으로 전달된다. drain 중 ack 직전에 연결이 끊기는 좁은 구간에서는 중복이 발생할 수 있으나(위 at-least-once와 동일한 성격), 유실은 발생하지 않는다.
 
 ### Object store 설정
 
@@ -118,7 +119,7 @@ LogQL 파싱(chumsky) → 플랜 → 프루닝 단계 순서:
 | M3 | LogQL 확장: json/logfmt 파서, metric query, 필드 필터 push-down | 실제 대시보드 구동 |
 | M4 | 트레이스: OTLP ingest + trace_id 조회(bloom) + Tempo API | Grafana Tempo 데이터소스로 트레이스 조회 |
 | M5 | merge/컴팩션 튜닝, 리텐션, 자원 상한(쿼리 메모리·범위 제한), 부하 테스트 | 목표 처리량 달성 |
-| M6 | read replica + master 승격 | 장비 교체 리허설 성공 |
+| M6 | graceful shutdown 기반 장비 교체 (SIGTERM 핸들러 + force-flush + drain-status readiness) | 장비 교체 리허설 성공 (손실 없이 신규 장비로 트래픽 전환) |
 
 ## 참고
 
