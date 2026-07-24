@@ -4,6 +4,7 @@ use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bloom::BloomFilter;
 use crate::logql::{LabelMatcher, LineFilter, MatcherOp};
-use crate::memtable::{Labels, LogEntry, StreamResult};
+use crate::memtable::{Labels, LogEntry, QueryResult, StreamResult};
 
 pub const DATA_FILE: &str = "data.parquet";
 pub const BLOOM_FILE: &str = "bloom.tri";
@@ -27,8 +28,13 @@ pub const STREAM_INDEX_FILE: &str = "stream.idx";
 pub const META_FILE: &str = "meta.json";
 pub const MERGE_TOMBSTONE_FILE: &str = ".merge.tombstone";
 
-const BLOOM_MAGIC: &[u8; 4] = b"BTF1";
+const BLOOM_MAGIC_V1: &[u8; 4] = b"BTF1";
+const BLOOM_MAGIC_V2: &[u8; 4] = b"BTF2";
+const BLOOM_MAGIC_V3: &[u8; 4] = b"BTF3";
 const STREAM_MAGIC: &[u8; 4] = b"SIX1";
+
+const EXACT_FIELD_TOKEN_MAGIC: &[u8; 4] = b"FEQ1";
+const EXACT_FIELD_SCALAR_SCOPE: u8 = 0;
 
 pub type StreamMap = BTreeMap<String, BTreeMap<String, RoaringBitmap>>;
 
@@ -37,6 +43,78 @@ struct QueryTimeRange {
     start_ns: i64,
     end_ns: i64,
     include_end: bool,
+}
+
+/// A positive exact equality over an entry's structured or parser-visible
+/// scalar fields.
+///
+/// This type deliberately lives below LogQL. Callers may compile eligible
+/// pipeline predicates into it without coupling the immutable part format to
+/// a particular query AST. Missing field blooms (notably BTF1 parts) always
+/// fall back to scanning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactFieldPredicate {
+    pub name: String,
+    pub value: String,
+    /// A preceding parser may also produce this field from the log line. BTF2
+    /// indexes parser-visible scalars as well as structured metadata; this bit
+    /// remains explicit so older/alternate indexes can conservatively scan.
+    pub may_be_extracted: bool,
+    /// Whether `value` is a canonical numeric/duration representation. Older
+    /// BTF2 indexes contain only raw values and must not prune such queries.
+    pub canonical: bool,
+}
+
+impl ExactFieldPredicate {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            may_be_extracted: false,
+            canonical: false,
+        }
+    }
+
+    pub fn new_with_extraction(
+        name: impl Into<String>,
+        value: impl Into<String>,
+        may_be_extracted: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            may_be_extracted,
+            canonical: false,
+        }
+    }
+
+    pub fn new_canonical_with_extraction(
+        name: impl Into<String>,
+        value: impl Into<String>,
+        may_be_extracted: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            may_be_extracted,
+            canonical: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ExactFieldPruning<'a> {
+    pub line_filters: &'a [LineFilter],
+    pub exact_fields: &'a [ExactFieldPredicate],
+}
+
+impl<'a> ExactFieldPruning<'a> {
+    pub fn new(line_filters: &'a [LineFilter], exact_fields: &'a [ExactFieldPredicate]) -> Self {
+        Self {
+            line_filters,
+            exact_fields,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -355,13 +433,44 @@ fn write_parquet(
 fn write_bloom(path: &Path, rows: &[Row], row_group_size: usize) -> io::Result<()> {
     let bounds = row_group_bounds(rows.len(), row_group_size);
     let mut buf = Vec::new();
-    buf.extend_from_slice(BLOOM_MAGIC);
+    buf.extend_from_slice(BLOOM_MAGIC_V3);
     buf.extend_from_slice(&(bounds.len() as u32).to_le_bytes());
     for (start, end) in &bounds {
         let mut unique_trigrams: BTreeSet<[u8; 3]> = BTreeSet::new();
+        // Count the actual indexed tokens instead of estimating from rows.
+        // The second pass keeps the existing bounded-memory insertion path,
+        // while sizing the filter for wide structured rows as well as sparse
+        // rows.
+        let mut exact_capacity = 0usize;
+        for row in &rows[*start..*end] {
+            for (_name, value) in &row.structured_metadata {
+                exact_capacity = exact_capacity
+                    .saturating_add(crate::logql::canonical_index_values(value).len());
+            }
+            for (_name, values) in crate::logql::indexed_parser_fields(&row.line) {
+                for value in values {
+                    exact_capacity = exact_capacity
+                        .saturating_add(crate::logql::canonical_index_values(&value).len());
+                }
+            }
+        }
+        let exact_capacity = exact_capacity.max(1);
+        let mut exact_fields = BloomFilter::with_capacity(exact_capacity, 0.01);
         for row in &rows[*start..*end] {
             for tri in crate::bloom::trigrams(&row.line) {
                 unique_trigrams.insert(tri);
+            }
+            for (name, value) in &row.structured_metadata {
+                for value in crate::logql::canonical_index_values(value) {
+                    exact_fields.insert(&encode_exact_field_token(name, &value)?);
+                }
+            }
+            for (name, values) in crate::logql::indexed_parser_fields(&row.line) {
+                for value in values {
+                    for value in crate::logql::canonical_index_values(&value) {
+                        exact_fields.insert(&encode_exact_field_token(&name, &value)?);
+                    }
+                }
             }
         }
         let estimated_items = unique_trigrams.len().max(1);
@@ -372,10 +481,32 @@ fn write_bloom(path: &Path, rows: &[Row], row_group_size: usize) -> io::Result<(
         let bytes = bloom.encode();
         buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&bytes);
+        let bytes = exact_fields.encode();
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&bytes);
     }
     fs::write(path, &buf)?;
     sync_file(path)?;
     Ok(())
+}
+
+fn encode_exact_field_token(name: &str, value: &str) -> io::Result<Vec<u8>> {
+    let name_len = u32::try_from(name.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "field name is too large"))?;
+    let value_len = u32::try_from(value.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "field value is too large"))?;
+    let capacity = EXACT_FIELD_TOKEN_MAGIC
+        .len()
+        .checked_add(1 + 4 + name.len() + 4 + value.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "field token is too large"))?;
+    let mut token = Vec::with_capacity(capacity);
+    token.extend_from_slice(EXACT_FIELD_TOKEN_MAGIC);
+    token.push(EXACT_FIELD_SCALAR_SCOPE);
+    token.extend_from_slice(&name_len.to_le_bytes());
+    token.extend_from_slice(name.as_bytes());
+    token.extend_from_slice(&value_len.to_le_bytes());
+    token.extend_from_slice(value.as_bytes());
+    Ok(token)
 }
 
 fn write_stream_index(
@@ -1092,8 +1223,16 @@ impl Read for PreadCursor {
 pub struct PartReader {
     part: Part,
     bloom: Vec<BloomFilter>,
+    exact_field_bloom: Option<Vec<BloomFilter>>,
+    exact_field_bloom_canonical: bool,
     stream_index: StreamMap,
     stream_labels: Vec<String>,
+}
+
+struct DecodedBlooms {
+    line: Vec<BloomFilter>,
+    exact_fields: Option<Vec<BloomFilter>>,
+    exact_fields_canonical: bool,
 }
 
 fn validate_sidecar_files(part: &Part) -> Result<(), String> {
@@ -1241,15 +1380,7 @@ impl PartReader {
             ));
         }
         let bloom_bytes = fs::read(part.bloom_path()).map_err(|e| e.to_string())?;
-        let bloom = decode_blooms(&bloom_bytes)?;
-        if bloom.len() != part.meta.row_group_count as usize {
-            return Err(format!(
-                "row group count mismatch for part {}: bloom says {}, meta says {}",
-                part.meta.id,
-                bloom.len(),
-                part.meta.row_group_count
-            ));
-        }
+        let decoded_blooms = decode_blooms(&bloom_bytes, part.meta.row_group_count as usize)?;
         let stream_index =
             decode_stream_index(&fs::read(part.stream_index_path()).map_err(|e| e.to_string())?)?;
         validate_stream_index(&part, &stream_index)?;
@@ -1259,7 +1390,9 @@ impl PartReader {
         }
         Ok(Self {
             part,
-            bloom,
+            bloom: decoded_blooms.line,
+            exact_field_bloom: decoded_blooms.exact_fields,
+            exact_field_bloom_canonical: decoded_blooms.exact_fields_canonical,
             stream_index,
             stream_labels,
         })
@@ -1303,9 +1436,55 @@ impl PartReader {
         limit: usize,
         forward: bool,
     ) -> Result<Vec<StreamResult>, String> {
+        Ok(self
+            .query_with_exact_field_pruning_and_scan_limit(
+                matchers,
+                ExactFieldPruning::new(line_filters, &[]),
+                start_ns,
+                end_ns,
+                limit,
+                forward,
+                None,
+                None,
+            )?
+            .results)
+    }
+
+    /// Uses exact-field predicates only for row-group pruning. Bloom filters
+    /// can return false positives, so the caller remains responsible for
+    /// evaluating the predicates against each returned entry.
+    pub fn query_with_exact_field_pruning(
+        &self,
+        matchers: &[LabelMatcher],
+        pruning: ExactFieldPruning<'_>,
+        start_ns: i64,
+        end_ns: i64,
+        limit: usize,
+        forward: bool,
+    ) -> Result<Vec<StreamResult>, String> {
+        Ok(self
+            .query_with_exact_field_pruning_and_scan_limit(
+                matchers, pruning, start_ns, end_ns, limit, forward, None, None,
+            )?
+            .results)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_with_exact_field_pruning_and_scan_limit(
+        &self,
+        matchers: &[LabelMatcher],
+        pruning: ExactFieldPruning<'_>,
+        start_ns: i64,
+        end_ns: i64,
+        limit: usize,
+        forward: bool,
+        scan_limit: Option<usize>,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<QueryResult, String> {
         self.query_internal(
             matchers,
-            line_filters,
+            pruning.line_filters,
+            pruning.exact_fields,
             QueryTimeRange {
                 start_ns,
                 end_ns,
@@ -1313,27 +1492,44 @@ impl PartReader {
             },
             limit,
             forward,
+            scan_limit,
+            cancellation,
         )
     }
 
     pub fn query_all(&self) -> Result<Vec<StreamResult>, String> {
-        self.query_internal(
-            &[],
-            &[],
-            QueryTimeRange {
-                start_ns: i64::MIN,
-                end_ns: i64::MAX,
-                include_end: true,
-            },
-            usize::MAX,
-            true,
-        )
+        Ok(self
+            .query_internal(
+                &[],
+                &[],
+                &[],
+                QueryTimeRange {
+                    start_ns: i64::MIN,
+                    end_ns: i64::MAX,
+                    include_end: true,
+                },
+                usize::MAX,
+                true,
+                None,
+                None,
+            )?
+            .results)
     }
 
     fn select_row_groups(
         &self,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
+        time_range: QueryTimeRange,
+    ) -> Vec<u32> {
+        self.select_row_groups_with_exact_fields(matchers, line_filters, &[], time_range)
+    }
+
+    fn select_row_groups_with_exact_fields(
+        &self,
+        matchers: &[LabelMatcher],
+        line_filters: &[LineFilter],
+        exact_fields: &[ExactFieldPredicate],
         time_range: QueryTimeRange,
     ) -> Vec<u32> {
         let mut selected = Vec::with_capacity(self.bloom.len());
@@ -1352,94 +1548,203 @@ impl PartReader {
             if !self.bloom_prune(rgu, line_filters) {
                 continue;
             }
+            if !self.exact_field_bloom_prune(rgu, exact_fields) {
+                continue;
+            }
             selected.push(rg);
         }
         selected
     }
 
+    /// Returns whether any row group can satisfy the catalog-visible portion
+    /// of a query. This does not open `data.parquet`, so object-store callers
+    /// can use it before deciding which evicted bodies to restore.
+    pub fn may_match_exact_fields(
+        &self,
+        matchers: &[LabelMatcher],
+        line_filters: &[LineFilter],
+        exact_fields: &[ExactFieldPredicate],
+        start_ns: i64,
+        end_ns: i64,
+    ) -> bool {
+        !self
+            .select_row_groups_with_exact_fields(
+                matchers,
+                line_filters,
+                exact_fields,
+                QueryTimeRange {
+                    start_ns,
+                    end_ns,
+                    include_end: true,
+                },
+            )
+            .is_empty()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn query_internal(
         &self,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
+        exact_fields: &[ExactFieldPredicate],
         time_range: QueryTimeRange,
         limit: usize,
         forward: bool,
-    ) -> Result<Vec<StreamResult>, String> {
+        scan_limit: Option<usize>,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<QueryResult, String> {
         let rg_count = self.bloom.len();
         if rg_count == 0 {
-            return Ok(Vec::new());
+            return Ok(QueryResult {
+                results: Vec::new(),
+                scanned_rows: 0,
+            });
+        }
+        if limit == 0 {
+            return Ok(QueryResult {
+                results: Vec::new(),
+                scanned_rows: 0,
+            });
         }
 
-        let selected = self.select_row_groups(matchers, line_filters, time_range);
+        let selected = if exact_fields.is_empty() {
+            self.select_row_groups(matchers, line_filters, time_range)
+        } else {
+            self.select_row_groups_with_exact_fields(
+                matchers,
+                line_filters,
+                exact_fields,
+                time_range,
+            )
+        };
         if selected.is_empty() {
-            return Ok(Vec::new());
+            return Ok(QueryResult {
+                results: Vec::new(),
+                scanned_rows: 0,
+            });
         }
         let mut sorted_selected = selected.clone();
         sorted_selected.sort_unstable();
+        if !forward {
+            sorted_selected.reverse();
+        }
 
         let mut collected: Vec<(Labels, LogEntry)> = Vec::new();
+        let mut scanned_rows = 0usize;
 
-        // Keep the file descriptor local to this query. Eviction is
-        // coordinated with active queries, so dropping the query releases the
-        // final filesystem reference and immediately reclaims disk space.
-        let (data_file, arrow_reader_metadata) = open_part_data(&self.part, false)?;
-        let builder =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(data_file, arrow_reader_metadata);
-        let row_group_indices: Vec<usize> = sorted_selected.iter().map(|&rg| rg as usize).collect();
-        let reader = builder
-            .with_row_groups(row_group_indices)
-            .build()
-            .map_err(|e| e.to_string())?;
+        let batch_size = scan_limit
+            .into_iter()
+            .chain(forward.then_some(limit))
+            .min()
+            .map(|value| value.clamp(1, 1024))
+            .unwrap_or(1024);
+        'row_groups: for &row_group in &sorted_selected {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                break;
+            }
+            // Parquet may normalize a multi-row-group selection back to file
+            // order. Build one reader per group so backward scans really start
+            // at the newest group and can stop once the limit is satisfied.
+            let (data_file, arrow_reader_metadata) = open_part_data(&self.part, false)?;
+            let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                data_file,
+                arrow_reader_metadata,
+            )
+            .with_batch_size(batch_size);
+            let reader = builder
+                .with_row_groups(vec![row_group as usize])
+                .build()
+                .map_err(|e| e.to_string())?;
 
-        for maybe_batch in reader {
-            let batch = maybe_batch.map_err(|e| e.to_string())?;
-            let ts = batch.column(0).as_primitive::<Int64Type>();
-            let msg = batch.column(1).as_string::<i32>();
-            let sm_col_idx = 2 + self.stream_labels.len();
-            let sm = batch.column(sm_col_idx).as_string::<i32>();
-            let label_cols: Vec<&StringArray> = (0..self.stream_labels.len())
-                .map(|i| batch.column(2 + i).as_string::<i32>())
-                .collect();
+            // Parquet yields batches in row order even when a single row
+            // group is selected. Buffer only this row group and reverse the
+            // batches as well as the rows; reversing rows inside each batch
+            // alone would return the oldest batch first for backward scans.
+            let mut batches: Vec<_> = reader
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?;
+            if !forward {
+                batches.reverse();
+            }
+            for batch in batches {
+                if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    break 'row_groups;
+                }
+                let rows_to_scan = scan_limit
+                    .map(|limit| limit.saturating_sub(scanned_rows).min(batch.num_rows()))
+                    .unwrap_or(batch.num_rows());
+                scanned_rows = scanned_rows.saturating_add(rows_to_scan);
+                let ts = batch.column(0).as_primitive::<Int64Type>();
+                let msg = batch.column(1).as_string::<i32>();
+                let sm_col_idx = 2 + self.stream_labels.len();
+                let sm = batch.column(sm_col_idx).as_string::<i32>();
+                let label_cols: Vec<&StringArray> = (0..self.stream_labels.len())
+                    .map(|i| batch.column(2 + i).as_string::<i32>())
+                    .collect();
 
-            for i in 0..batch.num_rows() {
-                let ts_val = ts.value(i);
-                if ts_val < time_range.start_ns
-                    || ts_val > time_range.end_ns
-                    || (!time_range.include_end && ts_val == time_range.end_ns)
-                {
-                    continue;
-                }
-                let mut labels: Labels = BTreeMap::new();
-                for (j, label_name) in self.stream_labels.iter().enumerate() {
-                    if !label_cols[j].is_null(i) {
-                        labels.insert(label_name.clone(), label_cols[j].value(i).to_string());
-                    }
-                }
-                if !matchers.iter().all(|m| m.matches(&labels)) {
-                    continue;
-                }
-                let line = msg.value(i).to_string();
-                if !line_filters.iter().all(|f| f.matches(&line)) {
-                    continue;
-                }
-                let structured_metadata = if sm.is_null(i) {
-                    Vec::new()
+                let row_start = if forward {
+                    0
                 } else {
-                    serde_json::from_str(sm.value(i)).map_err(|error| {
+                    batch.num_rows().saturating_sub(rows_to_scan)
+                };
+                let row_end = row_start + rows_to_scan;
+                let row_indices: Box<dyn Iterator<Item = usize>> = if forward {
+                    Box::new(row_start..row_end)
+                } else {
+                    Box::new((row_start..row_end).rev())
+                };
+                for i in row_indices {
+                    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                        break 'row_groups;
+                    }
+                    let ts_val = ts.value(i);
+                    if ts_val < time_range.start_ns
+                        || ts_val > time_range.end_ns
+                        || (!time_range.include_end && ts_val == time_range.end_ns)
+                    {
+                        continue;
+                    }
+                    let mut labels: Labels = BTreeMap::new();
+                    for (j, label_name) in self.stream_labels.iter().enumerate() {
+                        if !label_cols[j].is_null(i) {
+                            labels.insert(label_name.clone(), label_cols[j].value(i).to_string());
+                        }
+                    }
+                    if !matchers.iter().all(|m| m.matches(&labels)) {
+                        continue;
+                    }
+                    let line = msg.value(i).to_string();
+                    if !line_filters.iter().all(|f| f.matches(&line)) {
+                        continue;
+                    }
+                    let structured_metadata = if sm.is_null(i) {
+                        Vec::new()
+                    } else {
+                        serde_json::from_str(sm.value(i)).map_err(|error| {
                         format!(
                             "invalid structured metadata in part {} at timestamp {ts_val}: {error}",
                             self.part.meta.id
                         )
                     })?
-                };
-                collected.push((
-                    labels,
-                    LogEntry {
-                        timestamp_ns: ts_val,
-                        line,
-                        structured_metadata,
-                    },
-                ));
+                    };
+                    collected.push((
+                        labels,
+                        LogEntry {
+                            timestamp_ns: ts_val,
+                            line,
+                            structured_metadata,
+                        },
+                    ));
+                    if forward && collected.len() >= limit {
+                        break 'row_groups;
+                    }
+                }
+                if scan_limit.is_some_and(|limit| scanned_rows >= limit) {
+                    break 'row_groups;
+                }
+            }
+            if !forward && collected.len() >= limit {
+                break;
             }
         }
 
@@ -1450,7 +1755,10 @@ impl PartReader {
         }
         collected.truncate(limit);
 
-        Ok(group_by_labels(collected))
+        Ok(QueryResult {
+            results: group_by_labels(collected),
+            scanned_rows,
+        })
     }
 }
 
@@ -1464,6 +1772,38 @@ impl PartReader {
             }
         }
         true
+    }
+
+    fn exact_field_bloom_prune(&self, rg: usize, exact_fields: &[ExactFieldPredicate]) -> bool {
+        let Some(blooms) = &self.exact_field_bloom else {
+            return true;
+        };
+        exact_fields.iter().all(|predicate| {
+            if predicate.canonical && !self.exact_field_bloom_canonical {
+                return true;
+            }
+            // Stream labels are visible to pipeline field filters, but are
+            // intentionally not part of the exact-field bloom. The stream
+            // index handles label matchers; skipping this predicate here is
+            // required to avoid pruning a row group that contains the label.
+            if self
+                .stream_labels
+                .iter()
+                .any(|name| name == &predicate.name)
+            {
+                return true;
+            }
+            // Field-filter execution may treat an absent field as an empty
+            // string. Absence is not represented in the bloom, so an empty
+            // equality cannot safely reject a row group.
+            if predicate.value.is_empty() {
+                return true;
+            }
+            encode_exact_field_token(&predicate.name, &predicate.value)
+                .map(|token| blooms[rg].contains(&token))
+                // An unrepresentable predicate must conservatively scan.
+                .unwrap_or(true)
+        })
     }
 }
 
@@ -1495,32 +1835,63 @@ fn row_group_matches_index(rg: u32, matchers: &[LabelMatcher], index: &StreamMap
     true
 }
 
-fn decode_blooms(buf: &[u8]) -> Result<Vec<BloomFilter>, String> {
+fn decode_blooms(buf: &[u8], expected_count: usize) -> Result<DecodedBlooms, String> {
     if buf.len() < 8 {
         return Err("bloom file too short".to_string());
     }
-    if &buf[0..4] != BLOOM_MAGIC {
+    let (has_exact_fields, exact_fields_canonical) = if &buf[0..4] == BLOOM_MAGIC_V1 {
+        (false, false)
+    } else if &buf[0..4] == BLOOM_MAGIC_V2 {
+        (true, false)
+    } else if &buf[0..4] == BLOOM_MAGIC_V3 {
+        (true, true)
+    } else {
         return Err("bloom magic mismatch".to_string());
-    }
+    };
     let count = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    if count != expected_count {
+        return Err(format!(
+            "row group count mismatch: bloom says {count}, metadata says {expected_count}"
+        ));
+    }
     let mut pos = 8;
-    let mut blooms = Vec::with_capacity(count);
+    let mut line = Vec::with_capacity(count);
+    let mut exact_fields = has_exact_fields.then(|| Vec::with_capacity(count));
     for _ in 0..count {
-        if pos + 4 > buf.len() {
-            return Err("bloom length truncated".to_string());
+        line.push(decode_length_prefixed_bloom(buf, &mut pos)?);
+        if let Some(exact_fields) = &mut exact_fields {
+            exact_fields.push(decode_length_prefixed_bloom(buf, &mut pos)?);
         }
-        let len = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-        pos += 4;
-        if pos + len > buf.len() {
-            return Err("bloom payload truncated".to_string());
-        }
-        blooms.push(BloomFilter::decode(&buf[pos..pos + len])?);
-        pos += len;
     }
     if pos != buf.len() {
         return Err("bloom file has trailing bytes".to_string());
     }
-    Ok(blooms)
+    Ok(DecodedBlooms {
+        line,
+        exact_fields,
+        exact_fields_canonical,
+    })
+}
+
+fn decode_length_prefixed_bloom(buf: &[u8], pos: &mut usize) -> Result<BloomFilter, String> {
+    let length_end = pos
+        .checked_add(4)
+        .ok_or_else(|| "bloom length overflow".to_string())?;
+    let length_bytes: [u8; 4] = buf
+        .get(*pos..length_end)
+        .ok_or_else(|| "bloom length truncated".to_string())?
+        .try_into()
+        .map_err(|_| "bloom length truncated".to_string())?;
+    let len = u32::from_le_bytes(length_bytes) as usize;
+    *pos = length_end;
+    let payload_end = pos
+        .checked_add(len)
+        .ok_or_else(|| "bloom payload length overflow".to_string())?;
+    let payload = buf
+        .get(*pos..payload_end)
+        .ok_or_else(|| "bloom payload truncated".to_string())?;
+    *pos = payload_end;
+    BloomFilter::decode(payload)
 }
 
 fn decode_stream_index(buf: &[u8]) -> Result<StreamMap, String> {
@@ -1581,26 +1952,76 @@ fn decode_stream_index(buf: &[u8]) -> Result<StreamMap, String> {
 }
 
 pub fn group_by_labels(collected: Vec<(Labels, LogEntry)>) -> Vec<StreamResult> {
-    if collected.is_empty() {
-        return Vec::new();
-    }
-    let mut results: Vec<StreamResult> = Vec::new();
+    let mut grouped: BTreeMap<Labels, Vec<LogEntry>> = BTreeMap::new();
     for (labels, entry) in collected {
-        if let Some(r) = results.iter_mut().find(|r| r.labels == labels) {
-            r.entries.push(entry);
-        } else {
-            results.push(StreamResult {
-                labels,
-                entries: vec![entry],
-            });
-        }
+        grouped.entry(labels).or_default().push(entry);
     }
-    results
+    grouped
+        .into_iter()
+        .map(|(labels, entries)| StreamResult { labels, entries })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_btf1(line_blooms: &[BloomFilter]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BLOOM_MAGIC_V1);
+        bytes.extend_from_slice(&(line_blooms.len() as u32).to_le_bytes());
+        for bloom in line_blooms {
+            let encoded = bloom.encode();
+            bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&encoded);
+        }
+        bytes
+    }
+
+    fn encode_btf2(line_blooms: &[BloomFilter], exact_blooms: &[BloomFilter]) -> Vec<u8> {
+        assert_eq!(line_blooms.len(), exact_blooms.len());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BLOOM_MAGIC_V2);
+        bytes.extend_from_slice(&(line_blooms.len() as u32).to_le_bytes());
+        for (line, exact) in line_blooms.iter().zip(exact_blooms) {
+            for bloom in [line, exact] {
+                let encoded = bloom.encode();
+                bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(&encoded);
+            }
+        }
+        bytes
+    }
+
+    fn rewrite_part_bloom_as_v1(part: &Part) {
+        let bytes = fs::read(part.bloom_path()).unwrap();
+        let decoded = decode_blooms(&bytes, part.meta.row_group_count as usize).unwrap();
+        let legacy = encode_btf1(&decoded.line);
+        fs::write(part.bloom_path(), &legacy).unwrap();
+
+        let meta_path = part.meta_path();
+        let mut meta: MetaFile =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.integrity.bloom_crc32 = crc32fast::hash(&legacy);
+        meta.integrity.metadata_crc32 = 0;
+        meta.integrity.metadata_crc32 = metadata_crc32(&meta).unwrap();
+        fs::write(meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
+
+    fn rewrite_part_bloom_as_v2(part: &Part) {
+        let bytes = fs::read(part.bloom_path()).unwrap();
+        let decoded = decode_blooms(&bytes, part.meta.row_group_count as usize).unwrap();
+        let legacy = encode_btf2(&decoded.line, decoded.exact_fields.as_ref().unwrap());
+        fs::write(part.bloom_path(), &legacy).unwrap();
+
+        let meta_path = part.meta_path();
+        let mut meta: MetaFile =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.integrity.bloom_crc32 = crc32fast::hash(&legacy);
+        meta.integrity.metadata_crc32 = 0;
+        meta.integrity.metadata_crc32 = metadata_crc32(&meta).unwrap();
+        fs::write(meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
 
     fn make_rows() -> Vec<Row> {
         let mut labels1: Labels = BTreeMap::new();
@@ -1705,6 +2126,314 @@ mod tests {
     }
 
     #[test]
+    fn btf2_exact_field_bloom_prunes_structured_metadata_by_row_group() {
+        let tmp = tempfile_dir();
+        let mut rows = make_rows();
+        rows[0].structured_metadata = vec![("trace_id".to_string(), "first".to_string())];
+        rows[1].structured_metadata = vec![("trace_id".to_string(), "second".to_string())];
+        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
+        assert_eq!(&fs::read(part.bloom_path()).unwrap()[..4], BLOOM_MAGIC_V3);
+        let reader = PartReader::open(part).unwrap();
+
+        let selected = reader.select_row_groups_with_exact_fields(
+            &[],
+            &[],
+            &[ExactFieldPredicate::new("trace_id", "second")],
+            QueryTimeRange {
+                start_ns: i64::MIN,
+                end_ns: i64::MAX,
+                include_end: true,
+            },
+        );
+        assert_eq!(selected, vec![1]);
+
+        // Stream labels are pipeline fields too, but are not in the exact
+        // field bloom. Their predicate must therefore remain conservative.
+        let app = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "test".to_string()).unwrap();
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                std::slice::from_ref(&app),
+                &[],
+                &[ExactFieldPredicate::new("app", "test")],
+                QueryTimeRange {
+                    start_ns: i64::MIN,
+                    end_ns: i64::MAX,
+                    include_end: true,
+                },
+            ),
+            vec![0, 1]
+        );
+
+        assert!(!reader.may_match_exact_fields(
+            &[],
+            &[],
+            &[ExactFieldPredicate::new("trace_id", "not-present")],
+            i64::MIN,
+            i64::MAX,
+        ));
+        assert!(reader.may_match_exact_fields(
+            &[],
+            &[],
+            &[ExactFieldPredicate::new("missing", "")],
+            i64::MIN,
+            i64::MAX,
+        ));
+    }
+
+    #[test]
+    fn btf2_exact_field_bloom_indexes_parser_scalars_without_raw_substring_assumptions() {
+        let tmp = tempfile_dir();
+        let mut rows = make_rows();
+        rows[0].line = r#"{"user":"\u0061lice","namespace:key":"value"}"#.to_string();
+        rows[1].line = r#"user=bob elapsed=250ms"#.to_string();
+        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let time_range = QueryTimeRange {
+            start_ns: i64::MIN,
+            end_ns: i64::MAX,
+            include_end: true,
+        };
+
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &[],
+                &[],
+                &[ExactFieldPredicate::new_with_extraction(
+                    "user", "alice", true,
+                )],
+                time_range,
+            ),
+            vec![0]
+        );
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &[],
+                &[],
+                &[ExactFieldPredicate::new_with_extraction(
+                    "user", "bob", true,
+                )],
+                time_range,
+            ),
+            vec![1]
+        );
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &[],
+                &[],
+                &[ExactFieldPredicate::new_with_extraction(
+                    "namespace_key",
+                    "value",
+                    true,
+                )],
+                time_range,
+            ),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn btf2_exact_field_bloom_indexes_canonical_numeric_and_duration_values() {
+        let tmp = tempfile_dir();
+        let rows = vec![
+            Row {
+                timestamp_ns: 1,
+                labels: BTreeMap::new(),
+                line: r#"{"value":9007199254740992,"elapsed":"1s"}"#.to_string(),
+                structured_metadata: vec![],
+            },
+            Row {
+                timestamp_ns: 2,
+                labels: BTreeMap::new(),
+                line: r#"{"value":9007199254740993,"elapsed":"1000ms"}"#.to_string(),
+                structured_metadata: vec![],
+            },
+        ];
+        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let range = QueryTimeRange {
+            start_ns: i64::MIN,
+            end_ns: i64::MAX,
+            include_end: true,
+        };
+
+        let numeric = crate::logql::parse("{} | json | value=9007199254740993").unwrap();
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &[],
+                &[],
+                &numeric.exact_field_predicates(),
+                range,
+            ),
+            vec![1]
+        );
+
+        let duration = crate::logql::parse("{} | json | elapsed=1s").unwrap();
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &[],
+                &[],
+                &duration.exact_field_predicates(),
+                range,
+            ),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn btf2_indexes_scan_typed_equality_conservatively() {
+        let tmp = tempfile_dir();
+        let rows = vec![
+            Row {
+                timestamp_ns: 1,
+                labels: BTreeMap::new(),
+                line: r#"{"value":500.0}"#.to_string(),
+                structured_metadata: vec![],
+            },
+            Row {
+                timestamp_ns: 2,
+                labels: BTreeMap::new(),
+                line: r#"{"value":999}"#.to_string(),
+                structured_metadata: vec![],
+            },
+        ];
+        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
+        rewrite_part_bloom_as_v2(&part);
+        let reader = PartReader::open(load_part(&part.dir).unwrap()).unwrap();
+        let query = crate::logql::parse("{} | json | value=500").unwrap();
+        let selected = reader.select_row_groups_with_exact_fields(
+            &[],
+            &[],
+            &query.exact_field_predicates(),
+            QueryTimeRange {
+                start_ns: i64::MIN,
+                end_ns: i64::MAX,
+                include_end: true,
+            },
+        );
+        assert_eq!(selected, vec![0, 1]);
+    }
+
+    #[test]
+    fn btf1_part_loads_and_exact_fields_fall_back_to_scanning() {
+        let tmp = tempfile_dir();
+        let part = flush_rows(make_rows(), &tmp, 1).unwrap().remove(0);
+        rewrite_part_bloom_as_v1(&part);
+
+        let legacy_part = load_part(&part.dir).unwrap();
+        let reader = PartReader::open(legacy_part).unwrap();
+        assert!(reader.exact_field_bloom.is_none());
+        assert!(reader.may_match_exact_fields(
+            &[],
+            &[],
+            &[ExactFieldPredicate::new("trace_id", "not-present")],
+            i64::MIN,
+            i64::MAX,
+        ));
+    }
+
+    #[test]
+    fn bloom_container_versions_reject_invalid_framing() {
+        let bloom = BloomFilter::with_capacity(1, 0.01);
+        let legacy = encode_btf1(&[bloom]);
+        let decoded = decode_blooms(&legacy, 1).unwrap();
+        assert_eq!(decoded.line.len(), 1);
+        assert!(decoded.exact_fields.is_none());
+        assert!(
+            decode_blooms(&legacy, 2)
+                .err()
+                .unwrap()
+                .contains("row group count mismatch")
+        );
+
+        let mut trailing = legacy.clone();
+        trailing.push(0);
+        assert!(
+            decode_blooms(&trailing, 1)
+                .err()
+                .unwrap()
+                .contains("trailing bytes")
+        );
+
+        let mut unknown = legacy.clone();
+        unknown[..4].copy_from_slice(b"BTF9");
+        assert!(
+            decode_blooms(&unknown, 1)
+                .err()
+                .unwrap()
+                .contains("magic mismatch")
+        );
+
+        let mut truncated_v2 = Vec::new();
+        truncated_v2.extend_from_slice(BLOOM_MAGIC_V2);
+        truncated_v2.extend_from_slice(&1u32.to_le_bytes());
+        truncated_v2.extend_from_slice(&legacy[8..]);
+        assert!(
+            decode_blooms(&truncated_v2, 1)
+                .err()
+                .unwrap()
+                .contains("length truncated")
+        );
+    }
+
+    #[test]
+    fn forward_limit_stops_physical_part_scan() {
+        let tmp = tempfile_dir();
+        let rows: Vec<Row> = (0..20)
+            .map(|timestamp_ns| Row {
+                timestamp_ns,
+                labels: BTreeMap::new(),
+                line: format!("line-{timestamp_ns}"),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 20).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let result = reader
+            .query_with_exact_field_pruning_and_scan_limit(
+                &[],
+                ExactFieldPruning::new(&[], &[]),
+                0,
+                19,
+                1,
+                true,
+                Some(100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.scanned_rows, 1);
+        assert_eq!(result.results[0].entries[0].timestamp_ns, 0);
+    }
+
+    #[test]
+    fn scan_limit_stops_before_collecting_the_rest_of_a_part() {
+        let tmp = tempfile_dir();
+        let rows: Vec<Row> = (0..20)
+            .map(|timestamp_ns| Row {
+                timestamp_ns,
+                labels: BTreeMap::new(),
+                line: format!("line-{timestamp_ns}"),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 20).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let result = reader
+            .query_with_exact_field_pruning_and_scan_limit(
+                &[],
+                ExactFieldPruning::new(&[], &[]),
+                0,
+                19,
+                usize::MAX,
+                true,
+                Some(3),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.scanned_rows, 3);
+        assert_eq!(result.results[0].entries.len(), 3);
+    }
+
+    #[test]
     fn label_index_prunes_wrong_app() {
         let tmp = tempfile_dir();
         let rows = make_rows();
@@ -1746,15 +2475,15 @@ mod tests {
         let tmp = tempfile_dir();
         let mut labels: Labels = BTreeMap::new();
         labels.insert("app".to_string(), "test".to_string());
-        let rows: Vec<Row> = (0..20)
+        let rows: Vec<Row> = (0..3_000)
             .map(|i| Row {
                 timestamp_ns: 1_700_000_000_000_000_000 + i * 1_000_000_000,
                 labels: labels.clone(),
-                line: format!("line-{:02}", i),
+                line: format!("line-{i:04}"),
                 structured_metadata: vec![],
             })
             .collect();
-        let parts = flush_rows(rows, &tmp, 5).expect("flush");
+        let parts = flush_rows(rows, &tmp, 3_000).expect("flush");
         let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
 
         let r = reader
@@ -1764,7 +2493,7 @@ mod tests {
             .iter()
             .flat_map(|s| s.entries.iter().map(|e| e.line.as_str()))
             .collect();
-        assert_eq!(lines, vec!["line-19", "line-18", "line-17"]);
+        assert_eq!(lines, vec!["line-2999", "line-2998", "line-2997"]);
 
         let r = reader
             .query(&[], &[], i64::MIN, i64::MAX, 3, true)
@@ -1773,7 +2502,7 @@ mod tests {
             .iter()
             .flat_map(|s| s.entries.iter().map(|e| e.line.as_str()))
             .collect();
-        assert_eq!(lines, vec!["line-00", "line-01", "line-02"]);
+        assert_eq!(lines, vec!["line-0000", "line-0001", "line-0002"]);
     }
 
     #[test]

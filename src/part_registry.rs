@@ -1,11 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::logql::{LabelMatcher, LineFilter};
-use crate::memtable::{IndexStats, Labels, StreamResult};
+use crate::memtable::{IndexStats, Labels, QueryResult, StreamResult};
 use crate::object_storage::Manifest;
-use crate::part::{Part, PartReader, discover_parts};
+use crate::part::{ExactFieldPredicate, ExactFieldPruning, Part, PartReader, discover_parts};
 
 pub struct PartRegistry {
     inner: RwLock<HashMap<String, Arc<PartReader>>>,
@@ -97,19 +98,32 @@ impl PartRegistry {
         start_ns: i64,
         end_ns: i64,
     ) -> std::collections::HashSet<String> {
+        self.candidate_part_ids_with_exact_fields(matchers, &[], &[], start_ns, end_ns)
+    }
+
+    /// Plans against catalog-resident indexes only, including the optional
+    /// BTF2/BTF3 exact-field blooms. BTF1 readers conservatively return
+    /// candidates; BTF2 also conservatively scans typed canonical predicates.
+    pub fn candidate_part_ids_with_exact_fields(
+        &self,
+        matchers: &[LabelMatcher],
+        line_filters: &[LineFilter],
+        exact_fields: &[ExactFieldPredicate],
+        start_ns: i64,
+        end_ns: i64,
+    ) -> std::collections::HashSet<String> {
         self.inner
             .read()
             .unwrap()
             .iter()
             .filter(|(_, reader)| {
-                let meta = reader.meta();
-                meta.max_ts_ns >= start_ns
-                    && meta.min_ts_ns <= end_ns
-                    && (matchers.is_empty()
-                        || meta
-                            .streams
-                            .iter()
-                            .any(|labels| matchers.iter().all(|matcher| matcher.matches(labels))))
+                reader.may_match_exact_fields(
+                    matchers,
+                    line_filters,
+                    exact_fields,
+                    start_ns,
+                    end_ns,
+                )
             })
             .map(|(id, _)| id.clone())
             .collect()
@@ -194,9 +208,54 @@ impl PartRegistry {
         limit: usize,
         forward: bool,
     ) -> Result<Vec<StreamResult>, String> {
+        Ok(self
+            .query_with_exact_field_pruning_and_scan_limit(
+                matchers,
+                ExactFieldPruning::new(line_filters, &[]),
+                start_ns,
+                end_ns,
+                limit,
+                forward,
+                None,
+                None,
+            )?
+            .results)
+    }
+
+    pub fn query_with_exact_field_pruning(
+        &self,
+        matchers: &[LabelMatcher],
+        pruning: ExactFieldPruning<'_>,
+        start_ns: i64,
+        end_ns: i64,
+        limit: usize,
+        forward: bool,
+    ) -> Result<Vec<StreamResult>, String> {
+        Ok(self
+            .query_with_exact_field_pruning_and_scan_limit(
+                matchers, pruning, start_ns, end_ns, limit, forward, None, None,
+            )?
+            .results)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_with_exact_field_pruning_and_scan_limit(
+        &self,
+        matchers: &[LabelMatcher],
+        pruning: ExactFieldPruning<'_>,
+        start_ns: i64,
+        end_ns: i64,
+        limit: usize,
+        forward: bool,
+        scan_limit: Option<usize>,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<QueryResult, String> {
         let readers = self.snapshot();
         if readers.is_empty() {
-            return Ok(Vec::new());
+            return Ok(QueryResult {
+                results: Vec::new(),
+                scanned_rows: 0,
+            });
         }
 
         let mut candidates: Vec<Arc<PartReader>> = readers
@@ -217,7 +276,19 @@ impl PartRegistry {
         }
 
         let mut all: Vec<(Labels, crate::memtable::LogEntry)> = Vec::new();
+        let mut scanned_rows = 0usize;
         for reader in &candidates {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                break;
+            }
+            // Every part must be considered. Parts can contain overlapping and
+            // out-of-order timestamp ranges, so reaching the global limit in
+            // an earlier part is not a safe reason to skip later parts.
+            let part_limit = limit;
+            let part_scan_limit = scan_limit.map(|budget| budget.saturating_sub(scanned_rows));
+            if part_scan_limit == Some(0) {
+                break;
+            }
             let access_marker = reader.part().dir.join(".access");
             match std::fs::symlink_metadata(&access_marker) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -230,15 +301,28 @@ impl PartRegistry {
                     let _ = std::fs::write(&access_marker, []);
                 }
             }
-            let results = reader
-                .query(matchers, line_filters, start_ns, end_ns, limit, forward)
+            let result = reader
+                .query_with_exact_field_pruning_and_scan_limit(
+                    matchers,
+                    pruning,
+                    start_ns,
+                    end_ns,
+                    part_limit,
+                    forward,
+                    part_scan_limit,
+                    cancellation,
+                )
                 .map_err(|error| {
                     format!("failed to query part {}: {error}", reader.part().meta.id)
                 })?;
-            for sr in results {
+            scanned_rows = scanned_rows.saturating_add(result.scanned_rows);
+            for sr in result.results {
                 for entry in sr.entries {
                     all.push((sr.labels.clone(), entry));
                 }
+            }
+            if part_scan_limit.is_some_and(|limit| result.scanned_rows >= limit) {
+                break;
             }
         }
 
@@ -249,7 +333,10 @@ impl PartRegistry {
         }
         all.truncate(limit);
 
-        Ok(crate::part::group_by_labels(all))
+        Ok(QueryResult {
+            results: crate::part::group_by_labels(all),
+            scanned_rows,
+        })
     }
 
     pub fn label_names(&self) -> Vec<String> {
@@ -333,6 +420,30 @@ mod tests {
             line: line.to_string(),
             structured_metadata: vec![],
         }
+    }
+
+    #[test]
+    fn query_considers_later_parts_with_overlapping_out_of_order_timestamps() {
+        let dir = temp_dir();
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = PartRegistry::new();
+        let first =
+            part::flush_rows(vec![row("first", 0), row("late", 1_000)], &parts_root, 100).unwrap();
+        let second = part::flush_rows(vec![row("out-of-order", 1)], &parts_root, 100).unwrap();
+        registry.register(first).unwrap();
+        registry.register(second).unwrap();
+
+        let result = registry.query(&[], &[], 0, 1_000, 2, true).unwrap();
+        let entries: Vec<_> = result
+            .into_iter()
+            .flat_map(|stream| stream.entries)
+            .map(|entry| (entry.timestamp_ns, entry.line))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![(0, "first".to_string()), (1, "out-of-order".to_string())]
+        );
     }
 
     #[test]
@@ -454,5 +565,41 @@ mod tests {
             .query(&[], &[], i64::MAX, i64::MAX, 100, true)
             .expect("part query");
         assert_eq!(results.iter().map(|r| r.entries.len()).sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn exact_field_candidates_preserve_row_group_time_correlation() {
+        let dir = temp_dir();
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let first_ts = 1_700_000_000_000_000_000;
+        let second_ts = first_ts + 1_000_000_000;
+        let mut first = row("first", first_ts);
+        first.structured_metadata = vec![("trace_id".to_string(), "first".to_string())];
+        let mut second = row("second", second_ts);
+        second.structured_metadata = vec![("trace_id".to_string(), "second".to_string())];
+        let parts = part::flush_rows(vec![first, second], &parts_root, 1).unwrap();
+        let part_id = parts[0].meta.id.clone();
+        let registry = PartRegistry::new();
+        registry.register(parts).unwrap();
+
+        let predicate = ExactFieldPredicate::new("trace_id", "second");
+        assert!(
+            registry
+                .candidate_part_ids_with_exact_fields(
+                    &[],
+                    &[],
+                    std::slice::from_ref(&predicate),
+                    i64::MIN,
+                    i64::MAX,
+                )
+                .contains(&part_id)
+        );
+        assert!(
+            registry
+                .candidate_part_ids_with_exact_fields(&[], &[], &[predicate], first_ts, first_ts,)
+                .is_empty(),
+            "a field value in a later row group must not force restoration"
+        );
     }
 }

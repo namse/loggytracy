@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode, PutOptions, UpdateVersion};
@@ -261,6 +262,12 @@ pub struct ObjectStorage {
 pub struct RemoteCache {
     pub storage: Arc<ObjectStorage>,
     pub parts_root: PathBuf,
+    // The low bit is health; the remaining bits are a failure generation.
+    // A success may clear a failure only if the operation started in the
+    // current generation, preventing an older concurrent restore/publish from
+    // overwriting a newer failure.
+    remote_state: Arc<AtomicU64>,
+    cache_healthy: Arc<AtomicBool>,
 }
 
 impl RemoteCache {
@@ -268,7 +275,62 @@ impl RemoteCache {
         Self {
             storage,
             parts_root,
+            remote_state: Arc::new(AtomicU64::new(1)),
+            cache_healthy: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.is_remote_healthy() && self.is_cache_healthy()
+    }
+
+    pub fn is_remote_healthy(&self) -> bool {
+        self.remote_state.load(Ordering::Acquire) & 1 == 1
+    }
+
+    pub fn is_cache_healthy(&self) -> bool {
+        self.cache_healthy.load(Ordering::Acquire)
+    }
+
+    pub fn mark_remote_healthy(&self) {
+        let epoch = self.remote_operation_epoch();
+        self.mark_remote_healthy_since(epoch);
+    }
+
+    pub fn mark_remote_unhealthy(&self) {
+        self.remote_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                Some((((state >> 1).saturating_add(1)) << 1) & !1)
+            })
+            .ok();
+    }
+
+    pub fn remote_operation_epoch(&self) -> u64 {
+        self.remote_state.load(Ordering::Acquire) >> 1
+    }
+
+    pub fn mark_remote_healthy_since(&self, epoch: u64) {
+        let unhealthy = epoch << 1;
+        let healthy = unhealthy | 1;
+        let _ = self.remote_state.compare_exchange(
+            unhealthy,
+            healthy,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn mark_cache_healthy(&self) {
+        self.cache_healthy.store(true, Ordering::Release);
+    }
+
+    pub fn mark_cache_unhealthy(&self) {
+        self.cache_healthy.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn mark_unhealthy(&self) {
+        self.mark_remote_unhealthy();
     }
 }
 

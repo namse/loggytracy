@@ -1115,6 +1115,7 @@ dependencies = [
  "serde_json",
  "snap",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",

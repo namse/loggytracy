@@ -9,7 +9,7 @@ new Codex context can continue without relying on chat history.
 | M0 | Complete (`8594b63`) | Loki push ingest, durable journal acknowledgement, MemTable, and the initial LogQL/query APIs |
 | M1 | Complete locally (`2b51b29`) | Parquet parts, bloom/stream indexes, restart recovery, unified query, and merge |
 | M2 | Complete | Object-store publication, conditional manifest updates, local cache eviction, and query restoration |
-| M3 | Pending | JSON/logfmt parsing, metric queries, and field-filter push-down sufficient for real dashboards |
+| M3 | Complete (review remediated) | JSON/logfmt parsing, metric queries, field-filter push-down, and bounded query execution sufficient for real dashboards |
 | M4 | Pending | OTLP trace ingest, trace-ID lookup, and Tempo-compatible APIs |
 | M5 | Pending | Compaction tuning, retention, resource limits, and load validation against explicit targets |
 | M6 | Pending | Read replica, manifest following, fenced promotion, and a machine-replacement rehearsal |
@@ -46,6 +46,58 @@ M2 final verification: `cargo fmt --all -- --check`, Clippy with warnings
 denied, all 134 tests, and `git diff --check` passed. A process-level local-file
 object-store run also restored an evicted Parquet body and returned the expected
 query results. The final fresh-context review reported no blocking findings.
+
+## M3 acceptance checklist
+
+- [x] LogQL has an ordered AST for line filters, `json`, `logfmt`, and field
+  comparisons using `=`, `!=`, `=~`, `!~`, `<`, `<=`, `>`, and `>=`.
+- [x] JSON and logfmt extract scalar fields deterministically; structured
+  metadata participates in field filtering, and malformed parser input has a
+  consistent error-field behavior instead of aborting an entire scan.
+- [x] String, regex, exact-decimal numeric, and duration filters return
+  identical results for MemTable and flushed-part data. Numeric field values
+  are rejected when they are not finite decimal values; the 2^53 boundary is
+  covered by regression tests.
+- [x] `rate`, `count_over_time`, and `bytes_over_time` implement `(t-range, t]`
+  windows without inheriting the log query limit.
+- [x] `sum`, `avg`, `min`, and `max`, with optional `by (...)`, plus `topk`,
+  operate independently at every evaluation timestamp.
+- [x] Range metrics return Loki `matrix` results and instant metrics return
+  `vector` results; log queries remain `streams`.
+- [x] Metric lookback scans and restores data before the HTTP start time, and
+  invalid steps/ranges or unsupported expressions return clear client errors.
+- [x] Positive exact field equality can conservatively prune new parts or row
+  groups, including canonical numeric/duration values before remote-body
+  restoration, while old M1/M2 parts load and fall back to scanning without
+  false negatives.
+- [x] A fresh-context review reports no blocking findings.
+- [x] The complete required validation set passes after the final review fix.
+
+M3 explicitly defers `line_format`, `label_format`, `unwrap`,
+`quantile_over_time`, binary/vector operators, `without`, offsets, subqueries,
+deduplication for crash-replay duplicates, and Parquet range reads. Metric
+queries have bounded evaluation points, scanned rows, output samples, and
+series; concurrent scans/evaluations are scheduled and timed out, but the
+bounded row set is still evaluated in memory rather than using streaming or
+pre-aggregation. Structured metadata is promoted to metric labels only when a
+`by (...)` clause names the field, with a series cardinality limit. JSON
+extraction currently supports scalar/object fields; top-level arrays and null
+values are ignored or produce parser-error behavior rather than Loki's full
+JSON semantics. Empty-string equality, stream-label fields, and synthesized
+`_extracted` collision names remain conservative and do not drive exact-field
+pruning.
+
+M3 final verification: `cargo fmt --all -- --check`, Clippy with warnings
+denied, `cargo test --all-targets` (171 tests), and `git diff --check` passed.
+Review remediation now scans every overlapping part before applying the global
+limit, includes the first metric lookback window when `start` is omitted,
+counts and bounds physical row scans, streams metric evaluation output under
+the sample cap, cooperatively cancels timed-out blocking work before releasing
+permits and part guards, and allows parser fields named after storage columns
+in metric grouping. Query limits include a 5,000,000-row scan budget, bounded
+metric output, eight concurrent log scans, four concurrent metric evaluations,
+and a 30-second execution/restore timeout. Object-store and journal failures
+are reflected in readiness and retried without requiring new ingest.
 
 ## Completion protocol
 

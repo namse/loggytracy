@@ -52,6 +52,19 @@ impl EntryAdapter {
 }
 
 pub fn validate_label_name(name: &str) -> Result<(), String> {
+    validate_field_name(name)?;
+    // Stream labels are persisted as Parquet columns, so these storage column
+    // names remain reserved even though LogQL pipeline fields may use them.
+    match name {
+        "_msg" | "timestamp_ns" | "structured_metadata" => Err(format!(
+            "invalid label name '{}': reserved column name",
+            name
+        )),
+        _ => Ok(()),
+    }
+}
+
+pub fn validate_field_name(name: &str) -> Result<(), String> {
     let bytes = name.as_bytes();
     if bytes.is_empty() {
         return Err("empty label name".to_string());
@@ -71,15 +84,7 @@ pub fn validate_label_name(name: &str) -> Result<(), String> {
             ));
         }
     }
-    // 예약 컬럼명 거부: 라벨 이름이 _msg/timestamp_ns/structured_metadata와 충돌하면
-    // Parquet 스키마에서 중복 컬럼이 생기는 것을 막는다.
-    match name {
-        "_msg" | "timestamp_ns" | "structured_metadata" => Err(format!(
-            "invalid label name '{}': reserved column name",
-            name
-        )),
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 pub fn parse_labels(s: &str) -> Result<std::collections::BTreeMap<String, String>, String> {

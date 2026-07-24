@@ -34,6 +34,20 @@ pub struct AppState {
     pub remote_cache: Option<Arc<RemoteCache>>,
 }
 
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/loki/api/v1/push", post(ingest::push))
+        .route("/loki/api/v1/query_range", get(query::query_range))
+        .route("/loki/api/v1/query", get(query::query))
+        .route("/loki/api/v1/series", get(query::series))
+        .route("/loki/api/v1/labels", get(query::labels))
+        .route("/loki/api/v1/label/{name}/values", get(query::label_values))
+        .route("/loki/api/v1/status/buildinfo", get(query::buildinfo))
+        .route("/loki/api/v1/index/stats", get(query::index_stats))
+        .route("/ready", get(query::ready))
+        .with_state(state)
+}
+
 fn recover(config: &Config, memtable: &MemTable) -> Result<(), String> {
     let parts_root = config.data_dir.join("parts");
     std::fs::create_dir_all(&parts_root).map_err(|e| e.to_string())?;
@@ -180,8 +194,14 @@ async fn main() {
                     config.cache_max_bytes,
                     &eligible,
                 ) {
-                    Ok(bytes) => tracing::debug!(bytes, "local part cache eviction complete"),
-                    Err(error) => tracing::warn!(%error, "local part cache eviction failed"),
+                    Ok(bytes) => {
+                        cache.mark_cache_healthy();
+                        tracing::debug!(bytes, "local part cache eviction complete");
+                    }
+                    Err(error) => {
+                        cache.mark_cache_unhealthy();
+                        tracing::warn!(%error, "local part cache eviction failed");
+                    }
                 }
             }
         });
@@ -196,17 +216,7 @@ async fn main() {
         remote_cache,
     });
 
-    let app = Router::new()
-        .route("/loki/api/v1/push", post(ingest::push))
-        .route("/loki/api/v1/query_range", get(query::query_range))
-        .route("/loki/api/v1/query", get(query::query))
-        .route("/loki/api/v1/series", get(query::series))
-        .route("/loki/api/v1/labels", get(query::labels))
-        .route("/loki/api/v1/label/{name}/values", get(query::label_values))
-        .route("/loki/api/v1/status/buildinfo", get(query::buildinfo))
-        .route("/loki/api/v1/index/stats", get(query::index_stats))
-        .route("/ready", get(query::ready))
-        .with_state(state);
+    let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)
         .await

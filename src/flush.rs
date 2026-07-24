@@ -29,7 +29,13 @@ pub async fn flush_loop(
         ticker.tick().await;
         if pending_checkpoint.is_some() {
             let pending_offset = pending_checkpoint.expect("checked pending checkpoint");
-            match retry_pending_checkpoint(&journal, &mut pending_checkpoint) {
+            match retry_pending_checkpoint(
+                &journal,
+                &mut pending_checkpoint,
+                remote_cache.is_some(),
+            )
+            .await
+            {
                 Ok(offset) => {
                     healthy.store(true, Ordering::Release);
                     last_flush = Instant::now();
@@ -78,15 +84,23 @@ pub async fn flush_loop(
     }
 }
 
-fn retry_pending_checkpoint(
+async fn retry_pending_checkpoint(
     journal: &Journal,
     pending_checkpoint: &mut Option<u64>,
+    compact: bool,
 ) -> Result<u64, String> {
     let offset = pending_checkpoint
         .as_ref()
         .copied()
         .ok_or_else(|| "no journal checkpoint is pending".to_string())?;
-    journal.set_checkpoint(offset).map_err(|e| e.to_string())?;
+    if compact {
+        journal
+            .compact_checkpoint(offset)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        journal.set_checkpoint(offset).map_err(|e| e.to_string())?;
+    }
     *pending_checkpoint = None;
     Ok(offset)
 }
@@ -103,9 +117,10 @@ async fn flush_once(
     if ckpt.snapshot.is_empty() {
         memtable.commit_flush();
         if let Err(error) = advance_checkpoint(journal, ckpt.offset, remote_cache.is_some()).await {
-            if remote_cache.is_none() {
-                *pending_checkpoint = Some(ckpt.offset);
-            }
+            // The part/WAL boundary is ambiguous for both local checkpoint
+            // writes and remote WAL compaction. Retain the offset so a
+            // transient failure is retried even when no new ingest arrives.
+            *pending_checkpoint = Some(ckpt.offset);
             return Err(error.to_string());
         }
         return Ok(());
@@ -114,7 +129,7 @@ async fn flush_once(
     let total_rows = rows.len();
     // Prevent eviction from observing a freshly committed directory before
     // it has been published and installed in the registry.
-    let _cache_guard = match remote_cache {
+    let cache_guard = match remote_cache {
         Some(_) => Some(registry.operation_lock().read_owned().await),
         None => None,
     };
@@ -142,18 +157,28 @@ async fn flush_once(
         Ok(new_parts) => {
             let n = new_parts.len();
             let new_part_dirs: Vec<_> = new_parts.iter().map(|part| part.dir.clone()).collect();
-            if let Some(cache) = remote_cache
-                && let Err(error) = cache.storage.publish(&new_parts, &[]).await
-            {
-                let cleanup_error = part::remove_part_dirs(&new_part_dirs).err();
-                memtable.abort_flush(ckpt.snapshot);
-                return Err(match cleanup_error {
-                    Some(cleanup_error) => format!(
-                        "object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
-                    ),
-                    None => format!("object-store publish failed: {error}"),
-                });
+            if let Some(cache) = remote_cache {
+                let epoch = cache.remote_operation_epoch();
+                if let Err(error) = cache.storage.publish(&new_parts, &[]).await {
+                    cache.mark_remote_unhealthy();
+                    let cleanup_error = part::remove_part_dirs(&new_part_dirs).err();
+                    memtable.abort_flush(ckpt.snapshot);
+                    return Err(match cleanup_error {
+                        Some(cleanup_error) => format!(
+                            "object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
+                        ),
+                        None => format!("object-store publish failed: {error}"),
+                    });
+                }
+                cache.mark_remote_healthy_since(epoch);
             }
+            // A query holds the operation read lock for its complete
+            // memtable/part snapshot. Publish may happen under a read lock,
+            // but registry installation and memtable commit must be one
+            // write-locked visibility transition; otherwise a query can see
+            // the flushing snapshot and its newly registered part together.
+            drop(cache_guard);
+            let _visibility_guard = registry.operation_lock().write_owned().await;
             if let Err(error) = registry.register(new_parts) {
                 // Once a remote manifest has made these parts visible it is
                 // unsafe to delete them. Recovery will reopen them from the
@@ -183,9 +208,7 @@ async fn flush_once(
                 // Commit the in-memory side and retain this offset for the
                 // flush loop to retry before it attempts any later flush.
                 memtable.commit_flush();
-                if remote_cache.is_none() {
-                    *pending_checkpoint = Some(ckpt.offset);
-                }
+                *pending_checkpoint = Some(ckpt.offset);
                 return Err(format!(
                     "parts were committed but journal checkpoint could not be advanced: {error}"
                 ));
@@ -279,7 +302,9 @@ mod tests {
         let failed_offset = pending_checkpoint.expect("checkpoint retry must be retained");
 
         std::fs::remove_dir(data_dir.join("journal.ckpt.tmp")).unwrap();
-        let retried_offset = retry_pending_checkpoint(&journal, &mut pending_checkpoint).unwrap();
+        let retried_offset = retry_pending_checkpoint(&journal, &mut pending_checkpoint, false)
+            .await
+            .unwrap();
 
         assert_eq!(registry.part_count(), 1);
         assert_eq!(retried_offset, failed_offset);

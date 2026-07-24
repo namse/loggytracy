@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::logql::{LabelMatcher, LineFilter};
 
@@ -17,9 +18,66 @@ pub struct StreamResult {
     pub entries: Vec<LogEntry>,
 }
 
+pub struct QueryResult {
+    pub results: Vec<StreamResult>,
+    pub scanned_rows: usize,
+}
+
 pub struct MemTable {
     inner: RwLock<HashMap<Labels, Vec<LogEntry>>>,
     flushing: RwLock<Option<HashMap<Labels, Vec<LogEntry>>>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_memtable_stream(
+    labels: &Labels,
+    entries: &[LogEntry],
+    line_filters: &[LineFilter],
+    start_ns: i64,
+    end_ns: i64,
+    limit: usize,
+    forward: bool,
+    scan_limit: Option<usize>,
+    cancellation: Option<&AtomicBool>,
+    scanned_rows: &mut usize,
+    grouped: &mut BTreeMap<Labels, Vec<LogEntry>>,
+    scan_stopped: &mut bool,
+) {
+    let mut ordered: Vec<&LogEntry> = entries.iter().collect();
+    ordered.sort_unstable_by_key(|entry| entry.timestamp_ns);
+    if !forward {
+        ordered.reverse();
+    }
+    let mut matched = 0usize;
+    for entry in ordered {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            *scan_stopped = true;
+            break;
+        }
+        *scanned_rows = scanned_rows.saturating_add(1);
+        if entry.timestamp_ns >= start_ns
+            && entry.timestamp_ns <= end_ns
+            && line_filters
+                .iter()
+                .all(|filter| filter.matches(&entry.line))
+        {
+            grouped
+                .entry(labels.clone())
+                .or_default()
+                .push(entry.clone());
+            matched += 1;
+            // Each stream contributes at most `limit` rows to the global top
+            // or bottom `limit`, so older rows from this stream cannot affect
+            // the final result once its own candidate set is full.
+            if !forward && matched >= limit {
+                break;
+            }
+        }
+        if scan_limit.is_some_and(|limit| *scanned_rows >= limit) {
+            *scan_stopped = true;
+            break;
+        }
+    }
 }
 
 impl MemTable {
@@ -117,7 +175,40 @@ impl MemTable {
         limit: usize,
         forward: bool,
     ) -> Vec<StreamResult> {
-        let mut all_entries: Vec<(Labels, LogEntry)> = Vec::new();
+        self.query_with_scan_limit(
+            matchers,
+            line_filters,
+            start_ns,
+            end_ns,
+            limit,
+            forward,
+            None,
+            None,
+        )
+        .results
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_with_scan_limit(
+        &self,
+        matchers: &[LabelMatcher],
+        line_filters: &[LineFilter],
+        start_ns: i64,
+        end_ns: i64,
+        limit: usize,
+        forward: bool,
+        scan_limit: Option<usize>,
+        cancellation: Option<&AtomicBool>,
+    ) -> QueryResult {
+        if limit == 0 {
+            return QueryResult {
+                results: Vec::new(),
+                scanned_rows: 0,
+            };
+        }
+        let mut grouped: BTreeMap<Labels, Vec<LogEntry>> = BTreeMap::new();
+        let mut scanned_rows = 0usize;
+        let mut scan_stopped = false;
 
         // begin_flush and abort_flush acquire inner before flushing. Holding
         // both read guards in that order prevents observing the same entry in
@@ -127,55 +218,79 @@ impl MemTable {
             if !matchers.iter().all(|m| m.matches(labels)) {
                 continue;
             }
-            for e in entries {
-                if e.timestamp_ns >= start_ns
-                    && e.timestamp_ns <= end_ns
-                    && line_filters.iter().all(|f| f.matches(&e.line))
-                {
-                    all_entries.push((labels.clone(), e.clone()));
-                }
+            scan_memtable_stream(
+                labels,
+                entries,
+                line_filters,
+                start_ns,
+                end_ns,
+                limit,
+                forward,
+                scan_limit,
+                cancellation,
+                &mut scanned_rows,
+                &mut grouped,
+                &mut scan_stopped,
+            );
+            if scan_stopped {
+                break;
             }
         }
         let flushing = self.flushing.read().unwrap();
-        if let Some(f) = flushing.as_ref() {
+        if !scan_stopped && let Some(f) = flushing.as_ref() {
             for (labels, entries) in f {
                 if !matchers.iter().all(|m| m.matches(labels)) {
                     continue;
                 }
-                for e in entries {
-                    if e.timestamp_ns >= start_ns
-                        && e.timestamp_ns <= end_ns
-                        && line_filters.iter().all(|f| f.matches(&e.line))
-                    {
-                        all_entries.push((labels.clone(), e.clone()));
-                    }
+                scan_memtable_stream(
+                    labels,
+                    entries,
+                    line_filters,
+                    start_ns,
+                    end_ns,
+                    limit,
+                    forward,
+                    scan_limit,
+                    cancellation,
+                    &mut scanned_rows,
+                    &mut grouped,
+                    &mut scan_stopped,
+                );
+                if scan_stopped {
+                    break;
                 }
             }
         }
         drop(flushing);
         drop(inner);
 
+        let mut all_entries: Vec<(Labels, LogEntry)> = grouped
+            .into_iter()
+            .flat_map(|(labels, entries)| {
+                entries
+                    .into_iter()
+                    .map(move |entry| (labels.clone(), entry))
+            })
+            .collect();
         if forward {
             all_entries.sort_by_key(|e| e.1.timestamp_ns);
         } else {
             all_entries.sort_by_key(|e| std::cmp::Reverse(e.1.timestamp_ns));
         }
-
         all_entries.truncate(limit);
-
-        let mut results: Vec<StreamResult> = Vec::new();
+        let mut result_groups: BTreeMap<Labels, Vec<LogEntry>> = BTreeMap::new();
         for (labels, entry) in all_entries {
-            if let Some(result) = results.iter_mut().find(|r| r.labels == labels) {
-                result.entries.push(entry);
-            } else {
-                results.push(StreamResult {
-                    labels,
-                    entries: vec![entry],
-                });
-            }
+            result_groups.entry(labels).or_default().push(entry);
         }
+        let results = result_groups
+            .into_iter()
+            .map(|(labels, entries)| StreamResult { labels, entries })
+            .collect();
 
-        results
+        QueryResult {
+            results,
+            scanned_rows,
+        }
     }
 
     pub fn label_names(&self) -> Vec<String> {

@@ -19,6 +19,11 @@ const RECORD_HEADER_SIZE: usize = 8;
 const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
 const WAL_FILE: &str = "journal.wal";
 const CKPT_FILE: &str = "journal.ckpt";
+const COMPACTION_STATE_FILE: &str = "journal.wal.compact.state";
+const COMPACTION_STATE_VERSION: u8 = 1;
+
+#[cfg(test)]
+static FAIL_AFTER_COMPACTION_RENAME: AtomicBool = AtomicBool::new(false);
 
 pub struct CheckpointSnapshot {
     pub offset: u64,
@@ -228,8 +233,35 @@ pub fn replay(
     ckpt_path: &Path,
     memtable: &MemTable,
 ) -> Result<(u64, u64), String> {
+    recover_unfinished_compaction(wal_path, ckpt_path).map_err(|e| e.to_string())?;
     let checkpoint = read_checkpoint(ckpt_path).map_err(|e| e.to_string())?;
     replay_from(wal_path, checkpoint, memtable).map(|end| (checkpoint, end))
+}
+
+fn recover_unfinished_compaction(wal_path: &Path, ckpt_path: &Path) -> Result<(), IoError> {
+    let state_path = wal_path.with_file_name(COMPACTION_STATE_FILE);
+    let Some(state) = read_compaction_state(&state_path)? else {
+        return Ok(());
+    };
+    if state.phase != 1 {
+        return Ok(());
+    }
+    let tmp_path = wal_path.with_extension("wal.compact.tmp");
+    if !tmp_path.exists() {
+        // The replacement WAL is already in place; replay its suffix from
+        // checkpoint zero.
+        return Ok(());
+    }
+
+    // Rename never committed. Restore the old checkpoint before replay so a
+    // crash between checkpoint=0 and rename cannot replay flushed records.
+    write_checkpoint(ckpt_path, state.offset)?;
+    std::fs::remove_file(&tmp_path)?;
+    std::fs::remove_file(&state_path)?;
+    if let Some(parent) = wal_path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn replay_from(wal_path: &Path, checkpoint: u64, memtable: &MemTable) -> Result<u64, String> {
@@ -491,7 +523,34 @@ async fn writer_loop(
                 Err(error) => {
                     let error_for_caller = IoError::new(error.kind(), error.to_string());
                     let _ = done.send(Err(error_for_caller));
-                    return Err(error);
+                    // Compaction can fail before or after replacing the WAL
+                    // (for example, a directory fsync can fail after rename).
+                    // Reopen the path and continue serving appends so the
+                    // caller can retry the same checkpoint instead of
+                    // permanently fencing the journal writer.
+                    let reopened = async {
+                        let reopened = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                            .await?;
+                        let length = reopened.metadata().await?.len();
+                        Ok::<_, IoError>((reopened, length))
+                    }
+                    .await;
+                    match reopened {
+                        Ok((reopened, length)) => {
+                            file = reopened;
+                            good_len = length;
+                        }
+                        Err(reopen_error) => {
+                            tracing::error!(
+                                error = %reopen_error,
+                                "journal reopen after compaction failure failed; fencing writer"
+                            );
+                            return Err(reopen_error);
+                        }
+                    }
                 }
             }
         }
@@ -511,6 +570,67 @@ async fn compact_wal(
     offset: u64,
     good_len: &mut u64,
 ) -> Result<(), IoError> {
+    let state_path = wal_path.with_file_name(COMPACTION_STATE_FILE);
+    let compaction_state = read_compaction_state(&state_path)?;
+    if let Some(state) = compaction_state {
+        if state.phase == 2 {
+            if offset == state.offset {
+                *file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(wal_path)
+                    .await?;
+                *good_len = file.metadata().await?.len();
+                return Ok(());
+            }
+            if offset < state.offset {
+                return Err(IoError::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "WAL compaction checkpoint moved backwards",
+                ));
+            }
+        } else if state.phase == 1 {
+            let wal_len = std::fs::metadata(wal_path)?.len();
+            let tmp_path = wal_path.with_extension("wal.compact.tmp");
+            if tmp_path.exists() {
+                // Rename did not happen. The checkpoint may already be zero,
+                // so restore the old WAL/checkpoint pair before retrying. New
+                // appends are included in the next source length.
+                if wal_len < state.source_len {
+                    return Err(IoError::new(
+                        std::io::ErrorKind::InvalidData,
+                        "source WAL is shorter than its recorded compaction length",
+                    ));
+                }
+                write_checkpoint(ckpt_path, state.offset)?;
+                std::fs::remove_file(&tmp_path)?;
+                std::fs::remove_file(&state_path)?;
+                if let Some(parent) = wal_path.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+                *good_len = wal_len;
+            } else {
+                // Rename happened; only the directory durability step (or a
+                // later state update) failed. Never apply the old offset to
+                // this replacement WAL a second time.
+                if wal_len < state.retained_len {
+                    return Err(IoError::new(
+                        std::io::ErrorKind::InvalidData,
+                        "replacement WAL is shorter than its recorded suffix",
+                    ));
+                }
+                sync_wal_parent(wal_path)?;
+                write_compaction_state(&state_path, &state, 2)?;
+                *file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(wal_path)
+                    .await?;
+                *good_len = file.metadata().await?.len();
+                return Ok(());
+            }
+        }
+    }
     if offset > *good_len {
         return Err(IoError::new(
             std::io::ErrorKind::InvalidInput,
@@ -539,20 +659,92 @@ async fn compact_wal(
     tmp.sync_all().await?;
     drop(tmp);
 
+    // This durable intent record makes compaction idempotent across the
+    // rename/fsync boundary. A retry observes it and keeps the current WAL
+    // intact instead of interpreting the suffix length as the old offset.
+    let state = CompactionState {
+        phase: 1,
+        offset,
+        source_len: *good_len,
+        retained_len,
+    };
+    write_compaction_state(&state_path, &state, 1)?;
+
     // Resetting the checkpoint before replacing the WAL makes every crash
     // point at-least-once safe: a crash before rename replays the old WAL,
     // while a crash after rename replays only the retained suffix.
     write_checkpoint(ckpt_path, 0)?;
     tokio::fs::rename(&tmp_path, wal_path).await?;
-    if let Some(parent) = wal_path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
+    sync_wal_parent(wal_path)?;
     *file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(wal_path)
         .await?;
     *good_len = retained_len;
+    write_compaction_state(&state_path, &state, 2)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct CompactionState {
+    phase: u8,
+    offset: u64,
+    source_len: u64,
+    retained_len: u64,
+}
+
+fn read_compaction_state(path: &Path) -> Result<Option<CompactionState>, IoError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match bytes.as_slice() {
+        [version, phase, offset @ ..]
+            if *version == COMPACTION_STATE_VERSION
+                && matches!(*phase, 1 | 2)
+                && offset.len() == 24 =>
+        {
+            Ok(Some(CompactionState {
+                phase: *phase,
+                offset: u64::from_le_bytes(offset[0..8].try_into().unwrap()),
+                source_len: u64::from_le_bytes(offset[8..16].try_into().unwrap()),
+                retained_len: u64::from_le_bytes(offset[16..24].try_into().unwrap()),
+            }))
+        }
+        _ => Err(IoError::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid WAL compaction state",
+        )),
+    }
+}
+
+fn write_compaction_state(path: &Path, state: &CompactionState, phase: u8) -> Result<(), IoError> {
+    let mut bytes = Vec::with_capacity(26);
+    bytes.push(COMPACTION_STATE_VERSION);
+    bytes.push(phase);
+    bytes.extend_from_slice(&state.offset.to_le_bytes());
+    bytes.extend_from_slice(&state.source_len.to_le_bytes());
+    bytes.extend_from_slice(&state.retained_len.to_le_bytes());
+    let tmp = path.with_extension("compact.state.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn sync_wal_parent(wal_path: &Path) -> Result<(), IoError> {
+    #[cfg(test)]
+    if FAIL_AFTER_COMPACTION_RENAME.swap(false, Ordering::AcqRel) {
+        return Err(IoError::other("injected WAL directory fsync failure"));
+    }
+    if let Some(parent) = wal_path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -696,6 +888,106 @@ mod tests {
             .flat_map(|stream| stream.entries.iter().map(|entry| entry.line.as_str()))
             .collect();
         assert_eq!(lines, vec!["new"]);
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_does_not_fence_journal_writer() {
+        let h = harness("compact_retry").await;
+        push(&h, make_push_req(&[("{app=\"old\"}", vec![("old", 100)])])).await;
+        let checkpoint = h.journal.checkpoint().await.unwrap();
+        h.memtable.commit_flush();
+
+        let compact_tmp = h.journal.wal_path().with_extension("wal.compact.tmp");
+        std::fs::create_dir_all(&compact_tmp).unwrap();
+        assert!(
+            h.journal
+                .compact_checkpoint(checkpoint.offset)
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir(&compact_tmp).unwrap();
+
+        push(&h, make_push_req(&[("{app=\"new\"}", vec![("new", 200)])])).await;
+        h.journal
+            .compact_checkpoint(checkpoint.offset)
+            .await
+            .unwrap();
+        let restored = MemTable::new();
+        replay(h.journal.wal_path(), h.journal.ckpt_path(), &restored).unwrap();
+        let lines: Vec<_> = restored
+            .query(&[], &[], i64::MIN, i64::MAX, 10, true)
+            .into_iter()
+            .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
+            .collect();
+        assert_eq!(lines, vec!["new"]);
+    }
+
+    #[tokio::test]
+    async fn compaction_retry_after_rename_failure_keeps_acknowledged_suffix() {
+        let h = harness("compact_rename_retry").await;
+        push(&h, make_push_req(&[("{app=\"old\"}", vec![("old", 100)])])).await;
+        let checkpoint = h.journal.checkpoint().await.unwrap();
+        h.memtable.commit_flush();
+
+        FAIL_AFTER_COMPACTION_RENAME.store(true, Ordering::Release);
+        assert!(
+            h.journal
+                .compact_checkpoint(checkpoint.offset)
+                .await
+                .is_err()
+        );
+
+        // The writer was reopened after the injected post-rename failure;
+        // this append must remain in the replacement WAL before retry.
+        push(&h, make_push_req(&[("{app=\"new\"}", vec![("new", 200)])])).await;
+        h.journal
+            .compact_checkpoint(checkpoint.offset)
+            .await
+            .unwrap();
+
+        let restored = MemTable::new();
+        replay(h.journal.wal_path(), h.journal.ckpt_path(), &restored).unwrap();
+        let lines: Vec<_> = restored
+            .query(&[], &[], i64::MIN, i64::MAX, 10, true)
+            .into_iter()
+            .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
+            .collect();
+        assert_eq!(lines, vec!["new"]);
+    }
+
+    #[tokio::test]
+    async fn replay_rolls_back_uncommitted_compaction_before_rename() {
+        let h = harness("compact_replay_rollback").await;
+        push(&h, make_push_req(&[("{app=\"old\"}", vec![("old", 100)])])).await;
+        let checkpoint = h.journal.checkpoint().await.unwrap();
+        h.memtable.commit_flush();
+
+        let source_len = std::fs::metadata(h.journal.wal_path()).unwrap().len();
+        let state_path = h.journal.wal_path().with_file_name(COMPACTION_STATE_FILE);
+        let tmp_path = h.journal.wal_path().with_extension("wal.compact.tmp");
+        let state = CompactionState {
+            phase: 1,
+            offset: checkpoint.offset,
+            source_len,
+            retained_len: 0,
+        };
+        write_compaction_state(&state_path, &state, 1).unwrap();
+        write_checkpoint(h.journal.ckpt_path(), 0).unwrap();
+        std::fs::write(&tmp_path, []).unwrap();
+
+        let restored = MemTable::new();
+        replay(h.journal.wal_path(), h.journal.ckpt_path(), &restored).unwrap();
+        assert!(
+            restored
+                .query(&[], &[], i64::MIN, i64::MAX, 10, true)
+                .is_empty()
+        );
+        assert_eq!(
+            read_checkpoint(h.journal.ckpt_path()).unwrap(),
+            checkpoint.offset
+        );
+        assert!(!state_path.exists());
+        assert!(!tmp_path.exists());
     }
 
     #[tokio::test]

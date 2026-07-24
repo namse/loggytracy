@@ -78,10 +78,16 @@ async fn merge_once(
                 let required: std::collections::HashSet<String> = old_ids.iter().cloned().collect();
                 let missing = registry.missing_data_ids(&required);
                 if !missing.is_empty() {
-                    cache
+                    let epoch = cache.remote_operation_epoch();
+                    if let Err(error) = cache
                         .storage
                         .restore_parts(&cache.parts_root, &missing)
-                        .await?;
+                        .await
+                    {
+                        cache.mark_remote_unhealthy();
+                        return Err(error);
+                    }
+                    cache.mark_remote_healthy_since(epoch);
                 }
             }
 
@@ -150,21 +156,24 @@ async fn merge_once(
                             continue;
                         }
                     };
-                    if let Some(cache) = remote_cache
-                        && let Err(error) = cache.storage.publish(&new_parts, &old_ids).await
-                    {
-                        tracing::error!(
-                            %error,
-                            partition = %partition,
-                            "merged parts could not be published; keeping old parts"
-                        );
-                        if let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs) {
-                            tracing::warn!(%cleanup_error, "failed to remove unpublished merged parts");
+                    if let Some(cache) = remote_cache {
+                        let epoch = cache.remote_operation_epoch();
+                        if let Err(error) = cache.storage.publish(&new_parts, &old_ids).await {
+                            cache.mark_remote_unhealthy();
+                            tracing::error!(
+                                %error,
+                                partition = %partition,
+                                "merged parts could not be published; keeping old parts"
+                            );
+                            if let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs) {
+                                tracing::warn!(%cleanup_error, "failed to remove unpublished merged parts");
+                            }
+                            errors.push(format!(
+                                "object-store merge publish failed for partition {partition}: {error}"
+                            ));
+                            continue;
                         }
-                        errors.push(format!(
-                            "object-store merge publish failed for partition {partition}: {error}"
-                        ));
-                        continue;
+                        cache.mark_remote_healthy_since(epoch);
                     }
                     match registry.replace(&old_ids, new_parts) {
                         Ok(_) => {
