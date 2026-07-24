@@ -17,6 +17,7 @@ mod remote_lifecycle;
 mod retention;
 mod router;
 mod runtime_error;
+mod shutdown;
 mod startup;
 mod tempo;
 #[cfg(test)]
@@ -48,4 +49,5 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     include!("tests/e2e.rs");
+    include!("tests/shutdown_rehearsal.rs");
 }

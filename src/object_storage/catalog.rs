@@ -125,6 +125,19 @@ impl ObjectStorage {
         }
     }
 
+    /// Wrap an arbitrary object store, used by tests to inject fault-injecting
+    /// backends. The store is treated as a full conditional-put backend (no
+    /// local overwrite shortcut), exercising the real CAS manifest path.
+    #[cfg(test)]
+    pub fn from_store(store: Arc<dyn ObjectStore>, prefix: &str) -> Self {
+        Self {
+            store,
+            prefix: ObjectPath::from(prefix),
+            manifest_update: tokio::sync::Mutex::new(()),
+            local_manifest_overwrite: false,
+        }
+    }
+
     fn path(&self, relative: &str) -> ObjectPath {
         if self.prefix.as_ref().is_empty() {
             ObjectPath::from(relative)

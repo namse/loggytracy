@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use tokio::sync::watch;
 use tokio::time::interval;
+
+use crate::shutdown::wait_for_drain;
 
 use crate::config::Config;
 use crate::journal::Journal;
@@ -29,6 +32,7 @@ pub async fn flush_loop(
     config: Arc<Config>,
     healthy: Arc<AtomicBool>,
     metrics: Arc<RuntimeMetrics>,
+    mut drain_rx: watch::Receiver<bool>,
 ) {
     healthy.store(true, Ordering::Release);
     let mut ticker = interval(config.flush_check_interval);
@@ -37,7 +41,13 @@ pub async fn flush_loop(
     let mut pending_checkpoint = None;
 
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = wait_for_drain(&mut drain_rx) => {
+                tracing::info!("flush loop stopping for shutdown; final force-flush will drain remaining data");
+                return;
+            }
+        }
         if pending_checkpoint.is_some() {
             let pending_offset = pending_checkpoint.expect("checked pending checkpoint");
             match retry_pending_checkpoint(
@@ -109,6 +119,62 @@ pub async fn flush_loop(
             }
         }
     }
+}
+
+/// Borrowed inputs for a single force-flush pass during shutdown.
+pub struct ForceFlush<'a> {
+    pub memtable: &'a MemTable,
+    pub trace_memtable: &'a TraceMemTable,
+    pub journal: &'a Journal,
+    pub registry: &'a PartRegistry,
+    pub trace_registry: &'a TraceRegistry,
+    pub remote_cache: Option<&'a RemoteCache>,
+    pub config: &'a Config,
+    pub pending_checkpoint: &'a mut Option<u64>,
+}
+
+/// Perform one force-flush pass, ignoring the size/interval thresholds the
+/// background loop uses. First retry any checkpoint the loop left pending, then
+/// flush the current MemTable snapshot. Returns `Ok(true)` once nothing remains
+/// to flush and the checkpoint is durable, `Ok(false)` when progress was made
+/// but more work remains, and `Err` on a failed attempt the caller should
+/// retry.
+pub async fn force_flush_pass(pass: ForceFlush<'_>) -> Result<bool, String> {
+    let ForceFlush {
+        memtable,
+        trace_memtable,
+        journal,
+        registry,
+        trace_registry,
+        remote_cache,
+        config,
+        pending_checkpoint,
+    } = pass;
+
+    if pending_checkpoint.is_some() {
+        retry_pending_checkpoint(journal, pending_checkpoint, remote_cache.is_some())
+            .await
+            .map_err(|error| format!("failed to retry pending journal checkpoint: {error}"))?;
+        if remote_cache.is_some()
+            && let Err(error) = clear_flush_transaction(&config.data_dir)
+        {
+            tracing::warn!(%error, "failed to clear committed flush transaction after checkpoint retry");
+        }
+    }
+
+    flush_once(
+        memtable,
+        trace_memtable,
+        journal,
+        registry,
+        trace_registry,
+        remote_cache,
+        config,
+        pending_checkpoint,
+    )
+    .await?;
+
+    Ok(memtable.is_empty() && trace_memtable.is_empty() && pending_checkpoint.is_none())
 }
 
 async fn retry_pending_checkpoint(

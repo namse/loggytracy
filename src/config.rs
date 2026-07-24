@@ -47,6 +47,9 @@ pub struct Config {
     pub max_concurrent_trace_scans: usize,
     pub max_trace_query_runtime: Duration,
     pub max_trace_restore_runtime: Duration,
+    /// How long the shutdown force-flush retries silently before it starts
+    /// warning on stdout and enabling operator-initiated abort.
+    pub shutdown_flush_warn_after: Duration,
 }
 
 impl Default for Config {
@@ -93,6 +96,7 @@ impl Default for Config {
             max_concurrent_trace_scans: 8,
             max_trace_query_runtime: Duration::from_secs(30),
             max_trace_restore_runtime: Duration::from_secs(25),
+            shutdown_flush_warn_after: Duration::from_secs(30),
         }
     }
 }
@@ -245,6 +249,10 @@ impl Config {
                 "LOGGYTRACY_MAX_TRACE_RESTORE_RUNTIME",
                 defaults.max_trace_restore_runtime,
             )?,
+            shutdown_flush_warn_after: env_required_duration(
+                "LOGGYTRACY_SHUTDOWN_FLUSH_WARN_AFTER",
+                defaults.shutdown_flush_warn_after,
+            )?,
         };
         config.validate()?;
         Ok(config)
@@ -314,7 +322,8 @@ impl Config {
             self.max_concurrent_trace_scans,
         )?;
         positive_duration("max_trace_query_runtime", self.max_trace_query_runtime)?;
-        positive_duration("max_trace_restore_runtime", self.max_trace_restore_runtime)
+        positive_duration("max_trace_restore_runtime", self.max_trace_restore_runtime)?;
+        positive_duration("shutdown_flush_warn_after", self.shutdown_flush_warn_after)
     }
 }
 

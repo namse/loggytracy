@@ -9,6 +9,7 @@ use crate::memtable::MemTable;
 use crate::metrics::RuntimeMetrics;
 use crate::object_storage::RemoteCache;
 use crate::part_registry::PartRegistry;
+use crate::shutdown::ShutdownState;
 use crate::trace_registry::TraceRegistry;
 
 /// Canonical state fixture used by Loki, Tempo, and ingest tests.
@@ -33,6 +34,7 @@ pub fn state(
             otlp_healthy: Arc::new(AtomicBool::new(true)),
             remote_cache,
             metrics: Arc::new(RuntimeMetrics::new()),
+            shutdown: Arc::new(ShutdownState::new()),
         },
     ))
 }

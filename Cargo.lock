@@ -1135,6 +1135,7 @@ name = "loggytracy"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "axum",
  "bytes",
  "chrono",

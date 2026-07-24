@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::sync::watch;
 use tokio::time::interval;
 
 use crate::config::Config;
@@ -9,6 +10,7 @@ use crate::metrics::RuntimeMetrics;
 use crate::object_storage::{ManifestPart, RemoteCache, TraceManifestPart};
 use crate::part;
 use crate::part_registry::PartRegistry;
+use crate::shutdown::wait_for_drain;
 use crate::trace_registry::TraceRegistry;
 
 pub async fn retention_loop(
@@ -18,12 +20,16 @@ pub async fn retention_loop(
     config: Arc<Config>,
     metrics: Arc<RuntimeMetrics>,
     healthy: Arc<AtomicBool>,
+    mut drain_rx: watch::Receiver<bool>,
 ) {
     healthy.store(true, Ordering::Release);
     let mut ticker = interval(config.retention_interval.max(Duration::from_secs(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = wait_for_drain(&mut drain_rx) => return,
+        }
         if let Err(error) =
             retention_once(&registry, &trace_registry, remote_cache.as_deref(), &config).await
         {

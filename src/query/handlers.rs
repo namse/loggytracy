@@ -230,6 +230,16 @@ pub async fn label_values(
 pub async fn ready(
     State(state): State<Arc<AppState>>,
 ) -> Result<&'static str, (StatusCode, String)> {
+    if state.shutdown.is_draining() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "draining for shutdown: force_flush_complete={}, pending_flush_bytes={}",
+                state.shutdown.is_flush_complete(),
+                state.shutdown.pending_flush_bytes(),
+            ),
+        ));
+    }
     let mut unavailable = Vec::new();
     if !state.journal.is_healthy() {
         unavailable.push("journal writer");
@@ -360,7 +370,13 @@ loggytracy_remote_restore_errors_total {}\n\
 # TYPE loggytracy_remote_restore_latency_ns_total counter\n\
 loggytracy_remote_restore_latency_ns_total {}\n\
 # TYPE loggytracy_cache_evictions_total counter\n\
-loggytracy_cache_evictions_total {}\n",
+loggytracy_cache_evictions_total {}\n\
+# TYPE loggytracy_drain_in_progress gauge\n\
+loggytracy_drain_in_progress {}\n\
+# TYPE loggytracy_pending_flush_bytes gauge\n\
+loggytracy_pending_flush_bytes {}\n\
+# TYPE loggytracy_force_flush_complete gauge\n\
+loggytracy_force_flush_complete {}\n",
         mem.entries,
         mem.bytes,
         disk.entries,
@@ -387,6 +403,9 @@ loggytracy_cache_evictions_total {}\n",
         m.remote_restore_errors.load(Ordering::Relaxed),
         m.remote_restore_latency_ns.load(Ordering::Relaxed),
         m.cache_evictions.load(Ordering::Relaxed),
+        state.shutdown.is_draining() as u8,
+        state.shutdown.pending_flush_bytes(),
+        state.shutdown.is_flush_complete() as u8,
     )
 }
 

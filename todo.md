@@ -28,8 +28,16 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
 
 ## P4 — M6 장비 교체
 
-- [ ] graceful shutdown 핸들러 구현 (SIGTERM 수신 시 ingest 엔드포인트 차단 + in-flight 요청 drain)
-- [ ] 강제 flush(force-flush) 함수 구현 및 S3 업로드/manifest 갱신 완료 대기
-- [ ] drain-status readiness 신호 노출 (pending bytes/flush 완료 여부를 외부에서 확인 가능하게)
-- [ ] 장비 교체 리허설 수행
+상세 계획: [`docs/M6_IMPLEMENTATION_PLAN.md`](docs/M6_IMPLEMENTATION_PLAN.md)
+
+- [x] graceful shutdown 핸들러 구현 (SIGTERM/SIGINT 수신 시 drain 시퀀스 시작, 시퀀스가 프로세스 종료 담당)
+- [x] ingest 차단: draining 중 Loki push 503, OTLP UNAVAILABLE (journal append 이전)
+- [x] in-flight drain: axum `with_graceful_shutdown` + tonic `serve_with_shutdown`
+- [x] background 워커(flush/merge/retention/eviction) 정상 종료 후 최종 force-flush
+- [x] force-flush 함수 구현: 임계값 무시하고 MemTable·pending checkpoint 소진, S3 업로드/manifest 갱신 완료 대기
+- [x] object-store 지속 실패 시 무한 재시도 + stdout 경고 + 운영자 stdin 입력으로만 종료 (하드 타임아웃 없음)
+- [x] 강제 종료 후 재시작 시 저널 replay로 무손실 자동 복구
+- [x] drain-status readiness: draining 중 `/ready` 503 + `/metrics`에 pending bytes/flush 완료 노출
+- [x] 장비 교체 리허설 (새 인스턴스가 무손실로 트래픽 재개)
+- [ ] fresh-context 리뷰 (남은 게이트)
 

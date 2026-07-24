@@ -8,6 +8,7 @@ use prost014::Message;
 use tonic::{Request, Response, Status};
 
 use crate::journal::Journal;
+use crate::shutdown::ShutdownState;
 use crate::trace::normalize_request;
 
 pub const MAX_OTLP_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -16,11 +17,12 @@ pub const MAX_OTLP_SPANS: usize = 100_000;
 #[derive(Clone)]
 pub struct TraceIngestService {
     journal: Arc<Journal>,
+    shutdown: Arc<ShutdownState>,
 }
 
 impl TraceIngestService {
-    pub fn new(journal: Arc<Journal>) -> Self {
-        Self { journal }
+    pub fn new(journal: Arc<Journal>, shutdown: Arc<ShutdownState>) -> Self {
+        Self { journal, shutdown }
     }
 
     pub fn into_server(self) -> TraceServiceServer<Self> {
@@ -36,6 +38,9 @@ impl TraceService for TraceIngestService {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        if self.shutdown.is_draining() {
+            return Err(Status::unavailable("server is draining for shutdown"));
+        }
         let request = request.into_inner();
         if request.encoded_len() > MAX_OTLP_REQUEST_BYTES {
             return Err(Status::resource_exhausted(format!(
@@ -101,6 +106,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_rejects_while_draining_for_shutdown() {
+        let config = Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("loggytracy-trace-drain-{}", uuid::Uuid::new_v4())),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let trace_memtable = Arc::new(TraceMemTable::new());
+        let journal = Arc::new(
+            journal::Journal::spawn_with_traces(
+                &config,
+                Arc::new(crate::memtable::MemTable::new()),
+                trace_memtable.clone(),
+            )
+            .unwrap(),
+        );
+        let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
+        shutdown.begin_drain();
+        let service = TraceIngestService::new(journal, shutdown);
+
+        let status = service.export(Request::new(request())).await.unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(
+            trace_memtable.is_empty(),
+            "a drained OTLP request must not be appended"
+        );
+    }
+
+    #[tokio::test]
     async fn export_acknowledges_after_journal_append() {
         let config = Config {
             data_dir: std::env::temp_dir()
@@ -114,7 +149,8 @@ mod tests {
             journal::Journal::spawn_with_traces(&config, log_memtable, trace_memtable.clone())
                 .unwrap(),
         );
-        let service = TraceIngestService::new(journal);
+        let service =
+            TraceIngestService::new(journal, Arc::new(crate::shutdown::ShutdownState::new()));
         let response = service.export(Request::new(request())).await.unwrap();
         assert!(response.into_inner().partial_success.is_none());
         assert_eq!(trace_memtable.query_trace_id(&"01".repeat(16)).len(), 1);
@@ -147,7 +183,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let service = TraceIngestService::new(journal);
+        let service =
+            TraceIngestService::new(journal, Arc::new(crate::shutdown::ShutdownState::new()));
         let mut invalid = request();
         invalid.resource_spans[0].scope_spans[0].spans[0].trace_id = vec![0; 16];
         let status = service.export(Request::new(invalid)).await.unwrap_err();
@@ -174,7 +211,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let service = TraceIngestService::new(journal);
+        let service =
+            TraceIngestService::new(journal, Arc::new(crate::shutdown::ShutdownState::new()));
         let mut oversized = request();
         oversized.resource_spans[0].scope_spans[0].spans[0].name =
             "x".repeat(MAX_OTLP_REQUEST_BYTES);
@@ -204,7 +242,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let service = TraceIngestService::new(journal);
+        let service =
+            TraceIngestService::new(journal, Arc::new(crate::shutdown::ShutdownState::new()));
         let mut too_many = request();
         too_many.resource_spans[0].scope_spans[0].spans = vec![Span::default(); MAX_OTLP_SPANS + 1];
 
@@ -247,9 +286,11 @@ mod tests {
             Arc::new(config.clone()),
             healthy,
             Arc::new(crate::metrics::RuntimeMetrics::new()),
+            tokio::sync::watch::channel(false).1,
         ));
 
-        let service = TraceIngestService::new(journal);
+        let service =
+            TraceIngestService::new(journal, Arc::new(crate::shutdown::ShutdownState::new()));
         service.export(Request::new(request())).await.unwrap();
         for _ in 0..100 {
             if trace_parts.part_count() == 1 {

@@ -7,6 +7,7 @@ use crate::memtable::MemTable;
 use crate::metrics::RuntimeMetrics;
 use crate::object_storage::RemoteCache;
 use crate::part_registry::PartRegistry;
+use crate::shutdown::ShutdownState;
 use crate::trace_registry::TraceRegistry;
 
 /// Runtime resources shared by HTTP handlers and background workers.
@@ -25,6 +26,7 @@ pub struct AppState {
     pub otlp_healthy: Arc<AtomicBool>,
     pub remote_cache: Option<Arc<RemoteCache>>,
     pub metrics: Arc<RuntimeMetrics>,
+    pub shutdown: Arc<ShutdownState>,
 }
 
 /// Dependencies that are created during startup or by a test fixture.
@@ -39,6 +41,7 @@ pub struct AppStateDependencies {
     pub otlp_healthy: Arc<AtomicBool>,
     pub remote_cache: Option<Arc<RemoteCache>>,
     pub metrics: Arc<RuntimeMetrics>,
+    pub shutdown: Arc<ShutdownState>,
 }
 
 impl AppState {
@@ -67,6 +70,7 @@ impl AppState {
             otlp_healthy: dependencies.otlp_healthy,
             remote_cache: dependencies.remote_cache,
             metrics: dependencies.metrics,
+            shutdown: dependencies.shutdown,
         }
     }
 }

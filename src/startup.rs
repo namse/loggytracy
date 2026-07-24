@@ -152,6 +152,22 @@ pub async fn run(config: Arc<Config>) {
     let merge_healthy = Arc::new(AtomicBool::new(true));
     let retention_healthy = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(RuntimeMetrics::new());
+    let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
+
+    // Handles for every background worker. Shutdown signals them through the
+    // drain watch and then joins them here before the final force-flush, so the
+    // force-flush is the only writer touching the registry and object store.
+    let mut worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // Cheap Arc clones retained for the final force-flush; the originals are
+    // moved into the workers and the shared AppState below.
+    let finalize_memtable = memtable.clone();
+    let finalize_journal = journal.clone();
+    let finalize_parts = parts.clone();
+    let finalize_trace_registry = trace_registry.clone();
+    let finalize_remote_cache = remote_cache.clone();
+    let finalize_config = config.clone();
+    let finalize_shutdown = shutdown.clone();
 
     {
         let memtable = memtable.clone();
@@ -164,6 +180,7 @@ pub async fn run(config: Arc<Config>) {
         let monitor_health = flush_healthy.clone();
         let cache = remote_cache.clone();
         let metrics = metrics.clone();
+        let drain_rx = shutdown.subscribe();
         let handle = tokio::spawn(async move {
             flush::flush_loop(
                 memtable,
@@ -175,16 +192,17 @@ pub async fn run(config: Arc<Config>) {
                 config,
                 task_health,
                 metrics,
+                drain_rx,
             )
             .await;
         });
-        tokio::spawn(async move {
+        worker_handles.push(tokio::spawn(async move {
             match handle.await {
-                Ok(()) => tracing::error!("flush task terminated unexpectedly"),
+                Ok(()) => tracing::info!("flush task stopped"),
                 Err(error) => tracing::error!(%error, "flush task failed"),
             }
             monitor_health.store(false, Ordering::Release);
-        });
+        }));
     }
 
     {
@@ -194,16 +212,17 @@ pub async fn run(config: Arc<Config>) {
         let monitor_health = merge_healthy.clone();
         let cache = remote_cache.clone();
         let metrics = metrics.clone();
+        let drain_rx = shutdown.subscribe();
         let handle = tokio::spawn(async move {
-            merge::merge_loop(registry, cache, config, task_health, metrics).await;
+            merge::merge_loop(registry, cache, config, task_health, metrics, drain_rx).await;
         });
-        tokio::spawn(async move {
+        worker_handles.push(tokio::spawn(async move {
             match handle.await {
-                Ok(()) => tracing::error!("merge task terminated unexpectedly"),
+                Ok(()) => tracing::info!("merge task stopped"),
                 Err(error) => tracing::error!(%error, "merge task failed"),
             }
             monitor_health.store(false, Ordering::Release);
-        });
+        }));
     }
 
     if let Some(cache) = remote_cache.clone() {
@@ -211,11 +230,15 @@ pub async fn run(config: Arc<Config>) {
         let registry = parts.clone();
         let trace_registry = trace_registry.clone();
         let metrics = metrics.clone();
-        tokio::spawn(async move {
+        let mut drain_rx = shutdown.subscribe();
+        worker_handles.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(config.cache_eviction_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = crate::shutdown::wait_for_drain(&mut drain_rx) => return,
+                }
                 let _guard = registry.operation_lock().write_owned().await;
                 let eligible = registry.part_ids();
                 let (log_result, trace_result) = match cache.storage.evict_cache(
@@ -250,7 +273,7 @@ pub async fn run(config: Arc<Config>) {
                     }
                 }
             }
-        });
+        }));
     }
 
     {
@@ -260,7 +283,8 @@ pub async fn run(config: Arc<Config>) {
         let config = config.clone();
         let metrics = metrics.clone();
         let retention_health = retention_healthy.clone();
-        tokio::spawn(async move {
+        let drain_rx = shutdown.subscribe();
+        worker_handles.push(tokio::spawn(async move {
             retention::retention_loop(
                 registry,
                 trace_registry,
@@ -268,9 +292,10 @@ pub async fn run(config: Arc<Config>) {
                 config,
                 metrics,
                 retention_health,
+                drain_rx,
             )
             .await;
-        });
+        }));
     }
 
     let otlp_journal = journal.clone();
@@ -288,23 +313,38 @@ pub async fn run(config: Arc<Config>) {
             otlp_healthy: otlp_healthy.clone(),
             remote_cache,
             metrics,
+            shutdown: shutdown.clone(),
         },
     ));
 
     let app = router::build_router(state);
 
+    // A SIGTERM/SIGINT starts draining: new ingest is rejected, and every drain
+    // subscriber (the HTTP and gRPC servers plus the background workers) stops.
+    {
+        let signal_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            crate::shutdown::wait_for_signal().await;
+            tracing::warn!("shutdown signal received; draining before machine replacement");
+            signal_shutdown.begin_drain();
+        });
+    }
+
     let otlp_addr = config
         .otlp_grpc_addr
         .parse()
         .unwrap_or_else(|error| panic!("invalid OTLP gRPC address: {error}"));
-    let otlp_service = trace_ingest::TraceIngestService::new(otlp_journal);
+    let otlp_service = trace_ingest::TraceIngestService::new(otlp_journal, shutdown.clone());
     let otlp_task_health = otlp_healthy;
-    tokio::spawn(async move {
-        if let Err(error) = tonic::transport::Server::builder()
+    let mut otlp_drain = shutdown.subscribe();
+    let otlp_handle = tokio::spawn(async move {
+        let result = tonic::transport::Server::builder()
             .add_service(otlp_service.into_server())
-            .serve(otlp_addr)
-            .await
-        {
+            .serve_with_shutdown(otlp_addr, async move {
+                crate::shutdown::wait_for_drain(&mut otlp_drain).await;
+            })
+            .await;
+        if let Err(error) = result {
             tracing::error!(%error, "OTLP gRPC server failed");
         }
         otlp_task_health.store(false, Ordering::Release);
@@ -314,5 +354,56 @@ pub async fn run(config: Arc<Config>) {
         .await
         .expect("failed to bind");
     tracing::info!(addr = %config.listen_addr, "loggytracy listening");
-    axum::serve(listener, app).await.expect("server error");
+    let mut http_drain = shutdown.subscribe();
+    let http_result = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            crate::shutdown::wait_for_drain(&mut http_drain).await;
+        })
+        .await;
+    if let Err(error) = http_result {
+        tracing::error!(%error, "HTTP server error");
+    }
+
+    // The HTTP server has stopped accepting and finished its in-flight requests.
+    // Ensure draining is set even if it exited for another reason, then wait for
+    // the gRPC server and every background worker to stop.
+    shutdown.begin_drain();
+    if let Err(error) = otlp_handle.await {
+        tracing::error!(%error, "OTLP gRPC task join failed");
+    }
+    for handle in worker_handles {
+        if let Err(error) = handle.await {
+            tracing::error!(%error, "background worker join failed");
+        }
+    }
+
+    tracing::info!("servers drained; force-flushing before exit");
+    let trace_memtable = finalize_journal.trace_memtable();
+    let outcome = crate::shutdown::finalize_flush(crate::shutdown::FinalizeContext {
+        shutdown: finalize_shutdown,
+        memtable: finalize_memtable,
+        trace_memtable,
+        journal: finalize_journal,
+        registry: finalize_parts,
+        trace_registry: finalize_trace_registry,
+        remote_cache: finalize_remote_cache,
+        config: finalize_config,
+    })
+    .await;
+    match outcome {
+        crate::shutdown::ShutdownOutcome::Durable => {
+            tracing::info!("graceful shutdown complete; all acknowledged data is durable");
+        }
+        crate::shutdown::ShutdownOutcome::AbortedByOperator => {
+            // Force-flush did not reach durability; the operator forced the exit.
+            // Exit non-zero so an automated controller never mistakes this for a
+            // clean shutdown and discards the disk — the WAL still holds the
+            // unflushed data and a restart on this same disk recovers it.
+            tracing::error!(
+                "shutdown aborted before durability; acknowledged data is only on the WAL. \
+Restart on THIS disk to recover; do not discard the disk or replace the machine."
+            );
+            std::process::exit(1);
+        }
+    }
 }

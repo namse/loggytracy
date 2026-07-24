@@ -12,7 +12,7 @@ new Codex context can continue without relying on chat history.
 | M3 | Complete (review remediated) | JSON/logfmt parsing, metric queries, field-filter push-down, and bounded query execution sufficient for real dashboards |
 | M4 | Complete | OTLP trace ingest, trace-ID lookup, and Tempo-compatible APIs |
 | M5 | In progress | Compaction tuning, retention, resource limits, and load validation against explicit targets |
-| M6 | Pending | Graceful shutdown for machine replacement (SIGTERM handling, forced flush-to-S3, drain-status readiness) and a machine-replacement rehearsal |
+| M6 | Complete (review pending) | Graceful shutdown for machine replacement (SIGTERM handling, forced flush-to-S3, drain-status readiness) and a machine-replacement rehearsal |
 
 ## Repository state note
 
@@ -134,6 +134,27 @@ no S3 credentials or S3-compatible deployment/test endpoint is available.
 The mixed-workload tool is implemented, but remote restore, retention GC, and
 long-running object-store behavior require an environment-level run.
 - [ ] Load results and bottlenecks are documented.
+
+## M6 acceptance checklist
+
+The implementation plan and design decisions are recorded in
+[`docs/M6_IMPLEMENTATION_PLAN.md`](M6_IMPLEMENTATION_PLAN.md).
+
+- [x] SIGTERM/SIGINT starts the drain sequence and the sequence owns process exit.
+- [x] While draining, Loki push returns 503 and OTLP returns UNAVAILABLE before any journal append.
+- [x] In-flight acknowledged HTTP and gRPC requests complete before force-flush begins.
+- [x] Background flush/merge/retention/eviction workers stop before the final force-flush.
+- [x] Force-flush drains both MemTables and any pending checkpoint to the object store and manifest, ignoring size/interval thresholds.
+- [x] Persistent object-store failure keeps retrying, warns on stdout, and exits only on explicit operator input; recovery mid-retry finishes and exits cleanly.
+- [x] A manual/forced exit before durability recovers with zero loss on the next start via journal replay.
+- [x] `/ready` returns 503 while draining and `/metrics` exposes drain progress, pending bytes, and force-flush completion.
+- [x] The machine-replacement rehearsal shows a fresh instance resuming with zero acknowledged-data loss.
+- [ ] A fresh-context review reports no blocking findings.
+- [ ] The complete required validation set passes after the final review fix.
+
+Live S3 is not exercised in this workspace; the in-memory and local-file
+object-store backends exercise the same durability contract, and live S3
+remains an environment-level deployment check.
 
 ## Completion protocol
 

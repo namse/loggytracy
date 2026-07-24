@@ -14,6 +14,12 @@ pub async fn push(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if state.shutdown.is_draining() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server is draining for shutdown".to_string(),
+        ));
+    }
     state
         .metrics
         .ingest_requests
@@ -273,6 +279,7 @@ mod tests {
                     config,
                     healthy,
                     Arc::new(crate::metrics::RuntimeMetrics::new()),
+                    tokio::sync::watch::channel(false).1,
                 )
                 .await;
             })

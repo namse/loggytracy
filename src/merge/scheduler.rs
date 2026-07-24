@@ -4,12 +4,16 @@ pub async fn merge_loop(
     config: Arc<Config>,
     healthy: Arc<AtomicBool>,
     metrics: Arc<RuntimeMetrics>,
+    mut drain_rx: watch::Receiver<bool>,
 ) {
     healthy.store(true, Ordering::Release);
     let mut ticker = interval(config.merge_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = wait_for_drain(&mut drain_rx) => return,
+        }
         match merge_once(&registry, remote_cache.as_deref(), &config).await {
             Ok(()) => {
                 metrics.merge_success.fetch_add(1, Ordering::Relaxed);
