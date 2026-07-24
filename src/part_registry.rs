@@ -257,11 +257,38 @@ impl PartRegistry {
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
     ) -> Result<QueryResult, String> {
+        self.query_with_exact_field_pruning_and_scan_limits(
+            matchers,
+            pruning,
+            start_ns,
+            end_ns,
+            limit,
+            forward,
+            scan_limit,
+            None,
+            cancellation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_with_exact_field_pruning_and_scan_limits(
+        &self,
+        matchers: &[LabelMatcher],
+        pruning: ExactFieldPruning<'_>,
+        start_ns: i64,
+        end_ns: i64,
+        limit: usize,
+        forward: bool,
+        scan_limit: Option<usize>,
+        scan_bytes_limit: Option<u64>,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<QueryResult, String> {
         let readers = self.snapshot();
         if readers.is_empty() {
             return Ok(QueryResult {
                 results: Vec::new(),
                 scanned_rows: 0,
+                scanned_bytes: 0,
             });
         }
 
@@ -284,6 +311,7 @@ impl PartRegistry {
 
         let mut all: Vec<(Labels, crate::memtable::LogEntry)> = Vec::new();
         let mut scanned_rows = 0usize;
+        let mut scanned_bytes = 0u64;
         for reader in &candidates {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 break;
@@ -293,7 +321,12 @@ impl PartRegistry {
             // an earlier part is not a safe reason to skip later parts.
             let part_limit = limit;
             let part_scan_limit = scan_limit.map(|budget| budget.saturating_sub(scanned_rows));
+            let part_scan_bytes_limit =
+                scan_bytes_limit.map(|budget| budget.saturating_sub(scanned_bytes));
             if part_scan_limit == Some(0) {
+                break;
+            }
+            if part_scan_bytes_limit == Some(0) {
                 break;
             }
             let access_marker = reader.part().dir.join(".access");
@@ -309,7 +342,7 @@ impl PartRegistry {
                 }
             }
             let result = reader
-                .query_with_exact_field_pruning_and_scan_limit(
+                .query_with_exact_field_pruning_and_scan_limits(
                     matchers,
                     pruning,
                     start_ns,
@@ -317,18 +350,23 @@ impl PartRegistry {
                     part_limit,
                     forward,
                     part_scan_limit,
+                    part_scan_bytes_limit,
                     cancellation,
                 )
                 .map_err(|error| {
                     format!("failed to query part {}: {error}", reader.part().meta.id)
                 })?;
             scanned_rows = scanned_rows.saturating_add(result.scanned_rows);
+            scanned_bytes = scanned_bytes.saturating_add(result.scanned_bytes);
             for sr in result.results {
                 for entry in sr.entries {
                     all.push((sr.labels.clone(), entry));
                 }
             }
             if part_scan_limit.is_some_and(|limit| result.scanned_rows >= limit) {
+                break;
+            }
+            if part_scan_bytes_limit.is_some_and(|limit| result.scanned_bytes >= limit) {
                 break;
             }
         }
@@ -343,6 +381,7 @@ impl PartRegistry {
         Ok(QueryResult {
             results: crate::part::group_by_labels(all),
             scanned_rows,
+            scanned_bytes,
         })
     }
 

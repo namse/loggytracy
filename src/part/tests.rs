@@ -1,0 +1,1087 @@
+    use super::*;
+
+    fn encode_btf1(line_blooms: &[BloomFilter]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BLOOM_MAGIC_V1);
+        bytes.extend_from_slice(&(line_blooms.len() as u32).to_le_bytes());
+        for bloom in line_blooms {
+            let encoded = bloom.encode();
+            bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&encoded);
+        }
+        bytes
+    }
+
+    fn encode_btf2(line_blooms: &[BloomFilter], exact_blooms: &[BloomFilter]) -> Vec<u8> {
+        assert_eq!(line_blooms.len(), exact_blooms.len());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BLOOM_MAGIC_V2);
+        bytes.extend_from_slice(&(line_blooms.len() as u32).to_le_bytes());
+        for (line, exact) in line_blooms.iter().zip(exact_blooms) {
+            for bloom in [line, exact] {
+                let encoded = bloom.encode();
+                bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(&encoded);
+            }
+        }
+        bytes
+    }
+
+    fn rewrite_part_bloom_as_v1(part: &Part) {
+        let bytes = fs::read(part.bloom_path()).unwrap();
+        let decoded = decode_blooms(&bytes, part.meta.row_group_count as usize).unwrap();
+        let legacy = encode_btf1(&decoded.line);
+        fs::write(part.bloom_path(), &legacy).unwrap();
+
+        let meta_path = part.meta_path();
+        let mut meta: MetaFile =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.integrity.bloom_crc32 = crc32fast::hash(&legacy);
+        meta.integrity.metadata_crc32 = 0;
+        meta.integrity.metadata_crc32 = metadata_crc32(&meta).unwrap();
+        fs::write(meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
+
+    fn rewrite_part_bloom_as_v2(part: &Part) {
+        let bytes = fs::read(part.bloom_path()).unwrap();
+        let decoded = decode_blooms(&bytes, part.meta.row_group_count as usize).unwrap();
+        let legacy = encode_btf2(&decoded.line, decoded.exact_fields.as_ref().unwrap());
+        fs::write(part.bloom_path(), &legacy).unwrap();
+
+        let meta_path = part.meta_path();
+        let mut meta: MetaFile =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.integrity.bloom_crc32 = crc32fast::hash(&legacy);
+        meta.integrity.metadata_crc32 = 0;
+        meta.integrity.metadata_crc32 = metadata_crc32(&meta).unwrap();
+        fs::write(meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
+
+    fn make_rows() -> Vec<Row> {
+        let mut labels1: Labels = BTreeMap::new();
+        labels1.insert("app".to_string(), "test".to_string());
+        labels1.insert("host".to_string(), "h1".to_string());
+        let mut labels2: Labels = BTreeMap::new();
+        labels2.insert("app".to_string(), "other".to_string());
+        vec![
+            Row {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                labels: labels1.clone(),
+                line: "error connecting to database".to_string(),
+                structured_metadata: vec![],
+            },
+            Row {
+                timestamp_ns: 1_700_000_001_000_000_000,
+                labels: labels1,
+                line: "all good now".to_string(),
+                structured_metadata: vec![("trace_id".to_string(), "abc".to_string())],
+            },
+            Row {
+                timestamp_ns: 1_700_000_002_000_000_000,
+                labels: labels2,
+                line: "other app log line".to_string(),
+                structured_metadata: vec![],
+            },
+        ]
+    }
+
+    #[test]
+    fn flush_then_query_roundtrip() {
+        let tmp = tempfile_dir();
+        let rows = make_rows();
+        let parts = flush_rows(rows.clone(), &tmp, 2).expect("flush");
+        assert_eq!(parts.len(), 1);
+        let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
+
+        // all
+        let r = reader
+            .query(&[], &[], i64::MIN, i64::MAX, 100, true)
+            .expect("q");
+        let total: usize = r.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(total, 3);
+
+        // label matcher app="test"
+        let m = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "test".to_string()).unwrap();
+        let r = reader
+            .query(std::slice::from_ref(&m), &[], i64::MIN, i64::MAX, 100, true)
+            .expect("q");
+        let total: usize = r.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(total, 2);
+
+        // line filter "error"
+        let f = LineFilter::Contains("error".to_string());
+        let r = reader
+            .query(&[], &[f], i64::MIN, i64::MAX, 100, true)
+            .expect("q");
+        let total: usize = r.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(total, 1);
+
+        // time range
+        let r = reader
+            .query(
+                &[],
+                &[],
+                1_700_000_001_000_000_000,
+                1_700_000_003_000_000_000,
+                100,
+                true,
+            )
+            .expect("q");
+        let total: usize = r.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn bloom_prunes_nonexistent_substring() {
+        let tmp = tempfile_dir();
+        let rows = make_rows();
+        let parts = flush_rows(rows, &tmp, 100).expect("flush");
+        let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
+        let f = LineFilter::Contains("zzzzzz-not-present".to_string());
+        assert!(
+            reader
+                .select_row_groups(
+                    &[],
+                    std::slice::from_ref(&f),
+                    QueryTimeRange {
+                        start_ns: i64::MIN,
+                        end_ns: i64::MAX,
+                        include_end: true,
+                    },
+                )
+                .is_empty(),
+            "bloom miss must avoid selecting the parquet row group"
+        );
+        let r = reader
+            .query(&[], &[f], i64::MIN, i64::MAX, 100, true)
+            .expect("q");
+        let total: usize = r.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn btf2_exact_field_bloom_prunes_structured_metadata_by_row_group() {
+        let tmp = tempfile_dir();
+        let mut rows = make_rows();
+        rows[0].structured_metadata = vec![("trace_id".to_string(), "first".to_string())];
+        rows[1].structured_metadata = vec![("trace_id".to_string(), "second".to_string())];
+        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
+        assert_eq!(&fs::read(part.bloom_path()).unwrap()[..4], BLOOM_MAGIC_V3);
+        let reader = PartReader::open(part).unwrap();
+
+        let selected = reader.select_row_groups_with_exact_fields(
+            &[],
+            &[],
+            &[ExactFieldPredicate::new("trace_id", "second")],
+            QueryTimeRange {
+                start_ns: i64::MIN,
+                end_ns: i64::MAX,
+                include_end: true,
+            },
+        );
+        assert_eq!(selected, vec![1]);
+
+        // Stream labels are pipeline fields too, but are not in the exact
+        // field bloom. Their predicate must therefore remain conservative.
+        let app = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "test".to_string()).unwrap();
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                std::slice::from_ref(&app),
+                &[],
+                &[ExactFieldPredicate::new("app", "test")],
+                QueryTimeRange {
+                    start_ns: i64::MIN,
+                    end_ns: i64::MAX,
+                    include_end: true,
+                },
+            ),
+            vec![0, 1]
+        );
+
+        assert!(!reader.may_match_exact_fields(
+            &[],
+            &[],
+            &[ExactFieldPredicate::new("trace_id", "not-present")],
+            i64::MIN,
+            i64::MAX,
+        ));
+        assert!(reader.may_match_exact_fields(
+            &[],
+            &[],
+            &[ExactFieldPredicate::new("missing", "")],
+            i64::MIN,
+            i64::MAX,
+        ));
+    }
+
+    #[test]
+    fn btf2_exact_field_bloom_indexes_parser_scalars_without_raw_substring_assumptions() {
+        let tmp = tempfile_dir();
+        let mut rows = make_rows();
+        rows[0].line = r#"{"user":"\u0061lice","namespace:key":"value"}"#.to_string();
+        rows[1].line = r#"user=bob elapsed=250ms"#.to_string();
+        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let time_range = QueryTimeRange {
+            start_ns: i64::MIN,
+            end_ns: i64::MAX,
+            include_end: true,
+        };
+
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &[],
+                &[],
+                &[ExactFieldPredicate::new_with_extraction(
+                    "user", "alice", true,
+                )],
+                time_range,
+            ),
+            vec![0]
+        );
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &[],
+                &[],
+                &[ExactFieldPredicate::new_with_extraction(
+                    "user", "bob", true,
+                )],
+                time_range,
+            ),
+            vec![1]
+        );
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &[],
+                &[],
+                &[ExactFieldPredicate::new_with_extraction(
+                    "namespace_key",
+                    "value",
+                    true,
+                )],
+                time_range,
+            ),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn btf2_exact_field_bloom_indexes_canonical_numeric_and_duration_values() {
+        let tmp = tempfile_dir();
+        let rows = vec![
+            Row {
+                timestamp_ns: 1,
+                labels: BTreeMap::new(),
+                line: r#"{"value":9007199254740992,"elapsed":"1s"}"#.to_string(),
+                structured_metadata: vec![],
+            },
+            Row {
+                timestamp_ns: 2,
+                labels: BTreeMap::new(),
+                line: r#"{"value":9007199254740993,"elapsed":"1000ms"}"#.to_string(),
+                structured_metadata: vec![],
+            },
+        ];
+        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let range = QueryTimeRange {
+            start_ns: i64::MIN,
+            end_ns: i64::MAX,
+            include_end: true,
+        };
+
+        let numeric = crate::logql::parse("{} | json | value=9007199254740993").unwrap();
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &[],
+                &[],
+                &numeric.exact_field_predicates(),
+                range,
+            ),
+            vec![1]
+        );
+
+        let duration = crate::logql::parse("{} | json | elapsed=1s").unwrap();
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &[],
+                &[],
+                &duration.exact_field_predicates(),
+                range,
+            ),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn btf2_indexes_scan_typed_equality_conservatively() {
+        let tmp = tempfile_dir();
+        let rows = vec![
+            Row {
+                timestamp_ns: 1,
+                labels: BTreeMap::new(),
+                line: r#"{"value":500.0}"#.to_string(),
+                structured_metadata: vec![],
+            },
+            Row {
+                timestamp_ns: 2,
+                labels: BTreeMap::new(),
+                line: r#"{"value":999}"#.to_string(),
+                structured_metadata: vec![],
+            },
+        ];
+        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
+        rewrite_part_bloom_as_v2(&part);
+        let reader = PartReader::open(load_part(&part.dir).unwrap()).unwrap();
+        let query = crate::logql::parse("{} | json | value=500").unwrap();
+        let selected = reader.select_row_groups_with_exact_fields(
+            &[],
+            &[],
+            &query.exact_field_predicates(),
+            QueryTimeRange {
+                start_ns: i64::MIN,
+                end_ns: i64::MAX,
+                include_end: true,
+            },
+        );
+        assert_eq!(selected, vec![0, 1]);
+    }
+
+    #[test]
+    fn btf1_part_loads_and_exact_fields_fall_back_to_scanning() {
+        let tmp = tempfile_dir();
+        let part = flush_rows(make_rows(), &tmp, 1).unwrap().remove(0);
+        rewrite_part_bloom_as_v1(&part);
+
+        let legacy_part = load_part(&part.dir).unwrap();
+        let reader = PartReader::open(legacy_part).unwrap();
+        assert!(reader.exact_field_bloom.is_none());
+        assert!(reader.may_match_exact_fields(
+            &[],
+            &[],
+            &[ExactFieldPredicate::new("trace_id", "not-present")],
+            i64::MIN,
+            i64::MAX,
+        ));
+    }
+
+    #[test]
+    fn bloom_container_versions_reject_invalid_framing() {
+        let bloom = BloomFilter::with_capacity(1, 0.01);
+        let legacy = encode_btf1(&[bloom]);
+        let decoded = decode_blooms(&legacy, 1).unwrap();
+        assert_eq!(decoded.line.len(), 1);
+        assert!(decoded.exact_fields.is_none());
+        assert!(
+            decode_blooms(&legacy, 2)
+                .err()
+                .unwrap()
+                .contains("row group count mismatch")
+        );
+
+        let mut trailing = legacy.clone();
+        trailing.push(0);
+        assert!(
+            decode_blooms(&trailing, 1)
+                .err()
+                .unwrap()
+                .contains("trailing bytes")
+        );
+
+        let mut unknown = legacy.clone();
+        unknown[..4].copy_from_slice(b"BTF9");
+        assert!(
+            decode_blooms(&unknown, 1)
+                .err()
+                .unwrap()
+                .contains("magic mismatch")
+        );
+
+        let mut truncated_v2 = Vec::new();
+        truncated_v2.extend_from_slice(BLOOM_MAGIC_V2);
+        truncated_v2.extend_from_slice(&1u32.to_le_bytes());
+        truncated_v2.extend_from_slice(&legacy[8..]);
+        assert!(
+            decode_blooms(&truncated_v2, 1)
+                .err()
+                .unwrap()
+                .contains("length truncated")
+        );
+    }
+
+    #[test]
+    fn forward_limit_stops_physical_part_scan() {
+        let tmp = tempfile_dir();
+        let rows: Vec<Row> = (0..20)
+            .map(|timestamp_ns| Row {
+                timestamp_ns,
+                labels: BTreeMap::new(),
+                line: format!("line-{timestamp_ns}"),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 20).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let result = reader
+            .query_with_exact_field_pruning_and_scan_limit(
+                &[],
+                ExactFieldPruning::new(&[], &[]),
+                0,
+                19,
+                1,
+                true,
+                Some(100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.scanned_rows, 1);
+        assert_eq!(result.results[0].entries[0].timestamp_ns, 0);
+    }
+
+    #[test]
+    fn scan_limit_stops_before_collecting_the_rest_of_a_part() {
+        let tmp = tempfile_dir();
+        let rows: Vec<Row> = (0..20)
+            .map(|timestamp_ns| Row {
+                timestamp_ns,
+                labels: BTreeMap::new(),
+                line: format!("line-{timestamp_ns}"),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 20).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let result = reader
+            .query_with_exact_field_pruning_and_scan_limit(
+                &[],
+                ExactFieldPruning::new(&[], &[]),
+                0,
+                19,
+                usize::MAX,
+                true,
+                Some(3),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.scanned_rows, 3);
+        assert_eq!(result.results[0].entries.len(), 3);
+    }
+
+    #[test]
+    fn label_index_prunes_wrong_app() {
+        let tmp = tempfile_dir();
+        let rows = make_rows();
+        let parts = flush_rows(rows, &tmp, 100).expect("flush");
+        let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
+        let m = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "missing".to_string()).unwrap();
+        assert!(
+            reader
+                .select_row_groups(
+                    std::slice::from_ref(&m),
+                    &[],
+                    QueryTimeRange {
+                        start_ns: i64::MIN,
+                        end_ns: i64::MAX,
+                        include_end: true,
+                    },
+                )
+                .is_empty(),
+            "stream-index miss must avoid selecting the parquet row group"
+        );
+        let r = reader
+            .query(&[m], &[], i64::MIN, i64::MAX, 100, true)
+            .expect("q");
+        let total: usize = r.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn discover_parts_after_flush() {
+        let tmp = tempfile_dir();
+        let rows = make_rows();
+        let _ = flush_rows(rows, &tmp, 100).expect("flush");
+        let parts = discover_parts(&tmp).unwrap();
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn backward_limit_returns_most_recent() {
+        let tmp = tempfile_dir();
+        let mut labels: Labels = BTreeMap::new();
+        labels.insert("app".to_string(), "test".to_string());
+        let rows: Vec<Row> = (0..3_000)
+            .map(|i| Row {
+                timestamp_ns: 1_700_000_000_000_000_000 + i * 1_000_000_000,
+                labels: labels.clone(),
+                line: format!("line-{i:04}"),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let parts = flush_rows(rows, &tmp, 3_000).expect("flush");
+        let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
+
+        let r = reader
+            .query(&[], &[], i64::MIN, i64::MAX, 3, false)
+            .expect("q");
+        let lines: Vec<&str> = r
+            .iter()
+            .flat_map(|s| s.entries.iter().map(|e| e.line.as_str()))
+            .collect();
+        assert_eq!(lines, vec!["line-2999", "line-2998", "line-2997"]);
+
+        let r = reader
+            .query(&[], &[], i64::MIN, i64::MAX, 3, true)
+            .expect("q");
+        let lines: Vec<&str> = r
+            .iter()
+            .flat_map(|s| s.entries.iter().map(|e| e.line.as_str()))
+            .collect();
+        assert_eq!(lines, vec!["line-0000", "line-0001", "line-0002"]);
+    }
+
+    #[test]
+    fn series_returns_actual_label_sets() {
+        let tmp = tempfile_dir();
+        let rows = make_rows();
+        let parts = flush_rows(rows, &tmp, 100).expect("flush");
+        let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
+
+        let all = reader.series(&[]);
+        assert_eq!(all.len(), 2);
+        let app_test: Vec<&Labels> = all
+            .iter()
+            .filter(|l| l.get("app").map(|v| v.as_str()) == Some("test"))
+            .collect();
+        assert_eq!(app_test.len(), 1);
+        assert_eq!(app_test[0].get("host").map(|s| s.as_str()), Some("h1"));
+
+        let m = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "other".to_string()).unwrap();
+        let r = reader.series(&[m]);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].get("app").map(|v| v.as_str()) == Some("other"));
+        assert!(!r[0].contains_key("host"));
+    }
+
+    #[test]
+    fn concurrent_queries_on_same_part_no_race() {
+        let tmp = tempfile_dir();
+        let mut labels: Labels = BTreeMap::new();
+        labels.insert("app".to_string(), "concurrent".to_string());
+        let rows: Vec<Row> = (0..50)
+            .map(|i| Row {
+                timestamp_ns: 1_700_000_000_000_000_000 + i * 1_000_000_000,
+                labels: labels.clone(),
+                line: format!("concurrent-line-{:02}", i),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let parts = flush_rows(rows, &tmp, 8).expect("flush");
+        let reader = Arc::new(PartReader::open(parts.into_iter().next().unwrap()).expect("open"));
+
+        let matcher =
+            LabelMatcher::new("app".to_string(), MatcherOp::Eq, "concurrent".to_string()).unwrap();
+
+        let num_threads = 16;
+        let queries_per_thread = 50;
+        let mut handles = Vec::with_capacity(num_threads);
+        for thread_index in 0..num_threads {
+            let reader = reader.clone();
+            let matcher = matcher.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut errors = 0u32;
+                let mut wrong = 0u32;
+                for q in 0..queries_per_thread {
+                    let forward = (thread_index + q) % 2 == 0;
+                    let limit = 3 + (q % 5);
+                    let result = reader
+                        .query(
+                            std::slice::from_ref(&matcher),
+                            &[],
+                            i64::MIN,
+                            i64::MAX,
+                            limit,
+                            forward,
+                        )
+                        .expect("query must not error");
+                    let total: usize = result.iter().map(|s| s.entries.len()).sum();
+                    if total == 0 {
+                        errors += 1;
+                    } else if total > limit {
+                        wrong += 1;
+                    }
+                    if forward {
+                        let first = result
+                            .iter()
+                            .flat_map(|s| s.entries.iter())
+                            .map(|e| e.timestamp_ns)
+                            .next()
+                            .unwrap_or(0);
+                        let expected_first = 1_700_000_000_000_000_000;
+                        if first != expected_first {
+                            wrong += 1;
+                        }
+                    } else {
+                        let first = result
+                            .iter()
+                            .flat_map(|s| s.entries.iter())
+                            .map(|e| e.timestamp_ns)
+                            .next()
+                            .unwrap_or(0);
+                        let expected_first = 1_700_000_000_000_000_000 + 49 * 1_000_000_000;
+                        if first != expected_first {
+                            wrong += 1;
+                        }
+                    }
+                }
+                (errors, wrong)
+            }));
+        }
+        let mut total_errors = 0u32;
+        let mut total_wrong = 0u32;
+        for h in handles {
+            let (e, w) = h.join().expect("thread");
+            total_errors += e;
+            total_wrong += w;
+        }
+        assert_eq!(
+            total_errors, 0,
+            "some queries returned empty (race-induced decode failure)"
+        );
+        assert_eq!(
+            total_wrong, 0,
+            "some queries returned wrong ordering or count (race-induced corruption)"
+        );
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "loggytracy-test-{}-{}-{}",
+            std::process::id(),
+            c,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_tmp_rejects_symlinked_root_and_tmp_directory() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile_dir();
+        let outside_tmp = outside.join(".tmp");
+        fs::create_dir_all(&outside_tmp).unwrap();
+        let sentinel = outside_tmp.join("sentinel");
+        fs::write(&sentinel, b"must survive").unwrap();
+
+        let link_parent = tempfile_dir();
+        let linked_root = link_parent.join("parts");
+        symlink(&outside, &linked_root).unwrap();
+        let error = cleanup_tmp(&linked_root).unwrap_err();
+        assert!(error.contains("unsafe parts root"));
+        assert!(sentinel.exists());
+
+        let normal_root = tempfile_dir();
+        let linked_tmp = normal_root.join(".tmp");
+        symlink(&outside_tmp, &linked_tmp).unwrap();
+        let error = cleanup_tmp(&normal_root).unwrap_err();
+        assert!(error.contains("unsafe tmp directory"));
+        assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn label_eq_empty_matches_missing_label_in_part() {
+        // {app=""}는 라벨 부재를 매치한다. memtable 경로는 이미 그렇게 동작하므로
+        // part 경로에서도 보수적으로 통과시켜 정합성을 맞춰야 한다.
+        let tmp = tempfile_dir();
+        let mut labels: Labels = BTreeMap::new();
+        labels.insert("host".to_string(), "h1".to_string());
+        // app 라벨 부재
+        let rows: Vec<Row> = vec![Row {
+            timestamp_ns: 1_700_000_000_000_000_000,
+            labels,
+            line: "no app label here".to_string(),
+            structured_metadata: vec![],
+        }];
+        let parts = flush_rows(rows, &tmp, 100).expect("flush");
+        let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
+        let m = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "".to_string()).unwrap();
+        let r = reader
+            .query(&[m], &[], i64::MIN, i64::MAX, 100, true)
+            .expect("q");
+        let total: usize = r.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(
+            total, 1,
+            "{{app=\"\"}} should match streams without an app label in part"
+        );
+    }
+
+    #[test]
+    fn load_rejects_metadata_checksum_mismatch() {
+        let tmp = tempfile_dir();
+        let part = flush_rows(make_rows(), &tmp, 100).expect("flush").remove(0);
+        let meta_path = part.meta_path();
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta["stream_labels"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::String("ghost_label".to_string()));
+        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        assert!(load_part(&part.dir).is_err());
+    }
+
+    #[test]
+    fn bloom_handles_large_trigram_volume_in_single_row_group() {
+        // row group 8192행 × 라인당 수십 trigram → unique 항목이 row 수의 수배~수십배.
+        // 이전 구현(capacity=row 수)은 fill ratio ~99%로 도달해 거짓 양성이 발생하지만,
+        // 새 구현(unique trigram 수로 capacity)은 존재하지 않는 부분문자열을 정확히 프루닝.
+        let tmp = tempfile_dir();
+        let mut labels: Labels = BTreeMap::new();
+        labels.insert("app".to_string(), "test".to_string());
+        let rows: Vec<Row> = (0..8192usize)
+            .map(|i| Row {
+                timestamp_ns: 1_700_000_000_000_000_000 + (i as i64) * 1_000_000,
+                labels: labels.clone(),
+                line: format!(
+                    "log line index {} some random words here for trigrams unique fragment {}",
+                    i, i
+                ),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let parts = flush_rows(rows, &tmp, 8192).expect("flush");
+        let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
+        let f = LineFilter::Contains("zzzzzz-not-present-substr".to_string());
+        let r = reader
+            .query(&[], &[f], i64::MIN, i64::MAX, 100, true)
+            .expect("q");
+        let total: usize = r.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(
+            total, 0,
+            "bloom should prune nonexistent substring even with 8192-row group"
+        );
+    }
+
+    #[test]
+    fn merge_flush_renames_part_with_tombstone_already_present() {
+        let tmp = tempfile_dir();
+        let parts_root = tmp.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let old = flush_rows(
+            vec![Row {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                labels: BTreeMap::new(),
+                line: "old".to_string(),
+                structured_metadata: vec![],
+            }],
+            &parts_root,
+            100,
+        )
+        .unwrap()
+        .remove(0);
+
+        let merged = flush_rows_with_merge_tombstone(
+            vec![Row {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                labels: BTreeMap::new(),
+                line: "merged".to_string(),
+                structured_metadata: vec![],
+            }],
+            &parts_root,
+            100,
+            std::slice::from_ref(&old.dir),
+        )
+        .unwrap();
+        let new_dir = &merged[0].dir;
+        assert!(new_dir.join(MERGE_TOMBSTONE_FILE).exists());
+        assert_eq!(
+            read_merge_tombstone(new_dir).unwrap(),
+            vec![old.dir.strip_prefix(&parts_root).unwrap().to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn discover_keeps_old_parts_when_tombstoned_replacement_is_corrupt() {
+        let tmp = tempfile_dir();
+        let parts_root = tmp.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let old = flush_rows(
+            vec![Row {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                labels: BTreeMap::new(),
+                line: "old".to_string(),
+                structured_metadata: vec![],
+            }],
+            &parts_root,
+            100,
+        )
+        .unwrap()
+        .remove(0);
+        let merged = flush_rows_with_merge_tombstone(
+            vec![Row {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                labels: BTreeMap::new(),
+                line: "merged".to_string(),
+                structured_metadata: vec![],
+            }],
+            &parts_root,
+            100,
+            std::slice::from_ref(&old.dir),
+        )
+        .unwrap();
+        let new_dir = &merged[0].dir;
+        std::fs::write(new_dir.join(BLOOM_FILE), b"corrupt").unwrap();
+
+        let discovered = discover_parts(&parts_root).unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].dir, old.dir);
+        assert!(old.dir.exists());
+        assert!(new_dir.join(MERGE_TOMBSTONE_FILE).exists());
+    }
+
+    #[test]
+    fn merge_tombstone_cleanup_during_discover() {
+        // merge에서 새 part rename + tombstone 기록 후 old_dirs 삭제 전 crash 시
+        // 재시작 시 discover_parts가 tombstone을 발견해 old_dirs를 정리하고
+        // 새 part 1개만 로드하는 것을 검증.
+        let tmp = tempfile_dir();
+        let parts_root = tmp.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+
+        let mut l1: Labels = BTreeMap::new();
+        l1.insert("app".to_string(), "old1".to_string());
+        let mut l2: Labels = BTreeMap::new();
+        l2.insert("app".to_string(), "old2".to_string());
+
+        let parts1 = flush_rows(
+            vec![Row {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                labels: l1,
+                line: "old1 line".to_string(),
+                structured_metadata: vec![],
+            }],
+            &parts_root,
+            100,
+        )
+        .expect("flush1");
+        let parts2 = flush_rows(
+            vec![Row {
+                timestamp_ns: 1_700_000_002_000_000_000,
+                labels: l2,
+                line: "old2 line".to_string(),
+                structured_metadata: vec![],
+            }],
+            &parts_root,
+            100,
+        )
+        .expect("flush2");
+
+        let old_dirs: Vec<PathBuf> = parts1
+            .iter()
+            .chain(parts2.iter())
+            .map(|p| p.dir.clone())
+            .collect();
+
+        // 모의 merge: 두 스트림의 rows를 모아 새 part 생성
+        let mut l3: Labels = BTreeMap::new();
+        l3.insert("app".to_string(), "old1".to_string());
+        let mut l4: Labels = BTreeMap::new();
+        l4.insert("app".to_string(), "old2".to_string());
+        let merged_rows = vec![
+            Row {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                labels: l3,
+                line: "old1 line".to_string(),
+                structured_metadata: vec![],
+            },
+            Row {
+                timestamp_ns: 1_700_000_002_000_000_000,
+                labels: l4,
+                line: "old2 line".to_string(),
+                structured_metadata: vec![],
+            },
+        ];
+        let merged_parts = flush_rows(merged_rows, &parts_root, 100).expect("flush merged");
+
+        let new_dir = merged_parts[0].dir.clone();
+        write_merge_tombstone(&new_dir, &parts_root, &old_dirs).expect("tombstone write");
+
+        // crash 시뮬레이션: old_dirs는 그대로, tombstone은 새 part 디렉터리에 있음.
+        for old_dir in &old_dirs {
+            assert!(
+                old_dir.exists(),
+                "old_dirs should still exist before discover"
+            );
+        }
+        assert!(new_dir.join(MERGE_TOMBSTONE_FILE).exists());
+
+        let discovered = discover_parts(&parts_root).unwrap();
+        assert_eq!(
+            discovered.len(),
+            1,
+            "tombstone cleanup should leave only the new part"
+        );
+
+        for old_dir in &old_dirs {
+            assert!(
+                !old_dir.exists(),
+                "old part dir {} should be removed by tombstone cleanup",
+                old_dir.display()
+            );
+        }
+        assert!(
+            !new_dir.join(MERGE_TOMBSTONE_FILE).exists(),
+            "tombstone file should be removed during discover"
+        );
+    }
+
+    #[test]
+    fn discover_cleans_transitive_merge_tombstone_chain() {
+        let tmp = tempfile_dir();
+        let parts_root = tmp.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let row = |line: &str| Row {
+            timestamp_ns: 1_700_000_000_000_000_000,
+            labels: BTreeMap::new(),
+            line: line.to_string(),
+            structured_metadata: vec![],
+        };
+
+        let oldest = flush_rows(vec![row("oldest")], &parts_root, 100)
+            .unwrap()
+            .remove(0);
+        let middle = flush_rows_with_merge_tombstone(
+            vec![row("middle")],
+            &parts_root,
+            100,
+            std::slice::from_ref(&oldest.dir),
+        )
+        .unwrap()
+        .remove(0);
+        let newest = flush_rows_with_merge_tombstone(
+            vec![row("newest")],
+            &parts_root,
+            100,
+            std::slice::from_ref(&middle.dir),
+        )
+        .unwrap()
+        .remove(0);
+
+        let discovered = discover_parts(&parts_root).unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].meta.id, newest.meta.id);
+        assert!(!oldest.dir.exists());
+        assert!(!middle.dir.exists());
+        assert!(newest.dir.exists());
+        assert!(!newest.dir.join(MERGE_TOMBSTONE_FILE).exists());
+    }
+
+    #[test]
+    fn discover_rejects_tombstone_paths_outside_parts_root() {
+        let tmp = tempfile_dir();
+        let parts_root = tmp.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"data").unwrap();
+        let replacement = flush_rows(
+            vec![Row {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                labels: BTreeMap::new(),
+                line: "replacement".to_string(),
+                structured_metadata: vec![],
+            }],
+            &parts_root,
+            100,
+        )
+        .unwrap()
+        .remove(0);
+        std::fs::write(
+            replacement.dir.join(MERGE_TOMBSTONE_FILE),
+            r#"{"old_dirs":["../../outside"]}"#,
+        )
+        .unwrap();
+
+        let discovered = discover_parts(&parts_root).unwrap();
+
+        assert!(discovered.is_empty());
+        assert!(outside.join("keep").exists());
+        assert!(replacement.dir.join(MERGE_TOMBSTONE_FILE).exists());
+    }
+
+    #[test]
+    fn tombstone_path_validation_rejects_absolute_and_parent_paths() {
+        assert!(validate_tombstone_part_path(Path::new("/tmp/part")).is_err());
+        assert!(validate_tombstone_part_path(Path::new("partition/../part")).is_err());
+        assert!(validate_tombstone_part_path(Path::new("partition/part")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tombstone_resolution_rejects_symlink_escape() {
+        let tmp = tempfile_dir();
+        let parts_root = tmp.join("parts");
+        let marker_dir = tmp.join("marker");
+        let outside_partition = tmp.join("outside-partition");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        std::fs::create_dir_all(outside_partition.join("part")).unwrap();
+        std::os::unix::fs::symlink(&outside_partition, parts_root.join("escape")).unwrap();
+        std::fs::write(
+            marker_dir.join(MERGE_TOMBSTONE_FILE),
+            r#"{"old_dirs":["escape/part"]}"#,
+        )
+        .unwrap();
+
+        let result = read_merge_tombstone_dirs(&marker_dir, &parts_root);
+
+        assert!(result.is_err());
+        assert!(outside_partition.join("part").exists());
+    }
+
+    #[test]
+    fn discover_retains_tombstone_when_old_part_deletion_fails() {
+        let tmp = tempfile_dir();
+        let parts_root = tmp.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let replacement = flush_rows(
+            vec![Row {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                labels: BTreeMap::new(),
+                line: "replacement".to_string(),
+                structured_metadata: vec![],
+            }],
+            &parts_root,
+            100,
+        )
+        .unwrap()
+        .remove(0);
+        let partition = replacement.dir.parent().unwrap();
+        let undeletable_as_directory = partition.join("old-part");
+        std::fs::write(&undeletable_as_directory, b"not a directory").unwrap();
+        let relative = undeletable_as_directory
+            .strip_prefix(&parts_root)
+            .unwrap()
+            .to_string_lossy();
+        std::fs::write(
+            replacement.dir.join(MERGE_TOMBSTONE_FILE),
+            format!(r#"{{"old_dirs":["{relative}"]}}"#),
+        )
+        .unwrap();
+
+        let discovered = discover_parts(&parts_root).unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        assert!(undeletable_as_directory.exists());
+        assert!(replacement.dir.join(MERGE_TOMBSTONE_FILE).exists());
+    }

@@ -14,6 +14,25 @@ pub async fn push(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    state
+        .metrics
+        .ingest_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let result = push_inner(&state, headers, body).await;
+    if result.is_err() {
+        state
+            .metrics
+            .ingest_errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+async fn push_inner(
+    state: &Arc<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, String)> {
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -150,16 +169,14 @@ mod tests {
         let memtable = Arc::new(MemTable::new());
         let parts = Arc::new(PartRegistry::new());
         let journal = Arc::new(journal::Journal::spawn(&config, memtable.clone()).unwrap());
-        let state = Arc::new(AppState {
-            memtable: memtable.clone(),
-            journal: journal.clone(),
+        let state = crate::test_support::state(
+            config.clone(),
+            memtable.clone(),
+            journal.clone(),
             parts,
-            trace_parts: Arc::new(crate::trace_registry::TraceRegistry::standalone()),
-            flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            remote_cache: None,
-        });
+            Arc::new(crate::trace_registry::TraceRegistry::standalone()),
+            None,
+        );
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -189,16 +206,14 @@ mod tests {
         };
         let memtable = Arc::new(MemTable::new());
         let journal = Arc::new(journal::Journal::spawn(&config, memtable.clone()).unwrap());
-        let state = Arc::new(AppState {
-            memtable: memtable.clone(),
+        let state = crate::test_support::state(
+            config.clone(),
+            memtable.clone(),
             journal,
-            parts: Arc::new(PartRegistry::new()),
-            trace_parts: Arc::new(crate::trace_registry::TraceRegistry::standalone()),
-            flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            remote_cache: None,
-        });
+            Arc::new(PartRegistry::new()),
+            Arc::new(crate::trace_registry::TraceRegistry::standalone()),
+            None,
+        );
         let body = build_snappy_push("bad-time", "must be rejected", 9_223_372_037);
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/x-protobuf".parse().unwrap());
@@ -230,16 +245,14 @@ mod tests {
             parts.operation_lock(),
         ));
 
-        let state = Arc::new(AppState {
-            memtable: memtable.clone(),
-            journal: journal.clone(),
-            parts: parts.clone(),
-            trace_parts: trace_parts.clone(),
-            flush_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            merge_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            otlp_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            remote_cache: None,
-        });
+        let state = crate::test_support::state(
+            config.clone(),
+            memtable.clone(),
+            journal.clone(),
+            parts.clone(),
+            trace_parts.clone(),
+            None,
+        );
 
         let flush_handle = {
             let memtable = memtable.clone();
@@ -259,6 +272,7 @@ mod tests {
                     None,
                     config,
                     healthy,
+                    Arc::new(crate::metrics::RuntimeMetrics::new()),
                 )
                 .await;
             })

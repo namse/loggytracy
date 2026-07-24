@@ -246,6 +246,7 @@ mod tests {
             None,
             Arc::new(config.clone()),
             healthy,
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
         ));
 
         let service = TraceIngestService::new(journal);

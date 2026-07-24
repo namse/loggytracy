@@ -1139,6 +1139,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
+ "futures-util",
  "object_store",
  "opentelemetry-proto",
  "parquet",

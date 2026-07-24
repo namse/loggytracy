@@ -10,8 +10,8 @@ new Codex context can continue without relying on chat history.
 | M1 | Complete locally (`2b51b29`) | Parquet parts, bloom/stream indexes, restart recovery, unified query, and merge |
 | M2 | Complete | Object-store publication, conditional manifest updates, local cache eviction, and query restoration |
 | M3 | Complete (review remediated) | JSON/logfmt parsing, metric queries, field-filter push-down, and bounded query execution sufficient for real dashboards |
-| M4 | In progress | OTLP trace ingest, trace-ID lookup, and Tempo-compatible APIs |
-| M5 | Pending | Compaction tuning, retention, resource limits, and load validation against explicit targets |
+| M4 | Complete | OTLP trace ingest, trace-ID lookup, and Tempo-compatible APIs |
+| M5 | In progress | Compaction tuning, retention, resource limits, and load validation against explicit targets |
 | M6 | Pending | Graceful shutdown for machine replacement (SIGTERM handling, forced flush-to-S3, drain-status readiness) and a machine-replacement rehearsal |
 
 ## Repository state note
@@ -114,8 +114,26 @@ The detailed English implementation plan and design decisions are recorded in
 - [x] Evicted trace bodies restore from the object store on demand.
 - [x] Tempo trace-by-ID and bounded search APIs match the implemented compatibility shape.
 - [x] Existing Loki ingest, LogQL, object-store, and readiness tests remain green.
-- [ ] A fresh-context review reports no blocking findings.
-- [ ] The complete validation set passes after the final review fix.
+- [x] A fresh-context review reports no blocking findings.
+- [x] The complete validation set passes after the final review fix.
+
+## M5 acceptance checklist
+
+The implementation plan and provisional validation targets are recorded in
+[`docs/M5_IMPLEMENTATION_PLAN.md`](M5_IMPLEMENTATION_PLAN.md).
+
+- [x] M4 review and complete validation are green.
+- [x] Merge parameters and query/retention limits are configurable and validated.
+- [x] Compaction preserves restart/object-store correctness and stays within the agreed memory and query-disruption targets.
+- [x] Expired log and trace parts are removed without deleting active or boundary data.
+- [x] Loki and Tempo resource limits cover range, scan, memory, output, concurrency, and timeout.
+- [ ] Reproducible load validation meets the agreed throughput, latency, memory, retention, and error-rate targets.
+
+The sustained S3 load validation was not executed in this workspace because
+no S3 credentials or S3-compatible deployment/test endpoint is available.
+The mixed-workload tool is implemented, but remote restore, retention GC, and
+long-running object-store behavior require an environment-level run.
+- [ ] Load results and bottlenecks are documented.
 
 ## Completion protocol
 

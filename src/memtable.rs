@@ -21,6 +21,7 @@ pub struct StreamResult {
 pub struct QueryResult {
     pub results: Vec<StreamResult>,
     pub scanned_rows: usize,
+    pub scanned_bytes: u64,
 }
 
 pub struct MemTable {
@@ -204,6 +205,7 @@ impl MemTable {
             return QueryResult {
                 results: Vec::new(),
                 scanned_rows: 0,
+                scanned_bytes: 0,
             };
         }
         let mut grouped: BTreeMap<Labels, Vec<LogEntry>> = BTreeMap::new();
@@ -290,6 +292,7 @@ impl MemTable {
         QueryResult {
             results,
             scanned_rows,
+            scanned_bytes: 0,
         }
     }
 

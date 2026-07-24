@@ -7,7 +7,11 @@ use tokio::time::interval;
 use crate::config::Config;
 use crate::journal::Journal;
 use crate::memtable::MemTable;
-use crate::object_storage::RemoteCache;
+use crate::metrics::RuntimeMetrics;
+use crate::object_storage::{
+    FlushTransaction, ManifestPart, RemoteCache, TraceManifestPart, clear_flush_transaction,
+    write_flush_transaction,
+};
 use crate::part::{self};
 use crate::part_registry::PartRegistry;
 use crate::trace::TraceMemTable;
@@ -24,6 +28,7 @@ pub async fn flush_loop(
     remote_cache: Option<Arc<RemoteCache>>,
     config: Arc<Config>,
     healthy: Arc<AtomicBool>,
+    metrics: Arc<RuntimeMetrics>,
 ) {
     healthy.store(true, Ordering::Release);
     let mut ticker = interval(config.flush_check_interval);
@@ -43,11 +48,21 @@ pub async fn flush_loop(
             .await
             {
                 Ok(offset) => {
+                    metrics.flush_success.fetch_add(1, Ordering::Relaxed);
+                    if remote_cache.is_some()
+                        && let Err(error) = clear_flush_transaction(&config.data_dir)
+                    {
+                        tracing::warn!(
+                            %error,
+                            "failed to clear committed flush transaction after checkpoint retry"
+                        );
+                    }
                     healthy.store(true, Ordering::Release);
                     last_flush = Instant::now();
                     tracing::info!(offset, "advanced previously failed journal checkpoint");
                 }
                 Err(error) => {
+                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     healthy.store(false, Ordering::Release);
                     tracing::error!(
                         %error,
@@ -82,10 +97,12 @@ pub async fn flush_loop(
         .await
         {
             Ok(()) => {
+                metrics.flush_success.fetch_add(1, Ordering::Relaxed);
                 healthy.store(true, Ordering::Release);
                 last_flush = Instant::now();
             }
             Err(e) => {
+                metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                 healthy.store(false, Ordering::Release);
                 tracing::error!(error = %e, "flush iteration failed");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -137,6 +154,11 @@ async fn flush_once(
             *pending_checkpoint = Some(ckpt.offset);
             return Err(error.to_string());
         }
+        if remote_cache.is_some()
+            && let Err(error) = clear_flush_transaction(&config.data_dir)
+        {
+            tracing::warn!(%error, "failed to clear committed flush transaction");
+        }
         return Ok(());
     }
     let rows = part::rows_from_snapshot(&ckpt.snapshot);
@@ -169,8 +191,8 @@ async fn flush_once(
             ) {
                 Ok(parts) => parts,
                 Err(error) => {
-                    let log_dirs: Vec<_> = log_parts.iter().map(|part| part.dir.clone()).collect();
-                    let cleanup = part::remove_part_dirs(&log_dirs);
+                    let log_dirs = part_dirs(&log_parts);
+                    let cleanup = cleanup_part_directories(&log_dirs, &[]);
                     return Err(match cleanup {
                         Ok(()) => std::io::Error::other(format!("trace flush failed: {error}")),
                         Err(cleanup_error) => std::io::Error::other(format!(
@@ -201,33 +223,88 @@ async fn flush_once(
                 .map(|part| part.dir.clone())
                 .collect();
             if let Some(cache) = remote_cache {
+                let checkpoint =
+                    match crate::journal::read_checkpoint(&config.data_dir.join("journal.ckpt")) {
+                        Ok(checkpoint) => checkpoint,
+                        Err(error) => {
+                            cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).ok();
+                            memtable.abort_flush(ckpt.snapshot);
+                            trace_memtable.abort_flush(trace_spans);
+                            return Err(error.to_string());
+                        }
+                    };
+                if let Err(error) = cache
+                    .storage
+                    .reconcile_flush_transaction(&config.data_dir, checkpoint)
+                    .await
+                {
+                    cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).ok();
+                    memtable.abort_flush(ckpt.snapshot);
+                    trace_memtable.abort_flush(trace_spans);
+                    return Err(format!("failed to reconcile flush transaction: {error}"));
+                }
+                let transaction = FlushTransaction {
+                    offset: ckpt.offset,
+                    log_parts: new_parts.iter().map(ManifestPart::from).collect(),
+                    trace_parts: new_trace_parts
+                        .iter()
+                        .map(|part| TraceManifestPart {
+                            id: part.meta.id.clone(),
+                            partition: part.meta.partition.clone(),
+                        })
+                        .collect(),
+                };
+                if let Err(error) = write_flush_transaction(&config.data_dir, &transaction) {
+                    cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).ok();
+                    memtable.abort_flush(ckpt.snapshot);
+                    trace_memtable.abort_flush(trace_spans);
+                    return Err(format!("failed to record flush transaction: {error}"));
+                }
                 let epoch = cache.remote_operation_epoch();
                 if let Err(error) = cache.storage.publish(&new_parts, &[]).await {
                     cache.mark_remote_unhealthy();
-                    let mut cleanup_dirs = new_part_dirs.clone();
-                    cleanup_dirs.extend(new_trace_part_dirs.clone());
-                    let cleanup_error = part::remove_part_dirs(&cleanup_dirs).err();
+                    let rollback_error = cache
+                        .storage
+                        .rollback_flush_transaction(&config.data_dir)
+                        .await
+                        .err();
+                    let cleanup_error =
+                        cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).err();
                     memtable.abort_flush(ckpt.snapshot);
                     trace_memtable.abort_flush(trace_spans);
                     return Err(match cleanup_error {
                         Some(cleanup_error) => format!(
                             "object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
                         ),
-                        None => format!("object-store publish failed: {error}"),
+                        None => match rollback_error {
+                            Some(rollback_error) => format!(
+                                "object-store publish failed: {error}; rollback failed: {rollback_error}"
+                            ),
+                            None => format!("object-store publish failed: {error}"),
+                        },
                     });
                 }
                 if let Err(error) = cache.storage.publish_trace_parts(&new_trace_parts).await {
                     cache.mark_remote_unhealthy();
-                    let mut cleanup_dirs = new_part_dirs.clone();
-                    cleanup_dirs.extend(new_trace_part_dirs.clone());
-                    let cleanup_error = part::remove_part_dirs(&cleanup_dirs).err();
+                    let rollback_error = cache
+                        .storage
+                        .rollback_flush_transaction(&config.data_dir)
+                        .await
+                        .err();
+                    let cleanup_error =
+                        cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).err();
                     memtable.abort_flush(ckpt.snapshot);
                     trace_memtable.abort_flush(trace_spans);
                     return Err(match cleanup_error {
                         Some(cleanup_error) => format!(
                             "trace object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
                         ),
-                        None => format!("trace object-store publish failed: {error}"),
+                        None => match rollback_error {
+                            Some(rollback_error) => format!(
+                                "trace object-store publish failed: {error}; rollback failed: {rollback_error}"
+                            ),
+                            None => format!("trace object-store publish failed: {error}"),
+                        },
                     });
                 }
                 cache.mark_remote_healthy_since(epoch);
@@ -247,9 +324,7 @@ async fn flush_once(
                     // manifest; reinserting the snapshot preserves at-least-once
                     // semantics until then.
                     let cleanup_error = if remote_cache.is_none() {
-                        let mut cleanup_dirs = new_part_dirs.clone();
-                        cleanup_dirs.extend(new_trace_part_dirs.clone());
-                        part::remove_part_dirs(&cleanup_dirs).err()
+                        cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).err()
                     } else {
                         None
                     };
@@ -266,9 +341,7 @@ async fn flush_once(
             if let Err(error) = trace_registry.register(new_trace_parts) {
                 registry.unregister(&registered_log_ids);
                 let cleanup_error = if remote_cache.is_none() {
-                    let mut cleanup_dirs = new_part_dirs.clone();
-                    cleanup_dirs.extend(new_trace_part_dirs.clone());
-                    part::remove_part_dirs(&cleanup_dirs).err()
+                    cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).err()
                 } else {
                     None
                 };
@@ -297,6 +370,14 @@ async fn flush_once(
                 return Err(format!(
                     "parts were committed but journal checkpoint could not be advanced: {error}"
                 ));
+            }
+            if remote_cache.is_some()
+                && let Err(error) = clear_flush_transaction(&config.data_dir)
+            {
+                // The checkpoint is the commit record. A leftover intent is
+                // harmless and startup will clear it after observing the
+                // committed checkpoint.
+                tracing::warn!(%error, "failed to clear committed flush transaction");
             }
             memtable.commit_flush();
             trace_memtable.commit_flush();
@@ -327,6 +408,19 @@ async fn advance_checkpoint(
     } else {
         journal.set_checkpoint(offset)
     }
+}
+
+fn part_dirs(parts: &[part::Part]) -> Vec<std::path::PathBuf> {
+    parts.iter().map(|part| part.dir.clone()).collect()
+}
+
+fn cleanup_part_directories(
+    log_dirs: &[std::path::PathBuf],
+    trace_dirs: &[std::path::PathBuf],
+) -> Result<(), String> {
+    let mut dirs = log_dirs.to_vec();
+    dirs.extend_from_slice(trace_dirs);
+    part::remove_part_dirs(&dirs)
 }
 
 #[cfg(test)]

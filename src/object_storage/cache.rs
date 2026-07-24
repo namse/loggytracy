@@ -1,0 +1,534 @@
+impl ObjectStorage {
+    async fn upload_part(&self, part: &Part) -> Result<(), String> {
+        let descriptor = ManifestPart::from(part);
+        for file in PART_FILES {
+            let local_path = part.dir.join(file);
+            let metadata = std::fs::symlink_metadata(&local_path).map_err(|error| {
+                format!(
+                    "failed to inspect part file {}: {error}",
+                    local_path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "refusing unsafe part file {}",
+                    local_path.display()
+                ));
+            }
+            let bytes = tokio::fs::read(&local_path).await.map_err(|error| {
+                format!("failed to read part file {}: {error}", local_path.display())
+            })?;
+            let options = PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            };
+            match self
+                .store
+                .put_opts(
+                    &self.part_path(&descriptor, file),
+                    bytes.clone().into(),
+                    options,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    let remote = self
+                        .store
+                        .get(&self.part_path(&descriptor, file))
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "failed to verify existing part {} file {file}: {error}",
+                                part.meta.id
+                            )
+                        })?
+                        .bytes()
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "failed to read existing part {} file {file}: {error}",
+                                part.meta.id
+                            )
+                        })?;
+                    if remote.as_ref() != bytes.as_slice() {
+                        return Err(format!(
+                            "immutable object collision for part {} file {file}",
+                            part.meta.id
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "failed to upload part {} file {file}: {error}",
+                        part.meta.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Repairs the manifest and local catalog after crashes, including a
+    /// local-only to object-store transition. An initially empty manifest is
+    /// seeded with the final locally recovered generation in one CAS. Once a
+    /// remote generation exists, interrupted merge tombstones are replayed
+    /// oldest-first before local cleanup.
+    pub async fn reconcile_local_cache(&self, parts_root: &Path) -> Result<Manifest, String> {
+        let initial = self.restore_catalog(parts_root).await?;
+        validate_cache_tree_no_symlinks(parts_root)?;
+        let migrating_from_local_only = initial.generation == 0 && initial.parts.is_empty();
+
+        let tombstoned_active_ids: HashSet<String> = initial
+            .parts
+            .iter()
+            .filter(|descriptor| {
+                parts_root
+                    .join(&descriptor.partition)
+                    .join(&descriptor.id)
+                    .join(part::MERGE_TOMBSTONE_FILE)
+                    .exists()
+            })
+            .map(|descriptor| descriptor.id.clone())
+            .collect();
+        if !tombstoned_active_ids.is_empty() {
+            self.restore_parts(parts_root, &tombstoned_active_ids)
+                .await?;
+        }
+
+        let groups = collect_local_merge_groups(parts_root)?;
+        let valid_outputs: HashSet<&str> = groups
+            .iter()
+            .flat_map(|group| group.added.iter().map(|part| part.meta.id.as_str()))
+            .collect();
+        for active_id in &tombstoned_active_ids {
+            if !valid_outputs.contains(active_id.as_str()) {
+                return Err(format!(
+                    "active manifest part {active_id} has an invalid local merge tombstone replacement"
+                ));
+            }
+        }
+
+        let produced_ids: HashSet<&str> = groups
+            .iter()
+            .flat_map(|group| group.added.iter().map(|part| part.meta.id.as_str()))
+            .collect();
+        let merge_order = topological_merge_order(&groups)?;
+        if migrating_from_local_only {
+            // Reject overlapping roots before local cleanup: they describe
+            // competing histories whose rows cannot be combined safely.
+            let mut root_inputs = HashSet::new();
+            for group in &groups {
+                let is_root = group
+                    .old_ids
+                    .iter()
+                    .all(|old_id| !produced_ids.contains(old_id.as_str()));
+                if !is_root {
+                    continue;
+                }
+                for old_id in &group.old_ids {
+                    if !root_inputs.insert(old_id.as_str()) {
+                        return Err(format!(
+                            "overlapping local-only merge roots contain input part {old_id}"
+                        ));
+                    }
+                }
+            }
+
+            // Resolve every local tombstone first, then publish the complete
+            // final frontier in one CAS. This handles unbalanced trees such as
+            // A+B -> M followed by M+C -> N without needing C to appear in an
+            // intermediate remote generation. A crash before the CAS leaves
+            // durable local outputs to retry; a crash after it leaves the
+            // whole active generation visible.
+            let local_parts = part::discover_parts(parts_root)?;
+            self.publish_local_only_parts(&local_parts, &initial)
+                .await?;
+            return self.restore_catalog(parts_root).await;
+        }
+
+        for index in merge_order {
+            let manifest = self.load_manifest().await?;
+            let active: HashSet<&str> =
+                manifest.parts.iter().map(|part| part.id.as_str()).collect();
+            let active_inputs = groups[index]
+                .old_ids
+                .iter()
+                .filter(|id| active.contains(id.as_str()))
+                .count();
+            let outputs_active = groups[index].added.iter().all(|part| {
+                let descriptor = ManifestPart::from(part);
+                manifest.parts.iter().any(|active| active == &descriptor)
+            });
+
+            if outputs_active && active_inputs == 0 {
+                // The manifest CAS completed before the previous process
+                // stopped. The local tombstone is only pending cleanup.
+                continue;
+            }
+            if active_inputs == groups[index].old_ids.len() {
+                self.publish(&groups[index].added, &groups[index].old_ids)
+                    .await?;
+                continue;
+            }
+            if merge_group_reaches_active_output(index, &groups, &active) {
+                // A newer local merge in the same tombstone chain is already
+                // active. Replaying this ancestor would temporarily resurrect
+                // rows that the active descendant replaced.
+                continue;
+            }
+            return Err(format!(
+                "local merge replacement conflict: expected {} active input parts, found {active_inputs}",
+                groups[index].old_ids.len()
+            ));
+        }
+
+        // The manifest now durably describes every valid merge transaction,
+        // so it is safe for the existing tombstone recovery to remove old
+        // local generations and their markers.
+        let local_parts = part::discover_parts(parts_root)?;
+        let manifest = self.load_manifest().await?;
+        self.publish_local_only_parts(&local_parts, &manifest)
+            .await?;
+        self.restore_catalog(parts_root).await
+    }
+
+    /// Restores only the small metadata/index catalog needed to plan queries.
+    /// Parquet bodies remain remote until a query or merge selects them.
+    pub async fn restore_catalog(&self, parts_root: &Path) -> Result<Manifest, String> {
+        let manifest = self.load_manifest().await?;
+        tokio::fs::create_dir_all(parts_root)
+            .await
+            .map_err(|error| error.to_string())?;
+        validate_cache_root(parts_root)?;
+        for descriptor in &manifest.parts {
+            let final_dir = cache_part_dir(parts_root, descriptor)?;
+            if open_manifest_part(&final_dir, descriptor, false).is_ok() {
+                continue;
+            }
+            self.download_part(descriptor, parts_root, false).await?;
+        }
+        Ok(manifest)
+    }
+
+    /// Restores the Parquet bodies for a selected set of parts. The caller
+    /// must hold the cache's exclusive operation lock.
+    pub async fn restore_parts(
+        &self,
+        parts_root: &Path,
+        ids: &HashSet<String>,
+    ) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let manifest = self.load_manifest().await?;
+        let mut restored = HashSet::new();
+        for descriptor in &manifest.parts {
+            if !ids.contains(&descriptor.id) {
+                continue;
+            }
+            let final_dir = cache_part_dir(parts_root, descriptor)?;
+            if open_manifest_part(&final_dir, descriptor, true).is_err() {
+                self.download_part(descriptor, parts_root, true).await?;
+            }
+            restored.insert(descriptor.id.clone());
+        }
+        let missing: Vec<_> = ids.difference(&restored).cloned().collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "parts are no longer present in the object-store manifest: {}",
+                missing.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    async fn download_part(
+        &self,
+        descriptor: &ManifestPart,
+        parts_root: &Path,
+        include_data: bool,
+    ) -> Result<(), String> {
+        let final_dir = cache_part_dir(parts_root, descriptor)?;
+        let local_tombstone = std::fs::read(final_dir.join(part::MERGE_TOMBSTONE_FILE)).ok();
+        let tmp_dir = ensure_safe_directory_chain(
+            parts_root,
+            &[".tmp", "remote", &descriptor.partition, &descriptor.id],
+        )?;
+        std::fs::remove_dir_all(&tmp_dir).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&tmp_dir).map_err(|error| error.to_string())?;
+        let files: &[&str] = if include_data {
+            &PART_FILES
+        } else {
+            &CATALOG_FILES
+        };
+        for &file in files {
+            let result = self
+                .store
+                .get(&self.part_path(descriptor, file))
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to download part {} file {file}: {error}",
+                        descriptor.id
+                    )
+                })?;
+            let bytes = result.bytes().await.map_err(|error| {
+                format!("failed to read part {} file {file}: {error}", descriptor.id)
+            })?;
+            tokio::fs::write(tmp_dir.join(file), bytes)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to cache part {} file {file}: {error}",
+                        descriptor.id
+                    )
+                })?;
+        }
+        let downloaded =
+            open_manifest_part(&tmp_dir, descriptor, include_data).map_err(|error| {
+                format!(
+                    "downloaded part {} failed validation: {error}",
+                    descriptor.id
+                )
+            })?;
+        drop(downloaded);
+
+        if let Some(tombstone) = local_tombstone {
+            let marker = tmp_dir.join(part::MERGE_TOMBSTONE_FILE);
+            std::fs::write(&marker, tombstone).map_err(|error| error.to_string())?;
+            std::fs::File::open(&marker)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| error.to_string())?;
+            part::fsync_dir(&tmp_dir).map_err(|error| error.to_string())?;
+        }
+
+        std::fs::remove_dir_all(&final_dir).map_err(|error| error.to_string())?;
+        std::fs::rename(&tmp_dir, &final_dir)
+            .map_err(|error| format!("failed to commit cached part {}: {error}", descriptor.id))?;
+        Ok(())
+    }
+
+    pub fn evict_cache(
+        &self,
+        parts_root: &Path,
+        max_bytes: u64,
+        eligible_part_ids: &HashSet<String>,
+    ) -> Result<u64, String> {
+        let mut cached = Vec::new();
+        let mut total = 0u64;
+        let canonical_root = match std::fs::symlink_metadata(parts_root) {
+            Ok(_) => validate_cache_root(parts_root)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.to_string()),
+        };
+        let partitions = match std::fs::read_dir(parts_root) {
+            Ok(entries) => entries,
+            Err(error) => return Err(error.to_string()),
+        };
+        for partition in partitions {
+            let partition = partition.map_err(|error| error.to_string())?;
+            if partition.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let partition_metadata =
+                std::fs::symlink_metadata(partition.path()).map_err(|error| error.to_string())?;
+            if partition_metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing symlinked cache partition {}",
+                    partition.path().display()
+                ));
+            }
+            if !partition_metadata.is_dir() {
+                continue;
+            }
+            ensure_existing_cache_dir(&canonical_root, &partition.path())?;
+            for entry in std::fs::read_dir(partition.path()).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let entry_metadata =
+                    std::fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+                if entry_metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "refusing symlinked cache part {}",
+                        entry.path().display()
+                    ));
+                }
+                if !entry_metadata.is_dir() {
+                    continue;
+                }
+                ensure_existing_cache_dir(&canonical_root, &entry.path())?;
+                let id = entry.file_name().to_string_lossy().into_owned();
+                if !eligible_part_ids.contains(&id) {
+                    // Absence from the current registry does not prove that a
+                    // directory is disposable. It may be local-only data from
+                    // a period when object storage was disabled, or an
+                    // interrupted transaction requiring operator recovery.
+                    // Cache eviction only removes bodies belonging to active
+                    // manifest parts; retention can clean confirmed stale
+                    // generations separately.
+                    continue;
+                }
+                // The bound applies to evictable Parquet bodies. Metadata,
+                // bloom filters, and stream indexes form the small persistent
+                // catalog required to plan selective restores.
+                let data_path = entry.path().join(DATA_FILE);
+                let bytes = match std::fs::symlink_metadata(&data_path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "refusing symlinked cache data file {}",
+                            data_path.display()
+                        ));
+                    }
+                    Ok(metadata) if metadata.is_file() => metadata.len(),
+                    Ok(_) => {
+                        return Err(format!(
+                            "cache data path is not a file: {}",
+                            data_path.display()
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(error) => return Err(error.to_string()),
+                };
+                let access_path = entry.path().join(".access");
+                let accessed = match std::fs::symlink_metadata(&access_path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "refusing symlinked cache access marker {}",
+                            access_path.display()
+                        ));
+                    }
+                    Ok(metadata) => metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        entry_metadata.modified().unwrap_or(std::time::UNIX_EPOCH)
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                total = total.saturating_add(bytes);
+                if bytes > 0 {
+                    cached.push((accessed, bytes, entry.path()));
+                }
+            }
+        }
+        cached.sort_by_key(|(accessed, _, _)| *accessed);
+        for (_, bytes, dir) in cached {
+            if total <= max_bytes {
+                break;
+            }
+            let data_path = dir.join(DATA_FILE);
+            match std::fs::remove_file(&data_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "failed to evict cached data file {}: {error}",
+                        data_path.display()
+                    ));
+                }
+            }
+            let _ = std::fs::remove_file(dir.join(".access"));
+            part::fsync_dir(&dir).map_err(|error| error.to_string())?;
+            total = total.saturating_sub(bytes);
+        }
+        Ok(total)
+    }
+
+    pub fn evict_trace_cache(
+        &self,
+        traces_root: &Path,
+        max_bytes: u64,
+        eligible_part_ids: &HashSet<String>,
+    ) -> Result<u64, String> {
+        let canonical_root = match std::fs::symlink_metadata(traces_root) {
+            Ok(_) => validate_cache_root(traces_root)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut cached = Vec::new();
+        let mut total = 0u64;
+        for partition in std::fs::read_dir(traces_root).map_err(|error| error.to_string())? {
+            let partition = partition.map_err(|error| error.to_string())?;
+            if partition.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let metadata =
+                std::fs::symlink_metadata(partition.path()).map_err(|error| error.to_string())?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing symlinked trace cache partition {}",
+                    partition.path().display()
+                ));
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            ensure_existing_cache_dir(&canonical_root, &partition.path())?;
+            for entry in std::fs::read_dir(partition.path()).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let metadata =
+                    std::fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "refusing symlinked trace cache part {}",
+                        entry.path().display()
+                    ));
+                }
+                if !metadata.is_dir() {
+                    continue;
+                }
+                ensure_existing_cache_dir(&canonical_root, &entry.path())?;
+                validate_trace_cache_files(&entry.path())?;
+                let id = entry.file_name().to_string_lossy().into_owned();
+                if !eligible_part_ids.contains(&id) {
+                    continue;
+                }
+                let data_path = entry.path().join(TRACE_DATA_FILE);
+                let bytes = match std::fs::symlink_metadata(&data_path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "refusing symlinked trace data file {}",
+                            data_path.display()
+                        ));
+                    }
+                    Ok(metadata) if metadata.is_file() => metadata.len(),
+                    Ok(_) => {
+                        return Err(format!(
+                            "trace cache data path is not a file: {}",
+                            data_path.display()
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(error) => return Err(error.to_string()),
+                };
+                total = total.saturating_add(bytes);
+                if bytes > 0 {
+                    cached.push((
+                        metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                        bytes,
+                        data_path,
+                    ));
+                }
+            }
+        }
+        cached.sort_by_key(|(accessed, _, _)| *accessed);
+        for (_, bytes, data_path) in cached {
+            if total <= max_bytes {
+                break;
+            }
+            match std::fs::remove_file(&data_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "failed to evict trace data file {}: {error}",
+                        data_path.display()
+                    ));
+                }
+            }
+            if let Some(parent) = data_path.parent() {
+                part::fsync_dir(parent).map_err(|error| error.to_string())?;
+            }
+            total = total.saturating_sub(bytes);
+        }
+        Ok(total)
+    }
+}
