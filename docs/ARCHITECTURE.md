@@ -28,6 +28,41 @@ Rust로 만드는 싱글 머신 log + trace 엔진. VictoriaLogs의 논리 설�
 | 쿼리 언어 | LogQL — 사용 빈도 높은 subset만, 미지원 문법은 명확한 에러 |
 | API | Loki HTTP API 호환 (Grafana Loki 데이터소스 직결), 트레이스는 Tempo API |
 | Ingest 프로토콜 | Loki push (protobuf+snappy) + OTLP (gRPC) |
+| 전송 보안 | **TLS를 지원하지 않는다.** 평문 HTTP/gRPC만 제공하며, 종단 암호화가 필요하면 리버스 프록시나 서비스 메시가 담당한다 |
+| 테넌시 | 멀티테넌트. `X-Scope-OrgID`로 테넌트를 구분하고, 테넌트가 스로틀·quota의 단위가 된다 |
+
+## 전송 보안 — TLS 미지원
+
+TLS 종단은 이 프로세스의 책임이 아니다. 인증서 발급·갱신·SNI·mTLS 정책은 이미 잘 하는 계층
+(리버스 프록시, ingress, 서비스 메시)에 맡기고, 엔진은 평문 HTTP와 평문 gRPC만 제공한다.
+저장 계층의 S3 접근은 `object_store`가 HTTPS를 쓰므로 이 결정과 무관하다.
+
+따라서 배포 요구사항은 다음과 같다.
+
+- 리스닝 주소는 신뢰 경계 안에 두어야 한다. 공개망에 직접 노출하는 구성은 지원하지 않는다.
+- 인증·인가도 이 프로세스 밖(프록시 또는 게이트웨이)에서 수행하되, 프록시가 검증한 테넌트를
+  `X-Scope-OrgID`로 전달해야 한다. 엔진은 이 헤더를 신뢰한다 — 즉 **헤더를 위조할 수 있는
+  네트워크 위치에서 엔진에 직접 접근 가능하면 테넌트 격리가 무너진다.**
+- 로컬 개발 외에는 `0.0.0.0` 바인드를 쓰지 않는 것을 권한다.
+
+## 테넌시
+
+테넌시는 부가 기능이 아니라 **자원 관리의 기본 단위**다. 스로틀과 quota를 테넌트별로 운영할
+것이므로, 테넌트는 ingest·저장·쿼리 전 경로에서 1급 식별자여야 한다.
+
+- **식별**: `X-Scope-OrgID` 헤더 (Loki/Tempo 관례와 동일). OTLP는 gRPC 메타데이터의 동명 키를 쓴다.
+  헤더가 없는 요청의 처리 정책(기본 테넌트로 수용 vs 거절)은 설정으로 정한다.
+- **격리 지점**: 테넌트는 스트림 라벨이 아니라 **저장 경로의 분할 축**이어야 한다. 그렇지 않으면
+  테넌트별 retention·quota 회계·삭제 요청 대응이 전부 전체 스캔이 된다. manifest/part 경로에
+  테넌트를 포함시키는 방향이 자연스럽다.
+- **스로틀·quota 대상**: ingest rate(bytes/s, events/s), 활성 스트림 수(카디널리티),
+  저장 용량, 동시 쿼리 수, 쿼리 스캔 예산. 초과 시 ingest는 `429`(Alloy가 backoff하고 자체 WAL로
+  버티게 한다), 쿼리는 `429` 또는 `422`로 응답한다.
+- **관측**: 모든 quota 카운터와 거절 카운터는 테넌트 라벨을 붙여 `/metrics`에 노출해야 한다.
+  quota를 운영하려면 "누가 어디서 얼마나 막혔는지"가 보여야 한다.
+- **현재 상태**: 아직 구현되지 않았다. `X-Scope-OrgID`는 파싱되지 않고 모든 데이터가 한
+  네임스페이스에 섞이며 테넌트별 제한도 없다. 위 설계를 만족시키는 것이 프로덕션 게이트다
+  (`docs/PRODUCTION_READINESS_REVIEW.md` P0-3 참고).
 
 ## 데이터 모델
 
@@ -94,6 +129,28 @@ LogQL 파싱(chumsky) → 플랜 → 프루닝 단계 순서:
 - S3 credential, region, endpoint, path-style 옵션은 `object_store`가 읽는 AWS/OBJECT_STORE 환경 변수를 사용한다.
 - `LOGGYTRACY_CACHE_MAX_BYTES`: 로컬 Parquet 본문 캐시 상한(기본 10 GiB, 작은 catalog 파일은 제외). 오래 접근하지 않은 본문부터 제거하며, 이후 필요한 쿼리에서 manifest를 기준으로 다시 내려받는다.
 - 시작 시 먼저 manifest catalog를 복구한다. 최초 object store 활성화로 manifest가 비어 있으면 로컬 tombstone 복구가 계산한 최종 active part 전체를 한 번의 CAS로 게시한다. 기존 manifest가 있으면 중단된 merge tombstone을 오래된 세대부터 재개한 뒤 일반 로컬 part를 업로드한다. 업로드 전에는 durable marker를 남겨 manifest 반영 전 중단된 작업을 다음 시작에서 검증·재개한다. marker 없이 완전한 원격 object set만 남은 part는 비활성 generation으로 판단해 되살리지 않는다. registry 밖의 로컬 디렉터리는 자동 삭제하지 않고 후속 retention 대상으로 보존한다.
+
+### Ingest 입력 제한
+
+모든 제한은 journal append **이전에** 적용되므로, 거절된 요청은 WAL에 아무 흔적을 남기지 않는다.
+로그 라인 손실을 막는 쪽보다 엔진을 지키는 쪽을 우선한다 — 거절된 배치는 Alloy가 자체 WAL에서
+재시도하거나 drop한다.
+
+- `LOGGYTRACY_MAX_PUSH_BYTES` (기본 16 MiB): 압축된 push body 상한. axum의 암묵적 2 MiB 기본값을
+  대체하므로, Alloy 배치 크기를 키울 때 이 값을 함께 올려야 한다.
+- `LOGGYTRACY_MAX_DECOMPRESSED_PUSH_BYTES` (기본 64 MiB): snappy 헤더가 신고할 수 있는 압축 해제
+  길이의 상한. `decompress_vec`는 스트림을 검증하기 전에 신고된 길이만큼 할당하므로, 이 검사가
+  없으면 몇 바이트짜리 헤더가 할당 크기를 정한다.
+- `LOGGYTRACY_MAX_LINE_BYTES` (기본 256 KiB)
+- `LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM` (기본 30), `LOGGYTRACY_MAX_LABEL_NAME_BYTES` (기본 1 KiB),
+  `LOGGYTRACY_MAX_LABEL_VALUE_BYTES` (기본 2 KiB): 스트림 카디널리티 폭발 방어. stream index는
+  캐시 상한에서 제외되는 영속 카탈로그이므로, 카디널리티 폭발은 곧 evict 불가능한 디스크 사용량이 된다.
+- `LOGGYTRACY_MAX_TIMESTAMP_AGE` (기본 7d), `LOGGYTRACY_MAX_TIMESTAMP_SKEW` (기본 1h):
+  서버 시계 기준 수용 구간. `off`로 비활성화할 수 있다(과거 데이터 일괄 적재 시 필요).
+  파티션이 UTC 일자 단위이므로 시계 오류나 단위 착오(초/밀리초를 나노초로 전송)가 파티션을 증식시키며,
+  특히 **미래 날짜 part는 retention cutoff에 영구히 걸리지 않는다.**
+
+이 제한들은 아직 전역이다. 테넌트별 스로틀·quota는 테넌시 구현과 함께 들어간다(위 "테넌시" 절).
 
 ## LogQL 지원 범위 (subset)
 

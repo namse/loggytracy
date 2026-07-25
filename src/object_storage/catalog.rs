@@ -104,6 +104,14 @@ impl ObjectStorage {
         let url =
             url::Url::parse(url).map_err(|error| format!("invalid object-store URL: {error}"))?;
         let local_manifest_overwrite = url.scheme() == "file";
+        if local_manifest_overwrite {
+            tracing::warn!(
+                %url,
+                "object store is a local filesystem path: manifest updates use overwrite instead \
+of compare-and-swap and are only safe for a single process on a local disk. Do not use this for \
+production or on shared/network storage."
+            );
+        }
         let options = normalized_object_store_options(std::env::vars());
         let (store, prefix) = object_store::parse_url_opts(&url, options)
             .map_err(|error| format!("failed to configure object store: {error}"))?;

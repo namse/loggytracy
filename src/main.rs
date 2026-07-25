@@ -36,9 +36,9 @@ pub use startup::recover;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("loggytracy=debug,info")
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("loggytracy=info,warn"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let config = Arc::new(
         Config::from_env().unwrap_or_else(|error| panic!("invalid configuration: {error}")),

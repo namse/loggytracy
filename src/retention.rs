@@ -163,8 +163,11 @@ async fn retention_once_at(
         if !removed_log_ids.is_empty() {
             let ids = removed_log_ids.clone();
             let epoch = cache.remote_operation_epoch();
-            match tokio::time::timeout(config.max_restore_runtime, cache.storage.publish(&[], &ids))
-                .await
+            match tokio::time::timeout(
+                config.max_retention_runtime,
+                cache.storage.publish(&[], &ids),
+            )
+            .await
             {
                 Ok(Ok(_)) => cache.mark_remote_healthy_since(epoch),
                 Ok(Err(error)) => {
@@ -185,7 +188,7 @@ async fn retention_once_at(
                 .collect();
             let epoch = cache.remote_operation_epoch();
             match tokio::time::timeout(
-                config.max_restore_runtime,
+                config.max_retention_runtime,
                 cache.storage.remove_trace_parts(&descriptors),
             )
             .await
@@ -211,7 +214,7 @@ async fn retention_once_at(
     if let Some(cache) = remote_cache {
         let epoch = cache.remote_operation_epoch();
         match tokio::time::timeout(
-            config.max_restore_runtime,
+            config.max_retention_runtime,
             cache
                 .storage
                 .garbage_collect_orphans(config.retention_grace_period),

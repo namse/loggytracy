@@ -8,6 +8,19 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub max_batch_bytes: usize,
     pub max_batch_ms: u64,
+    /// Largest accepted compressed push body. Also bounds the length a snappy
+    /// header may declare, so a tiny body cannot drive a huge allocation.
+    pub max_push_bytes: usize,
+    pub max_decompressed_push_bytes: usize,
+    pub max_line_bytes: usize,
+    pub max_label_names_per_stream: usize,
+    pub max_label_name_bytes: usize,
+    pub max_label_value_bytes: usize,
+    /// How far behind and ahead of the server clock an entry timestamp may be.
+    /// Timestamps outside the window create day partitions that retention can
+    /// never expire, so they are rejected at ingest.
+    pub max_timestamp_age: Option<Duration>,
+    pub max_timestamp_skew: Option<Duration>,
     pub flush_max_bytes: u64,
     pub flush_max_interval: Duration,
     pub flush_check_interval: Duration,
@@ -29,6 +42,7 @@ pub struct Config {
     pub retention_interval: Duration,
     pub retention_batch_size: usize,
     pub retention_grace_period: Duration,
+    pub max_retention_runtime: Duration,
     pub max_query_range: Option<Duration>,
     pub max_query_scan_rows: usize,
     pub max_query_scan_bytes: u64,
@@ -60,6 +74,14 @@ impl Default for Config {
             data_dir: PathBuf::from("./data"),
             max_batch_bytes: 1024 * 1024,
             max_batch_ms: 200,
+            max_push_bytes: 16 * 1024 * 1024,
+            max_decompressed_push_bytes: 64 * 1024 * 1024,
+            max_line_bytes: 256 * 1024,
+            max_label_names_per_stream: 30,
+            max_label_name_bytes: 1024,
+            max_label_value_bytes: 2048,
+            max_timestamp_age: Some(Duration::from_secs(7 * 24 * 60 * 60)),
+            max_timestamp_skew: Some(Duration::from_secs(60 * 60)),
             flush_max_bytes: 1024 * 1024,
             flush_max_interval: Duration::from_secs(5),
             flush_check_interval: Duration::from_millis(500),
@@ -78,6 +100,7 @@ impl Default for Config {
             retention_interval: Duration::from_secs(300),
             retention_batch_size: 100,
             retention_grace_period: Duration::from_secs(60 * 60),
+            max_retention_runtime: Duration::from_secs(120),
             max_query_range: None,
             max_query_scan_rows: 5_000_000,
             max_query_scan_bytes: 2 * 1024 * 1024 * 1024,
@@ -115,6 +138,38 @@ impl Config {
                 defaults.max_batch_bytes,
             )?,
             max_batch_ms: env_positive_u64("LOGGYTRACY_MAX_BATCH_MS", defaults.max_batch_ms)?,
+            max_push_bytes: env_positive_usize(
+                "LOGGYTRACY_MAX_PUSH_BYTES",
+                defaults.max_push_bytes,
+            )?,
+            max_decompressed_push_bytes: env_positive_usize(
+                "LOGGYTRACY_MAX_DECOMPRESSED_PUSH_BYTES",
+                defaults.max_decompressed_push_bytes,
+            )?,
+            max_line_bytes: env_positive_usize(
+                "LOGGYTRACY_MAX_LINE_BYTES",
+                defaults.max_line_bytes,
+            )?,
+            max_label_names_per_stream: env_positive_usize(
+                "LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM",
+                defaults.max_label_names_per_stream,
+            )?,
+            max_label_name_bytes: env_positive_usize(
+                "LOGGYTRACY_MAX_LABEL_NAME_BYTES",
+                defaults.max_label_name_bytes,
+            )?,
+            max_label_value_bytes: env_positive_usize(
+                "LOGGYTRACY_MAX_LABEL_VALUE_BYTES",
+                defaults.max_label_value_bytes,
+            )?,
+            max_timestamp_age: env_duration(
+                "LOGGYTRACY_MAX_TIMESTAMP_AGE",
+                defaults.max_timestamp_age,
+            )?,
+            max_timestamp_skew: env_duration(
+                "LOGGYTRACY_MAX_TIMESTAMP_SKEW",
+                defaults.max_timestamp_skew,
+            )?,
             flush_max_bytes: env_positive_u64(
                 "LOGGYTRACY_FLUSH_MAX_BYTES",
                 defaults.flush_max_bytes,
@@ -182,6 +237,10 @@ impl Config {
             retention_grace_period: env_required_duration(
                 "LOGGYTRACY_RETENTION_GRACE_PERIOD",
                 defaults.retention_grace_period,
+            )?,
+            max_retention_runtime: env_required_duration(
+                "LOGGYTRACY_MAX_RETENTION_RUNTIME",
+                defaults.max_retention_runtime,
             )?,
             max_query_range: env_duration("LOGGYTRACY_MAX_QUERY_RANGE", None)?,
             max_query_scan_rows: env_positive_usize(
@@ -264,6 +323,27 @@ impl Config {
         }
         positive_usize("max_batch_bytes", self.max_batch_bytes)?;
         positive_u64("max_batch_ms", self.max_batch_ms)?;
+        positive_usize("max_push_bytes", self.max_push_bytes)?;
+        positive_usize(
+            "max_decompressed_push_bytes",
+            self.max_decompressed_push_bytes,
+        )?;
+        if self.max_decompressed_push_bytes < self.max_push_bytes {
+            return Err("max_decompressed_push_bytes must not be below max_push_bytes".to_string());
+        }
+        positive_usize("max_line_bytes", self.max_line_bytes)?;
+        positive_usize(
+            "max_label_names_per_stream",
+            self.max_label_names_per_stream,
+        )?;
+        positive_usize("max_label_name_bytes", self.max_label_name_bytes)?;
+        positive_usize("max_label_value_bytes", self.max_label_value_bytes)?;
+        if let Some(age) = self.max_timestamp_age {
+            positive_duration("max_timestamp_age", age)?;
+        }
+        if let Some(skew) = self.max_timestamp_skew {
+            positive_duration("max_timestamp_skew", skew)?;
+        }
         positive_u64("flush_max_bytes", self.flush_max_bytes)?;
         positive_duration("flush_max_interval", self.flush_max_interval)?;
         positive_duration("flush_check_interval", self.flush_check_interval)?;
@@ -291,6 +371,7 @@ impl Config {
         positive_duration("retention_interval", self.retention_interval)?;
         positive_usize("retention_batch_size", self.retention_batch_size)?;
         positive_duration("retention_grace_period", self.retention_grace_period)?;
+        positive_duration("max_retention_runtime", self.max_retention_runtime)?;
         if let Some(range) = self.max_query_range {
             positive_duration("max_query_range", range)?;
         }

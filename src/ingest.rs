@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use prost::Message;
 
 use crate::AppState;
+use crate::config::Config;
 use crate::memtable::LogEntry;
 use crate::proto::{self, PushRequest};
 
@@ -34,6 +35,82 @@ pub async fn push(
     result
 }
 
+/// Accepted timestamp band around the server clock, resolved once per request.
+/// Timestamps outside it are rejected: a far-past entry lands in a partition
+/// retention already swept, and a far-future entry lands in one whose
+/// `max_ts_ns` never falls behind the retention cutoff, so it is never expired.
+struct TimestampWindow {
+    oldest_ns: Option<i64>,
+    newest_ns: Option<i64>,
+}
+
+impl TimestampWindow {
+    fn from_config(config: &Config) -> Self {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
+        Self {
+            oldest_ns: config
+                .max_timestamp_age
+                .map(|age| now_ns.saturating_sub(duration_to_ns(age))),
+            newest_ns: config
+                .max_timestamp_skew
+                .map(|skew| now_ns.saturating_add(duration_to_ns(skew))),
+        }
+    }
+
+    fn validate(&self, timestamp_ns: i64) -> Result<(), String> {
+        if self.oldest_ns.is_some_and(|oldest| timestamp_ns < oldest) {
+            return Err(format!(
+                "entry timestamp {timestamp_ns} is older than the accepted window; \
+raise LOGGYTRACY_MAX_TIMESTAMP_AGE or disable it with 'off'"
+            ));
+        }
+        if self.newest_ns.is_some_and(|newest| timestamp_ns > newest) {
+            return Err(format!(
+                "entry timestamp {timestamp_ns} is further in the future than the accepted window; \
+check the client clock and timestamp units, or raise LOGGYTRACY_MAX_TIMESTAMP_SKEW"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn duration_to_ns(duration: std::time::Duration) -> i64 {
+    duration.as_nanos().min(i64::MAX as u128) as i64
+}
+
+fn validate_labels(
+    labels: &std::collections::BTreeMap<String, String>,
+    config: &Config,
+) -> Result<(), String> {
+    if labels.len() > config.max_label_names_per_stream {
+        return Err(format!(
+            "stream has {} labels, exceeding the maximum of {}",
+            labels.len(),
+            config.max_label_names_per_stream
+        ));
+    }
+    for (name, value) in labels {
+        if name.len() > config.max_label_name_bytes {
+            return Err(format!(
+                "label name is {} bytes, exceeding the maximum of {}",
+                name.len(),
+                config.max_label_name_bytes
+            ));
+        }
+        if value.len() > config.max_label_value_bytes {
+            return Err(format!(
+                "value of label '{name}' is {} bytes, exceeding the maximum of {}",
+                value.len(),
+                config.max_label_value_bytes
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn push_inner(
     state: &Arc<AppState>,
     headers: HeaderMap,
@@ -44,21 +121,49 @@ async fn push_inner(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let decompressed = if content_type.contains("application/json") {
+    if content_type.contains("application/json") {
         return Err((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "JSON push not supported in M0, use protobuf+snappy".to_string(),
+            "JSON push is not supported, use protobuf+snappy".to_string(),
         ));
-    } else {
-        snap::raw::Decoder::new()
-            .decompress_vec(&body)
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("snappy decompress failed: {}", e),
-                )
-            })?
-    };
+    }
+    let limits = &state.config;
+    if body.len() > limits.max_push_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "push body is {} bytes, exceeding the maximum of {}",
+                body.len(),
+                limits.max_push_bytes
+            ),
+        ));
+    }
+    // The snappy header declares the decompressed length and `decompress_vec`
+    // allocates it before validating the stream, so an attacker-chosen header
+    // would otherwise size the allocation. Check the declared length first.
+    let declared = snap::raw::decompress_len(&body).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid snappy header: {error}"),
+        )
+    })?;
+    if declared > limits.max_decompressed_push_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "push declares {declared} decompressed bytes, exceeding the maximum of {}",
+                limits.max_decompressed_push_bytes
+            ),
+        ));
+    }
+    let decompressed = snap::raw::Decoder::new()
+        .decompress_vec(&body)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("snappy decompress failed: {}", e),
+            )
+        })?;
 
     let push_req = PushRequest::decode(decompressed.as_slice()).map_err(|e| {
         (
@@ -67,6 +172,7 @@ async fn push_inner(
         )
     })?;
 
+    let timestamp_window = TimestampWindow::from_config(limits);
     let mut parsed: Vec<(std::collections::BTreeMap<String, String>, Vec<LogEntry>)> =
         Vec::with_capacity(push_req.streams.len());
     for stream in &push_req.streams {
@@ -76,6 +182,7 @@ async fn push_inner(
                 format!("invalid labels '{}': {}", stream.labels, e),
             )
         })?;
+        validate_labels(&labels, limits).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
         let entries: Vec<LogEntry> = stream
             .entries
             .iter()
@@ -86,6 +193,19 @@ async fn push_inner(
                         format!("invalid entry timestamp: {error}"),
                     )
                 })?;
+                timestamp_window
+                    .validate(timestamp_ns)
+                    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+                if e.line.len() > limits.max_line_bytes {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "log line is {} bytes, exceeding the maximum of {}",
+                            e.line.len(),
+                            limits.max_line_bytes
+                        ),
+                    ));
+                }
                 Ok(LogEntry {
                     timestamp_ns,
                     line: e.line.clone(),
@@ -230,6 +350,183 @@ mod tests {
 
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
         assert!(memtable.is_empty());
+    }
+
+    fn protobuf_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/x-protobuf".parse().unwrap());
+        headers
+    }
+
+    async fn limits_state(config: Config) -> Arc<crate::AppState> {
+        let memtable = Arc::new(MemTable::new());
+        let journal = Arc::new(journal::Journal::spawn(&config, memtable.clone()).unwrap());
+        crate::test_support::state(
+            config,
+            memtable,
+            journal,
+            Arc::new(PartRegistry::new()),
+            Arc::new(crate::trace_registry::TraceRegistry::standalone()),
+            None,
+        )
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[tokio::test]
+    async fn push_rejects_a_snappy_header_declaring_more_than_the_limit() {
+        let config = Config {
+            data_dir: tmp_data_dir("declared_length"),
+            max_decompressed_push_bytes: 1024,
+            ..Config::default()
+        };
+        let state = limits_state(config).await;
+        // A four-byte varint header declaring ~256 MiB with no payload: the
+        // guard must reject it before `decompress_vec` sizes an allocation.
+        let body = vec![0x80, 0x80, 0x80, 0x80, 0x01];
+
+        let error = push(State(state), protobuf_headers(), Bytes::from(body))
+            .await
+            .expect_err("an oversized declared length must be rejected");
+
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error.1.contains("decompressed bytes"), "{}", error.1);
+    }
+
+    #[tokio::test]
+    async fn push_rejects_a_body_over_the_configured_limit() {
+        let config = Config {
+            data_dir: tmp_data_dir("body_limit"),
+            max_push_bytes: 32,
+            max_decompressed_push_bytes: 64,
+            ..Config::default()
+        };
+        let state = limits_state(config).await;
+        let body = build_snappy_push("body-limit", &"x".repeat(4096), now_secs());
+
+        let error = push(State(state), protobuf_headers(), Bytes::from(body))
+            .await
+            .expect_err("an oversized body must be rejected");
+
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn push_rejects_a_line_over_the_configured_limit() {
+        let config = Config {
+            data_dir: tmp_data_dir("line_limit"),
+            max_line_bytes: 16,
+            ..Config::default()
+        };
+        let state = limits_state(config).await;
+        let body = build_snappy_push("line-limit", &"x".repeat(64), now_secs());
+
+        let error = push(State(state.clone()), protobuf_headers(), Bytes::from(body))
+            .await
+            .expect_err("an oversized line must be rejected");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(state.memtable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_rejects_too_many_labels() {
+        let config = Config {
+            data_dir: tmp_data_dir("label_count"),
+            max_label_names_per_stream: 2,
+            ..Config::default()
+        };
+        let state = limits_state(config).await;
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{a="1",b="2",c="3"}"#.to_string(),
+                entries: vec![EntryAdapter {
+                    timestamp: Some(::prost_types::Timestamp {
+                        seconds: now_secs(),
+                        nanos: 0,
+                    }),
+                    line: "too many labels".to_string(),
+                    structured_metadata: vec![],
+                }],
+                hash: 0,
+            }],
+        };
+        let mut buf = Vec::new();
+        req.encode(&mut buf).unwrap();
+        let body = snap::raw::Encoder::new().compress_vec(&buf).unwrap();
+
+        let error = push(State(state.clone()), protobuf_headers(), Bytes::from(body))
+            .await
+            .expect_err("an oversized label set must be rejected");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("3 labels"), "{}", error.1);
+        assert!(state.memtable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_rejects_timestamps_outside_the_accepted_window() {
+        let config = Config {
+            data_dir: tmp_data_dir("timestamp_window"),
+            max_timestamp_age: Some(Duration::from_secs(3600)),
+            max_timestamp_skew: Some(Duration::from_secs(3600)),
+            ..Config::default()
+        };
+        let state = limits_state(config).await;
+
+        let ancient = build_snappy_push("skew", "far past", now_secs() - 86_400);
+        let ancient_error = push(
+            State(state.clone()),
+            protobuf_headers(),
+            Bytes::from(ancient),
+        )
+        .await
+        .expect_err("a far-past timestamp must be rejected");
+        assert_eq!(ancient_error.0, StatusCode::BAD_REQUEST);
+        assert!(
+            ancient_error.1.contains("older than"),
+            "{}",
+            ancient_error.1
+        );
+
+        // A unit mix-up (seconds sent where nanoseconds were meant) is the
+        // realistic source of far-future partitions retention never expires.
+        let future = build_snappy_push("skew", "far future", now_secs() + 86_400);
+        let future_error = push(
+            State(state.clone()),
+            protobuf_headers(),
+            Bytes::from(future),
+        )
+        .await
+        .expect_err("a far-future timestamp must be rejected");
+        assert_eq!(future_error.0, StatusCode::BAD_REQUEST);
+        assert!(future_error.1.contains("future"), "{}", future_error.1);
+
+        assert!(state.memtable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_accepts_old_timestamps_when_the_window_is_disabled() {
+        let config = Config {
+            data_dir: tmp_data_dir("timestamp_window_off"),
+            max_timestamp_age: None,
+            max_timestamp_skew: None,
+            ..Config::default()
+        };
+        let state = limits_state(config).await;
+        let body = build_snappy_push("backfill", "historical import", 1_000_000);
+
+        let status = push(State(state.clone()), protobuf_headers(), Bytes::from(body))
+            .await
+            .expect("a disabled window must accept any in-range timestamp");
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!state.memtable.is_empty());
     }
 
     #[tokio::test]
