@@ -107,8 +107,15 @@ impl ObjectStorage {
         let options = normalized_object_store_options(std::env::vars());
         let (store, prefix) = object_store::parse_url_opts(&url, options)
             .map_err(|error| format!("failed to configure object store: {error}"))?;
+        // Tier B load gate: wrap the real store with seeded latency/fault
+        // injection only when the load knobs are present. Absent the knobs this
+        // is a no-op and the object-store construction path is unchanged.
+        let store: Arc<dyn ObjectStore> = match fault_store::FaultConfig::from_env()? {
+            Some(config) => Arc::new(fault_store::LatencyFaultStore::new(Arc::from(store), config)),
+            None => Arc::from(store),
+        };
         Ok(Self {
-            store: Arc::from(store),
+            store,
             prefix,
             manifest_update: tokio::sync::Mutex::new(()),
             local_manifest_overwrite,

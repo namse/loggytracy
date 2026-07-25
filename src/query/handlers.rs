@@ -317,6 +317,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
         .unwrap_or(0);
     let checkpoint = crate::journal::read_checkpoint(state.journal.ckpt_path()).unwrap_or(0);
     let wal_backlog_bytes = wal_bytes.saturating_sub(checkpoint);
+    let merge_debt_parts = crate::merge::merge_debt_part_count(&state.parts, &state.config);
     let m = &state.metrics;
     format!(
         "# TYPE loggytracy_memtable_entries gauge\n\
@@ -337,6 +338,8 @@ loggytracy_remote_healthy {}\n\
 loggytracy_cache_healthy {}\n\
 # TYPE loggytracy_wal_backlog_bytes gauge\n\
 loggytracy_wal_backlog_bytes {}\n\
+# TYPE loggytracy_merge_debt_parts gauge\n\
+loggytracy_merge_debt_parts {}\n\
 # TYPE loggytracy_ingest_requests_total counter\n\
 loggytracy_ingest_requests_total {}\n\
 # TYPE loggytracy_ingest_errors_total counter\n\
@@ -386,6 +389,7 @@ loggytracy_force_flush_complete {}\n",
         remote_healthy as u8,
         cache_healthy as u8,
         wal_backlog_bytes,
+        merge_debt_parts,
         m.ingest_requests.load(Ordering::Relaxed),
         m.ingest_errors.load(Ordering::Relaxed),
         m.flush_success.load(Ordering::Relaxed),

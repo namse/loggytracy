@@ -28,7 +28,7 @@ roaring = "0.11.4"
 object_store = { version = "0.12", features = ["aws"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-async-trait = "0.1"

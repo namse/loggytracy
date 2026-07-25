@@ -120,6 +120,7 @@ LogQL 파싱(chumsky) → 플랜 → 프루닝 단계 순서:
 | M4 | 트레이스: OTLP ingest + trace_id 조회(bloom) + Tempo API | Grafana Tempo 데이터소스로 트레이스 조회 |
 | M5 | merge/컴팩션 튜닝, 리텐션, 자원 상한(쿼리 메모리·범위 제한), 부하 테스트 | 목표 처리량 달성 |
 | M6 | graceful shutdown 기반 장비 교체 (SIGTERM 핸들러 + force-flush + drain-status readiness) | 장비 교체 리허설 성공 (손실 없이 신규 장비로 트래픽 전환) |
+| M7 | 로컬 S3 부하 검증 (Tier B: 인프로세스 지연·장애 주입 스토어 / Tier C: 로컬 MinIO 실제 S3 프로토콜) + 부하 분석용 gauge 관측성 보강 | 목표 대비 처리량·지연·메모리·리텐션·에러율 검증 및 병목 문서화, MinIO에서 manifest CAS·원격 restore·retention GC 확인 |
 
 ## 참고
 

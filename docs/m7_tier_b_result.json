@@ -1,0 +1,124 @@
+{
+  "achieved_eps": 476.5485019398037,
+  "ack_latency_ms": {
+    "count": 166,
+    "p50_ms": 208.80325,
+    "p95_ms": 212.169667,
+    "p99_ms": 214.44987500000002
+  },
+  "ack_warmup_latency_ms": {
+    "count": 49,
+    "p50_ms": 209.702958,
+    "p95_ms": 214.57875,
+    "p99_ms": 255.89104200000003
+  },
+  "behavioral": {
+    "cache_healthy_end": true,
+    "flush_progressing": false,
+    "flush_success_delta": 2,
+    "no_ingest_errors": true,
+    "recovered_flush_errors": 39,
+    "recovered_merge_errors": 0,
+    "remote_healthy_end": true,
+    "restore_errors": 0,
+    "restore_observed": false,
+    "retention_observed": true,
+    "wal_backlog_bounded": false
+  },
+  "behavioral_pass": false,
+  "build_revision": "782e7ff",
+  "duration_seconds": 45,
+  "events": 21500,
+  "eviction_delta": 15,
+  "flush_errors_delta": 39,
+  "ingest_errors_delta": 0,
+  "machine_profile": "Darwin arm64; 8 logical CPUs; 16 GiB RAM (developer laptop, not 4-vCPU/16-GiB reference)",
+  "merge_errors_delta": 0,
+  "metric_errors": 0,
+  "metric_latency_ms": {
+    "count": 8,
+    "p50_ms": 27.806833,
+    "p95_ms": 39.508666999999996,
+    "p99_ms": 39.508666999999996
+  },
+  "metric_queries": 10,
+  "numeric_pass": true,
+  "offered_eps": 3000,
+  "otlp_errors": 0,
+  "otlp_requests": 10,
+  "push_errors": 0,
+  "pushes": 215,
+  "queries": 10,
+  "query_errors": 0,
+  "query_latency_ms": {
+    "count": 8,
+    "p50_ms": 6.611459,
+    "p95_ms": 10.89175,
+    "p99_ms": 10.89175
+  },
+  "restore_errors_delta": 0,
+  "restore_probe_latency_ms": {
+    "count": 8,
+    "p50_ms": 12.367833,
+    "p95_ms": 20.712417000000002,
+    "p99_ms": 20.712417000000002
+  },
+  "restore_probes": 8,
+  "restore_success_delta": 0,
+  "retention_errors_delta": 0,
+  "retention_success_delta": 9,
+  "rss_peak_bytes": 4194304,
+  "seed": 1592598566,
+  "targets": {
+    "ack_p95": {
+      "measured": 212.169667,
+      "pass": true,
+      "target": 250.0
+    },
+    "ack_p99": {
+      "measured": 214.44987500000002,
+      "pass": true,
+      "target": 1000.0
+    },
+    "error_rate": {
+      "measured": 0.0,
+      "pass": true,
+      "target": 0.0
+    },
+    "query_p95": {
+      "measured": 10.89175,
+      "pass": true,
+      "target": 2000.0
+    },
+    "rss_peak_bytes": {
+      "measured": 4194304.0,
+      "pass": true,
+      "target": 4294967296.0
+    },
+    "wal_backlog_bytes": {
+      "measured": 19947490.0,
+      "pass": false,
+      "target": 16777216.0
+    }
+  },
+  "tempo_errors": 0,
+  "tempo_latency_ms": {
+    "count": 8,
+    "p50_ms": 0.6980000000000001,
+    "p95_ms": 3.377,
+    "p99_ms": 3.377
+  },
+  "tempo_searches": 10,
+  "terminal_gauges": {
+    "memtable_bytes": 18329600,
+    "memtable_entries": 17900,
+    "merge_debt_parts": 0,
+    "part_bytes": 0,
+    "part_count": 0,
+    "trace_part_count": 0,
+    "wal_backlog_bytes": 19947490
+  },
+  "tier": "B",
+  "verdict": "FAIL",
+  "warmup_seconds": 10
+}

@@ -1,3 +1,32 @@
+/// Number of parts currently eligible for but not yet merged: the point-in-time
+/// merge backlog. Mirrors the scheduler's per-partition grouping and counts
+/// members of every group that meets `merge_min_part_count`, so the load report
+/// can attribute backpressure to accumulated small parts.
+pub fn merge_debt_part_count(registry: &PartRegistry, config: &Config) -> usize {
+    let readers = registry.snapshot();
+    if readers.is_empty() {
+        return 0;
+    }
+    let mut by_partition: HashMap<String, Vec<Arc<PartReader>>> = HashMap::new();
+    for reader in readers {
+        by_partition
+            .entry(reader.meta().partition.clone())
+            .or_default()
+            .push(reader);
+    }
+    let min_part_count = config.merge_min_part_count.max(2);
+    let mut debt = 0usize;
+    for (_partition, mut parts) in by_partition {
+        parts.sort_by_key(|reader| reader.meta().row_count);
+        for group in group_for_merge(&parts, config) {
+            if group.len() >= min_part_count {
+                debt += group.len();
+            }
+        }
+    }
+    debt
+}
+
 fn group_for_merge(parts: &[Arc<PartReader>], config: &Config) -> Vec<Vec<Arc<PartReader>>> {
     let mut groups: Vec<Vec<Arc<PartReader>>> = Vec::new();
     let mut current: Vec<Arc<PartReader>> = Vec::new();

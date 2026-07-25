@@ -875,6 +875,52 @@
         assert_eq!(std::fs::read(&outside).unwrap(), b"must survive");
     }
 
+    #[tokio::test]
+    async fn seeded_fault_store_publishes_losslessly_after_injected_errors() {
+        // Tier B recovery gate: a high write-error rate makes most publish
+        // attempts fail, but retrying the same acknowledged parts must
+        // eventually land every one in the manifest with no loss and no
+        // duplication. A fixed seed makes the injected-error sequence
+        // reproducible.
+        let root = temp_dir("fault-recovery");
+        let parts_root = root.join("parts");
+        let parts = crate::part::flush_rows(
+            vec![row("first"), row("second"), row("third")],
+            &parts_root,
+            16,
+        )
+        .unwrap();
+        let config = super::fault_store::FaultConfig::for_test(0, 0, 0, 0.6, 0x00c0_ffee_5eed);
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(super::fault_store::LatencyFaultStore::new(inner, config));
+        let storage = ObjectStorage::from_store(store, "loggytracy-fault");
+
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match storage.publish(&parts, &[]).await {
+                Ok(_) => break,
+                Err(error) => {
+                    assert!(
+                        error.contains("injected object-store write failure")
+                            || error.contains("failed to"),
+                        "unexpected error: {error}"
+                    );
+                    assert!(attempts < 1000, "publish never recovered");
+                }
+            }
+        }
+        assert!(attempts > 1, "test seed did not inject any failure");
+
+        let manifest = storage.load_manifest().await.unwrap();
+        let mut ids: Vec<_> = manifest.parts.iter().map(|part| part.id.clone()).collect();
+        ids.sort();
+        let mut expected: Vec<_> = parts.iter().map(|part| part.meta.id.clone()).collect();
+        expected.sort();
+        assert_eq!(ids, expected, "every acknowledged part must be present exactly once");
+    }
+
     #[test]
     fn manifest_rejects_relative_path_components() {
         for value in [".", "..", "a/b", ""] {

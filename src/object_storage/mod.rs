@@ -123,6 +123,8 @@ struct LocalMergeGroup {
     added: Vec<Part>,
 }
 
+mod fault_store;
+
 include!("paths.rs");
 include!("catalog.rs");
 include!("object_io.rs");

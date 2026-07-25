@@ -13,6 +13,7 @@ new Codex context can continue without relying on chat history.
 | M4 | Complete | OTLP trace ingest, trace-ID lookup, and Tempo-compatible APIs |
 | M5 | In progress | Compaction tuning, retention, resource limits, and load validation against explicit targets |
 | M6 | Complete (review pending) | Graceful shutdown for machine replacement (SIGTERM handling, forced flush-to-S3, drain-status readiness) and a machine-replacement rehearsal |
+| M7 | Planned | Local S3 load validation via in-process latency/fault injection (Tier B) and a local MinIO over the real S3 protocol (Tier C), plus point-in-time gauge observability for load analysis |
 
 ## Repository state note
 
@@ -155,6 +156,23 @@ The implementation plan and design decisions are recorded in
 Live S3 is not exercised in this workspace; the in-memory and local-file
 object-store backends exercise the same durability contract, and live S3
 remains an environment-level deployment check.
+
+## M7 acceptance checklist
+
+The implementation plan and design decisions are recorded in
+[`docs/M7_IMPLEMENTATION_PLAN.md`](M7_IMPLEMENTATION_PLAN.md).
+
+- [x] `RuntimeMetrics`/`/metrics` expose active part counts, WAL backlog, MemTable bytes, and merge debt as point-in-time gauges.
+- [x] `from_url` optionally wraps the constructed store in a latency/fault-injecting store when load knobs are set, and is a no-op otherwise.
+- [~] Tier B: a seeded, reproducible run drives the real server over a latency/fault-injected backend and recovers from injected object-store errors. Storage-layer lossless recovery is covered by a test; the full end-to-end run is blocked by the WAL-compaction wedge bug (see M7_LOAD_RESULTS.md).
+- [x] `docker-compose.yml` brings up MinIO and a load script runs the server against it end to end.
+- [~] Tier C: manifest CAS is confirmed against MinIO over the real S3 protocol (needs `OBJECT_STORE_CONDITIONAL_PUT=etag`, documented). Remote restore/retention GC confirmation is blocked by the same wedge bug.
+- [x] The load harness paces to a target rate, splits warmup from steady state, forces eviction→restore, and emits an explicit per-target pass/fail verdict.
+- [ ] A run meets the agreed throughput, latency, memory, retention, and error-rate targets on target-class hardware; local runs are error-free with bounded RSS and correct backpressure, and the achieved numbers are recorded. (Blocked: WAL-compaction wedge bug.)
+- [x] `docs/M7_LOAD_RESULTS.md` records both tier results, the machine profile, the identified bottleneck, and per-target pass/fail.
+- [ ] The M6 fresh-context review gate is cleared (carried over; blocks final acceptance).
+- [ ] A fresh-context review reports no blocking findings.
+- [x] Focused tests, `cargo test --all-targets`, `cargo fmt --all -- --check`, Clippy with warnings denied, and `git diff --check` pass.
 
 ## Completion protocol
 
