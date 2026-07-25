@@ -447,6 +447,9 @@ exclusive: per-tenant retention replaces the global period"
         positive_duration("tenant_policy_interval", self.tenant_policy_interval)?;
         positive_duration("tenant_policy_timeout", self.tenant_policy_timeout)?;
         positive_usize("tenant_policy_max_bytes", self.tenant_policy_max_bytes)?;
+        if let Some(raw) = &self.tenant_policy_auth_header {
+            crate::tenant_policy::parse_auth_header(raw)?;
+        }
         if let Some(maximum) = self.max_tenant_retention {
             positive_duration("max_tenant_retention", maximum)?;
         }
@@ -669,6 +672,28 @@ mod tests {
         }
         config.retention_rewrite_threshold = 1.0;
         assert!(config.validate().is_ok());
+    }
+
+    /// The auth header is validated here rather than only when the policy
+    /// client is built, so a malformed one is reported with every other
+    /// configuration error instead of at worker startup.
+    #[test]
+    fn a_malformed_tenant_policy_auth_header_fails_validation() {
+        let mut config = Config {
+            tenant_policy_url: Some("https://control-plane/policy".to_string()),
+            tenant_policy_auth_header: Some("Authorization: Bearer secret".to_string()),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+
+        for invalid in ["Authorization", "Authorization: ", "Bad Name: value"] {
+            config.tenant_policy_auth_header = Some(invalid.to_string());
+            assert!(config.validate().is_err(), "{invalid} must be rejected");
+            assert!(
+                crate::tenant_policy::TenantPolicy::from_config(&config).is_err(),
+                "{invalid} must also be rejected where it is used"
+            );
+        }
     }
 
     #[test]

@@ -428,8 +428,10 @@ fn parse_retention(raw: &str) -> Result<TenantRetention, String> {
     Ok(TenantRetention::Finite(Duration::from_nanos(nanos)))
 }
 
-/// A single `Name: value` string, as configured.
-fn parse_auth_header(raw: &str) -> Result<(String, String), String> {
+/// A single `Name: value` string, as configured. `Config::validate` calls this
+/// too, so a malformed header is rejected with the rest of the configuration
+/// instead of surfacing later as a failed `TenantPolicy::from_config`.
+pub fn parse_auth_header(raw: &str) -> Result<(String, String), String> {
     let (name, value) = raw.split_once(':').ok_or_else(|| {
         "LOGGYTRACY_TENANT_POLICY_AUTH_HEADER must be a single \"Name: value\" string".to_string()
     })?;

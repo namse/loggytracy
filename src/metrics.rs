@@ -15,6 +15,10 @@ pub struct RuntimeMetrics {
     pub retention_errors: AtomicU64,
     pub retention_expired_rows_dropped: AtomicU64,
     pub retention_parts_rewritten: AtomicU64,
+    /// Retention-only merge groups whose inputs could not be read, so the
+    /// expired rows in them stay on disk. A number that keeps rising means a
+    /// part is permanently too large for `merge_max_memory_bytes`.
+    pub retention_rewrite_skipped: AtomicU64,
     pub query_success: AtomicU64,
     pub query_errors: AtomicU64,
     pub query_scanned_rows: AtomicU64,
@@ -39,6 +43,7 @@ impl RuntimeMetrics {
             retention_errors: AtomicU64::new(0),
             retention_expired_rows_dropped: AtomicU64::new(0),
             retention_parts_rewritten: AtomicU64::new(0),
+            retention_rewrite_skipped: AtomicU64::new(0),
             query_success: AtomicU64::new(0),
             query_errors: AtomicU64::new(0),
             query_scanned_rows: AtomicU64::new(0),

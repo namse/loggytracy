@@ -176,7 +176,11 @@ Individual account deletion, in order of preference:
 2. **Lazy purge at merge.** Merge already rewrites parts; drop the deleted
    tenant's rows at that point. No extra I/O, but latency until the next merge.
 
-Start with (1); add (2) only if a compliance requirement forces it.
+*Resolved:* deleting a tenant is pushing `retention: "0"`, which does both — the
+data is invisible from the next query, parts holding only that tenant are
+deleted whole, and shared parts drop its rows at the next merge, ignoring the
+rewrite threshold so reclamation is bounded. There is no completion report; see
+[`RETENTION_DESIGN.md`](RETENTION_DESIGN.md).
 
 ## Read path
 
@@ -409,7 +413,7 @@ This is the gap `PRODUCTION_READINESS_REVIEW.md:276` records as
 | Trace part format | **done** — same shape (`tenant` column, tenant-aligned row groups, tenant index) |
 | Read path isolation | **done** — `PartReader`/`PartRegistry`/`TraceRegistry`/MemTable queries, `label_names`, `label_values`, `series`, `stats` all take a required tenant; part-level time pruning is per tenant |
 | Merge | **done** — reads rows through the tenant index and re-sorts by `(tenant, ts)`; no cross-tenant mixing beyond the shared object |
-| Per-tenant retention | **done** — `tenant_policy.rs` polls a configured endpoint and applies it at deletion time; partitions stay on `day`. See [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
+| Per-tenant retention | **deletion side done**, intake being replaced — the control plane pushes one tenant at a time and it is applied at deletion time; partitions stay on `day`. See [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
 | Partition on `(tier, day)` | **rejected** — retention baked in at write time cannot honour a plan change; superseded by [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
 | Sidecar consolidation | **not done** — still four `PART_FILES` |
 | Range GET / per-`(part, tenant)` cache | **not done** |
@@ -421,9 +425,9 @@ operator scrape, not a tenant-facing endpoint.
 
 ### Open questions
 
-**Where does a tenant's tier come from?** *Answered* — a configured control-plane
-endpoint, polled by the retention loop, and applied at **deletion** time rather
-than at write time. `Partition on (tier, day)` was rejected along with every
+**Where does a tenant's tier come from?** *Answered* — the control plane pushes
+one tenant's retention at a time, loggytracy persists it before acknowledging,
+and it is applied at **deletion** time rather than at write time. `Partition on (tier, day)` was rejected along with every
 other scheme that fixes retention when the bytes are written, because none of
 them honours a plan upgrade or downgrade. Partitions stay on `day`. Full record:
 [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md).

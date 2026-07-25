@@ -417,6 +417,80 @@ mod tests {
         assert!(parts[0].dir.exists());
     }
 
+    /// Unknown means keep, in whichever state the data happens to be. Nothing
+    /// deletes memtable entries for retention — the query floor makes expired
+    /// ones invisible and the flush carries them to a part — so an unknown
+    /// tenant that has only pushed must come through a tick untouched, and so
+    /// must the part it eventually becomes.
+    #[tokio::test]
+    async fn an_unknown_tenant_survives_retention_in_the_memtable_and_in_a_part() {
+        let root = temp_root("retention-unknown-memtable");
+        let parts_root = root.join("parts");
+        let config = per_tenant_config(root);
+        let registry = Arc::new(PartRegistry::new());
+        let trace_registry = Arc::new(TraceRegistry::standalone());
+        // Everything the control plane knows about has expired many times
+        // over; `unmentioned` is absent from it entirely.
+        let policy = policy_with(&[("alpha", TenantRetention::Finite(Duration::from_nanos(1)))]);
+
+        let memtable = crate::memtable::MemTable::new();
+        memtable.insert(
+            tenant("unmentioned"),
+            [("app".to_string(), "unmentioned".to_string())]
+                .into_iter()
+                .collect(),
+            vec![crate::memtable::LogEntry {
+                timestamp_ns: 1_000,
+                line: "still in the memtable".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+
+        retention_once_at(
+            &registry,
+            &trace_registry,
+            None,
+            &config,
+            &policy,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+
+        let in_memory = memtable.query(
+            &tenant("unmentioned"),
+            &[],
+            &[],
+            i64::MIN,
+            i64::MAX,
+            10,
+            true,
+        );
+        assert_eq!(
+            in_memory.iter().flat_map(|stream| &stream.entries).count(),
+            1
+        );
+
+        // The same rows once they have been flushed, in a part of their own.
+        let parts =
+            part::flush_rows(vec![row_for("unmentioned", 1_000)], &parts_root, 100).unwrap();
+        registry.register(parts.clone()).unwrap();
+
+        retention_once_at(
+            &registry,
+            &trace_registry,
+            None,
+            &config,
+            &policy,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(registry.part_count(), 1);
+        assert!(parts[0].dir.exists());
+    }
+
     #[tokio::test]
     async fn a_part_whose_every_tenant_expired_takes_the_free_whole_delete_path() {
         let root = temp_root("retention-all-expired");

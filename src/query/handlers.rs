@@ -458,6 +458,8 @@ loggytracy_retention_errors_total {}\n\
 loggytracy_retention_expired_rows_dropped_total {}\n\
 # TYPE loggytracy_retention_parts_rewritten_total counter\n\
 loggytracy_retention_parts_rewritten_total {}\n\
+# TYPE loggytracy_retention_rewrite_skipped_total counter\n\
+loggytracy_retention_rewrite_skipped_total {}\n\
 # TYPE loggytracy_tenant_policy_fetch_success_total counter\n\
 loggytracy_tenant_policy_fetch_success_total {}\n\
 # TYPE loggytracy_tenant_policy_fetch_errors_total counter\n\
@@ -516,6 +518,7 @@ loggytracy_force_flush_complete {}\n",
         m.retention_errors.load(Ordering::Relaxed),
         m.retention_expired_rows_dropped.load(Ordering::Relaxed),
         m.retention_parts_rewritten.load(Ordering::Relaxed),
+        m.retention_rewrite_skipped.load(Ordering::Relaxed),
         state.tenant_policy.metrics.fetch_success.load(Ordering::Relaxed),
         state.tenant_policy.metrics.fetch_errors.load(Ordering::Relaxed),
         state
@@ -552,6 +555,12 @@ struct TenantPolicyGauges {
 /// `"infinite"` and *absent* keep the same data, so a control plane that
 /// silently drops a tenant is only visible as a rising unknown-tenant gauge
 /// rather than as invisible unbounded storage.
+///
+/// Both memtables are counted alongside the parts. A tenant that has just
+/// started pushing owns no `meta.json` segment until its first flush, and that
+/// is exactly the window in which the control plane is most likely to have
+/// missed it — waiting for a flush to make it visible would hide the newest
+/// omissions for as long as they are newest.
 fn tenant_policy_gauges(state: &AppState) -> TenantPolicyGauges {
     let Some(snapshot) = state.tenant_policy.snapshot() else {
         return TenantPolicyGauges {
@@ -563,19 +572,26 @@ fn tenant_policy_gauges(state: &AppState) -> TenantPolicyGauges {
     };
     let mut unknown: std::collections::BTreeSet<crate::tenant::TenantId> =
         std::collections::BTreeSet::new();
+    let mut note = |tenant: &crate::tenant::TenantId| {
+        if snapshot.retention(tenant).is_none() {
+            unknown.insert(tenant.clone());
+        }
+    };
     for reader in state.parts.snapshot() {
         for segment in &reader.meta().tenants {
-            if snapshot.retention(&segment.tenant).is_none() {
-                unknown.insert(segment.tenant.clone());
-            }
+            note(&segment.tenant);
         }
     }
     for reader in state.trace_parts.snapshot() {
         for segment in &reader.part().meta.tenants {
-            if snapshot.retention(&segment.tenant).is_none() {
-                unknown.insert(segment.tenant.clone());
-            }
+            note(&segment.tenant);
         }
+    }
+    for tenant in state.memtable.tenants() {
+        note(&tenant);
+    }
+    for tenant in state.journal.trace_memtable().tenants() {
+        note(&tenant);
     }
     TenantPolicyGauges {
         known_tenants: snapshot.tenant_count(),

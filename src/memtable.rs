@@ -143,6 +143,20 @@ impl MemTable {
         flushing.as_ref().map(|m| m.is_empty()).unwrap_or(true)
     }
 
+    /// Every tenant with entries that have not been flushed yet, including the
+    /// ones in a flush that is still in flight. A tenant that has only ever
+    /// pushed is invisible in `meta.json` until its first flush, so the
+    /// unknown-tenant gauge reads this too.
+    pub fn tenants(&self) -> BTreeSet<TenantId> {
+        let inner = self.inner.read().unwrap();
+        let flushing = self.flushing.read().unwrap();
+        inner
+            .keys()
+            .chain(flushing.iter().flat_map(|snapshot| snapshot.keys()))
+            .cloned()
+            .collect()
+    }
+
     pub fn approximate_size(&self) -> usize {
         fn snapshot_bytes(snapshot: &MemTableSnapshot) -> usize {
             let mut bytes = 0usize;

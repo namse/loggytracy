@@ -1231,6 +1231,61 @@
         assert_eq!(lines_in_last_day(state).await.len(), 1);
     }
 
+    /// The unknown-tenant gauge reads the memtables as well as the parts. A
+    /// tenant that has only just started pushing owns no `meta.json` segment
+    /// yet, and that is precisely when a control-plane omission is newest and
+    /// most worth reporting.
+    #[tokio::test]
+    async fn the_unknown_tenant_gauge_counts_a_tenant_that_has_only_pushed() {
+        let data_dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            crate::tenant::TenantId::parse("brand-new").unwrap(),
+            [("app".to_string(), "api".to_string())]
+                .into_iter()
+                .collect(),
+            vec![LogEntry {
+                timestamp_ns: 1_000,
+                line: "never flushed".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+        let policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test());
+        policy.install_for_test(
+            [(
+                crate::tenant::TenantId::parse("acme").unwrap(),
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_secs(60)),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let state = tenant_policy_state(&data_dir, memtable, Arc::new(PartRegistry::new()), policy);
+
+        let rendered = metrics(State(state.clone())).await;
+        assert!(
+            rendered.contains("loggytracy_tenant_policy_unknown_tenants 1\n"),
+            "{rendered}"
+        );
+
+        state.journal.trace_memtable().insert(vec![crate::trace::TraceSpan {
+            tenant: crate::tenant::TenantId::parse("brand-new-traces").unwrap(),
+            trace_id: "dd".repeat(16),
+            span_id: "unflushed".to_string(),
+            start_time_ns: 1_000,
+            end_time_ns: 2_000,
+            span: Default::default(),
+            resource: None,
+            resource_schema_url: String::new(),
+            scope: None,
+            scope_schema_url: String::new(),
+        }]);
+        let rendered = metrics(State(state)).await;
+        assert!(
+            rendered.contains("loggytracy_tenant_policy_unknown_tenants 2\n"),
+            "{rendered}"
+        );
+    }
+
     /// A tenant the control plane never mentioned reads its full history.
     #[tokio::test]
     async fn an_unknown_tenant_is_never_clamped() {

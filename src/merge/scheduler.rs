@@ -92,7 +92,11 @@ async fn merge_once(
         // 작은 part들을 그룹지어 합친다. 단순화: 파티션 내에서 merge_min_part_count개 이상이면
         // 가장 작은 것부터 merge_target_part_rows에 도달할 때까지 그룹화.
         let groups = select_groups(&parts, config, cutoffs.as_ref());
-        for group in groups {
+        for MergeGroup {
+            parts: group,
+            retention_only,
+        } in groups
+        {
             if groups_processed >= config.merge_max_groups_per_tick {
                 break 'partitions;
             }
@@ -142,6 +146,19 @@ async fn merge_once(
                 Ok(rows) => rows,
                 Err(e) => {
                     tracing::warn!(error = %e, partition = %partition, "merge read failed, skipping group");
+                    if retention_only {
+                        // The group exists only to reclaim expired rows, and
+                        // its inputs are fixed: a part that does not fit in
+                        // merge_max_memory_bytes will not fit on the next tick
+                        // either. Reporting it would pin merge_healthy low
+                        // forever over an optimization that never had to
+                        // happen, so it is counted and skipped instead. The
+                        // rows stay on disk and stay invisible to queries.
+                        metrics
+                            .retention_rewrite_skipped
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     errors.push(format!("merge read failed for partition {partition}: {e}"));
                     continue;
                 }
@@ -163,7 +180,7 @@ async fn merge_once(
                 tracing::debug!(partition = %partition, "merge group is entirely expired; leaving it to retention");
                 continue;
             }
-            if dropped_rows == 0 && group.len() < config.merge_min_part_count.max(2) {
+            if dropped_rows == 0 && retention_only {
                 // The group only existed to reclaim expired rows, and another
                 // tick already reclaimed them. Rewriting now would copy a part
                 // onto itself.

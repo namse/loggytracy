@@ -298,6 +298,18 @@ impl TraceMemTable {
             .unwrap_or(true)
     }
 
+    /// Every tenant with spans that have not been flushed yet, including the
+    /// ones in a flush that is still in flight. See `MemTable::tenants`.
+    pub fn tenants(&self) -> std::collections::BTreeSet<TenantId> {
+        let inner = self.inner.read().unwrap();
+        let flushing = self.flushing.read().unwrap();
+        inner
+            .iter()
+            .chain(flushing.as_ref().into_iter().flatten())
+            .map(|span| span.tenant.clone())
+            .collect()
+    }
+
     pub fn approximate_size(&self) -> usize {
         let inner = self.inner.read().unwrap();
         let flushing = self.flushing.read().unwrap();

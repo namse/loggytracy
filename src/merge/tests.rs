@@ -560,3 +560,71 @@
             2
         );
     }
+
+    /// A part that does not fit in `merge_max_memory_bytes` fails to read on
+    /// every tick. When retention is the only reason it was selected, that has
+    /// to stay a counted skip: reporting it would hold `merge_healthy` low
+    /// forever — and `/ready` at 503 — over reclamation that was never
+    /// required for correctness. Expired rows are already invisible to queries.
+    #[tokio::test]
+    async fn an_unreadable_retention_only_group_is_skipped_instead_of_failing_the_tick() {
+        let dir = tmp_dir("retention-group-too-large");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 4,
+            retention_period: None,
+            // Below one row, so reading the part always exceeds the budget.
+            merge_max_memory_bytes: 1,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        let parts = part::flush_rows(
+            vec![
+                tenant_row("alpha", 1_000),
+                tenant_row("alpha", 1_001),
+                tenant_row("beta", 1_002),
+            ],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        registry.register(parts.clone()).unwrap();
+        let policy = policy_with(&[
+            (
+                "alpha",
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_nanos(1)),
+            ),
+            ("beta", crate::tenant_policy::TenantRetention::Infinite),
+        ]);
+        let metrics = RuntimeMetrics::new();
+
+        merge_once(&registry, None, &config, &policy, &metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(registry.part_count(), 1);
+        assert_eq!(registry.snapshot()[0].meta().id, parts[0].meta.id);
+        assert_eq!(
+            metrics.retention_rewrite_skipped.load(Ordering::Relaxed),
+            1
+        );
+
+        // An ordinary merge group is a different matter: it is work that has
+        // to happen, so a read failure there still fails the tick.
+        for timestamp_ns in [2_000i64, 2_001, 2_002] {
+            let more = part::flush_rows(
+                vec![tenant_row("beta", timestamp_ns)],
+                &parts_root,
+                config.row_group_size,
+            )
+            .unwrap();
+            registry.register(more).unwrap();
+        }
+        assert!(
+            merge_once(&registry, None, &config, &policy, &RuntimeMetrics::new())
+                .await
+                .is_err()
+        );
+    }

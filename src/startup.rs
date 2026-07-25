@@ -159,6 +159,9 @@ pub async fn run(config: Arc<Config>) {
     let retention_healthy = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(RuntimeMetrics::new());
     let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
+    // Everything a misconfiguration can break here — the auth header above all
+    // — is already rejected by `Config::validate`, so what is left is the HTTP
+    // client failing to build, which is not a user error.
     let tenant_policy = Arc::new(
         TenantPolicy::from_config(&config)
             .unwrap_or_else(|error| panic!("tenant policy initialization failed: {error}")),
