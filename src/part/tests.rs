@@ -1,4 +1,5 @@
     use super::*;
+    use crate::tenant::test_tenant;
 
     fn encode_btf1(line_blooms: &[BloomFilter]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -65,18 +66,21 @@
         labels2.insert("app".to_string(), "other".to_string());
         vec![
             Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
                 labels: labels1.clone(),
                 line: "error connecting to database".to_string(),
                 structured_metadata: vec![],
             },
             Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_001_000_000_000,
                 labels: labels1,
                 line: "all good now".to_string(),
                 structured_metadata: vec![("trace_id".to_string(), "abc".to_string())],
             },
             Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_002_000_000_000,
                 labels: labels2,
                 line: "other app log line".to_string(),
@@ -95,7 +99,7 @@
 
         // all
         let r = reader
-            .query(&[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 3);
@@ -103,7 +107,7 @@
         // label matcher app="test"
         let m = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "test".to_string()).unwrap();
         let r = reader
-            .query(std::slice::from_ref(&m), &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), std::slice::from_ref(&m), &[], i64::MIN, i64::MAX, 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 2);
@@ -111,14 +115,15 @@
         // line filter "error"
         let f = LineFilter::Contains("error".to_string());
         let r = reader
-            .query(&[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
 
         // time range
         let r = reader
-            .query(
+            .query(&test_tenant(),
+
                 &[],
                 &[],
                 1_700_000_001_000_000_000,
@@ -140,7 +145,8 @@
         let f = LineFilter::Contains("zzzzzz-not-present".to_string());
         assert!(
             reader
-                .select_row_groups(
+                .select_row_groups(&test_tenant(),
+
                     &[],
                     std::slice::from_ref(&f),
                     QueryTimeRange {
@@ -153,7 +159,7 @@
             "bloom miss must avoid selecting the parquet row group"
         );
         let r = reader
-            .query(&[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -169,7 +175,8 @@
         assert_eq!(&fs::read(part.bloom_path()).unwrap()[..4], BLOOM_MAGIC_V3);
         let reader = PartReader::open(part).unwrap();
 
-        let selected = reader.select_row_groups_with_exact_fields(
+        let selected = reader.select_row_groups_with_exact_fields(&test_tenant(),
+
             &[],
             &[],
             &[ExactFieldPredicate::new("trace_id", "second")],
@@ -185,7 +192,8 @@
         // field bloom. Their predicate must therefore remain conservative.
         let app = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "test".to_string()).unwrap();
         assert_eq!(
-            reader.select_row_groups_with_exact_fields(
+            reader.select_row_groups_with_exact_fields(&test_tenant(),
+
                 std::slice::from_ref(&app),
                 &[],
                 &[ExactFieldPredicate::new("app", "test")],
@@ -198,14 +206,16 @@
             vec![0, 1]
         );
 
-        assert!(!reader.may_match_exact_fields(
+        assert!(!reader.may_match_exact_fields(&test_tenant(),
+
             &[],
             &[],
             &[ExactFieldPredicate::new("trace_id", "not-present")],
             i64::MIN,
             i64::MAX,
         ));
-        assert!(reader.may_match_exact_fields(
+        assert!(reader.may_match_exact_fields(&test_tenant(),
+
             &[],
             &[],
             &[ExactFieldPredicate::new("missing", "")],
@@ -229,7 +239,8 @@
         };
 
         assert_eq!(
-            reader.select_row_groups_with_exact_fields(
+            reader.select_row_groups_with_exact_fields(&test_tenant(),
+
                 &[],
                 &[],
                 &[ExactFieldPredicate::new_with_extraction(
@@ -240,7 +251,8 @@
             vec![0]
         );
         assert_eq!(
-            reader.select_row_groups_with_exact_fields(
+            reader.select_row_groups_with_exact_fields(&test_tenant(),
+
                 &[],
                 &[],
                 &[ExactFieldPredicate::new_with_extraction(
@@ -251,7 +263,8 @@
             vec![1]
         );
         assert_eq!(
-            reader.select_row_groups_with_exact_fields(
+            reader.select_row_groups_with_exact_fields(&test_tenant(),
+
                 &[],
                 &[],
                 &[ExactFieldPredicate::new_with_extraction(
@@ -270,12 +283,14 @@
         let tmp = tempfile_dir();
         let rows = vec![
             Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1,
                 labels: BTreeMap::new(),
                 line: r#"{"value":9007199254740992,"elapsed":"1s"}"#.to_string(),
                 structured_metadata: vec![],
             },
             Row {
+                tenant: test_tenant(),
                 timestamp_ns: 2,
                 labels: BTreeMap::new(),
                 line: r#"{"value":9007199254740993,"elapsed":"1000ms"}"#.to_string(),
@@ -292,7 +307,8 @@
 
         let numeric = crate::logql::parse("{} | json | value=9007199254740993").unwrap();
         assert_eq!(
-            reader.select_row_groups_with_exact_fields(
+            reader.select_row_groups_with_exact_fields(&test_tenant(),
+
                 &[],
                 &[],
                 &numeric.exact_field_predicates(),
@@ -303,7 +319,8 @@
 
         let duration = crate::logql::parse("{} | json | elapsed=1s").unwrap();
         assert_eq!(
-            reader.select_row_groups_with_exact_fields(
+            reader.select_row_groups_with_exact_fields(&test_tenant(),
+
                 &[],
                 &[],
                 &duration.exact_field_predicates(),
@@ -318,12 +335,14 @@
         let tmp = tempfile_dir();
         let rows = vec![
             Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1,
                 labels: BTreeMap::new(),
                 line: r#"{"value":500.0}"#.to_string(),
                 structured_metadata: vec![],
             },
             Row {
+                tenant: test_tenant(),
                 timestamp_ns: 2,
                 labels: BTreeMap::new(),
                 line: r#"{"value":999}"#.to_string(),
@@ -334,7 +353,8 @@
         rewrite_part_bloom_as_v2(&part);
         let reader = PartReader::open(load_part(&part.dir).unwrap()).unwrap();
         let query = crate::logql::parse("{} | json | value=500").unwrap();
-        let selected = reader.select_row_groups_with_exact_fields(
+        let selected = reader.select_row_groups_with_exact_fields(&test_tenant(),
+
             &[],
             &[],
             &query.exact_field_predicates(),
@@ -356,7 +376,8 @@
         let legacy_part = load_part(&part.dir).unwrap();
         let reader = PartReader::open(legacy_part).unwrap();
         assert!(reader.exact_field_bloom.is_none());
-        assert!(reader.may_match_exact_fields(
+        assert!(reader.may_match_exact_fields(&test_tenant(),
+
             &[],
             &[],
             &[ExactFieldPredicate::new("trace_id", "not-present")],
@@ -414,6 +435,7 @@
         let tmp = tempfile_dir();
         let rows: Vec<Row> = (0..20)
             .map(|timestamp_ns| Row {
+                tenant: test_tenant(),
                 timestamp_ns,
                 labels: BTreeMap::new(),
                 line: format!("line-{timestamp_ns}"),
@@ -423,7 +445,8 @@
         let part = flush_rows(rows, &tmp, 20).unwrap().remove(0);
         let reader = PartReader::open(part).unwrap();
         let result = reader
-            .query_with_exact_field_pruning_and_scan_limit(
+            .query_with_exact_field_pruning_and_scan_limit(&test_tenant(),
+
                 &[],
                 ExactFieldPruning::new(&[], &[]),
                 0,
@@ -443,6 +466,7 @@
         let tmp = tempfile_dir();
         let rows: Vec<Row> = (0..20)
             .map(|timestamp_ns| Row {
+                tenant: test_tenant(),
                 timestamp_ns,
                 labels: BTreeMap::new(),
                 line: format!("line-{timestamp_ns}"),
@@ -452,7 +476,8 @@
         let part = flush_rows(rows, &tmp, 20).unwrap().remove(0);
         let reader = PartReader::open(part).unwrap();
         let result = reader
-            .query_with_exact_field_pruning_and_scan_limit(
+            .query_with_exact_field_pruning_and_scan_limit(&test_tenant(),
+
                 &[],
                 ExactFieldPruning::new(&[], &[]),
                 0,
@@ -476,7 +501,8 @@
         let m = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "missing".to_string()).unwrap();
         assert!(
             reader
-                .select_row_groups(
+                .select_row_groups(&test_tenant(),
+
                     std::slice::from_ref(&m),
                     &[],
                     QueryTimeRange {
@@ -489,7 +515,7 @@
             "stream-index miss must avoid selecting the parquet row group"
         );
         let r = reader
-            .query(&[m], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[m], &[], i64::MIN, i64::MAX, 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -511,6 +537,7 @@
         labels.insert("app".to_string(), "test".to_string());
         let rows: Vec<Row> = (0..3_000)
             .map(|i| Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000 + i * 1_000_000_000,
                 labels: labels.clone(),
                 line: format!("line-{i:04}"),
@@ -521,7 +548,7 @@
         let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
 
         let r = reader
-            .query(&[], &[], i64::MIN, i64::MAX, 3, false)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 3, false)
             .expect("q");
         let lines: Vec<&str> = r
             .iter()
@@ -530,7 +557,7 @@
         assert_eq!(lines, vec!["line-2999", "line-2998", "line-2997"]);
 
         let r = reader
-            .query(&[], &[], i64::MIN, i64::MAX, 3, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 3, true)
             .expect("q");
         let lines: Vec<&str> = r
             .iter()
@@ -546,7 +573,7 @@
         let parts = flush_rows(rows, &tmp, 100).expect("flush");
         let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
 
-        let all = reader.series(&[]);
+        let all = reader.series(&test_tenant(), &[]);
         assert_eq!(all.len(), 2);
         let app_test: Vec<&Labels> = all
             .iter()
@@ -556,7 +583,7 @@
         assert_eq!(app_test[0].get("host").map(|s| s.as_str()), Some("h1"));
 
         let m = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "other".to_string()).unwrap();
-        let r = reader.series(&[m]);
+        let r = reader.series(&test_tenant(), &[m]);
         assert_eq!(r.len(), 1);
         assert!(r[0].get("app").map(|v| v.as_str()) == Some("other"));
         assert!(!r[0].contains_key("host"));
@@ -569,6 +596,7 @@
         labels.insert("app".to_string(), "concurrent".to_string());
         let rows: Vec<Row> = (0..50)
             .map(|i| Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000 + i * 1_000_000_000,
                 labels: labels.clone(),
                 line: format!("concurrent-line-{:02}", i),
@@ -594,7 +622,8 @@
                     let forward = (thread_index + q) % 2 == 0;
                     let limit = 3 + (q % 5);
                     let result = reader
-                        .query(
+                        .query(&test_tenant(),
+
                             std::slice::from_ref(&matcher),
                             &[],
                             i64::MIN,
@@ -705,6 +734,7 @@
         labels.insert("host".to_string(), "h1".to_string());
         // app 라벨 부재
         let rows: Vec<Row> = vec![Row {
+            tenant: test_tenant(),
             timestamp_ns: 1_700_000_000_000_000_000,
             labels,
             line: "no app label here".to_string(),
@@ -714,7 +744,7 @@
         let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
         let m = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "".to_string()).unwrap();
         let r = reader
-            .query(&[m], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[m], &[], i64::MIN, i64::MAX, 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
@@ -749,6 +779,7 @@
         labels.insert("app".to_string(), "test".to_string());
         let rows: Vec<Row> = (0..8192usize)
             .map(|i| Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000 + (i as i64) * 1_000_000,
                 labels: labels.clone(),
                 line: format!(
@@ -762,7 +793,7 @@
         let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
         let f = LineFilter::Contains("zzzzzz-not-present-substr".to_string());
         let r = reader
-            .query(&[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
@@ -778,6 +809,7 @@
         std::fs::create_dir_all(&parts_root).unwrap();
         let old = flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
                 labels: BTreeMap::new(),
                 line: "old".to_string(),
@@ -791,6 +823,7 @@
 
         let merged = flush_rows_with_merge_tombstone(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
                 labels: BTreeMap::new(),
                 line: "merged".to_string(),
@@ -816,6 +849,7 @@
         std::fs::create_dir_all(&parts_root).unwrap();
         let old = flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
                 labels: BTreeMap::new(),
                 line: "old".to_string(),
@@ -828,6 +862,7 @@
         .remove(0);
         let merged = flush_rows_with_merge_tombstone(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
                 labels: BTreeMap::new(),
                 line: "merged".to_string(),
@@ -864,6 +899,7 @@
 
         let parts1 = flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
                 labels: l1,
                 line: "old1 line".to_string(),
@@ -875,6 +911,7 @@
         .expect("flush1");
         let parts2 = flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_002_000_000_000,
                 labels: l2,
                 line: "old2 line".to_string(),
@@ -898,12 +935,14 @@
         l4.insert("app".to_string(), "old2".to_string());
         let merged_rows = vec![
             Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
                 labels: l3,
                 line: "old1 line".to_string(),
                 structured_metadata: vec![],
             },
             Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_002_000_000_000,
                 labels: l4,
                 line: "old2 line".to_string(),
@@ -950,6 +989,7 @@
         let parts_root = tmp.join("parts");
         std::fs::create_dir_all(&parts_root).unwrap();
         let row = |line: &str| Row {
+            tenant: test_tenant(),
             timestamp_ns: 1_700_000_000_000_000_000,
             labels: BTreeMap::new(),
             line: line.to_string(),
@@ -996,6 +1036,7 @@
         std::fs::write(outside.join("keep"), b"data").unwrap();
         let replacement = flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
                 labels: BTreeMap::new(),
                 line: "replacement".to_string(),
@@ -1056,6 +1097,7 @@
         std::fs::create_dir_all(&parts_root).unwrap();
         let replacement = flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
                 labels: BTreeMap::new(),
                 line: "replacement".to_string(),
@@ -1084,4 +1126,102 @@
         assert_eq!(discovered.len(), 1);
         assert!(undeletable_as_directory.exists());
         assert!(replacement.dir.join(MERGE_TOMBSTONE_FILE).exists());
+    }
+
+    fn tenant_row(tenant: &str, line: &str, timestamp_ns: i64) -> Row {
+        let mut labels: Labels = BTreeMap::new();
+        labels.insert("app".to_string(), format!("{tenant}-app"));
+        Row {
+            tenant: TenantId::parse(tenant).unwrap(),
+            timestamp_ns,
+            labels,
+            line: line.to_string(),
+            structured_metadata: vec![],
+        }
+    }
+
+    #[test]
+    fn a_shared_part_confines_every_read_to_the_querying_tenant() {
+        let tmp = tempfile_dir();
+        // Interleaved in time and supplied out of tenant order, so the part
+        // writer has to do the `(tenant, timestamp)` sort itself.
+        let rows = vec![
+            tenant_row("globex", "globex second", 2_000),
+            tenant_row("acme", "acme first", 1_000),
+            tenant_row("globex", "globex first", 500),
+            tenant_row("acme", "acme second", 3_000),
+        ];
+        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
+
+        let acme = TenantId::parse("acme").unwrap();
+        let globex = TenantId::parse("globex").unwrap();
+        let outsider = TenantId::parse("initech").unwrap();
+
+        let acme_segment = part.meta.tenant_segment(&acme).unwrap();
+        let globex_segment = part.meta.tenant_segment(&globex).unwrap();
+        assert_eq!(acme_segment.row_count, 2);
+        assert_eq!(globex_segment.row_count, 2);
+        assert_eq!(acme_segment.row_group_end, globex_segment.row_group_start);
+        assert!(part.meta.tenant_segment(&outsider).is_none());
+        // Per-tenant time bounds, not the part-wide range.
+        assert_eq!((acme_segment.min_ts_ns, acme_segment.max_ts_ns), (1_000, 3_000));
+        assert_eq!(
+            (globex_segment.min_ts_ns, globex_segment.max_ts_ns),
+            (500, 2_000)
+        );
+
+        let reader = PartReader::open(part).unwrap();
+        let lines = |tenant: &TenantId| -> Vec<String> {
+            reader
+                .query(tenant, &[], &[], i64::MIN, i64::MAX, 100, true)
+                .unwrap()
+                .into_iter()
+                .flat_map(|stream| stream.entries)
+                .map(|entry| entry.line)
+                .collect()
+        };
+        assert_eq!(lines(&acme), vec!["acme first", "acme second"]);
+        assert_eq!(lines(&globex), vec!["globex first", "globex second"]);
+        assert!(lines(&outsider).is_empty());
+
+        // The catalog surface is scoped too: acme must not learn that globex
+        // exists from label names, values, or series.
+        assert_eq!(reader.label_values(&acme, "app"), vec!["acme-app"]);
+        assert_eq!(reader.label_values(&globex, "app"), vec!["globex-app"]);
+        assert!(reader.label_names(&outsider).is_empty());
+        assert!(reader.series(&outsider, &[]).is_empty());
+        assert_eq!(reader.series(&acme, &[]).len(), 1);
+
+        // A matcher that only another tenant satisfies must return nothing
+        // rather than reaching across the segment boundary.
+        let globex_matcher = LabelMatcher::new(
+            "app".to_string(),
+            MatcherOp::Eq,
+            "globex-app".to_string(),
+        )
+        .unwrap();
+        assert!(
+            reader
+                .query(&acme, &[globex_matcher], &[], i64::MIN, i64::MAX, 100, true)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn row_groups_never_straddle_a_tenant_boundary() {
+        let rows = vec![
+            tenant_row("acme", "one", 1),
+            tenant_row("acme", "two", 2),
+            tenant_row("acme", "three", 3),
+            tenant_row("globex", "four", 4),
+        ];
+        // A row group size of 2 would put acme's third row and globex's row in
+        // one group if the boundary were not tenant-aligned.
+        let bounds = row_group_bounds(&rows, 2);
+        assert_eq!(bounds, vec![(0, 2), (2, 3), (3, 4)]);
+        for (start, end) in bounds {
+            let tenants: BTreeSet<_> = rows[start..end].iter().map(|row| &row.tenant).collect();
+            assert_eq!(tenants.len(), 1);
+        }
     }

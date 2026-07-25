@@ -1,14 +1,16 @@
 async fn pin_query_parts(
     state: &AppState,
+    tenant: &TenantId,
     parsed: &logql::LogQuery,
     start_ns: i64,
     end_ns: i64,
 ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
-    pin_query_parts_with_gap_hook(state, parsed, start_ns, end_ns, || Ok(())).await
+    pin_query_parts_with_gap_hook(state, tenant, parsed, start_ns, end_ns, || Ok(())).await
 }
 
 async fn pin_query_parts_with_gap_hook<F>(
     state: &AppState,
+    tenant: &TenantId,
     parsed: &logql::LogQuery,
     start_ns: i64,
     end_ns: i64,
@@ -23,6 +25,7 @@ where
         state.remote_cache.clone(),
         || {
             state.parts.candidate_part_ids_with_exact_fields(
+                tenant,
                 &parsed.matchers,
                 &parsed.line_filters,
                 &exact_fields,

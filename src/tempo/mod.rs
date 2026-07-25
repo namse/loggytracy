@@ -4,11 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 
 use crate::AppState;
+use crate::tenant::TenantId;
 use crate::trace::{TraceSpan, canonical_trace_id};
 use crate::trace_registry::TraceRegistry;
 

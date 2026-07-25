@@ -3,9 +3,10 @@ pub fn replay(
     wal_path: &Path,
     ckpt_path: &Path,
     memtable: &MemTable,
+    default_tenant: &TenantId,
 ) -> Result<(u64, u64), String> {
     let traces = TraceMemTable::new();
-    replay_with_traces(wal_path, ckpt_path, memtable, &traces)
+    replay_with_traces(wal_path, ckpt_path, memtable, &traces, default_tenant)
 }
 
 pub fn replay_with_traces(
@@ -13,10 +14,18 @@ pub fn replay_with_traces(
     ckpt_path: &Path,
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
+    default_tenant: &TenantId,
 ) -> Result<(u64, u64), String> {
     recover_unfinished_compaction(wal_path, ckpt_path).map_err(|e| e.to_string())?;
     let checkpoint = read_checkpoint(ckpt_path).map_err(|e| e.to_string())?;
-    replay_from(wal_path, checkpoint, memtable, trace_memtable).map(|end| (checkpoint, end))
+    replay_from(
+        wal_path,
+        checkpoint,
+        memtable,
+        trace_memtable,
+        default_tenant,
+    )
+    .map(|end| (checkpoint, end))
 }
 
 fn recover_unfinished_compaction(wal_path: &Path, ckpt_path: &Path) -> Result<(), IoError> {
@@ -50,6 +59,7 @@ fn replay_from(
     checkpoint: u64,
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
+    default_tenant: &TenantId,
 ) -> Result<u64, String> {
     if !wal_path.exists() {
         if checkpoint == 0 {
@@ -118,53 +128,29 @@ fn replay_from(
             }
             return Err(format!("journal record crc mismatch at offset {offset}"));
         }
-        if let Some(trace_data) = decode_trace_record(&data)? {
-            let request = ExportTraceServiceRequest::decode(trace_data)
-                .map_err(|e| format!("trace protobuf decode failed at offset {offset}: {e}"))?;
-            let spans = normalize_request(request)
-                .map_err(|e| format!("trace record invalid at offset {offset}: {e}"))?;
-            trace_memtable.insert(spans);
-        } else {
-            match PushRequest::decode(data.as_slice()) {
-                Ok(req) => {
-                    for stream in &req.streams {
-                        let labels = match proto::parse_labels(&stream.labels) {
-                            Ok(l) => l,
-                            Err(e) => {
-                                return Err(format!(
-                                    "journal record has invalid labels at offset {offset}: {e}"
-                                ));
-                            }
-                        };
-                        let entries: Vec<LogEntry> = stream
-                        .entries
-                        .iter()
-                        .map(|e| {
-                            let timestamp_ns = e.timestamp_ns().map_err(|error| {
-                                format!(
-                                    "journal record has invalid timestamp at offset {offset}: {error}"
-                                )
-                            })?;
-                            Ok(LogEntry {
-                                timestamp_ns,
-                                line: e.line.clone(),
-                                structured_metadata: e
-                                    .structured_metadata
-                                    .iter()
-                                    .map(|lp| (lp.name.clone(), lp.value.clone()))
-                                    .collect(),
-                            })
-                        })
-                        .collect::<Result<_, String>>()?;
-                        memtable.insert(labels, entries);
-                    }
+        if let Some((tenant, kind, payload)) = decode_tenant_record(&data)
+            .map_err(|error| format!("journal record invalid at offset {offset}: {error}"))?
+        {
+            match kind {
+                TENANT_RECORD_KIND_LOGS => {
+                    replay_log_record(&tenant, payload, offset, memtable)?;
                 }
-                Err(e) => {
+                TENANT_RECORD_KIND_TRACES => {
+                    replay_trace_record(&tenant, payload, offset, trace_memtable)?;
+                }
+                other => {
                     return Err(format!(
-                        "journal protobuf decode failed at offset {offset}: {e}"
+                        "unsupported tenant journal record kind {other} at offset {offset}"
                     ));
                 }
             }
+        } else if let Some(trace_data) = decode_trace_record(&data)? {
+            // Pre-tenancy record. Attributing it to the default tenant keeps
+            // an upgrade lossless; a deployment that requires the header will
+            // still see the old data under its configured default.
+            replay_trace_record(default_tenant, trace_data, offset, trace_memtable)?;
+        } else {
+            replay_log_record(default_tenant, &data, offset, memtable)?;
         }
         offset += (RECORD_HEADER_SIZE + len) as u64;
         replayed += 1;
@@ -173,6 +159,54 @@ fn replay_from(
         tracing::info!(replayed, offset, "journal replay complete");
     }
     Ok(offset)
+}
+
+fn replay_log_record(
+    tenant: &TenantId,
+    payload: &[u8],
+    offset: u64,
+    memtable: &MemTable,
+) -> Result<(), String> {
+    let request = PushRequest::decode(payload)
+        .map_err(|e| format!("journal protobuf decode failed at offset {offset}: {e}"))?;
+    for stream in &request.streams {
+        let labels = proto::parse_labels(&stream.labels)
+            .map_err(|e| format!("journal record has invalid labels at offset {offset}: {e}"))?;
+        let entries: Vec<LogEntry> = stream
+            .entries
+            .iter()
+            .map(|e| {
+                let timestamp_ns = e.timestamp_ns().map_err(|error| {
+                    format!("journal record has invalid timestamp at offset {offset}: {error}")
+                })?;
+                Ok(LogEntry {
+                    timestamp_ns,
+                    line: e.line.clone(),
+                    structured_metadata: e
+                        .structured_metadata
+                        .iter()
+                        .map(|lp| (lp.name.clone(), lp.value.clone()))
+                        .collect(),
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        memtable.insert(tenant.clone(), labels, entries);
+    }
+    Ok(())
+}
+
+fn replay_trace_record(
+    tenant: &TenantId,
+    payload: &[u8],
+    offset: u64,
+    trace_memtable: &TraceMemTable,
+) -> Result<(), String> {
+    let request = ExportTraceServiceRequest::decode(payload)
+        .map_err(|e| format!("trace protobuf decode failed at offset {offset}: {e}"))?;
+    let spans = normalize_request(tenant, request)
+        .map_err(|e| format!("trace record invalid at offset {offset}: {e}"))?;
+    trace_memtable.insert(spans);
+    Ok(())
 }
 
 fn decode_trace_record(data: &[u8]) -> Result<Option<&[u8]>, String> {

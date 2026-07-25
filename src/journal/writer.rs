@@ -63,8 +63,30 @@ impl Journal {
 
     pub async fn append(
         &self,
+        tenant: TenantId,
         data: Vec<u8>,
         streams: Vec<(Labels, Vec<LogEntry>)>,
+    ) -> Result<(), IoError> {
+        let framed = frame_tenant_record(&tenant, TENANT_RECORD_KIND_LOGS, &data);
+        self.send_append(framed, tenant, streams, Vec::new()).await
+    }
+
+    pub async fn append_trace(
+        &self,
+        tenant: TenantId,
+        data: Vec<u8>,
+        spans: Vec<TraceSpan>,
+    ) -> Result<(), IoError> {
+        let framed = frame_tenant_record(&tenant, TENANT_RECORD_KIND_TRACES, &data);
+        self.send_append(framed, tenant, Vec::new(), spans).await
+    }
+
+    async fn send_append(
+        &self,
+        data: Vec<u8>,
+        tenant: TenantId,
+        streams: Vec<(Labels, Vec<LogEntry>)>,
+        traces: Vec<TraceSpan>,
     ) -> Result<(), IoError> {
         if data.len() > MAX_RECORD_BYTES {
             return Err(IoError::new(
@@ -80,42 +102,9 @@ impl Journal {
         self.tx
             .send(JournalCmd::Append {
                 data,
+                tenant,
                 streams,
-                traces: Vec::new(),
-                done: done_tx,
-            })
-            .await
-            .map_err(|_| IoError::new(std::io::ErrorKind::BrokenPipe, "journal writer closed"))?;
-        match done_rx.await {
-            Ok(result) => result,
-            Err(_) => Err(IoError::new(
-                std::io::ErrorKind::BrokenPipe,
-                "journal writer dropped",
-            )),
-        }
-    }
-
-    pub async fn append_trace(&self, data: Vec<u8>, spans: Vec<TraceSpan>) -> Result<(), IoError> {
-        let mut framed = Vec::with_capacity(TRACE_RECORD_MAGIC.len() + 1 + data.len());
-        framed.extend_from_slice(TRACE_RECORD_MAGIC);
-        framed.push(TRACE_RECORD_VERSION);
-        framed.extend_from_slice(&data);
-        if framed.len() > MAX_RECORD_BYTES {
-            return Err(IoError::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "journal record is too large: {} bytes (maximum {})",
-                    framed.len(),
-                    MAX_RECORD_BYTES
-                ),
-            ));
-        }
-        let (done_tx, done_rx) = oneshot::channel();
-        self.tx
-            .send(JournalCmd::Append {
-                data: framed,
-                streams: Vec::new(),
-                traces: spans,
+                traces,
                 done: done_tx,
             })
             .await
@@ -220,23 +209,25 @@ async fn writer_loop(
         match first {
             JournalCmd::Append {
                 data,
+                tenant,
                 streams,
                 traces,
                 done,
             } => {
                 batch_bytes += data.len();
-                batch.push((data, streams, traces, done));
+                batch.push((data, tenant, streams, traces, done));
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(max_batch_ms);
                 while batch_bytes < max_batch_bytes {
                     match tokio::time::timeout_at(deadline, rx.recv()).await {
                         Ok(Some(JournalCmd::Append {
                             data,
+                            tenant,
                             streams,
                             traces,
                             done,
                         })) => {
                             batch_bytes += data.len();
-                            batch.push((data, streams, traces, done));
+                            batch.push((data, tenant, streams, traces, done));
                         }
                         Ok(Some(JournalCmd::Checkpoint { done })) => {
                             pending_checkpoint = Some(done);
@@ -264,7 +255,7 @@ async fn writer_loop(
 
         if !batch.is_empty() {
             let mut buf = Vec::with_capacity(batch_bytes + batch.len() * RECORD_HEADER_SIZE);
-            for (data, _, _, _) in &batch {
+            for (data, _, _, _, _) in &batch {
                 let len = u32::try_from(data.len()).map_err(|_| {
                     IoError::new(
                         std::io::ErrorKind::InvalidInput,
@@ -287,9 +278,9 @@ async fn writer_loop(
             match write_result {
                 Ok(()) => {
                     good_len += buf.len() as u64;
-                    for (_, streams, traces, done) in batch.drain(..) {
+                    for (_, tenant, streams, traces, done) in batch.drain(..) {
                         for (labels, entries) in streams {
-                            memtable.insert(labels, entries);
+                            memtable.insert(tenant.clone(), labels, entries);
                         }
                         trace_memtable.insert(traces);
                         let _ = done.send(Ok(()));
@@ -297,7 +288,7 @@ async fn writer_loop(
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "journal write failed, truncating partial record");
-                    for (_, _, _, done) in batch.drain(..) {
+                    for (_, _, _, _, done) in batch.drain(..) {
                         let _ = done.send(Err(IoError::new(e.kind(), e.to_string())));
                     }
                     let recovered = async {

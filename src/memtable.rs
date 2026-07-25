@@ -3,8 +3,15 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::logql::{LabelMatcher, LineFilter};
+use crate::tenant::TenantId;
 
 pub type Labels = BTreeMap<String, String>;
+
+/// One tenant's streams. The MemTable keeps a map of these rather than one
+/// flat `(tenant, labels)` map so that every read path has to name a tenant
+/// before it can reach any entry.
+pub type TenantStreams = HashMap<Labels, Vec<LogEntry>>;
+pub type MemTableSnapshot = HashMap<TenantId, TenantStreams>;
 
 #[derive(Clone)]
 pub struct LogEntry {
@@ -25,8 +32,17 @@ pub struct QueryResult {
 }
 
 pub struct MemTable {
-    inner: RwLock<HashMap<Labels, Vec<LogEntry>>>,
-    flushing: RwLock<Option<HashMap<Labels, Vec<LogEntry>>>>,
+    inner: RwLock<MemTableSnapshot>,
+    flushing: RwLock<Option<MemTableSnapshot>>,
+}
+
+fn merge_snapshot(target: &mut MemTableSnapshot, source: MemTableSnapshot) {
+    for (tenant, streams) in source {
+        let tenant_streams = target.entry(tenant).or_default();
+        for (labels, entries) in streams {
+            tenant_streams.entry(labels).or_default().extend(entries);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -89,20 +105,18 @@ impl MemTable {
         }
     }
 
-    pub fn insert(&self, labels: Labels, entries: Vec<LogEntry>) {
+    pub fn insert(&self, tenant: TenantId, labels: Labels, entries: Vec<LogEntry>) {
         let mut inner = self.inner.write().unwrap();
-        let stream = inner.entry(labels).or_default();
+        let stream = inner.entry(tenant).or_default().entry(labels).or_default();
         stream.extend(entries);
     }
 
-    pub fn begin_flush(&self) -> HashMap<Labels, Vec<LogEntry>> {
+    pub fn begin_flush(&self) -> MemTableSnapshot {
         let mut inner = self.inner.write().unwrap();
         let mut flushing = self.flushing.write().unwrap();
         let mut snapshot = std::mem::take(&mut *inner);
         if let Some(previous_snapshot) = flushing.take() {
-            for (labels, entries) in previous_snapshot {
-                snapshot.entry(labels).or_default().extend(entries);
-            }
+            merge_snapshot(&mut snapshot, previous_snapshot);
         }
         *flushing = Some(snapshot.clone());
         snapshot
@@ -113,12 +127,9 @@ impl MemTable {
         *flushing = None;
     }
 
-    pub fn abort_flush(&self, snapshot: HashMap<Labels, Vec<LogEntry>>) {
+    pub fn abort_flush(&self, snapshot: MemTableSnapshot) {
         let mut inner = self.inner.write().unwrap();
-        for (labels, entries) in snapshot {
-            let stream = inner.entry(labels).or_default();
-            stream.extend(entries);
-        }
+        merge_snapshot(&mut inner, snapshot);
         let mut flushing = self.flushing.write().unwrap();
         *flushing = None;
     }
@@ -133,42 +144,42 @@ impl MemTable {
     }
 
     pub fn approximate_size(&self) -> usize {
-        let inner = self.inner.read().unwrap();
-        let mut bytes = 0usize;
-        for (labels, entries) in inner.iter() {
-            for (k, v) in labels {
-                bytes += k.len() + v.len();
-            }
-            for e in entries {
-                bytes += e.line.len();
-                for (k, v) in &e.structured_metadata {
-                    bytes += k.len() + v.len();
+        fn snapshot_bytes(snapshot: &MemTableSnapshot) -> usize {
+            let mut bytes = 0usize;
+            for (tenant, streams) in snapshot {
+                for (labels, entries) in streams {
+                    bytes += tenant.as_str().len();
+                    for (k, v) in labels {
+                        bytes += k.len() + v.len();
+                    }
+                    for e in entries {
+                        bytes += e.line.len();
+                        for (k, v) in &e.structured_metadata {
+                            bytes += k.len() + v.len();
+                        }
+                    }
                 }
             }
+            bytes
         }
+
+        let inner = self.inner.read().unwrap();
+        let mut bytes = snapshot_bytes(&inner);
         // Keep the lock order aligned with begin_flush/abort_flush. The
         // size is therefore computed from one consistent pair of buffers.
         let flushing = self.flushing.read().unwrap();
         if let Some(f) = flushing.as_ref() {
-            for (labels, entries) in f {
-                for (k, v) in labels {
-                    bytes += k.len() + v.len();
-                }
-                for e in entries {
-                    bytes += e.line.len();
-                    for (k, v) in &e.structured_metadata {
-                        bytes += k.len() + v.len();
-                    }
-                }
-            }
+            bytes += snapshot_bytes(f);
         }
         drop(flushing);
         drop(inner);
         bytes
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn query(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         start_ns: i64,
@@ -177,6 +188,7 @@ impl MemTable {
         forward: bool,
     ) -> Vec<StreamResult> {
         self.query_with_scan_limit(
+            tenant,
             matchers,
             line_filters,
             start_ns,
@@ -192,6 +204,7 @@ impl MemTable {
     #[allow(clippy::too_many_arguments)]
     pub fn query_with_scan_limit(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         start_ns: i64,
@@ -216,31 +229,33 @@ impl MemTable {
         // both read guards in that order prevents observing the same entry in
         // both buffers if a flush starts between the two reads.
         let inner = self.inner.read().unwrap();
-        for (labels, entries) in inner.iter() {
-            if !matchers.iter().all(|m| m.matches(labels)) {
-                continue;
-            }
-            scan_memtable_stream(
-                labels,
-                entries,
-                line_filters,
-                start_ns,
-                end_ns,
-                limit,
-                forward,
-                scan_limit,
-                cancellation,
-                &mut scanned_rows,
-                &mut grouped,
-                &mut scan_stopped,
-            );
-            if scan_stopped {
-                break;
+        if let Some(streams) = inner.get(tenant) {
+            for (labels, entries) in streams.iter() {
+                if !matchers.iter().all(|m| m.matches(labels)) {
+                    continue;
+                }
+                scan_memtable_stream(
+                    labels,
+                    entries,
+                    line_filters,
+                    start_ns,
+                    end_ns,
+                    limit,
+                    forward,
+                    scan_limit,
+                    cancellation,
+                    &mut scanned_rows,
+                    &mut grouped,
+                    &mut scan_stopped,
+                );
+                if scan_stopped {
+                    break;
+                }
             }
         }
         let flushing = self.flushing.read().unwrap();
-        if !scan_stopped && let Some(f) = flushing.as_ref() {
-            for (labels, entries) in f {
+        if !scan_stopped && let Some(streams) = flushing.as_ref().and_then(|f| f.get(tenant)) {
+            for (labels, entries) in streams {
                 if !matchers.iter().all(|m| m.matches(labels)) {
                     continue;
                 }
@@ -296,91 +311,95 @@ impl MemTable {
         }
     }
 
-    pub fn label_names(&self) -> Vec<String> {
+    /// Run `visit` over both buffers of one tenant while holding the read
+    /// guards in the order `begin_flush`/`abort_flush` acquire them, so an
+    /// entry can never be observed in both buffers or in neither.
+    fn for_each_tenant_stream(
+        &self,
+        tenant: &TenantId,
+        mut visit: impl FnMut(&Labels, &[LogEntry]),
+    ) {
         let inner = self.inner.read().unwrap();
+        let flushing = self.flushing.read().unwrap();
+        if let Some(streams) = inner.get(tenant) {
+            for (labels, entries) in streams {
+                visit(labels, entries);
+            }
+        }
+        if let Some(streams) = flushing.as_ref().and_then(|f| f.get(tenant)) {
+            for (labels, entries) in streams {
+                visit(labels, entries);
+            }
+        }
+    }
+
+    pub fn label_names(&self, tenant: &TenantId) -> Vec<String> {
         let mut names = BTreeSet::new();
-        for labels in inner.keys() {
+        self.for_each_tenant_stream(tenant, |labels, _| {
             for k in labels.keys() {
                 names.insert(k.clone());
             }
-        }
-        drop(inner);
-        let flushing = self.flushing.read().unwrap();
-        if let Some(f) = flushing.as_ref() {
-            for labels in f.keys() {
-                for k in labels.keys() {
-                    names.insert(k.clone());
-                }
-            }
-        }
+        });
         names.into_iter().collect()
     }
 
-    pub fn label_values(&self, name: &str) -> Vec<String> {
-        let inner = self.inner.read().unwrap();
+    pub fn label_values(&self, tenant: &TenantId, name: &str) -> Vec<String> {
         let mut values = BTreeSet::new();
-        for labels in inner.keys() {
+        self.for_each_tenant_stream(tenant, |labels, _| {
             if let Some(v) = labels.get(name) {
                 values.insert(v.clone());
             }
-        }
-        drop(inner);
-        let flushing = self.flushing.read().unwrap();
-        if let Some(f) = flushing.as_ref() {
-            for labels in f.keys() {
-                if let Some(v) = labels.get(name) {
-                    values.insert(v.clone());
-                }
-            }
-        }
+        });
         values.into_iter().collect()
     }
 
-    pub fn series(&self, matchers: &[LabelMatcher]) -> Vec<Labels> {
+    pub fn series(&self, tenant: &TenantId, matchers: &[LabelMatcher]) -> Vec<Labels> {
+        let mut result: BTreeSet<Labels> = BTreeSet::new();
+        self.for_each_tenant_stream(tenant, |labels, _| {
+            if matchers.iter().all(|m| m.matches(labels)) {
+                result.insert(labels.clone());
+            }
+        });
+        result.into_iter().collect()
+    }
+
+    /// Process-wide totals for the operator metrics endpoint. Not a query
+    /// path: nothing here is returned to a tenant.
+    pub fn global_stats(&self) -> IndexStats {
+        let mut streams = 0usize;
+        let mut entries = 0usize;
+        let mut bytes = 0u64;
         let inner = self.inner.read().unwrap();
-        let mut result: Vec<Labels> = inner
-            .keys()
-            .filter(|labels| matchers.iter().all(|m| m.matches(labels)))
-            .cloned()
-            .collect();
-        drop(inner);
         let flushing = self.flushing.read().unwrap();
-        if let Some(f) = flushing.as_ref() {
-            for labels in f.keys() {
-                if matchers.iter().all(|m| m.matches(labels)) {
-                    result.push(labels.clone());
+        for snapshot in std::iter::once(&*inner).chain(flushing.as_ref()) {
+            for tenant_streams in snapshot.values() {
+                streams += tenant_streams.len();
+                for stream in tenant_streams.values() {
+                    entries += stream.len();
+                    for entry in stream {
+                        bytes += entry.line.len() as u64;
+                    }
                 }
             }
         }
-        result.sort();
-        result.dedup();
-        result
+        IndexStats {
+            streams,
+            entries,
+            bytes,
+        }
     }
 
-    pub fn stats(&self) -> IndexStats {
-        let inner = self.inner.read().unwrap();
+    pub fn stats(&self, tenant: &TenantId) -> IndexStats {
         let mut stream_set: BTreeSet<Labels> = BTreeSet::new();
         let mut entries = 0usize;
         let mut bytes = 0u64;
-        for (labels, stream) in inner.iter() {
+        self.for_each_tenant_stream(tenant, |labels, stream| {
             stream_set.insert(labels.clone());
             entries += stream.len();
             for e in stream {
                 bytes += e.line.len() as u64;
             }
-        }
-        let flushing = self.flushing.read().unwrap();
-        if let Some(f) = flushing.as_ref() {
-            for (labels, stream) in f.iter() {
-                stream_set.insert(labels.clone());
-                entries += stream.len();
-                for e in stream {
-                    bytes += e.line.len() as u64;
-                }
-            }
-        }
-        drop(flushing);
-        drop(inner);
+        });
         IndexStats {
             streams: stream_set.len(),
             entries,
@@ -411,18 +430,63 @@ mod tests {
         std::iter::once(("app".to_string(), "test".to_string())).collect()
     }
 
+    fn tenant(name: &str) -> TenantId {
+        TenantId::parse(name).unwrap()
+    }
+
+    fn sample_tenant() -> TenantId {
+        tenant("acme")
+    }
+
+    #[test]
+    fn a_tenant_never_sees_another_tenants_entries() {
+        let memtable = MemTable::new();
+        memtable.insert(
+            tenant("acme"),
+            sample_labels(),
+            vec![sample_entry("acme line", 100)],
+        );
+        memtable.insert(
+            tenant("globex"),
+            sample_labels(),
+            vec![sample_entry("globex line", 100)],
+        );
+
+        let acme = memtable.query(&tenant("acme"), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let lines: Vec<_> = acme
+            .iter()
+            .flat_map(|stream| stream.entries.iter().map(|entry| entry.line.as_str()))
+            .collect();
+        assert_eq!(lines, vec!["acme line"]);
+
+        assert_eq!(memtable.stats(&tenant("acme")).entries, 1);
+        assert_eq!(memtable.stats(&tenant("globex")).entries, 1);
+        assert!(
+            memtable
+                .query(&tenant("initech"), &[], &[], i64::MIN, i64::MAX, 100, true)
+                .is_empty(),
+            "an unknown tenant must see nothing"
+        );
+        assert!(memtable.label_names(&tenant("initech")).is_empty());
+        assert!(memtable.series(&tenant("initech"), &[]).is_empty());
+    }
+
     #[test]
     fn flushing_buffer_visible_during_flush() {
         // begin_flush는 inner를 비우고 flushing 버퍼로 옮긴다.
         // unified_query는 flushing 버퍼까지 조회하므로 flush 진행 중에도
         // 데이터는 사라지지 않는다 (이슈 #2 복구).
         let mt = MemTable::new();
-        mt.insert(sample_labels(), vec![sample_entry("hello", 100)]);
+        mt.insert(
+            sample_tenant(),
+            sample_labels(),
+            vec![sample_entry("hello", 100)],
+        );
 
         let snapshot = mt.begin_flush();
         assert_eq!(snapshot.len(), 1);
 
-        let results = mt.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = mt.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
             total, 1,
@@ -430,7 +494,7 @@ mod tests {
         );
 
         mt.commit_flush();
-        let results2 = mt.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let results2 = mt.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let total2: usize = results2.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
             total2, 0,
@@ -441,12 +505,16 @@ mod tests {
     #[test]
     fn abort_flush_restores_to_inner() {
         let mt = MemTable::new();
-        mt.insert(sample_labels(), vec![sample_entry("hello", 100)]);
+        mt.insert(
+            sample_tenant(),
+            sample_labels(),
+            vec![sample_entry("hello", 100)],
+        );
 
         let snapshot = mt.begin_flush();
         mt.abort_flush(snapshot);
 
-        let results = mt.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = mt.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1, "abort_flush should restore data to inner");
         assert!(!mt.is_empty());
@@ -456,13 +524,21 @@ mod tests {
     fn begin_flush_keeps_query_consistent_with_concurrent_insert() {
         // flush 진행 중 새로 들어온 데이터도 보여야 한다.
         let mt = MemTable::new();
-        mt.insert(sample_labels(), vec![sample_entry("first", 100)]);
+        mt.insert(
+            sample_tenant(),
+            sample_labels(),
+            vec![sample_entry("first", 100)],
+        );
 
         let _snapshot = mt.begin_flush();
         // flush 진행 중 새 데이터 수신
-        mt.insert(sample_labels(), vec![sample_entry("second", 200)]);
+        mt.insert(
+            sample_tenant(),
+            sample_labels(),
+            vec![sample_entry("second", 200)],
+        );
 
-        let results = mt.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = mt.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
             total, 2,
@@ -473,11 +549,19 @@ mod tests {
     #[test]
     fn stats_does_not_count_same_stream_twice_during_flush() {
         let mt = MemTable::new();
-        mt.insert(sample_labels(), vec![sample_entry("first", 100)]);
+        mt.insert(
+            sample_tenant(),
+            sample_labels(),
+            vec![sample_entry("first", 100)],
+        );
         let _snapshot = mt.begin_flush();
-        mt.insert(sample_labels(), vec![sample_entry("second", 200)]);
+        mt.insert(
+            sample_tenant(),
+            sample_labels(),
+            vec![sample_entry("second", 200)],
+        );
 
-        let stats = mt.stats();
+        let stats = mt.stats(&sample_tenant());
         assert_eq!(stats.streams, 1);
         assert_eq!(stats.entries, 2);
     }
@@ -485,17 +569,29 @@ mod tests {
     #[test]
     fn begin_flush_preserves_previous_uncommitted_snapshot() {
         let memtable = MemTable::new();
-        memtable.insert(sample_labels(), vec![sample_entry("first", 100)]);
+        memtable.insert(
+            sample_tenant(),
+            sample_labels(),
+            vec![sample_entry("first", 100)],
+        );
 
         let _first_snapshot = memtable.begin_flush();
-        memtable.insert(sample_labels(), vec![sample_entry("second", 200)]);
+        memtable.insert(
+            sample_tenant(),
+            sample_labels(),
+            vec![sample_entry("second", 200)],
+        );
 
         let second_snapshot = memtable.begin_flush();
-        let snapshot_entries: usize = second_snapshot.values().map(Vec::len).sum();
+        let snapshot_entries: usize = second_snapshot
+            .values()
+            .flat_map(|streams| streams.values())
+            .map(Vec::len)
+            .sum();
         assert_eq!(snapshot_entries, 2);
 
         memtable.abort_flush(second_snapshot);
-        let results = memtable.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = memtable.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let total_entries: usize = results.iter().map(|stream| stream.entries.len()).sum();
         assert_eq!(total_entries, 2);
     }
@@ -504,11 +600,12 @@ mod tests {
     fn query_includes_the_end_timestamp() {
         let memtable = MemTable::new();
         memtable.insert(
+            sample_tenant(),
             sample_labels(),
             vec![sample_entry("at the inclusive end", i64::MAX)],
         );
 
-        let results = memtable.query(&[], &[], i64::MAX, i64::MAX, 100, true);
+        let results = memtable.query(&sample_tenant(), &[], &[], i64::MAX, i64::MAX, 100, true);
         let total_entries: usize = results.iter().map(|stream| stream.entries.len()).sum();
         assert_eq!(total_entries, 1);
     }

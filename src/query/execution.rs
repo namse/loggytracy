@@ -1,13 +1,17 @@
 #[cfg(test)]
 fn unified_query(
     state: &AppState,
+    tenant: &TenantId,
     parsed: &logql::LogQuery,
     start_ns: i64,
     end_ns: i64,
     limit: usize,
     forward: bool,
 ) -> Result<Vec<StreamResult>, String> {
-    Ok(unified_query_with_stats(state, parsed, start_ns, end_ns, limit, forward, None)?.results)
+    Ok(
+        unified_query_with_stats(state, tenant, parsed, start_ns, end_ns, limit, forward, None)?
+            .results,
+    )
 }
 
 struct QueryExecution {
@@ -17,8 +21,10 @@ struct QueryExecution {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn unified_query_with_stats(
     state: &AppState,
+    tenant: &TenantId,
     parsed: &logql::LogQuery,
     start_ns: i64,
     end_ns: i64,
@@ -28,6 +34,7 @@ fn unified_query_with_stats(
 ) -> Result<QueryExecution, String> {
     unified_query_with_stats_cancellable(
         state,
+        tenant,
         parsed,
         start_ns,
         end_ns,
@@ -42,6 +49,7 @@ fn unified_query_with_stats(
 #[allow(clippy::too_many_arguments)]
 fn unified_query_with_stats_cancellable(
     state: &AppState,
+    tenant: &TenantId,
     parsed: &logql::LogQuery,
     start_ns: i64,
     end_ns: i64,
@@ -52,6 +60,7 @@ fn unified_query_with_stats_cancellable(
 ) -> Result<QueryExecution, String> {
     unified_query_with_stats_cancellable_with_memory(
         state,
+        tenant,
         parsed,
         start_ns,
         end_ns,
@@ -67,6 +76,7 @@ fn unified_query_with_stats_cancellable(
 #[allow(clippy::too_many_arguments)]
 fn unified_query_with_stats_cancellable_with_memory(
     state: &AppState,
+    tenant: &TenantId,
     parsed: &logql::LogQuery,
     start_ns: i64,
     end_ns: i64,
@@ -92,6 +102,7 @@ fn unified_query_with_stats_cancellable_with_memory(
     let scan_limit = scan_budget.map(|budget| budget.saturating_add(1));
 
     let memtable_result = state.memtable.query_with_scan_limit(
+        tenant,
         &parsed.matchers,
         &parsed.line_filters,
         start_ns,
@@ -137,6 +148,7 @@ fn unified_query_with_stats_cancellable_with_memory(
     let part_scan_limit = scan_limit.map(|budget| budget.saturating_sub(scanned_rows as usize));
     let part_scan_bytes_limit = max_scan_bytes.map(|budget| budget.saturating_sub(scanned_bytes));
     let part_result = state.parts.query_with_exact_field_pruning_and_scan_limits(
+        tenant,
         &parsed.matchers,
         crate::part::ExactFieldPruning::new(&parsed.line_filters, &exact_fields),
         start_ns,
@@ -207,6 +219,7 @@ fn unified_query_with_stats_cancellable_with_memory(
 #[cfg(test)]
 async fn run_unified_query(
     state: Arc<AppState>,
+    tenant: TenantId,
     parsed: logql::LogQuery,
     start_ns: i64,
     end_ns: i64,
@@ -214,14 +227,18 @@ async fn run_unified_query(
     forward: bool,
 ) -> Result<Vec<StreamResult>, String> {
     Ok(
-        run_unified_query_with_stats(state, parsed, start_ns, end_ns, limit, forward, None)
-            .await?
-            .results,
+        run_unified_query_with_stats(
+            state, tenant, parsed, start_ns, end_ns, limit, forward, None,
+        )
+        .await?
+        .results,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_unified_query_with_stats(
     state: Arc<AppState>,
+    tenant: TenantId,
     parsed: logql::LogQuery,
     start_ns: i64,
     end_ns: i64,
@@ -234,6 +251,7 @@ async fn run_unified_query_with_stats(
     let started = std::time::Instant::now();
     let result = run_unified_query_with_stats_cancellable(
         state,
+        tenant,
         parsed,
         start_ns,
         end_ns,
@@ -268,6 +286,7 @@ async fn run_unified_query_with_stats(
 #[allow(clippy::too_many_arguments)]
 async fn run_unified_query_with_stats_cancellable(
     state: Arc<AppState>,
+    tenant: TenantId,
     parsed: logql::LogQuery,
     start_ns: i64,
     end_ns: i64,
@@ -278,6 +297,7 @@ async fn run_unified_query_with_stats_cancellable(
 ) -> Result<QueryExecution, String> {
     run_unified_query_with_stats_cancellable_for_runtime(
         state,
+        tenant,
         parsed,
         start_ns,
         end_ns,
@@ -293,6 +313,7 @@ async fn run_unified_query_with_stats_cancellable(
 #[allow(clippy::too_many_arguments)]
 async fn run_unified_query_with_stats_cancellable_for_runtime(
     state: Arc<AppState>,
+    tenant: TenantId,
     parsed: logql::LogQuery,
     start_ns: i64,
     end_ns: i64,
@@ -312,7 +333,7 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
     .map_err(|_| "query scan scheduler is closed".to_string())?;
     let part_guard = tokio::time::timeout(
         max_runtime,
-        pin_query_parts(&state, &parsed, start_ns, end_ns),
+        pin_query_parts(&state, &tenant, &parsed, start_ns, end_ns),
     )
     .await
     .map_err(|_| "query timed out".to_string())??;
@@ -327,6 +348,7 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
         let _part_guard = part_guard;
         unified_query_with_stats_cancellable_with_memory(
             &state,
+            &tenant,
             &parsed,
             start_ns,
             end_ns,

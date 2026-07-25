@@ -7,6 +7,7 @@ use crate::logql::{LabelMatcher, LineFilter};
 use crate::memtable::{IndexStats, Labels, QueryResult, StreamResult};
 use crate::object_storage::Manifest;
 use crate::part::{ExactFieldPredicate, ExactFieldPruning, Part, PartReader, discover_parts};
+use crate::tenant::TenantId;
 
 pub struct PartRegistry {
     inner: RwLock<HashMap<String, Arc<PartReader>>>,
@@ -94,11 +95,12 @@ impl PartRegistry {
 
     pub fn candidate_part_ids(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         start_ns: i64,
         end_ns: i64,
     ) -> std::collections::HashSet<String> {
-        self.candidate_part_ids_with_exact_fields(matchers, &[], &[], start_ns, end_ns)
+        self.candidate_part_ids_with_exact_fields(tenant, matchers, &[], &[], start_ns, end_ns)
     }
 
     /// Plans against catalog-resident indexes only, including the optional
@@ -106,6 +108,7 @@ impl PartRegistry {
     /// candidates; BTF2 also conservatively scans typed canonical predicates.
     pub fn candidate_part_ids_with_exact_fields(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
@@ -118,6 +121,7 @@ impl PartRegistry {
             .iter()
             .filter(|(_, reader)| {
                 reader.may_match_exact_fields(
+                    tenant,
                     matchers,
                     line_filters,
                     exact_fields,
@@ -206,8 +210,10 @@ impl PartRegistry {
         self.inner.read().unwrap().keys().cloned().collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn query(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         start_ns: i64,
@@ -217,6 +223,7 @@ impl PartRegistry {
     ) -> Result<Vec<StreamResult>, String> {
         Ok(self
             .query_with_exact_field_pruning_and_scan_limit(
+                tenant,
                 matchers,
                 ExactFieldPruning::new(line_filters, &[]),
                 start_ns,
@@ -229,8 +236,10 @@ impl PartRegistry {
             .results)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn query_with_exact_field_pruning(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         start_ns: i64,
@@ -240,7 +249,7 @@ impl PartRegistry {
     ) -> Result<Vec<StreamResult>, String> {
         Ok(self
             .query_with_exact_field_pruning_and_scan_limit(
-                matchers, pruning, start_ns, end_ns, limit, forward, None, None,
+                tenant, matchers, pruning, start_ns, end_ns, limit, forward, None, None,
             )?
             .results)
     }
@@ -248,6 +257,7 @@ impl PartRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn query_with_exact_field_pruning_and_scan_limit(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         start_ns: i64,
@@ -258,6 +268,7 @@ impl PartRegistry {
         cancellation: Option<&AtomicBool>,
     ) -> Result<QueryResult, String> {
         self.query_with_exact_field_pruning_and_scan_limits(
+            tenant,
             matchers,
             pruning,
             start_ns,
@@ -273,6 +284,7 @@ impl PartRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn query_with_exact_field_pruning_and_scan_limits(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         start_ns: i64,
@@ -295,16 +307,27 @@ impl PartRegistry {
         let mut candidates: Vec<Arc<PartReader>> = readers
             .into_iter()
             .filter(|r| {
-                let m = r.meta();
-                m.max_ts_ns >= start_ns
-                    && m.min_ts_ns <= end_ns
+                // Part-level time pruning is per tenant: a shared part spans
+                // every tenant's range, so the part-wide min/max would keep
+                // parts that hold nothing for this tenant.
+                let Some(segment) = r.meta().tenant_segment(tenant) else {
+                    return false;
+                };
+                segment.max_ts_ns >= start_ns
+                    && segment.min_ts_ns <= end_ns
                     && (matchers.is_empty()
-                        || m.streams
+                        || r.meta()
+                            .streams
                             .iter()
                             .any(|labels| matchers.iter().all(|matcher| matcher.matches(labels))))
             })
             .collect();
-        candidates.sort_by_key(|r| r.meta().min_ts_ns);
+        candidates.sort_by_key(|r| {
+            r.meta()
+                .tenant_segment(tenant)
+                .map(|segment| segment.min_ts_ns)
+                .unwrap_or(i64::MAX)
+        });
         if !forward {
             candidates.reverse();
         }
@@ -343,6 +366,7 @@ impl PartRegistry {
             }
             let result = reader
                 .query_with_exact_field_pruning_and_scan_limits(
+                    tenant,
                     matchers,
                     pruning,
                     start_ns,
@@ -385,37 +409,38 @@ impl PartRegistry {
         })
     }
 
-    pub fn label_names(&self) -> Vec<String> {
+    pub fn label_names(&self, tenant: &TenantId) -> Vec<String> {
         let mut set = BTreeSet::new();
         for reader in self.snapshot() {
-            for name in reader.label_names() {
-                set.insert(name.clone());
+            for name in reader.label_names(tenant) {
+                set.insert(name);
             }
         }
         set.into_iter().collect()
     }
 
-    pub fn label_values(&self, name: &str) -> Vec<String> {
+    pub fn label_values(&self, tenant: &TenantId, name: &str) -> Vec<String> {
         let mut set = BTreeSet::new();
         for reader in self.snapshot() {
-            for v in reader.label_values(name) {
+            for v in reader.label_values(tenant, name) {
                 set.insert(v);
             }
         }
         set.into_iter().collect()
     }
 
-    pub fn series(&self, matchers: &[LabelMatcher]) -> Vec<Labels> {
+    pub fn series(&self, tenant: &TenantId, matchers: &[LabelMatcher]) -> Vec<Labels> {
         let mut set: std::collections::BTreeSet<Labels> = std::collections::BTreeSet::new();
         for reader in self.snapshot() {
-            for labels in reader.series(matchers) {
+            for labels in reader.series(tenant, matchers) {
                 set.insert(labels);
             }
         }
         set.into_iter().collect()
     }
 
-    pub fn stats(&self) -> IndexStats {
+    /// Process-wide totals for the operator metrics endpoint.
+    pub fn global_stats(&self) -> IndexStats {
         let mut stream_set: BTreeSet<Labels> = BTreeSet::new();
         let mut entries = 0usize;
         let mut bytes = 0u64;
@@ -424,8 +449,35 @@ impl PartRegistry {
                 stream_set.insert(labels.clone());
             }
             entries += reader.meta().row_count as usize;
-            if let Ok(meta) = std::fs::metadata(reader.part().data_path()) {
-                bytes += meta.len();
+            if let Ok(metadata) = std::fs::metadata(reader.part().data_path()) {
+                bytes += metadata.len();
+            }
+        }
+        IndexStats {
+            streams: stream_set.len(),
+            entries,
+            bytes,
+        }
+    }
+
+    pub fn stats(&self, tenant: &TenantId) -> IndexStats {
+        let mut stream_set: BTreeSet<Labels> = BTreeSet::new();
+        let mut entries = 0usize;
+        let mut bytes = 0u64;
+        for reader in self.snapshot() {
+            let Some(segment) = reader.meta().tenant_segment(tenant) else {
+                continue;
+            };
+            for labels in reader.series(tenant, &[]) {
+                stream_set.insert(labels);
+            }
+            entries += segment.row_count as usize;
+            // Attribute the part's stored bytes in proportion to the tenant's
+            // share of its rows; a shared object has no per-tenant file size.
+            if let Ok(metadata) = std::fs::metadata(reader.part().data_path()) {
+                let part_rows = reader.meta().row_count.max(1);
+                bytes +=
+                    (metadata.len() as u128 * segment.row_count as u128 / part_rows as u128) as u64;
             }
         }
         IndexStats {
@@ -441,6 +493,7 @@ mod tests {
     use super::*;
     use crate::memtable::Labels;
     use crate::part::{self, BLOOM_FILE, Row};
+    use crate::tenant::test_tenant;
     use std::collections::BTreeMap;
 
     fn temp_dir() -> std::path::PathBuf {
@@ -461,6 +514,7 @@ mod tests {
         let mut labels: Labels = BTreeMap::new();
         labels.insert("app".to_string(), "test".to_string());
         Row {
+            tenant: test_tenant(),
             timestamp_ns,
             labels,
             line: line.to_string(),
@@ -480,7 +534,9 @@ mod tests {
         registry.register(first).unwrap();
         registry.register(second).unwrap();
 
-        let result = registry.query(&[], &[], 0, 1_000, 2, true).unwrap();
+        let result = registry
+            .query(&test_tenant(), &[], &[], 0, 1_000, 2, true)
+            .unwrap();
         let entries: Vec<_> = result
             .into_iter()
             .flat_map(|stream| stream.entries)
@@ -521,7 +577,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(registry.part_count(), 1);
         let results = registry
-            .query(&[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
             .expect("part query");
         assert_eq!(results.iter().map(|r| r.entries.len()).sum::<usize>(), 1);
         assert!(old.dir.exists());
@@ -593,7 +649,7 @@ mod tests {
 
         std::fs::write(data_path, b"corrupt").unwrap();
 
-        let result = registry.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let result = registry.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         assert!(result.is_err());
     }
 
@@ -608,7 +664,7 @@ mod tests {
         registry.register(parts).unwrap();
 
         let results = registry
-            .query(&[], &[], i64::MAX, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], i64::MAX, i64::MAX, 100, true)
             .expect("part query");
         assert_eq!(results.iter().map(|r| r.entries.len()).sum::<usize>(), 1);
     }
@@ -633,6 +689,7 @@ mod tests {
         assert!(
             registry
                 .candidate_part_ids_with_exact_fields(
+                    &test_tenant(),
                     &[],
                     &[],
                     std::slice::from_ref(&predicate),
@@ -643,7 +700,14 @@ mod tests {
         );
         assert!(
             registry
-                .candidate_part_ids_with_exact_fields(&[], &[], &[predicate], first_ts, first_ts,)
+                .candidate_part_ids_with_exact_fields(
+                    &test_tenant(),
+                    &[],
+                    &[],
+                    &[predicate],
+                    first_ts,
+                    first_ts,
+                )
                 .is_empty(),
             "a field value in a later row group must not force restoration"
         );

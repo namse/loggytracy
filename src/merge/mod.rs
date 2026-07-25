@@ -7,7 +7,6 @@ use tokio::sync::watch;
 use tokio::time::interval;
 
 use crate::config::Config;
-use crate::memtable::Labels;
 use crate::metrics::RuntimeMetrics;
 use crate::object_storage::RemoteCache;
 use crate::part::{self, PartReader};

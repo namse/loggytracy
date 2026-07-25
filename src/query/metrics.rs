@@ -23,11 +23,12 @@ fn parse_step_ns(step: Option<&str>) -> Result<i64, String> {
 #[cfg(test)]
 async fn run_metric_query(
     state: Arc<AppState>,
+    tenant: TenantId,
     expr: logql::MetricExpr,
     evaluation_times: Vec<i64>,
 ) -> Result<Vec<MetricSeries>, String> {
     Ok(
-        run_metric_query_with_stats(state, expr, evaluation_times, None)
+        run_metric_query_with_stats(state, tenant, expr, evaluation_times, None)
             .await?
             .series,
     )
@@ -40,6 +41,7 @@ struct MetricQueryResult {
 
 async fn run_metric_query_with_stats(
     state: Arc<AppState>,
+    tenant: TenantId,
     expr: logql::MetricExpr,
     evaluation_times: Vec<i64>,
     scan_start_override: Option<i64>,
@@ -47,6 +49,7 @@ async fn run_metric_query_with_stats(
     let cancellation = Arc::new(AtomicBool::new(false));
     run_metric_query_with_stats_cancellable(
         state,
+        tenant,
         expr,
         evaluation_times,
         scan_start_override,
@@ -55,8 +58,10 @@ async fn run_metric_query_with_stats(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_metric_query_with_stats_cancellable(
     state: Arc<AppState>,
+    tenant: TenantId,
     expr: logql::MetricExpr,
     evaluation_times: Vec<i64>,
     scan_start_override: Option<i64>,
@@ -83,6 +88,7 @@ async fn run_metric_query_with_stats_cancellable(
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let execution = run_unified_query_with_stats_cancellable_for_runtime(
         state.clone(),
+        tenant,
         query,
         scan_start,
         end,

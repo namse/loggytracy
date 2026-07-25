@@ -1,4 +1,5 @@
     use super::*;
+    use crate::tenant::test_tenant;
     use crate::journal::Journal;
     use crate::memtable::{LogEntry, MemTable};
     use crate::part;
@@ -85,7 +86,7 @@
                 .collect();
             streams.push((labels, entries));
         }
-        journal.append(raw.to_vec(), streams).await.unwrap();
+        journal.append(test_tenant(), raw.to_vec(), streams).await.unwrap();
     }
 
     #[tokio::test]
@@ -120,7 +121,7 @@
         let memtable2 = MemTable::new();
         let wal = config.data_dir.join("journal.wal");
         let ckpt_p = config.data_dir.join("journal.ckpt");
-        let (start, end) = journal::replay(&wal, &ckpt_p, &memtable2).unwrap();
+        let (start, end) = journal::replay(&wal, &ckpt_p, &memtable2, &test_tenant()).unwrap();
         assert_eq!(start, ckpt.offset);
         assert_eq!(end, ckpt.offset);
         assert!(memtable2.is_empty(), "no in-flight data after full flush");
@@ -129,7 +130,7 @@
         assert_eq!(registry.part_count(), 1);
 
         let results = registry
-            .query(&[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
             .expect("part query");
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 3);
@@ -142,7 +143,7 @@
         )
         .unwrap();
         let results = registry
-            .query(&[m], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[m], &[], i64::MIN, i64::MAX, 100, true)
             .expect("part query");
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 3);
@@ -154,7 +155,7 @@
         )
         .unwrap();
         let results = registry
-            .query(&[m_miss], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[m_miss], &[], i64::MIN, i64::MAX, 100, true)
             .expect("part query");
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -179,14 +180,14 @@
         let memtable2 = MemTable::new();
         let wal = config.data_dir.join("journal.wal");
         let ckpt_p = config.data_dir.join("journal.ckpt");
-        let (start, end) = journal::replay(&wal, &ckpt_p, &memtable2).unwrap();
+        let (start, end) = journal::replay(&wal, &ckpt_p, &memtable2, &test_tenant()).unwrap();
         assert_eq!(start, 0);
         assert!(end > 0);
 
         let registry = PartRegistry::load_from_disk(&config.data_dir.join("parts")).unwrap();
         assert_eq!(registry.part_count(), 0);
 
-        let results = memtable2.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = memtable2.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 3);
     }
@@ -219,7 +220,7 @@
             std::fs::metadata(&wal_path).unwrap().len(),
             valid_len as u64
         );
-        let results = recovered.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = recovered.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         assert_eq!(
             results
                 .iter()
@@ -261,19 +262,19 @@
         let memtable2 = MemTable::new();
         let wal = config.data_dir.join("journal.wal");
         let ckpt_p = config.data_dir.join("journal.ckpt");
-        journal::replay(&wal, &ckpt_p, &memtable2).unwrap();
+        journal::replay(&wal, &ckpt_p, &memtable2, &test_tenant()).unwrap();
 
         let registry = PartRegistry::load_from_disk(&parts_root).unwrap();
         assert_eq!(registry.part_count(), 1);
 
         // disk: 3, memtable: 3
         let disk_results = registry
-            .query(&[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
             .expect("part query");
         let disk_total: usize = disk_results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(disk_total, 3);
 
-        let mem_results = memtable2.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let mem_results = memtable2.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let mem_total: usize = mem_results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(mem_total, 3);
     }
@@ -306,7 +307,7 @@
         // 존재하는 부분문자열
         let f = crate::logql::LineFilter::Contains("database".to_string());
         let r = registry
-            .query(&[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
@@ -314,7 +315,7 @@
         // 존재하지 않는 부분문자열 — bloom 프루닝
         let f = crate::logql::LineFilter::Contains("zzzzzz-no-such-substr".to_string());
         let r = registry
-            .query(&[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -340,7 +341,7 @@
         // 첫 재시작
         let memtable1 = MemTable::new();
         recover(&config, &memtable1).expect("recover 1");
-        let r1 = memtable1.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let r1 = memtable1.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let t1: usize = r1.iter().map(|s| s.entries.len()).sum();
         assert_eq!(t1, 3, "first restart should restore in-flight data");
         drop(memtable1);
@@ -348,7 +349,7 @@
         // 두 번째 재시작 — checkpoint가 전진하지 않았으므로 동일 데이터가 다시 복원되어야 함
         let memtable2 = MemTable::new();
         recover(&config, &memtable2).expect("recover 2");
-        let r2 = memtable2.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let r2 = memtable2.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let t2: usize = r2.iter().map(|s| s.entries.len()).sum();
         assert_eq!(t2, 3, "second restart must NOT lose in-flight data");
     }
@@ -414,12 +415,14 @@
                         .collect();
                 let rows = [
                     part::Row {
+                        tenant: test_tenant(),
                         timestamp_ns: 1_700_000_000_000_000_000,
                         labels: labels.clone(),
                         line: "old-one".to_string(),
                         structured_metadata: Vec::new(),
                     },
                     part::Row {
+                        tenant: test_tenant(),
                         timestamp_ns: 1_700_000_001_000_000_000,
                         labels,
                         line: "old-two".to_string(),
@@ -463,7 +466,7 @@
 
         recover(&config, &recovered).expect("recover acknowledged WAL");
 
-        let results = recovered.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = recovered.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         assert_eq!(
             results
                 .iter()
@@ -486,12 +489,12 @@
         let registry = PartRegistry::load_from_disk(&config.data_dir.join("parts")).unwrap();
 
         let memory_rows: usize = recovered
-            .query(&[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
             .iter()
             .map(|stream| stream.entries.len())
             .sum();
         let part_rows: usize = registry
-            .query(&[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
             .unwrap()
             .iter()
             .map(|stream| stream.entries.len())
@@ -506,10 +509,155 @@
 
         assert_eq!(registry.part_count(), 1);
         let rows: usize = registry
-            .query(&[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
             .unwrap()
             .iter()
             .map(|stream| stream.entries.len())
             .sum();
         assert_eq!(rows, 2);
+    }
+
+    fn tenant_push_body(tenant: &str, line: &str) -> Vec<u8> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let request = PushRequest {
+            streams: vec![crate::proto::StreamAdapter {
+                labels: format!(r#"{{app="{tenant}-app"}}"#),
+                entries: vec![crate::proto::EntryAdapter {
+                    timestamp: Some(::prost_types::Timestamp {
+                        seconds: now,
+                        nanos: 0,
+                    }),
+                    line: line.to_string(),
+                    structured_metadata: vec![],
+                }],
+                hash: 0,
+            }],
+        };
+        let mut encoded = Vec::new();
+        request.encode(&mut encoded).unwrap();
+        snap::raw::Encoder::new().compress_vec(&encoded).unwrap()
+    }
+
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Two tenants pushing through the real router must not be able to read,
+    /// enumerate, or count each other's data — before or after a flush turns
+    /// the memtable into one shared part.
+    #[tokio::test]
+    async fn two_tenants_never_see_each_others_logs_over_http() {
+        use tower::ServiceExt;
+
+        let data_dir = tmp_data_dir("tenant_isolation");
+        let config = crate::config::Config {
+            data_dir: data_dir.clone(),
+            ..crate::config::Config::default()
+        };
+        let memtable = Arc::new(MemTable::new());
+        let parts = Arc::new(PartRegistry::new());
+        let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
+        let state = crate::test_support::state(
+            config.clone(),
+            memtable.clone(),
+            journal.clone(),
+            parts.clone(),
+            trace_parts.clone(),
+            None,
+        );
+
+        let push = |tenant: &'static str, line: &'static str| {
+            let state = state.clone();
+            async move {
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/loki/api/v1/push")
+                    .header("content-type", "application/x-protobuf")
+                    .header(crate::tenant::TENANT_HEADER, tenant)
+                    .body(axum::body::Body::from(tenant_push_body(tenant, line)))
+                    .unwrap();
+                let response = crate::build_router(state).oneshot(request).await.unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+            }
+        };
+        push("acme", "acme secret").await;
+        push("globex", "globex secret").await;
+
+        let get = |tenant: &'static str, uri: &'static str| {
+            let state = state.clone();
+            async move {
+                let request = axum::http::Request::builder()
+                    .uri(uri)
+                    .header(crate::tenant::TENANT_HEADER, tenant)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let response = crate::build_router(state).oneshot(request).await.unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK, "{uri}");
+                json_body(response).await
+            }
+        };
+
+        let query_uri = "/loki/api/v1/query_range?query=%7B%7D&start=0&limit=100&direction=forward";
+        for stage in ["memtable", "part"] {
+            let acme = get("acme", query_uri).await;
+            let globex = get("globex", query_uri).await;
+            let acme_lines = acme["data"]["result"].to_string();
+            let globex_lines = globex["data"]["result"].to_string();
+            assert!(acme_lines.contains("acme secret"), "{stage}: {acme_lines}");
+            assert!(
+                !acme_lines.contains("globex secret"),
+                "{stage}: acme read globex's line: {acme_lines}"
+            );
+            assert!(
+                !globex_lines.contains("acme secret"),
+                "{stage}: globex read acme's line: {globex_lines}"
+            );
+
+            let values = get("acme", "/loki/api/v1/label/app/values").await;
+            assert_eq!(
+                values["data"],
+                serde_json::json!(["acme-app"]),
+                "{stage}: label values leaked another tenant"
+            );
+
+            let stats = get("acme", "/loki/api/v1/index/stats").await;
+            assert_eq!(stats["data"]["streams"], 1, "{stage}");
+            assert_eq!(stats["data"]["entries"], 1, "{stage}");
+
+            let series = get("acme", "/loki/api/v1/series?match%5B%5D=%7B%7D").await;
+            assert_eq!(series["data"].as_array().unwrap().len(), 1, "{stage}");
+
+            if stage == "memtable" {
+                // Flush both tenants into one shared part and repeat every
+                // assertion against the on-disk path.
+                let mut pending_checkpoint = None;
+                crate::flush::force_flush_pass(crate::flush::ForceFlush {
+                    memtable: &memtable,
+                    trace_memtable: &journal.trace_memtable(),
+                    journal: &journal,
+                    registry: &parts,
+                    trace_registry: &trace_parts,
+                    remote_cache: None,
+                    config: &config,
+                    pending_checkpoint: &mut pending_checkpoint,
+                })
+                .await
+                .unwrap();
+                assert_eq!(parts.part_count(), 1, "both tenants share one part");
+                assert!(memtable.is_empty());
+            }
+        }
+
+        // A tenant that has never written sees nothing at all.
+        let stranger = get("initech", query_uri).await;
+        assert_eq!(stranger["data"]["result"], serde_json::json!([]));
     }

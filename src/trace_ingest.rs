@@ -7,6 +7,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use prost014::Message;
 use tonic::{Request, Response, Status};
 
+use crate::config::Config;
 use crate::journal::Journal;
 use crate::shutdown::ShutdownState;
 use crate::trace::normalize_request;
@@ -18,11 +19,16 @@ pub const MAX_OTLP_SPANS: usize = 100_000;
 pub struct TraceIngestService {
     journal: Arc<Journal>,
     shutdown: Arc<ShutdownState>,
+    config: Arc<Config>,
 }
 
 impl TraceIngestService {
-    pub fn new(journal: Arc<Journal>, shutdown: Arc<ShutdownState>) -> Self {
-        Self { journal, shutdown }
+    pub fn new(journal: Arc<Journal>, shutdown: Arc<ShutdownState>, config: Arc<Config>) -> Self {
+        Self {
+            journal,
+            shutdown,
+            config,
+        }
     }
 
     pub fn into_server(self) -> TraceServiceServer<Self> {
@@ -41,6 +47,8 @@ impl TraceService for TraceIngestService {
         if self.shutdown.is_draining() {
             return Err(Status::unavailable("server is draining for shutdown"));
         }
+        let tenant = crate::tenant::from_grpc_metadata(request.metadata(), &self.config)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let request = request.into_inner();
         if request.encoded_len() > MAX_OTLP_REQUEST_BYTES {
             return Err(Status::resource_exhausted(format!(
@@ -59,14 +67,14 @@ impl TraceService for TraceIngestService {
                 "OTLP request contains more than {MAX_OTLP_SPANS} spans"
             )));
         }
-        let spans = normalize_request(request.clone())
+        let spans = normalize_request(&tenant, request.clone())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let mut encoded = Vec::new();
         request.encode(&mut encoded).map_err(|error| {
             Status::invalid_argument(format!("failed to encode request: {error}"))
         })?;
         self.journal
-            .append_trace(encoded, spans)
+            .append_trace(tenant, encoded, spans)
             .await
             .map_err(|error| Status::internal(format!("journal write failed: {error}")))?;
         Ok(Response::new(ExportTraceServiceResponse::default()))
@@ -79,11 +87,20 @@ mod tests {
     use crate::config::Config;
     use crate::journal;
     use crate::part_registry::PartRegistry;
+    use crate::tenant::test_tenant;
     use crate::trace::TraceMemTable;
     use crate::trace_registry::TraceRegistry;
     use opentelemetry_proto::tonic::common::v1::AnyValue;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use std::time::Duration;
+
+    fn tenant_request(request: ExportTraceServiceRequest) -> Request<ExportTraceServiceRequest> {
+        Request::from_parts(
+            crate::tenant::test_tenant_metadata(),
+            tonic::Extensions::default(),
+            request,
+        )
+    }
 
     fn request() -> ExportTraceServiceRequest {
         ExportTraceServiceRequest {
@@ -124,9 +141,9 @@ mod tests {
         );
         let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
         shutdown.begin_drain();
-        let service = TraceIngestService::new(journal, shutdown);
+        let service = TraceIngestService::new(journal, shutdown, Arc::new(config.clone()));
 
-        let status = service.export(Request::new(request())).await.unwrap_err();
+        let status = service.export(tenant_request(request())).await.unwrap_err();
 
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(
@@ -149,11 +166,19 @@ mod tests {
             journal::Journal::spawn_with_traces(&config, log_memtable, trace_memtable.clone())
                 .unwrap(),
         );
-        let service =
-            TraceIngestService::new(journal, Arc::new(crate::shutdown::ShutdownState::new()));
-        let response = service.export(Request::new(request())).await.unwrap();
+        let service = TraceIngestService::new(
+            journal,
+            Arc::new(crate::shutdown::ShutdownState::new()),
+            Arc::new(config.clone()),
+        );
+        let response = service.export(tenant_request(request())).await.unwrap();
         assert!(response.into_inner().partial_success.is_none());
-        assert_eq!(trace_memtable.query_trace_id(&"01".repeat(16)).len(), 1);
+        assert_eq!(
+            trace_memtable
+                .query_trace_id(&test_tenant(), &"01".repeat(16))
+                .len(),
+            1
+        );
 
         let replayed = TraceMemTable::new();
         journal::replay_with_traces(
@@ -161,9 +186,15 @@ mod tests {
             service.journal.ckpt_path(),
             &crate::memtable::MemTable::new(),
             &replayed,
+            &test_tenant(),
         )
         .unwrap();
-        assert_eq!(replayed.query_trace_id(&"01".repeat(16)).len(), 1);
+        assert_eq!(
+            replayed
+                .query_trace_id(&test_tenant(), &"01".repeat(16))
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -183,11 +214,14 @@ mod tests {
             )
             .unwrap(),
         );
-        let service =
-            TraceIngestService::new(journal, Arc::new(crate::shutdown::ShutdownState::new()));
+        let service = TraceIngestService::new(
+            journal,
+            Arc::new(crate::shutdown::ShutdownState::new()),
+            Arc::new(config.clone()),
+        );
         let mut invalid = request();
         invalid.resource_spans[0].scope_spans[0].spans[0].trace_id = vec![0; 16];
-        let status = service.export(Request::new(invalid)).await.unwrap_err();
+        let status = service.export(tenant_request(invalid)).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(trace_memtable.is_empty());
     }
@@ -211,13 +245,16 @@ mod tests {
             )
             .unwrap(),
         );
-        let service =
-            TraceIngestService::new(journal, Arc::new(crate::shutdown::ShutdownState::new()));
+        let service = TraceIngestService::new(
+            journal,
+            Arc::new(crate::shutdown::ShutdownState::new()),
+            Arc::new(config.clone()),
+        );
         let mut oversized = request();
         oversized.resource_spans[0].scope_spans[0].spans[0].name =
             "x".repeat(MAX_OTLP_REQUEST_BYTES);
 
-        let status = service.export(Request::new(oversized)).await.unwrap_err();
+        let status = service.export(tenant_request(oversized)).await.unwrap_err();
 
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
         assert!(trace_memtable.is_empty());
@@ -242,12 +279,15 @@ mod tests {
             )
             .unwrap(),
         );
-        let service =
-            TraceIngestService::new(journal, Arc::new(crate::shutdown::ShutdownState::new()));
+        let service = TraceIngestService::new(
+            journal,
+            Arc::new(crate::shutdown::ShutdownState::new()),
+            Arc::new(config.clone()),
+        );
         let mut too_many = request();
         too_many.resource_spans[0].scope_spans[0].spans = vec![Span::default(); MAX_OTLP_SPANS + 1];
 
-        let status = service.export(Request::new(too_many)).await.unwrap_err();
+        let status = service.export(tenant_request(too_many)).await.unwrap_err();
 
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
         assert!(trace_memtable.is_empty());
@@ -289,9 +329,12 @@ mod tests {
             tokio::sync::watch::channel(false).1,
         ));
 
-        let service =
-            TraceIngestService::new(journal, Arc::new(crate::shutdown::ShutdownState::new()));
-        service.export(Request::new(request())).await.unwrap();
+        let service = TraceIngestService::new(
+            journal,
+            Arc::new(crate::shutdown::ShutdownState::new()),
+            Arc::new(config.clone()),
+        );
+        service.export(tenant_request(request())).await.unwrap();
         for _ in 0..100 {
             if trace_parts.part_count() == 1 {
                 break;
@@ -301,7 +344,7 @@ mod tests {
         assert_eq!(trace_parts.part_count(), 1);
         assert_eq!(
             trace_parts
-                .query_trace_id(&"01".repeat(16), None, None)
+                .query_trace_id(&test_tenant(), &"01".repeat(16), None, None)
                 .unwrap()
                 .len(),
             1
@@ -313,7 +356,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             restored
-                .query_trace_id(&"01".repeat(16), None, None)
+                .query_trace_id(&test_tenant(), &"01".repeat(16), None, None)
                 .unwrap()
                 .len(),
             1

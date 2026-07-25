@@ -1,4 +1,5 @@
     use super::*;
+    use crate::tenant::test_tenant;
     use crate::memtable::MemTable;
     use crate::proto::{EntryAdapter, StreamAdapter};
     use std::sync::Arc;
@@ -79,7 +80,7 @@
                 .collect();
             streams.push((labels, entries));
         }
-        h.journal.append(raw, streams).await.unwrap();
+        h.journal.append(test_tenant(), raw, streams).await.unwrap();
     }
 
     #[tokio::test]
@@ -90,13 +91,15 @@
 
         let ckpt = h.journal.checkpoint().await.unwrap();
         assert!(ckpt.offset > 0);
-        assert_eq!(ckpt.snapshot.len(), 2);
+        assert_eq!(ckpt.snapshot.len(), 1, "one tenant produced both streams");
+        assert_eq!(ckpt.snapshot[&test_tenant()].len(), 2);
         h.journal.set_checkpoint(ckpt.offset).unwrap();
 
         let (start, end) = replay(
             h.journal.wal_path(),
             h.journal.ckpt_path(),
             &MemTable::new(),
+            &test_tenant(),
         )
         .unwrap();
         assert_eq!(start, ckpt.offset);
@@ -129,8 +132,13 @@
         let after = std::fs::metadata(h.journal.wal_path()).unwrap().len();
         assert!(after < before);
         let restored = MemTable::new();
-        replay(h.journal.wal_path(), h.journal.ckpt_path(), &restored).unwrap();
-        let results = restored.query(&[], &[], i64::MIN, i64::MAX, 10, true);
+        replay(
+            h.journal.wal_path(),
+            h.journal.ckpt_path(),
+            &restored,
+            &test_tenant(),
+        ).unwrap();
+        let results = restored.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true);
         let lines: Vec<_> = results
             .iter()
             .flat_map(|stream| stream.entries.iter().map(|entry| entry.line.as_str()))
@@ -161,9 +169,14 @@
             .await
             .unwrap();
         let restored = MemTable::new();
-        replay(h.journal.wal_path(), h.journal.ckpt_path(), &restored).unwrap();
+        replay(
+            h.journal.wal_path(),
+            h.journal.ckpt_path(),
+            &restored,
+            &test_tenant(),
+        ).unwrap();
         let lines: Vec<_> = restored
-            .query(&[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
             .into_iter()
             .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
             .collect();
@@ -194,9 +207,14 @@
             .unwrap();
 
         let restored = MemTable::new();
-        replay(h.journal.wal_path(), h.journal.ckpt_path(), &restored).unwrap();
+        replay(
+            h.journal.wal_path(),
+            h.journal.ckpt_path(),
+            &restored,
+            &test_tenant(),
+        ).unwrap();
         let lines: Vec<_> = restored
-            .query(&[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
             .into_iter()
             .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
             .collect();
@@ -224,10 +242,15 @@
         std::fs::write(&tmp_path, []).unwrap();
 
         let restored = MemTable::new();
-        replay(h.journal.wal_path(), h.journal.ckpt_path(), &restored).unwrap();
+        replay(
+            h.journal.wal_path(),
+            h.journal.ckpt_path(),
+            &restored,
+            &test_tenant(),
+        ).unwrap();
         assert!(
             restored
-                .query(&[], &[], i64::MIN, i64::MAX, 10, true)
+                .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
                 .is_empty()
         );
         assert_eq!(
@@ -262,10 +285,10 @@
         )
         .await;
         let mt = MemTable::new();
-        let (start, end) = replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt).unwrap();
+        let (start, end) = replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt, &test_tenant()).unwrap();
         assert_eq!(start, 0);
         assert!(end > 0);
-        let results = mt.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = mt.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 2);
     }
@@ -282,7 +305,7 @@
         record.extend_from_slice(&data);
         std::fs::write(&wal_path, record).unwrap();
 
-        let (start, end) = replay(&wal_path, &ckpt_path, &MemTable::new()).unwrap();
+        let (start, end) = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant()).unwrap();
 
         assert_eq!(start, 0);
         assert_eq!(end, 0);
@@ -298,7 +321,7 @@
         header.extend_from_slice(&0u32.to_le_bytes());
         std::fs::write(&wal_path, header).unwrap();
 
-        let (start, end) = replay(&wal_path, &ckpt_path, &MemTable::new()).unwrap();
+        let (start, end) = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant()).unwrap();
 
         assert_eq!(start, 0);
         assert_eq!(end, 0);
@@ -320,7 +343,7 @@
         wal.extend_from_slice(&second);
         std::fs::write(&wal_path, wal).unwrap();
 
-        let result = replay(&wal_path, &ckpt_path, &MemTable::new());
+        let result = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant());
 
         assert!(result.is_err());
     }
@@ -332,7 +355,7 @@
         let ckpt_path = dir.join(CKPT_FILE);
         write_checkpoint(&ckpt_path, 128).unwrap();
 
-        let result = replay(&wal_path, &ckpt_path, &MemTable::new());
+        let result = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant());
 
         assert!(result.is_err());
     }
@@ -345,7 +368,7 @@
         std::fs::write(&wal_path, [0u8; 16]).unwrap();
         write_checkpoint(&ckpt_path, 32).unwrap();
 
-        let result = replay(&wal_path, &ckpt_path, &MemTable::new());
+        let result = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant());
 
         assert!(result.is_err());
     }
@@ -359,7 +382,7 @@
 
         for bytes in [&[1u8, 2, 3][..], &[0u8; 9][..]] {
             std::fs::write(&ckpt_path, bytes).unwrap();
-            let error = replay(&wal_path, &ckpt_path, &MemTable::new())
+            let error = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant())
                 .expect_err("malformed checkpoint must stop recovery");
             assert!(error.contains("exactly 8 bytes"));
         }
@@ -393,8 +416,82 @@
         push(&h, make_push_req(&[("{app=\"b\"}", vec![("y", 2)])])).await;
 
         let mt = MemTable::new();
-        replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt).unwrap();
-        let results = mt.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt, &test_tenant()).unwrap();
+        let results = mt.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
+    }
+
+    #[tokio::test]
+    async fn replay_restores_each_record_under_its_own_tenant() {
+        let harness = harness("replay_tenant").await;
+        let acme = TenantId::parse("acme").unwrap();
+        let globex = TenantId::parse("globex").unwrap();
+        harness
+            .journal
+            .append(
+                acme.clone(),
+                make_push_req(&[(r#"{app="a"}"#, vec![("acme line", 100)])]),
+                vec![],
+            )
+            .await
+            .unwrap();
+        harness
+            .journal
+            .append(
+                globex.clone(),
+                make_push_req(&[(r#"{app="b"}"#, vec![("globex line", 200)])]),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let restored = MemTable::new();
+        replay(
+            harness.journal.wal_path(),
+            harness.journal.ckpt_path(),
+            &restored,
+            &test_tenant(),
+        )
+        .unwrap();
+
+        let lines = |tenant: &TenantId| -> Vec<String> {
+            restored
+                .query(tenant, &[], &[], i64::MIN, i64::MAX, 100, true)
+                .into_iter()
+                .flat_map(|stream| stream.entries)
+                .map(|entry| entry.line)
+                .collect()
+        };
+        assert_eq!(lines(&acme), vec!["acme line"]);
+        assert_eq!(lines(&globex), vec!["globex line"]);
+        assert!(lines(&test_tenant()).is_empty());
+    }
+
+    #[test]
+    fn replay_attributes_a_pre_tenancy_record_to_the_default_tenant() {
+        // A WAL written before tenancy holds bare PushRequest bytes with no
+        // framing. Upgrading must recover that data, not reject it.
+        let dir = tmp_dir("legacy_record");
+        let wal_path = dir.join(WAL_FILE);
+        let ckpt_path = dir.join(CKPT_FILE);
+        let payload = make_push_req(&[(r#"{app="legacy"}"#, vec![("from before tenancy", 100)])]);
+        let mut wal = Vec::new();
+        wal.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        wal.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        wal.extend_from_slice(&payload);
+        std::fs::write(&wal_path, &wal).unwrap();
+
+        let restored = MemTable::new();
+        replay(&wal_path, &ckpt_path, &restored, &test_tenant()).unwrap();
+
+        let entries = restored.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        assert_eq!(
+            entries
+                .into_iter()
+                .flat_map(|stream| stream.entries)
+                .map(|entry| entry.line)
+                .collect::<Vec<_>>(),
+            vec!["from before tenancy"]
+        );
     }

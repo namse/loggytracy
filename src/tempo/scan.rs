@@ -1,7 +1,9 @@
+#[allow(clippy::too_many_arguments)]
 async fn scan_trace_spans(
     guard: tokio::sync::OwnedRwLockReadGuard<()>,
     journal: Arc<crate::journal::Journal>,
     trace_parts: Arc<TraceRegistry>,
+    tenant: TenantId,
     trace_id: Option<String>,
     config: Arc<crate::config::Config>,
     scan_semaphore: Arc<Semaphore>,
@@ -25,15 +27,20 @@ async fn scan_trace_spans(
         let mut spans = match trace_id.as_deref() {
             Some(trace_id) => journal
                 .trace_memtable()
-                .query_trace_id_limited(trace_id, max_trace_spans)?,
-            None => journal.trace_memtable().snapshot_limited(max_trace_spans)?,
+                .query_trace_id_limited(&tenant, trace_id, max_trace_spans)?,
+            None => journal
+                .trace_memtable()
+                .snapshot_limited(&tenant, max_trace_spans)?,
         };
         let remaining = max_trace_spans.saturating_sub(spans.len());
         let part_spans = match trace_id.as_deref() {
-            Some(trace_id) => {
-                trace_parts.query_trace_id(trace_id, Some(remaining), Some(&task_cancellation))?
-            }
-            None => trace_parts.query_all(Some(remaining), Some(&task_cancellation))?,
+            Some(trace_id) => trace_parts.query_trace_id(
+                &tenant,
+                trace_id,
+                Some(remaining),
+                Some(&task_cancellation),
+            )?,
+            None => trace_parts.query_all(&tenant, Some(remaining), Some(&task_cancellation))?,
         };
         spans.extend(part_spans);
         Ok::<_, String>(spans)
@@ -64,13 +71,15 @@ fn trace_scan_error(error: String) -> (StatusCode, String) {
 
 async fn query_trace(
     state: &AppState,
+    tenant: &TenantId,
     trace_id: &str,
 ) -> Result<Vec<TraceSpan>, (StatusCode, String)> {
-    let guard = pin_trace_parts(state, trace_id).await?;
+    let guard = pin_trace_parts(state, tenant, trace_id).await?;
     let mut spans = scan_trace_spans(
         guard,
         state.journal.clone(),
         state.trace_parts.clone(),
+        tenant.clone(),
         Some(trace_id.to_string()),
         state.config.clone(),
         state.trace_scan_semaphore.clone(),
@@ -95,12 +104,13 @@ async fn query_trace(
 
 async fn pin_trace_parts(
     state: &AppState,
+    tenant: &TenantId,
     trace_id: &str,
 ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, (StatusCode, String)> {
     crate::remote_lifecycle::pin_remote_parts(
         state.parts.operation_lock(),
         state.remote_cache.clone(),
-        || state.trace_parts.candidate_part_ids(trace_id),
+        || state.trace_parts.candidate_part_ids(tenant, trace_id),
         |required| state.trace_parts.missing_data_ids(required),
         crate::remote_lifecycle::RemoteDomain::Traces,
         state.config.max_trace_restore_runtime,
@@ -113,11 +123,12 @@ async fn pin_trace_parts(
 
 async fn pin_all_trace_parts(
     state: &AppState,
+    tenant: &TenantId,
 ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, (StatusCode, String)> {
     crate::remote_lifecycle::pin_remote_parts(
         state.parts.operation_lock(),
         state.remote_cache.clone(),
-        || state.trace_parts.part_ids(),
+        || state.trace_parts.tenant_part_ids(tenant),
         |required| state.trace_parts.missing_data_ids(required),
         crate::remote_lifecycle::RemoteDomain::Traces,
         state.config.max_trace_restore_runtime,

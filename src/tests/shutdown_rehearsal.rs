@@ -160,10 +160,10 @@ async fn ingest_trace(journal: &Journal, marker: u8) -> String {
             schema_url: String::new(),
         }],
     };
-    let spans = crate::trace::normalize_request(request.clone()).unwrap();
+    let spans = crate::trace::normalize_request(&test_tenant(), request.clone()).unwrap();
     let mut encoded = Vec::new();
     request.encode(&mut encoded).unwrap();
-    journal.append_trace(encoded, spans).await.unwrap();
+    journal.append_trace(test_tenant(), encoded, spans).await.unwrap();
     (0..16).map(|_| format!("{marker:02x}")).collect()
 }
 
@@ -291,7 +291,7 @@ async fn m6_machine_replacement_force_flush_is_lossless() {
     storage_b.restore_parts(&parts_root_b, &log_ids).await.unwrap();
     let registry_b = PartRegistry::load_from_manifest(&parts_root_b, &log_manifest).unwrap();
     let results = registry_b
-        .query(&[], &[], i64::MIN, i64::MAX, 100, true)
+        .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
         .unwrap();
     let total: usize = results.iter().map(|stream| stream.entries.len()).sum();
     assert_eq!(
@@ -318,7 +318,7 @@ async fn m6_machine_replacement_force_flush_is_lossless() {
         registry_b.operation_lock(),
     )
     .unwrap();
-    let spans = trace_registry_b.query_trace_id(&trace_id, None, None).unwrap();
+    let spans = trace_registry_b.query_trace_id(&test_tenant(), &trace_id, None, None).unwrap();
     assert_eq!(
         spans.len(),
         1,

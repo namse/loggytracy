@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::bloom::BloomFilter;
 use crate::logql::{LabelMatcher, LineFilter, MatcherOp};
-use crate::memtable::{Labels, LogEntry, QueryResult, StreamResult};
+use crate::memtable::{Labels, LogEntry, MemTableSnapshot, QueryResult, StreamResult};
+use crate::tenant::TenantId;
 
 pub const DATA_FILE: &str = "data.parquet";
 pub const BLOOM_FILE: &str = "bloom.tri";
@@ -35,6 +36,10 @@ const STREAM_MAGIC: &[u8; 4] = b"SIX1";
 
 const EXACT_FIELD_TOKEN_MAGIC: &[u8; 4] = b"FEQ1";
 const EXACT_FIELD_SCALAR_SCOPE: u8 = 0;
+
+/// Parquet column holding the row's tenant. It is the leading sort key, so it
+/// is also the leading column.
+pub const TENANT_COLUMN: &str = "_tenant";
 
 pub type StreamMap = BTreeMap<String, BTreeMap<String, RoaringBitmap>>;
 
@@ -117,6 +122,24 @@ impl<'a> ExactFieldPruning<'a> {
     }
 }
 
+/// One tenant's contiguous slice of a shared part.
+///
+/// Rows are sorted by `(tenant, timestamp_ns)` and row groups never straddle
+/// a tenant boundary, so a tenant occupies a whole run of row groups. A query
+/// is confined to its own run, which is what makes a shared object as
+/// fail-closed as a per-tenant file: rows outside the run are not addressable.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TenantSegment {
+    pub tenant: TenantId,
+    /// Inclusive first row group.
+    pub row_group_start: u32,
+    /// Exclusive last row group.
+    pub row_group_end: u32,
+    pub row_count: u64,
+    pub min_ts_ns: i64,
+    pub max_ts_ns: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct PartMeta {
     pub id: String,
@@ -127,9 +150,20 @@ pub struct PartMeta {
     pub row_group_count: u32,
     pub row_group_min_ts: Vec<i64>,
     pub row_group_max_ts: Vec<i64>,
+    /// Sorted by tenant, non-overlapping, and covering every row group.
+    pub tenants: Vec<TenantSegment>,
     pub stream_labels: Vec<String>,
     pub streams: Vec<Labels>,
     integrity: PartIntegrity,
+}
+
+impl PartMeta {
+    pub fn tenant_segment(&self, tenant: &TenantId) -> Option<&TenantSegment> {
+        self.tenants
+            .binary_search_by(|segment| segment.tenant.cmp(tenant))
+            .ok()
+            .map(|index| &self.tenants[index])
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +189,7 @@ impl Part {
 
 #[derive(Clone, Debug)]
 pub struct Row {
+    pub tenant: TenantId,
     pub timestamp_ns: i64,
     pub labels: Labels,
     pub line: String,
@@ -162,13 +197,20 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn from_entry(labels: &Labels, e: &LogEntry) -> Self {
+    pub fn from_entry(tenant: &TenantId, labels: &Labels, e: &LogEntry) -> Self {
         Self {
+            tenant: tenant.clone(),
             timestamp_ns: e.timestamp_ns,
             labels: labels.clone(),
             line: e.line.clone(),
             structured_metadata: e.structured_metadata.clone(),
         }
+    }
+
+    /// The part sort key. Timestamp order is preserved *within* a tenant, so
+    /// the reader's early termination and row-group time pruning keep working.
+    fn sort_key(&self) -> (&str, i64) {
+        (self.tenant.as_str(), self.timestamp_ns)
     }
 }
 

@@ -10,15 +10,21 @@ fn gen_part_id(min_ts_ns: i64) -> String {
     format!("{}-{}", dt.format("%Y%m%dT%H%M%S"), uuid::Uuid::new_v4())
 }
 
-pub fn rows_from_snapshot(snapshot: &HashMap<Labels, Vec<LogEntry>>) -> Vec<Row> {
+pub fn rows_from_snapshot(snapshot: &MemTableSnapshot) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
-    for (labels, entries) in snapshot {
-        for e in entries {
-            rows.push(Row::from_entry(labels, e));
+    for (tenant, streams) in snapshot {
+        for (labels, entries) in streams {
+            for e in entries {
+                rows.push(Row::from_entry(tenant, labels, e));
+            }
         }
     }
-    rows.sort_by_key(|r| r.timestamp_ns);
+    sort_rows(&mut rows);
     rows
+}
+
+fn sort_rows(rows: &mut [Row]) {
+    rows.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
 }
 
 pub fn flush_rows(
@@ -65,8 +71,14 @@ fn flush_rows_internal(
     let mut parts = Vec::new();
     let mut committed_dirs: Vec<PathBuf> = Vec::new();
     for (partition, mut part_rows) in by_partition {
-        part_rows.sort_by_key(|r| r.timestamp_ns);
-        let part_id = gen_part_id(part_rows[0].timestamp_ns);
+        sort_rows(&mut part_rows);
+        let part_id = gen_part_id(
+            part_rows
+                .iter()
+                .map(|row| row.timestamp_ns)
+                .min()
+                .unwrap_or_default(),
+        );
 
         let tmp_dir = tmp_root.join(&part_id);
         if tmp_dir.exists() {
@@ -189,24 +201,34 @@ fn write_part_files(
     Ok(())
 }
 
-fn row_group_bounds(n: usize, row_group_size: usize) -> Vec<(usize, usize)> {
+/// Row-group boundaries for a `(tenant, timestamp)`-sorted row set.
+///
+/// A row group never spans two tenants. That is what keeps the stream index
+/// and the bloom sidecars — both row-group granular — able to prune: with
+/// timestamp-only ordering every active tenant appears in every row group and
+/// the posting lists degenerate to all-ones.
+fn row_group_bounds(rows: &[Row], row_group_size: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    let mut start = 0;
-    while start < n {
-        let end = (start + row_group_size).min(n);
-        out.push((start, end));
-        start = end;
+    let mut segment_start = 0usize;
+    while segment_start < rows.len() {
+        let mut segment_end = segment_start;
+        while segment_end < rows.len() && rows[segment_end].tenant == rows[segment_start].tenant {
+            segment_end += 1;
+        }
+        let mut start = segment_start;
+        while start < segment_end {
+            let end = (start + row_group_size).min(segment_end);
+            out.push((start, end));
+            start = end;
+        }
+        segment_start = segment_end;
     }
     out
 }
 
-fn write_parquet(
-    path: &Path,
-    rows: &[Row],
-    stream_labels: &[String],
-    row_group_size: usize,
-) -> io::Result<()> {
+fn part_schema(stream_labels: &[String]) -> Arc<Schema> {
     let mut fields = vec![
+        Field::new(TENANT_COLUMN, DataType::Utf8, false),
         Field::new("timestamp_ns", DataType::Int64, false),
         Field::new("_msg", DataType::Utf8, false),
     ];
@@ -214,8 +236,15 @@ fn write_parquet(
         fields.push(Field::new(label, DataType::Utf8, true));
     }
     fields.push(Field::new("structured_metadata", DataType::Utf8, true));
-    let schema = Arc::new(Schema::new(fields));
+    Arc::new(Schema::new(fields))
+}
 
+fn row_group_batch(
+    schema: &Arc<Schema>,
+    rows: &[Row],
+    stream_labels: &[String],
+) -> io::Result<RecordBatch> {
+    let tenants: Vec<&str> = rows.iter().map(|r| r.tenant.as_str()).collect();
     let ts: Vec<i64> = rows.iter().map(|r| r.timestamp_ns).collect();
     let msg: Vec<&str> = rows.iter().map(|r| r.line.as_str()).collect();
     let sm: Vec<Option<String>> = rows
@@ -230,6 +259,7 @@ fn write_parquet(
         .collect();
 
     let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(tenants)),
         Arc::new(Int64Array::from(ts)),
         Arc::new(StringArray::from(msg)),
     ];
@@ -242,22 +272,40 @@ fn write_parquet(
     }
     columns.push(Arc::new(StringArray::from(sm)));
 
-    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(io::Error::other)?;
+    RecordBatch::try_new(schema.clone(), columns).map_err(io::Error::other)
+}
+
+fn write_parquet(
+    path: &Path,
+    rows: &[Row],
+    stream_labels: &[String],
+    row_group_size: usize,
+) -> io::Result<()> {
+    let schema = part_schema(stream_labels);
+    let bounds = row_group_bounds(rows, row_group_size);
 
     let file = fs::File::create(path)?;
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(row_group_size))
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).map_err(io::Error::other)?;
-    writer.write(&batch).map_err(io::Error::other)?;
+    let mut writer =
+        ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(io::Error::other)?;
+    // The sidecars address row groups by ordinal, so the Parquet row groups
+    // must be exactly `bounds`. Flushing after each batch pins the boundary
+    // instead of letting the writer choose one that straddles a tenant.
+    for (start, end) in &bounds {
+        let batch = row_group_batch(&schema, &rows[*start..*end], stream_labels)?;
+        writer.write(&batch).map_err(io::Error::other)?;
+        writer.flush().map_err(io::Error::other)?;
+    }
     writer.close().map_err(io::Error::other)?;
     sync_file(path)?;
     Ok(())
 }
 
 fn write_bloom(path: &Path, rows: &[Row], row_group_size: usize) -> io::Result<()> {
-    let bounds = row_group_bounds(rows.len(), row_group_size);
+    let bounds = row_group_bounds(rows, row_group_size);
     let mut buf = Vec::new();
     buf.extend_from_slice(BLOOM_MAGIC_V3);
     buf.extend_from_slice(&(bounds.len() as u32).to_le_bytes());

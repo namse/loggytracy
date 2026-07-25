@@ -116,6 +116,11 @@ async fn push_inner(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // Resolve the tenant before anything else touches the body: every input
+    // limit, and the journal append itself, is attributed to it.
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -222,7 +227,7 @@ async fn push_inner(
 
     state
         .journal
-        .append(decompressed, parsed)
+        .append(tenant, decompressed, parsed)
         .await
         .map_err(|e| {
             (
@@ -242,6 +247,7 @@ mod tests {
     use crate::memtable::MemTable;
     use crate::part_registry::PartRegistry;
     use crate::proto::{EntryAdapter, StreamAdapter};
+    use crate::tenant::test_tenant;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -309,7 +315,7 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         let body = build_snappy_push("ack-test", "atomic insert check", now);
-        let mut headers = HeaderMap::new();
+        let mut headers = crate::tenant::test_tenant_headers();
         headers.insert("content-type", "application/x-protobuf".parse().unwrap());
 
         let status = push(State(state.clone()), headers, Bytes::from(body))
@@ -318,7 +324,7 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         // push가 204를 반환한 시점에 writer가 이미 insert했는지 확인 (#2 원자성)
-        let results = memtable.query(&[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = memtable.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
     }
@@ -341,7 +347,7 @@ mod tests {
             None,
         );
         let body = build_snappy_push("bad-time", "must be rejected", 9_223_372_037);
-        let mut headers = HeaderMap::new();
+        let mut headers = crate::tenant::test_tenant_headers();
         headers.insert("content-type", "application/x-protobuf".parse().unwrap());
 
         let error = push(State(state), headers, Bytes::from(body))
@@ -353,7 +359,7 @@ mod tests {
     }
 
     fn protobuf_headers() -> HeaderMap {
-        let mut headers = HeaderMap::new();
+        let mut headers = crate::tenant::test_tenant_headers();
         headers.insert("content-type", "application/x-protobuf".parse().unwrap());
         headers
     }
@@ -588,7 +594,7 @@ mod tests {
             .as_secs() as i64;
         for i in 0..3u64 {
             let body = build_snappy_push("pipeline-app", &format!("line-{}", i), now + i as i64);
-            let mut headers = HeaderMap::new();
+            let mut headers = crate::tenant::test_tenant_headers();
             headers.insert("content-type", "application/x-protobuf".parse().unwrap());
             let status = push(State(state.clone()), headers, Bytes::from(body))
                 .await
@@ -607,6 +613,7 @@ mod tests {
         for _ in 0..300 {
             let r = parts
                 .query(
+                    &test_tenant(),
                     std::slice::from_ref(&matcher),
                     &[],
                     i64::MIN,
@@ -644,7 +651,7 @@ mod tests {
         let memtable2 = MemTable::new();
         let wal = dir.join("journal.wal");
         let ckpt = dir.join("journal.ckpt");
-        let (cs, re) = journal::replay(&wal, &ckpt, &memtable2).expect("replay");
+        let (cs, re) = journal::replay(&wal, &ckpt, &memtable2, &test_tenant()).expect("replay");
         assert!(
             memtable2.is_empty(),
             "after full flush, replay should yield no in-flight data"
@@ -655,7 +662,15 @@ mod tests {
         assert!(registry.part_count() >= 1);
 
         let r = registry
-            .query(&[matcher], &[], i64::MIN, i64::MAX, 100, true)
+            .query(
+                &test_tenant(),
+                &[matcher],
+                &[],
+                i64::MIN,
+                i64::MAX,
+                100,
+                true,
+            )
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 3, "data must persist across restart");

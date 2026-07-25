@@ -7,9 +7,11 @@ fn write_meta(
     stream_labels: &[String],
 ) -> io::Result<()> {
     let n = rows.len();
-    let bounds = row_group_bounds(n, row_group_size);
-    let min_ts = rows[0].timestamp_ns;
-    let max_ts = rows[n - 1].timestamp_ns;
+    let bounds = row_group_bounds(rows, row_group_size);
+    // Rows are ordered by `(tenant, timestamp)`, so the part-wide extremes are
+    // no longer the first and last row.
+    let min_ts = rows.iter().map(|r| r.timestamp_ns).min().unwrap_or_default();
+    let max_ts = rows.iter().map(|r| r.timestamp_ns).max().unwrap_or_default();
     let row_group_min_ts: Vec<i64> = bounds
         .iter()
         .map(|(start, _)| rows[*start].timestamp_ns)
@@ -18,6 +20,7 @@ fn write_meta(
         .iter()
         .map(|(_, end)| rows[*end - 1].timestamp_ns)
         .collect();
+    let tenants = tenant_segments(rows, &bounds);
 
     let mut stream_set: BTreeSet<Labels> = BTreeSet::new();
     for r in rows {
@@ -46,6 +49,7 @@ fn write_meta(
         row_group_count: bounds.len() as u32,
         row_group_min_ts,
         row_group_max_ts,
+        tenants,
         stream_labels: stream_labels.to_vec(),
         streams,
         integrity,
@@ -55,6 +59,35 @@ fn write_meta(
     fs::write(path, s)?;
     sync_file(path)?;
     Ok(())
+}
+
+/// Build the per-tenant index from `(tenant, timestamp)`-sorted rows whose
+/// row-group boundaries already respect tenant boundaries.
+fn tenant_segments(rows: &[Row], bounds: &[(usize, usize)]) -> Vec<TenantSegment> {
+    let mut segments: Vec<TenantSegment> = Vec::new();
+    for (row_group, (start, end)) in bounds.iter().enumerate() {
+        let group = &rows[*start..*end];
+        let tenant = &group[0].tenant;
+        let min_ts_ns = group.iter().map(|r| r.timestamp_ns).min().unwrap_or_default();
+        let max_ts_ns = group.iter().map(|r| r.timestamp_ns).max().unwrap_or_default();
+        match segments.last_mut() {
+            Some(segment) if segment.tenant == *tenant => {
+                segment.row_group_end = row_group as u32 + 1;
+                segment.row_count += group.len() as u64;
+                segment.min_ts_ns = segment.min_ts_ns.min(min_ts_ns);
+                segment.max_ts_ns = segment.max_ts_ns.max(max_ts_ns);
+            }
+            _ => segments.push(TenantSegment {
+                tenant: tenant.clone(),
+                row_group_start: row_group as u32,
+                row_group_end: row_group as u32 + 1,
+                row_count: group.len() as u64,
+                min_ts_ns,
+                max_ts_ns,
+            }),
+        }
+    }
+    segments
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +108,7 @@ struct MetaFile {
     row_group_count: u32,
     row_group_min_ts: Vec<i64>,
     row_group_max_ts: Vec<i64>,
+    tenants: Vec<TenantSegment>,
     stream_labels: Vec<String>,
     streams: Vec<Vec<(String, String)>>,
     integrity: PartIntegrity,
@@ -131,6 +165,7 @@ pub fn load_part(dir: &Path) -> Result<Part, String> {
         row_group_count: meta_file.row_group_count,
         row_group_min_ts: meta_file.row_group_min_ts,
         row_group_max_ts: meta_file.row_group_max_ts,
+        tenants: meta_file.tenants,
         stream_labels: meta_file.stream_labels,
         streams,
         integrity: meta_file.integrity,
@@ -175,18 +210,17 @@ fn validate_meta_file(dir: &Path, meta: &MetaFile) -> Result<(), String> {
     let row_group_count = meta.row_group_count as usize;
     if meta.row_group_min_ts.len() != row_group_count
         || meta.row_group_max_ts.len() != row_group_count
-        || meta.row_group_min_ts.first() != Some(&meta.min_ts_ns)
-        || meta.row_group_max_ts.last() != Some(&meta.max_ts_ns)
+        || meta.row_group_min_ts.iter().min() != Some(&meta.min_ts_ns)
+        || meta.row_group_max_ts.iter().max() != Some(&meta.max_ts_ns)
     {
         return Err("part metadata has inconsistent row-group bounds".to_string());
     }
     for index in 0..row_group_count {
-        if meta.row_group_min_ts[index] > meta.row_group_max_ts[index]
-            || (index > 0 && meta.row_group_min_ts[index] < meta.row_group_max_ts[index - 1])
-        {
+        if meta.row_group_min_ts[index] > meta.row_group_max_ts[index] {
             return Err("part metadata row-group bounds are not sorted".to_string());
         }
     }
+    validate_tenant_segments(meta)?;
 
     let mut expected_labels = BTreeSet::new();
     for stream in &meta.streams {
@@ -202,6 +236,63 @@ fn validate_meta_file(dir: &Path, meta: &MetaFile) -> Result<(), String> {
     let actual_labels: BTreeSet<_> = meta.stream_labels.iter().cloned().collect();
     if actual_labels.len() != meta.stream_labels.len() || actual_labels != expected_labels {
         return Err("part stream label metadata is inconsistent".to_string());
+    }
+    Ok(())
+}
+
+/// The tenant index is the isolation boundary for a shared part, so it is
+/// validated as strictly as the rest of the metadata: it must be sorted,
+/// gap-free, and cover exactly the part's row groups and rows. Anything less
+/// would let a malformed part expose one tenant's row groups to another.
+fn validate_tenant_segments(meta: &MetaFile) -> Result<(), String> {
+    if meta.tenants.is_empty() {
+        return Err("part metadata has no tenant segments".to_string());
+    }
+    let mut expected_start = 0u32;
+    let mut total_rows = 0u64;
+    for (index, segment) in meta.tenants.iter().enumerate() {
+        if index > 0 && meta.tenants[index - 1].tenant >= segment.tenant {
+            return Err("part tenant segments are not sorted by tenant".to_string());
+        }
+        if segment.row_group_start != expected_start || segment.row_group_end <= segment.row_group_start
+        {
+            return Err("part tenant segments do not tile the row groups".to_string());
+        }
+        if segment.row_group_end > meta.row_group_count {
+            return Err("part tenant segment exceeds the row-group count".to_string());
+        }
+        let groups = segment.row_group_start as usize..segment.row_group_end as usize;
+        let segment_min = meta.row_group_min_ts[groups.clone()]
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or_default();
+        let segment_max = meta.row_group_max_ts[groups.clone()]
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or_default();
+        if segment.min_ts_ns != segment_min || segment.max_ts_ns != segment_max {
+            return Err("part tenant segment timestamps do not match its row groups".to_string());
+        }
+        // Timestamp order is preserved inside a tenant. The reader relies on
+        // this for row-group time pruning and backward early termination.
+        for row_group in groups.start + 1..groups.end {
+            if meta.row_group_min_ts[row_group] < meta.row_group_max_ts[row_group - 1] {
+                return Err("part tenant segment row groups are not time-ordered".to_string());
+            }
+        }
+        if segment.row_count == 0 {
+            return Err("part tenant segment is empty".to_string());
+        }
+        total_rows = total_rows.saturating_add(segment.row_count);
+        expected_start = segment.row_group_end;
+    }
+    if expected_start != meta.row_group_count {
+        return Err("part tenant segments do not cover every row group".to_string());
+    }
+    if total_rows != meta.row_count {
+        return Err("part tenant segment row counts do not sum to the part row count".to_string());
     }
     Ok(())
 }

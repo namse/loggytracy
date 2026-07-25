@@ -4,13 +4,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use serde::Serialize;
 
 use crate::AppState;
 use crate::logql::{self};
 use crate::memtable::{Labels, LogEntry, StreamResult};
 use crate::part;
+use crate::tenant::TenantId;
 
 const MAX_METRIC_EVALUATION_POINTS: usize = 10_000;
 const MAX_METRIC_ROWS: usize = 1_000_000;
@@ -239,10 +240,10 @@ fn parse_limit(limit: Option<usize>, max_limit: usize) -> Result<usize, String> 
     Ok(limit)
 }
 
-fn distinct_stream_count(state: &AppState) -> usize {
+fn distinct_stream_count(state: &AppState, tenant: &TenantId) -> usize {
     let mut streams = std::collections::BTreeSet::new();
-    streams.extend(state.memtable.series(&[]));
-    streams.extend(state.parts.series(&[]));
+    streams.extend(state.memtable.series(tenant, &[]));
+    streams.extend(state.parts.series(tenant, &[]));
     streams.len()
 }
 

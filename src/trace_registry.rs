@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::object_storage::TraceManifest;
+use crate::tenant::TenantId;
 use crate::trace::TraceSpan;
 use crate::trace_part::{TracePart, TracePartReader, discover_trace_parts};
 
@@ -107,12 +108,29 @@ impl TraceRegistry {
         self.inner.read().unwrap().values().cloned().collect()
     }
 
-    pub fn candidate_part_ids(&self, trace_id: &str) -> std::collections::HashSet<String> {
+    pub fn candidate_part_ids(
+        &self,
+        tenant: &TenantId,
+        trace_id: &str,
+    ) -> std::collections::HashSet<String> {
         self.inner
             .read()
             .unwrap()
             .iter()
-            .filter(|(_, reader)| reader.may_match_trace_id(trace_id))
+            .filter(|(_, reader)| reader.may_match_trace_id(tenant, trace_id))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Parts that hold any row for `tenant`. Used to pin the restore set for
+    /// an unfiltered search, which would otherwise restore every tenant's
+    /// object bodies.
+    pub fn tenant_part_ids(&self, tenant: &TenantId) -> std::collections::HashSet<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, reader)| reader.part().meta.tenant_row_groups(tenant).is_some())
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -136,6 +154,7 @@ impl TraceRegistry {
 
     pub fn query_trace_id(
         &self,
+        tenant: &TenantId,
         trace_id: &str,
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
@@ -147,13 +166,18 @@ impl TraceRegistry {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Err("trace query timed out".to_string());
             }
-            if !reader.may_match_trace_id(trace_id) {
+            if !reader.may_match_trace_id(tenant, trace_id) {
                 continue;
             }
             let remaining = scan_limit
                 .map(|limit| limit.saturating_sub(spans.len()))
                 .unwrap_or(usize::MAX);
-            spans.extend(reader.query_trace_id_limited(trace_id, remaining, cancellation)?);
+            spans.extend(reader.query_trace_id_limited(
+                tenant,
+                trace_id,
+                remaining,
+                cancellation,
+            )?);
         }
         spans.sort_by(|left, right| {
             left.start_time_ns
@@ -165,6 +189,7 @@ impl TraceRegistry {
 
     pub fn query_all(
         &self,
+        tenant: &TenantId,
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
     ) -> Result<Vec<TraceSpan>, String> {
@@ -176,7 +201,7 @@ impl TraceRegistry {
             let remaining = scan_limit
                 .map(|limit| limit.saturating_sub(spans.len()))
                 .unwrap_or(usize::MAX);
-            spans.extend(reader.query_all_limited(remaining, cancellation)?);
+            spans.extend(reader.query_all_limited(tenant, remaining, cancellation)?);
         }
         spans.sort_by(|left, right| {
             left.start_time_ns

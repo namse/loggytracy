@@ -11,8 +11,20 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
 - [ ] **ingest backpressure**: memtable/WAL backlog 상한 초과 시 journal append 이전에 `429`.
       선행 작업으로 memtable 크기 O(1) 추적이 필요하다 (현재 `approximate_size`가 O(rows)이고
       500ms마다 ingest와 같은 락을 잡는다).
-- [ ] **테넌시**: `X-Scope-OrgID` 추출 → 저장 경로 분할 축 → 테넌트별 스로틀·quota →
-      테넌트 라벨 metrics. 설계는 `docs/ARCHITECTURE.md`의 "테넌시" 절.
+- [ ] **테넌시** (진행 중). 설계·비용 모델·구현 체크리스트는
+      [`docs/MULTI_TENANCY_DESIGN.md`](docs/MULTI_TENANCY_DESIGN.md).
+      **테넌트를 저장 경로 분할 축으로 두는 기존 설계(`docs/ARCHITECTURE.md`의 "테넌시" 절)는
+      R2 Class A 비용 때문에 폐기됐다** — 테넌트마다 객체를 쓰면 어떤 RPO에서도 $1 플랜 예산에
+      맞지 않는다.
+  - [x] `X-Scope-OrgID` 추출·허용 목록 검증 (Loki push + OTLP gRPC), 헤더 없는 요청 정책 설정
+  - [x] WAL 레코드에 테넌트 기록 (재시작 후에도 소유자 유지, 기존 WAL은 기본 테넌트로 복구)
+  - [x] 테넌트 공유 part: `(tenant, ts)` 정렬 + 테넌트 경계에 정렬된 row group + `meta.json`
+        테넌트 인덱스 (로그·트레이스 양쪽)
+  - [x] 격리 표면: MemTable·PartRegistry·TraceRegistry·쿼리·카탈로그 조회에 테넌트 필수 인자화
+  - [ ] `(tier, day)` 파티셔닝 — 테넌트→tier 매핑 출처가 미정이라 보류 (설계 문서 Open questions)
+  - [ ] part 사이드카 4개→1개 통합, Parquet range read(P2), `(part, tenant)` 로컬 캐시 키
+  - [ ] 테넌트별 스로틀·quota·세마포어, 테넌트 라벨 metrics
+  - [ ] 월간 사용량 durable 회계 (`FlushTransaction`에 연동)
 - [x] TLS 미지원을 아키텍처 결정으로 명문화
 - [x] ingest 입력 제한 (body/압축 해제 길이/라인/라벨 개수·길이/타임스탬프 수용 윈도우)
 
@@ -28,7 +40,8 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
 ## P2 — 정확성·스토리지 성능
 
 - [ ] crash replay로 발생할 수 있는 중복 로그 deduplication
-- [ ] Parquet range read 도입
+- [ ] Parquet range read 도입 (**테넌시 선행 작업** — 공유 part에서 테넌트 byte range만 읽어야 하므로
+      더 이상 선택적 최적화가 아니다)
 - [ ] 메트릭 평가를 bounded in-memory 계산에서 streaming/pre-aggregation 방식으로 개선
 - [ ] 실제 S3 또는 S3-compatible endpoint를 이용한 배포 환경 검증
 

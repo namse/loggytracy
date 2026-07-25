@@ -143,15 +143,7 @@ fn open_part_data(
             part.meta.id, parquet_row_count, part.meta.row_count
         ));
     }
-    let mut expected_fields = vec![
-        Field::new("timestamp_ns", DataType::Int64, false),
-        Field::new("_msg", DataType::Utf8, false),
-    ];
-    for label in &part.meta.stream_labels {
-        expected_fields.push(Field::new(label, DataType::Utf8, true));
-    }
-    expected_fields.push(Field::new("structured_metadata", DataType::Utf8, true));
-    let expected_schema = Schema::new(expected_fields);
+    let expected_schema = part_schema(&part.meta.stream_labels);
     if arrow_reader_metadata.schema().fields() != expected_schema.fields() {
         return Err(format!(
             "parquet schema does not match metadata for part {}: expected {:?}, got {:?}",
@@ -245,29 +237,89 @@ impl PartReader {
         &self.part.meta
     }
 
-    pub fn label_names(&self) -> &[String] {
+    /// The row groups a tenant may address, or `None` when the part holds no
+    /// rows for it. Every read path funnels through this, so a tenant cannot
+    /// reach another tenant's rows even if a matcher or filter would select
+    /// them.
+    fn tenant_row_groups(&self, tenant: &TenantId) -> Option<std::ops::Range<u32>> {
+        self.part
+            .meta
+            .tenant_segment(tenant)
+            .map(|segment| segment.row_group_start..segment.row_group_end)
+    }
+
+    /// Label names a tenant can see. Derived from the stream index restricted
+    /// to the tenant's row groups rather than the part-wide label list.
+    pub fn label_names(&self, tenant: &TenantId) -> Vec<String> {
+        let Some(groups) = self.tenant_row_groups(tenant) else {
+            return Vec::new();
+        };
+        self.stream_index
+            .iter()
+            .filter(|(_, values)| {
+                values
+                    .values()
+                    .any(|bitmap| bitmap.iter().any(|rg| groups.contains(&rg)))
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Label names present anywhere in the part, for internal use by callers
+    /// that already know they are not serving a tenant query (schema checks).
+    pub fn all_label_names(&self) -> &[String] {
         &self.stream_labels
     }
 
-    pub fn label_values(&self, name: &str) -> Vec<String> {
+    pub fn label_values(&self, tenant: &TenantId, name: &str) -> Vec<String> {
+        let Some(groups) = self.tenant_row_groups(tenant) else {
+            return Vec::new();
+        };
         self.stream_index
             .get(name)
-            .map(|m| m.keys().cloned().collect())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter(|(_, bitmap)| bitmap.iter().any(|rg| groups.contains(&rg)))
+                    .map(|(value, _)| value.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    pub fn series(&self, matchers: &[LabelMatcher]) -> Vec<Labels> {
+    pub fn series(&self, tenant: &TenantId, matchers: &[LabelMatcher]) -> Vec<Labels> {
+        let Some(groups) = self.tenant_row_groups(tenant) else {
+            return Vec::new();
+        };
         self.part
             .meta
             .streams
             .iter()
             .filter(|labels| matchers.iter().all(|m| m.matches(labels)))
+            .filter(|labels| self.stream_occurs_in(labels, &groups))
             .cloned()
             .collect()
     }
 
+    /// Whether a stream's labels are indexed in any of `groups`. The part-wide
+    /// stream list is shared by all tenants, so it has to be filtered through
+    /// the row-group posting lists before it can be returned.
+    fn stream_occurs_in(&self, labels: &Labels, groups: &std::ops::Range<u32>) -> bool {
+        if labels.is_empty() {
+            return true;
+        }
+        labels.iter().all(|(name, value)| {
+            self.stream_index
+                .get(name)
+                .and_then(|values| values.get(value))
+                .is_some_and(|bitmap| bitmap.iter().any(|rg| groups.contains(&rg)))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn query(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         start_ns: i64,
@@ -277,6 +329,7 @@ impl PartReader {
     ) -> Result<Vec<StreamResult>, String> {
         Ok(self
             .query_with_exact_field_pruning_and_scan_limit(
+                tenant,
                 matchers,
                 ExactFieldPruning::new(line_filters, &[]),
                 start_ns,
@@ -292,8 +345,10 @@ impl PartReader {
     /// Uses exact-field predicates only for row-group pruning. Bloom filters
     /// can return false positives, so the caller remains responsible for
     /// evaluating the predicates against each returned entry.
+    #[allow(clippy::too_many_arguments)]
     pub fn query_with_exact_field_pruning(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         start_ns: i64,
@@ -303,7 +358,7 @@ impl PartReader {
     ) -> Result<Vec<StreamResult>, String> {
         Ok(self
             .query_with_exact_field_pruning_and_scan_limit(
-                matchers, pruning, start_ns, end_ns, limit, forward, None, None,
+                tenant, matchers, pruning, start_ns, end_ns, limit, forward, None, None,
             )?
             .results)
     }
@@ -311,6 +366,7 @@ impl PartReader {
     #[allow(clippy::too_many_arguments)]
     pub fn query_with_exact_field_pruning_and_scan_limit(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         start_ns: i64,
@@ -321,6 +377,7 @@ impl PartReader {
         cancellation: Option<&AtomicBool>,
     ) -> Result<QueryResult, String> {
         self.query_with_exact_field_pruning_and_scan_limits(
+            tenant,
             matchers,
             pruning,
             start_ns,
@@ -336,6 +393,7 @@ impl PartReader {
     #[allow(clippy::too_many_arguments)]
     pub fn query_with_exact_field_pruning_and_scan_limits(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         start_ns: i64,
@@ -347,6 +405,7 @@ impl PartReader {
         cancellation: Option<&AtomicBool>,
     ) -> Result<QueryResult, String> {
         self.query_internal(
+            tenant,
             matchers,
             pruning.line_filters,
             pruning.exact_fields,
@@ -363,16 +422,15 @@ impl PartReader {
         )
     }
 
-    pub fn query_all(&self) -> Result<Vec<StreamResult>, String> {
-        self.query_all_with_scan_bytes(None)
-    }
-
-    pub fn query_all_with_scan_bytes(
-        &self,
-        scan_bytes_limit: Option<u64>,
-    ) -> Result<Vec<StreamResult>, String> {
-        Ok(self
-            .query_internal(
+    /// Every row in the part, tenant by tenant. Merge is the only caller: it
+    /// rewrites a part and therefore has to see all tenants, so this returns
+    /// `Row`s that carry their own tenant instead of `StreamResult`s that do
+    /// not.
+    pub fn read_all_rows(&self, scan_bytes_limit: Option<u64>) -> Result<Vec<Row>, String> {
+        let mut rows = Vec::new();
+        for segment in &self.part.meta.tenants {
+            let result = self.query_internal(
+                &segment.tenant,
                 &[],
                 &[],
                 &[],
@@ -386,28 +444,39 @@ impl PartReader {
                 None,
                 scan_bytes_limit,
                 None,
-            )?
-            .results)
+            )?;
+            for stream in result.results {
+                for entry in stream.entries {
+                    rows.push(Row::from_entry(&segment.tenant, &stream.labels, &entry));
+                }
+            }
+        }
+        Ok(rows)
     }
 
     fn select_row_groups(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         time_range: QueryTimeRange,
     ) -> Vec<u32> {
-        self.select_row_groups_with_exact_fields(matchers, line_filters, &[], time_range)
+        self.select_row_groups_with_exact_fields(tenant, matchers, line_filters, &[], time_range)
     }
 
     fn select_row_groups_with_exact_fields(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
         time_range: QueryTimeRange,
     ) -> Vec<u32> {
-        let mut selected = Vec::with_capacity(self.bloom.len());
-        for rg in 0..self.bloom.len() as u32 {
+        let Some(groups) = self.tenant_row_groups(tenant) else {
+            return Vec::new();
+        };
+        let mut selected = Vec::with_capacity(groups.len());
+        for rg in groups {
             let rgu = rg as usize;
             if !(self.part.meta.row_group_max_ts[rgu] >= time_range.start_ns
                 && (self.part.meta.row_group_min_ts[rgu] < time_range.end_ns
@@ -435,6 +504,7 @@ impl PartReader {
     /// can use it before deciding which evicted bodies to restore.
     pub fn may_match_exact_fields(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
@@ -443,6 +513,7 @@ impl PartReader {
     ) -> bool {
         !self
             .select_row_groups_with_exact_fields(
+                tenant,
                 matchers,
                 line_filters,
                 exact_fields,
@@ -458,6 +529,7 @@ impl PartReader {
     #[allow(clippy::too_many_arguments)]
     fn query_internal(
         &self,
+        tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
@@ -485,9 +557,10 @@ impl PartReader {
         }
 
         let selected = if exact_fields.is_empty() {
-            self.select_row_groups(matchers, line_filters, time_range)
+            self.select_row_groups(tenant, matchers, line_filters, time_range)
         } else {
             self.select_row_groups_with_exact_fields(
+                tenant,
                 matchers,
                 line_filters,
                 exact_fields,
@@ -561,12 +634,13 @@ impl PartReader {
                     .map(|limit| limit.saturating_sub(scanned_rows).min(batch.num_rows()))
                     .unwrap_or(batch.num_rows());
                 scanned_rows = scanned_rows.saturating_add(rows_to_scan);
-                let ts = batch.column(0).as_primitive::<Int64Type>();
-                let msg = batch.column(1).as_string::<i32>();
-                let sm_col_idx = 2 + self.stream_labels.len();
+                let row_tenant = batch.column(0).as_string::<i32>();
+                let ts = batch.column(1).as_primitive::<Int64Type>();
+                let msg = batch.column(2).as_string::<i32>();
+                let sm_col_idx = 3 + self.stream_labels.len();
                 let sm = batch.column(sm_col_idx).as_string::<i32>();
                 let label_cols: Vec<&StringArray> = (0..self.stream_labels.len())
-                    .map(|i| batch.column(2 + i).as_string::<i32>())
+                    .map(|label_index| batch.column(3 + label_index).as_string::<i32>())
                     .collect();
 
                 let row_start = if forward {
@@ -583,6 +657,16 @@ impl PartReader {
                 for i in row_indices {
                     if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                         break 'row_groups;
+                    }
+                    // Row groups are tenant-aligned, so this never rejects a
+                    // row in a well-formed part. It is kept so isolation does
+                    // not depend on `meta.json` alone: a metadata bug becomes
+                    // an empty result rather than a cross-tenant read.
+                    if row_tenant.value(i) != tenant.as_str() {
+                        return Err(format!(
+                            "part {} row group {row_group} contains rows outside tenant {tenant}",
+                            self.part.meta.id
+                        ));
                     }
                     let ts_val = ts.value(i);
                     if ts_val < time_range.start_ns

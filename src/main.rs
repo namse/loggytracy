@@ -20,6 +20,7 @@ mod runtime_error;
 mod shutdown;
 mod startup;
 mod tempo;
+mod tenant;
 #[cfg(test)]
 mod test_support;
 mod trace;

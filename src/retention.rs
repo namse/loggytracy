@@ -268,6 +268,7 @@ mod tests {
             .collect();
         let parts = part::flush_rows(
             vec![Row {
+                tenant: crate::tenant::test_tenant(),
                 timestamp_ns: 1_000,
                 labels,
                 line: "expired".to_string(),
@@ -302,6 +303,7 @@ mod tests {
             .collect();
         let parts = part::flush_rows(
             vec![Row {
+                tenant: crate::tenant::test_tenant(),
                 timestamp_ns: 1_000,
                 labels,
                 line: "expired remotely".to_string(),
@@ -341,6 +343,7 @@ mod tests {
         let parts_root = root.join("parts");
         let parts = part::flush_rows(
             vec![Row {
+                tenant: crate::tenant::test_tenant(),
                 timestamp_ns: 90,
                 labels: [("app".to_string(), "boundary".to_string())]
                     .into_iter()

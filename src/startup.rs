@@ -37,8 +37,13 @@ pub fn recover_with_traces(
 
     let wal_path = config.data_dir.join("journal.wal");
     let ckpt_path = config.data_dir.join("journal.ckpt");
-    let (ckpt_start, replay_end) =
-        journal::replay_with_traces(&wal_path, &ckpt_path, memtable, trace_memtable)?;
+    let (ckpt_start, replay_end) = journal::replay_with_traces(
+        &wal_path,
+        &ckpt_path,
+        memtable,
+        trace_memtable,
+        &config.default_tenant,
+    )?;
     tracing::info!(
         checkpoint = ckpt_start,
         replay_end,
@@ -334,7 +339,8 @@ pub async fn run(config: Arc<Config>) {
         .otlp_grpc_addr
         .parse()
         .unwrap_or_else(|error| panic!("invalid OTLP gRPC address: {error}"));
-    let otlp_service = trace_ingest::TraceIngestService::new(otlp_journal, shutdown.clone());
+    let otlp_service =
+        trace_ingest::TraceIngestService::new(otlp_journal, shutdown.clone(), config.clone());
     let otlp_task_health = otlp_healthy;
     let mut otlp_drain = shutdown.subscribe();
     let otlp_handle = tokio::spawn(async move {

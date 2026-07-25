@@ -1,7 +1,10 @@
 pub async fn query_range(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<QueryRangeParams>,
 ) -> Result<Json<LokiResponse<QueryRangeData>>, (StatusCode, String)> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let parsed = logql::parse_expr(&params.query)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
 
@@ -53,6 +56,7 @@ pub async fn query_range(
                 .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
             let execution = run_unified_query_with_stats(
                 state,
+                tenant,
                 parsed,
                 start_ns,
                 end_ns,
@@ -81,7 +85,7 @@ pub async fn query_range(
                     ),
                 ));
             }
-            let execution = run_metric_query_with_stats(state, expr, times, None)
+            let execution = run_metric_query_with_stats(state, tenant, expr, times, None)
                 .await
                 .map_err(|e| (metric_error_status(&e), e))?;
             (
@@ -108,8 +112,11 @@ pub async fn query_range(
 
 pub async fn query(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<QueryParams>,
 ) -> Result<Json<LokiResponse<QueryRangeData>>, (StatusCode, String)> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let parsed = logql::parse_expr(&params.query)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
 
@@ -149,6 +156,7 @@ pub async fn query(
                 .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
             let execution = run_unified_query_with_stats(
                 state,
+                tenant,
                 parsed,
                 query_start_ns,
                 end_ns,
@@ -165,7 +173,7 @@ pub async fn query(
             )
         }
         logql::QueryExpr::Metric(expr) => {
-            let execution = run_metric_query_with_stats(state, expr, vec![end_ns], None)
+            let execution = run_metric_query_with_stats(state, tenant, expr, vec![end_ns], None)
                 .await
                 .map_err(|e| (metric_error_status(&e), e))?;
             (
@@ -196,35 +204,43 @@ fn duration_to_i64_ns(duration: std::time::Duration) -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-pub async fn labels(State(state): State<Arc<AppState>>) -> Json<LokiResponse<Vec<String>>> {
+pub async fn labels(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<LokiResponse<Vec<String>>>, (StatusCode, String)> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let mut names = std::collections::BTreeSet::new();
-    for n in state.memtable.label_names() {
+    for n in state.memtable.label_names(&tenant) {
         names.insert(n);
     }
-    for n in state.parts.label_names() {
+    for n in state.parts.label_names(&tenant) {
         names.insert(n);
     }
-    Json(LokiResponse {
+    Ok(Json(LokiResponse {
         status: "success",
         data: names.into_iter().collect(),
-    })
+    }))
 }
 
 pub async fn label_values(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(name): Path<String>,
-) -> Json<LokiResponse<Vec<String>>> {
+) -> Result<Json<LokiResponse<Vec<String>>>, (StatusCode, String)> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let mut values = std::collections::BTreeSet::new();
-    for v in state.memtable.label_values(&name) {
+    for v in state.memtable.label_values(&tenant, &name) {
         values.insert(v);
     }
-    for v in state.parts.label_values(&name) {
+    for v in state.parts.label_values(&tenant, &name) {
         values.insert(v);
     }
-    Json(LokiResponse {
+    Ok(Json(LokiResponse {
         status: "success",
         data: values.into_iter().collect(),
-    })
+    }))
 }
 
 pub async fn ready(
@@ -287,23 +303,30 @@ pub async fn buildinfo() -> Json<serde_json::Value> {
     }))
 }
 
-pub async fn index_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let mem = state.memtable.stats();
-    let disk = state.parts.stats();
-    let stream_count = distinct_stream_count(&state);
-    Json(serde_json::json!({
+pub async fn index_stats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let mem = state.memtable.stats(&tenant);
+    let disk = state.parts.stats(&tenant);
+    let stream_count = distinct_stream_count(&state, &tenant);
+    Ok(Json(serde_json::json!({
         "status": "success",
         "data": {
             "streams": stream_count,
             "entries": mem.entries + disk.entries,
             "bytes": mem.bytes + disk.bytes
         }
-    }))
+    })))
 }
 
+/// Operator-facing Prometheus scrape. These gauges are process-wide by
+/// design, so they use the global accessors rather than a tenant scope.
 pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
-    let mem = state.memtable.stats();
-    let disk = state.parts.stats();
+    let mem = state.memtable.global_stats();
+    let disk = state.parts.global_stats();
     let remote_healthy = state
         .remote_cache
         .as_ref()
@@ -425,15 +448,18 @@ fn extract_match_params(raw: &Option<String>) -> Vec<String> {
 
 pub async fn series(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<LokiResponse<Vec<HashMap<String, String>>>>, (StatusCode, String)> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let matchers = extract_match_params(&raw);
     let mut all_series: Vec<Labels> = Vec::new();
     for matcher_str in &matchers {
         let parsed = logql::parse(matcher_str)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
-        all_series.extend(state.memtable.series(&parsed.matchers));
-        all_series.extend(state.parts.series(&parsed.matchers));
+        all_series.extend(state.memtable.series(&tenant, &parsed.matchers));
+        all_series.extend(state.parts.series(&tenant, &parsed.matchers));
     }
     all_series.sort();
     all_series.dedup();

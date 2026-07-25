@@ -23,7 +23,7 @@ fn write_stream_index(
     row_group_size: usize,
     stream_labels: &[String],
 ) -> io::Result<()> {
-    let bounds = row_group_bounds(rows.len(), row_group_size);
+    let bounds = row_group_bounds(rows, row_group_size);
     let mut index: StreamMap = BTreeMap::new();
     for (rg, (start, end)) in bounds.iter().enumerate() {
         for row in &rows[*start..*end] {

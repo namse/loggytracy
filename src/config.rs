@@ -1,11 +1,17 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::tenant::{MissingTenantPolicy, TenantId};
+
 #[derive(Clone)]
 pub struct Config {
     pub listen_addr: String,
     pub otlp_grpc_addr: String,
     pub data_dir: PathBuf,
+    /// Tenant a request is attributed to when it carries no `X-Scope-OrgID`
+    /// and `missing_tenant_policy` accepts it.
+    pub default_tenant: TenantId,
+    pub missing_tenant_policy: MissingTenantPolicy,
     pub max_batch_bytes: usize,
     pub max_batch_ms: u64,
     /// Largest accepted compressed push body. Also bounds the length a snappy
@@ -72,6 +78,9 @@ impl Default for Config {
             listen_addr: "0.0.0.0:3100".to_string(),
             otlp_grpc_addr: "0.0.0.0:4317".to_string(),
             data_dir: PathBuf::from("./data"),
+            default_tenant: TenantId::parse("default")
+                .expect("the built-in default tenant is valid"),
+            missing_tenant_policy: MissingTenantPolicy::UseDefault,
             max_batch_bytes: 1024 * 1024,
             max_batch_ms: 200,
             max_push_bytes: 16 * 1024 * 1024,
@@ -133,6 +142,17 @@ impl Config {
             data_dir: std::env::var("LOGGYTRACY_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| defaults.data_dir.clone()),
+            default_tenant: match std::env::var("LOGGYTRACY_DEFAULT_TENANT") {
+                Ok(raw) => TenantId::parse(&raw)
+                    .map_err(|error| format!("invalid LOGGYTRACY_DEFAULT_TENANT: {error}"))?,
+                Err(_) => defaults.default_tenant.clone(),
+            },
+            missing_tenant_policy: match std::env::var("LOGGYTRACY_MISSING_TENANT_POLICY") {
+                Ok(raw) => raw.parse().map_err(|error| {
+                    format!("invalid LOGGYTRACY_MISSING_TENANT_POLICY: {error}")
+                })?,
+                Err(_) => defaults.missing_tenant_policy,
+            },
             max_batch_bytes: env_positive_usize(
                 "LOGGYTRACY_MAX_BATCH_BYTES",
                 defaults.max_batch_bytes,

@@ -94,40 +94,33 @@ fn read_all_rows_with_limit(
     let mut estimated_memory = 0u64;
     for reader in readers {
         let remaining_memory = max_memory_bytes.saturating_sub(estimated_memory);
-        let results = reader.query_all_with_scan_bytes(Some(remaining_memory))?;
-        for sr in results {
-            let labels: Labels = sr.labels;
-            for entry in sr.entries {
-                let row_memory = labels
-                    .iter()
-                    .map(|(name, value)| name.len().saturating_add(value.len()))
-                    .sum::<usize>()
-                    .saturating_add(entry.line.len())
-                    .saturating_add(
-                        entry
-                            .structured_metadata
-                            .iter()
-                            .map(|(name, value)| name.len().saturating_add(value.len()))
-                            .sum::<usize>(),
-                    )
-                    .saturating_add(std::mem::size_of::<part::Row>()) as u64;
-                estimated_memory = estimated_memory
-                    .checked_add(row_memory)
-                    .ok_or_else(|| "merge memory accounting overflowed".to_string())?;
-                if estimated_memory > max_memory_bytes {
-                    return Err(format!(
-                        "merge exceeds the maximum of {max_memory_bytes} materialized bytes"
-                    ));
-                }
-                rows.push(part::Row {
-                    timestamp_ns: entry.timestamp_ns,
-                    labels: labels.clone(),
-                    line: entry.line,
-                    structured_metadata: entry.structured_metadata,
-                });
+        // Merge rewrites the whole shared part, so it reads every tenant's
+        // rows. `read_all_rows` walks the tenant index rather than bypassing
+        // it, so each row still arrives tagged with its own tenant.
+        for row in reader.read_all_rows(Some(remaining_memory))? {
+            let row_memory = row
+                .labels
+                .iter()
+                .map(|(name, value)| name.len().saturating_add(value.len()))
+                .sum::<usize>()
+                .saturating_add(row.line.len())
+                .saturating_add(
+                    row.structured_metadata
+                        .iter()
+                        .map(|(name, value)| name.len().saturating_add(value.len()))
+                        .sum::<usize>(),
+                )
+                .saturating_add(std::mem::size_of::<part::Row>()) as u64;
+            estimated_memory = estimated_memory
+                .checked_add(row_memory)
+                .ok_or_else(|| "merge memory accounting overflowed".to_string())?;
+            if estimated_memory > max_memory_bytes {
+                return Err(format!(
+                    "merge exceeds the maximum of {max_memory_bytes} materialized bytes"
+                ));
             }
+            rows.push(row);
         }
     }
-    rows.sort_by_key(|r| r.timestamp_ns);
     Ok(rows)
 }

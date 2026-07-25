@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bloom::BloomFilter;
 use crate::part::partition_of;
+use crate::tenant::TenantId;
 use crate::trace::TraceSpan;
 
 pub const TRACE_DATA_FILE: &str = "data.parquet";
@@ -22,6 +23,16 @@ pub const TRACE_BLOOM_FILE: &str = "trace.bloom";
 pub const TRACE_META_FILE: &str = "meta.json";
 
 const TRACE_BLOOM_MAGIC: &[u8; 4] = b"TBF1";
+
+/// One tenant's contiguous run of row groups in a shared trace part. Same
+/// role as `part::TenantSegment` on the log side.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TraceTenantSegment {
+    pub tenant: TenantId,
+    pub row_group_start: u32,
+    pub row_group_end: u32,
+    pub row_count: u64,
+}
 
 #[derive(Clone, Debug)]
 pub struct TracePartMeta {
@@ -33,8 +44,18 @@ pub struct TracePartMeta {
     pub row_group_count: u32,
     pub row_group_min_ts: Vec<i64>,
     pub row_group_max_ts: Vec<i64>,
+    pub tenants: Vec<TraceTenantSegment>,
     #[allow(dead_code)]
     integrity: TracePartIntegrity,
+}
+
+impl TracePartMeta {
+    pub fn tenant_row_groups(&self, tenant: &TenantId) -> Option<std::ops::Range<u32>> {
+        self.tenants
+            .binary_search_by(|segment| segment.tenant.cmp(tenant))
+            .ok()
+            .map(|index| self.tenants[index].row_group_start..self.tenants[index].row_group_end)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +80,7 @@ impl TracePart {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TraceSpanFile {
+    tenant: TenantId,
     trace_id: String,
     span_id: String,
     start_time_ns: i64,
@@ -73,6 +95,7 @@ struct TraceSpanFile {
 impl From<&TraceSpan> for TraceSpanFile {
     fn from(span: &TraceSpan) -> Self {
         Self {
+            tenant: span.tenant.clone(),
             trace_id: span.trace_id.clone(),
             span_id: span.span_id.clone(),
             start_time_ns: span.start_time_ns,
@@ -89,6 +112,7 @@ impl From<&TraceSpan> for TraceSpanFile {
 impl From<TraceSpanFile> for TraceSpan {
     fn from(span: TraceSpanFile) -> Self {
         Self {
+            tenant: span.tenant,
             trace_id: span.trace_id,
             span_id: span.span_id,
             start_time_ns: span.start_time_ns,
@@ -119,6 +143,7 @@ struct TraceMetaFile {
     row_group_count: u32,
     row_group_min_ts: Vec<i64>,
     row_group_max_ts: Vec<i64>,
+    tenants: Vec<TraceTenantSegment>,
     integrity: TracePartIntegrity,
 }
 
@@ -148,9 +173,13 @@ pub fn flush_trace_spans(
     let mut parts = Vec::new();
     let mut committed_dirs = Vec::new();
     for (partition, mut partition_spans) in by_partition {
+        // Tenant leads the sort key so a tenant occupies a contiguous run of
+        // row groups; trace_id still leads within a tenant so the per-row-group
+        // trace-id bloom stays selective.
         partition_spans.sort_by(|left, right| {
-            left.trace_id
-                .cmp(&right.trace_id)
+            left.tenant
+                .cmp(&right.tenant)
+                .then_with(|| left.trace_id.cmp(&right.trace_id))
                 .then_with(|| left.start_time_ns.cmp(&right.start_time_ns))
                 .then_with(|| left.span_id.cmp(&right.span_id))
         });
@@ -200,7 +229,7 @@ fn write_trace_part_files(
     write_trace_parquet(&dir.join(TRACE_DATA_FILE), spans, row_group_size)?;
     write_trace_bloom(&dir.join(TRACE_BLOOM_FILE), spans, row_group_size)?;
 
-    let bounds = row_group_bounds(spans.len(), row_group_size);
+    let bounds = row_group_bounds(spans, row_group_size);
     let min_ts = spans.iter().map(|span| span.start_time_ns).min().unwrap();
     let max_ts = spans.iter().map(|span| span.end_time_ns).max().unwrap();
     let meta_without_crc = TraceMetaFile {
@@ -230,6 +259,7 @@ fn write_trace_part_files(
                     .unwrap()
             })
             .collect(),
+        tenants: trace_tenant_segments(spans, &bounds),
         integrity: TracePartIntegrity {
             data_crc32: file_crc32(&dir.join(TRACE_DATA_FILE))?,
             bloom_crc32: file_crc32(&dir.join(TRACE_BLOOM_FILE))?,
@@ -244,14 +274,19 @@ fn write_trace_part_files(
     Ok(())
 }
 
-fn write_trace_parquet(path: &Path, spans: &[TraceSpan], row_group_size: usize) -> io::Result<()> {
-    let schema = Arc::new(Schema::new(vec![
+fn trace_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("tenant", DataType::Utf8, false),
         Field::new("start_time_ns", DataType::Int64, false),
         Field::new("end_time_ns", DataType::Int64, false),
         Field::new("trace_id", DataType::Utf8, false),
         Field::new("span_id", DataType::Utf8, false),
         Field::new("payload", DataType::Utf8, false),
-    ]));
+    ]))
+}
+
+fn trace_row_group_batch(schema: &Arc<Schema>, spans: &[TraceSpan]) -> io::Result<RecordBatch> {
+    let tenants: Vec<&str> = spans.iter().map(|span| span.tenant.as_str()).collect();
     let starts: Vec<i64> = spans.iter().map(|span| span.start_time_ns).collect();
     let ends: Vec<i64> = spans.iter().map(|span| span.end_time_ns).collect();
     let trace_ids: Vec<&str> = spans.iter().map(|span| span.trace_id.as_str()).collect();
@@ -261,9 +296,10 @@ fn write_trace_parquet(path: &Path, spans: &[TraceSpan], row_group_size: usize) 
         .map(|span| serde_json::to_string(&TraceSpanFile::from(span)).map_err(io::Error::other))
         .collect::<io::Result<_>>()?;
     let payload_refs: Vec<&str> = payloads.iter().map(String::as_str).collect();
-    let batch = RecordBatch::try_new(
+    RecordBatch::try_new(
         schema.clone(),
         vec![
+            Arc::new(StringArray::from(tenants)) as ArrayRef,
             Arc::new(Int64Array::from(starts)) as ArrayRef,
             Arc::new(Int64Array::from(ends)) as ArrayRef,
             Arc::new(StringArray::from(trace_ids)) as ArrayRef,
@@ -271,21 +307,32 @@ fn write_trace_parquet(path: &Path, spans: &[TraceSpan], row_group_size: usize) 
             Arc::new(StringArray::from(payload_refs)) as ArrayRef,
         ],
     )
-    .map_err(io::Error::other)?;
+    .map_err(io::Error::other)
+}
+
+fn write_trace_parquet(path: &Path, spans: &[TraceSpan], row_group_size: usize) -> io::Result<()> {
+    let schema = trace_schema();
+    let bounds = row_group_bounds(spans, row_group_size);
     let file = fs::File::create(path)?;
     let properties = WriterProperties::builder()
         .set_max_row_group_row_count(Some(row_group_size))
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
         .build();
     let mut writer =
-        ArrowWriter::try_new(file, schema, Some(properties)).map_err(io::Error::other)?;
-    writer.write(&batch).map_err(io::Error::other)?;
+        ArrowWriter::try_new(file, schema.clone(), Some(properties)).map_err(io::Error::other)?;
+    // The bloom sidecar and the tenant index address row groups by ordinal, so
+    // the boundaries must be exactly `bounds`.
+    for (start, end) in &bounds {
+        let batch = trace_row_group_batch(&schema, &spans[*start..*end])?;
+        writer.write(&batch).map_err(io::Error::other)?;
+        writer.flush().map_err(io::Error::other)?;
+    }
     writer.close().map_err(io::Error::other)?;
     sync_file(path)
 }
 
 fn write_trace_bloom(path: &Path, spans: &[TraceSpan], row_group_size: usize) -> io::Result<()> {
-    let bounds = row_group_bounds(spans.len(), row_group_size);
+    let bounds = row_group_bounds(spans, row_group_size);
     let mut encoded = Vec::new();
     encoded.extend_from_slice(TRACE_BLOOM_MAGIC);
     encoded.extend_from_slice(&(bounds.len() as u32).to_le_bytes());
@@ -306,11 +353,80 @@ fn write_trace_bloom(path: &Path, spans: &[TraceSpan], row_group_size: usize) ->
     sync_file(path)
 }
 
-fn row_group_bounds(row_count: usize, row_group_size: usize) -> Vec<(usize, usize)> {
-    (0..row_count)
-        .step_by(row_group_size)
-        .map(|start| (start, (start + row_group_size).min(row_count)))
-        .collect()
+/// Row-group boundaries that never straddle a tenant.
+fn row_group_bounds(spans: &[TraceSpan], row_group_size: usize) -> Vec<(usize, usize)> {
+    let mut bounds = Vec::new();
+    let mut segment_start = 0usize;
+    while segment_start < spans.len() {
+        let mut segment_end = segment_start;
+        while segment_end < spans.len() && spans[segment_end].tenant == spans[segment_start].tenant
+        {
+            segment_end += 1;
+        }
+        let mut start = segment_start;
+        while start < segment_end {
+            let end = (start + row_group_size).min(segment_end);
+            bounds.push((start, end));
+            start = end;
+        }
+        segment_start = segment_end;
+    }
+    bounds
+}
+
+fn trace_tenant_segments(
+    spans: &[TraceSpan],
+    bounds: &[(usize, usize)],
+) -> Vec<TraceTenantSegment> {
+    let mut segments: Vec<TraceTenantSegment> = Vec::new();
+    for (row_group, (start, end)) in bounds.iter().enumerate() {
+        let tenant = &spans[*start].tenant;
+        let row_count = (end - start) as u64;
+        match segments.last_mut() {
+            Some(segment) if segment.tenant == *tenant => {
+                segment.row_group_end = row_group as u32 + 1;
+                segment.row_count += row_count;
+            }
+            _ => segments.push(TraceTenantSegment {
+                tenant: tenant.clone(),
+                row_group_start: row_group as u32,
+                row_group_end: row_group as u32 + 1,
+                row_count,
+            }),
+        }
+    }
+    segments
+}
+
+fn validate_trace_tenant_segments(meta: &TraceMetaFile) -> Result<(), String> {
+    if meta.tenants.is_empty() {
+        return Err("trace part metadata has no tenant segments".to_string());
+    }
+    let mut expected_start = 0u32;
+    let mut total_rows = 0u64;
+    for (index, segment) in meta.tenants.iter().enumerate() {
+        if index > 0 && meta.tenants[index - 1].tenant >= segment.tenant {
+            return Err("trace tenant segments are not sorted by tenant".to_string());
+        }
+        if segment.row_group_start != expected_start
+            || segment.row_group_end <= segment.row_group_start
+            || segment.row_group_end > meta.row_group_count
+        {
+            return Err("trace tenant segments do not tile the row groups".to_string());
+        }
+        if segment.row_count == 0 {
+            return Err("trace tenant segment is empty".to_string());
+        }
+        total_rows = total_rows.saturating_add(segment.row_count);
+        expected_start = segment.row_group_end;
+    }
+    if expected_start != meta.row_group_count {
+        return Err("trace tenant segments do not cover every row group".to_string());
+    }
+    if total_rows != meta.row_count {
+        return Err("trace tenant segment row counts do not sum to the part row count".to_string());
+    }
+    Ok(())
 }
 
 pub fn load_trace_part(dir: &Path) -> Result<TracePart, String> {
@@ -360,6 +476,7 @@ pub fn load_trace_part(dir: &Path) -> Result<TracePart, String> {
             dir.display()
         ));
     }
+    validate_trace_tenant_segments(&meta)?;
     Ok(TracePart {
         dir: dir.to_path_buf(),
         meta: TracePartMeta {
@@ -371,6 +488,7 @@ pub fn load_trace_part(dir: &Path) -> Result<TracePart, String> {
             row_group_count: meta.row_group_count,
             row_group_min_ts: meta.row_group_min_ts,
             row_group_max_ts: meta.row_group_max_ts,
+            tenants: meta.tenants,
             integrity: meta.integrity,
         },
     })
@@ -435,45 +553,62 @@ impl TracePartReader {
         &self.part
     }
 
-    pub fn may_match_trace_id(&self, trace_id: &str) -> bool {
-        self.blooms
-            .iter()
-            .any(|bloom| bloom.contains(trace_id.as_bytes()))
+    pub fn may_match_trace_id(&self, tenant: &TenantId, trace_id: &str) -> bool {
+        let Some(groups) = self.part.meta.tenant_row_groups(tenant) else {
+            return false;
+        };
+        groups
+            .clone()
+            .any(|row_group| self.blooms[row_group as usize].contains(trace_id.as_bytes()))
     }
 
-    pub fn query_trace_id(&self, trace_id: &str) -> Result<Vec<TraceSpan>, String> {
-        self.query_trace_id_limited(trace_id, usize::MAX, None)
+    #[cfg(test)]
+    pub fn query_trace_id(
+        &self,
+        tenant: &TenantId,
+        trace_id: &str,
+    ) -> Result<Vec<TraceSpan>, String> {
+        self.query_trace_id_limited(tenant, trace_id, usize::MAX, None)
     }
 
     pub fn query_trace_id_limited(
         &self,
+        tenant: &TenantId,
         trace_id: &str,
         limit: usize,
         cancellation: Option<&AtomicBool>,
     ) -> Result<Vec<TraceSpan>, String> {
-        let selected: Vec<usize> = self
-            .blooms
-            .iter()
-            .enumerate()
-            .filter_map(|(index, bloom)| bloom.contains(trace_id.as_bytes()).then_some(index))
+        let Some(groups) = self.part.meta.tenant_row_groups(tenant) else {
+            return Ok(Vec::new());
+        };
+        let selected: Vec<usize> = groups
+            .filter(|row_group| self.blooms[*row_group as usize].contains(trace_id.as_bytes()))
+            .map(|row_group| row_group as usize)
             .collect();
-        self.query_selected(selected, Some(trace_id), limit, cancellation)
+        self.query_selected(tenant, selected, Some(trace_id), limit, cancellation)
     }
 
-    pub fn query_all(&self) -> Result<Vec<TraceSpan>, String> {
-        self.query_all_limited(usize::MAX, None)
+    #[cfg(test)]
+    pub fn query_all(&self, tenant: &TenantId) -> Result<Vec<TraceSpan>, String> {
+        self.query_all_limited(tenant, usize::MAX, None)
     }
 
     pub fn query_all_limited(
         &self,
+        tenant: &TenantId,
         limit: usize,
         cancellation: Option<&AtomicBool>,
     ) -> Result<Vec<TraceSpan>, String> {
-        self.query_selected((0..self.blooms.len()).collect(), None, limit, cancellation)
+        let Some(groups) = self.part.meta.tenant_row_groups(tenant) else {
+            return Ok(Vec::new());
+        };
+        let selected: Vec<usize> = groups.map(|row_group| row_group as usize).collect();
+        self.query_selected(tenant, selected, None, limit, cancellation)
     }
 
     fn query_selected(
         &self,
+        tenant: &TenantId,
         selected: Vec<usize>,
         trace_id: Option<&str>,
         limit: usize,
@@ -495,11 +630,21 @@ impl TracePartReader {
                 return Err("trace query timed out".to_string());
             }
             let batch = batch.map_err(|error| error.to_string())?;
-            let trace_ids = batch.column(2).as_string::<i32>();
-            let payloads = batch.column(4).as_string::<i32>();
+            let row_tenants = batch.column(0).as_string::<i32>();
+            let trace_ids = batch.column(3).as_string::<i32>();
+            let payloads = batch.column(5).as_string::<i32>();
             for index in 0..batch.num_rows() {
                 if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                     return Err("trace query timed out".to_string());
+                }
+                // Row groups are tenant-aligned, so this is unreachable in a
+                // well-formed part; it keeps a metadata bug from becoming a
+                // cross-tenant read.
+                if row_tenants.value(index) != tenant.as_str() {
+                    return Err(format!(
+                        "trace part {} contains rows outside tenant {tenant}",
+                        self.part.meta.id
+                    ));
                 }
                 if trace_id.is_some_and(|wanted| trace_ids.value(index) != wanted) {
                     continue;
@@ -603,6 +748,7 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tenant::test_tenant;
     use crate::trace::normalize_request;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
@@ -634,7 +780,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        normalize_request(request).unwrap()
+        normalize_request(&test_tenant(), request).unwrap()
     }
 
     #[test]
@@ -644,14 +790,21 @@ mod tests {
         let parts = flush_trace_spans(spans(), &root, 1).unwrap();
         assert_eq!(parts.len(), 1);
         let reader = TracePartReader::open(parts.into_iter().next().unwrap()).unwrap();
-        assert!(reader.may_match_trace_id(&"01".repeat(16)));
+        assert!(reader.may_match_trace_id(&test_tenant(), &"01".repeat(16)));
         let negative = ["09", "0a", "0b", "0c", "f0", "ff"]
             .into_iter()
             .map(|prefix| prefix.repeat(16))
-            .find(|id| !reader.may_match_trace_id(id))
+            .find(|id| !reader.may_match_trace_id(&test_tenant(), id))
             .expect("test ID should be absent from the small bloom");
-        assert!(reader.query_trace_id(&negative).unwrap().is_empty());
-        let result = reader.query_trace_id(&"01".repeat(16)).unwrap();
+        assert!(
+            reader
+                .query_trace_id(&test_tenant(), &negative)
+                .unwrap()
+                .is_empty()
+        );
+        let result = reader
+            .query_trace_id(&test_tenant(), &"01".repeat(16))
+            .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].span_id, "02".repeat(8));
     }
@@ -664,7 +817,72 @@ mod tests {
         let part = parts.into_iter().next().unwrap();
         fs::remove_file(part.data_path()).unwrap();
         let reader = TracePartReader::open_cached(load_trace_part(&part.dir).unwrap()).unwrap();
-        assert!(reader.may_match_trace_id(&"01".repeat(16)));
-        assert!(reader.query_trace_id(&"01".repeat(16)).is_err());
+        assert!(reader.may_match_trace_id(&test_tenant(), &"01".repeat(16)));
+        assert!(
+            reader
+                .query_trace_id(&test_tenant(), &"01".repeat(16))
+                .is_err()
+        );
+    }
+
+    fn tenant_spans(tenant: &str, trace_byte: u8, start_ns: u64) -> Vec<TraceSpan> {
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![trace_byte; 16],
+                        span_id: vec![trace_byte; 8],
+                        start_time_unix_nano: start_ns,
+                        end_time_unix_nano: start_ns + 10,
+                        name: format!("{tenant}-span"),
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        normalize_request(&TenantId::parse(tenant).unwrap(), request).unwrap()
+    }
+
+    #[test]
+    fn a_shared_trace_part_confines_every_read_to_the_querying_tenant() {
+        let root =
+            std::env::temp_dir().join(format!("loggytracy-trace-tenant-{}", uuid::Uuid::new_v4()));
+        let mut spans = tenant_spans("globex", 9, 300);
+        spans.extend(tenant_spans("acme", 1, 100));
+        let part = flush_trace_spans(spans, &root, 1).unwrap().remove(0);
+
+        let acme = TenantId::parse("acme").unwrap();
+        let globex = TenantId::parse("globex").unwrap();
+        let outsider = TenantId::parse("initech").unwrap();
+        assert_eq!(part.meta.tenants.len(), 2);
+        assert!(part.meta.tenant_row_groups(&outsider).is_none());
+
+        let reader = TracePartReader::open(part).unwrap();
+        let acme_trace = "01".repeat(16);
+        let globex_trace = "09".repeat(16);
+
+        assert_eq!(reader.query_all(&acme).unwrap().len(), 1);
+        assert_eq!(reader.query_all(&globex).unwrap().len(), 1);
+        assert!(reader.query_all(&outsider).unwrap().is_empty());
+
+        // Knowing another tenant's trace ID must not be enough to read it.
+        // (`may_match_trace_id` is a bloom hint and may say yes; the read
+        // itself is what has to be empty.)
+        assert!(!reader.may_match_trace_id(&outsider, &globex_trace));
+        assert!(
+            reader
+                .query_trace_id(&acme, &globex_trace)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reader.query_trace_id(&globex, &globex_trace).unwrap().len(),
+            1
+        );
+        assert_eq!(reader.query_trace_id(&acme, &acme_trace).unwrap().len(), 1);
     }
 }

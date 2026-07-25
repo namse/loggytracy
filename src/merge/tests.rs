@@ -1,4 +1,5 @@
     use super::*;
+    use crate::tenant::test_tenant;
     use crate::config::Config;
     use crate::memtable::Labels;
     use crate::part::{self};
@@ -24,6 +25,7 @@
         labels.insert("app".to_string(), "test".to_string());
         (0..n)
             .map(|i| part::Row {
+                tenant: test_tenant(),
                 timestamp_ns: start_ts + i as i64,
                 labels: labels.clone(),
                 line: format!("{}-line-{}", suffix, i),
@@ -58,7 +60,7 @@
         assert_eq!(registry.part_count(), 1);
 
         let results = registry
-            .query(&[], &[], i64::MIN, i64::MAX, 1000, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 1000, true)
             .expect("part query");
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 50);
@@ -204,7 +206,7 @@
 
         assert_eq!(registry.part_count(), 1);
         let results = registry
-            .query(&[], &[], i64::MIN, i64::MAX, 2000, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 2000, true)
             .expect("part query");
         assert_eq!(
             results
@@ -276,7 +278,7 @@
         // bloom prune after merge
         let f = crate::logql::LineFilter::Contains("zzzzz".to_string());
         let r = registry
-            .query(&[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -289,7 +291,7 @@
         )
         .unwrap();
         let r = registry
-            .query(&[m], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[m], &[], i64::MIN, i64::MAX, 100, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -302,7 +304,7 @@
         )
         .unwrap();
         let r = registry
-            .query(&[m], &[], i64::MIN, i64::MAX, 1000, true)
+            .query(&test_tenant(), &[m], &[], i64::MIN, i64::MAX, 1000, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 60);

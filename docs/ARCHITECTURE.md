@@ -51,17 +51,28 @@ TLS 종단은 이 프로세스의 책임이 아니다. 인증서 발급·갱신�
 것이므로, 테넌트는 ingest·저장·쿼리 전 경로에서 1급 식별자여야 한다.
 
 - **식별**: `X-Scope-OrgID` 헤더 (Loki/Tempo 관례와 동일). OTLP는 gRPC 메타데이터의 동명 키를 쓴다.
-  헤더가 없는 요청의 처리 정책(기본 테넌트로 수용 vs 거절)은 설정으로 정한다.
-- **격리 지점**: 테넌트는 스트림 라벨이 아니라 **저장 경로의 분할 축**이어야 한다. 그렇지 않으면
-  테넌트별 retention·quota 회계·삭제 요청 대응이 전부 전체 스캔이 된다. manifest/part 경로에
-  테넌트를 포함시키는 방향이 자연스럽다.
+  값은 journal append **이전에** `[a-zA-Z0-9_-]{1,64}` 허용 목록으로 검증한다 — 이 값이 그대로
+  object store 키와 로컬 파일 경로에 들어가기 때문이다.
+  - `LOGGYTRACY_DEFAULT_TENANT` (기본 `default`): 헤더 없는 요청에 적용할 테넌트.
+  - `LOGGYTRACY_MISSING_TENANT_POLICY` (기본 `default`): `default`면 위 테넌트로 수용하고,
+    `reject`면 400으로 거절한다. 헤더가 **빈 값**인 경우는 두 정책 모두 거절한다 —
+    클라이언트 버그를 다른 테넌트로 조용히 흘려보내지 않기 위해서다.
+- **격리 지점**: 테넌트는 저장 경로의 분할 축이 **아니라** part 내부의 정렬 키이자 인덱스 축이다.
+  하나의 part object가 모든 테넌트를 담고, 행은 `(tenant, timestamp_ns)`로 정렬되며 row group은
+  테넌트 경계를 넘지 않는다. `meta.json`의 테넌트 인덱스가 각 테넌트의 row group 구간과
+  min/max 타임스탬프를 담고, 모든 읽기 경로는 이 구간 밖의 row group을 **주소로 지정할 수 없다**.
+  테넌트를 경로 축으로 두는 예전 설계는 R2 Class A 비용 때문에 폐기됐다 —
+  자세한 비용 모델과 근거는 [`docs/MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md).
 - **스로틀·quota 대상**: ingest rate(bytes/s, events/s), 활성 스트림 수(카디널리티),
   저장 용량, 동시 쿼리 수, 쿼리 스캔 예산. 초과 시 ingest는 `429`(Alloy가 backoff하고 자체 WAL로
   버티게 한다), 쿼리는 `429` 또는 `422`로 응답한다.
 - **관측**: 모든 quota 카운터와 거절 카운터는 테넌트 라벨을 붙여 `/metrics`에 노출해야 한다.
   quota를 운영하려면 "누가 어디서 얼마나 막혔는지"가 보여야 한다.
-- **현재 상태**: 아직 구현되지 않았다. `X-Scope-OrgID`는 파싱되지 않고 모든 데이터가 한
-  네임스페이스에 섞이며 테넌트별 제한도 없다. 위 설계를 만족시키는 것이 프로덕션 게이트다
+- **현재 상태**: 식별·검증·격리는 구현됐다. `X-Scope-OrgID`는 Loki push와 OTLP gRPC에서 추출되어
+  WAL 레코드에 함께 기록되고(재시작 후에도 소유자가 유지된다), MemTable·part·trace part·쿼리·
+  카탈로그 조회는 모두 테넌트를 필수 인자로 받는다. `/metrics`만 운영자용 프로세스 전역 집계를
+  유지한다. 아직 없는 것은 **테넌트별 quota·스로틀·durable 사용량 회계**와 tier 파티셔닝이며,
+  이는 `docs/MULTI_TENANCY_DESIGN.md`의 5·6단계다
   (`docs/PRODUCTION_READINESS_REVIEW.md` P0-3 참고).
 
 ## 데이터 모델
@@ -150,7 +161,10 @@ LogQL 파싱(chumsky) → 플랜 → 프루닝 단계 순서:
   파티션이 UTC 일자 단위이므로 시계 오류나 단위 착오(초/밀리초를 나노초로 전송)가 파티션을 증식시키며,
   특히 **미래 날짜 part는 retention cutoff에 영구히 걸리지 않는다.**
 
-이 제한들은 아직 전역이다. 테넌트별 스로틀·quota는 테넌시 구현과 함께 들어간다(위 "테넌시" 절).
+- `LOGGYTRACY_DEFAULT_TENANT`, `LOGGYTRACY_MISSING_TENANT_POLICY`: 테넌트 식별 (위 "테넌시" 절).
+  허용 목록 검증도 다른 제한과 같이 journal append 이전에 적용된다.
+
+이 제한들은 아직 전역이다. 테넌트별 스로틀·quota는 후속 작업이다(위 "테넌시" 절).
 
 ## LogQL 지원 범위 (subset)
 

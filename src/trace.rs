@@ -6,11 +6,14 @@ use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::Span;
 
+use crate::tenant::TenantId;
+
 pub const TRACE_ID_BYTES: usize = 16;
 pub const SPAN_ID_BYTES: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct TraceSpan {
+    pub tenant: TenantId,
     pub trace_id: String,
     pub span_id: String,
     pub start_time_ns: i64,
@@ -119,13 +122,17 @@ impl std::fmt::Display for TraceError {
 
 impl std::error::Error for TraceError {}
 
-pub fn normalize_request(request: ExportTraceServiceRequest) -> Result<Vec<TraceSpan>, TraceError> {
+pub fn normalize_request(
+    tenant: &TenantId,
+    request: ExportTraceServiceRequest,
+) -> Result<Vec<TraceSpan>, TraceError> {
     let mut spans = Vec::new();
     for resource_spans in request.resource_spans {
         let resource = resource_spans.resource;
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
                 spans.push(normalize_span(
+                    tenant,
                     span,
                     resource.clone(),
                     resource_spans.schema_url.clone(),
@@ -162,6 +169,7 @@ pub fn canonical_trace_id(input: &str) -> Result<String, String> {
 }
 
 fn normalize_span(
+    tenant: &TenantId,
     span: Span,
     resource: Option<Resource>,
     resource_schema_url: String,
@@ -187,6 +195,7 @@ fn normalize_span(
     }
 
     Ok(TraceSpan {
+        tenant: tenant.clone(),
         trace_id,
         span_id,
         start_time_ns,
@@ -304,19 +313,20 @@ impl TraceMemTable {
             .sum()
     }
 
-    pub fn query_trace_id(&self, trace_id: &str) -> Vec<TraceSpan> {
+    pub fn query_trace_id(&self, tenant: &TenantId, trace_id: &str) -> Vec<TraceSpan> {
         let inner = self.inner.read().unwrap();
         let flushing = self.flushing.read().unwrap();
         inner
             .iter()
             .chain(flushing.as_ref().into_iter().flatten())
-            .filter(|span| span.trace_id == trace_id)
+            .filter(|span| span.tenant == *tenant && span.trace_id == trace_id)
             .cloned()
             .collect()
     }
 
     pub fn query_trace_id_limited(
         &self,
+        tenant: &TenantId,
         trace_id: &str,
         limit: usize,
     ) -> Result<Vec<TraceSpan>, String> {
@@ -326,7 +336,7 @@ impl TraceMemTable {
         for span in inner
             .iter()
             .chain(flushing.as_ref().into_iter().flatten())
-            .filter(|span| span.trace_id == trace_id)
+            .filter(|span| span.tenant == *tenant && span.trace_id == trace_id)
         {
             if spans.len() >= limit {
                 return Err(format!("trace query exceeds the maximum of {limit} spans"));
@@ -336,7 +346,9 @@ impl TraceMemTable {
         Ok(spans)
     }
 
-    pub fn snapshot(&self) -> Vec<TraceSpan> {
+    /// Every buffered span, across all tenants. Only the flush path may use
+    /// this; query paths must go through the tenant-scoped variants.
+    pub fn flush_snapshot(&self) -> Vec<TraceSpan> {
         let inner = self.inner.read().unwrap();
         let flushing = self.flushing.read().unwrap();
         inner
@@ -346,11 +358,30 @@ impl TraceMemTable {
             .collect()
     }
 
-    pub fn snapshot_limited(&self, limit: usize) -> Result<Vec<TraceSpan>, String> {
+    pub fn snapshot(&self, tenant: &TenantId) -> Vec<TraceSpan> {
+        let inner = self.inner.read().unwrap();
+        let flushing = self.flushing.read().unwrap();
+        inner
+            .iter()
+            .chain(flushing.as_ref().into_iter().flatten())
+            .filter(|span| span.tenant == *tenant)
+            .cloned()
+            .collect()
+    }
+
+    pub fn snapshot_limited(
+        &self,
+        tenant: &TenantId,
+        limit: usize,
+    ) -> Result<Vec<TraceSpan>, String> {
         let inner = self.inner.read().unwrap();
         let flushing = self.flushing.read().unwrap();
         let mut spans = Vec::new();
-        for span in inner.iter().chain(flushing.as_ref().into_iter().flatten()) {
+        for span in inner
+            .iter()
+            .chain(flushing.as_ref().into_iter().flatten())
+            .filter(|span| span.tenant == *tenant)
+        {
             if spans.len() >= limit {
                 return Err(format!("trace query exceeds the maximum of {limit} spans"));
             }
@@ -359,9 +390,9 @@ impl TraceMemTable {
         Ok(spans)
     }
 
-    pub fn trace_ids(&self) -> BTreeMap<String, usize> {
+    pub fn trace_ids(&self, tenant: &TenantId) -> BTreeMap<String, usize> {
         let mut ids = BTreeMap::new();
-        for span in self.snapshot() {
+        for span in self.snapshot(tenant) {
             *ids.entry(span.trace_id).or_default() += 1;
         }
         ids
@@ -377,6 +408,7 @@ impl Default for TraceMemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tenant::test_tenant;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans};
@@ -414,7 +446,7 @@ mod tests {
 
     #[test]
     fn normalizes_ids_and_preserves_resource() {
-        let spans = normalize_request(request(vec![1; 16], vec![2; 8])).unwrap();
+        let spans = normalize_request(&test_tenant(), request(vec![1; 16], vec![2; 8])).unwrap();
         assert_eq!(spans[0].trace_id, "01".repeat(16));
         assert_eq!(spans[0].span_id, "02".repeat(8));
         assert_eq!(spans[0].service_name(), Some("api"));
@@ -424,17 +456,17 @@ mod tests {
     #[test]
     fn rejects_invalid_ids_and_end_before_start() {
         assert_eq!(
-            normalize_request(request(vec![0; 16], vec![2; 8])).unwrap_err(),
+            normalize_request(&test_tenant(), request(vec![0; 16], vec![2; 8])).unwrap_err(),
             TraceError::InvalidTraceId
         );
         assert_eq!(
-            normalize_request(request(vec![1; 16], vec![2; 7])).unwrap_err(),
+            normalize_request(&test_tenant(), request(vec![1; 16], vec![2; 7])).unwrap_err(),
             TraceError::InvalidSpanId
         );
         let mut invalid = request(vec![1; 16], vec![2; 8]);
         invalid.resource_spans[0].scope_spans[0].spans[0].end_time_unix_nano = 99;
         assert_eq!(
-            normalize_request(invalid).unwrap_err(),
+            normalize_request(&test_tenant(), invalid).unwrap_err(),
             TraceError::EndBeforeStart
         );
     }
@@ -445,7 +477,9 @@ mod tests {
         extreme.resource_spans[0].scope_spans[0].spans[0].start_time_unix_nano = 0;
         extreme.resource_spans[0].scope_spans[0].spans[0].end_time_unix_nano = i64::MAX as u64;
 
-        let span = normalize_request(extreme).unwrap().remove(0);
+        let span = normalize_request(&test_tenant(), extreme)
+            .unwrap()
+            .remove(0);
 
         assert_eq!(span.duration_ns(), i64::MAX as u64);
         assert_eq!(
@@ -457,11 +491,23 @@ mod tests {
     #[test]
     fn memtable_queries_across_active_and_flushing_buffers() {
         let memtable = TraceMemTable::new();
-        memtable.insert(normalize_request(request(vec![1; 16], vec![2; 8])).unwrap());
+        memtable
+            .insert(normalize_request(&test_tenant(), request(vec![1; 16], vec![2; 8])).unwrap());
         let snapshot = memtable.begin_flush();
-        memtable.insert(normalize_request(request(vec![1; 16], vec![3; 8])).unwrap());
-        assert_eq!(memtable.query_trace_id(&"01".repeat(16)).len(), 2);
+        memtable
+            .insert(normalize_request(&test_tenant(), request(vec![1; 16], vec![3; 8])).unwrap());
+        assert_eq!(
+            memtable
+                .query_trace_id(&test_tenant(), &"01".repeat(16))
+                .len(),
+            2
+        );
         memtable.abort_flush(snapshot);
-        assert_eq!(memtable.query_trace_id(&"01".repeat(16)).len(), 2);
+        assert_eq!(
+            memtable
+                .query_trace_id(&test_tenant(), &"01".repeat(16))
+                .len(),
+            2
+        );
     }
 }

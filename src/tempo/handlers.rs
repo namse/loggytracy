@@ -1,10 +1,13 @@
 pub async fn trace_by_id(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(trace_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let trace_id =
         canonical_trace_id(&trace_id).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let spans = query_trace(&state, &trace_id).await?;
+    let spans = query_trace(&state, &tenant, &trace_id).await?;
     if spans.is_empty() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -29,8 +32,11 @@ pub struct SearchParams {
 
 pub async fn search(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let limit = params.limit.unwrap_or(20);
     let max_search_limit = state
         .config
@@ -93,11 +99,12 @@ pub async fn search(
         .transpose()
         .map_err(client_error)?;
 
-    let guard = pin_all_trace_parts(&state).await?;
+    let guard = pin_all_trace_parts(&state, &tenant).await?;
     let spans = scan_trace_spans(
         guard,
         state.journal.clone(),
         state.trace_parts.clone(),
+        tenant.clone(),
         None,
         state.config.clone(),
         state.trace_scan_semaphore.clone(),
@@ -155,12 +162,16 @@ pub async fn search(
 
 pub async fn search_tags(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let guard = pin_all_trace_parts(&state).await?;
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let guard = pin_all_trace_parts(&state, &tenant).await?;
     let spans = scan_trace_spans(
         guard,
         state.journal.clone(),
         state.trace_parts.clone(),
+        tenant.clone(),
         None,
         state.config.clone(),
         state.trace_scan_semaphore.clone(),
@@ -180,13 +191,17 @@ pub async fn search_tags(
 
 pub async fn search_tag_values(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(tag): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let guard = pin_all_trace_parts(&state).await?;
+    let tenant = crate::tenant::from_headers(&headers, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let guard = pin_all_trace_parts(&state, &tenant).await?;
     let spans = scan_trace_spans(
         guard,
         state.journal.clone(),
         state.trace_parts.clone(),
+        tenant.clone(),
         None,
         state.config.clone(),
         state.trace_scan_semaphore.clone(),

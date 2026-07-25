@@ -493,6 +493,7 @@ fn cleanup_part_directories(
 mod tests {
     use super::*;
     use crate::memtable::{Labels, LogEntry};
+    use crate::tenant::test_tenant;
 
     fn temp_dir() -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();
@@ -520,6 +521,7 @@ mod tests {
             .into_iter()
             .collect();
         memtable.insert(
+            test_tenant(),
             labels,
             vec![LogEntry {
                 timestamp_ns: 1_700_000_000_000_000_000,
@@ -565,7 +567,7 @@ mod tests {
         );
         assert!(pending_checkpoint.is_none());
         let results = registry
-            .query(&[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
             .unwrap();
         assert_eq!(results.iter().map(|r| r.entries.len()).sum::<usize>(), 1);
     }

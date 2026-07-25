@@ -1,4 +1,5 @@
     use super::*;
+    use crate::tenant::test_tenant;
     use crate::memtable::Labels;
     use crate::part::Row;
     use std::path::PathBuf;
@@ -21,6 +22,7 @@
             .into_iter()
             .collect();
         Row {
+            tenant: test_tenant(),
             timestamp_ns: 1_700_000_000_000_000_000,
             labels,
             line: line.to_string(),
@@ -115,7 +117,7 @@
         let registry =
             crate::part_registry::PartRegistry::load_from_manifest(&source, &manifest).unwrap();
         let result = registry
-            .query(&[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
             .unwrap();
         assert_eq!(result[0].entries[0].line, "from object store");
     }
@@ -765,7 +767,7 @@
                 schema_url: String::new(),
             }],
         };
-        let spans = crate::trace::normalize_request(request).unwrap();
+        let spans = crate::trace::normalize_request(&test_tenant(), request).unwrap();
         let parts = crate::trace_part::flush_trace_spans(spans, &root, 100).unwrap();
         let manifest = storage.publish_trace_parts(&parts).await.unwrap();
         assert_eq!(manifest.parts.len(), 1);
@@ -793,7 +795,7 @@
             crate::trace_part::load_trace_part(&parts[0].dir).unwrap(),
         )
         .unwrap();
-        assert_eq!(reader.query_trace_id(&"01".repeat(16)).unwrap().len(), 1);
+        assert_eq!(reader.query_trace_id(&test_tenant(), &"01".repeat(16)).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -820,7 +822,7 @@
                 schema_url: String::new(),
             }],
         };
-        let spans = crate::trace::normalize_request(request).unwrap();
+        let spans = crate::trace::normalize_request(&test_tenant(), request).unwrap();
         let parts = crate::trace_part::flush_trace_spans(spans, &root, 100).unwrap();
 
         let manifest = storage.reconcile_trace_local_cache(&root).await.unwrap();
@@ -856,7 +858,7 @@
                 schema_url: String::new(),
             }],
         };
-        let spans = crate::trace::normalize_request(request).unwrap();
+        let spans = crate::trace::normalize_request(&test_tenant(), request).unwrap();
         let parts = crate::trace_part::flush_trace_spans(spans, &source, 100).unwrap();
         let manifest = storage.publish_trace_parts(&parts).await.unwrap();
         let root = temp_dir("trace-symlink-cache").join("traces");

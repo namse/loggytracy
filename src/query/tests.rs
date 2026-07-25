@@ -1,4 +1,5 @@
     use super::*;
+    use crate::tenant::test_tenant;
     use crate::config::Config;
     use crate::journal::Journal;
     use crate::memtable::{LogEntry, MemTable};
@@ -69,6 +70,7 @@
             .collect();
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
+            test_tenant(),
             labels,
             vec![LogEntry {
                 timestamp_ns: 5_000_000_000,
@@ -79,6 +81,7 @@
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
         let request = axum::http::Request::builder()
             .uri("/loki/api/v1/query_range?query=%7Bapp%3D%22api%22%7D%20%7C%3D%20%22hello%22&start=4&end=6&limit=10&direction=forward")
+            .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -102,6 +105,7 @@
             .collect();
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
+            test_tenant(),
             labels,
             vec![LogEntry {
                 timestamp_ns: 20_000_000_000,
@@ -113,6 +117,7 @@
 
         let response = query_range(
             State(state),
+            crate::tenant::test_tenant_headers(),
             Query(QueryRangeParams {
                 query: "count_over_time({}[60s])".to_string(),
                 start: None,
@@ -138,6 +143,7 @@
             .collect();
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
+            test_tenant(),
             labels,
             (0..3)
                 .map(|timestamp_ns| LogEntry {
@@ -150,7 +156,16 @@
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
         let parsed = logql::parse("{}").unwrap();
         let execution =
-            run_unified_query_with_stats(state.clone(), parsed.clone(), 0, 2, 1, true, None)
+            run_unified_query_with_stats(
+                state.clone(),
+                test_tenant(),
+                parsed.clone(),
+                0,
+                2,
+                1,
+                true,
+                None,
+            )
                 .await
                 .unwrap();
         assert_eq!(execution.results[0].entries.len(), 1);
@@ -158,6 +173,7 @@
 
         let error = match unified_query_with_stats_cancellable(
             &state,
+            &test_tenant(),
             &parsed,
             0,
             2,
@@ -271,6 +287,7 @@
             .collect();
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
+            test_tenant(),
             labels.clone(),
             vec![LogEntry {
                 timestamp_ns: 2,
@@ -284,6 +301,7 @@
             .register(
                 part::flush_rows(
                     vec![Row {
+                        tenant: test_tenant(),
                         timestamp_ns: 1,
                         labels,
                         line: "on disk".to_string(),
@@ -308,7 +326,7 @@
             None,
         );
 
-        assert_eq!(distinct_stream_count(&state), 1);
+        assert_eq!(distinct_stream_count(&state, &test_tenant()), 1);
     }
 
     #[tokio::test]
@@ -396,6 +414,7 @@
             .collect();
         let local_parts = part::flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
                 labels,
                 line: "restored after eviction".to_string(),
@@ -410,6 +429,7 @@
             .collect();
         let other_parts = part::flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_001,
                 labels: other_labels,
                 line: "must remain remote".to_string(),
@@ -444,7 +464,7 @@
             ))),
         );
         let parsed = logql::parse(r#"{app="remote"}"#).unwrap();
-        let result = run_unified_query(state, parsed, i64::MIN, i64::MAX, 10, true)
+        let result = run_unified_query(state, test_tenant(), parsed, i64::MIN, i64::MAX, 10, true)
             .await
             .unwrap();
 
@@ -470,6 +490,7 @@
             .collect();
         let old = part::flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 1,
                 labels: labels.clone(),
                 line: "old generation".to_string(),
@@ -484,6 +505,7 @@
 
         let new = part::flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 2,
                 labels,
                 line: "new generation".to_string(),
@@ -518,12 +540,12 @@
             ))),
         );
         let parsed = logql::parse(r#"{app="remote"}"#).unwrap();
-        let guard = pin_query_parts_with_gap_hook(&state, &parsed, i64::MIN, i64::MAX, || {
+        let guard = pin_query_parts_with_gap_hook(&state, &test_tenant(), &parsed, i64::MIN, i64::MAX, || {
             parts.reload_from_manifest(&parts_root, &manifest)
         })
         .await
         .unwrap();
-        let result = unified_query(&state, &parsed, i64::MIN, i64::MAX, 10, true).unwrap();
+        let result = unified_query(&state, &test_tenant(), &parsed, i64::MIN, i64::MAX, 10, true).unwrap();
         drop(guard);
 
         assert_eq!(result.len(), 1);
@@ -544,6 +566,7 @@
         ];
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
+            test_tenant(),
             labels.clone(),
             vec![LogEntry {
                 timestamp_ns: 10,
@@ -556,6 +579,7 @@
             .register(
                 part::flush_rows(
                     vec![Row {
+                        tenant: test_tenant(),
                         timestamp_ns: 20,
                         labels,
                         line: line.to_string(),
@@ -573,7 +597,7 @@
         )
         .unwrap();
 
-        let result = run_unified_query(state.clone(), parsed, 0, 30, 10, true)
+        let result = run_unified_query(state.clone(), test_tenant(), parsed, 0, 30, 10, true)
             .await
             .unwrap();
         let timestamps: Vec<_> = result[0]
@@ -585,7 +609,7 @@
 
         for query in [r#"{} | json | json="ok""#, r#"{} | logfmt="value""#] {
             let result =
-                run_unified_query(state.clone(), logql::parse(query).unwrap(), 0, 30, 10, true)
+                run_unified_query(state.clone(), test_tenant(), logql::parse(query).unwrap(), 0, 30, 10, true)
                     .await
                     .unwrap();
             let timestamps: Vec<_> = result[0]
@@ -609,6 +633,7 @@
         ];
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
+            test_tenant(),
             labels.clone(),
             vec![LogEntry {
                 timestamp_ns: 10,
@@ -621,6 +646,7 @@
             .register(
                 part::flush_rows(
                     vec![Row {
+                        tenant: test_tenant(),
                         timestamp_ns: 20,
                         labels,
                         line: r#"{"foo":"z"}"#.to_string(),
@@ -635,7 +661,7 @@
         let state = test_state(&data_dir, memtable, parts, None);
         let parsed = logql::parse(r#"{} | json | foo_extracted_2="z""#).unwrap();
 
-        let result = run_unified_query(state, parsed, 0, 30, 10, true)
+        let result = run_unified_query(state, test_tenant(), parsed, 0, 30, 10, true)
             .await
             .unwrap();
         let timestamps: Vec<_> = result[0]
@@ -761,6 +787,7 @@
             .register(
                 part::flush_rows(
                     vec![Row {
+                        tenant: test_tenant(),
                         timestamp_ns: i64::MIN,
                         labels: labels.clone(),
                         line: "oldest".to_string(),
@@ -778,7 +805,7 @@
             panic!("expected metric")
         };
 
-        let result = run_metric_query(state, expr, vec![i64::MIN + 1])
+        let result = run_metric_query(state, test_tenant(), expr, vec![i64::MIN + 1])
             .await
             .unwrap();
         assert_eq!(result[0].labels, labels);
@@ -793,6 +820,7 @@
             .collect();
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
+            test_tenant(),
             labels,
             (1..=3)
                 .map(|second| LogEntry {
@@ -806,6 +834,7 @@
 
         let range = query_range(
             State(state.clone()),
+            crate::tenant::test_tenant_headers(),
             Query(QueryRangeParams {
                 query: "bytes_over_time({}[5s])".to_string(),
                 start: Some("5".to_string()),
@@ -823,6 +852,7 @@
 
         let instant = query(
             State(state),
+            crate::tenant::test_tenant_headers(),
             Query(QueryParams {
                 query: "count_over_time({}[5s])".to_string(),
                 time: Some("5".to_string()),
@@ -845,6 +875,7 @@
             .collect();
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
+            test_tenant(),
             labels,
             vec![
                 LogEntry {
@@ -872,7 +903,7 @@
         else {
             panic!("expected metric")
         };
-        let result = run_metric_query(state.clone(), expr, vec![10_000_000_000])
+        let result = run_metric_query(state.clone(), test_tenant(), expr, vec![10_000_000_000])
             .await
             .unwrap();
         let levels: Vec<_> = result
@@ -888,7 +919,7 @@
         .unwrap() else {
             panic!("expected metric")
         };
-        let result = run_metric_query(state.clone(), expr, vec![10_000_000_000])
+        let result = run_metric_query(state.clone(), test_tenant(), expr, vec![10_000_000_000])
             .await
             .unwrap();
         assert!(
@@ -903,7 +934,7 @@
         else {
             panic!("expected metric")
         };
-        let result = run_metric_query(state, expr, vec![10_000_000_000])
+        let result = run_metric_query(state, test_tenant(), expr, vec![10_000_000_000])
             .await
             .unwrap();
         assert!(result.iter().any(|series| {
@@ -922,6 +953,7 @@
             .collect();
         let wanted = part::flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 6_000_000_000,
                 labels: labels.clone(),
                 line: "wanted".to_string(),
@@ -933,6 +965,7 @@
         .unwrap();
         let unwanted = part::flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 7_000_000_000,
                 labels,
                 line: "unwanted".to_string(),
@@ -964,7 +997,7 @@
             panic!("expected metric")
         };
 
-        let result = run_metric_query(state, expr, vec![10_000_000_000])
+        let result = run_metric_query(state, test_tenant(), expr, vec![10_000_000_000])
             .await
             .unwrap();
         assert_eq!(result[0].samples, vec![(10_000_000_000, 1.0)]);
@@ -988,6 +1021,7 @@
             .collect();
         let flushed = part::flush_rows(
             vec![Row {
+                tenant: test_tenant(),
                 timestamp_ns: 10,
                 labels,
                 line: r#"{"foo":"z"}"#.to_string(),
@@ -1016,7 +1050,7 @@
         );
         let parsed = logql::parse(r#"{} | json | foo_extracted_2="z""#).unwrap();
 
-        let result = run_unified_query(state, parsed, 0, 20, 10, true)
+        let result = run_unified_query(state, test_tenant(), parsed, 0, 20, 10, true)
             .await
             .unwrap();
         assert_eq!(result[0].entries[0].line, r#"{"foo":"z"}"#);
@@ -1034,6 +1068,7 @@
         );
         let bad_step = query_range(
             State(state.clone()),
+            crate::tenant::test_tenant_headers(),
             Query(QueryRangeParams {
                 query: "rate({}[5m])".to_string(),
                 start: Some("5".to_string()),
@@ -1051,6 +1086,7 @@
 
         let bad_range = query_range(
             State(state),
+            crate::tenant::test_tenant_headers(),
             Query(QueryRangeParams {
                 query: "rate({}[5m])".to_string(),
                 start: Some("10".to_string()),
