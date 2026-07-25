@@ -240,10 +240,14 @@ fn parse_limit(limit: Option<usize>, max_limit: usize) -> Result<usize, String> 
     Ok(limit)
 }
 
-fn distinct_stream_count(state: &AppState, tenant: &TenantId) -> usize {
+fn distinct_stream_count(
+    state: &AppState,
+    tenant: &TenantId,
+    retention_floor_ns: Option<i64>,
+) -> usize {
     let mut streams = std::collections::BTreeSet::new();
-    streams.extend(state.memtable.series(tenant, &[]));
-    streams.extend(state.parts.series(tenant, &[]));
+    streams.extend(state.memtable.series(tenant, &[], retention_floor_ns));
+    streams.extend(state.parts.series(tenant, &[], retention_floor_ns));
     streams.len()
 }
 

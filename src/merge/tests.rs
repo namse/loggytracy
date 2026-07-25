@@ -55,7 +55,7 @@
         }
         assert_eq!(registry.part_count(), 5);
 
-        merge_once(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config).await.unwrap();
 
         assert_eq!(registry.part_count(), 1);
 
@@ -95,7 +95,7 @@
         let merge_registry = registry.clone();
         let merge_config = config.clone();
         let mut merge =
-            tokio::spawn(async move { merge_once(&merge_registry, None, &merge_config).await });
+            tokio::spawn(async move { merge_once_without_retention(&merge_registry, None, &merge_config).await });
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut merge)
                 .await
@@ -131,7 +131,7 @@
         }
         assert_eq!(registry.part_count(), 2);
 
-        merge_once(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config).await.unwrap();
 
         assert_eq!(registry.part_count(), 2);
     }
@@ -202,7 +202,7 @@
         }
         assert_eq!(registry.part_count(), 4);
 
-        merge_once(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config).await.unwrap();
 
         assert_eq!(registry.part_count(), 1);
         let results = registry
@@ -237,7 +237,7 @@
             registry.register(parts).unwrap();
         }
 
-        merge_once(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config).await.unwrap();
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.len(), 2);
@@ -272,7 +272,7 @@
             let parts = part::flush_rows(rows, &parts_root, config.row_group_size).unwrap();
             registry.register(parts).unwrap();
         }
-        merge_once(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config).await.unwrap();
         assert_eq!(registry.part_count(), 1);
 
         // bloom prune after merge
@@ -334,7 +334,7 @@
             registry.register(parts).unwrap();
         }
 
-        merge_once(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config).await.unwrap();
 
         assert_eq!(registry.part_count(), 1);
         let rows = read_all_rows(&registry.snapshot()).unwrap();
@@ -342,3 +342,221 @@
         assert_eq!(rows.last().map(|row| row.timestamp_ns), Some(i64::MAX));
     }
 
+
+    fn tenant_id(raw: &str) -> crate::tenant::TenantId {
+        crate::tenant::TenantId::parse(raw).expect("valid tenant id")
+    }
+
+    fn tenant_row(owner: &str, timestamp_ns: i64) -> part::Row {
+        part::Row {
+            tenant: tenant_id(owner),
+            timestamp_ns,
+            labels: [("app".to_string(), owner.to_string())]
+                .into_iter()
+                .collect(),
+            line: format!("{owner}-{timestamp_ns}"),
+            structured_metadata: vec![],
+        }
+    }
+
+    fn policy_with(entries: &[(&str, crate::tenant_policy::TenantRetention)]) -> TenantPolicy {
+        let policy = TenantPolicy::enabled_for_test();
+        policy.install_for_test(
+            entries
+                .iter()
+                .map(|(name, retention)| (tenant_id(name), *retention))
+                .collect(),
+        );
+        policy
+    }
+
+    /// A part too small for an ordinary merge group still gets rewritten when
+    /// enough of it has expired, and the surviving tenant comes through with a
+    /// correct tenant index.
+    #[tokio::test]
+    async fn a_partially_expired_part_is_rewritten_and_the_other_tenant_survives() {
+        let dir = tmp_dir("partial-expiry");
+        let config = Config {
+            data_dir: dir.clone(),
+            // Far above the single part below: only the expired share can
+            // make this part eligible.
+            merge_min_part_count: 4,
+            retention_period: None,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        let parts = part::flush_rows(
+            vec![
+                tenant_row("alpha", 1_000),
+                tenant_row("alpha", 1_001),
+                tenant_row("beta", 1_002),
+            ],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        registry.register(parts.clone()).unwrap();
+        let original_id = parts[0].meta.id.clone();
+
+        // alpha is two of three rows, so the expired fraction clears the 0.5
+        // default threshold.
+        let policy = policy_with(&[
+            (
+                "alpha",
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_nanos(1)),
+            ),
+            ("beta", crate::tenant_policy::TenantRetention::Infinite),
+        ]);
+        let metrics = RuntimeMetrics::new();
+
+        merge_once(&registry, None, &config, &policy, &metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(registry.part_count(), 1);
+        let reader = registry.snapshot().remove(0);
+        assert_ne!(reader.meta().id, original_id, "the part must be replaced");
+        assert_eq!(reader.meta().row_count, 1);
+        let tenants: Vec<String> = reader
+            .meta()
+            .tenants
+            .iter()
+            .map(|segment| segment.tenant.to_string())
+            .collect();
+        assert_eq!(tenants, vec!["beta".to_string()]);
+        assert_eq!(reader.meta().tenants[0].row_count, 1);
+        assert_eq!(reader.meta().tenants[0].row_group_start, 0);
+        assert_eq!(
+            reader.meta().tenants[0].row_group_end,
+            reader.meta().row_group_count
+        );
+
+        let surviving = registry
+            .query(&tenant_id("beta"), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .unwrap();
+        assert_eq!(
+            surviving
+                .iter()
+                .flat_map(|stream| &stream.entries)
+                .map(|entry| entry.line.clone())
+                .collect::<Vec<_>>(),
+            vec!["beta-1002".to_string()]
+        );
+        assert!(
+            registry
+                .query(&tenant_id("alpha"), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            metrics
+                .retention_expired_rows_dropped
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(metrics.retention_parts_rewritten.load(Ordering::Relaxed), 1);
+    }
+
+    /// Below the threshold the rows stay on disk — already invisible to
+    /// queries — instead of paying for a rewrite.
+    #[tokio::test]
+    async fn a_barely_expired_part_is_left_alone() {
+        let dir = tmp_dir("below-threshold");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 4,
+            retention_period: None,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        let parts = part::flush_rows(
+            vec![
+                tenant_row("alpha", 1_000),
+                tenant_row("beta", 1_001),
+                tenant_row("beta", 1_002),
+                tenant_row("beta", 1_003),
+            ],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        registry.register(parts.clone()).unwrap();
+        let original_id = parts[0].meta.id.clone();
+
+        let policy = policy_with(&[
+            (
+                "alpha",
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_nanos(1)),
+            ),
+            ("beta", crate::tenant_policy::TenantRetention::Infinite),
+        ]);
+
+        merge_once(&registry, None, &config, &policy, &RuntimeMetrics::new())
+            .await
+            .unwrap();
+
+        assert_eq!(registry.part_count(), 1);
+        assert_eq!(registry.snapshot()[0].meta().id, original_id);
+    }
+
+    /// An unknown tenant is never dropped, even from a part that merge is
+    /// rewriting for another reason.
+    #[tokio::test]
+    async fn merge_never_drops_rows_for_an_unknown_tenant() {
+        let dir = tmp_dir("unknown-tenant-merge");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 2,
+            retention_period: None,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        for timestamp_ns in [1_000i64, 2_000] {
+            let parts = part::flush_rows(
+                vec![
+                    tenant_row("alpha", timestamp_ns),
+                    tenant_row("unmentioned", timestamp_ns),
+                ],
+                &parts_root,
+                config.row_group_size,
+            )
+            .unwrap();
+            registry.register(parts).unwrap();
+        }
+
+        let policy = policy_with(&[(
+            "alpha",
+            crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_nanos(1)),
+        )]);
+
+        merge_once(&registry, None, &config, &policy, &RuntimeMetrics::new())
+            .await
+            .unwrap();
+
+        assert_eq!(registry.part_count(), 1);
+        let survivors = registry
+            .query(
+                &tenant_id("unmentioned"),
+                &[],
+                &[],
+                i64::MIN,
+                i64::MAX,
+                10,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            survivors
+                .iter()
+                .map(|stream| stream.entries.len())
+                .sum::<usize>(),
+            2
+        );
+    }

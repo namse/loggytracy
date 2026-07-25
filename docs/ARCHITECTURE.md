@@ -63,6 +63,11 @@ TLS 종단은 이 프로세스의 책임이 아니다. 인증서 발급·갱신�
   min/max 타임스탬프를 담고, 모든 읽기 경로는 이 구간 밖의 row group을 **주소로 지정할 수 없다**.
   테넌트를 경로 축으로 두는 예전 설계는 R2 Class A 비용 때문에 폐기됐다 —
   자세한 비용 모델과 근거는 [`docs/MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md).
+- **retention**: 플랜 속성이므로 테넌트마다 다르다. 설정한 control plane 엔드포인트에서
+  테넌트→retention 맵을 주기적으로 받아 **삭제 시점에** 적용한다 — 쓰기 시점이 아니므로
+  플랜 업그레이드·다운그레이드가 이미 기록된 데이터에도 그대로 반영된다.
+  응답에 없는 테넌트는 **정책 미상이며 미상은 보존**이다. 자세한 내용은
+  [`docs/RETENTION_DESIGN.md`](RETENTION_DESIGN.md).
 - **스로틀·quota 대상**: ingest rate(bytes/s, events/s), 활성 스트림 수(카디널리티),
   저장 용량, 동시 쿼리 수, 쿼리 스캔 예산. 초과 시 ingest는 `429`(Alloy가 backoff하고 자체 WAL로
   버티게 한다), 쿼리는 `429` 또는 `422`로 응답한다.
@@ -163,6 +168,23 @@ LogQL 파싱(chumsky) → 플랜 → 프루닝 단계 순서:
 
 - `LOGGYTRACY_DEFAULT_TENANT`, `LOGGYTRACY_MISSING_TENANT_POLICY`: 테넌트 식별 (위 "테넌시" 절).
   허용 목록 검증도 다른 제한과 같이 journal append 이전에 적용된다.
+
+### Retention 설정
+
+두 가지 모드가 있고 **섞이지 않는다**. 둘 다 설정하면 시작 시 검증 오류로 죽는다 —
+retention 설정이 조용히 무시되는 것이 가장 나쁜 결과이기 때문이다.
+
+- `LOGGYTRACY_RETENTION_PERIOD` (기본 미설정): 모든 테넌트에 적용되는 전역 기간.
+- `LOGGYTRACY_TENANT_POLICY_URL` (기본 미설정): 테넌트별 retention. 설정하면 이 엔드포인트에서
+  받은 스냅샷이 유일한 권위가 된다. 함께 쓰는 값은
+  `LOGGYTRACY_TENANT_POLICY_INTERVAL` (기본 300s), `LOGGYTRACY_TENANT_POLICY_TIMEOUT` (기본 10s),
+  `LOGGYTRACY_TENANT_POLICY_AUTH_HEADER` (`Name: value` 한 줄),
+  `LOGGYTRACY_TENANT_POLICY_MAX_BYTES` (기본 8 MiB),
+  `LOGGYTRACY_MAX_TENANT_RETENTION` (엔드포인트 값의 상한),
+  `LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` (기본 0.5 — part를 다시 쓸 만한 만료 행 비율).
+
+엔드포인트는 ingest·쿼리 hot path에 **없다**. 쓰기는 아예 조회하지 않고, 읽기는 스냅샷이 없으면
+범위를 그대로 둔다(fail open). 즉 control plane이 죽어 있으면 회수만 멈추고 가용성은 그대로다.
 
 이 제한들은 아직 전역이다. 테넌트별 스로틀·quota는 후속 작업이다(위 "테넌시" 절).
 

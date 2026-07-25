@@ -43,6 +43,17 @@ pub async fn query_range(
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
 
+    // Retention is enforced logically here, before any scan. The range is
+    // validated against the request the client made and clamped afterwards, so
+    // a downgrade hides data immediately instead of turning valid queries into
+    // errors. `None` leaves the range untouched: an unknown tenant, or a
+    // control plane that has not answered yet, must never break reads.
+    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
+    let start_ns = clamp_to_retention(start_ns, retention_floor_ns);
+    if start_ns > end_ns {
+        return Ok(Json(empty_query_range_response(&parsed)));
+    }
+
     let forward = parse_direction(&params.direction).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let max_log_limit = state.config.max_log_limit.min(MAX_LOG_LIMIT);
     let max_scan_rows = state.config.max_query_scan_rows.min(MAX_LOG_SCAN_ROWS);
@@ -85,9 +96,15 @@ pub async fn query_range(
                     ),
                 ));
             }
-            let execution = run_metric_query_with_stats(state, tenant, expr, times, None)
-                .await
-                .map_err(|e| (metric_error_status(&e), e))?;
+            // Clamping the range start is not enough for a metric query: the
+            // first evaluation point still looks back past it. Raise the scan
+            // start too, so no expired row can reach the evaluator.
+            let scan_start_override = retention_floor_ns
+                .map(|floor_ns| floor_ns.max(start_ns.saturating_sub(expr.lookback_ns())));
+            let execution =
+                run_metric_query_with_stats(state, tenant, expr, times, scan_start_override)
+                    .await
+                    .map_err(|e| (metric_error_status(&e), e))?;
             (
                 "matrix",
                 metric_series_json(execution.series, false),
@@ -146,6 +163,12 @@ pub async fn query(
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
 
+    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
+    let query_start_ns = clamp_to_retention(query_start_ns, retention_floor_ns);
+    if query_start_ns > end_ns {
+        return Ok(Json(empty_query_response(&parsed)));
+    }
+
     let forward = parse_direction(&params.direction).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let max_log_limit = state.config.max_log_limit.min(MAX_LOG_LIMIT);
     let max_scan_rows = state.config.max_query_scan_rows.min(MAX_LOG_SCAN_ROWS);
@@ -173,9 +196,17 @@ pub async fn query(
             )
         }
         logql::QueryExpr::Metric(expr) => {
-            let execution = run_metric_query_with_stats(state, tenant, expr, vec![end_ns], None)
-                .await
-                .map_err(|e| (metric_error_status(&e), e))?;
+            let scan_start_override = retention_floor_ns
+                .map(|floor_ns| floor_ns.max(end_ns.saturating_sub(expr.lookback_ns())));
+            let execution = run_metric_query_with_stats(
+                state,
+                tenant,
+                expr,
+                vec![end_ns],
+                scan_start_override,
+            )
+            .await
+            .map_err(|e| (metric_error_status(&e), e))?;
             (
                 "vector",
                 metric_series_json(execution.series, true),
@@ -198,6 +229,46 @@ pub async fn query(
     }))
 }
 
+/// `effective_start = max(requested_start, now - retention(tenant))`.
+fn clamp_to_retention(start_ns: i64, retention_floor_ns: Option<i64>) -> i64 {
+    match retention_floor_ns {
+        Some(floor_ns) => start_ns.max(floor_ns),
+        None => start_ns,
+    }
+}
+
+/// A range query whose whole window is older than the tenant's retention. The
+/// data may still be on disk waiting for the next merge, but it is no longer
+/// the tenant's to read.
+fn empty_query_range_response(parsed: &logql::QueryExpr) -> LokiResponse<QueryRangeData> {
+    empty_response(match parsed {
+        logql::QueryExpr::Logs(_) => "streams",
+        logql::QueryExpr::Metric(_) => "matrix",
+    })
+}
+
+fn empty_query_response(parsed: &logql::QueryExpr) -> LokiResponse<QueryRangeData> {
+    empty_response(match parsed {
+        logql::QueryExpr::Logs(_) => "streams",
+        logql::QueryExpr::Metric(_) => "vector",
+    })
+}
+
+fn empty_response(result_type: &'static str) -> LokiResponse<QueryRangeData> {
+    LokiResponse {
+        status: "success",
+        data: QueryRangeData {
+            result_type,
+            result: serde_json::Value::Array(Vec::new()),
+            stats: Stats {
+                summary: StatsSummary {
+                    total_lines_processed: 0,
+                },
+            },
+        },
+    }
+}
+
 fn duration_to_i64_ns(duration: std::time::Duration) -> i64 {
     duration
         .as_nanos()
@@ -210,11 +281,12 @@ pub async fn labels(
 ) -> Result<Json<LokiResponse<Vec<String>>>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
     let mut names = std::collections::BTreeSet::new();
-    for n in state.memtable.label_names(&tenant) {
+    for n in state.memtable.label_names(&tenant, retention_floor_ns) {
         names.insert(n);
     }
-    for n in state.parts.label_names(&tenant) {
+    for n in state.parts.label_names(&tenant, retention_floor_ns) {
         names.insert(n);
     }
     Ok(Json(LokiResponse {
@@ -230,11 +302,12 @@ pub async fn label_values(
 ) -> Result<Json<LokiResponse<Vec<String>>>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
     let mut values = std::collections::BTreeSet::new();
-    for v in state.memtable.label_values(&tenant, &name) {
+    for v in state.memtable.label_values(&tenant, &name, retention_floor_ns) {
         values.insert(v);
     }
-    for v in state.parts.label_values(&tenant, &name) {
+    for v in state.parts.label_values(&tenant, &name, retention_floor_ns) {
         values.insert(v);
     }
     Ok(Json(LokiResponse {
@@ -309,9 +382,10 @@ pub async fn index_stats(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let mem = state.memtable.stats(&tenant);
-    let disk = state.parts.stats(&tenant);
-    let stream_count = distinct_stream_count(&state, &tenant);
+    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
+    let mem = state.memtable.stats(&tenant, retention_floor_ns);
+    let disk = state.parts.stats(&tenant, retention_floor_ns);
+    let stream_count = distinct_stream_count(&state, &tenant, retention_floor_ns);
     Ok(Json(serde_json::json!({
         "status": "success",
         "data": {
@@ -341,6 +415,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
     let checkpoint = crate::journal::read_checkpoint(state.journal.ckpt_path()).unwrap_or(0);
     let wal_backlog_bytes = wal_bytes.saturating_sub(checkpoint);
     let merge_debt_parts = crate::merge::merge_debt_part_count(&state.parts, &state.config);
+    let policy = tenant_policy_gauges(&state);
     let m = &state.metrics;
     format!(
         "# TYPE loggytracy_memtable_entries gauge\n\
@@ -379,6 +454,24 @@ loggytracy_merge_errors_total {}\n\
 loggytracy_retention_success_total {}\n\
 # TYPE loggytracy_retention_errors_total counter\n\
 loggytracy_retention_errors_total {}\n\
+# TYPE loggytracy_retention_expired_rows_dropped_total counter\n\
+loggytracy_retention_expired_rows_dropped_total {}\n\
+# TYPE loggytracy_retention_parts_rewritten_total counter\n\
+loggytracy_retention_parts_rewritten_total {}\n\
+# TYPE loggytracy_tenant_policy_fetch_success_total counter\n\
+loggytracy_tenant_policy_fetch_success_total {}\n\
+# TYPE loggytracy_tenant_policy_fetch_errors_total counter\n\
+loggytracy_tenant_policy_fetch_errors_total {}\n\
+# TYPE loggytracy_tenant_policy_fetch_latency_ns_total counter\n\
+loggytracy_tenant_policy_fetch_latency_ns_total {}\n\
+# TYPE loggytracy_tenant_policy_known_tenants gauge\n\
+loggytracy_tenant_policy_known_tenants {}\n\
+# TYPE loggytracy_tenant_policy_infinite_tenants gauge\n\
+loggytracy_tenant_policy_infinite_tenants {}\n\
+# TYPE loggytracy_tenant_policy_unknown_tenants gauge\n\
+loggytracy_tenant_policy_unknown_tenants {}\n\
+# TYPE loggytracy_tenant_policy_snapshot_age_seconds gauge\n\
+loggytracy_tenant_policy_snapshot_age_seconds {}\n\
 # TYPE loggytracy_query_success_total counter\n\
 loggytracy_query_success_total {}\n\
 # TYPE loggytracy_query_errors_total counter\n\
@@ -421,6 +514,19 @@ loggytracy_force_flush_complete {}\n",
         m.merge_errors.load(Ordering::Relaxed),
         m.retention_success.load(Ordering::Relaxed),
         m.retention_errors.load(Ordering::Relaxed),
+        m.retention_expired_rows_dropped.load(Ordering::Relaxed),
+        m.retention_parts_rewritten.load(Ordering::Relaxed),
+        state.tenant_policy.metrics.fetch_success.load(Ordering::Relaxed),
+        state.tenant_policy.metrics.fetch_errors.load(Ordering::Relaxed),
+        state
+            .tenant_policy
+            .metrics
+            .fetch_latency_ns
+            .load(Ordering::Relaxed),
+        policy.known_tenants,
+        policy.infinite_tenants,
+        policy.unknown_tenants,
+        policy.snapshot_age_seconds,
         m.query_success.load(Ordering::Relaxed),
         m.query_errors.load(Ordering::Relaxed),
         m.query_scanned_rows.load(Ordering::Relaxed),
@@ -434,6 +540,49 @@ loggytracy_force_flush_complete {}\n",
         state.shutdown.pending_flush_bytes(),
         state.shutdown.is_flush_complete() as u8,
     )
+}
+
+struct TenantPolicyGauges {
+    known_tenants: usize,
+    infinite_tenants: usize,
+    unknown_tenants: usize,
+    snapshot_age_seconds: u64,
+}
+
+/// `"infinite"` and *absent* keep the same data, so a control plane that
+/// silently drops a tenant is only visible as a rising unknown-tenant gauge
+/// rather than as invisible unbounded storage.
+fn tenant_policy_gauges(state: &AppState) -> TenantPolicyGauges {
+    let Some(snapshot) = state.tenant_policy.snapshot() else {
+        return TenantPolicyGauges {
+            known_tenants: 0,
+            infinite_tenants: 0,
+            unknown_tenants: 0,
+            snapshot_age_seconds: 0,
+        };
+    };
+    let mut unknown: std::collections::BTreeSet<crate::tenant::TenantId> =
+        std::collections::BTreeSet::new();
+    for reader in state.parts.snapshot() {
+        for segment in &reader.meta().tenants {
+            if snapshot.retention(&segment.tenant).is_none() {
+                unknown.insert(segment.tenant.clone());
+            }
+        }
+    }
+    for reader in state.trace_parts.snapshot() {
+        for segment in &reader.part().meta.tenants {
+            if snapshot.retention(&segment.tenant).is_none() {
+                unknown.insert(segment.tenant.clone());
+            }
+        }
+    }
+    TenantPolicyGauges {
+        known_tenants: snapshot.tenant_count(),
+        infinite_tenants: snapshot.infinite_tenant_count(),
+        unknown_tenants: unknown.len(),
+        snapshot_age_seconds: snapshot.age(std::time::SystemTime::now()).as_secs(),
+    }
 }
 
 fn extract_match_params(raw: &Option<String>) -> Vec<String> {
@@ -453,13 +602,22 @@ pub async fn series(
 ) -> Result<Json<LokiResponse<Vec<HashMap<String, String>>>>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
     let matchers = extract_match_params(&raw);
     let mut all_series: Vec<Labels> = Vec::new();
     for matcher_str in &matchers {
         let parsed = logql::parse(matcher_str)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
-        all_series.extend(state.memtable.series(&tenant, &parsed.matchers));
-        all_series.extend(state.parts.series(&tenant, &parsed.matchers));
+        all_series.extend(
+            state
+                .memtable
+                .series(&tenant, &parsed.matchers, retention_floor_ns),
+        );
+        all_series.extend(
+            state
+                .parts
+                .series(&tenant, &parsed.matchers, retention_floor_ns),
+        );
     }
     all_series.sort();
     all_series.dedup();

@@ -27,6 +27,43 @@ pub fn merge_debt_part_count(registry: &PartRegistry, config: &Config) -> usize 
     debt
 }
 
+/// Merge groups for one partition, including the ones retention needs.
+///
+/// An ordinary group must reach `merge_min_part_count` to be worth the write.
+/// A part whose expired share exceeds `retention_rewrite_threshold` is worth
+/// it on its own, so it is admitted as a group of one — even when it is too
+/// large for `group_for_merge` to consider at all.
+fn select_groups(
+    parts: &[Arc<PartReader>],
+    config: &Config,
+    cutoffs: Option<&Cutoffs>,
+) -> Vec<Vec<Arc<PartReader>>> {
+    let min_part_count = config.merge_min_part_count.max(2);
+    let needs_rewrite = |reader: &Arc<PartReader>| {
+        cutoffs.is_some_and(|cutoffs| {
+            cutoffs.expired_log_row_fraction(reader.meta()) >= config.retention_rewrite_threshold
+        })
+    };
+
+    let mut selected: Vec<Vec<Arc<PartReader>>> = Vec::new();
+    let mut grouped: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for group in group_for_merge(parts, config) {
+        if group.len() < min_part_count && !group.iter().any(needs_rewrite) {
+            continue;
+        }
+        for reader in &group {
+            grouped.insert(reader.meta().id.clone());
+        }
+        selected.push(group);
+    }
+    for reader in parts {
+        if needs_rewrite(reader) && !grouped.contains(&reader.meta().id) {
+            selected.push(vec![reader.clone()]);
+        }
+    }
+    selected
+}
+
 fn group_for_merge(parts: &[Arc<PartReader>], config: &Config) -> Vec<Vec<Arc<PartReader>>> {
     let mut groups: Vec<Vec<Arc<PartReader>>> = Vec::new();
     let mut current: Vec<Arc<PartReader>> = Vec::new();

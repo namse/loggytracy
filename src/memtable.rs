@@ -314,28 +314,48 @@ impl MemTable {
     /// Run `visit` over both buffers of one tenant while holding the read
     /// guards in the order `begin_flush`/`abort_flush` acquire them, so an
     /// entry can never be observed in both buffers or in neither.
+    /// Visit each of the tenant's streams, restricted to entries the tenant's
+    /// retention still covers. `retention_floor_ns` of `None` visits
+    /// everything, which is the fail-open behaviour for an unknown tenant.
     fn for_each_tenant_stream(
         &self,
         tenant: &TenantId,
+        retention_floor_ns: Option<i64>,
         mut visit: impl FnMut(&Labels, &[LogEntry]),
     ) {
         let inner = self.inner.read().unwrap();
         let flushing = self.flushing.read().unwrap();
+        let mut retained = Vec::new();
+        let mut visit_retained = |labels: &Labels, entries: &[LogEntry]| match retention_floor_ns {
+            None => visit(labels, entries),
+            Some(floor_ns) => {
+                retained.clear();
+                retained.extend(
+                    entries
+                        .iter()
+                        .filter(|entry| entry.timestamp_ns >= floor_ns)
+                        .cloned(),
+                );
+                if !retained.is_empty() {
+                    visit(labels, &retained);
+                }
+            }
+        };
         if let Some(streams) = inner.get(tenant) {
             for (labels, entries) in streams {
-                visit(labels, entries);
+                visit_retained(labels, entries);
             }
         }
         if let Some(streams) = flushing.as_ref().and_then(|f| f.get(tenant)) {
             for (labels, entries) in streams {
-                visit(labels, entries);
+                visit_retained(labels, entries);
             }
         }
     }
 
-    pub fn label_names(&self, tenant: &TenantId) -> Vec<String> {
+    pub fn label_names(&self, tenant: &TenantId, retention_floor_ns: Option<i64>) -> Vec<String> {
         let mut names = BTreeSet::new();
-        self.for_each_tenant_stream(tenant, |labels, _| {
+        self.for_each_tenant_stream(tenant, retention_floor_ns, |labels, _| {
             for k in labels.keys() {
                 names.insert(k.clone());
             }
@@ -343,9 +363,14 @@ impl MemTable {
         names.into_iter().collect()
     }
 
-    pub fn label_values(&self, tenant: &TenantId, name: &str) -> Vec<String> {
+    pub fn label_values(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        retention_floor_ns: Option<i64>,
+    ) -> Vec<String> {
         let mut values = BTreeSet::new();
-        self.for_each_tenant_stream(tenant, |labels, _| {
+        self.for_each_tenant_stream(tenant, retention_floor_ns, |labels, _| {
             if let Some(v) = labels.get(name) {
                 values.insert(v.clone());
             }
@@ -353,9 +378,14 @@ impl MemTable {
         values.into_iter().collect()
     }
 
-    pub fn series(&self, tenant: &TenantId, matchers: &[LabelMatcher]) -> Vec<Labels> {
+    pub fn series(
+        &self,
+        tenant: &TenantId,
+        matchers: &[LabelMatcher],
+        retention_floor_ns: Option<i64>,
+    ) -> Vec<Labels> {
         let mut result: BTreeSet<Labels> = BTreeSet::new();
-        self.for_each_tenant_stream(tenant, |labels, _| {
+        self.for_each_tenant_stream(tenant, retention_floor_ns, |labels, _| {
             if matchers.iter().all(|m| m.matches(labels)) {
                 result.insert(labels.clone());
             }
@@ -389,11 +419,11 @@ impl MemTable {
         }
     }
 
-    pub fn stats(&self, tenant: &TenantId) -> IndexStats {
+    pub fn stats(&self, tenant: &TenantId, retention_floor_ns: Option<i64>) -> IndexStats {
         let mut stream_set: BTreeSet<Labels> = BTreeSet::new();
         let mut entries = 0usize;
         let mut bytes = 0u64;
-        self.for_each_tenant_stream(tenant, |labels, stream| {
+        self.for_each_tenant_stream(tenant, retention_floor_ns, |labels, stream| {
             stream_set.insert(labels.clone());
             entries += stream.len();
             for e in stream {
@@ -459,16 +489,16 @@ mod tests {
             .collect();
         assert_eq!(lines, vec!["acme line"]);
 
-        assert_eq!(memtable.stats(&tenant("acme")).entries, 1);
-        assert_eq!(memtable.stats(&tenant("globex")).entries, 1);
+        assert_eq!(memtable.stats(&tenant("acme"), None).entries, 1);
+        assert_eq!(memtable.stats(&tenant("globex"), None).entries, 1);
         assert!(
             memtable
                 .query(&tenant("initech"), &[], &[], i64::MIN, i64::MAX, 100, true)
                 .is_empty(),
             "an unknown tenant must see nothing"
         );
-        assert!(memtable.label_names(&tenant("initech")).is_empty());
-        assert!(memtable.series(&tenant("initech"), &[]).is_empty());
+        assert!(memtable.label_names(&tenant("initech"), None).is_empty());
+        assert!(memtable.series(&tenant("initech"), &[], None).is_empty());
     }
 
     #[test]
@@ -561,7 +591,7 @@ mod tests {
             vec![sample_entry("second", 200)],
         );
 
-        let stats = mt.stats(&sample_tenant());
+        let stats = mt.stats(&sample_tenant(), None);
         assert_eq!(stats.streams, 1);
         assert_eq!(stats.entries, 2);
     }

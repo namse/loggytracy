@@ -8,6 +8,7 @@ use crate::metrics::RuntimeMetrics;
 use crate::object_storage::RemoteCache;
 use crate::part_registry::PartRegistry;
 use crate::shutdown::ShutdownState;
+use crate::tenant_policy::TenantPolicy;
 use crate::trace_registry::TraceRegistry;
 
 /// Runtime resources shared by HTTP handlers and background workers.
@@ -25,6 +26,9 @@ pub struct AppState {
     pub retention_healthy: Arc<AtomicBool>,
     pub otlp_healthy: Arc<AtomicBool>,
     pub remote_cache: Option<Arc<RemoteCache>>,
+    /// The tenant→retention snapshot, read by query handlers to clamp a
+    /// requested range to what the tenant is still entitled to see.
+    pub tenant_policy: Arc<TenantPolicy>,
     pub metrics: Arc<RuntimeMetrics>,
     pub shutdown: Arc<ShutdownState>,
 }
@@ -40,6 +44,7 @@ pub struct AppStateDependencies {
     pub retention_healthy: Arc<AtomicBool>,
     pub otlp_healthy: Arc<AtomicBool>,
     pub remote_cache: Option<Arc<RemoteCache>>,
+    pub tenant_policy: Arc<TenantPolicy>,
     pub metrics: Arc<RuntimeMetrics>,
     pub shutdown: Arc<ShutdownState>,
 }
@@ -69,6 +74,7 @@ impl AppState {
             retention_healthy: dependencies.retention_healthy,
             otlp_healthy: dependencies.otlp_healthy,
             remote_cache: dependencies.remote_cache,
+            tenant_policy: dependencies.tenant_policy,
             metrics: dependencies.metrics,
             shutdown: dependencies.shutdown,
         }

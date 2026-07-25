@@ -12,6 +12,7 @@ use crate::object_storage::RemoteCache;
 use crate::part::{self, PartReader};
 use crate::part_registry::PartRegistry;
 use crate::shutdown::wait_for_drain;
+use crate::tenant_policy::{Cutoffs, TenantPolicy};
 
 include!("scheduler.rs");
 include!("transaction.rs");

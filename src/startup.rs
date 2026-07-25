@@ -15,6 +15,7 @@ use crate::object_storage::{ObjectStorage, RemoteCache};
 use crate::part_registry::PartRegistry;
 use crate::retention;
 use crate::router;
+use crate::tenant_policy::TenantPolicy;
 use crate::trace_ingest;
 use crate::{AppState, trace_registry};
 
@@ -158,6 +159,10 @@ pub async fn run(config: Arc<Config>) {
     let retention_healthy = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(RuntimeMetrics::new());
     let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
+    let tenant_policy = Arc::new(
+        TenantPolicy::from_config(&config)
+            .unwrap_or_else(|error| panic!("tenant policy initialization failed: {error}")),
+    );
 
     // Handles for every background worker. Shutdown signals them through the
     // drain watch and then joins them here before the final force-flush, so the
@@ -218,8 +223,18 @@ pub async fn run(config: Arc<Config>) {
         let cache = remote_cache.clone();
         let metrics = metrics.clone();
         let drain_rx = shutdown.subscribe();
+        let policy = tenant_policy.clone();
         let handle = tokio::spawn(async move {
-            merge::merge_loop(registry, cache, config, task_health, metrics, drain_rx).await;
+            merge::merge_loop(
+                registry,
+                cache,
+                config,
+                policy,
+                task_health,
+                metrics,
+                drain_rx,
+            )
+            .await;
         });
         worker_handles.push(tokio::spawn(async move {
             match handle.await {
@@ -287,6 +302,7 @@ pub async fn run(config: Arc<Config>) {
         let remote_cache = remote_cache.clone();
         let config = config.clone();
         let metrics = metrics.clone();
+        let policy = tenant_policy.clone();
         let retention_health = retention_healthy.clone();
         let drain_rx = shutdown.subscribe();
         worker_handles.push(tokio::spawn(async move {
@@ -295,6 +311,7 @@ pub async fn run(config: Arc<Config>) {
                 trace_registry,
                 remote_cache,
                 config,
+                policy,
                 metrics,
                 retention_health,
                 drain_rx,
@@ -317,6 +334,7 @@ pub async fn run(config: Arc<Config>) {
             retention_healthy,
             otlp_healthy: otlp_healthy.clone(),
             remote_cache,
+            tenant_policy,
             metrics,
             shutdown: shutdown.clone(),
         },

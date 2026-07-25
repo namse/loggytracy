@@ -154,6 +154,13 @@ right shape for a platform.
 
 ### Retention: partition by tier, not by tenant
 
+> **Superseded.** This section records the reasoning as it stood when the
+> document was written. Partitioning on `(tier, day)` was rejected because it
+> fixes retention at write time, so a plan upgrade or downgrade never reaches
+> data that is already on disk. Per-tenant retention is instead decided from
+> the `meta.json` tenant index at **deletion** time; see
+> [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md). Partitions stay on `day`.
+
 Shared objects cannot express per-tenant retention. fn0 does not need it:
 retention is a **plan attribute** ($1 plan, free plan), not a per-project
 setting.
@@ -402,7 +409,8 @@ This is the gap `PRODUCTION_READINESS_REVIEW.md:276` records as
 | Trace part format | **done** — same shape (`tenant` column, tenant-aligned row groups, tenant index) |
 | Read path isolation | **done** — `PartReader`/`PartRegistry`/`TraceRegistry`/MemTable queries, `label_names`, `label_values`, `series`, `stats` all take a required tenant; part-level time pruning is per tenant |
 | Merge | **done** — reads rows through the tenant index and re-sorts by `(tenant, ts)`; no cross-tenant mixing beyond the shared object |
-| Partition on `(tier, day)` | **not done** — still `day`. There is no tenant→tier mapping in the engine; see [Open questions](#open-questions) |
+| Per-tenant retention | **done** — `tenant_policy.rs` polls a configured endpoint and applies it at deletion time; partitions stay on `day`. See [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
+| Partition on `(tier, day)` | **rejected** — retention baked in at write time cannot honour a plan change; superseded by [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
 | Sidecar consolidation | **not done** — still four `PART_FILES` |
 | Range GET / per-`(part, tenant)` cache | **not done** |
 | Quotas, per-tenant semaphores, tenant-labelled metrics | **not done** |
@@ -413,11 +421,12 @@ operator scrape, not a tenant-facing endpoint.
 
 ### Open questions
 
-**Where does a tenant's tier come from?** `Partition on (tier, day)` assumes the
-engine can map a tenant to its plan. Nothing supplies that today. The options
-are a whole-instance tier from config (one engine per tier), a second request
-header, or a config-driven tenant→tier map. Partitioning stayed on `day` until
-this is decided; retention is still one global period.
+**Where does a tenant's tier come from?** *Answered* — a configured control-plane
+endpoint, polled by the retention loop, and applied at **deletion** time rather
+than at write time. `Partition on (tier, day)` was rejected along with every
+other scheme that fixes retention when the bytes are written, because none of
+them honours a plan upgrade or downgrade. Partitions stay on `day`. Full record:
+[`RETENTION_DESIGN.md`](RETENTION_DESIGN.md).
 
 **Parquet footer size at high tenant counts** remains unmeasured — the open item
 recorded under [Known read-side overhead](#known-read-side-overhead).
@@ -439,7 +448,8 @@ Ordered by dependency.
       `part/format.rs`.
 - [x] Align row-group boundaries to tenant boundaries in `row_group_bounds`.
 - [x] Add the per-tenant index to `meta.json` (`part/metadata.rs`).
-- [ ] Partition on `(tier, day)` instead of `day` (`part/format.rs:1-5`).
+- [x] ~~Partition on `(tier, day)` instead of `day`~~ — rejected; per-tenant
+      retention is applied at deletion time instead ([`RETENTION_DESIGN.md`](RETENTION_DESIGN.md)).
 - [ ] Consolidate `PART_FILES` into a single container object.
 
 ### 3. Read path

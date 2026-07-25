@@ -2,6 +2,7 @@ pub async fn merge_loop(
     registry: Arc<PartRegistry>,
     remote_cache: Option<Arc<RemoteCache>>,
     config: Arc<Config>,
+    tenant_policy: Arc<TenantPolicy>,
     healthy: Arc<AtomicBool>,
     metrics: Arc<RuntimeMetrics>,
     mut drain_rx: watch::Receiver<bool>,
@@ -14,7 +15,15 @@ pub async fn merge_loop(
             _ = ticker.tick() => {}
             _ = wait_for_drain(&mut drain_rx) => return,
         }
-        match merge_once(&registry, remote_cache.as_deref(), &config).await {
+        match merge_once(
+            &registry,
+            remote_cache.as_deref(),
+            &config,
+            &tenant_policy,
+            &metrics,
+        )
+        .await
+        {
             Ok(()) => {
                 metrics.merge_success.fetch_add(1, Ordering::Relaxed);
                 healthy.store(true, Ordering::Release)
@@ -28,15 +37,41 @@ pub async fn merge_loop(
     }
 }
 
+/// Merge with per-tenant retention switched off, which is what every test
+/// that is not specifically about retention wants.
+#[cfg(test)]
+async fn merge_once_without_retention(
+    registry: &PartRegistry,
+    remote_cache: Option<&RemoteCache>,
+    config: &Config,
+) -> Result<(), String> {
+    merge_once(
+        registry,
+        remote_cache,
+        config,
+        &TenantPolicy::disabled(),
+        &RuntimeMetrics::new(),
+    )
+    .await
+}
+
 async fn merge_once(
     registry: &PartRegistry,
     remote_cache: Option<&RemoteCache>,
     config: &Config,
+    tenant_policy: &TenantPolicy,
+    metrics: &RuntimeMetrics,
 ) -> Result<(), String> {
     let readers = registry.snapshot();
     if readers.is_empty() {
         return Ok(());
     }
+
+    // Retention never writes a part itself. When a part carries expired rows
+    // but no ordinary merge would pick it up, it becomes a valid group of one
+    // here, and merge's existing transaction, tombstone and manifest CAS do
+    // the replacement — one commit path, one crash-safety story.
+    let cutoffs = tenant_policy.cutoffs_now();
 
     let mut by_partition: HashMap<String, Vec<Arc<PartReader>>> = HashMap::new();
     for r in readers {
@@ -56,11 +91,8 @@ async fn merge_once(
         // 너무 큰 단일 part는 제외 (이미 충분히 큼)
         // 작은 part들을 그룹지어 합친다. 단순화: 파티션 내에서 merge_min_part_count개 이상이면
         // 가장 작은 것부터 merge_target_part_rows에 도달할 때까지 그룹화.
-        let groups = group_for_merge(&parts, config);
+        let groups = select_groups(&parts, config, cutoffs.as_ref());
         for group in groups {
-            if group.len() < config.merge_min_part_count.max(2) {
-                continue;
-            }
             if groups_processed >= config.merge_max_groups_per_tick {
                 break 'partitions;
             }
@@ -106,7 +138,7 @@ async fn merge_once(
             .await
             .map_err(|e| format!("merge read task join failed: {}", e))?;
 
-            let rows = match rows_result {
+            let mut rows = match rows_result {
                 Ok(rows) => rows,
                 Err(e) => {
                     tracing::warn!(error = %e, partition = %partition, "merge read failed, skipping group");
@@ -114,6 +146,29 @@ async fn merge_once(
                     continue;
                 }
             };
+
+            // Merge has already loaded and will re-sort these rows, so dropping
+            // the expired ones is a filter over work that is happening anyway.
+            let dropped_rows = match &cutoffs {
+                Some(cutoffs) => {
+                    let before = rows.len();
+                    rows.retain(|row| !cutoffs.is_expired(&row.tenant, row.timestamp_ns));
+                    before - rows.len()
+                }
+                None => 0,
+            };
+            if rows.is_empty() {
+                // Every row expired. Leave the inputs to retention's free
+                // whole-part deletion rather than committing an empty merge.
+                tracing::debug!(partition = %partition, "merge group is entirely expired; leaving it to retention");
+                continue;
+            }
+            if dropped_rows == 0 && group.len() < config.merge_min_part_count.max(2) {
+                // The group only existed to reclaim expired rows, and another
+                // tick already reclaimed them. Rewriting now would copy a part
+                // onto itself.
+                continue;
+            }
 
             let row_group_size = config.row_group_size;
             let merge_result = tokio::task::spawn_blocking({
@@ -221,10 +276,19 @@ async fn merge_once(
                                     }
                                 }
                             }
+                            if dropped_rows > 0 {
+                                metrics
+                                    .retention_expired_rows_dropped
+                                    .fetch_add(dropped_rows as u64, Ordering::Relaxed);
+                                metrics
+                                    .retention_parts_rewritten
+                                    .fetch_add(old_ids.len() as u64, Ordering::Relaxed);
+                            }
                             tracing::info!(
                                 partition = %partition,
                                 merged = old_ids.len(),
                                 produced = new_n,
+                                dropped_rows,
                                 "merge completed"
                             );
                         }

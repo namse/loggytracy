@@ -21,7 +21,10 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
   - [x] 테넌트 공유 part: `(tenant, ts)` 정렬 + 테넌트 경계에 정렬된 row group + `meta.json`
         테넌트 인덱스 (로그·트레이스 양쪽)
   - [x] 격리 표면: MemTable·PartRegistry·TraceRegistry·쿼리·카탈로그 조회에 테넌트 필수 인자화
-  - [ ] `(tier, day)` 파티셔닝 — 테넌트→tier 매핑 출처가 미정이라 보류 (설계 문서 Open questions)
+  - [x] 테넌트별 retention — control plane 엔드포인트에서 받은 테넌트→retention 맵을
+        **삭제 시점에** 적용. 설계·근거는 [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
+  - [x] ~~`(tier, day)` 파티셔닝~~ — 폐기. 쓰기 시점에 retention을 고정하면 플랜 변경이
+        기존 데이터에 반영되지 않는다. 파티션은 `day` 유지
   - [ ] part 사이드카 4개→1개 통합, Parquet range read(P2), `(part, tenant)` 로컬 캐시 키
   - [ ] 테넌트별 스로틀·quota·세마포어, 테넌트 라벨 metrics
   - [ ] 월간 사용량 durable 회계 (`FlushTransaction`에 연동)

@@ -7,7 +7,12 @@ pub async fn trace_by_id(
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let trace_id =
         canonical_trace_id(&trace_id).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let spans = query_trace(&state, &tenant, &trace_id).await?;
+    let mut spans = query_trace(&state, &tenant, &trace_id).await?;
+    // A trace lookup carries no range, so retention is applied to the spans
+    // themselves instead of to a clamped window.
+    if let Some(floor_ns) = state.tenant_policy.query_floor_ns(&tenant) {
+        spans.retain(|span| span.start_time_ns >= floor_ns);
+    }
     if spans.is_empty() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -85,6 +90,13 @@ pub async fn search(
         ));
     }
     crate::query::validate_query_range(&state.config, start, end).map_err(client_error)?;
+    let start = match state.tenant_policy.query_floor_ns(&tenant) {
+        Some(floor_ns) => start.max(floor_ns),
+        None => start,
+    };
+    if start > end {
+        return Ok(Json(serde_json::json!({ "traces": [] })));
+    }
     let tags = parse_tags(params.tags.as_deref()).map_err(client_error)?;
     let min_duration = params
         .min_duration
@@ -167,16 +179,20 @@ pub async fn search_tags(
     let tenant = crate::tenant::from_headers(&headers, &state.config)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let guard = pin_all_trace_parts(&state, &tenant).await?;
-    let spans = scan_trace_spans(
-        guard,
-        state.journal.clone(),
-        state.trace_parts.clone(),
-        tenant.clone(),
-        None,
-        state.config.clone(),
-        state.trace_scan_semaphore.clone(),
-    )
-    .await?;
+    let spans = retained_spans(
+        &state,
+        &tenant,
+        scan_trace_spans(
+            guard,
+            state.journal.clone(),
+            state.trace_parts.clone(),
+            tenant.clone(),
+            None,
+            state.config.clone(),
+            state.trace_scan_semaphore.clone(),
+        )
+        .await?,
+    );
     let tags = collect_tags(&spans);
     let (resource_tags, span_tags) = collect_scoped_tags(&spans);
     Ok(Json(serde_json::json!({
@@ -197,16 +213,20 @@ pub async fn search_tag_values(
     let tenant = crate::tenant::from_headers(&headers, &state.config)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let guard = pin_all_trace_parts(&state, &tenant).await?;
-    let spans = scan_trace_spans(
-        guard,
-        state.journal.clone(),
-        state.trace_parts.clone(),
-        tenant.clone(),
-        None,
-        state.config.clone(),
-        state.trace_scan_semaphore.clone(),
-    )
-    .await?;
+    let spans = retained_spans(
+        &state,
+        &tenant,
+        scan_trace_spans(
+            guard,
+            state.journal.clone(),
+            state.trace_parts.clone(),
+            tenant.clone(),
+            None,
+            state.config.clone(),
+            state.trace_scan_semaphore.clone(),
+        )
+        .await?,
+    );
     let values: BTreeSet<String> = spans
         .iter()
         .filter_map(|span| span.tag_value(&tag))
@@ -214,3 +234,16 @@ pub async fn search_tag_values(
     Ok(Json(serde_json::json!({ "tag": tag, "values": values })))
 }
 
+
+/// Drop spans the tenant's retention no longer covers. Used by the tag
+/// endpoints, which have no time range of their own to clamp.
+fn retained_spans(
+    state: &AppState,
+    tenant: &TenantId,
+    mut spans: Vec<TraceSpan>,
+) -> Vec<TraceSpan> {
+    if let Some(floor_ns) = state.tenant_policy.query_floor_ns(tenant) {
+        spans.retain(|span| span.start_time_ns >= floor_ns);
+    }
+    spans
+}

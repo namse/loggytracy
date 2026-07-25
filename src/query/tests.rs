@@ -326,7 +326,7 @@
             None,
         );
 
-        assert_eq!(distinct_stream_count(&state, &test_tenant()), 1);
+        assert_eq!(distinct_stream_count(&state, &test_tenant(), None), 1);
     }
 
     #[tokio::test]
@@ -1116,4 +1116,290 @@
     fn metric_evaluation_points_are_bounded() {
         assert!(evaluation_times(0, MAX_METRIC_EVALUATION_POINTS as i64, 1).is_err());
         assert!(evaluation_times(0, (MAX_METRIC_EVALUATION_POINTS - 1) as i64, 1).is_ok());
+    }
+
+    fn tenant_policy_state(
+        data_dir: &std::path::Path,
+        memtable: Arc<MemTable>,
+        parts: Arc<PartRegistry>,
+        tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
+    ) -> Arc<AppState> {
+        let config = Config {
+            data_dir: data_dir.to_path_buf(),
+            ..Config::default()
+        };
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
+        crate::test_support::state_with_tenant_policy(
+            config.clone(),
+            memtable.clone(),
+            Arc::new(Journal::spawn(&config, memtable).unwrap()),
+            parts,
+            trace_parts,
+            None,
+            tenant_policy,
+        )
+    }
+
+    async fn lines_in_last_day(state: Arc<AppState>) -> Vec<String> {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let response = query_range(
+            State(state),
+            crate::tenant::test_tenant_headers(),
+            Query(QueryRangeParams {
+                query: "{app=\"api\"}".to_string(),
+                start: Some((now_ns - 86_400_000_000_000).to_string()),
+                end: Some(now_ns.to_string()),
+                limit: Some(100),
+                direction: Some("forward".to_string()),
+                step: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        response
+            .data
+            .result
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|stream| stream["values"].as_array().unwrap().clone())
+            .map(|value| value[1].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A downgrade takes effect at query time within one poll, long before the
+    /// bytes are reclaimed.
+    #[tokio::test]
+    async fn a_downgrade_hides_data_before_the_bytes_are_gone() {
+        let data_dir = temp_dir();
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let one_hour_ago = now_ns - 3_600_000_000_000;
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            [("app".to_string(), "api".to_string())]
+                .into_iter()
+                .collect(),
+            vec![LogEntry {
+                timestamp_ns: one_hour_ago,
+                line: "an hour old".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+        let policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test());
+        let state = tenant_policy_state(
+            &data_dir,
+            memtable,
+            Arc::new(PartRegistry::new()),
+            policy.clone(),
+        );
+
+        // No snapshot yet: reads fail open, so the control plane is never on
+        // the query hot path.
+        assert_eq!(lines_in_last_day(state.clone()).await.len(), 1);
+
+        policy.install_for_test(
+            [(
+                test_tenant(),
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_secs(60)),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert!(lines_in_last_day(state.clone()).await.is_empty());
+
+        // An upgrade brings back everything still on disk.
+        policy.install_for_test(
+            [(
+                test_tenant(),
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_secs(
+                    7 * 24 * 60 * 60,
+                )),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(lines_in_last_day(state).await.len(), 1);
+    }
+
+    /// A tenant the control plane never mentioned reads its full history.
+    #[tokio::test]
+    async fn an_unknown_tenant_is_never_clamped() {
+        let data_dir = temp_dir();
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            [("app".to_string(), "api".to_string())]
+                .into_iter()
+                .collect(),
+            vec![LogEntry {
+                timestamp_ns: now_ns - 3_600_000_000_000,
+                line: "an hour old".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+        let policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test());
+        policy.install_for_test(
+            [(
+                crate::tenant::TenantId::parse("someone-else").unwrap(),
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_secs(1)),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let state =
+            tenant_policy_state(&data_dir, memtable, Arc::new(PartRegistry::new()), policy);
+
+        assert_eq!(lines_in_last_day(state).await.len(), 1);
+    }
+
+    /// A metric query's first evaluation point looks back past the requested
+    /// start, so the scan start is raised too.
+    #[tokio::test]
+    async fn a_metric_lookback_cannot_reach_below_the_retention_floor() {
+        let data_dir = temp_dir();
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            [("app".to_string(), "api".to_string())]
+                .into_iter()
+                .collect(),
+            vec![LogEntry {
+                // Inside the 1h lookback of the evaluation point, but outside
+                // the 60s retention floor.
+                timestamp_ns: now_ns - 1_800_000_000_000,
+                line: "half an hour old".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+        let policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test());
+        policy.install_for_test(
+            [(
+                test_tenant(),
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_secs(60)),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let state =
+            tenant_policy_state(&data_dir, memtable, Arc::new(PartRegistry::new()), policy);
+
+        let response = query_range(
+            State(state),
+            crate::tenant::test_tenant_headers(),
+            Query(QueryRangeParams {
+                query: "count_over_time({app=\"api\"}[1h])".to_string(),
+                start: Some(now_ns.to_string()),
+                end: Some(now_ns.to_string()),
+                limit: None,
+                direction: None,
+                step: Some("60".to_string()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(
+            response.data.result.as_array().unwrap().is_empty(),
+            "an expired row must not reach the metric evaluator through the lookback window"
+        );
+    }
+
+    /// `labels`, `label_values`, `series` and `index_stats` have no range of
+    /// their own, so they inherit the clamp directly. Memtable entries are
+    /// filtered per entry; parts are pruned per part, which is the finest
+    /// granularity the stream index supports.
+    #[tokio::test]
+    async fn label_and_stats_endpoints_inherit_the_retention_clamp() {
+        let data_dir = temp_dir();
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            [("app".to_string(), "expired".to_string())]
+                .into_iter()
+                .collect(),
+            vec![LogEntry {
+                timestamp_ns: now_ns - 3_600_000_000_000,
+                line: "an hour old".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+        memtable.insert(
+            test_tenant(),
+            [("app".to_string(), "fresh".to_string())]
+                .into_iter()
+                .collect(),
+            vec![LogEntry {
+                timestamp_ns: now_ns,
+                line: "just now".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+        let policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test());
+        policy.install_for_test(
+            [(
+                test_tenant(),
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_secs(60)),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let state = tenant_policy_state(
+            &data_dir,
+            memtable,
+            Arc::new(PartRegistry::new()),
+            policy.clone(),
+        );
+
+        let values = label_values(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Path("app".to_string()),
+        )
+        .await
+        .unwrap()
+        .0
+        .data;
+        assert_eq!(values, vec!["fresh".to_string()]);
+
+        let stats = index_stats(State(state.clone()), crate::tenant::test_tenant_headers())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(stats["data"]["entries"], 1);
+        assert_eq!(stats["data"]["streams"], 1);
+
+        let matched = series(
+            State(state),
+            crate::tenant::test_tenant_headers(),
+            RawQuery(Some("match%5B%5D=%7B%7D".to_string())),
+        )
+        .await
+        .unwrap()
+        .0
+        .data;
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0]["app"], "fresh");
     }
