@@ -309,6 +309,7 @@ pub async fn run(config: Arc<Config>) {
         let config = config.clone();
         let metrics = metrics.clone();
         let policy = tenant_policy.clone();
+        let retention_journal = journal.clone();
         let retention_health = retention_healthy.clone();
         let drain_rx = shutdown.subscribe();
         worker_handles.push(tokio::spawn(async move {
@@ -318,6 +319,7 @@ pub async fn run(config: Arc<Config>) {
                 remote_cache,
                 config,
                 policy,
+                retention_journal,
                 metrics,
                 retention_health,
                 drain_rx,

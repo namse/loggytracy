@@ -41,6 +41,7 @@ fn write_meta(
         metadata_crc32: 0,
     };
     let mut meta = MetaFile {
+        version: PART_META_VERSION,
         id: id.to_string(),
         partition: partition.to_string(),
         min_ts_ns: min_ts,
@@ -50,6 +51,7 @@ fn write_meta(
         row_group_min_ts,
         row_group_max_ts,
         tenants,
+        materialized_bytes: rows.iter().map(Row::materialized_bytes).sum(),
         stream_labels: stream_labels.to_vec(),
         streams,
         integrity,
@@ -100,6 +102,11 @@ struct PartIntegrity {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct MetaFile {
+    /// Absent in parts written before versioning, which `serde` maps to 0 —
+    /// a value this build never writes, so those parts are reported as an
+    /// unsupported version rather than as corruption.
+    #[serde(default)]
+    version: u32,
     id: String,
     partition: String,
     min_ts_ns: i64,
@@ -109,6 +116,7 @@ struct MetaFile {
     row_group_min_ts: Vec<i64>,
     row_group_max_ts: Vec<i64>,
     tenants: Vec<TenantSegment>,
+    materialized_bytes: u64,
     stream_labels: Vec<String>,
     streams: Vec<Vec<(String, String)>>,
     integrity: PartIntegrity,
@@ -143,6 +151,13 @@ struct MergeTombstone {
 pub fn load_part(dir: &Path) -> Result<Part, String> {
     let meta_str = fs::read_to_string(dir.join(META_FILE)).map_err(|e| e.to_string())?;
     let meta_file: MetaFile = serde_json::from_str(&meta_str).map_err(|e| e.to_string())?;
+    if meta_file.version != PART_META_VERSION {
+        return Err(format!(
+            "unsupported part metadata version {} in {}: this build reads version {PART_META_VERSION}",
+            meta_file.version,
+            dir.display()
+        ));
+    }
     let actual_metadata_crc = metadata_crc32(&meta_file)?;
     if actual_metadata_crc != meta_file.integrity.metadata_crc32 {
         return Err(format!(
@@ -166,6 +181,7 @@ pub fn load_part(dir: &Path) -> Result<Part, String> {
         row_group_min_ts: meta_file.row_group_min_ts,
         row_group_max_ts: meta_file.row_group_max_ts,
         tenants: meta_file.tenants,
+        materialized_bytes: meta_file.materialized_bytes,
         stream_labels: meta_file.stream_labels,
         streams,
         integrity: meta_file.integrity,

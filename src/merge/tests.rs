@@ -635,6 +635,50 @@
         );
     }
 
+    /// Group selection and the read budget have to be in the same unit, or a
+    /// group is selected under one limit and then always fails the other. The
+    /// recorded size is what makes that true, so it has to equal what a read
+    /// actually accumulates — measured on highly compressible rows, where the
+    /// compressed file size the old code used is nowhere near it.
+    #[test]
+    fn a_parts_recorded_size_equals_what_reading_it_materializes() {
+        let dir = tmp_dir("materialized-bytes");
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let rows: Vec<part::Row> = (0..512)
+            .map(|index| part::Row {
+                tenant: test_tenant(),
+                timestamp_ns: 1_700_000_000_000_000_000 + index,
+                labels: [("app".to_string(), "compressible".to_string())]
+                    .into_iter()
+                    .collect(),
+                line: "a".repeat(512),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let expected: u64 = rows.iter().map(part::Row::materialized_bytes).sum();
+        let parts = part::flush_rows(rows, &parts_root, 64).unwrap();
+        assert_eq!(parts.len(), 1);
+
+        let reader = PartReader::open(parts[0].clone()).unwrap();
+        assert_eq!(reader.meta().materialized_bytes, expected);
+        let read_back: u64 = reader
+            .read_all_rows(None)
+            .unwrap()
+            .iter()
+            .map(part::Row::materialized_bytes)
+            .sum();
+        assert_eq!(read_back, expected);
+
+        // The compressed body is far smaller, which is exactly why using it as
+        // the group-selection measure admitted groups that could never be read.
+        let compressed = std::fs::metadata(parts[0].data_path()).unwrap().len();
+        assert!(
+            compressed < expected / 4,
+            "expected the compressed body ({compressed}) to be far below {expected}"
+        );
+    }
+
     fn wide_tenant_row(owner: &str, timestamp_ns: i64) -> part::Row {
         part::Row {
             tenant: tenant_id(owner),

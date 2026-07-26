@@ -138,10 +138,13 @@ fn group_for_merge(parts: &[Arc<PartReader>], config: &Config) -> Vec<Vec<Arc<Pa
     groups
 }
 
+/// What reading this part will materialize, straight from `meta.json`.
+///
+/// Replaces a `stat` of the compressed file: that number was both the wrong
+/// unit for the budgets it was compared against and a syscall per part on
+/// every `/metrics` scrape.
 fn estimated_part_bytes(reader: &PartReader) -> u64 {
-    std::fs::metadata(reader.part().data_path())
-        .map(|metadata| metadata.len())
-        .unwrap_or_else(|_| reader.meta().row_count.saturating_mul(128))
+    reader.meta().materialized_bytes
 }
 
 #[cfg(test)]
@@ -252,31 +255,25 @@ fn row_group_windows(reader: &PartReader, max_memory_bytes: u64) -> Vec<std::ops
     let row_group_count = reader.row_group_count();
     let meta = reader.meta();
     let rows_per_group = (meta.row_count / row_group_count.max(1) as u64).max(1);
-    let bytes_per_row = estimated_part_bytes(reader)
+    let bytes_per_row = meta
+        .materialized_bytes
         .checked_div(meta.row_count.max(1))
-        .unwrap_or(128)
-        .max(1)
-        // Compressed on disk, materialized in memory. Undershooting the window
-        // costs an extra output part; overshooting costs another failed read.
-        .saturating_mul(UNCOMPRESSED_EXPANSION);
+        .unwrap_or(0)
+        .max(1);
     let bytes_per_group = rows_per_group.saturating_mul(bytes_per_row).max(1);
     let groups_per_window = (max_memory_bytes / bytes_per_group).clamp(1, row_group_count as u64);
 
     let mut windows = Vec::new();
     let mut start = 0u32;
     while start < row_group_count {
-        let end = start.saturating_add(groups_per_window as u32).min(row_group_count);
+        let end = start
+            .saturating_add(groups_per_window as u32)
+            .min(row_group_count);
         windows.push(start..end);
         start = end;
     }
     windows
 }
-
-/// Assumed zstd ratio when converting a part's on-disk size into the memory a
-/// rewrite of it will need. Log text commonly compresses far better than this;
-/// the estimate is deliberately conservative because being wrong the other way
-/// means another failed read.
-const UNCOMPRESSED_EXPANSION: u64 = 8;
 
 fn read_all_rows_with_limit(
     readers: &[Arc<PartReader>],
@@ -290,19 +287,7 @@ fn read_all_rows_with_limit(
         // rows. `read_all_rows` walks the tenant index rather than bypassing
         // it, so each row still arrives tagged with its own tenant.
         for row in reader.read_all_rows(Some(remaining_memory))? {
-            let row_memory = row
-                .labels
-                .iter()
-                .map(|(name, value)| name.len().saturating_add(value.len()))
-                .sum::<usize>()
-                .saturating_add(row.line.len())
-                .saturating_add(
-                    row.structured_metadata
-                        .iter()
-                        .map(|(name, value)| name.len().saturating_add(value.len()))
-                        .sum::<usize>(),
-                )
-                .saturating_add(std::mem::size_of::<part::Row>()) as u64;
+            let row_memory = row.materialized_bytes();
             estimated_memory = estimated_memory
                 .checked_add(row_memory)
                 .ok_or_else(|| "merge memory accounting overflowed".to_string())?;

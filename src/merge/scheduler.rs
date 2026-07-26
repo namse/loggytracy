@@ -73,6 +73,14 @@ async fn merge_once(
     // the replacement — one commit path, one crash-safety story.
     let cutoffs = tenant_policy.cutoffs_now();
 
+    // Published here rather than on scrape: this tick already has the snapshot
+    // and the cutoffs, and it runs whether or not the previous one succeeded,
+    // so a stalled merge still shows its backlog growing.
+    metrics.merge_debt_parts.store(
+        merge_debt_part_count(registry, config, cutoffs.as_ref()) as u64,
+        Ordering::Relaxed,
+    );
+
     let mut by_partition: HashMap<String, Vec<Arc<PartReader>>> = HashMap::new();
     for r in readers {
         by_partition

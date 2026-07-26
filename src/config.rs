@@ -41,6 +41,12 @@ pub struct Config {
     pub merge_min_part_count: usize,
     pub merge_target_part_rows: u64,
     pub merge_max_part_rows: u64,
+    /// Largest group merge will assemble, and the hard ceiling on what one
+    /// read may materialize. Both are **uncompressed** bytes, taken from each
+    /// part's recorded `materialized_bytes`: comparing a compressed input size
+    /// against a materialized budget let groups be selected that could then
+    /// never be read. The first sits below the second so an ordinary merge
+    /// leaves headroom rather than running at the hard limit.
     pub merge_max_input_bytes: u64,
     pub merge_max_memory_bytes: u64,
     pub merge_max_groups_per_tick: usize,
@@ -432,6 +438,13 @@ impl Config {
         }
         positive_u64("merge_max_input_bytes", self.merge_max_input_bytes)?;
         positive_u64("merge_max_memory_bytes", self.merge_max_memory_bytes)?;
+        if self.merge_max_input_bytes > self.merge_max_memory_bytes {
+            return Err(format!(
+                "merge_max_input_bytes ({}) must not exceed merge_max_memory_bytes ({}): a group \
+selected above the read budget can never be merged",
+                self.merge_max_input_bytes, self.merge_max_memory_bytes
+            ));
+        }
         positive_usize("merge_max_groups_per_tick", self.merge_max_groups_per_tick)?;
         positive_duration("merge_interval", self.merge_interval)?;
         positive_u64("cache_max_bytes", self.cache_max_bytes)?;

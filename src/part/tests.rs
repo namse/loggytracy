@@ -769,6 +769,33 @@
         assert!(load_part(&part.dir).is_err());
     }
 
+    /// A metadata layout this build does not know has to say so. Reporting it
+    /// as a checksum mismatch would read as corruption and send an operator
+    /// looking for a failing disk instead of a version skew.
+    #[test]
+    fn load_reports_an_unknown_metadata_version_as_such() {
+        let tmp = tempfile_dir();
+        let part = flush_rows(make_rows(), &tmp, 100).expect("flush").remove(0);
+        let meta_path = part.meta_path();
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta["version"] = serde_json::Value::from(PART_META_VERSION + 1);
+        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let error = load_part(&part.dir).expect_err("a future version must be refused");
+        assert!(error.contains("unsupported part metadata version"), "{error}");
+
+        // A part written before the field existed reads as version 0, which is
+        // the pre-versioning marker rather than a checksum problem.
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.as_object_mut().unwrap().remove("version");
+        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let error = load_part(&part.dir).expect_err("an unversioned part must be refused");
+        assert!(error.contains("version 0"), "{error}");
+    }
+
     #[test]
     fn bloom_handles_large_trigram_volume_in_single_row_group() {
         // row group 8192행 × 라인당 수십 trigram → unique 항목이 row 수의 수배~수십배.

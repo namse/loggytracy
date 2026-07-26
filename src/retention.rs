@@ -21,6 +21,7 @@ pub async fn retention_loop(
     remote_cache: Option<Arc<RemoteCache>>,
     config: Arc<Config>,
     tenant_policy: Arc<TenantPolicy>,
+    journal: Arc<crate::journal::Journal>,
     metrics: Arc<RuntimeMetrics>,
     healthy: Arc<AtomicBool>,
     mut drain_rx: watch::Receiver<bool>,
@@ -35,6 +36,10 @@ pub async fn retention_loop(
             _ = ticker.tick() => {}
             _ = wait_for_drain(&mut drain_rx) => return,
         }
+        metrics.unknown_tenants.store(
+            unknown_tenant_count(&registry, &trace_registry, &journal, &tenant_policy) as u64,
+            Ordering::Relaxed,
+        );
         if let Err(error) = retention_once(
             &registry,
             &trace_registry,
@@ -59,6 +64,45 @@ pub async fn retention_loop(
             healthy.store(true, Ordering::Release);
         }
     }
+}
+
+/// Tenants holding data that the control plane has never mentioned.
+///
+/// *Absent* and `"infinite"` keep the same data, so a control plane that
+/// silently dropped a tenant is only visible as this number rising. Computed on
+/// the retention tick rather than per scrape: it walks every part's tenant
+/// index, which is not work an unauthenticated endpoint should be able to ask
+/// for at scrape frequency.
+///
+/// Both memtables are counted alongside the parts. A tenant that has just
+/// started pushing owns no `meta.json` segment until its first flush, and that
+/// is exactly the window in which the control plane is most likely to have
+/// missed it.
+fn unknown_tenant_count(
+    registry: &PartRegistry,
+    trace_registry: &TraceRegistry,
+    journal: &crate::journal::Journal,
+    tenant_policy: &TenantPolicy,
+) -> usize {
+    let Some(policies) = tenant_policy.snapshot() else {
+        return 0;
+    };
+    let mut unknown: std::collections::BTreeSet<crate::tenant::TenantId> =
+        std::collections::BTreeSet::new();
+    let mut note = |tenant: &crate::tenant::TenantId| {
+        if policies.retention(tenant).is_none() {
+            unknown.insert(tenant.clone());
+        }
+    };
+    registry.visit_tenants(&mut note);
+    trace_registry.visit_tenants(&mut note);
+    for tenant in journal.log_memtable().tenants() {
+        note(&tenant);
+    }
+    for tenant in journal.trace_memtable().tenants() {
+        note(&tenant);
+    }
+    unknown.len()
 }
 
 async fn retention_once(
@@ -382,6 +426,77 @@ mod tests {
             retention_period: None,
             ..Config::default()
         }
+    }
+
+    /// The count reads the memtables as well as the parts. A tenant that has
+    /// only just started pushing owns no `meta.json` segment yet, and that is
+    /// precisely when a control-plane omission is newest and most worth
+    /// reporting.
+    #[tokio::test]
+    async fn the_unknown_tenant_count_sees_tenants_that_have_only_pushed() {
+        let root = temp_root("retention-unknown-count");
+        let config = Config {
+            data_dir: root.clone(),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        let memtable = Arc::new(crate::memtable::MemTable::new());
+        let journal =
+            Arc::new(crate::journal::Journal::spawn(&config, memtable.clone()).expect("journal"));
+        let registry = Arc::new(PartRegistry::new());
+        let trace_registry = Arc::new(TraceRegistry::standalone());
+        let policy = policy_with(&[("acme", TenantRetention::Finite(Duration::from_secs(60)))]);
+
+        assert_eq!(
+            unknown_tenant_count(&registry, &trace_registry, &journal, &policy),
+            0
+        );
+
+        memtable.insert(
+            tenant("brand-new"),
+            [("app".to_string(), "api".to_string())]
+                .into_iter()
+                .collect(),
+            vec![crate::memtable::LogEntry {
+                timestamp_ns: 1_000,
+                line: "never flushed".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            unknown_tenant_count(&registry, &trace_registry, &journal, &policy),
+            1
+        );
+
+        journal.trace_memtable().insert(vec![span_for(
+            "brand-new-traces",
+            &"dd".repeat(16),
+            1_000,
+        )]);
+        assert_eq!(
+            unknown_tenant_count(&registry, &trace_registry, &journal, &policy),
+            2
+        );
+
+        // A flushed part counts the same tenant once, not twice.
+        let parts =
+            part::flush_rows(vec![row_for("brand-new", 1_000)], &root.join("parts"), 100).unwrap();
+        registry.register(parts).unwrap();
+        assert_eq!(
+            unknown_tenant_count(&registry, &trace_registry, &journal, &policy),
+            2
+        );
+
+        // With the policy switched off there is nothing to be unknown against.
+        assert_eq!(
+            unknown_tenant_count(
+                &registry,
+                &trace_registry,
+                &journal,
+                &TenantPolicy::disabled()
+            ),
+            0
+        );
     }
 
     #[tokio::test]

@@ -11,6 +11,12 @@ pub struct RuntimeMetrics {
     /// from `ingest_errors`: this one says the server is healthy and saying no,
     /// which is the signal an operator scales or tunes flush on.
     pub ingest_throttled: AtomicU64,
+    /// Point-in-time backlog gauges, published by the workers that already walk
+    /// the structures they describe. Computing them per scrape instead was
+    /// O(parts × tenants) of work on an unauthenticated endpoint, and the
+    /// numbers are only as fresh as a worker tick either way.
+    pub merge_debt_parts: AtomicU64,
+    pub unknown_tenants: AtomicU64,
     pub flush_success: AtomicU64,
     pub flush_errors: AtomicU64,
     pub merge_success: AtomicU64,
@@ -47,6 +53,8 @@ impl RuntimeMetrics {
             ingest_requests: AtomicU64::new(0),
             ingest_errors: AtomicU64::new(0),
             ingest_throttled: AtomicU64::new(0),
+            merge_debt_parts: AtomicU64::new(0),
+            unknown_tenants: AtomicU64::new(0),
             flush_success: AtomicU64::new(0),
             flush_errors: AtomicU64::new(0),
             merge_success: AtomicU64::new(0),

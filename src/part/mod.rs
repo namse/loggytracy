@@ -28,6 +28,14 @@ pub const BLOOM_FILE: &str = "bloom.tri";
 pub const STREAM_INDEX_FILE: &str = "stream.idx";
 pub const META_FILE: &str = "meta.json";
 pub const MERGE_TOMBSTONE_FILE: &str = ".merge.tombstone";
+/// On-disk layout of `meta.json`.
+///
+/// Read and rejected before the checksum is verified, because the checksum is
+/// computed over the struct and therefore only means anything once both sides
+/// agree on what the struct is. Without this a format change surfaces as a
+/// checksum mismatch, which reads as corruption rather than as a version the
+/// build cannot handle.
+pub const PART_META_VERSION: u32 = 1;
 
 const BLOOM_MAGIC_V1: &[u8; 4] = b"BTF1";
 const BLOOM_MAGIC_V2: &[u8; 4] = b"BTF2";
@@ -152,6 +160,10 @@ pub struct PartMeta {
     pub row_group_max_ts: Vec<i64>,
     /// Sorted by tenant, non-overlapping, and covering every row group.
     pub tenants: Vec<TenantSegment>,
+    /// Memory a full read of this part materializes, recorded at write time.
+    /// Merge compares this against its budgets instead of the compressed file
+    /// size, which is smaller by whatever zstd achieved on the data.
+    pub materialized_bytes: u64,
     pub stream_labels: Vec<String>,
     pub streams: Vec<Labels>,
     integrity: PartIntegrity,
@@ -197,6 +209,26 @@ pub struct Row {
 }
 
 impl Row {
+    /// What this row costs to hold in memory once read back.
+    ///
+    /// Merge sizes both its group selection and its read budget with this, so
+    /// the two are in the same unit by construction. Comparing a compressed
+    /// on-disk size against a materialized budget is what made large groups
+    /// select successfully and then always fail to read.
+    pub fn materialized_bytes(&self) -> u64 {
+        let labels_bytes: usize = self
+            .labels
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        let metadata_bytes: usize = self
+            .structured_metadata
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        (labels_bytes + self.line.len() + metadata_bytes + std::mem::size_of::<Row>()) as u64
+    }
+
     pub fn from_entry(tenant: &TenantId, labels: &Labels, e: &LogEntry) -> Self {
         Self {
             tenant: tenant.clone(),

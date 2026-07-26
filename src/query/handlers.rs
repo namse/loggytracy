@@ -410,12 +410,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
         .as_ref()
         .is_none_or(|cache| cache.is_cache_healthy());
     let wal_backlog_bytes = state.journal.wal_backlog_bytes();
-    let merge_debt_cutoffs = state.tenant_policy.cutoffs_now();
-    let merge_debt_parts = crate::merge::merge_debt_part_count(
-        &state.parts,
-        &state.config,
-        merge_debt_cutoffs.as_ref(),
-    );
+    // Both of these are published by the workers that already hold the
+    // snapshots they describe. A scrape must not be able to ask for a walk of
+    // every part's tenant index.
+    let merge_debt_parts = m_merge_debt(&state);
     let policy = tenant_policy_gauges(&state);
     let m = &state.metrics;
     format!(
@@ -570,22 +568,23 @@ loggytracy_force_flush_complete {}\n",
     )
 }
 
+fn m_merge_debt(state: &AppState) -> u64 {
+    state
+        .metrics
+        .merge_debt_parts
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
 struct TenantPolicyGauges {
     known_tenants: usize,
     infinite_tenants: usize,
-    unknown_tenants: usize,
+    unknown_tenants: u64,
     last_push_age_seconds: u64,
 }
 
-/// `"infinite"` and *absent* keep the same data, so a control plane that
-/// silently drops a tenant is only visible as a rising unknown-tenant gauge
-/// rather than as invisible unbounded storage.
-///
-/// Both memtables are counted alongside the parts. A tenant that has just
-/// started pushing owns no `meta.json` segment until its first flush, and that
-/// is exactly the window in which the control plane is most likely to have
-/// missed it — waiting for a flush to make it visible would hide the newest
-/// omissions for as long as they are newest.
+/// The policy map is small and in memory, so its two counts are computed here.
+/// The unknown-tenant count is not: it walks every part's tenant index, so the
+/// retention worker publishes it and this reads what that worker last saw.
 fn tenant_policy_gauges(state: &AppState) -> TenantPolicyGauges {
     let Some(snapshot) = state.tenant_policy.snapshot() else {
         return TenantPolicyGauges {
@@ -595,28 +594,16 @@ fn tenant_policy_gauges(state: &AppState) -> TenantPolicyGauges {
             last_push_age_seconds: 0,
         };
     };
-    let mut unknown: std::collections::BTreeSet<crate::tenant::TenantId> =
-        std::collections::BTreeSet::new();
-    // Clones only the ids that turn out to be unknown, which is the rare case;
-    // a known tenant costs one map lookup.
-    let mut note = |tenant: &crate::tenant::TenantId| {
-        if snapshot.retention(tenant).is_none() {
-            unknown.insert(tenant.clone());
-        }
-    };
-    state.parts.visit_tenants(&mut note);
-    state.trace_parts.visit_tenants(&mut note);
-    for tenant in state.memtable.tenants() {
-        note(&tenant);
-    }
-    for tenant in state.journal.trace_memtable().tenants() {
-        note(&tenant);
-    }
     TenantPolicyGauges {
         known_tenants: snapshot.tenant_count(),
         infinite_tenants: snapshot.infinite_tenant_count(),
-        unknown_tenants: unknown.len(),
-        last_push_age_seconds: snapshot.newest_push_age(std::time::SystemTime::now()).as_secs(),
+        unknown_tenants: state
+            .metrics
+            .unknown_tenants
+            .load(std::sync::atomic::Ordering::Relaxed),
+        last_push_age_seconds: snapshot
+            .newest_push_age(std::time::SystemTime::now())
+            .as_secs(),
     }
 }
 
