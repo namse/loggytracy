@@ -357,14 +357,12 @@ production or on shared/network storage."
                 .iter()
                 .filter(|part| removed_ids.contains(part.id.as_str()))
                 .count();
+            // Removal is the only thing this writes, so it is idempotent per
+            // id: a batch that mixes ids an earlier tick already removed with
+            // ids that have only just expired removes what is left rather than
+            // failing, which is what keeps a retry from wedging forever.
             if present == 0 {
                 return Ok(loaded);
-            }
-            if present != removed_ids.len() {
-                return Err(format!(
-                    "trace manifest retention conflict: expected {} parts, found {present}",
-                    removed_ids.len()
-                ));
             }
             let mut next = loaded.clone();
             next.parts

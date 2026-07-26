@@ -92,6 +92,11 @@ impl PolicyMap {
     /// Age of the newest policy on this pod. It gates nothing; it tells an
     /// operator whether the control plane is still talking to this instance.
     /// Restored from the stored `updated_at`, so a restart does not reset it.
+    ///
+    /// Only meaningful once at least one policy exists: with an empty map there
+    /// is no newest push and this reads zero, so an alert on it must be paired
+    /// with `known_tenants > 0`. The "never pushed at all" state is the
+    /// unknown-tenant gauge's to report, not this one's.
     pub fn newest_push_age(&self, now: SystemTime) -> Duration {
         self.entries
             .values()
@@ -199,8 +204,17 @@ impl Cutoffs {
 #[derive(Default)]
 pub struct TenantPolicyMetrics {
     pub push_accepted: AtomicU64,
+    /// A policy change the instance refused to make: a malformed body, an
+    /// unparseable retention value, or a tenant id that is not one. Counts
+    /// only requests that meant to change something, so a bad `GET` does not
+    /// look like a control plane pushing garbage.
     pub push_rejected: AtomicU64,
     pub push_persist_errors: AtomicU64,
+    /// Admin requests that failed the bearer check, on any of the three
+    /// methods. Separate from `push_rejected` because the two ask different
+    /// questions: one is "is the control plane broken", the other is "is
+    /// someone knocking".
+    pub admin_unauthorized: AtomicU64,
 }
 
 /// Why a policy change did not take effect.
@@ -475,14 +489,6 @@ impl TenantPolicy {
         self.cutoffs_now()?.cutoff_ns(tenant)
     }
 
-    /// Apply the retention floor to a requested range start.
-    pub fn clamp_start_ns(&self, tenant: &TenantId, start_ns: i64) -> i64 {
-        match self.query_floor_ns(tenant) {
-            Some(floor_ns) => start_ns.max(floor_ns),
-            None => start_ns,
-        }
-    }
-
     pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
         self.snapshot()?.view(tenant)
     }
@@ -560,6 +566,12 @@ impl TenantPolicy {
 
     pub fn record_rejected_push(&self) {
         self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_unauthorized(&self) {
+        self.metrics
+            .admin_unauthorized
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Copy-insert-swap. Pushes are rare, so paying a map copy per push keeps
@@ -736,7 +748,7 @@ mod tests {
         assert!(!policy.is_enabled());
         assert!(policy.cutoffs_now().is_none());
         assert!(policy.snapshot().is_none());
-        assert_eq!(policy.clamp_start_ns(&tenant("acme"), 5), 5);
+        assert_eq!(policy.query_floor_ns(&tenant("acme")), None);
     }
 
     #[tokio::test]

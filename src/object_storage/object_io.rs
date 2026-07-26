@@ -350,7 +350,14 @@ impl ObjectStorage {
                     remove_upload_markers_best_effort(added);
                     return Ok(loaded.manifest);
                 }
-                if present_removed != removed.len() {
+                // The intact-input-set rule protects a *replacement*: there is
+                // an output that must not be retained alongside another
+                // writer's. A pure removal produces no output, so deleting
+                // whichever subset is still present reaches the same end state.
+                // Requiring an intact set here would wedge retention forever
+                // once a batch mixes ids an earlier tick already removed with
+                // ids that have only just expired.
+                if !added.is_empty() && present_removed != removed.len() {
                     return Err(format!(
                         "manifest replacement conflict: expected {} input parts, found {present_removed}",
                         removed.len()

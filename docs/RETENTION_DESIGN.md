@@ -340,7 +340,13 @@ Following `metrics.rs` conventions (monotonic counters plus the gauges added in
 M7):
 
 - `tenant_policy_push_accepted`, `tenant_policy_push_rejected`,
-  `tenant_policy_push_persist_errors`
+  `tenant_policy_push_persist_errors`. `push_rejected` counts only requests
+  that meant to change a policy and were refused for being malformed, so a bad
+  `GET` never makes the control plane look like it is pushing garbage.
+- `tenant_policy_admin_unauthorized` (counter — admin requests that failed the
+  bearer check, on any of the three methods). Separate from `push_rejected`
+  because the two answer different questions: whether the control plane is
+  broken, and whether someone is knocking.
 - `tenant_policy_known_tenants` (gauge), `tenant_policy_infinite_tenants`
   (gauge), `tenant_policy_unknown_tenants` (gauge — tenants with data but no
   policy). "With data" includes both memtables, not only the parts: a tenant
@@ -348,7 +354,10 @@ M7):
   flush, which is exactly when a control-plane omission is newest.
 - `tenant_policy_last_push_age_seconds` (gauge — age of the newest policy on
   this pod). It gates nothing; it tells an operator whether the control plane
-  is still talking to this instance.
+  is still talking to this instance. It is only meaningful once a policy
+  exists: with an empty map there is no newest push and it reads zero, so an
+  alert on it must be paired with `known_tenants > 0`. The "never pushed at
+  all" state belongs to `unknown_tenants`, not to this gauge.
 - `retention_expired_rows_dropped`, `retention_parts_rewritten`,
   `retention_rewrite_skipped` (retention-only merge groups that could not be
   read; a number that keeps rising means a part is permanently too large for
@@ -490,8 +499,28 @@ look like a control-plane outage.
 
 ## What the implementation settled that the design left open
 
-Four points where the deletion side had to make a call the design did not spell
-out. All four survive the move to push intake.
+Five points where the deletion side had to make a call the design did not spell
+out. All of them survive the move to push intake.
+
+**A retention batch is not a replacement, and the manifest must know it.** Both
+manifest writers rejected a removal set that was not intact, so that a merge
+replacement could never be reapplied on top of another writer's output and
+duplicate every row. Retention reuses those writers with an empty `added` set,
+where that rule is not protective but actively harmful: there is no output to
+duplicate, and a tick that removed some of its ids and then failed before
+retiring them from the registry leaves the *next* tick holding a batch that
+mixes already-removed ids with newly expired ones. The intact-set check turned
+that into a permanent failure — the batch could only grow, so no later tick
+could recover, and `retention_healthy` stayed low until a restart. A pure
+removal is now idempotent per id and deletes whatever is still present
+(`object_io.rs` `publish`, `catalog.rs` `remove_trace_parts`), while the
+non-empty-`added` case keeps the strict rule that merge depends on.
+
+Retention also retires each side's descriptors as soon as *that* side's
+manifest write lands, rather than after both. A part that is absent from the
+manifest but still advertised by the registry is only serviceable until the
+orphan collector's grace period passes and its objects are deleted, so the
+window where a failure can produce one is kept to a single manifest operation.
 
 **Retention does not mark; merge decides.** The design has retention flag a
 part as merge-eligible. The code has `merge_once` derive that itself from the

@@ -36,7 +36,7 @@ pub async fn put_retention(
     body: axum::body::Bytes,
 ) -> Result<Json<RetentionResponse>, (StatusCode, String)> {
     authorize(&state, &headers)?;
-    let tenant = parse_tenant(&state, &raw_tenant)?;
+    let tenant = parse_tenant_for_change(&state, &raw_tenant)?;
     let request: RetentionRequest = serde_json::from_slice(&body).map_err(|error| {
         state.tenant_policy.record_rejected_push();
         (
@@ -63,7 +63,7 @@ pub async fn get_retention(
     headers: HeaderMap,
 ) -> Result<Json<RetentionResponse>, (StatusCode, String)> {
     authorize(&state, &headers)?;
-    let tenant = parse_tenant(&state, &raw_tenant)?;
+    let tenant = parse_tenant(&raw_tenant)?;
     let view = state.tenant_policy.view(&tenant).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -85,7 +85,7 @@ pub async fn delete_retention(
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     authorize(&state, &headers)?;
-    let tenant = parse_tenant(&state, &raw_tenant)?;
+    let tenant = parse_tenant_for_change(&state, &raw_tenant)?;
     state
         .tenant_policy
         .remove(&tenant)
@@ -98,14 +98,19 @@ pub async fn delete_retention(
 /// The tenant id arrives in the request path and ends up in an object key, so
 /// it goes through the same allowlist as an ingest header rather than a
 /// path-specific check.
-fn parse_tenant(state: &AppState, raw: &str) -> Result<TenantId, (StatusCode, String)> {
+fn parse_tenant(raw: &str) -> Result<TenantId, (StatusCode, String)> {
     TenantId::parse(raw).map_err(|error| {
-        state.tenant_policy.record_rejected_push();
         (
             StatusCode::BAD_REQUEST,
             format!("invalid tenant id: {error}"),
         )
     })
+}
+
+/// A rejected id on a method that meant to change the policy. `GET` reads, so
+/// a malformed id there is a bad read, not a rejected push.
+fn parse_tenant_for_change(state: &AppState, raw: &str) -> Result<TenantId, (StatusCode, String)> {
+    parse_tenant(raw).inspect_err(|_| state.tenant_policy.record_rejected_push())
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
@@ -125,7 +130,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, S
     if secret_matches(provided.as_bytes(), expected.as_bytes()) {
         return Ok(());
     }
-    state.tenant_policy.record_rejected_push();
+    state.tenant_policy.record_unauthorized();
     Err((
         StatusCode::UNAUTHORIZED,
         "invalid or missing bearer token".to_string(),

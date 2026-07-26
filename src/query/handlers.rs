@@ -466,6 +466,8 @@ loggytracy_tenant_policy_push_accepted_total {}\n\
 loggytracy_tenant_policy_push_rejected_total {}\n\
 # TYPE loggytracy_tenant_policy_push_persist_errors_total counter\n\
 loggytracy_tenant_policy_push_persist_errors_total {}\n\
+# TYPE loggytracy_tenant_policy_admin_unauthorized_total counter\n\
+loggytracy_tenant_policy_admin_unauthorized_total {}\n\
 # TYPE loggytracy_tenant_policy_known_tenants gauge\n\
 loggytracy_tenant_policy_known_tenants {}\n\
 # TYPE loggytracy_tenant_policy_infinite_tenants gauge\n\
@@ -533,6 +535,11 @@ loggytracy_force_flush_complete {}\n",
             .tenant_policy
             .metrics
             .push_persist_errors
+            .load(Ordering::Relaxed),
+        state
+            .tenant_policy
+            .metrics
+            .admin_unauthorized
             .load(Ordering::Relaxed),
         policy.known_tenants,
         policy.infinite_tenants,

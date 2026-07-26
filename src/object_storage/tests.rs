@@ -937,3 +937,85 @@
             assert!(validate_manifest(&manifest).is_err(), "accepted {value:?}");
         }
     }
+
+    /// A retention batch is not a replacement. Once a tick has removed some of
+    /// its ids and then failed before retiring them from the registry, the
+    /// next tick's batch mixes those ids with newly expired ones. Requiring an
+    /// intact set there wedged retention permanently: the batch could only ever
+    /// grow, so every later tick failed too.
+    #[tokio::test]
+    async fn a_pure_removal_tolerates_ids_an_earlier_tick_already_removed() {
+        let root = temp_dir("retention-partial-removal");
+        let storage = ObjectStorage::in_memory();
+
+        let mut first_row = row("already removed");
+        first_row.timestamp_ns += 1;
+        let first = crate::part::flush_rows(vec![first_row], &root, 100).unwrap();
+        let mut second_row = row("newly expired");
+        second_row.timestamp_ns += 2;
+        let second = crate::part::flush_rows(vec![second_row], &root, 100).unwrap();
+        storage.publish(&first, &[]).await.unwrap();
+        storage.publish(&second, &[]).await.unwrap();
+
+        let first_id = first[0].meta.id.clone();
+        let second_id = second[0].meta.id.clone();
+        storage
+            .publish(&[], std::slice::from_ref(&first_id))
+            .await
+            .unwrap();
+
+        storage
+            .publish(&[], &[first_id, second_id])
+            .await
+            .expect("a mixed removal batch removes what is left");
+        assert!(storage.load_manifest().await.unwrap().parts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_trace_removal_tolerates_ids_an_earlier_tick_already_removed() {
+        let root = temp_dir("trace-retention-partial-removal");
+        let storage = ObjectStorage::in_memory();
+
+        let mut spans = Vec::new();
+        for (index, trace_id) in ["aa", "bb"].iter().enumerate() {
+            spans.push(crate::trace::TraceSpan {
+                tenant: test_tenant(),
+                trace_id: trace_id.repeat(16),
+                span_id: format!("span-{index}"),
+                start_time_ns: 1_700_000_000_000_000_000 + index as i64,
+                end_time_ns: 1_700_000_000_000_000_001 + index as i64,
+                span: Default::default(),
+                resource: None,
+                resource_schema_url: String::new(),
+                scope: None,
+                scope_schema_url: String::new(),
+            });
+        }
+        let first = crate::trace_part::flush_trace_spans(vec![spans[0].clone()], &root, 100).unwrap();
+        let second =
+            crate::trace_part::flush_trace_spans(vec![spans[1].clone()], &root, 100).unwrap();
+        storage.publish_trace_parts(&first).await.unwrap();
+        storage.publish_trace_parts(&second).await.unwrap();
+
+        let descriptor = |part: &crate::trace_part::TracePart| TraceManifestPart {
+            id: part.meta.id.clone(),
+            partition: part.meta.partition.clone(),
+        };
+        storage
+            .remove_trace_parts(&[descriptor(&first[0])])
+            .await
+            .unwrap();
+
+        storage
+            .remove_trace_parts(&[descriptor(&first[0]), descriptor(&second[0])])
+            .await
+            .expect("a mixed removal batch removes what is left");
+        assert!(
+            storage
+                .load_trace_manifest()
+                .await
+                .unwrap()
+                .parts
+                .is_empty()
+        );
+    }

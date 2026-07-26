@@ -93,8 +93,10 @@ enum Expiry {
 }
 
 impl Expiry {
-    /// `None` means "delete nothing this tick", which covers both retention
-    /// being off and the policy endpoint never having answered.
+    /// `None` means "delete nothing this tick": retention is off entirely.
+    /// An enabled policy always resolves, even before the control plane has
+    /// pushed anything — an empty map makes every tenant unknown, and unknown
+    /// already means keep.
     fn resolve(config: &Config, tenant_policy: &TenantPolicy, now_ns: u128) -> Option<Self> {
         let clamped_now_ns = now_ns.min(i64::MAX as u128) as i64;
         if tenant_policy.is_enabled() {
@@ -246,6 +248,14 @@ async fn retention_once_at(
                     return Err("object-store retention timed out".to_string());
                 }
             }
+            // Retire the descriptors as soon as *their own* manifest write
+            // lands, not after the trace side has also succeeded. A failure
+            // below must not leave a part that is gone from the manifest but
+            // still advertised by the registry: once the grace period passes,
+            // the orphan collector removes its objects and the restore path
+            // has nothing left to serve.
+            let _guard = registry.operation_lock().write_owned().await;
+            registry.unregister(&removed_log_ids);
         }
         if !removed_trace_ids.is_empty() {
             let descriptors: Vec<_> = trace_parts
@@ -270,14 +280,11 @@ async fn retention_once_at(
                     return Err("trace object-store retention timed out".to_string());
                 }
             }
+            let _guard = registry.operation_lock().write_owned().await;
+            trace_registry.unregister(&removed_trace_ids);
         }
     }
 
-    if remote_cache.is_some() {
-        let _guard = registry.operation_lock().write_owned().await;
-        registry.unregister(&removed_log_ids);
-        trace_registry.unregister(&removed_trace_ids);
-    }
     if let Some(cache) = remote_cache {
         let epoch = cache.remote_operation_epoch();
         match tokio::time::timeout(
