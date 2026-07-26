@@ -777,7 +777,6 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
-    #[test]
     /// A settings reference that silently falls behind the code is worse than
     /// none: an operator trusts it and tunes a knob that no longer exists, or
     /// misses one that now decides whether their data survives. Adding a knob

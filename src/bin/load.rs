@@ -70,6 +70,9 @@ async fn main() {
     let target_eps = env_u64("LOGGYTRACY_LOAD_TARGET_EPS", 0);
     let query_every = env_usize("LOGGYTRACY_LOAD_QUERY_EVERY", 20).max(1) as u64;
     let seed = env_u64("LOGGYTRACY_LOAD_SEED", 0x5eed_2026);
+    // 1 means "send no tenant header", which is what every run did before this
+    // knob existed. Above 1 the workload rotates across that many tenants.
+    let tenant_count = env_u64("LOGGYTRACY_LOAD_TENANTS", 1).max(1);
     let revision = std::env::var("LOGGYTRACY_BUILD_REVISION")
         .or_else(|_| std::env::var("GIT_COMMIT"))
         .unwrap_or_else(|_| "unknown".to_string());
@@ -150,12 +153,15 @@ async fn main() {
         let batch = build_push(entries_per_push, event_bytes, sequence);
         let started = Instant::now();
         let steady = started >= warmup_end;
+        // Rotate so the tenant index in every flushed part has real breadth.
+        let push_tenant = tenant_name(sequence, tenant_count);
         match request(
             &http_address,
             "POST",
             "/loki/api/v1/push",
             &batch,
             "application/x-protobuf",
+            push_tenant.as_deref(),
         ) {
             Ok((204, _)) => {
                 let elapsed = started.elapsed();
@@ -179,7 +185,15 @@ async fn main() {
                 now.saturating_sub(60),
                 now
             );
-            match request(&http_address, "GET", &path, &[], "") {
+            let query_tenant = tenant_name(pushes, tenant_count);
+            match request(
+                &http_address,
+                "GET",
+                &path,
+                &[],
+                "",
+                query_tenant.as_deref(),
+            ) {
                 Ok((200, _)) => {
                     if steady {
                         query_steady.push(started.elapsed());
@@ -200,7 +214,14 @@ async fn main() {
                     earliest_s + 120
                 );
                 let started = Instant::now();
-                match request(&http_address, "GET", &restore_path, &[], "") {
+                match request(
+                    &http_address,
+                    "GET",
+                    &restore_path,
+                    &[],
+                    "",
+                    query_tenant.as_deref(),
+                ) {
                     Ok((200, _)) => {
                         restore_probe_latency.push(started.elapsed());
                         restore_probes += 1;
@@ -215,7 +236,14 @@ async fn main() {
                 now.saturating_sub(60),
                 now
             );
-            match request(&http_address, "GET", &metric_path, &[], "") {
+            match request(
+                &http_address,
+                "GET",
+                &metric_path,
+                &[],
+                "",
+                query_tenant.as_deref(),
+            ) {
                 Ok((200, _)) => {
                     if steady {
                         metric_steady.push(started.elapsed());
@@ -226,7 +254,14 @@ async fn main() {
             }
 
             let started = Instant::now();
-            match request(&http_address, "GET", "/api/search?limit=20", &[], "") {
+            match request(
+                &http_address,
+                "GET",
+                "/api/search?limit=20",
+                &[],
+                "",
+                query_tenant.as_deref(),
+            ) {
                 Ok((200, _)) => {
                     if steady {
                         tempo_steady.push(started.elapsed());
@@ -376,7 +411,7 @@ async fn main() {
         "merge_debt_parts": gauge(&end_metrics, "loggytracy_merge_debt_parts"),
     });
 
-    let report = serde_json::json!({
+    let mut report = serde_json::json!({
         "tier": tier,
         "seed": seed,
         "build_revision": revision,
@@ -420,6 +455,9 @@ async fn main() {
         "verdict": if behavioral_pass && numeric_pass { "PASS" } else if behavioral_pass { "PASS_BEHAVIORAL_ONLY" } else { "FAIL" },
     });
 
+    // Added after construction: the literal is already at `json!`'s recursion
+    // limit, and one more key inside it stops the macro from expanding.
+    report["tenants"] = serde_json::json!(tenant_count);
     let rendered = serde_json::to_string_pretty(&report).expect("report serialization");
     if let Ok(path) = std::env::var("LOGGYTRACY_LOAD_RESULT_PATH")
         && let Err(error) = std::fs::write(&path, format!("{rendered}\n"))
@@ -460,6 +498,16 @@ async fn send_otlp(client: &mut OtelClient, sequence: u64) -> Result<(), String>
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Which tenant a given request belongs to, or `None` when the run is
+/// single-tenant (in which case the server applies its missing-header policy,
+/// exactly as before this existed).
+fn tenant_name(sequence: u64, tenant_count: u64) -> Option<String> {
+    if tenant_count <= 1 {
+        return None;
+    }
+    Some(format!("load-tenant-{}", sequence % tenant_count))
 }
 
 fn build_push(count: usize, event_bytes: usize, sequence: u64) -> Vec<u8> {
@@ -507,6 +555,7 @@ fn request(
     path: &str,
     body: &[u8],
     content_type: &str,
+    tenant: Option<&str>,
 ) -> Result<(u16, String), String> {
     let mut stream = TcpStream::connect(address).map_err(|error| error.to_string())?;
     stream
@@ -517,8 +566,16 @@ fn request(
     } else {
         format!("Content-Type: {content_type}\r\n")
     };
+    // Without this header every request lands on the default tenant, which is
+    // what made a multi-tenant workload impossible to generate — and the
+    // per-tenant costs (a row group per tenant per part, a `meta.json` segment
+    // each) invisible to the load runs.
+    let tenant_header = match tenant {
+        Some(tenant) => format!("X-Scope-OrgID: {tenant}\r\n"),
+        None => String::new(),
+    };
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {address}\r\n{content_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\n{tenant_header}{content_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream
@@ -542,7 +599,7 @@ fn request(
 /// and HELP comment lines are skipped.
 fn fetch_metrics(address: &str) -> HashMap<String, f64> {
     let mut map = HashMap::new();
-    let Ok((200, response)) = request(address, "GET", "/metrics", &[], "") else {
+    let Ok((200, response)) = request(address, "GET", "/metrics", &[], "", None) else {
         return map;
     };
     let Some(body_start) = response.find("\r\n\r\n") else {
