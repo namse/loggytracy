@@ -778,6 +778,38 @@ mod tests {
     }
 
     #[test]
+    /// A settings reference that silently falls behind the code is worse than
+    /// none: an operator trusts it and tunes a knob that no longer exists, or
+    /// misses one that now decides whether their data survives. Adding a knob
+    /// without documenting it breaks this test rather than shipping quietly.
+    #[test]
+    fn every_configuration_knob_is_documented() {
+        let source = include_str!("config.rs");
+        let reference = include_str!("../docs/CONFIGURATION.md");
+
+        let mut undocumented: Vec<&str> = Vec::new();
+        let mut rest = source;
+        while let Some(start) = rest.find("\"LOGGYTRACY_") {
+            rest = &rest[start + 1..];
+            let Some(end) = rest.find('"') else { break };
+            let name = &rest[..end];
+            // Error messages quote knob names inside prose, so a match is only
+            // a knob when the whole literal looks like one.
+            let is_knob = name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+            if is_knob && !reference.contains(name) && !undocumented.contains(&name) {
+                undocumented.push(name);
+            }
+        }
+
+        assert!(
+            undocumented.is_empty(),
+            "these knobs exist in config.rs but not in docs/CONFIGURATION.md: {undocumented:#?}"
+        );
+    }
+
+    #[test]
     fn validates_that_the_default_tenant_is_itself_allowed() {
         let mut config = Config {
             allowed_tenants: Some(
