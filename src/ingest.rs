@@ -57,11 +57,8 @@ struct TimestampWindow {
 }
 
 impl TimestampWindow {
-    fn from_config(config: &Config) -> Self {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos().min(i64::MAX as u128) as i64)
-            .unwrap_or(0);
+    fn from_config(config: &Config, clock: &crate::clock::Clock) -> Self {
+        let now_ns = clock.now_ns();
         Self {
             oldest_ns: config
                 .max_timestamp_age
@@ -189,7 +186,7 @@ async fn push_inner(
         )
     })?;
 
-    let timestamp_window = TimestampWindow::from_config(limits);
+    let timestamp_window = TimestampWindow::from_config(limits, &state.clock);
     let mut parsed: Vec<(std::collections::BTreeMap<String, String>, Vec<LogEntry>)> =
         Vec::with_capacity(push_req.streams.len());
     for stream in &push_req.streams {
@@ -534,6 +531,60 @@ mod tests {
         );
 
         assert!(state.memtable.is_empty());
+    }
+
+    /// The window's whole content is two boundaries, and every test until now
+    /// approached them from far away — "a day old is rejected", "an hour old is
+    /// accepted" — which never exercises the edge itself. A unit mix-up lands
+    /// *just* outside; an ordinary clock skew lands *just* inside.
+    #[tokio::test]
+    async fn the_timestamp_window_accepts_its_edge_and_rejects_one_nanosecond_past_it() {
+        let now_ns = 1_800_000_000_000_000_000i64;
+        let age = Duration::from_secs(3600);
+        let config = Config {
+            data_dir: tmp_data_dir("timestamp_edge"),
+            max_timestamp_age: Some(age),
+            max_timestamp_skew: Some(age),
+            ..Config::default()
+        };
+        let clock = crate::clock::Clock::fixed(now_ns);
+        let memtable = Arc::new(MemTable::new());
+        let journal = Arc::new(journal::Journal::spawn(&config, memtable.clone()).unwrap());
+        let state = crate::test_support::state_with_clock(
+            config.clone(),
+            memtable,
+            journal,
+            Arc::new(PartRegistry::new()),
+            Arc::new(crate::trace_registry::TraceRegistry::standalone()),
+            None,
+            clock.clone(),
+        );
+
+        let window = TimestampWindow::from_config(&state.config, &clock);
+        let oldest = now_ns - age.as_nanos() as i64;
+        let newest = now_ns + age.as_nanos() as i64;
+
+        assert!(window.validate(oldest).is_ok(), "the oldest edge is inside");
+        assert!(window.validate(newest).is_ok(), "the newest edge is inside");
+        assert!(
+            window.validate(oldest - 1).is_err(),
+            "one nanosecond older must be refused"
+        );
+        assert!(
+            window.validate(newest + 1).is_err(),
+            "one nanosecond newer must be refused"
+        );
+
+        // And the window travels with the clock rather than being fixed at
+        // startup: a long-running process must not drift into refusing the
+        // present.
+        clock.advance(Duration::from_secs(7200));
+        let later = TimestampWindow::from_config(&state.config, &clock);
+        assert!(
+            later.validate(oldest).is_err(),
+            "what was the edge two hours ago is now outside"
+        );
+        assert!(later.validate(newest + 1).is_ok());
     }
 
     #[tokio::test]

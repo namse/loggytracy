@@ -2,6 +2,7 @@ mod admin;
 mod app_state;
 mod backpressure;
 mod bloom;
+mod clock;
 mod config;
 mod flush;
 mod ingest;

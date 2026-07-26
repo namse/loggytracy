@@ -53,11 +53,7 @@ pub async fn search(
             format!("limit must be between 1 and {max_search_limit}"),
         ));
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(i64::MAX as u128) as i64;
+    let now = state.clock.now_ns();
     let default_end = now;
     let default_start = state
         .config

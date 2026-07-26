@@ -34,3 +34,7 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Virtual time. Elapsed-time decisions — the flush cadence, the force-flush
+# backoff, the startup retry budget — are logic, and testing logic by waiting
+# out a real clock is how they ended up untested.
+tokio = { version = "1", features = ["test-util"] }

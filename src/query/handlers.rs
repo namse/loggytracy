@@ -8,10 +8,7 @@ pub async fn query_range(
     let parsed = logql::parse_expr(&params.query)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
 
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64;
+    let now_ns = state.clock.now_ns();
 
     let end_ns = match params.end.as_deref() {
         Some(s) => parse_time_ns(s).map_err(|e| (StatusCode::BAD_REQUEST, e))?,
@@ -137,10 +134,7 @@ pub async fn query(
     let parsed = logql::parse_expr(&params.query)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
 
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64;
+    let now_ns = state.clock.now_ns();
 
     let end_ns = match params.time.as_deref() {
         Some(t) => parse_time_ns(t).map_err(|e| (StatusCode::BAD_REQUEST, e))?,
@@ -356,10 +350,7 @@ fn metadata_window(
     state: &Arc<AppState>,
     params: &crate::query::MetadataParams,
 ) -> Result<crate::part::MetadataWindow, (StatusCode, String)> {
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos().min(i64::MAX as u128) as i64)
-        .unwrap_or(0);
+    let now_ns = state.clock.now_ns();
     let end_ns = match params.end.as_deref() {
         Some(raw) => crate::query::parse_time_ns(raw).map_err(|e| (StatusCode::BAD_REQUEST, e))?,
         None => now_ns,
@@ -764,7 +755,7 @@ fn tenant_policy_gauges(state: &AppState) -> TenantPolicyGauges {
             .unknown_tenants
             .load(std::sync::atomic::Ordering::Relaxed),
         last_push_age_seconds: snapshot
-            .newest_push_age(std::time::SystemTime::now())
+            .newest_push_age(state.clock.now())
             .as_secs(),
     }
 }

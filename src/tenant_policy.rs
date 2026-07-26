@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -391,6 +393,11 @@ pub struct TenantPolicy {
     /// same tenant are blind writes, so without this the store and the in-memory
     /// map could end up disagreeing about which one landed last.
     write_lock: tokio::sync::Mutex<()>,
+    /// Stamps `updated_at` and resolves cutoffs. Injected because those two
+    /// decide what a tenant may read: `query_floor_ns` clamps every read path
+    /// to this clock, so a test that cannot move it cannot exercise a retention
+    /// boundary except by writing data in the past and hoping.
+    clock: Arc<crate::clock::Clock>,
     pub metrics: TenantPolicyMetrics,
 }
 
@@ -402,12 +409,37 @@ impl TenantPolicy {
     }
 
     fn with_entries(store: Option<PolicyStore>, entries: BTreeMap<TenantId, PolicyEntry>) -> Self {
+        Self::with_entries_and_clock(store, entries, crate::clock::Clock::system())
+    }
+
+    fn with_entries_and_clock(
+        store: Option<PolicyStore>,
+        entries: BTreeMap<TenantId, PolicyEntry>,
+        clock: Arc<crate::clock::Clock>,
+    ) -> Self {
         Self {
             store,
             policies: RwLock::new(Arc::new(PolicyMap { entries })),
             write_lock: tokio::sync::Mutex::new(()),
+            clock,
             metrics: TenantPolicyMetrics::default(),
         }
+    }
+
+    /// A policy whose clock the test controls, so retention boundaries can be
+    /// crossed by moving time instead of by backdating data.
+    #[cfg(test)]
+    pub fn enabled_with_clock(clock: Arc<crate::clock::Clock>) -> Self {
+        Self::with_entries_and_clock(
+            Some(PolicyStore::Remote(Arc::new(ObjectStorage::in_memory()))),
+            BTreeMap::new(),
+            clock,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn clock(&self) -> &Arc<crate::clock::Clock> {
+        &self.clock
     }
 
     /// Load every stored policy before the workers start. A failure is fatal,
@@ -463,7 +495,7 @@ resurrect data those policies had already expired",
     }
 
     pub fn cutoffs_now(&self) -> Option<Cutoffs> {
-        self.cutoffs_at(now_ns())
+        self.cutoffs_at(self.clock.now_ns())
     }
 
     /// Oldest timestamp `tenant` may still read. `None` leaves the requested
@@ -502,7 +534,7 @@ resurrect data those policies had already expired",
         // wait could let the one that commits last store the older `updated_at`
         // and walk the push age backwards.
         let _guard = self.write_lock.lock().await;
-        let updated_at = SystemTime::now();
+        let updated_at = self.clock.now();
         let document = PolicyDocument {
             retention: raw.clone(),
             updated_at: format_timestamp(updated_at),
@@ -611,6 +643,9 @@ resurrect data those policies had already expired",
     }
 }
 
+/// Only tests reach for this now; production code reads the clock its
+/// `TenantPolicy` or `AppState` was built with.
+#[cfg(test)]
 pub fn now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -831,6 +866,78 @@ mod tests {
             ..Config::default()
         };
         assert!(TenantPolicy::load(&config, Some(storage)).await.is_err());
+    }
+
+    /// What retention actually promises is a boundary in time, and the previous
+    /// tests could only approach it by writing data with backdated timestamps
+    /// and asserting the far side. That leaves the edge itself — the case a
+    /// user notices — unexercised.
+    ///
+    /// With the clock injected the data stays put and time moves, which is the
+    /// real situation, and the assertion can sit exactly on the boundary.
+    #[tokio::test]
+    async fn a_retention_boundary_is_crossed_by_time_passing() {
+        let start_ns = 1_800_000_000_000_000_000i64;
+        let clock = crate::clock::Clock::fixed(start_ns);
+        let policy = TenantPolicy::enabled_with_clock(clock.clone());
+        policy.push(&tenant("acme"), "7d").await.unwrap();
+
+        let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
+        let floor = || policy.query_floor_ns(&tenant("acme")).expect("finite");
+
+        // A row written now sits exactly at the floor's far side.
+        assert_eq!(floor(), start_ns - seven_days.as_nanos() as i64);
+
+        // One nanosecond before the boundary: still readable.
+        clock.advance(seven_days);
+        assert_eq!(floor(), start_ns);
+        assert!(
+            !policy
+                .cutoffs_now()
+                .unwrap()
+                .is_expired(&tenant("acme"), start_ns),
+            "a row exactly at the cutoff is retained"
+        );
+
+        // One nanosecond past it: gone.
+        clock.advance(Duration::from_nanos(1));
+        assert!(
+            policy
+                .cutoffs_now()
+                .unwrap()
+                .is_expired(&tenant("acme"), start_ns),
+            "one nanosecond past the cutoff must expire"
+        );
+    }
+
+    /// An upgrade applies at deletion time, not write time. Stated that way it
+    /// is a claim about the clock, so moving the clock is how to check it.
+    #[tokio::test]
+    async fn an_upgrade_rescues_data_the_old_plan_had_already_passed() {
+        let start_ns = 1_800_000_000_000_000_000i64;
+        let clock = crate::clock::Clock::fixed(start_ns);
+        let policy = TenantPolicy::enabled_with_clock(clock.clone());
+        policy.push(&tenant("acme"), "1d").await.unwrap();
+
+        clock.advance(Duration::from_secs(2 * 24 * 60 * 60));
+        assert!(
+            policy
+                .cutoffs_now()
+                .unwrap()
+                .is_expired(&tenant("acme"), start_ns),
+            "two days in, a one-day plan has passed this row"
+        );
+
+        // The control plane upgrades the tenant. The row is still on disk, and
+        // the new plan covers it again.
+        policy.push(&tenant("acme"), "30d").await.unwrap();
+        assert!(
+            !policy
+                .cutoffs_now()
+                .unwrap()
+                .is_expired(&tenant("acme"), start_ns),
+            "the upgrade must apply to data written under the old plan"
+        );
     }
 
     /// Retention `0` is how a tenant is deleted, and until a rewrite reclaims

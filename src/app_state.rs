@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::backpressure::IngestGate;
+use crate::clock::Clock;
 use crate::config::Config;
 use crate::journal::Journal;
 use crate::memtable::MemTable;
@@ -35,6 +36,10 @@ pub struct AppState {
     /// Shared with the OTLP service so both protocols answer to one set of
     /// thresholds.
     pub ingest_gate: Arc<IngestGate>,
+    /// Wall clock. Injected so the boundaries that depend on it — which
+    /// timestamps ingest accepts, what range a query defaults to — can be
+    /// tested at the edge instead of relative to whatever `now` happened to be.
+    pub clock: Arc<Clock>,
 }
 
 /// Dependencies that are created during startup or by a test fixture.
@@ -51,6 +56,7 @@ pub struct AppStateDependencies {
     pub tenant_policy: Arc<TenantPolicy>,
     pub metrics: Arc<RuntimeMetrics>,
     pub shutdown: Arc<ShutdownState>,
+    pub clock: Arc<Clock>,
 }
 
 impl AppState {
@@ -65,6 +71,7 @@ impl AppState {
         ));
         Self {
             ingest_gate,
+            clock: dependencies.clock,
             query_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_query_scans,
             )),

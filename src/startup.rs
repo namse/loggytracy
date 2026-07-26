@@ -38,7 +38,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, String>>,
 {
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let mut backoff = Duration::from_millis(250);
     let mut attempt = 0u32;
     loop {
@@ -128,6 +128,7 @@ pub async fn run(config: Arc<Config>) {
     }
 
     let startup_budget = config.startup_retry_budget;
+    let clock = crate::clock::Clock::system();
     let memtable = Arc::new(MemTable::new());
     let trace_memtable = Arc::new(trace::TraceMemTable::new());
 
@@ -416,6 +417,7 @@ pub async fn run(config: Arc<Config>) {
             tenant_policy,
             metrics,
             shutdown: shutdown.clone(),
+            clock: clock.clone(),
         },
     ));
 
@@ -524,5 +526,83 @@ against the same LOGGYTRACY_OBJECT_STORE_URL."
             );
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// The whole point of virtual time. This budget is five minutes by default;
+    /// asserting anything about it against a real clock would mean a five-minute
+    /// test, which is why the behaviour went untested when it was written.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_failure_is_absorbed_rather_than_becoming_a_crash_loop() {
+        let attempts = AtomicU32::new(0);
+        let value = with_object_store_retry("probe", Duration::from_secs(300), || {
+            let seen = attempts.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if seen < 4 {
+                    Err(format!("transient {seen}"))
+                } else {
+                    Ok("recovered")
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(value, "recovered");
+        assert_eq!(attempts.load(Ordering::Relaxed), 5);
+    }
+
+    /// Bounded on purpose. A store that is misconfigured rather than briefly
+    /// unavailable must eventually surface, or a visible crash is replaced by an
+    /// invisible hang.
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_failure_gives_up_once_the_budget_is_spent() {
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::spawn(async {
+            with_object_store_retry::<(), _, _>("probe", Duration::from_secs(300), || async {
+                Err("always".to_string())
+            })
+            .await
+        })
+        .await;
+
+        let error = outcome.expect_err("an exhausted budget must panic");
+        assert!(error.is_panic());
+        // It really did wait out the budget — in virtual time, so the test costs
+        // nothing — rather than giving up on the first attempt.
+        assert!(
+            started.elapsed() >= Duration::from_secs(300),
+            "gave up after only {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Backoff has to actually back off. Retrying a dead store in a tight loop
+    /// is its own denial of service, against a dependency that is already
+    /// struggling.
+    #[tokio::test(start_paused = true)]
+    async fn retries_back_off_instead_of_spinning() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counter = attempts.clone();
+        let handle = tokio::spawn(async move {
+            with_object_store_retry::<(), _, _>("probe", Duration::from_secs(300), || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                async { Err("always".to_string()) }
+            })
+            .await
+        });
+        let _ = handle.await;
+
+        // 250 ms doubling to a 10 s ceiling reaches 300 s in well under a
+        // hundred attempts; a spinning loop would be in the millions.
+        let total = attempts.load(Ordering::Relaxed);
+        assert!(
+            (5..100).contains(&total),
+            "{total} attempts does not look like exponential backoff"
+        );
     }
 }

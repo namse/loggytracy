@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+// tokio's Instant, not std's: it follows `tokio::time::pause()`, which is what
+// lets a test assert this loop's cadence in microseconds instead of waiting out
+// `flush_max_interval` in real seconds.
+use tokio::time::Instant;
 
 use tokio::sync::watch;
 use tokio::time::interval;

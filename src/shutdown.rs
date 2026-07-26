@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// See the note in `flush.rs`: virtual time is what makes the force-flush
+// backoff and its operator warning testable at all.
+use tokio::time::Instant;
 
 use tokio::sync::{mpsc, watch};
 

@@ -179,6 +179,16 @@ evict 불가능한 디스크 사용량**이 된다.
 | `LOGGYTRACY_OBJECT_STORE_ERROR_RATE` | 0.0~1.0. **쓰기에만** 주입된다 |
 | `LOGGYTRACY_OBJECT_STORE_FAULT_SEED` | 재현용 시드 |
 
+## 시계
+
+프로덕션에서 설정할 것은 없다. 다만 시간 의존 동작이 어떻게 검사되는지는 알아 둘 값어치가 있다.
+
+- **단조 시계**(flush 주기, force-flush backoff, 기동 재시도 예산)는 `tokio::time::Instant`를 쓴다.
+  `tokio::time::pause()`가 이것을 가상화하므로, 5분짜리 예산을 10밀리초에 검사한다.
+- **벽시계**(타임스탬프 수용 윈도우, 쿼리 기본 범위, retention cutoff)는 `Clock`을 통해 읽는다.
+  테스트가 시계를 세우고 밀 수 있어서 경계를 정확히 겨냥할 수 있다 — 데이터를 과거로 조작하는
+  대신 시간을 움직인다.
+
 ## 로깅
 
 `RUST_LOG`를 그대로 따른다. 미설정 시 `loggytracy=info,warn`.
