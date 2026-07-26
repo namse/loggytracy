@@ -1,5 +1,14 @@
 # M7 Load Validation Results
 
+> **Status (2026-07-26).** The blocker both tiers hit — the WAL-compaction wedge —
+> is fixed, so these FAIL verdicts are historical: the runs must be repeated
+> before they say anything about the current build. The "validated on
+> target-class hardware" caveat below is also obsolete: real-S3 and
+> target-hardware validation are now **out of scope**, and local MinIO is the
+> ceiling. See [`LOAD_VALIDATION.md`](LOAD_VALIDATION.md) for what that does and
+> does not establish, and for the Tier D duration/scale run these two never
+> covered.
+
 This records the first M7 load-validation runs across both object-store tiers,
 the machine profile, per-target pass/fail, and the bottleneck the runs
 identified. The raw harness output is checked in as `docs/m7_tier_b_result.json`

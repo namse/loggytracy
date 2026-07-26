@@ -168,6 +168,7 @@ group당 bloom 필터가 테넌트 수에 비례한다. 압축률도 무너진�
 | P2-7 히스토그램·라벨 없는 `/metrics` | 열림 (N4로 악화. WAL backlog의 스크레이프당 `stat`은 P0-2와 함께 제거) |
 | P2-8 stdin abort가 컨테이너에서 무효 | 열림 |
 | P3 배포 자산 | 열림 (Dockerfile·설정 레퍼런스·runbook 전부 없음) |
+| P2 실 S3 검증 | **범위 밖으로 확정** — 로컬 MinIO가 상한 ([`LOAD_VALIDATION.md`](LOAD_VALIDATION.md)) |
 
 ---
 
@@ -331,7 +332,9 @@ fence 감지는 `ObjectStorage`가 `ShutdownState`에 직접 알린다. 워커�
 - [ ] P1-11 part 수 O(N) 경로 개선
 - [ ] P1-5 memtable flush deep clone 제거
 - [ ] P1-9 eviction을 `spawn_blocking` + 인메모리 메타데이터로
-- [ ] 실제 S3 + 목표 사양에서 최소 24시간 지속 부하
+- [ ] Tier D 지속·규모 런 (2시간 이상, part 10,000개 이상, 테넌트 500개 이상) —
+      **실 S3 검증은 범위 밖으로 확정**되었다. 근거와 남은 위험은
+      [`LOAD_VALIDATION.md`](LOAD_VALIDATION.md)
 
 ### 게이트 5 — 기능 완성도
 

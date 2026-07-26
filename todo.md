@@ -66,7 +66,9 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
 - [ ] Parquet range read 도입 (**테넌시 선행 작업** — 공유 part에서 테넌트 byte range만 읽어야 하므로
       더 이상 선택적 최적화가 아니다)
 - [ ] 메트릭 평가를 bounded in-memory 계산에서 streaming/pre-aggregation 방식으로 개선
-- [ ] 실제 S3 또는 S3-compatible endpoint를 이용한 배포 환경 검증
+- [x] ~~실제 S3를 이용한 배포 환경 검증~~ — **범위 밖으로 확정.** 인디 프로젝트이므로 부하 검증의
+      상한은 로컬 MinIO다. 무엇이 검증되고 무엇이 남은 위험인지, 그리고 첫 실 배포에서 무엇을
+      확인해야 하는지는 [`docs/LOAD_VALIDATION.md`](docs/LOAD_VALIDATION.md)
 
 ## P3 — M5 운영 검증
 
@@ -76,7 +78,12 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
       `merge_max_input_bytes <= merge_max_memory_bytes`를 강제한다.
 - [x] retention 정책과 만료 데이터 삭제 구현 (retention 전용 타임아웃 knob 분리 포함)
 - [ ] 쿼리 메모리·범위·동시성 등 resource limit을 운영 목표에 맞게 조정
-- [ ] 명시적인 처리량·지연시간·메모리 목표를 정하고 부하 테스트 수행
+- [ ] **Tier D 지속·규모 런** — 2시간 이상 연속, part 10,000개 이상, 테넌트 500개 이상, 런 중
+      재시작 1회. 기존 Tier B/C는 수십 초짜리라 P1-11(O(N) 경로)과 N3(row group 파편화)를
+      건드리지 못한다. 수용 기준은 [`docs/LOAD_VALIDATION.md`](docs/LOAD_VALIDATION.md)
+- [ ] **오브젝트 스토어 연산 횟수 계측** — flush/merge/retention 1회당 PUT·GET·LIST 횟수.
+      금액은 로컬에서 못 재지만 횟수는 백엔드와 무관하므로 잴 수 있고, 이 설계는 R2 Class A
+      비용에 지배당해 왔으므로 이 숫자가 곧 비용 예측이다
 - [ ] 부하 테스트 결과와 병목 구간을 문서화
 
 ## P4 — M6 장비 교체
