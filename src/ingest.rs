@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use prost::Message;
 
 use crate::AppState;
+use crate::backpressure::IngestError;
 use crate::config::Config;
 use crate::memtable::LogEntry;
 use crate::proto::{self, PushRequest};
@@ -14,13 +15,17 @@ pub async fn push(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, IngestError> {
     if state.shutdown.is_draining() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "server is draining for shutdown".to_string(),
-        ));
+        )
+            .into());
     }
+    // Ahead of the request counter as well as the body work: a refusal is not
+    // an ingest the server attempted.
+    state.ingest_gate.check()?;
     state
         .metrics
         .ingest_requests
@@ -32,7 +37,7 @@ pub async fn push(
             .ingest_errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    result
+    result.map_err(IngestError::from)
 }
 
 /// Accepted timestamp band around the server clock, resolved once per request.
@@ -354,7 +359,7 @@ mod tests {
             .await
             .expect_err("out-of-range timestamp must fail");
 
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(memtable.is_empty());
     }
 
@@ -400,8 +405,12 @@ mod tests {
             .await
             .expect_err("an oversized declared length must be rejected");
 
-        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(error.1.contains("decompressed bytes"), "{}", error.1);
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            error.message.contains("decompressed bytes"),
+            "{}",
+            error.message
+        );
     }
 
     #[tokio::test]
@@ -419,7 +428,7 @@ mod tests {
             .await
             .expect_err("an oversized body must be rejected");
 
-        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
@@ -436,7 +445,7 @@ mod tests {
             .await
             .expect_err("an oversized line must be rejected");
 
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(state.memtable.is_empty());
     }
 
@@ -470,8 +479,8 @@ mod tests {
             .await
             .expect_err("an oversized label set must be rejected");
 
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(error.1.contains("3 labels"), "{}", error.1);
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("3 labels"), "{}", error.message);
         assert!(state.memtable.is_empty());
     }
 
@@ -493,11 +502,11 @@ mod tests {
         )
         .await
         .expect_err("a far-past timestamp must be rejected");
-        assert_eq!(ancient_error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(ancient_error.status, StatusCode::BAD_REQUEST);
         assert!(
-            ancient_error.1.contains("older than"),
+            ancient_error.message.contains("older than"),
             "{}",
-            ancient_error.1
+            ancient_error.message
         );
 
         // A unit mix-up (seconds sent where nanoseconds were meant) is the
@@ -510,8 +519,12 @@ mod tests {
         )
         .await
         .expect_err("a far-future timestamp must be rejected");
-        assert_eq!(future_error.0, StatusCode::BAD_REQUEST);
-        assert!(future_error.1.contains("future"), "{}", future_error.1);
+        assert_eq!(future_error.status, StatusCode::BAD_REQUEST);
+        assert!(
+            future_error.message.contains("future"),
+            "{}",
+            future_error.message
+        );
 
         assert!(state.memtable.is_empty());
     }
@@ -533,6 +546,124 @@ mod tests {
 
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(!state.memtable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_is_refused_once_the_memtable_is_over_its_limit() {
+        let config = Config {
+            data_dir: tmp_data_dir("memtable_backpressure"),
+            // Below the flush trigger is rejected by `validate`, so both move
+            // together: the point is a ceiling one push can cross.
+            flush_max_bytes: 1,
+            max_memtable_bytes: Some(1),
+            ..Config::default()
+        };
+        let state = limits_state(config).await;
+
+        let accepted = push(
+            State(state.clone()),
+            protobuf_headers(),
+            Bytes::from(build_snappy_push("backpressure", "first line", now_secs())),
+        )
+        .await
+        .expect("the first push is under the limit");
+        assert_eq!(accepted, StatusCode::NO_CONTENT);
+
+        let refused = push(
+            State(state.clone()),
+            protobuf_headers(),
+            Bytes::from(build_snappy_push("backpressure", "second line", now_secs())),
+        )
+        .await
+        .expect_err("a full memtable must be refused");
+
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            refused.retry_after.is_some(),
+            "429 must tell the client when"
+        );
+        assert!(
+            refused.message.contains("memtable holds"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(
+            state
+                .metrics
+                .ingest_throttled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn push_is_refused_once_the_wal_backlog_is_over_its_limit() {
+        let config = Config {
+            data_dir: tmp_data_dir("wal_backpressure"),
+            max_memtable_bytes: None,
+            max_wal_backlog_bytes: Some(1),
+            ..Config::default()
+        };
+        let state = limits_state(config).await;
+
+        push(
+            State(state.clone()),
+            protobuf_headers(),
+            Bytes::from(build_snappy_push("backlog", "first line", now_secs())),
+        )
+        .await
+        .expect("an empty WAL accepts the first push");
+
+        let refused = push(
+            State(state.clone()),
+            protobuf_headers(),
+            Bytes::from(build_snappy_push("backlog", "second line", now_secs())),
+        )
+        .await
+        .expect_err("an unretired WAL backlog must be refused");
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            refused.message.contains("WAL backlog"),
+            "{}",
+            refused.message
+        );
+
+        // Retiring the backlog reopens ingest: backpressure is a moving state,
+        // not a latch.
+        let checkpoint = state.journal.checkpoint().await.unwrap();
+        state.memtable.commit_flush();
+        state.journal.set_checkpoint(checkpoint.offset).unwrap();
+        push(
+            State(state.clone()),
+            protobuf_headers(),
+            Bytes::from(build_snappy_push("backlog", "third line", now_secs())),
+        )
+        .await
+        .expect("a retired backlog accepts writes again");
+    }
+
+    #[tokio::test]
+    async fn disabled_limits_accept_everything() {
+        let config = Config {
+            data_dir: tmp_data_dir("backpressure_off"),
+            max_memtable_bytes: None,
+            max_wal_backlog_bytes: None,
+            ..Config::default()
+        };
+        let state = limits_state(config).await;
+        for index in 0..8 {
+            push(
+                State(state.clone()),
+                protobuf_headers(),
+                Bytes::from(build_snappy_push(
+                    "unbounded",
+                    &format!("line {index}"),
+                    now_secs(),
+                )),
+            )
+            .await
+            .expect("disabled limits never refuse");
+        }
     }
 
     #[tokio::test]

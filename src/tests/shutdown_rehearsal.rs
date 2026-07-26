@@ -203,7 +203,7 @@ async fn m6_draining_rejects_new_ingest_and_readiness() {
     )
     .await
     .unwrap_err();
-    assert_eq!(push_error.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(push_error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

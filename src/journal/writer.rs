@@ -30,20 +30,26 @@ impl Journal {
         let max_batch_bytes = config.max_batch_bytes;
         let max_batch_ms = config.max_batch_ms;
         let healthy = Arc::new(AtomicBool::new(true));
+        let backlog = Arc::new(WalBacklog::default());
+        backlog.set_wal_bytes(std::fs::metadata(&wal_path)?.len());
+        backlog.set_checkpoint_bytes(read_checkpoint(&ckpt_path)?);
 
         let wal_path_clone = wal_path.clone();
         let ckpt_path_clone = ckpt_path.clone();
         let writer_health = healthy.clone();
         let trace_memtable_clone = trace_memtable.clone();
+        let writer_backlog = backlog.clone();
+        let writer_memtable = memtable.clone();
         tokio::spawn(async move {
             let result = writer_loop(
                 rx,
                 &wal_path_clone,
                 &ckpt_path_clone,
-                memtable,
+                writer_memtable,
                 trace_memtable_clone,
                 max_batch_bytes,
                 max_batch_ms,
+                &writer_backlog,
             )
             .await;
             writer_health.store(false, Ordering::Release);
@@ -57,8 +63,21 @@ impl Journal {
             wal_path,
             ckpt_path,
             healthy,
+            memtable,
             trace_memtable,
+            backlog,
         })
+    }
+
+    pub fn wal_backlog_bytes(&self) -> u64 {
+        self.backlog.bytes()
+    }
+
+    /// The memtable this journal feeds. Held so the ingest gate can size both
+    /// buffers from the journal alone, rather than every caller having to
+    /// thread the log memtable in beside it.
+    pub fn log_memtable(&self) -> &Arc<MemTable> {
+        &self.memtable
     }
 
     pub async fn append(
@@ -138,7 +157,9 @@ impl Journal {
     }
 
     pub fn set_checkpoint(&self, offset: u64) -> Result<(), IoError> {
-        write_checkpoint(&self.ckpt_path, offset)
+        write_checkpoint(&self.ckpt_path, offset)?;
+        self.backlog.set_checkpoint_bytes(offset);
+        Ok(())
     }
 
     /// Drops the durable WAL prefix through `offset`. This command runs in
@@ -175,6 +196,7 @@ impl Journal {
 }
 
 
+#[allow(clippy::too_many_arguments)]
 async fn writer_loop(
     mut rx: mpsc::Receiver<JournalCmd>,
     path: &Path,
@@ -183,6 +205,7 @@ async fn writer_loop(
     trace_memtable: Arc<TraceMemTable>,
     max_batch_bytes: usize,
     max_batch_ms: u64,
+    backlog: &WalBacklog,
 ) -> Result<(), IoError> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -191,6 +214,7 @@ async fn writer_loop(
         .await?;
 
     let mut good_len = file.metadata().await?.len();
+    backlog.set_wal_bytes(good_len);
 
     loop {
         let first = match rx.recv().await {
@@ -278,6 +302,10 @@ async fn writer_loop(
             match write_result {
                 Ok(()) => {
                     good_len += buf.len() as u64;
+                    // Published before the acks below: a client that sees its
+                    // 204 must already be counted against the next request's
+                    // backpressure gate.
+                    backlog.set_wal_bytes(good_len);
                     for (_, tenant, streams, traces, done) in batch.drain(..) {
                         for (labels, entries) in streams {
                             memtable.insert(tenant.clone(), labels, entries);
@@ -300,6 +328,7 @@ async fn writer_loop(
                         tracing::error!(error = %te, "journal truncate failed, fencing writer");
                         return Err(te);
                     }
+                    backlog.set_wal_bytes(good_len);
                 }
             }
         }
@@ -323,6 +352,10 @@ async fn writer_loop(
             let result = compact_wal(&mut file, path, ckpt_path, offset, &mut good_len).await;
             match result {
                 Ok(()) => {
+                    // Compaction resets the checkpoint to zero and leaves only
+                    // the retained suffix, so both halves of the backlog move.
+                    backlog.set_checkpoint_bytes(0);
+                    backlog.set_wal_bytes(good_len);
                     let _ = done.send(Ok(()));
                 }
                 Err(error) => {
@@ -347,6 +380,8 @@ async fn writer_loop(
                         Ok((reopened, length)) => {
                             file = reopened;
                             good_len = length;
+                            backlog.set_checkpoint_bytes(read_checkpoint(ckpt_path).unwrap_or(0));
+                            backlog.set_wal_bytes(good_len);
                         }
                         Err(reopen_error) => {
                             tracing::error!(

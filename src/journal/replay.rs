@@ -34,12 +34,19 @@ fn recover_unfinished_compaction(wal_path: &Path, ckpt_path: &Path) -> Result<()
         return Ok(());
     };
     if state.phase != 1 {
+        // A phase-2 record from a build that never removed one. The rename it
+        // describes committed, so the record is stale bookkeeping: leaving it
+        // would make the next compaction compare offsets across the checkpoint
+        // reset and wedge the flush loop permanently.
+        remove_compaction_state(&state_path, wal_path)?;
         return Ok(());
     }
     let tmp_path = wal_path.with_extension("wal.compact.tmp");
     if !tmp_path.exists() {
         // The replacement WAL is already in place; replay its suffix from
-        // checkpoint zero.
+        // checkpoint zero. The intent record still has to go, for the same
+        // reason as above.
+        remove_compaction_state(&state_path, wal_path)?;
         return Ok(());
     }
 

@@ -419,6 +419,7 @@ impl PartReader {
             scan_limit,
             scan_bytes_limit,
             cancellation,
+            None,
         )
     }
 
@@ -427,8 +428,25 @@ impl PartReader {
     /// `Row`s that carry their own tenant instead of `StreamResult`s that do
     /// not.
     pub fn read_all_rows(&self, scan_bytes_limit: Option<u64>) -> Result<Vec<Row>, String> {
+        self.read_rows_in_row_groups(0..self.part.meta.row_group_count, scan_bytes_limit)
+    }
+
+    /// The same, restricted to a window of row groups.
+    ///
+    /// Row groups are the part's own bounded unit — `row_group_size` caps how
+    /// many rows one holds — so a window is what lets a rewrite of a part too
+    /// large to materialize proceed in pieces instead of failing forever.
+    pub fn read_rows_in_row_groups(
+        &self,
+        row_groups: std::ops::Range<u32>,
+        scan_bytes_limit: Option<u64>,
+    ) -> Result<Vec<Row>, String> {
         let mut rows = Vec::new();
         for segment in &self.part.meta.tenants {
+            if segment.row_group_start >= row_groups.end || segment.row_group_end <= row_groups.start
+            {
+                continue;
+            }
             let result = self.query_internal(
                 &segment.tenant,
                 &[],
@@ -444,6 +462,7 @@ impl PartReader {
                 None,
                 scan_bytes_limit,
                 None,
+                Some(row_groups.clone()),
             )?;
             for stream in result.results {
                 for entry in stream.entries {
@@ -452,6 +471,10 @@ impl PartReader {
             }
         }
         Ok(rows)
+    }
+
+    pub fn row_group_count(&self) -> u32 {
+        self.part.meta.row_group_count
     }
 
     fn select_row_groups(
@@ -539,6 +562,7 @@ impl PartReader {
         scan_limit: Option<usize>,
         scan_bytes_limit: Option<u64>,
         cancellation: Option<&AtomicBool>,
+        row_group_window: Option<std::ops::Range<u32>>,
     ) -> Result<QueryResult, String> {
         let rg_count = self.bloom.len();
         if rg_count == 0 {
@@ -575,6 +599,16 @@ impl PartReader {
             });
         }
         let mut sorted_selected = selected.clone();
+        if let Some(window) = &row_group_window {
+            sorted_selected.retain(|row_group| window.contains(row_group));
+            if sorted_selected.is_empty() {
+                return Ok(QueryResult {
+                    results: Vec::new(),
+                    scanned_rows: 0,
+                    scanned_bytes: 0,
+                });
+            }
+        }
         sorted_selected.sort_unstable();
         if !forward {
             sorted_selected.reverse();

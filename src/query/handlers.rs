@@ -409,11 +409,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
         .remote_cache
         .as_ref()
         .is_none_or(|cache| cache.is_cache_healthy());
-    let wal_bytes = std::fs::metadata(state.journal.wal_path())
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let checkpoint = crate::journal::read_checkpoint(state.journal.ckpt_path()).unwrap_or(0);
-    let wal_backlog_bytes = wal_bytes.saturating_sub(checkpoint);
+    let wal_backlog_bytes = state.journal.wal_backlog_bytes();
     let merge_debt_cutoffs = state.tenant_policy.cutoffs_now();
     let merge_debt_parts = crate::merge::merge_debt_part_count(
         &state.parts,
@@ -447,6 +443,10 @@ loggytracy_merge_debt_parts {}\n\
 loggytracy_ingest_requests_total {}\n\
 # TYPE loggytracy_ingest_errors_total counter\n\
 loggytracy_ingest_errors_total {}\n\
+# TYPE loggytracy_ingest_throttled_total counter\n\
+loggytracy_ingest_throttled_total {}\n\
+# TYPE loggytracy_memtable_buffered_bytes gauge\n\
+loggytracy_memtable_buffered_bytes {}\n\
 # TYPE loggytracy_flush_success_total counter\n\
 loggytracy_flush_success_total {}\n\
 # TYPE loggytracy_flush_errors_total counter\n\
@@ -519,6 +519,8 @@ loggytracy_force_flush_complete {}\n",
         merge_debt_parts,
         m.ingest_requests.load(Ordering::Relaxed),
         m.ingest_errors.load(Ordering::Relaxed),
+        m.ingest_throttled.load(Ordering::Relaxed),
+        state.ingest_gate.buffered_bytes(),
         m.flush_success.load(Ordering::Relaxed),
         m.flush_errors.load(Ordering::Relaxed),
         m.merge_success.load(Ordering::Relaxed),

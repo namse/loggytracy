@@ -9,21 +9,13 @@ async fn compact_wal(
     let compaction_state = read_compaction_state(&state_path)?;
     if let Some(state) = compaction_state {
         if state.phase == 2 {
-            if offset == state.offset {
-                *file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(wal_path)
-                    .await?;
-                *good_len = file.metadata().await?.len();
-                return Ok(());
-            }
-            if offset < state.offset {
-                return Err(IoError::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "WAL compaction checkpoint moved backwards",
-                ));
-            }
+            // The previous compaction finished: it renamed the replacement WAL
+            // into place and reset the checkpoint to zero. Its offset lives in
+            // a coordinate system this one no longer shares, so comparing the
+            // two is meaningless — the only work left is retiring the record.
+            // Doing that here also un-wedges an instance that was upgraded from
+            // a build which never removed it.
+            remove_compaction_state(&state_path, wal_path)?;
         } else if state.phase == 1 {
             let wal_len = std::fs::metadata(wal_path)?.len();
             let tmp_path = wal_path.with_extension("wal.compact.tmp");
@@ -55,7 +47,7 @@ async fn compact_wal(
                     ));
                 }
                 sync_wal_parent(wal_path)?;
-                write_compaction_state(&state_path, &state, 2)?;
+                remove_compaction_state(&state_path, wal_path)?;
                 *file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -103,7 +95,7 @@ async fn compact_wal(
         source_len: *good_len,
         retained_len,
     };
-    write_compaction_state(&state_path, &state, 1)?;
+    write_compaction_state(&state_path, &state)?;
 
     // Resetting the checkpoint before replacing the WAL makes every crash
     // point at-least-once safe: a crash before rename replays the old WAL,
@@ -117,7 +109,31 @@ async fn compact_wal(
         .open(wal_path)
         .await?;
     *good_len = retained_len;
-    write_compaction_state(&state_path, &state, 2)?;
+    // Retire the intent durably. Leaving it behind would make the next
+    // compaction compare its offset against this one's, and the two are in
+    // different coordinate systems from the moment the checkpoint reset above
+    // landed.
+    remove_compaction_state(&state_path, wal_path)?;
+    Ok(())
+}
+
+/// Remove the intent record and make the removal durable.
+///
+/// The phase-2 marker it replaces existed only to say "the rename committed",
+/// which is exactly what the record's absence says once the removal is durable.
+fn remove_compaction_state(state_path: &Path, wal_path: &Path) -> Result<(), IoError> {
+    #[cfg(test)]
+    if take_compaction_fault(wal_path, CompactionFault::BeforeStateRemoval) {
+        return Err(IoError::other("injected compaction state removal failure"));
+    }
+    match std::fs::remove_file(state_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    if let Some(parent) = wal_path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -155,10 +171,13 @@ fn read_compaction_state(path: &Path) -> Result<Option<CompactionState>, IoError
     }
 }
 
-fn write_compaction_state(path: &Path, state: &CompactionState, phase: u8) -> Result<(), IoError> {
+/// Only phase 1 is ever written: phase 2 is now expressed by the record's
+/// absence. [`read_compaction_state`] still accepts a phase-2 record so an
+/// instance upgraded from a build that left one behind recovers on its own.
+fn write_compaction_state(path: &Path, state: &CompactionState) -> Result<(), IoError> {
     let mut bytes = Vec::with_capacity(26);
     bytes.push(COMPACTION_STATE_VERSION);
-    bytes.push(phase);
+    bytes.push(1);
     bytes.extend_from_slice(&state.offset.to_le_bytes());
     bytes.extend_from_slice(&state.source_len.to_le_bytes());
     bytes.extend_from_slice(&state.retained_len.to_le_bytes());
@@ -174,7 +193,7 @@ fn write_compaction_state(path: &Path, state: &CompactionState, phase: u8) -> Re
 
 fn sync_wal_parent(wal_path: &Path) -> Result<(), IoError> {
     #[cfg(test)]
-    if FAIL_AFTER_COMPACTION_RENAME.swap(false, Ordering::AcqRel) {
+    if take_compaction_fault(wal_path, CompactionFault::AfterRename) {
         return Err(IoError::other("injected WAL directory fsync failure"));
     }
     if let Some(parent) = wal_path.parent() {

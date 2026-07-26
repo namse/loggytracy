@@ -1,5 +1,6 @@
 mod admin;
 mod app_state;
+mod backpressure;
 mod bloom;
 mod config;
 mod flush;

@@ -2,21 +2,33 @@
 
 M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을 정리한다.
 
-프로덕션 레디 게이트 전체 목록은 [`docs/PRODUCTION_READINESS_REVIEW.md`](docs/PRODUCTION_READINESS_REVIEW.md)에 있다.
+프로덕션 레디 게이트 전체 목록은 [`docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md`](docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md)에 있다
+(직전 리뷰는 [`docs/PRODUCTION_READINESS_REVIEW.md`](docs/PRODUCTION_READINESS_REVIEW.md)).
 
 ## P0 — 프로덕션 게이트
 
-- [ ] **WAL compaction wedge 수정** (아래 P5의 BLOCKER와 같은 항목). 재시작으로도 복구되지 않으므로
-      기존 wedge 복구 절차(`journal.wal.compact.state` 수동 삭제)도 함께 문서화한다.
-- [ ] **ingest backpressure**: memtable/WAL backlog 상한 초과 시 journal append 이전에 `429`.
-      선행 작업으로 memtable 크기 O(1) 추적이 필요하다 (현재 `approximate_size`가 O(rows)이고
-      500ms마다 ingest와 같은 락을 잡는다).
+- [x] **WAL compaction wedge 수정** (아래 P5의 BLOCKER와 같은 항목). intent 레코드를 성공 직후
+      durable 제거하고, 남아 있는 phase-2 레코드는 완료로 간주해 제거한다 — 이미 wedge된 인스턴스도
+      업그레이드만으로 복구되므로 수동 삭제 절차가 필요 없다.
+- [x] **ingest backpressure**: memtable/WAL backlog 상한 초과 시 journal append 이전에 `429`
+      (+`Retry-After`, OTLP는 `RESOURCE_EXHAUSTED`). memtable·WAL backlog 크기를 O(1)로 추적한다.
+      knob: `LOGGYTRACY_MAX_MEMTABLE_BYTES`, `LOGGYTRACY_MAX_WAL_BACKLOG_BYTES`,
+      `LOGGYTRACY_BACKPRESSURE_RETRY_AFTER`.
+- [x] **테넌트 삭제 보장**: merge가 메모리 상한을 넘으면 그룹을 절반씩, 단일 part는 row group
+      윈도로 나눠 재작성한다. 큰 part가 zero-retention 행을 영구히 붙들지 못한다.
+- [x] **정책 토큰 없는 부팅 차단**: 저장된 tenant policy가 있는데 토큰이 없으면 부팅 실패.
+      숨겨져 있던 삭제 데이터가 되살아나지 않는다.
+- [ ] **writer fencing**: manifest에 epoch/lease를 넣고 다른 epoch 관측 시 self-fence.
+      현재 같은 prefix로 두 프로세스를 띄우면 둘 다 정상 동작한다고 믿고 쓴다.
+- [ ] **테넌트 allowlist**: 아래 체크리스트에 완료로 표시돼 있으나 코드에는 없다.
+      `TenantId::parse`가 문자셋만 보므로 무제한 테넌트 생성이 가능하다.
 - [ ] **테넌시** (진행 중). 설계·비용 모델·구현 체크리스트는
       [`docs/MULTI_TENANCY_DESIGN.md`](docs/MULTI_TENANCY_DESIGN.md).
       **테넌트를 저장 경로 분할 축으로 두는 기존 설계(`docs/ARCHITECTURE.md`의 "테넌시" 절)는
       R2 Class A 비용 때문에 폐기됐다** — 테넌트마다 객체를 쓰면 어떤 RPO에서도 $1 플랜 예산에
       맞지 않는다.
-  - [x] `X-Scope-OrgID` 추출·허용 목록 검증 (Loki push + OTLP gRPC), 헤더 없는 요청 정책 설정
+  - [x] `X-Scope-OrgID` 추출 (Loki push + OTLP gRPC), 헤더 없는 요청 정책 설정.
+        **허용 목록 검증은 미구현** — 위 P0의 "테넌트 allowlist" 참조
   - [x] WAL 레코드에 테넌트 기록 (재시작 후에도 소유자 유지, 기존 WAL은 기본 테넌트로 복구)
   - [x] 테넌트 공유 part: `(tenant, ts)` 정렬 + 테넌트 경계에 정렬된 row group + `meta.json`
         테넌트 인덱스 (로그·트레이스 양쪽)
@@ -56,7 +68,8 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
 
 - [ ] compaction 튜닝
 - [ ] `merge_max_input_bytes`(압축 크기)와 `merge_max_memory_bytes`(압축 해제 크기)의 단위 불일치 수정.
-      기본값으로 1 KiB 라인이면 대형 그룹 merge가 영구 실패하고 더 작은 그룹으로 물러서는 fallback이 없다.
+      **분할 fallback은 구현됐으므로 더 이상 영구 실패는 아니다** — 남은 것은 그룹 선택 단계에서
+      압축률을 반영해 애초에 안 맞는 그룹을 만들지 않는 것이다.
 - [x] retention 정책과 만료 데이터 삭제 구현 (retention 전용 타임아웃 knob 분리 포함)
 - [ ] 쿼리 메모리·범위·동시성 등 resource limit을 운영 목표에 맞게 조정
 - [ ] 명시적인 처리량·지연시간·메모리 목표를 정하고 부하 테스트 수행
@@ -75,7 +88,7 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
 - [x] 강제 종료 후 재시작 시 저널 replay로 무손실 자동 복구
 - [x] drain-status readiness: draining 중 `/ready` 503 + `/metrics`에 pending bytes/flush 완료 노출
 - [x] 장비 교체 리허설 (새 인스턴스가 무손실로 트래픽 재개)
-- [ ] fresh-context 리뷰 (남은 게이트)
+- [x] fresh-context 리뷰 (남은 게이트) — `docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md`
 
 ## P5 — M7 로컬 S3 부하 검증
 
@@ -87,7 +100,7 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
 - [x] MinIO manifest CAS(`PutMode::Create`/`Update`) 동작 확인 (`OBJECT_STORE_CONDITIONAL_PUT=etag` 필요, 문서화 완료)
 - [x] 부하 하네스 개선: target-rate pacing, warmup/steady-state 분리, 강제 eviction→restore, 목표 대비 pass/fail (`src/bin/load.rs`)
 - [x] `docs/M7_LOAD_RESULTS.md` 결과·머신 프로파일·병목 문서화
-- [ ] **BLOCKER — WAL compaction 무한 wedge 버그 수정 (후속 작업으로 분리):** 첫 compaction 이후
+- [x] **BLOCKER — WAL compaction 무한 wedge 버그 수정 (완료):** 첫 compaction 이후
   phase-2 compaction-state 파일이 제거되지 않아, 좌표계가 리셋된 다음 compaction offset이
   stale offset과 비교되어 `"WAL compaction checkpoint moved backwards"`로 flush 루프가 영구
   wedge됨. 장애 주입 없이 Tier B(`file://`)·Tier C(MinIO) 양쪽에서 재현. object-store 백엔드

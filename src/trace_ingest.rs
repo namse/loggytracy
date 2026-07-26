@@ -7,6 +7,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use prost014::Message;
 use tonic::{Request, Response, Status};
 
+use crate::backpressure::IngestGate;
 use crate::config::Config;
 use crate::journal::Journal;
 use crate::shutdown::ShutdownState;
@@ -20,14 +21,21 @@ pub struct TraceIngestService {
     journal: Arc<Journal>,
     shutdown: Arc<ShutdownState>,
     config: Arc<Config>,
+    ingest_gate: Arc<IngestGate>,
 }
 
 impl TraceIngestService {
-    pub fn new(journal: Arc<Journal>, shutdown: Arc<ShutdownState>, config: Arc<Config>) -> Self {
+    pub fn new(
+        journal: Arc<Journal>,
+        shutdown: Arc<ShutdownState>,
+        config: Arc<Config>,
+        ingest_gate: Arc<IngestGate>,
+    ) -> Self {
         Self {
             journal,
             shutdown,
             config,
+            ingest_gate,
         }
     }
 
@@ -47,6 +55,7 @@ impl TraceService for TraceIngestService {
         if self.shutdown.is_draining() {
             return Err(Status::unavailable("server is draining for shutdown"));
         }
+        self.ingest_gate.check_grpc()?;
         let tenant = crate::tenant::from_grpc_metadata(request.metadata(), &self.config)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let request = request.into_inner();
@@ -141,7 +150,9 @@ mod tests {
         );
         let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
         shutdown.begin_drain();
-        let service = TraceIngestService::new(journal, shutdown, Arc::new(config.clone()));
+        let ingest_gate = IngestGate::for_test(&journal, &config);
+        let service =
+            TraceIngestService::new(journal, shutdown, Arc::new(config.clone()), ingest_gate);
 
         let status = service.export(tenant_request(request())).await.unwrap_err();
 
@@ -149,6 +160,55 @@ mod tests {
         assert!(
             trace_memtable.is_empty(),
             "a drained OTLP request must not be appended"
+        );
+    }
+
+    /// One process, one memory budget: OTLP has to answer to the same
+    /// thresholds as Loki push, or refusing one protocol just moves the
+    /// overrun into the other.
+    #[tokio::test]
+    async fn export_is_refused_once_the_buffers_are_over_their_limit() {
+        let config = Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("loggytracy-trace-ingest-{}", uuid::Uuid::new_v4())),
+            flush_max_bytes: 1,
+            max_memtable_bytes: Some(1),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let trace_memtable = Arc::new(TraceMemTable::new());
+        let journal = Arc::new(
+            journal::Journal::spawn_with_traces(
+                &config,
+                Arc::new(crate::memtable::MemTable::new()),
+                trace_memtable.clone(),
+            )
+            .unwrap(),
+        );
+        let ingest_gate = IngestGate::for_test(&journal, &config);
+        let service = TraceIngestService::new(
+            journal,
+            Arc::new(crate::shutdown::ShutdownState::new()),
+            Arc::new(config.clone()),
+            ingest_gate,
+        );
+
+        service
+            .export(tenant_request(request()))
+            .await
+            .expect("the first export is under the limit");
+        let status = service
+            .export(tenant_request(request()))
+            .await
+            .expect_err("a full buffer must be refused");
+
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            trace_memtable
+                .query_trace_id(&test_tenant(), &"01".repeat(16))
+                .len(),
+            1,
+            "the refused export must not have been appended"
         );
     }
 
@@ -166,10 +226,12 @@ mod tests {
             journal::Journal::spawn_with_traces(&config, log_memtable, trace_memtable.clone())
                 .unwrap(),
         );
+        let ingest_gate = IngestGate::for_test(&journal, &config);
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
+            ingest_gate,
         );
         let response = service.export(tenant_request(request())).await.unwrap();
         assert!(response.into_inner().partial_success.is_none());
@@ -214,10 +276,12 @@ mod tests {
             )
             .unwrap(),
         );
+        let ingest_gate = IngestGate::for_test(&journal, &config);
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
+            ingest_gate,
         );
         let mut invalid = request();
         invalid.resource_spans[0].scope_spans[0].spans[0].trace_id = vec![0; 16];
@@ -245,10 +309,12 @@ mod tests {
             )
             .unwrap(),
         );
+        let ingest_gate = IngestGate::for_test(&journal, &config);
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
+            ingest_gate,
         );
         let mut oversized = request();
         oversized.resource_spans[0].scope_spans[0].spans[0].name =
@@ -279,10 +345,12 @@ mod tests {
             )
             .unwrap(),
         );
+        let ingest_gate = IngestGate::for_test(&journal, &config);
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
+            ingest_gate,
         );
         let mut too_many = request();
         too_many.resource_spans[0].scope_spans[0].spans = vec![Span::default(); MAX_OTLP_SPANS + 1];
@@ -329,10 +397,12 @@ mod tests {
             tokio::sync::watch::channel(false).1,
         ));
 
+        let ingest_gate = IngestGate::for_test(&journal, &config);
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
+            ingest_gate,
         );
         service.export(tenant_request(request())).await.unwrap();
         for _ in 0..100 {

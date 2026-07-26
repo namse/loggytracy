@@ -7,6 +7,10 @@ use std::time::Duration;
 pub struct RuntimeMetrics {
     pub ingest_requests: AtomicU64,
     pub ingest_errors: AtomicU64,
+    /// Requests refused because the durable path was already behind. Distinct
+    /// from `ingest_errors`: this one says the server is healthy and saying no,
+    /// which is the signal an operator scales or tunes flush on.
+    pub ingest_throttled: AtomicU64,
     pub flush_success: AtomicU64,
     pub flush_errors: AtomicU64,
     pub merge_success: AtomicU64,
@@ -42,6 +46,7 @@ impl RuntimeMetrics {
         Self {
             ingest_requests: AtomicU64::new(0),
             ingest_errors: AtomicU64::new(0),
+            ingest_throttled: AtomicU64::new(0),
             flush_success: AtomicU64::new(0),
             flush_errors: AtomicU64::new(0),
             merge_success: AtomicU64::new(0),

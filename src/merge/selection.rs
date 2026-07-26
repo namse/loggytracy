@@ -149,6 +149,135 @@ fn read_all_rows(readers: &[Arc<PartReader>]) -> Result<Vec<part::Row>, String> 
     read_all_rows_with_limit(readers, u64::MAX)
 }
 
+/// What one group's rewrite produced.
+pub struct GroupRewrite {
+    pub new_parts: Vec<part::Part>,
+    pub dropped_rows: usize,
+    pub kept_rows: usize,
+}
+
+/// Read a group, drop what has expired, and write the survivors.
+///
+/// Reading and writing are interleaved rather than staged, because the whole
+/// point of splitting an oversized group is to keep peak memory bounded:
+/// holding every batch until the end would cost exactly what materializing the
+/// group at once costs.
+///
+/// However many output parts this produces, they all carry the same merge
+/// tombstone naming `old_dirs`, so the commit that follows still replaces the
+/// inputs in one transaction.
+pub fn rewrite_group(
+    readers: &[Arc<PartReader>],
+    cutoffs: Option<&Cutoffs>,
+    parts_root: &Path,
+    row_group_size: usize,
+    max_memory_bytes: u64,
+    old_dirs: &[PathBuf],
+) -> Result<GroupRewrite, String> {
+    let mut rewrite = GroupRewrite {
+        new_parts: Vec::new(),
+        dropped_rows: 0,
+        kept_rows: 0,
+    };
+    let result = read_in_batches(readers, max_memory_bytes, &mut |mut rows| {
+        let before = rows.len();
+        if let Some(cutoffs) = cutoffs {
+            rows.retain(|row| !cutoffs.is_expired(&row.tenant, row.timestamp_ns));
+        }
+        rewrite.dropped_rows += before - rows.len();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        rewrite.kept_rows += rows.len();
+        let written =
+            part::flush_rows_with_merge_tombstone(rows, parts_root, row_group_size, old_dirs)
+                .map_err(|error| error.to_string())?;
+        rewrite.new_parts.extend(written);
+        Ok(())
+    });
+    if let Err(error) = result {
+        // A later batch failed after earlier ones were already on disk. They
+        // are unreferenced by any manifest, so removing them here keeps the
+        // failure from leaving parts that only tombstone recovery would clean.
+        let written: Vec<PathBuf> = rewrite.new_parts.iter().map(|new| new.dir.clone()).collect();
+        if let Err(cleanup_error) = part::remove_part_dirs(&written) {
+            tracing::warn!(%cleanup_error, "failed to remove partial merge output");
+        }
+        return Err(error);
+    }
+    Ok(rewrite)
+}
+
+/// Hand the group's rows to `sink` in pieces that each fit the budget.
+///
+/// A group of several parts halves until its pieces fit; a single part that
+/// still does not fit is read a row-group window at a time. Without this a
+/// part larger than `merge_max_memory_bytes` could never be rewritten, and for
+/// a tenant at zero retention that means its rows are never actually deleted —
+/// only hidden by the query clamp, which is not what deletion means.
+fn read_in_batches(
+    readers: &[Arc<PartReader>],
+    max_memory_bytes: u64,
+    sink: &mut impl FnMut(Vec<part::Row>) -> Result<(), String>,
+) -> Result<(), String> {
+    let error = match read_all_rows_with_limit(readers, max_memory_bytes) {
+        Ok(rows) => return sink(rows),
+        Err(error) => error,
+    };
+    if readers.len() > 1 {
+        let (left, right) = readers.split_at(readers.len() / 2);
+        read_in_batches(left, max_memory_bytes, sink)?;
+        return read_in_batches(right, max_memory_bytes, sink);
+    }
+    let reader = &readers[0];
+    if reader.row_group_count() <= 1 {
+        // One row group is the part's indivisible unit. `row_group_size` caps
+        // how many rows it holds, so reaching here means a single row group
+        // exceeds the whole merge budget — a configuration problem the split
+        // cannot solve, and the error says so rather than looping.
+        return Err(error);
+    }
+    for window in row_group_windows(reader, max_memory_bytes) {
+        sink(reader.read_rows_in_row_groups(window, Some(max_memory_bytes))?)?;
+    }
+    Ok(())
+}
+
+/// Row-group windows sized so each one is expected to fit the memory budget.
+///
+/// Sized from the part's own average row width rather than a fixed count: a
+/// part of wide rows needs smaller windows than one of narrow rows for the same
+/// budget. Always at least one row group, so the walk terminates.
+fn row_group_windows(reader: &PartReader, max_memory_bytes: u64) -> Vec<std::ops::Range<u32>> {
+    let row_group_count = reader.row_group_count();
+    let meta = reader.meta();
+    let rows_per_group = (meta.row_count / row_group_count.max(1) as u64).max(1);
+    let bytes_per_row = estimated_part_bytes(reader)
+        .checked_div(meta.row_count.max(1))
+        .unwrap_or(128)
+        .max(1)
+        // Compressed on disk, materialized in memory. Undershooting the window
+        // costs an extra output part; overshooting costs another failed read.
+        .saturating_mul(UNCOMPRESSED_EXPANSION);
+    let bytes_per_group = rows_per_group.saturating_mul(bytes_per_row).max(1);
+    let groups_per_window = (max_memory_bytes / bytes_per_group).clamp(1, row_group_count as u64);
+
+    let mut windows = Vec::new();
+    let mut start = 0u32;
+    while start < row_group_count {
+        let end = start.saturating_add(groups_per_window as u32).min(row_group_count);
+        windows.push(start..end);
+        start = end;
+    }
+    windows
+}
+
+/// Assumed zstd ratio when converting a part's on-disk size into the memory a
+/// rewrite of it will need. Log text commonly compresses far better than this;
+/// the estimate is deliberately conservative because being wrong the other way
+/// means another failed read.
+const UNCOMPRESSED_EXPANSION: u64 = 8;
+
 fn read_all_rows_with_limit(
     readers: &[Arc<PartReader>],
     max_memory_bytes: u64,

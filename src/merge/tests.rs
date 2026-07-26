@@ -635,6 +635,112 @@
         );
     }
 
+    fn wide_tenant_row(owner: &str, timestamp_ns: i64) -> part::Row {
+        part::Row {
+            tenant: tenant_id(owner),
+            timestamp_ns,
+            labels: [("app".to_string(), owner.to_string())]
+                .into_iter()
+                .collect(),
+            line: format!("{owner}-{timestamp_ns}-{}", "x".repeat(1024)),
+            structured_metadata: vec![],
+        }
+    }
+
+    /// Deleting a tenant is `retention: "0"`, and a deletion that a large part
+    /// can indefinitely postpone is not a deletion. When the part does not fit
+    /// in `merge_max_memory_bytes` as a whole, the rewrite proceeds a row-group
+    /// window at a time instead of being skipped forever.
+    #[tokio::test]
+    async fn a_part_too_large_to_materialize_is_rewritten_in_row_group_windows() {
+        let dir = tmp_dir("retention-windowed-rewrite");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 4,
+            retention_period: None,
+            // One row per row group, and a budget that fits a single row but
+            // not the whole part.
+            row_group_size: 1,
+            merge_max_memory_bytes: 2 * 1024,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        let parts = part::flush_rows(
+            vec![
+                wide_tenant_row("deleted", 1_000),
+                wide_tenant_row("deleted", 1_001),
+                wide_tenant_row("kept", 1_002),
+                wide_tenant_row("kept", 1_003),
+            ],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        registry.register(parts.clone()).unwrap();
+        assert_eq!(registry.snapshot()[0].row_group_count(), 4);
+
+        let policy = policy_with(&[
+            (
+                "deleted",
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::ZERO),
+            ),
+            ("kept", crate::tenant_policy::TenantRetention::Infinite),
+        ]);
+        let metrics = RuntimeMetrics::new();
+
+        merge_once(&registry, None, &config, &policy, &metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            metrics.retention_rewrite_skipped.load(Ordering::Relaxed),
+            0,
+            "the rewrite must happen rather than be skipped"
+        );
+        assert!(!parts[0].dir.exists(), "the input part must be replaced");
+
+        // Every one of the deleted tenant's rows is gone from the replacement,
+        // and the surviving tenant is untouched.
+        let survivors = registry.snapshot();
+        assert!(!survivors.is_empty());
+        for reader in &survivors {
+            assert!(
+                reader
+                    .meta()
+                    .tenants
+                    .iter()
+                    .all(|segment| segment.tenant != tenant_id("deleted")),
+                "a replacement part still indexes the deleted tenant"
+            );
+        }
+        let kept_rows: usize = survivors
+            .iter()
+            .map(|reader| {
+                reader
+                    .query(
+                        &tenant_id("kept"),
+                        &[],
+                        Default::default(),
+                        i64::MIN,
+                        i64::MAX,
+                        100,
+                        true,
+                    )
+                    .unwrap()
+                    .iter()
+                    .map(|stream| stream.entries.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        assert_eq!(kept_rows, 2, "the surviving tenant lost rows");
+        assert_eq!(
+            metrics.retention_expired_rows_dropped.load(Ordering::Relaxed),
+            2
+        );
+    }
+
     /// A part that does not fit in `merge_max_memory_bytes` fails to read on
     /// every tick. When retention is the only reason it was selected, that has
     /// to stay a counted skip: reporting it would hold `merge_healthy` low

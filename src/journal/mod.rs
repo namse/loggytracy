@@ -2,7 +2,7 @@ use std::io::Error as IoError;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use prost::Message;
@@ -35,8 +35,42 @@ const TENANT_RECORD_KIND_LOGS: u8 = 0;
 const TENANT_RECORD_KIND_TRACES: u8 = 1;
 const TENANT_RECORD_PREFIX_SIZE: usize = TENANT_RECORD_MAGIC.len() + 3;
 
+/// Where a compaction crash is simulated.
+///
+/// Keyed by WAL path rather than held in a plain flag: tests run in parallel,
+/// and a process-wide flag is consumed by whichever compaction reaches it
+/// first, which is rarely the one that armed it.
 #[cfg(test)]
-static FAIL_AFTER_COMPACTION_RENAME: AtomicBool = AtomicBool::new(false);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompactionFault {
+    AfterRename,
+    BeforeStateRemoval,
+}
+
+#[cfg(test)]
+static COMPACTION_FAULTS: std::sync::Mutex<Vec<(PathBuf, CompactionFault)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn inject_compaction_fault(wal_path: &Path, fault: CompactionFault) {
+    COMPACTION_FAULTS
+        .lock()
+        .unwrap()
+        .push((wal_path.to_path_buf(), fault));
+}
+
+#[cfg(test)]
+fn take_compaction_fault(wal_path: &Path, fault: CompactionFault) -> bool {
+    let mut armed = COMPACTION_FAULTS.lock().unwrap();
+    let Some(index) = armed
+        .iter()
+        .position(|(path, pending)| path == wal_path && *pending == fault)
+    else {
+        return false;
+    };
+    armed.swap_remove(index);
+    true
+}
 
 pub struct CheckpointSnapshot {
     pub offset: u64,
@@ -121,7 +155,38 @@ pub struct Journal {
     wal_path: PathBuf,
     ckpt_path: PathBuf,
     healthy: Arc<AtomicBool>,
+    memtable: Arc<MemTable>,
     trace_memtable: Arc<TraceMemTable>,
+    backlog: Arc<WalBacklog>,
+}
+
+/// Durable WAL bytes the flush loop has not yet retired.
+///
+/// Both numbers are already known to the code that changes them, so the ingest
+/// gate and `/metrics` read them instead of paying a `stat` plus a checkpoint
+/// file read per request.
+#[derive(Default)]
+pub struct WalBacklog {
+    wal_bytes: AtomicU64,
+    checkpoint_bytes: AtomicU64,
+}
+
+impl WalBacklog {
+    fn set_wal_bytes(&self, bytes: u64) {
+        self.wal_bytes.store(bytes, Ordering::Release);
+    }
+
+    fn set_checkpoint_bytes(&self, bytes: u64) {
+        self.checkpoint_bytes.store(bytes, Ordering::Release);
+    }
+
+    /// Saturating because the two stores are independent: a checkpoint that
+    /// lands between them can briefly exceed the WAL length it refers to.
+    pub fn bytes(&self) -> u64 {
+        self.wal_bytes
+            .load(Ordering::Acquire)
+            .saturating_sub(self.checkpoint_bytes.load(Ordering::Acquire))
+    }
 }
 
 include!("writer.rs");

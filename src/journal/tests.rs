@@ -190,7 +190,7 @@
         let checkpoint = h.journal.checkpoint().await.unwrap();
         h.memtable.commit_flush();
 
-        FAIL_AFTER_COMPACTION_RENAME.store(true, Ordering::Release);
+        inject_compaction_fault(h.journal.wal_path(), CompactionFault::AfterRename);
         assert!(
             h.journal
                 .compact_checkpoint(checkpoint.offset)
@@ -237,7 +237,7 @@
             source_len,
             retained_len: 0,
         };
-        write_compaction_state(&state_path, &state, 1).unwrap();
+        write_compaction_state(&state_path, &state).unwrap();
         write_checkpoint(h.journal.ckpt_path(), 0).unwrap();
         std::fs::write(&tmp_path, []).unwrap();
 
@@ -259,6 +259,137 @@
         );
         assert!(!state_path.exists());
         assert!(!tmp_path.exists());
+    }
+
+    /// Records the caller just flushed, so the next compaction offset is a
+    /// fresh one in whatever coordinate system the WAL is currently in.
+    async fn flush_round(harness: &Harness, label: &str, line: &str) -> u64 {
+        push(
+            harness,
+            make_push_req(&[(&format!("{{app=\"{label}\"}}"), vec![(line, 100)])]),
+        )
+        .await;
+        let checkpoint = harness.journal.checkpoint().await.unwrap();
+        harness.memtable.commit_flush();
+        checkpoint.offset
+    }
+
+    /// Compaction resets the checkpoint to zero, so every offset after the
+    /// first one lives in a new coordinate system. Comparing them across that
+    /// reset used to wedge the flush loop forever whenever a batch was smaller
+    /// than its predecessor, which is most batches.
+    #[tokio::test]
+    async fn consecutive_compactions_truncate_whatever_the_batch_sizes_are() {
+        let h = harness("consecutive_compactions").await;
+        // Shrinking, then equal, then growing: the three ways the next offset
+        // can compare against the previous one.
+        for (label, line) in [
+            ("aaaaaaaaaaaaaaaa", "first"),
+            ("b", "second"),
+            ("b", "second"),
+            ("cccccccccccccccccccccccc", "third"),
+        ] {
+            let offset = flush_round(&h, label, line).await;
+            h.journal.compact_checkpoint(offset).await.unwrap();
+            assert_eq!(
+                std::fs::metadata(h.journal.wal_path()).unwrap().len(),
+                0,
+                "compaction left the WAL untruncated for {label}"
+            );
+            assert_eq!(read_checkpoint(h.journal.ckpt_path()).unwrap(), 0);
+        }
+        let state_path = h.journal.wal_path().with_file_name(COMPACTION_STATE_FILE);
+        assert!(!state_path.exists(), "the intent record outlived compaction");
+    }
+
+    fn write_legacy_phase_two_state(state_path: &std::path::Path, offset: u64) {
+        let mut bytes = vec![COMPACTION_STATE_VERSION, 2];
+        bytes.extend_from_slice(&offset.to_le_bytes());
+        bytes.extend_from_slice(&offset.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(state_path, bytes).unwrap();
+    }
+
+    /// An instance upgraded while already wedged must recover on its own: the
+    /// documented workaround was for an operator to delete this file by hand.
+    #[tokio::test]
+    async fn a_leftover_phase_two_record_no_longer_wedges_compaction() {
+        let h = harness("legacy_phase_two_compact").await;
+        let state_path = h.journal.wal_path().with_file_name(COMPACTION_STATE_FILE);
+        write_legacy_phase_two_state(&state_path, u64::MAX);
+
+        let offset = flush_round(&h, "wedged", "recovered").await;
+        h.journal.compact_checkpoint(offset).await.unwrap();
+
+        assert_eq!(std::fs::metadata(h.journal.wal_path()).unwrap().len(), 0);
+        assert!(!state_path.exists());
+    }
+
+    #[tokio::test]
+    async fn replay_retires_a_leftover_phase_two_record() {
+        let h = harness("legacy_phase_two_replay").await;
+        let state_path = h.journal.wal_path().with_file_name(COMPACTION_STATE_FILE);
+        push(&h, make_push_req(&[("{app=\"a\"}", vec![("kept", 100)])])).await;
+        write_legacy_phase_two_state(&state_path, u64::MAX);
+
+        let restored = MemTable::new();
+        replay(
+            h.journal.wal_path(),
+            h.journal.ckpt_path(),
+            &restored,
+            &test_tenant(),
+        )
+        .unwrap();
+
+        // The record goes, and the unflushed record it was sitting next to
+        // still replays: retiring stale bookkeeping is not a data decision.
+        assert!(!state_path.exists());
+        let lines: Vec<_> = restored
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .into_iter()
+            .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
+            .collect();
+        assert_eq!(lines, vec!["kept"]);
+    }
+
+    /// The removal is the last durable step. A crash there leaves a phase-1
+    /// record whose rename already committed. `flush.rs` retries the same
+    /// offset, which that record must absorb as "already done" — applying a
+    /// pre-reset offset to the replacement WAL would truncate live records.
+    /// Only after it is retired can the next offset compact normally.
+    #[tokio::test]
+    async fn a_failed_state_removal_is_settled_by_the_callers_retry() {
+        let h = harness("compact_state_removal_retry").await;
+        let first = flush_round(&h, "old", "old").await;
+        inject_compaction_fault(h.journal.wal_path(), CompactionFault::BeforeStateRemoval);
+        assert!(h.journal.compact_checkpoint(first).await.is_err());
+
+        let state_path = h.journal.wal_path().with_file_name(COMPACTION_STATE_FILE);
+        assert!(state_path.exists(), "the injected failure kept the record");
+
+        // The retry `flush.rs` issues: the same offset, now stale.
+        h.journal.compact_checkpoint(first).await.unwrap();
+        assert!(!state_path.exists());
+
+        // A fresh offset in the post-reset coordinate system still compacts.
+        let second = flush_round(&h, "new", "new").await;
+        h.journal.compact_checkpoint(second).await.unwrap();
+        assert_eq!(std::fs::metadata(h.journal.wal_path()).unwrap().len(), 0);
+
+        let restored = MemTable::new();
+        replay(
+            h.journal.wal_path(),
+            h.journal.ckpt_path(),
+            &restored,
+            &test_tenant(),
+        )
+        .unwrap();
+        assert!(
+            restored
+                .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .is_empty(),
+            "both batches were flushed, so replay must yield nothing"
+        );
     }
 
     #[tokio::test]

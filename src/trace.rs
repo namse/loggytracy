@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
@@ -252,6 +253,22 @@ fn json_scalar_string(value: &serde_json::Value) -> Option<String> {
 pub struct TraceMemTable {
     inner: RwLock<Vec<TraceSpan>>,
     flushing: RwLock<Option<Vec<TraceSpan>>>,
+    /// Maintained by every mutation for the same reason as the log memtable's:
+    /// the flush loop and the ingest gate both ask for this several times a
+    /// second, and walking the spans gets slower exactly as the buffer grows.
+    inner_bytes: AtomicU64,
+    flushing_bytes: AtomicU64,
+}
+
+fn span_bytes(span: &TraceSpan) -> u64 {
+    (span.trace_id.len()
+        + span.span_id.len()
+        + span.span.name.len()
+        + span.span.attributes.len() * 32) as u64
+}
+
+fn spans_bytes(spans: &[TraceSpan]) -> u64 {
+    spans.iter().map(span_bytes).sum()
 }
 
 impl TraceMemTable {
@@ -259,31 +276,40 @@ impl TraceMemTable {
         Self {
             inner: RwLock::new(Vec::new()),
             flushing: RwLock::new(None),
+            inner_bytes: AtomicU64::new(0),
+            flushing_bytes: AtomicU64::new(0),
         }
     }
 
     pub fn insert(&self, spans: Vec<TraceSpan>) {
+        let added = spans_bytes(&spans);
         self.inner.write().unwrap().extend(spans);
+        self.inner_bytes.fetch_add(added, Ordering::Relaxed);
     }
 
     pub fn begin_flush(&self) -> Vec<TraceSpan> {
         let mut inner = self.inner.write().unwrap();
         let mut flushing = self.flushing.write().unwrap();
         let mut snapshot = std::mem::take(&mut *inner);
+        let moved = self.inner_bytes.swap(0, Ordering::Relaxed);
         if let Some(previous) = flushing.take() {
             snapshot.extend(previous);
         }
         *flushing = Some(snapshot.clone());
+        self.flushing_bytes.fetch_add(moved, Ordering::Relaxed);
         snapshot
     }
 
     pub fn commit_flush(&self) {
         *self.flushing.write().unwrap() = None;
+        self.flushing_bytes.store(0, Ordering::Relaxed);
     }
 
     pub fn abort_flush(&self, mut snapshot: Vec<TraceSpan>) {
         self.inner.write().unwrap().append(&mut snapshot);
         *self.flushing.write().unwrap() = None;
+        let returned = self.flushing_bytes.swap(0, Ordering::Relaxed);
+        self.inner_bytes.fetch_add(returned, Ordering::Relaxed);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -311,18 +337,9 @@ impl TraceMemTable {
     }
 
     pub fn approximate_size(&self) -> usize {
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
-        inner
-            .iter()
-            .chain(flushing.as_ref().into_iter().flatten())
-            .map(|span| {
-                span.trace_id.len()
-                    + span.span_id.len()
-                    + span.span.name.len()
-                    + span.span.attributes.len() * 32
-            })
-            .sum()
+        self.inner_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(self.flushing_bytes.load(Ordering::Relaxed)) as usize
     }
 
     pub fn query_trace_id(&self, tenant: &TenantId, trace_id: &str) -> Vec<TraceSpan> {

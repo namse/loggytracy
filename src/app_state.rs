@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use crate::backpressure::IngestGate;
 use crate::config::Config;
 use crate::journal::Journal;
 use crate::memtable::MemTable;
@@ -31,6 +32,9 @@ pub struct AppState {
     pub tenant_policy: Arc<TenantPolicy>,
     pub metrics: Arc<RuntimeMetrics>,
     pub shutdown: Arc<ShutdownState>,
+    /// Shared with the OTLP service so both protocols answer to one set of
+    /// thresholds.
+    pub ingest_gate: Arc<IngestGate>,
 }
 
 /// Dependencies that are created during startup or by a test fixture.
@@ -54,7 +58,13 @@ impl AppState {
     /// Keeping this in one place prevents production and test limits from
     /// silently diverging.
     pub fn from_config(config: Arc<Config>, dependencies: AppStateDependencies) -> Self {
+        let ingest_gate = Arc::new(IngestGate::new(
+            dependencies.journal.clone(),
+            config.clone(),
+            dependencies.metrics.clone(),
+        ));
         Self {
+            ingest_gate,
             query_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_query_scans,
             )),

@@ -27,6 +27,13 @@ pub struct Config {
     /// never expire, so they are rejected at ingest.
     pub max_timestamp_age: Option<Duration>,
     pub max_timestamp_skew: Option<Duration>,
+    /// Ingest backpressure thresholds. Above either one the server answers
+    /// `429` before appending to the journal, so a stalled flush costs the
+    /// client a retry instead of costing this process its memory and disk.
+    /// `off` disables a threshold, which restores the unbounded behaviour.
+    pub max_memtable_bytes: Option<u64>,
+    pub max_wal_backlog_bytes: Option<u64>,
+    pub backpressure_retry_after: Duration,
     pub flush_max_bytes: u64,
     pub flush_max_interval: Duration,
     pub flush_check_interval: Duration,
@@ -100,6 +107,9 @@ impl Default for Config {
             max_label_value_bytes: 2048,
             max_timestamp_age: Some(Duration::from_secs(7 * 24 * 60 * 60)),
             max_timestamp_skew: Some(Duration::from_secs(60 * 60)),
+            max_memtable_bytes: Some(256 * 1024 * 1024),
+            max_wal_backlog_bytes: Some(1024 * 1024 * 1024),
+            backpressure_retry_after: Duration::from_secs(1),
             flush_max_bytes: 1024 * 1024,
             flush_max_interval: Duration::from_secs(5),
             flush_check_interval: Duration::from_millis(500),
@@ -196,6 +206,18 @@ impl Config {
             max_timestamp_age: env_duration(
                 "LOGGYTRACY_MAX_TIMESTAMP_AGE",
                 defaults.max_timestamp_age,
+            )?,
+            max_memtable_bytes: env_optional_u64(
+                "LOGGYTRACY_MAX_MEMTABLE_BYTES",
+                defaults.max_memtable_bytes,
+            )?,
+            max_wal_backlog_bytes: env_optional_u64(
+                "LOGGYTRACY_MAX_WAL_BACKLOG_BYTES",
+                defaults.max_wal_backlog_bytes,
+            )?,
+            backpressure_retry_after: env_required_duration(
+                "LOGGYTRACY_BACKPRESSURE_RETRY_AFTER",
+                defaults.backpressure_retry_after,
             )?,
             max_timestamp_skew: env_duration(
                 "LOGGYTRACY_MAX_TIMESTAMP_SKEW",
@@ -384,6 +406,17 @@ impl Config {
         }
         positive_u64("flush_max_bytes", self.flush_max_bytes)?;
         positive_duration("flush_max_interval", self.flush_max_interval)?;
+        positive_duration("backpressure_retry_after", self.backpressure_retry_after)?;
+        // A memtable ceiling below the flush trigger would reject writes the
+        // flush loop has not even been asked to move yet.
+        if let Some(limit) = self.max_memtable_bytes
+            && limit < self.flush_max_bytes
+        {
+            return Err(format!(
+                "max_memtable_bytes ({limit}) must not be below flush_max_bytes ({})",
+                self.flush_max_bytes
+            ));
+        }
         positive_duration("flush_check_interval", self.flush_check_interval)?;
         positive_usize("row_group_size", self.row_group_size)?;
         if self.row_group_size > 65_536 {
@@ -497,6 +530,26 @@ where
 
 fn env_u64(name: &str, default: u64) -> Result<u64, String> {
     env_value(name, default)
+}
+
+/// A byte threshold that `off`/`none` turns into "no limit".
+fn env_optional_u64(name: &str, default: Option<u64>) -> Result<Option<u64>, String> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(default);
+    };
+    let value = raw.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let parsed: u64 = value
+        .parse()
+        .map_err(|error| format!("invalid {name} {raw:?}: {error}"))?;
+    if parsed == 0 {
+        return Err(format!(
+            "invalid {name}: use 'off' to disable the limit rather than zero"
+        ));
+    }
+    Ok(Some(parsed))
 }
 
 fn env_positive_u64(name: &str, default: u64) -> Result<u64, String> {

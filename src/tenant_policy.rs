@@ -416,14 +416,27 @@ impl TenantPolicy {
         config: &Config,
         object_storage: Option<Arc<ObjectStorage>>,
     ) -> Result<Self, String> {
-        if config.tenant_policy_token.is_none() {
-            return Ok(Self::disabled());
-        }
         let store = match object_storage {
             Some(storage) => PolicyStore::Remote(storage),
             None => PolicyStore::Local(config.data_dir.join(TENANT_POLICY_PREFIX)),
         };
         let entries = store.load_all().await?;
+        if config.tenant_policy_token.is_none() {
+            // Without a token nothing clamps queries, so every row a downgrade
+            // or a deletion had made invisible becomes readable again — and
+            // with the admin routes unmounted there is no surface on which an
+            // operator would notice. A forgotten environment variable must not
+            // be able to undelete data, so this is fatal rather than a warning.
+            if !entries.is_empty() {
+                return Err(format!(
+                    "{} stored tenant retention policies were found but \
+LOGGYTRACY_TENANT_POLICY_TOKEN is not set; starting without it would unclamp every query and \
+resurrect data those policies had already expired",
+                    entries.len()
+                ));
+            }
+            return Ok(Self::disabled());
+        }
         tracing::info!(
             tenants = entries.len(),
             "loaded per-tenant retention policies"
@@ -818,6 +831,49 @@ mod tests {
             ..Config::default()
         };
         assert!(TenantPolicy::load(&config, Some(storage)).await.is_err());
+    }
+
+    /// Retention `0` is how a tenant is deleted, and until a rewrite reclaims
+    /// the rows the only thing hiding them is the query clamp. Dropping the
+    /// token drops the clamp, so a boot that would do that has to fail.
+    #[tokio::test]
+    async fn dropping_the_token_with_stored_policies_fails_the_boot() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let with_token = Config {
+            tenant_policy_token: Some("secret".to_string()),
+            retention_period: None,
+            ..Config::default()
+        };
+        TenantPolicy::load(&with_token, Some(storage.clone()))
+            .await
+            .expect("an empty store boots")
+            .push(&tenant("acme"), "0")
+            .await
+            .expect("the deletion is stored");
+
+        let without_token = Config {
+            tenant_policy_token: None,
+            ..with_token.clone()
+        };
+        let error = match TenantPolicy::load(&without_token, Some(storage.clone())).await {
+            Err(error) => error,
+            Ok(_) => panic!("a stored policy without a token must not boot"),
+        };
+        assert!(error.contains("TENANT_POLICY_TOKEN"), "{error}");
+
+        // With the policy withdrawn there is nothing left to unclamp, so the
+        // guard stops applying: it protects stored decisions, not the token.
+        TenantPolicy::load(&with_token, Some(storage.clone()))
+            .await
+            .unwrap()
+            .remove(&tenant("acme"))
+            .await
+            .unwrap();
+        assert!(
+            TenantPolicy::load(&without_token, Some(storage))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

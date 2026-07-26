@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::logql::{LabelMatcher, LineFilter};
 use crate::tenant::TenantId;
@@ -34,15 +34,82 @@ pub struct QueryResult {
 pub struct MemTable {
     inner: RwLock<MemTableSnapshot>,
     flushing: RwLock<Option<MemTableSnapshot>>,
+    /// Live byte totals for the two buffers, maintained by every mutation.
+    ///
+    /// Walking the entries instead would be O(rows) under a read lock, and the
+    /// callers are the flush loop's twice-a-second size check and the ingest
+    /// backpressure gate — both of which get slower exactly when the memtable
+    /// is growing, which is when they most need to be cheap.
+    inner_bytes: AtomicU64,
+    flushing_bytes: AtomicU64,
 }
 
-fn merge_snapshot(target: &mut MemTableSnapshot, source: MemTableSnapshot) {
-    for (tenant, streams) in source {
-        let tenant_streams = target.entry(tenant).or_default();
+/// What a stream's own identity contributes, counted once per stream rather
+/// than per entry. High-cardinality label sets are the case the memtable
+/// ceiling most needs to catch, so this is counted rather than ignored.
+fn stream_overhead_bytes(tenant: &TenantId, labels: &Labels) -> u64 {
+    labels_overhead_bytes(tenant.as_str().len(), labels)
+}
+
+fn labels_overhead_bytes(tenant_bytes: usize, labels: &Labels) -> u64 {
+    let labels_bytes: usize = labels
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    (tenant_bytes + labels_bytes) as u64
+}
+
+fn entries_bytes(entries: &[LogEntry]) -> u64 {
+    entries
+        .iter()
+        .map(|entry| {
+            let metadata_bytes: usize = entry
+                .structured_metadata
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum();
+            (entry.line.len() + metadata_bytes) as u64
+        })
+        .sum()
+}
+
+/// The O(rows) walk the counters replaced, kept as the thing tests compare
+/// them against.
+#[cfg(test)]
+fn snapshot_bytes(snapshot: &MemTableSnapshot) -> u64 {
+    let mut bytes = 0u64;
+    for (tenant, streams) in snapshot {
         for (labels, entries) in streams {
-            tenant_streams.entry(labels).or_default().extend(entries);
+            bytes += stream_overhead_bytes(tenant, labels);
+            bytes += entries_bytes(entries);
         }
     }
+    bytes
+}
+
+/// Merge `source` into `target`, reporting the stream overhead the merge made
+/// redundant.
+///
+/// A stream present in both buffers was counted once in each, but the merged
+/// buffer holds one copy of its identity. Returning the difference keeps the
+/// byte counters exactly equal to a full walk without either side having to
+/// perform one — the collision count is bounded by the stream count, not the
+/// row count.
+fn merge_snapshot(target: &mut MemTableSnapshot, source: MemTableSnapshot) -> u64 {
+    let mut redundant_overhead = 0u64;
+    for (tenant, streams) in source {
+        let tenant_bytes = tenant.as_str().len();
+        let tenant_streams = target.entry(tenant).or_default();
+        for (labels, entries) in streams {
+            let overhead = labels_overhead_bytes(tenant_bytes, &labels);
+            let stream = tenant_streams.entry(labels).or_default();
+            if !stream.is_empty() {
+                redundant_overhead += overhead;
+            }
+            stream.extend(entries);
+        }
+    }
+    redundant_overhead
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -102,36 +169,59 @@ impl MemTable {
         Self {
             inner: RwLock::new(HashMap::new()),
             flushing: RwLock::new(None),
+            inner_bytes: AtomicU64::new(0),
+            flushing_bytes: AtomicU64::new(0),
         }
     }
 
     pub fn insert(&self, tenant: TenantId, labels: Labels, entries: Vec<LogEntry>) {
+        let mut delta = entries_bytes(&entries);
         let mut inner = self.inner.write().unwrap();
+        let overhead = stream_overhead_bytes(&tenant, &labels);
         let stream = inner.entry(tenant).or_default().entry(labels).or_default();
+        if stream.is_empty() {
+            delta += overhead;
+        }
         stream.extend(entries);
+        // Published under the same write lock as the mutation, so a reader
+        // that sees the entries also sees them counted.
+        self.inner_bytes.fetch_add(delta, Ordering::Relaxed);
     }
 
     pub fn begin_flush(&self) -> MemTableSnapshot {
         let mut inner = self.inner.write().unwrap();
         let mut flushing = self.flushing.write().unwrap();
         let mut snapshot = std::mem::take(&mut *inner);
+        let moved = self.inner_bytes.swap(0, Ordering::Relaxed);
+        let mut redundant_overhead = 0;
         if let Some(previous_snapshot) = flushing.take() {
-            merge_snapshot(&mut snapshot, previous_snapshot);
+            redundant_overhead = merge_snapshot(&mut snapshot, previous_snapshot);
         }
         *flushing = Some(snapshot.clone());
+        // `flushing_bytes` already covers the snapshot that was merged in.
+        self.flushing_bytes
+            .fetch_add(moved.saturating_sub(redundant_overhead), Ordering::Relaxed);
         snapshot
     }
 
     pub fn commit_flush(&self) {
         let mut flushing = self.flushing.write().unwrap();
         *flushing = None;
+        self.flushing_bytes.store(0, Ordering::Relaxed);
     }
 
     pub fn abort_flush(&self, snapshot: MemTableSnapshot) {
         let mut inner = self.inner.write().unwrap();
-        merge_snapshot(&mut inner, snapshot);
+        let redundant_overhead = merge_snapshot(&mut inner, snapshot);
         let mut flushing = self.flushing.write().unwrap();
         *flushing = None;
+        // The aborted snapshot is the one `flushing_bytes` was counting, so it
+        // moves back wholesale rather than being recomputed.
+        let returned = self.flushing_bytes.swap(0, Ordering::Relaxed);
+        self.inner_bytes.fetch_add(
+            returned.saturating_sub(redundant_overhead),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn is_empty(&self) -> bool {
@@ -157,37 +247,16 @@ impl MemTable {
             .collect()
     }
 
+    /// Bytes held across both buffers, in O(1).
+    ///
+    /// Takes no lock: the two counters are maintained under the same write
+    /// locks as the buffers, and a reader that lands between the pair sees a
+    /// value that is one in-flight mutation stale. Callers use it for
+    /// thresholds, and no threshold is meaningful at that resolution.
     pub fn approximate_size(&self) -> usize {
-        fn snapshot_bytes(snapshot: &MemTableSnapshot) -> usize {
-            let mut bytes = 0usize;
-            for (tenant, streams) in snapshot {
-                for (labels, entries) in streams {
-                    bytes += tenant.as_str().len();
-                    for (k, v) in labels {
-                        bytes += k.len() + v.len();
-                    }
-                    for e in entries {
-                        bytes += e.line.len();
-                        for (k, v) in &e.structured_metadata {
-                            bytes += k.len() + v.len();
-                        }
-                    }
-                }
-            }
-            bytes
-        }
-
-        let inner = self.inner.read().unwrap();
-        let mut bytes = snapshot_bytes(&inner);
-        // Keep the lock order aligned with begin_flush/abort_flush. The
-        // size is therefore computed from one consistent pair of buffers.
-        let flushing = self.flushing.read().unwrap();
-        if let Some(f) = flushing.as_ref() {
-            bytes += snapshot_bytes(f);
-        }
-        drop(flushing);
-        drop(inner);
-        bytes
+        self.inner_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(self.flushing_bytes.load(Ordering::Relaxed)) as usize
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -461,6 +530,56 @@ pub struct IndexStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The counters replace an O(rows) walk, so what has to hold is that they
+    /// still say what the walk would. Checked after each transition rather
+    /// than only at the end: a counter that drifts and later recovers is a
+    /// counter that reported a wrong threshold in between.
+    #[test]
+    fn the_size_counters_track_the_walked_total_across_a_flush_cycle() {
+        let memtable = MemTable::new();
+        let walked = |table: &MemTable| {
+            let inner = table.inner.read().unwrap();
+            let flushing = table.flushing.read().unwrap();
+            snapshot_bytes(&inner) + flushing.as_ref().map(snapshot_bytes).unwrap_or(0)
+        };
+        let tenant = crate::tenant::test_tenant();
+        let labels: Labels = [("app".to_string(), "sizes".to_string())]
+            .into_iter()
+            .collect();
+
+        memtable.insert(
+            tenant.clone(),
+            labels.clone(),
+            vec![sample_entry("first", 1)],
+        );
+        assert_eq!(memtable.approximate_size() as u64, walked(&memtable));
+
+        // A second insert into the same stream must not re-count the stream's
+        // own identity.
+        memtable.insert(
+            tenant.clone(),
+            labels.clone(),
+            vec![sample_entry("second", 2)],
+        );
+        assert_eq!(memtable.approximate_size() as u64, walked(&memtable));
+
+        let snapshot = memtable.begin_flush();
+        assert_eq!(memtable.approximate_size() as u64, walked(&memtable));
+
+        // An insert while a flush is in flight lands in the other buffer.
+        memtable.insert(tenant, labels, vec![sample_entry("third", 3)]);
+        assert_eq!(memtable.approximate_size() as u64, walked(&memtable));
+
+        memtable.abort_flush(snapshot);
+        assert_eq!(memtable.approximate_size() as u64, walked(&memtable));
+
+        let snapshot = memtable.begin_flush();
+        memtable.commit_flush();
+        drop(snapshot);
+        assert_eq!(memtable.approximate_size(), 0);
+        assert_eq!(walked(&memtable), 0);
+    }
 
     fn sample_entry(line: &str, ts_ns: i64) -> LogEntry {
         LogEntry {

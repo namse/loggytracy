@@ -346,6 +346,7 @@ pub async fn run(config: Arc<Config>) {
         },
     ));
 
+    let ingest_gate = state.ingest_gate.clone();
     let app = router::build_router(state);
 
     // A SIGTERM/SIGINT starts draining: new ingest is rejected, and every drain
@@ -363,8 +364,12 @@ pub async fn run(config: Arc<Config>) {
         .otlp_grpc_addr
         .parse()
         .unwrap_or_else(|error| panic!("invalid OTLP gRPC address: {error}"));
-    let otlp_service =
-        trace_ingest::TraceIngestService::new(otlp_journal, shutdown.clone(), config.clone());
+    let otlp_service = trace_ingest::TraceIngestService::new(
+        otlp_journal,
+        shutdown.clone(),
+        config.clone(),
+        ingest_gate,
+    );
     let otlp_task_health = otlp_healthy;
     let mut otlp_drain = shutdown.subscribe();
     let otlp_handle = tokio::spawn(async move {
