@@ -261,7 +261,11 @@ async fn run_unified_query_with_stats(
         cancellation,
     )
     .await;
-    crate::metrics::RuntimeMetrics::add_duration(&metrics.query_latency_ns, started.elapsed());
+    crate::metrics::RuntimeMetrics::observe(
+        &metrics.query_latency,
+        &metrics.query_latency_ns,
+        started.elapsed(),
+    );
     match &result {
         Ok(execution) => {
             metrics

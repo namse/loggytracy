@@ -502,8 +502,8 @@ pub async fn buildinfo() -> Json<serde_json::Value> {
         "status": "success",
         "data": {
             "version": env!("CARGO_PKG_VERSION"),
-            "revision": "unknown",
-            "branch": "main",
+            "revision": build_revision(),
+            "branch": option_env!("LOGGYTRACY_BUILD_BRANCH").unwrap_or("unknown"),
             "goVersion": "n/a"
         }
     }))
@@ -645,7 +645,16 @@ loggytracy_drain_in_progress {}\n\
 # TYPE loggytracy_pending_flush_bytes gauge\n\
 loggytracy_pending_flush_bytes {}\n\
 # TYPE loggytracy_force_flush_complete gauge\n\
-loggytracy_force_flush_complete {}\n",
+loggytracy_force_flush_complete {}\n\
+# HELP loggytracy_build_info Build identity, always 1. Join on it to attribute a series to a revision.\n\
+# TYPE loggytracy_build_info gauge\n\
+loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
+# HELP loggytracy_query_latency_ms Query latency. The cumulative _ns_total counters only ever yielded a mean; every target is written as p95/p99, so use histogram_quantile on this.\n\
+# TYPE loggytracy_query_latency_ms histogram\n\
+{}\
+# HELP loggytracy_remote_restore_latency_ms Object-store restore latency, the cost of a cache miss.\n\
+# TYPE loggytracy_remote_restore_latency_ms histogram\n\
+{}",
         mem.entries,
         mem.bytes,
         disk.entries,
@@ -706,7 +715,19 @@ loggytracy_force_flush_complete {}\n",
         state.shutdown.is_draining() as u8,
         state.shutdown.pending_flush_bytes(),
         state.shutdown.is_flush_complete() as u8,
+        env!("CARGO_PKG_VERSION"),
+        build_revision(),
+        m.query_latency.render("loggytracy_query_latency_ms"),
+        m.remote_restore_latency
+            .render("loggytracy_remote_restore_latency_ms"),
     )
+}
+
+/// The revision this binary was built from, or `unknown` when the build did
+/// not supply one. Without it a scraped series cannot be attributed to code,
+/// which is the first question asked when two deployments behave differently.
+pub fn build_revision() -> &'static str {
+    option_env!("LOGGYTRACY_BUILD_REVISION").unwrap_or("unknown")
 }
 
 fn m_merge_debt(state: &AppState) -> u64 {

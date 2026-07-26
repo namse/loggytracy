@@ -74,7 +74,8 @@ where
                     metrics
                         .remote_restore_success
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    RuntimeMetrics::add_duration(
+                    RuntimeMetrics::observe(
+                        &metrics.remote_restore_latency,
                         &metrics.remote_restore_latency_ns,
                         started.elapsed(),
                     );
@@ -86,7 +87,8 @@ where
                     metrics
                         .remote_restore_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    RuntimeMetrics::add_duration(
+                    RuntimeMetrics::observe(
+                        &metrics.remote_restore_latency,
                         &metrics.remote_restore_latency_ns,
                         started.elapsed(),
                     );
@@ -99,7 +101,8 @@ where
                     metrics
                         .remote_restore_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    RuntimeMetrics::add_duration(
+                    RuntimeMetrics::observe(
+                        &metrics.remote_restore_latency,
                         &metrics.remote_restore_latency_ns,
                         started.elapsed(),
                     );

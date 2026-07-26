@@ -1264,6 +1264,55 @@
         assert_eq!(lines_in_last_day(state).await.len(), 1);
     }
 
+    /// A cumulative latency sum cannot produce a quantile, and every target in
+    /// the plan documents is a p95 or p99. The histogram has to be in the shape
+    /// `histogram_quantile` reads: cumulative in `le`, with a `+Inf` bucket
+    /// that equals `_count`.
+    #[tokio::test]
+    async fn the_latency_histogram_is_shaped_for_histogram_quantile() {
+        let data_dir = temp_dir();
+        let state = state_with(
+            &data_dir,
+            Arc::new(MemTable::new()),
+            Arc::new(PartRegistry::new()),
+        );
+        for millis in [0, 3, 40, 900] {
+            state
+                .metrics
+                .query_latency
+                .observe(std::time::Duration::from_millis(millis));
+        }
+
+        let rendered = metrics(State(state)).await;
+        let bucket = |bound: &str| -> u64 {
+            let needle = format!("loggytracy_query_latency_ms_bucket{{le=\"{bound}\"}} ");
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(&needle))
+                .unwrap_or_else(|| panic!("no bucket {bound} in:\n{rendered}"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+
+        assert_eq!(bucket("1"), 1, "only the 0 ms observation is <= 1 ms");
+        assert_eq!(bucket("5"), 2);
+        assert_eq!(bucket("50"), 3);
+        assert_eq!(bucket("1000"), 4);
+        assert_eq!(bucket("+Inf"), 4);
+
+        // Monotonic in `le`, which is what makes the series a valid histogram.
+        let mut previous = 0;
+        for bound in ["1", "5", "10", "25", "50", "100", "250", "500", "1000", "+Inf"] {
+            let current = bucket(bound);
+            assert!(current >= previous, "bucket {bound} went backwards");
+            previous = current;
+        }
+        assert!(rendered.contains("loggytracy_query_latency_ms_count 4"));
+        assert!(rendered.contains("# TYPE loggytracy_query_latency_ms histogram"));
+        assert!(rendered.contains("loggytracy_build_info{"));
+    }
+
     /// The scrape renders whatever the retention worker last published. It
     /// deliberately does not recompute the number: that walk is
     /// `unknown_tenant_count`'s, and its own coverage lives with it.

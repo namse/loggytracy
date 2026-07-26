@@ -6,6 +6,7 @@ use crate::trace;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::app_state::AppStateDependencies;
 use crate::flush;
@@ -18,6 +19,57 @@ use crate::router;
 use crate::tenant_policy::TenantPolicy;
 use crate::trace_ingest;
 use crate::{AppState, trace_registry};
+
+/// Retry a startup step that talks to the object store.
+///
+/// Startup used to panic on the first failure, which does not distinguish a
+/// network blip from real corruption: an object store that is unavailable for
+/// ten seconds turned into a crash loop, and every restart in that loop dropped
+/// the process before it could accept the ingest its clients were still
+/// sending.
+///
+/// Bounded rather than infinite. Absorbing a transient outage is the point;
+/// waiting forever on a permanently misconfigured store would just replace a
+/// visible crash with an invisible hang. Past the budget the process exits and
+/// the orchestrator's own restart backoff takes over, which is the right place
+/// for escalation to live.
+async fn with_object_store_retry<T, F, Fut>(what: &str, budget: Duration, mut step: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let started = std::time::Instant::now();
+    let mut backoff = Duration::from_millis(250);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match step().await {
+            Ok(value) => {
+                if attempt > 1 {
+                    tracing::info!(what, attempt, "object-store startup step recovered");
+                }
+                return value;
+            }
+            Err(error) => {
+                let elapsed = started.elapsed();
+                if elapsed >= budget {
+                    panic!(
+                        "{what} failed for {elapsed:?} across {attempt} attempts and the startup \
+budget is exhausted: {error}"
+                    );
+                }
+                tracing::warn!(
+                    what,
+                    attempt,
+                    %error,
+                    "object-store startup step failed; retrying"
+                );
+                tokio::time::sleep(backoff.min(budget.saturating_sub(elapsed))).await;
+                backoff = (backoff * 2).min(Duration::from_secs(10));
+            }
+        }
+    }
+}
 
 #[allow(dead_code)]
 pub fn recover(config: &Config, memtable: &MemTable) -> Result<(), String> {
@@ -75,6 +127,7 @@ pub async fn run(config: Arc<Config>) {
         panic!("failed to create data dir: {}", e);
     }
 
+    let startup_budget = config.startup_retry_budget;
     let memtable = Arc::new(MemTable::new());
     let trace_memtable = Arc::new(trace::TraceMemTable::new());
 
@@ -101,14 +154,16 @@ pub async fn run(config: Arc<Config>) {
     let remote_manifest = if let Some(storage) = &object_storage {
         let checkpoint = journal::read_checkpoint(&config.data_dir.join("journal.ckpt"))
             .unwrap_or_else(|error| panic!("failed to read journal checkpoint: {error}"));
-        storage
-            .reconcile_flush_transaction(&config.data_dir, checkpoint)
-            .await
-            .unwrap_or_else(|error| panic!("flush transaction recovery failed: {error}"));
-        let restored = storage
-            .reconcile_local_cache(&config.data_dir.join("parts"))
-            .await
-            .unwrap_or_else(|error| panic!("object-store recovery failed: {error}"));
+        with_object_store_retry("flush transaction recovery", startup_budget, || {
+            storage.reconcile_flush_transaction(&config.data_dir, checkpoint)
+        })
+        .await;
+        let parts_root = config.data_dir.join("parts");
+        let restored =
+            with_object_store_retry("local cache reconciliation", startup_budget, || {
+                storage.reconcile_local_cache(&parts_root)
+            })
+            .await;
         tracing::info!(
             generation = restored.generation,
             parts = restored.parts.len(),
@@ -119,10 +174,12 @@ pub async fn run(config: Arc<Config>) {
         None
     };
     let remote_trace_manifest = if let Some(storage) = &object_storage {
-        let restored = storage
-            .reconcile_trace_local_cache(&config.data_dir.join("traces"))
-            .await
-            .unwrap_or_else(|error| panic!("trace object-store recovery failed: {error}"));
+        let traces_root = config.data_dir.join("traces");
+        let restored =
+            with_object_store_retry("trace cache reconciliation", startup_budget, || {
+                storage.reconcile_trace_local_cache(&traces_root)
+            })
+            .await;
         tracing::info!(
             generation = restored.generation,
             parts = restored.parts.len(),
@@ -178,9 +235,10 @@ pub async fn run(config: Arc<Config>) {
     // An empty *listing* is a different thing and boots normally: it means
     // nothing has been pushed yet, and an unknown tenant keeps its data.
     let tenant_policy = Arc::new(
-        TenantPolicy::load(&config, object_storage.clone())
-            .await
-            .unwrap_or_else(|error| panic!("tenant policy load failed: {error}")),
+        with_object_store_retry("tenant policy load", startup_budget, || {
+            TenantPolicy::load(&config, object_storage.clone())
+        })
+        .await,
     );
 
     // Handles for every background worker. Shutdown signals them through the

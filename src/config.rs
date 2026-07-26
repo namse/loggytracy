@@ -112,6 +112,13 @@ pub struct Config {
     /// How long the shutdown force-flush retries silently before it starts
     /// warning on stdout and enabling operator-initiated abort.
     pub shutdown_flush_warn_after: Duration,
+    /// How long startup keeps retrying an object-store step before giving up.
+    ///
+    /// Absorbs a transient outage instead of turning it into a crash loop.
+    /// Bounded on purpose: waiting forever on a permanently misconfigured store
+    /// would replace a visible crash with an invisible hang, and past this the
+    /// orchestrator's own restart backoff is the better place to escalate.
+    pub startup_retry_budget: Duration,
 }
 
 impl Default for Config {
@@ -178,6 +185,7 @@ impl Default for Config {
             max_trace_query_runtime: Duration::from_secs(30),
             max_trace_restore_runtime: Duration::from_secs(25),
             shutdown_flush_warn_after: Duration::from_secs(30),
+            startup_retry_budget: Duration::from_secs(300),
         }
     }
 }
@@ -400,6 +408,10 @@ impl Config {
             max_trace_restore_runtime: env_required_duration(
                 "LOGGYTRACY_MAX_TRACE_RESTORE_RUNTIME",
                 defaults.max_trace_restore_runtime,
+            )?,
+            startup_retry_budget: env_required_duration(
+                "LOGGYTRACY_STARTUP_RETRY_BUDGET",
+                defaults.startup_retry_budget,
             )?,
             shutdown_flush_warn_after: env_required_duration(
                 "LOGGYTRACY_SHUTDOWN_FLUSH_WARN_AFTER",
