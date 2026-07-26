@@ -23,9 +23,10 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
   - [x] 격리 표면: MemTable·PartRegistry·TraceRegistry·쿼리·카탈로그 조회에 테넌트 필수 인자화
   - [x] 테넌트별 retention 삭제 경로 — 테넌트 인덱스로 만료 판정, whole delete + merge 재작성,
         모든 읽기 경로 클램프. 설계·근거는 [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
-  - [ ] 정책 수신을 폴링 → **push**로 교체. 테넌트 하나씩 `PUT`, 오브젝트 스토어에 저장 후 ack,
-        시작 시 로드. 테넌트 삭제 = retention `0`. 폴링은 낡은 상대 기간이 시간이 갈수록 더 많이
-        지우기 때문에 폐기 — 상세와 마이그레이션 체크리스트는 `RETENTION_DESIGN.md`
+  - [x] 정책 수신을 폴링 → **push**로 교체. 테넌트 하나씩 `PUT`, 오브젝트 스토어에 저장 후 ack,
+        시작 시 로드(실패는 치명적). 테넌트 삭제 = retention `0`(rewrite threshold 무시).
+        폴링과 직접 `reqwest` 의존성 제거 — 오브젝트 스토어 외에는 나가는 호출이 없다.
+        상세는 [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
   - [x] ~~`(tier, day)` 파티셔닝~~ — 폐기. 쓰기 시점에 retention을 고정하면 플랜 변경이
         기존 데이터에 반영되지 않는다. 파티션은 `day` 유지
   - [ ] part 사이드카 4개→1개 통합, Parquet range read(P2), `(part, tenant)` 로컬 캐시 키

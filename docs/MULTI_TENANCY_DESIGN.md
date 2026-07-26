@@ -3,7 +3,8 @@
 Design record for making loggytracy multi-tenant. Written to be self-contained:
 a fresh context should be able to start implementing from this document alone.
 
-Status: **accepted; steps 1, 2 (partly), and 4 are implemented.** See
+Status: **accepted; steps 1, 2 (partly), and 4 are implemented, plus per-tenant
+retention end to end ([`RETENTION_DESIGN.md`](RETENTION_DESIGN.md)).** See
 [Implementation status](#implementation-status) for what actually landed.
 Supersedes the "테넌시" section of
 `ARCHITECTURE.md` (lines 48-65), which specified tenant-as-path-axis. That
@@ -413,7 +414,7 @@ This is the gap `PRODUCTION_READINESS_REVIEW.md:276` records as
 | Trace part format | **done** — same shape (`tenant` column, tenant-aligned row groups, tenant index) |
 | Read path isolation | **done** — `PartReader`/`PartRegistry`/`TraceRegistry`/MemTable queries, `label_names`, `label_values`, `series`, `stats` all take a required tenant; part-level time pruning is per tenant |
 | Merge | **done** — reads rows through the tenant index and re-sorts by `(tenant, ts)`; no cross-tenant mixing beyond the shared object |
-| Per-tenant retention | **deletion side done**, intake being replaced — the control plane pushes one tenant at a time and it is applied at deletion time; partitions stay on `day`. See [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
+| Per-tenant retention | **done** — the control plane pushes one tenant at a time to `PUT /loggytracy/api/v1/admin/tenants/{tenant}/retention`, loggytracy persists it before acknowledging, and it is applied at deletion time; partitions stay on `day`. See [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
 | Partition on `(tier, day)` | **rejected** — retention baked in at write time cannot honour a plan change; superseded by [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
 | Sidecar consolidation | **not done** — still four `PART_FILES` |
 | Range GET / per-`(part, tenant)` cache | **not done** |

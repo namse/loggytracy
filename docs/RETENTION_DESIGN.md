@@ -4,13 +4,10 @@ Design record for per-tenant retention in loggytracy. Written to be
 self-contained: a fresh context should be able to start implementing from this
 document alone.
 
-Status: **the deletion side is implemented; the policy intake is being
-replaced.**
-
-- Everything from [Two-layer deletion](#two-layer-deletion) down is live code.
-- [Policy intake](#policy-intake) specifies a **push** endpoint that replaces
-  the polling loop the code has today. [Migration checklist](#migration-checklist)
-  is the exact delta.
+Status: **implemented.** Push intake and the two-layer deletion are both live
+code; the polling loop, its five configuration variables and the direct
+`reqwest` dependency are gone. loggytracy no longer calls out to anything but
+its own object store.
 
 Closes the open question left by `MULTI_TENANCY_DESIGN.md` ("Where does a
 tenant's tier come from?", lines 416-420) and supersedes the
@@ -62,8 +59,7 @@ attribution. Too much risk for one feature.
 ### Rejected: polling the control plane for the whole map
 
 The first implementation polled `GET <url>` every five minutes and kept the
-last successful response in memory. This is the code as it stands; the rest of
-this section is why it is being removed.
+last successful response in memory. It has been removed; this section is why.
 
 Rejected because **the map holds relative durations, and a relative duration
 means something different every time it is re-applied.** A map that says
@@ -328,15 +324,15 @@ table: "Trace part format — done"). Everything above applies symmetrically via
 | Variable | Default | Meaning |
 |---|---|---|
 | `LOGGYTRACY_TENANT_POLICY_TOKEN` | unset | Bearer token for the admin routes. Unset disables per-tenant retention entirely and the routes are not mounted. |
-| `LOGGYTRACY_MAX_TENANT_RETENTION` | unset | Clamp on any pushed value. |
+| `LOGGYTRACY_MAX_TENANT_RETENTION` | unset | Clamp on any pushed value, applied where the value is read rather than where it is stored. |
 | `LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` | 0.5 | Expired-row fraction that forces a rewrite. Ignored for tenants at zero retention. |
 
-Checked in `validate` alongside the other retention settings
-(`config.rs:388-394`).
+Checked in `config.rs` `validate` alongside the other retention settings.
 
 Removed with the polling loop: `LOGGYTRACY_TENANT_POLICY_URL`,
 `..._INTERVAL`, `..._TIMEOUT`, `..._AUTH_HEADER`, `..._MAX_BYTES`. The
-`reqwest` dependency goes with them — nothing outbound remains.
+direct `reqwest` dependency went with them: the only HTTP client left in the
+process is the one `object_store` uses to reach the bucket.
 
 ## Metrics
 
@@ -433,49 +429,64 @@ so such a gate would have nothing to measure.
       `query/tests.rs`, and the trace-side clamp tests in `tempo/tests.rs`
       (lookup, search, both tag endpoints, and an unknown tenant on all four).
 
-### To change
+### Changed for push intake
 
-- [ ] Remove the poller from `retention::retention_loop`, plus
-      `TenantPolicy::refresh`, `fetch_snapshot`, `parse_auth_header`, and the
+- [x] The poller is gone from `retention::retention_loop`, along with
+      `TenantPolicy::refresh`, `fetch_snapshot`, `parse_auth_header` and the
       `reqwest` dependency.
-- [ ] Replace `PolicySnapshot` (one whole-map snapshot with a single
-      `fetched_at`) with a per-tenant map where each entry carries its own
-      `updated_at`. Keep the `Arc<…>` read path — a push copies the map,
-      inserts, and swaps, which is cheap because pushes are rare and keeps
-      query reads lock-light.
-- [ ] Add the three admin routes and bearer auth in `router.rs`, mounted only
-      when the token is configured.
-- [ ] Persist one object per tenant at `tenant_policies/<tenant>.json`, through
-      `ObjectStorage` when configured and under `<data_dir>` otherwise. Update
-      the in-memory map only after the write succeeds; return `503` when it
-      fails.
-- [ ] Load all policies at startup, before the workers spawn. Failure is fatal.
-- [ ] `config.rs` — drop the five polling variables, add
-      `LOGGYTRACY_TENANT_POLICY_TOKEN`, and re-key the mutual-exclusion check
-      against `retention_period` on the token.
-- [ ] `merge/selection.rs` — a tenant at zero retention ignores
-      `retention_rewrite_threshold`.
+- [x] `PolicySnapshot` (one whole-map snapshot with a single `fetched_at`) is
+      now `PolicyMap`, a per-tenant map where each entry carries its own
+      `updated_at`. The `Arc<…>` read path is unchanged — a push copies the map,
+      inserts, and swaps, which is cheap because pushes are rare and keeps query
+      reads lock-light.
+- [x] The three admin routes and bearer auth live in `src/admin.rs`, mounted by
+      `router.rs` only when the token is configured.
+- [x] One object per tenant at `tenant_policies/<tenant>.json`, through
+      `ObjectStorage` when configured and under `<data_dir>` otherwise. The
+      in-memory map is updated only after the write succeeds; a failure is a
+      `503`.
+- [x] `TenantPolicy::load` runs in `startup.rs` before the workers spawn.
+      Failure is fatal.
+- [x] `config.rs` — the five polling variables are gone,
+      `LOGGYTRACY_TENANT_POLICY_TOKEN` replaces them, and the mutual-exclusion
+      check against `retention_period` is keyed on the token.
+- [x] `merge/selection.rs` — a tenant at zero retention ignores
+      `retention_rewrite_threshold` (`Cutoffs::holds_zero_retention_rows`).
 
-### Tests to add
+### Tests
 
-- [ ] a push is acknowledged only after the write lands; a failing store
+- [x] a push is acknowledged only after the write lands; a failing store
       returns `503` and changes neither the map nor query behaviour
-- [ ] policies survive a restart, and a tenant downgraded before the restart is
+- [x] policies survive a restart, and a tenant downgraded before the restart is
       still clamped after it
-- [ ] a boot with an unreadable policy object fails instead of starting with an
+- [x] a boot with an unreadable policy object fails instead of starting with an
       empty map
-- [ ] `DELETE` returns a tenant to unknown: data kept, queries unclamped
-- [ ] `retention: "0"` empties queries immediately and makes every part holding
+- [x] `DELETE` returns a tenant to unknown: data kept, queries unclamped
+- [x] `retention: "0"` empties queries immediately and makes every part holding
       that tenant merge-eligible regardless of the threshold
-- [ ] an unauthenticated or wrong-token push changes nothing
-- [ ] a malformed tenant id or retention value is a `400` and stores nothing
-- [ ] `LOGGYTRACY_MAX_TENANT_RETENTION` still clamps a pushed value
-- [ ] setting both `RETENTION_PERIOD` and the token fails validation
+- [x] an unauthenticated or wrong-token push changes nothing
+- [x] a malformed tenant id or retention value is a `400` and stores nothing
+- [x] `LOGGYTRACY_MAX_TENANT_RETENTION` still clamps a pushed value
+- [x] setting both `RETENTION_PERIOD` and the token fails validation
 
-### Docs
+### Three calls the intake design left open
 
-- [ ] `ARCHITECTURE.md` retention section, `MULTI_TENANCY_DESIGN.md` status
-      table, `todo.md`.
+**Two pushes for the same tenant are serialized.** One object per tenant makes
+a push a blind write with no CAS, which is what the per-tenant shape is for —
+but it also means two concurrent pushes for the *same* tenant could land in the
+store in one order and in the in-memory map in the other. A `tokio::sync::Mutex`
+covers the write and the swap together. Pushes are rare, so the cost is nil.
+
+**The maximum is applied on read, not on write.** The pushed string is stored
+verbatim and `LOGGYTRACY_MAX_TENANT_RETENTION` is applied wherever the value is
+used. Raising the maximum therefore takes effect without the control plane
+re-pushing every tenant, and a `GET` returns what was actually sent rather than
+what this instance decided to keep.
+
+**A push is accepted while draining.** Ingest is rejected during shutdown, but a
+policy is not data this instance owns — it goes to the object store, which the
+replacement instance reads at boot. Refusing it would make a machine replacement
+look like a control-plane outage.
 
 ## What the implementation settled that the design left open
 
