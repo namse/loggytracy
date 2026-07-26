@@ -392,6 +392,87 @@
         );
     }
 
+    /// A single connection used to be capped at `1000/max_batch_ms` pushes per
+    /// second because the batch loop waited out the full linger even with an
+    /// empty channel. Sequential appends must now cost what the writes cost,
+    /// not what the timer costs.
+    #[tokio::test]
+    async fn sequential_appends_do_not_wait_out_a_batch_timer() {
+        let h = harness("no_batch_linger").await;
+        assert_eq!(
+            Config::default().max_batch_ms,
+            0,
+            "the default must not linger"
+        );
+
+        let started = std::time::Instant::now();
+        for index in 0..20 {
+            push(
+                &h,
+                make_push_req(&[("{app=\"nolinger\"}", vec![("line", 100 + index)])]),
+            )
+            .await;
+        }
+        let elapsed = started.elapsed();
+
+        // 20 sequential round trips. Under the old default (200 ms linger) this
+        // was ~4 s; the bound here is loose enough to survive a slow disk and
+        // still fail decisively if the timer comes back.
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "20 sequential appends took {elapsed:?}, which means something is waiting"
+        );
+    }
+
+    /// The linger still works when asked for: it is an opt-in trade of latency
+    /// for fewer fsyncs, not the default.
+    #[tokio::test]
+    async fn a_configured_linger_still_batches() {
+        let dir = tmp_dir("batch_linger");
+        let config = Config {
+            data_dir: dir,
+            max_batch_ms: 80,
+            ..Config::default()
+        };
+        let memtable = Arc::new(MemTable::new());
+        let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+
+        // Two appends issued concurrently: the second must join the first's
+        // batch rather than waiting for its own.
+        let started = std::time::Instant::now();
+        let one = {
+            let journal = journal.clone();
+            tokio::spawn(async move {
+                journal
+                    .append(
+                        test_tenant(),
+                        make_push_req(&[("{app=\"a\"}", vec![("first", 100)])]),
+                        Vec::new(),
+                    )
+                    .await
+            })
+        };
+        let two = {
+            let journal = journal.clone();
+            tokio::spawn(async move {
+                journal
+                    .append(
+                        test_tenant(),
+                        make_push_req(&[("{app=\"b\"}", vec![("second", 200)])]),
+                        Vec::new(),
+                    )
+                    .await
+            })
+        };
+        one.await.unwrap().unwrap();
+        two.await.unwrap().unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "both appends should have shared one linger window"
+        );
+    }
+
     #[tokio::test]
     async fn health_turns_false_when_writer_stops() {
         let h = harness("writer_health").await;

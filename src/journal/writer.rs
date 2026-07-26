@@ -240,9 +240,32 @@ async fn writer_loop(
             } => {
                 batch_bytes += data.len();
                 batch.push((data, tenant, streams, traces, done));
+                // Take what has already arrived and write it. Waiting for more
+                // charged every push the full linger even when the channel was
+                // empty, which fixed single-connection throughput at
+                // 1000/max_batch_ms pushes per second regardless of load.
+                //
+                // Batching still happens, and happens where it should: this
+                // task is busy writing and fsyncing, so everything that arrives
+                // during that window is already queued when the next iteration
+                // looks. Group commit forms behind the write rather than in
+                // front of it.
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(max_batch_ms);
                 while batch_bytes < max_batch_bytes {
-                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    let next = if max_batch_ms == 0 {
+                        match rx.try_recv() {
+                            Ok(command) => Ok(Some(command)),
+                            Err(mpsc::error::TryRecvError::Empty) => Err(()),
+                            Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
+                        }
+                    } else {
+                        // A deliberate linger: trades latency for fewer fsyncs
+                        // on a disk where an fsync costs more than the wait.
+                        tokio::time::timeout_at(deadline, rx.recv())
+                            .await
+                            .map_err(|_| ())
+                    };
+                    match next {
                         Ok(Some(JournalCmd::Append {
                             data,
                             tenant,
@@ -265,7 +288,7 @@ async fn writer_loop(
                             closed = true;
                             break;
                         }
-                        Err(_) => break,
+                        Err(()) => break,
                     }
                 }
             }

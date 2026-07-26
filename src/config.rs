@@ -21,6 +21,15 @@ pub struct Config {
     /// pushed — none of which anything else bounds.
     pub allowed_tenants: Option<std::collections::BTreeSet<TenantId>>,
     pub max_batch_bytes: usize,
+    /// How long the journal writer waits for more records before writing the
+    /// batch it already has. **Zero — the default — means it does not wait.**
+    ///
+    /// Group commit forms behind the write, not in front of it: while this task
+    /// writes and fsyncs, later arrivals queue up and become the next batch.
+    /// Waiting first charged every push the full linger even with an empty
+    /// channel, which capped a single connection at 1000/max_batch_ms pushes
+    /// per second. Raise it only on a disk where an fsync costs more than the
+    /// added latency.
     pub max_batch_ms: u64,
     /// Largest accepted compressed push body. Also bounds the length a snappy
     /// header may declare, so a tiny body cannot drive a huge allocation.
@@ -116,7 +125,7 @@ impl Default for Config {
             missing_tenant_policy: MissingTenantPolicy::UseDefault,
             allowed_tenants: None,
             max_batch_bytes: 1024 * 1024,
-            max_batch_ms: 200,
+            max_batch_ms: 0,
             max_push_bytes: 16 * 1024 * 1024,
             max_decompressed_push_bytes: 64 * 1024 * 1024,
             max_line_bytes: 256 * 1024,
@@ -198,7 +207,7 @@ impl Config {
                 "LOGGYTRACY_MAX_BATCH_BYTES",
                 defaults.max_batch_bytes,
             )?,
-            max_batch_ms: env_positive_u64("LOGGYTRACY_MAX_BATCH_MS", defaults.max_batch_ms)?,
+            max_batch_ms: env_u64("LOGGYTRACY_MAX_BATCH_MS", defaults.max_batch_ms)?,
             max_push_bytes: env_positive_usize(
                 "LOGGYTRACY_MAX_PUSH_BYTES",
                 defaults.max_push_bytes,
@@ -406,7 +415,8 @@ impl Config {
             return Err("listen and OTLP addresses must not be empty".to_string());
         }
         positive_usize("max_batch_bytes", self.max_batch_bytes)?;
-        positive_u64("max_batch_ms", self.max_batch_ms)?;
+        // Zero is the default and means "do not linger", so this one is not a
+        // positive-value knob.
         positive_usize("max_push_bytes", self.max_push_bytes)?;
         positive_usize(
             "max_decompressed_push_bytes",
