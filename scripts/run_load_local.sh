@@ -28,13 +28,19 @@ export LOGGYTRACY_OBJECT_STORE_READ_LATENCY_MS="${LOGGYTRACY_OBJECT_STORE_READ_L
 export LOGGYTRACY_OBJECT_STORE_ERROR_RATE="${LOGGYTRACY_OBJECT_STORE_ERROR_RATE:-0.03}"
 export LOGGYTRACY_OBJECT_STORE_FAULT_SEED="${LOGGYTRACY_OBJECT_STORE_FAULT_SEED:-20260724}"
 # Force eviction->restore and exercise merge/retention on the measured path.
-export LOGGYTRACY_CACHE_MAX_BYTES=8388608
-export LOGGYTRACY_CACHE_EVICTION_INTERVAL=3s
-export LOGGYTRACY_FLUSH_MAX_INTERVAL=2s
-export LOGGYTRACY_MERGE_INTERVAL=8s
-export LOGGYTRACY_RETENTION_PERIOD=20s
-export LOGGYTRACY_RETENTION_GRACE_PERIOD=5s
-export LOGGYTRACY_RETENTION_INTERVAL=5s
+#
+# Overridable, like the knobs above. These were unconditional `export`s, which
+# silently discarded whatever the caller passed: a run invoked with a longer
+# merge interval or retention period got these values instead and produced
+# results that looked like engine behaviour. Any knob a run might want to vary
+# has to be a default, not an assignment.
+export LOGGYTRACY_CACHE_MAX_BYTES="${LOGGYTRACY_CACHE_MAX_BYTES:-8388608}"
+export LOGGYTRACY_CACHE_EVICTION_INTERVAL="${LOGGYTRACY_CACHE_EVICTION_INTERVAL:-3s}"
+export LOGGYTRACY_FLUSH_MAX_INTERVAL="${LOGGYTRACY_FLUSH_MAX_INTERVAL:-2s}"
+export LOGGYTRACY_MERGE_INTERVAL="${LOGGYTRACY_MERGE_INTERVAL:-8s}"
+export LOGGYTRACY_RETENTION_PERIOD="${LOGGYTRACY_RETENTION_PERIOD:-20s}"
+export LOGGYTRACY_RETENTION_GRACE_PERIOD="${LOGGYTRACY_RETENTION_GRACE_PERIOD:-5s}"
+export LOGGYTRACY_RETENTION_INTERVAL="${LOGGYTRACY_RETENTION_INTERVAL:-5s}"
 
 ./target/release/loggytracy >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
