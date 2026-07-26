@@ -923,6 +923,159 @@
         assert_eq!(ids, expected, "every acknowledged part must be present exactly once");
     }
 
+    /// An `ObjectStore` that accepts every write regardless of the condition
+    /// attached to it — the failure mode a misconfigured S3-compatible store
+    /// presents, expressed directly so the guard can be tested against it.
+    #[derive(Debug)]
+    struct IgnoresConditions {
+        inner: Arc<dyn object_store::ObjectStore>,
+    }
+
+    impl std::fmt::Display for IgnoresConditions {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "IgnoresConditions")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for IgnoresConditions {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            // The whole point: the mode is thrown away.
+            self.inner
+                .put_opts(
+                    location,
+                    payload,
+                    object_store::PutOptions {
+                        mode: object_store::PutMode::Overwrite,
+                        ..Default::default()
+                    },
+                )
+                .await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, opts).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// `from_url` hands the environment straight to `object_store` and nothing
+    /// else checks what came back. Get `OBJECT_STORE_CONDITIONAL_PUT` wrong and
+    /// every manifest guarantee here rests on nothing — silently, because the
+    /// writes all succeed.
+    ///
+    /// This is not a test of `object_store`. It is a test that *our* startup
+    /// refuses a store whose conditional writes do not condition on anything.
+    #[tokio::test]
+    async fn the_preflight_refuses_a_store_that_ignores_conditions() {
+        let honest = ObjectStorage::sharing_store_for_test(Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
+        honest
+            .verify_conditional_put()
+            .await
+            .expect("a store that honours conditions must pass");
+
+        let dishonest = ObjectStorage::sharing_store_for_test(Arc::new(IgnoresConditions {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+        }));
+        let error = dishonest
+            .verify_conditional_put()
+            .await
+            .expect_err("a store that ignores conditions must not start");
+        assert!(
+            error.contains("does not enforce conditional writes"),
+            "{error}"
+        );
+        assert!(
+            error.contains("OBJECT_STORE_CONDITIONAL_PUT"),
+            "the message must say what to set: {error}"
+        );
+    }
+
+    /// The probe leaves nothing behind, so a restart does not accumulate them
+    /// and the check is repeatable within one process.
+    #[tokio::test]
+    async fn the_preflight_cleans_up_after_itself_and_can_run_twice() {
+        let storage = ObjectStorage::sharing_store_for_test(Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
+        storage.verify_conditional_put().await.unwrap();
+        storage.verify_conditional_put().await.unwrap();
+
+        let leftovers: Vec<_> = futures_util::StreamExt::collect::<Vec<_>>(storage.store.list(None))
+            .await
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|meta| meta.location.as_ref().contains("_preflight"))
+            .collect();
+        assert!(leftovers.is_empty(), "probe objects survived: {leftovers:?}");
+    }
+
+    /// `file://` opts out of CAS on purpose, so the preflight must not turn a
+    /// documented development backend into a boot failure.
+    #[tokio::test]
+    async fn the_preflight_skips_the_local_development_backend() {
+        let dir = temp_dir("preflight-local");
+        let storage = ObjectStorage::from_url(&format!("file://{}", dir.display()))
+            .expect("local store builds");
+        storage
+            .verify_conditional_put()
+            .await
+            .expect("file:// deliberately opts out of conditional writes");
+    }
+
     /// The M6 replacement procedure says drain the old instance before
     /// starting the new one. Orchestrators break that ordering routinely, and
     /// until now both processes would have kept writing, each believing it was

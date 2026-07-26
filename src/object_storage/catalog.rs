@@ -271,6 +271,122 @@ production or on shared/network storage."
         Ok(self.load_manifest_versioned().await?.manifest)
     }
 
+    /// Refuse to start when the configured store does not actually enforce
+    /// conditional writes.
+    ///
+    /// This does not test `object_store` — whether `AmazonS3` implements
+    /// `If-Match` correctly is that crate's problem and its test suite's. What
+    /// it tests is **our configuration**: `from_url` hands the environment
+    /// straight to `object_store`, and nothing else checks that the store it
+    /// built back actually does compare-and-swap. Get
+    /// `OBJECT_STORE_CONDITIONAL_PUT` wrong and every manifest guarantee in
+    /// this engine — lost-update protection, merge input revalidation, writer
+    /// fencing — silently rests on nothing.
+    ///
+    /// The check is the *negative* path. A positive one proves nothing: the
+    /// first manifest write of a fresh prefix succeeds whether or not the
+    /// condition was honoured. What must hold is that a write which should be
+    /// rejected **is** rejected.
+    pub async fn verify_conditional_put(&self) -> Result<(), String> {
+        if self.local_manifest_overwrite {
+            // `file://` is a declared single-process development backend that
+            // deliberately opts out of CAS, and `from_url` already warns.
+            return Ok(());
+        }
+        let probe = self.path("_preflight/conditional-put-probe");
+        // Any leftover from an aborted earlier boot would make the first
+        // create fail for the wrong reason.
+        let _ = self.store.delete(&probe).await;
+
+        let created = self
+            .store
+            .put_opts(
+                &probe,
+                Bytes::from_static(b"loggytracy conditional-put probe").into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| {
+                format!("conditional-put preflight could not write its probe object: {error}")
+            })?;
+
+        let outcome = self.probe_rejections(&probe, created).await;
+        // Best effort: a leftover probe only costs the next boot one delete.
+        let _ = self.store.delete(&probe).await;
+        outcome
+    }
+
+    async fn probe_rejections(&self, probe: &ObjectPath, created: PutResult) -> Result<(), String> {
+        let recreated = self
+            .store
+            .put_opts(
+                probe,
+                Bytes::from_static(b"second create").into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await;
+        if recreated.is_ok() {
+            return Err(Self::preflight_failure(
+                "a second PutMode::Create over an existing object succeeded",
+            ));
+        }
+
+        // A version that was valid and no longer is: exactly the shape of the
+        // lost update the manifest CAS exists to prevent.
+        let stale = UpdateVersion {
+            e_tag: created.e_tag.clone(),
+            version: created.version.clone(),
+        };
+        if stale.e_tag.is_none() && stale.version.is_none() {
+            return Err(Self::preflight_failure(
+                "the store returned neither an ETag nor a version, so no write can ever be conditioned on one",
+            ));
+        }
+        self.store
+            .put_opts(
+                probe,
+                Bytes::from_static(b"overwrite").into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| format!("conditional-put preflight could not overwrite: {error}"))?;
+        let updated = self
+            .store
+            .put_opts(
+                probe,
+                Bytes::from_static(b"stale update").into(),
+                PutOptions {
+                    mode: PutMode::Update(stale),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if updated.is_ok() {
+            return Err(Self::preflight_failure(
+                "a PutMode::Update carrying a superseded version succeeded",
+            ));
+        }
+        Ok(())
+    }
+
+    fn preflight_failure(what_happened: &str) -> String {
+        format!(
+            "the configured object store does not enforce conditional writes: {what_happened}. \
+Every manifest guarantee in this engine depends on compare-and-swap, so refusing to start is the \
+only safe response. For S3-compatible stores set OBJECT_STORE_CONDITIONAL_PUT=etag; for a local \
+single-process development store use a file:// URL, which opts out of CAS deliberately."
+        )
+    }
+
     /// Where a detected fence is reported. Set once, during startup.
     pub fn set_fence_sink(&self, shutdown: Arc<crate::shutdown::ShutdownState>) {
         let _ = self.fence_sink.set(shutdown);

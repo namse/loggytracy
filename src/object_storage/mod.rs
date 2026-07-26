@@ -3,8 +3,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutMode, PutOptions, UpdateVersion};
+use object_store::{ObjectStore, PutMode, PutOptions, PutResult, UpdateVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::part::{self, BLOOM_FILE, DATA_FILE, META_FILE, Part, STREAM_INDEX_FILE};
