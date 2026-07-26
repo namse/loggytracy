@@ -1,3 +1,4 @@
+mod admin;
 mod app_state;
 mod bloom;
 mod config;

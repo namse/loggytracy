@@ -49,15 +49,12 @@ pub struct Config {
     pub retention_batch_size: usize,
     pub retention_grace_period: Duration,
     pub max_retention_runtime: Duration,
-    /// Control-plane endpoint serving the tenant→retention map. When unset,
-    /// retention is exactly the global `retention_period` behaviour; when set,
-    /// the fetched snapshot is the sole authority. Setting both is a
-    /// validation error rather than a silently ignored setting.
-    pub tenant_policy_url: Option<String>,
-    pub tenant_policy_interval: Duration,
-    pub tenant_policy_timeout: Duration,
-    pub tenant_policy_auth_header: Option<String>,
-    pub tenant_policy_max_bytes: usize,
+    /// Bearer token for the admin routes the control plane pushes retention
+    /// through. When unset, retention is exactly the global `retention_period`
+    /// behaviour and the routes are not mounted; when set, the pushed policies
+    /// are the sole authority. Setting both is a validation error rather than a
+    /// silently ignored setting.
+    pub tenant_policy_token: Option<String>,
     pub max_tenant_retention: Option<Duration>,
     /// Expired share of a part's rows that justifies one rewrite through
     /// merge. Below it the rows stay on disk, already invisible to queries.
@@ -123,11 +120,7 @@ impl Default for Config {
             retention_batch_size: 100,
             retention_grace_period: Duration::from_secs(60 * 60),
             max_retention_runtime: Duration::from_secs(120),
-            tenant_policy_url: None,
-            tenant_policy_interval: Duration::from_secs(300),
-            tenant_policy_timeout: Duration::from_secs(10),
-            tenant_policy_auth_header: None,
-            tenant_policy_max_bytes: 8 * 1024 * 1024,
+            tenant_policy_token: None,
             max_tenant_retention: None,
             retention_rewrite_threshold: 0.5,
             max_query_range: None,
@@ -282,24 +275,9 @@ impl Config {
                 "LOGGYTRACY_MAX_RETENTION_RUNTIME",
                 defaults.max_retention_runtime,
             )?,
-            tenant_policy_url: std::env::var("LOGGYTRACY_TENANT_POLICY_URL")
+            tenant_policy_token: std::env::var("LOGGYTRACY_TENANT_POLICY_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            tenant_policy_interval: env_required_duration(
-                "LOGGYTRACY_TENANT_POLICY_INTERVAL",
-                defaults.tenant_policy_interval,
-            )?,
-            tenant_policy_timeout: env_required_duration(
-                "LOGGYTRACY_TENANT_POLICY_TIMEOUT",
-                defaults.tenant_policy_timeout,
-            )?,
-            tenant_policy_auth_header: std::env::var("LOGGYTRACY_TENANT_POLICY_AUTH_HEADER")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            tenant_policy_max_bytes: env_positive_usize(
-                "LOGGYTRACY_TENANT_POLICY_MAX_BYTES",
-                defaults.tenant_policy_max_bytes,
-            )?,
             max_tenant_retention: env_duration("LOGGYTRACY_MAX_TENANT_RETENTION", None)?,
             retention_rewrite_threshold: env_value(
                 "LOGGYTRACY_RETENTION_REWRITE_THRESHOLD",
@@ -437,18 +415,12 @@ impl Config {
         positive_duration("max_retention_runtime", self.max_retention_runtime)?;
         // A silently ignored retention setting is the worst possible outcome,
         // so the two modes fail at startup instead of quietly picking one.
-        if self.tenant_policy_url.is_some() && self.retention_period.is_some() {
+        if self.tenant_policy_token.is_some() && self.retention_period.is_some() {
             return Err(
-                "LOGGYTRACY_RETENTION_PERIOD and LOGGYTRACY_TENANT_POLICY_URL are mutually \
+                "LOGGYTRACY_RETENTION_PERIOD and LOGGYTRACY_TENANT_POLICY_TOKEN are mutually \
 exclusive: per-tenant retention replaces the global period"
                     .to_string(),
             );
-        }
-        positive_duration("tenant_policy_interval", self.tenant_policy_interval)?;
-        positive_duration("tenant_policy_timeout", self.tenant_policy_timeout)?;
-        positive_usize("tenant_policy_max_bytes", self.tenant_policy_max_bytes)?;
-        if let Some(raw) = &self.tenant_policy_auth_header {
-            crate::tenant_policy::parse_auth_header(raw)?;
         }
         if let Some(maximum) = self.max_tenant_retention {
             positive_duration("max_tenant_retention", maximum)?;
@@ -649,7 +621,7 @@ mod tests {
     #[test]
     fn the_two_retention_modes_are_mutually_exclusive() {
         let mut config = Config {
-            tenant_policy_url: Some("https://control-plane/policy".to_string()),
+            tenant_policy_token: Some("secret".to_string()),
             ..Config::default()
         };
         assert!(config.validate().is_ok());
@@ -659,7 +631,7 @@ mod tests {
         config.retention_period = Some(Duration::from_secs(3600));
         assert!(config.validate().is_err());
 
-        config.tenant_policy_url = None;
+        config.tenant_policy_token = None;
         assert!(config.validate().is_ok());
     }
 
@@ -672,28 +644,6 @@ mod tests {
         }
         config.retention_rewrite_threshold = 1.0;
         assert!(config.validate().is_ok());
-    }
-
-    /// The auth header is validated here rather than only when the policy
-    /// client is built, so a malformed one is reported with every other
-    /// configuration error instead of at worker startup.
-    #[test]
-    fn a_malformed_tenant_policy_auth_header_fails_validation() {
-        let mut config = Config {
-            tenant_policy_url: Some("https://control-plane/policy".to_string()),
-            tenant_policy_auth_header: Some("Authorization: Bearer secret".to_string()),
-            ..Config::default()
-        };
-        assert!(config.validate().is_ok());
-
-        for invalid in ["Authorization", "Authorization: ", "Bad Name: value"] {
-            config.tenant_policy_auth_header = Some(invalid.to_string());
-            assert!(config.validate().is_err(), "{invalid} must be rejected");
-            assert!(
-                crate::tenant_policy::TenantPolicy::from_config(&config).is_err(),
-                "{invalid} must also be rejected where it is used"
-            );
-        }
     }
 
     #[test]

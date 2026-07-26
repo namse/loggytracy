@@ -159,12 +159,15 @@ pub async fn run(config: Arc<Config>) {
     let retention_healthy = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(RuntimeMetrics::new());
     let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
-    // Everything a misconfiguration can break here — the auth header above all
-    // — is already rejected by `Config::validate`, so what is left is the HTTP
-    // client failing to build, which is not a user error.
+    // Loaded before the workers spawn, and fatal on failure — the same class as
+    // a manifest that cannot be read. Booting with a silently empty map would
+    // unclamp every query and hand back data a downgrade had already hidden.
+    // An empty *listing* is a different thing and boots normally: it means
+    // nothing has been pushed yet, and an unknown tenant keeps its data.
     let tenant_policy = Arc::new(
-        TenantPolicy::from_config(&config)
-            .unwrap_or_else(|error| panic!("tenant policy initialization failed: {error}")),
+        TenantPolicy::load(&config, object_storage.clone())
+            .await
+            .unwrap_or_else(|error| panic!("tenant policy load failed: {error}")),
     );
 
     // Handles for every background worker. Shutdown signals them through the

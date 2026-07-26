@@ -28,22 +28,10 @@ pub async fn retention_loop(
     healthy.store(true, Ordering::Release);
     let mut ticker = interval(config.retention_interval.max(Duration::from_secs(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // The poller lives here rather than in a process of its own: loggytracy is
-    // one machine, one process, and a second writer would invalidate every
-    // single-writer crash-safety invariant the merge and flush paths rest on.
-    let mut policy_ticker = interval(config.tenant_policy_interval.max(Duration::from_secs(1)));
-    policy_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Nothing here fetches a policy: the control plane pushes them and this
+    // loop only applies what is already in memory. loggytracy never calls out.
     loop {
         tokio::select! {
-            _ = policy_ticker.tick(), if tenant_policy.is_enabled() => {
-                if let Err(error) = tenant_policy.refresh().await {
-                    // Deliberately does not clear `healthy`: an unreachable
-                    // control plane must not make the pod look unhealthy and
-                    // get restarted. It only stops reclamation.
-                    tracing::warn!(%error, "tenant policy refresh failed; keeping the previous snapshot");
-                }
-                continue;
-            }
             _ = ticker.tick() => {}
             _ = wait_for_drain(&mut drain_rx) => return,
         }

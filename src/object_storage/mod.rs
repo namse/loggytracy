@@ -19,6 +19,9 @@ const PART_FILES: [&str; 4] = [DATA_FILE, BLOOM_FILE, STREAM_INDEX_FILE, META_FI
 const CATALOG_FILES: [&str; 3] = [BLOOM_FILE, STREAM_INDEX_FILE, META_FILE];
 const MANIFEST_FORMAT_VERSION: u32 = 1;
 const TRACE_MANIFEST_FILE: &str = "trace-manifest.json";
+/// Per-tenant retention policies, one object per tenant. Deliberately outside
+/// the `parts`/`trace_parts` prefixes that `garbage_collect_orphans` sweeps.
+pub const TENANT_POLICY_PREFIX: &str = "tenant_policies";
 const TRACE_PART_FILES: [&str; 3] = [TRACE_DATA_FILE, TRACE_BLOOM_FILE, TRACE_META_FILE];
 const TRACE_CATALOG_FILES: [&str; 2] = [TRACE_BLOOM_FILE, TRACE_META_FILE];
 const MAX_CAS_ATTEMPTS: usize = 16;

@@ -43,6 +43,10 @@ struct MergeGroup {
 /// A part whose expired share reaches `retention_rewrite_threshold` is worth
 /// it on its own, so it is admitted as a group of one — even when it is too
 /// large for `group_for_merge` to consider at all.
+///
+/// A tenant at zero retention is a deleted tenant, and its rows are reclaimed
+/// regardless of the threshold: otherwise "deletion" would leave rows in a
+/// large part indefinitely, which is not a thing the word can mean.
 fn select_groups(
     parts: &[Arc<PartReader>],
     config: &Config,
@@ -51,7 +55,9 @@ fn select_groups(
     let min_part_count = config.merge_min_part_count.max(2);
     let needs_rewrite = |reader: &Arc<PartReader>| {
         cutoffs.is_some_and(|cutoffs| {
-            cutoffs.expired_log_row_fraction(reader.meta()) >= config.retention_rewrite_threshold
+            cutoffs.holds_zero_retention_rows(reader.meta())
+                || cutoffs.expired_log_row_fraction(reader.meta())
+                    >= config.retention_rewrite_threshold
         })
     };
 

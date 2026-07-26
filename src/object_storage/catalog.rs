@@ -140,6 +140,22 @@ production or on shared/network storage."
         }
     }
 
+    /// An in-memory store whose every write fails, for the paths that must
+    /// report a failure rather than apply a change that is not durable.
+    #[cfg(test)]
+    pub fn in_memory_with_failing_writes() -> Self {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        Self {
+            store: Arc::new(fault_store::LatencyFaultStore::new(
+                inner,
+                fault_store::FaultConfig::for_test(0, 0, 0, 1.0, 1),
+            )),
+            prefix: ObjectPath::from("loggytracy-test"),
+            manifest_update: tokio::sync::Mutex::new(()),
+            local_manifest_overwrite: false,
+        }
+    }
+
     /// Wrap an arbitrary object store, used by tests to inject fault-injecting
     /// backends. The store is treated as a full conditional-put backend (no
     /// local overwrite shortcut), exercising the real CAS manifest path.
@@ -171,6 +187,10 @@ production or on shared/network storage."
 
     fn part_path(&self, part: &ManifestPart, file: &str) -> ObjectPath {
         self.path(&format!("parts/{}/{}/{}", part.partition, part.id, file))
+    }
+
+    fn tenant_policy_path(&self, tenant: &str) -> ObjectPath {
+        self.path(&format!("{TENANT_POLICY_PREFIX}/{tenant}.json"))
     }
 
     fn trace_part_path(&self, part: &TraceManifestPart, file: &str) -> ObjectPath {
@@ -416,6 +436,61 @@ production or on shared/network storage."
             }
         }
         Ok(())
+    }
+
+    /// One tenant's retention policy, written blind.
+    ///
+    /// One object per tenant is what lets a push be a single unconditional
+    /// write: no read-modify-write, no CAS, and no contention between two
+    /// tenants pushed concurrently. Ordering between two pushes for the *same*
+    /// tenant is the caller's problem, and `TenantPolicy` serializes them.
+    pub async fn put_tenant_policy(&self, tenant: &str, body: Vec<u8>) -> Result<(), String> {
+        self.store
+            .put(&self.tenant_policy_path(tenant), body.into())
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("failed to store the policy for tenant {tenant}: {error}"))
+    }
+
+    pub async fn delete_tenant_policy(&self, tenant: &str) -> Result<(), String> {
+        match self.store.delete(&self.tenant_policy_path(tenant)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(format!(
+                "failed to delete the policy for tenant {tenant}: {error}"
+            )),
+        }
+    }
+
+    /// Every stored policy, as `(file name, body)`. Read once at startup; a
+    /// failure here is fatal, so it never returns a partial listing.
+    pub async fn load_tenant_policies(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        use futures_util::StreamExt;
+
+        let prefix = self.path(TENANT_POLICY_PREFIX);
+        let mut locations = Vec::new();
+        let mut stream = self.store.list(Some(&prefix));
+        while let Some(item) = stream.next().await {
+            let meta =
+                item.map_err(|error| format!("failed to list the tenant policies: {error}"))?;
+            locations.push(meta.location);
+        }
+        let mut policies = Vec::new();
+        for location in locations {
+            let name = location
+                .filename()
+                .ok_or_else(|| format!("tenant policy object {location} has no file name"))?
+                .to_string();
+            let bytes = self
+                .store
+                .get(&location)
+                .await
+                .map_err(|error| format!("failed to read tenant policy {location}: {error}"))?
+                .bytes()
+                .await
+                .map_err(|error| format!("failed to read tenant policy {location}: {error}"))?;
+            policies.push((name, bytes.to_vec()));
+        }
+        Ok(policies)
     }
 
     /// Deletes immutable objects that are absent from both manifests only

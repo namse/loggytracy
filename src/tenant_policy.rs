@@ -1,21 +1,26 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::object_storage::{ObjectStorage, TENANT_POLICY_PREFIX};
 use crate::part::PartMeta;
 use crate::tenant::TenantId;
 use crate::trace_part::TracePartMeta;
 
+const POLICY_FILE_SUFFIX: &str = ".json";
+const POLICY_TEMP_SUFFIX: &str = ".json.tmp";
+
 /// How long one tenant's data is kept.
 ///
-/// A tenant that is *absent* from the control plane's response has no
-/// `TenantRetention` at all, which is deliberately different from
-/// [`TenantRetention::Infinite`]: both keep the data, but only the second one
-/// is an answer the control plane actually gave.
+/// A tenant the control plane has never pushed has no `TenantRetention` at
+/// all, which is deliberately different from [`TenantRetention::Infinite`]:
+/// both keep the data, but only the second one is an answer the control plane
+/// actually gave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TenantRetention {
     Finite(Duration),
@@ -32,28 +37,68 @@ impl TenantRetention {
     }
 }
 
-/// The last policy the control plane served, whole.
-pub struct PolicySnapshot {
-    retentions: BTreeMap<TenantId, TenantRetention>,
-    fetched_at: SystemTime,
-    infinite_tenants: usize,
+/// What the control plane pushed for one tenant.
+///
+/// The raw string is kept as it arrived, and `max_tenant_retention` is applied
+/// when the value is read rather than when it is stored: raising the clamp then
+/// takes effect without the control plane having to re-push every tenant, and a
+/// `GET` returns the value that was actually sent.
+#[derive(Clone)]
+struct PolicyEntry {
+    retention: TenantRetention,
+    raw: String,
+    updated_at: SystemTime,
 }
 
-impl PolicySnapshot {
+/// One tenant's policy as the admin endpoints report it.
+pub struct PolicyView {
+    pub retention: String,
+    pub updated_at: SystemTime,
+}
+
+/// Every policy this instance knows, read by queries, retention and merge.
+pub struct PolicyMap {
+    entries: BTreeMap<TenantId, PolicyEntry>,
+    max_retention: Option<Duration>,
+}
+
+impl PolicyMap {
     pub fn retention(&self, tenant: &TenantId) -> Option<TenantRetention> {
-        self.retentions.get(tenant).copied()
+        self.entries
+            .get(tenant)
+            .map(|entry| entry.retention.clamped(self.max_retention))
+    }
+
+    pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
+        self.entries.get(tenant).map(|entry| PolicyView {
+            retention: entry.raw.clone(),
+            updated_at: entry.updated_at,
+        })
     }
 
     pub fn tenant_count(&self) -> usize {
-        self.retentions.len()
+        self.entries.len()
     }
 
+    /// Counts what the control plane said, not what the clamp turned it into,
+    /// so an operator can still tell an explicit `infinite` from a finite plan.
     pub fn infinite_tenant_count(&self) -> usize {
-        self.infinite_tenants
+        self.entries
+            .values()
+            .filter(|entry| matches!(entry.retention, TenantRetention::Infinite))
+            .count()
     }
 
-    pub fn age(&self, now: SystemTime) -> Duration {
-        now.duration_since(self.fetched_at).unwrap_or_default()
+    /// Age of the newest policy on this pod. It gates nothing; it tells an
+    /// operator whether the control plane is still talking to this instance.
+    /// Restored from the stored `updated_at`, so a restart does not reset it.
+    pub fn newest_push_age(&self, now: SystemTime) -> Duration {
+        self.entries
+            .values()
+            .map(|entry| entry.updated_at)
+            .max()
+            .map(|newest| now.duration_since(newest).unwrap_or_default())
+            .unwrap_or_default()
     }
 }
 
@@ -64,7 +109,7 @@ impl PolicySnapshot {
 /// no object body is downloaded to decide what has expired.
 #[derive(Clone)]
 pub struct Cutoffs {
-    snapshot: Arc<PolicySnapshot>,
+    policies: Arc<PolicyMap>,
     now_ns: i64,
 }
 
@@ -72,7 +117,7 @@ impl Cutoffs {
     /// Oldest timestamp still retained for `tenant`, or `None` when nothing
     /// expires — an unknown tenant or an explicitly infinite one.
     pub fn cutoff_ns(&self, tenant: &TenantId) -> Option<i64> {
-        match self.snapshot.retention(tenant)? {
+        match self.policies.retention(tenant)? {
             TenantRetention::Infinite => None,
             TenantRetention::Finite(period) => Some(
                 self.now_ns
@@ -114,6 +159,25 @@ impl Cutoffs {
         self.expired_log_rows(meta) as f64 / meta.row_count as f64
     }
 
+    /// Whether the part still holds rows for a tenant at zero retention.
+    ///
+    /// Zero retention is how a tenant is deleted, so that path ignores
+    /// `retention_rewrite_threshold`: any part still holding the tenant's rows
+    /// is rewritten, which turns "the rows may survive in a large part
+    /// indefinitely" into "the next few merge ticks" without job tracking.
+    pub fn holds_zero_retention_rows(&self, meta: &PartMeta) -> bool {
+        meta.tenants
+            .iter()
+            .any(|segment| segment.row_count > 0 && self.is_zero_retention(&segment.tenant))
+    }
+
+    fn is_zero_retention(&self, tenant: &TenantId) -> bool {
+        matches!(
+            self.policies.retention(tenant),
+            Some(TenantRetention::Finite(period)) if period.is_zero()
+        )
+    }
+
     /// Trace tenant segments carry no timestamps of their own, so a segment's
     /// bound comes from the row groups it owns.
     pub fn trace_part_fully_expired(&self, meta: &TracePartMeta) -> bool {
@@ -134,90 +198,268 @@ impl Cutoffs {
 
 #[derive(Default)]
 pub struct TenantPolicyMetrics {
-    pub fetch_success: AtomicU64,
-    pub fetch_errors: AtomicU64,
-    pub fetch_latency_ns: AtomicU64,
+    pub push_accepted: AtomicU64,
+    pub push_rejected: AtomicU64,
+    pub push_persist_errors: AtomicU64,
 }
 
-/// The tenant→retention map, polled from a configured control-plane endpoint.
+/// Why a policy change did not take effect.
+#[derive(Debug)]
+pub enum PolicyError {
+    /// The request is malformed. Nothing was stored, so the control plane must
+    /// fix the request rather than retry it.
+    Invalid(String),
+    /// The policy could not be made durable. Nothing was applied, and the
+    /// control plane owns the retry.
+    Persist(String),
+}
+
+/// Where the policy objects live.
 ///
-/// The endpoint is never on the ingest or query hot path: writes ignore it
-/// entirely, and reads fail open when there is no snapshot. A control plane
-/// that is down therefore costs storage, never availability.
+/// One object per tenant, so a push is a single blind write: no
+/// read-modify-write, no CAS, and no contention between two tenants pushed at
+/// the same time.
+enum PolicyStore {
+    Remote(Arc<ObjectStorage>),
+    /// With no object store configured the same files live under the data
+    /// directory, written temp-file-then-rename like the rest of local state.
+    Local(PathBuf),
+}
+
+#[derive(Serialize, Deserialize)]
+struct PolicyDocument {
+    retention: String,
+    updated_at: String,
+}
+
+impl PolicyStore {
+    async fn put(&self, tenant: &TenantId, document: &PolicyDocument) -> Result<(), String> {
+        let body = serde_json::to_vec(document)
+            .map_err(|error| format!("failed to encode the tenant policy: {error}"))?;
+        match self {
+            Self::Remote(storage) => storage.put_tenant_policy(tenant.as_str(), body).await,
+            Self::Local(root) => {
+                let root = root.clone();
+                let file_name = format!("{tenant}{POLICY_FILE_SUFFIX}");
+                let temp_name = format!("{tenant}{POLICY_TEMP_SUFFIX}");
+                tokio::task::spawn_blocking(move || {
+                    write_local_policy(&root, &file_name, &temp_name, &body)
+                })
+                .await
+                .map_err(|error| format!("tenant policy write task failed: {error}"))?
+            }
+        }
+    }
+
+    async fn delete(&self, tenant: &TenantId) -> Result<(), String> {
+        match self {
+            Self::Remote(storage) => storage.delete_tenant_policy(tenant.as_str()).await,
+            Self::Local(root) => {
+                let path = root.join(format!("{tenant}{POLICY_FILE_SUFFIX}"));
+                let root = root.clone();
+                tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
+                    Ok(()) => crate::part::fsync_dir(&root).map_err(|error| error.to_string()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(format!(
+                        "failed to delete the tenant policy {}: {error}",
+                        path.display()
+                    )),
+                })
+                .await
+                .map_err(|error| format!("tenant policy delete task failed: {error}"))?
+            }
+        }
+    }
+
+    /// Every stored policy. A failure is fatal at boot, so this never returns a
+    /// partial map: booting with a silently empty one would unclamp every query
+    /// and hand back data a downgrade had already hidden.
+    async fn load_all(&self) -> Result<BTreeMap<TenantId, PolicyEntry>, String> {
+        let documents = match self {
+            Self::Remote(storage) => storage.load_tenant_policies().await?,
+            Self::Local(root) => {
+                let root = root.clone();
+                tokio::task::spawn_blocking(move || read_local_policies(&root))
+                    .await
+                    .map_err(|error| format!("tenant policy load task failed: {error}"))??
+            }
+        };
+        let mut entries = BTreeMap::new();
+        for (file_name, body) in documents {
+            // A temp file is an expected crash leftover; anything else under
+            // this prefix is unexplained, and guessing is exactly what the
+            // fatal load exists to prevent.
+            if file_name.ends_with(POLICY_TEMP_SUFFIX) {
+                continue;
+            }
+            let raw_tenant = file_name.strip_suffix(POLICY_FILE_SUFFIX).ok_or_else(|| {
+                format!("unexpected object {file_name:?} under {TENANT_POLICY_PREFIX}")
+            })?;
+            let tenant = TenantId::parse(raw_tenant)
+                .map_err(|error| format!("invalid tenant policy file {file_name:?}: {error}"))?;
+            let document: PolicyDocument = serde_json::from_slice(&body)
+                .map_err(|error| format!("invalid tenant policy {file_name:?}: {error}"))?;
+            let retention = parse_retention(&document.retention).map_err(|error| {
+                format!(
+                    "invalid retention {:?} in {file_name:?}: {error}",
+                    document.retention
+                )
+            })?;
+            let updated_at = parse_timestamp(&document.updated_at).map_err(|error| {
+                format!(
+                    "invalid updated_at {:?} in {file_name:?}: {error}",
+                    document.updated_at
+                )
+            })?;
+            entries.insert(
+                tenant,
+                PolicyEntry {
+                    retention,
+                    raw: document.retention,
+                    updated_at,
+                },
+            );
+        }
+        Ok(entries)
+    }
+}
+
+fn write_local_policy(
+    root: &Path,
+    file_name: &str,
+    temp_name: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    use std::io::Write;
+
+    std::fs::create_dir_all(root).map_err(|error| {
+        format!(
+            "failed to create the tenant policy directory {}: {error}",
+            root.display()
+        )
+    })?;
+    let temporary = root.join(temp_name);
+    let path = root.join(file_name);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    file.write_all(body).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
+    crate::part::fsync_dir(root).map_err(|error| error.to_string())
+}
+
+fn read_local_policies(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        // Nothing has ever been pushed on this machine. Distinct from a read
+        // failure: an empty policy set is a valid state, an unreadable one is
+        // not.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to read the tenant policy directory {}: {error}",
+                root.display()
+            ));
+        }
+    };
+    let mut documents = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_name = entry
+            .file_name()
+            .into_string()
+            .map_err(|name| format!("non-UTF-8 tenant policy file {name:?}"))?;
+        let body = std::fs::read(entry.path())
+            .map_err(|error| format!("failed to read tenant policy {file_name:?}: {error}"))?;
+        documents.push((file_name, body));
+    }
+    Ok(documents)
+}
+
+/// The tenant→retention map, pushed one tenant at a time by the control plane.
+///
+/// loggytracy never calls out: the control plane learns immediately whether its
+/// change took effect, and owns the retry when it did not. Nothing here is on
+/// the ingest hot path, and a tenant that was never pushed keeps its data
+/// forever — loggytracy never invents a deletion.
 pub struct TenantPolicy {
-    settings: Option<PolicySettings>,
-    snapshot: RwLock<Option<Arc<PolicySnapshot>>>,
-    client: Option<reqwest::Client>,
+    store: Option<PolicyStore>,
+    max_retention: Option<Duration>,
+    policies: RwLock<Arc<PolicyMap>>,
+    /// Serializes a write with the map swap that follows it. Two pushes for the
+    /// same tenant are blind writes, so without this the store and the in-memory
+    /// map could end up disagreeing about which one landed last.
+    write_lock: tokio::sync::Mutex<()>,
     pub metrics: TenantPolicyMetrics,
 }
 
-struct PolicySettings {
-    url: String,
-    max_bytes: usize,
-    max_retention: Option<Duration>,
-    auth_header: Option<(String, String)>,
-}
-
-#[derive(Deserialize)]
-struct PolicyResponse {
-    tenants: BTreeMap<String, String>,
-}
-
 impl TenantPolicy {
-    /// A policy that is switched off: every tenant keeps everything, and no
-    /// request is ever made.
+    /// A policy that is switched off: every tenant keeps everything, and the
+    /// admin routes are not mounted.
     pub fn disabled() -> Self {
+        Self::with_entries(None, None, BTreeMap::new())
+    }
+
+    fn with_entries(
+        store: Option<PolicyStore>,
+        max_retention: Option<Duration>,
+        entries: BTreeMap<TenantId, PolicyEntry>,
+    ) -> Self {
         Self {
-            settings: None,
-            snapshot: RwLock::new(None),
-            client: None,
+            store,
+            max_retention,
+            policies: RwLock::new(Arc::new(PolicyMap {
+                entries,
+                max_retention,
+            })),
+            write_lock: tokio::sync::Mutex::new(()),
             metrics: TenantPolicyMetrics::default(),
         }
     }
 
-    pub fn from_config(config: &Config) -> Result<Self, String> {
-        let Some(url) = config.tenant_policy_url.clone() else {
+    /// Load every stored policy before the workers start. A failure is fatal,
+    /// the same class as a manifest that cannot be read.
+    pub async fn load(
+        config: &Config,
+        object_storage: Option<Arc<ObjectStorage>>,
+    ) -> Result<Self, String> {
+        if config.tenant_policy_token.is_none() {
             return Ok(Self::disabled());
+        }
+        let store = match object_storage {
+            Some(storage) => PolicyStore::Remote(storage),
+            None => PolicyStore::Local(config.data_dir.join(TENANT_POLICY_PREFIX)),
         };
-        let auth_header = config
-            .tenant_policy_auth_header
-            .as_deref()
-            .map(parse_auth_header)
-            .transpose()?;
-        let client = reqwest::Client::builder()
-            .timeout(config.tenant_policy_timeout)
-            .build()
-            .map_err(|error| format!("failed to build the tenant policy HTTP client: {error}"))?;
-        Ok(Self {
-            settings: Some(PolicySettings {
-                url,
-                max_bytes: config.tenant_policy_max_bytes,
-                max_retention: config.max_tenant_retention,
-                auth_header,
-            }),
-            snapshot: RwLock::new(None),
-            client: Some(client),
-            metrics: TenantPolicyMetrics::default(),
-        })
+        let entries = store.load_all().await?;
+        tracing::info!(
+            tenants = entries.len(),
+            "loaded per-tenant retention policies"
+        );
+        Ok(Self::with_entries(
+            Some(store),
+            config.max_tenant_retention,
+            entries,
+        ))
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.settings.is_some()
+        self.store.is_some()
     }
 
-    pub fn snapshot(&self) -> Option<Arc<PolicySnapshot>> {
-        self.snapshot.read().unwrap().clone()
+    /// The current map, or `None` when per-tenant retention is off. `None` must
+    /// always mean "delete nothing".
+    pub fn snapshot(&self) -> Option<Arc<PolicyMap>> {
+        self.is_enabled()
+            .then(|| self.policies.read().unwrap().clone())
     }
 
-    /// Cutoffs for one instant, or `None` when per-tenant retention is off or
-    /// no successful fetch has happened yet. `None` must always mean "delete
-    /// nothing": a control plane that is down at boot cannot cause deletion.
     pub fn cutoffs_at(&self, now_ns: i64) -> Option<Cutoffs> {
-        if !self.is_enabled() {
-            return None;
-        }
         Some(Cutoffs {
-            snapshot: self.snapshot()?,
+            policies: self.snapshot()?,
             now_ns,
         })
     }
@@ -228,7 +470,7 @@ impl TenantPolicy {
 
     /// Oldest timestamp `tenant` may still read. `None` leaves the requested
     /// range untouched, which is the fail-open behaviour every read path wants
-    /// when the control plane has said nothing about this tenant.
+    /// for a tenant the control plane has said nothing about.
     pub fn query_floor_ns(&self, tenant: &TenantId) -> Option<i64> {
         self.cutoffs_now()?.cutoff_ns(tenant)
     }
@@ -241,61 +483,139 @@ impl TenantPolicy {
         }
     }
 
-    pub async fn refresh(&self) -> Result<(), String> {
-        let Some(settings) = &self.settings else {
-            return Ok(());
+    pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
+        self.snapshot()?.view(tenant)
+    }
+
+    /// Store one tenant's retention, then apply it.
+    ///
+    /// The order is the whole point of the push shape: a success is a promise
+    /// that the policy survives a restart, so the control plane's retry loop
+    /// terminates on a real guarantee.
+    pub async fn push(&self, tenant: &TenantId, raw: &str) -> Result<PolicyView, PolicyError> {
+        let Some(store) = &self.store else {
+            return Err(PolicyError::Invalid(
+                "per-tenant retention is not enabled".to_string(),
+            ));
         };
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| "tenant policy client is missing".to_string())?;
-        let started = Instant::now();
-        let result = fetch_snapshot(client, settings).await;
-        crate::metrics::RuntimeMetrics::add_duration(
-            &self.metrics.fetch_latency_ns,
-            started.elapsed(),
-        );
-        match result {
-            Ok(snapshot) => {
-                *self.snapshot.write().unwrap() = Some(Arc::new(snapshot));
-                self.metrics.fetch_success.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
+        let retention = match parse_retention(raw) {
+            Ok(retention) => retention,
             Err(error) => {
-                // The previous snapshot stays intact. It is the last known
-                // policy, and applying it is more correct than applying none.
-                self.metrics.fetch_errors.fetch_add(1, Ordering::Relaxed);
-                Err(error)
+                self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(PolicyError::Invalid(error));
             }
+        };
+        let raw = raw.trim().to_string();
+        let updated_at = SystemTime::now();
+        let document = PolicyDocument {
+            retention: raw.clone(),
+            updated_at: format_timestamp(updated_at),
+        };
+
+        let _guard = self.write_lock.lock().await;
+        if let Err(error) = store.put(tenant, &document).await {
+            self.metrics
+                .push_persist_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(PolicyError::Persist(error));
         }
+        self.mutate(|entries| {
+            entries.insert(
+                tenant.clone(),
+                PolicyEntry {
+                    retention,
+                    raw: raw.clone(),
+                    updated_at,
+                },
+            );
+        });
+        self.metrics.push_accepted.fetch_add(1, Ordering::Relaxed);
+        Ok(PolicyView {
+            retention: raw,
+            updated_at,
+        })
+    }
+
+    /// Return the tenant to *unknown*, which keeps its data forever. This is
+    /// not tenant deletion; that is `retention: "0"`.
+    pub async fn remove(&self, tenant: &TenantId) -> Result<(), PolicyError> {
+        let Some(store) = &self.store else {
+            return Err(PolicyError::Invalid(
+                "per-tenant retention is not enabled".to_string(),
+            ));
+        };
+        let _guard = self.write_lock.lock().await;
+        if let Err(error) = store.delete(tenant).await {
+            self.metrics
+                .push_persist_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(PolicyError::Persist(error));
+        }
+        self.mutate(|entries| {
+            entries.remove(tenant);
+        });
+        self.metrics.push_accepted.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn record_rejected_push(&self) {
+        self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Copy-insert-swap. Pushes are rare, so paying a map copy per push keeps
+    /// every query read to one `Arc` clone.
+    fn mutate(&self, change: impl FnOnce(&mut BTreeMap<TenantId, PolicyEntry>)) {
+        let mut policies = self.policies.write().unwrap();
+        let mut entries = policies.entries.clone();
+        change(&mut entries);
+        *policies = Arc::new(PolicyMap {
+            entries,
+            max_retention: self.max_retention,
+        });
     }
 
     #[cfg(test)]
     pub fn install_for_test(&self, retentions: BTreeMap<TenantId, TenantRetention>) {
-        let infinite_tenants = retentions
-            .values()
-            .filter(|retention| matches!(retention, TenantRetention::Infinite))
-            .count();
-        *self.snapshot.write().unwrap() = Some(Arc::new(PolicySnapshot {
-            retentions,
-            fetched_at: SystemTime::now(),
-            infinite_tenants,
-        }));
+        self.mutate(|entries| {
+            entries.clear();
+            for (tenant, retention) in retentions {
+                let raw = match retention {
+                    TenantRetention::Infinite => "infinite".to_string(),
+                    TenantRetention::Finite(period) => format!("{}ms", period.as_millis()),
+                };
+                entries.insert(
+                    tenant,
+                    PolicyEntry {
+                        retention,
+                        raw,
+                        updated_at: SystemTime::now(),
+                    },
+                );
+            }
+        });
     }
 
     #[cfg(test)]
     pub fn enabled_for_test() -> Self {
-        Self {
-            settings: Some(PolicySettings {
-                url: "http://127.0.0.1:1/policy".to_string(),
-                max_bytes: 8 * 1024 * 1024,
-                max_retention: None,
-                auth_header: None,
-            }),
-            snapshot: RwLock::new(None),
-            client: None,
-            metrics: TenantPolicyMetrics::default(),
-        }
+        Self::with_entries(
+            Some(PolicyStore::Remote(Arc::new(ObjectStorage::in_memory()))),
+            None,
+            BTreeMap::new(),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn for_test_with_store(store: Arc<ObjectStorage>, max_retention: Option<Duration>) -> Self {
+        Self::with_entries(
+            Some(PolicyStore::Remote(store)),
+            max_retention,
+            BTreeMap::new(),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn for_test_with_local_store(root: PathBuf) -> Self {
+        Self::with_entries(Some(PolicyStore::Local(root)), None, BTreeMap::new())
     }
 }
 
@@ -306,100 +626,26 @@ pub fn now_ns() -> i64 {
         .unwrap_or(0)
 }
 
-async fn fetch_snapshot(
-    client: &reqwest::Client,
-    settings: &PolicySettings,
-) -> Result<PolicySnapshot, String> {
-    let mut request = client.get(&settings.url);
-    if let Some((name, value)) = &settings.auth_header {
-        request = request.header(name, value);
-    }
-    let mut response = request
-        .send()
-        .await
-        .map_err(|error| format!("tenant policy request failed: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "tenant policy endpoint returned {}",
-            response.status()
-        ));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > settings.max_bytes as u64)
-    {
-        return Err(format!(
-            "tenant policy response declares more than {} bytes",
-            settings.max_bytes
-        ));
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("tenant policy response read failed: {error}"))?
-    {
-        if body.len().saturating_add(chunk.len()) > settings.max_bytes {
-            return Err(format!(
-                "tenant policy response exceeds {} bytes",
-                settings.max_bytes
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    parse_snapshot(&body, settings.max_retention)
+fn format_timestamp(at: SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339()
 }
 
-/// Parse a control-plane response. Untrusted input throughout.
-///
-/// A malformed *value* rejects the whole response, so a truncated or
-/// half-written body can never be applied in part. A malformed *tenant key* is
-/// dropped instead: it can never name a real tenant, so keeping the rest of an
-/// otherwise well-formed policy loses nothing.
-pub fn parse_snapshot(
-    body: &[u8],
-    max_retention: Option<Duration>,
-) -> Result<PolicySnapshot, String> {
-    let response: PolicyResponse = serde_json::from_slice(body)
-        .map_err(|error| format!("tenant policy response is not valid JSON: {error}"))?;
-    let mut retentions = BTreeMap::new();
-    let mut infinite_tenants = 0usize;
-    for (raw_tenant, raw_retention) in response.tenants {
-        let tenant = match TenantId::parse(&raw_tenant) {
-            Ok(tenant) => tenant,
-            Err(error) => {
-                tracing::warn!(
-                    tenant = %raw_tenant,
-                    %error,
-                    "dropping a tenant policy entry with an invalid tenant id"
-                );
-                continue;
-            }
-        };
-        let retention = parse_retention(&raw_retention).map_err(|error| {
-            format!("invalid retention {raw_retention:?} for tenant {raw_tenant}: {error}")
-        })?;
-        if matches!(retention, TenantRetention::Infinite) {
-            infinite_tenants += 1;
-        }
-        retentions.insert(tenant, retention.clamped(max_retention));
-    }
-    Ok(PolicySnapshot {
-        retentions,
-        fetched_at: SystemTime::now(),
-        infinite_tenants,
-    })
+fn parse_timestamp(raw: &str) -> Result<SystemTime, String> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|parsed| SystemTime::from(parsed.with_timezone(&chrono::Utc)))
+        .map_err(|error| format!("{error}"))
 }
 
-/// Prometheus-style duration, or the literal `infinite`.
-fn parse_retention(raw: &str) -> Result<TenantRetention, String> {
+/// Prometheus-style duration, or the literal `infinite`. Untrusted input.
+pub fn parse_retention(raw: &str) -> Result<TenantRetention, String> {
     let value = raw.trim();
     if value.eq_ignore_ascii_case("infinite") {
         return Ok(TenantRetention::Infinite);
     }
     if value == "0" {
-        // Expires everything for this tenant. Honoured because it falls out of
-        // the arithmetic, not because prompt deletion is a feature here.
+        // Deleting a tenant is `retention: "0"`: the cutoff lands at now, so
+        // queries empty immediately and every part holding the tenant becomes
+        // eligible for rewrite regardless of the rewrite threshold.
         return Ok(TenantRetention::Finite(Duration::ZERO));
     }
     let (number, unit_nanos) = if let Some(number) = value.strip_suffix("ms") {
@@ -428,28 +674,6 @@ fn parse_retention(raw: &str) -> Result<TenantRetention, String> {
     Ok(TenantRetention::Finite(Duration::from_nanos(nanos)))
 }
 
-/// A single `Name: value` string, as configured. `Config::validate` calls this
-/// too, so a malformed header is rejected with the rest of the configuration
-/// instead of surfacing later as a failed `TenantPolicy::from_config`.
-pub fn parse_auth_header(raw: &str) -> Result<(String, String), String> {
-    let (name, value) = raw.split_once(':').ok_or_else(|| {
-        "LOGGYTRACY_TENANT_POLICY_AUTH_HEADER must be a single \"Name: value\" string".to_string()
-    })?;
-    let name = name.trim();
-    let value = value.trim();
-    if name.is_empty() || value.is_empty() {
-        return Err(
-            "LOGGYTRACY_TENANT_POLICY_AUTH_HEADER must have a non-empty name and value".to_string(),
-        );
-    }
-    name.parse::<reqwest::header::HeaderName>()
-        .map_err(|error| format!("invalid tenant policy auth header name: {error}"))?;
-    value
-        .parse::<reqwest::header::HeaderValue>()
-        .map_err(|error| format!("invalid tenant policy auth header value: {error}"))?;
-    Ok((name.to_string(), value.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,11 +682,15 @@ mod tests {
         TenantId::parse(raw).expect("valid tenant id")
     }
 
+    fn days(count: u64) -> Duration {
+        Duration::from_secs(count * 24 * 60 * 60)
+    }
+
     #[test]
     fn parses_prometheus_durations_and_the_infinite_literal() {
         assert_eq!(
             parse_retention("30d").unwrap(),
-            TenantRetention::Finite(Duration::from_secs(30 * 24 * 60 * 60))
+            TenantRetention::Finite(days(30))
         );
         assert_eq!(
             parse_retention("90m").unwrap(),
@@ -482,43 +710,8 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_tenant_id_is_dropped_but_an_invalid_value_rejects_the_whole_response() {
-        let body = br#"{"tenants":{"acme":"30d","../etc":"7d"}}"#;
-        let snapshot = parse_snapshot(body, None).unwrap();
-        assert_eq!(snapshot.tenant_count(), 1);
-        assert_eq!(
-            snapshot.retention(&tenant("acme")),
-            Some(TenantRetention::Finite(Duration::from_secs(
-                30 * 24 * 60 * 60
-            )))
-        );
-
-        let body = br#"{"tenants":{"acme":"30d","hobby":"soon"}}"#;
-        assert!(parse_snapshot(body, None).is_err());
-        assert!(parse_snapshot(b"{\"tenants\":", None).is_err());
-    }
-
-    #[test]
-    fn retention_values_are_clamped_including_infinite() {
-        let body = br#"{"tenants":{"acme":"30d","intern":"infinite"}}"#;
-        let maximum = Duration::from_secs(7 * 24 * 60 * 60);
-        let snapshot = parse_snapshot(body, Some(maximum)).unwrap();
-        assert_eq!(
-            snapshot.retention(&tenant("acme")),
-            Some(TenantRetention::Finite(maximum))
-        );
-        assert_eq!(
-            snapshot.retention(&tenant("intern")),
-            Some(TenantRetention::Finite(maximum))
-        );
-        // The distinction survives for metrics even after clamping.
-        assert_eq!(snapshot.infinite_tenant_count(), 1);
-    }
-
-    #[test]
-    fn an_unknown_tenant_never_expires_and_a_missing_snapshot_deletes_nothing() {
+    fn an_unknown_tenant_never_expires() {
         let policy = TenantPolicy::enabled_for_test();
-        assert!(policy.cutoffs_at(1_000).is_none());
         assert_eq!(policy.query_floor_ns(&tenant("acme")), None);
 
         policy.install_for_test(
@@ -533,7 +726,6 @@ mod tests {
         assert_eq!(cutoffs.cutoff_ns(&tenant("acme")), Some(900));
         assert!(cutoffs.is_expired(&tenant("acme"), 899));
         assert!(!cutoffs.is_expired(&tenant("acme"), 900));
-        // Unknown: no cutoff, never expired.
         assert_eq!(cutoffs.cutoff_ns(&tenant("hobby")), None);
         assert!(!cutoffs.is_expired(&tenant("hobby"), i64::MIN));
     }
@@ -543,161 +735,178 @@ mod tests {
         let policy = TenantPolicy::disabled();
         assert!(!policy.is_enabled());
         assert!(policy.cutoffs_now().is_none());
+        assert!(policy.snapshot().is_none());
         assert_eq!(policy.clamp_start_ns(&tenant("acme"), 5), 5);
     }
 
-    /// Serve one fixed response on a loopback port and return its URL.
-    async fn serve(
-        status: axum::http::StatusCode,
-        body: &'static str,
-        require_auth: bool,
-    ) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let app = axum::Router::new().route(
-            "/policy",
-            axum::routing::get(move |headers: axum::http::HeaderMap| async move {
-                if require_auth
-                    && headers
-                        .get("Authorization")
-                        .and_then(|value| value.to_str().ok())
-                        != Some("Bearer secret")
-                {
-                    return (axum::http::StatusCode::UNAUTHORIZED, "no".to_string());
-                }
-                (status, body.to_string())
-            }),
+    #[tokio::test]
+    async fn a_push_is_durable_and_survives_a_restart() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = TenantPolicy::for_test_with_store(storage.clone(), None);
+        policy.push(&tenant("acme"), "30d").await.unwrap();
+        policy.push(&tenant("intern"), "infinite").await.unwrap();
+        // A downgrade taken before the restart must still be in force after it.
+        policy.push(&tenant("acme"), "7d").await.unwrap();
+        assert_eq!(
+            policy.metrics.push_accepted.load(Ordering::Relaxed),
+            3,
+            "every push is accepted"
         );
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        format!("http://{address}/policy")
-    }
 
-    fn policy_for(url: String, configure: impl FnOnce(&mut Config)) -> TenantPolicy {
-        let mut config = Config {
-            tenant_policy_url: Some(url),
+        let config = Config {
+            tenant_policy_token: Some("secret".to_string()),
             retention_period: None,
             ..Config::default()
         };
-        configure(&mut config);
-        TenantPolicy::from_config(&config).expect("policy builds")
-    }
-
-    #[tokio::test]
-    async fn a_successful_fetch_installs_the_snapshot() {
-        let url = serve(
-            axum::http::StatusCode::OK,
-            r#"{"tenants":{"acme":"30d","intern":"infinite"}}"#,
-            false,
-        )
-        .await;
-        let policy = policy_for(url, |_| {});
-
-        policy.refresh().await.unwrap();
-
-        let snapshot = policy.snapshot().expect("snapshot installed");
-        assert_eq!(snapshot.tenant_count(), 2);
+        let restarted = TenantPolicy::load(&config, Some(storage)).await.unwrap();
+        let map = restarted.snapshot().unwrap();
+        assert_eq!(map.tenant_count(), 2);
         assert_eq!(
-            snapshot.retention(&tenant("acme")),
-            Some(TenantRetention::Finite(Duration::from_secs(
-                30 * 24 * 60 * 60
-            )))
+            map.retention(&tenant("acme")),
+            Some(TenantRetention::Finite(days(7))),
+            "the newest policy wins, not the first one stored"
         );
-        assert_eq!(policy.metrics.fetch_success.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn malformed_oversized_and_unauthorised_responses_leave_the_snapshot_intact() {
-        let good = serve(
-            axum::http::StatusCode::OK,
-            r#"{"tenants":{"acme":"30d"}}"#,
-            false,
-        )
-        .await;
-        let policy = policy_for(good, |_| {});
-        policy.refresh().await.unwrap();
-        let installed = policy.snapshot().unwrap();
-
-        for (url, label) in [
-            (
-                serve(
-                    axum::http::StatusCode::OK,
-                    r#"{"tenants":{"acme":"soon"}}"#,
-                    false,
-                )
-                .await,
-                "malformed",
-            ),
-            (
-                serve(axum::http::StatusCode::UNAUTHORIZED, "denied", false).await,
-                "unauthorised",
-            ),
-            (
-                serve(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom", false).await,
-                "server error",
-            ),
-        ] {
-            let broken = policy_for(url, |_| {});
-            broken.install_for_test(
-                [(
-                    tenant("acme"),
-                    TenantRetention::Finite(Duration::from_secs(1)),
-                )]
-                .into_iter()
-                .collect(),
-            );
-            let before = broken.snapshot().unwrap();
-            assert!(broken.refresh().await.is_err(), "{label} must fail");
-            assert!(
-                Arc::ptr_eq(&before, &broken.snapshot().unwrap()),
-                "{label} must leave the previous snapshot in place"
-            );
-            assert_eq!(broken.metrics.fetch_errors.load(Ordering::Relaxed), 1);
-        }
-
-        let oversized = policy_for(
-            serve(
-                axum::http::StatusCode::OK,
-                r#"{"tenants":{"acme":"30d","beta":"7d"}}"#,
-                false,
-            )
-            .await,
-            |config| config.tenant_policy_max_bytes = 8,
+        assert_eq!(
+            map.retention(&tenant("intern")),
+            Some(TenantRetention::Infinite)
         );
-        assert!(oversized.refresh().await.is_err());
-
-        // The first policy's own snapshot is untouched throughout.
-        assert!(Arc::ptr_eq(&installed, &policy.snapshot().unwrap()));
-    }
-
-    #[tokio::test]
-    async fn the_configured_auth_header_is_sent() {
-        let url = serve(
-            axum::http::StatusCode::OK,
-            r#"{"tenants":{"acme":"30d"}}"#,
-            true,
-        )
-        .await;
-
-        let unauthenticated = policy_for(url.clone(), |_| {});
-        assert!(unauthenticated.refresh().await.is_err());
-
-        let authenticated = policy_for(url, |config| {
-            config.tenant_policy_auth_header = Some("Authorization: Bearer secret".to_string());
-        });
-        authenticated.refresh().await.unwrap();
-        assert_eq!(authenticated.snapshot().unwrap().tenant_count(), 1);
+        assert_eq!(map.view(&tenant("acme")).unwrap().retention, "7d");
     }
 
     #[test]
-    fn parses_the_auth_header_and_rejects_malformed_ones() {
-        assert_eq!(
-            parse_auth_header("Authorization: Bearer token").unwrap(),
-            ("Authorization".to_string(), "Bearer token".to_string())
+    fn zero_retention_expires_everything_and_forces_a_rewrite() {
+        let policy = TenantPolicy::enabled_for_test();
+        policy.install_for_test(
+            [
+                (tenant("acme"), TenantRetention::Finite(Duration::ZERO)),
+                (tenant("beta"), TenantRetention::Infinite),
+            ]
+            .into_iter()
+            .collect(),
         );
-        assert!(parse_auth_header("Authorization").is_err());
-        assert!(parse_auth_header("Authorization: ").is_err());
-        assert!(parse_auth_header("Bad Name: value").is_err());
+        let cutoffs = policy.cutoffs_at(1_000).unwrap();
+        // The cutoff sits at now, so every query for the tenant empties from
+        // the next request onward.
+        assert_eq!(cutoffs.cutoff_ns(&tenant("acme")), Some(1_000));
+        assert!(cutoffs.is_expired(&tenant("acme"), 999));
+        assert!(!cutoffs.is_expired(&tenant("beta"), i64::MIN));
+        assert!(cutoffs.is_zero_retention(&tenant("acme")));
+        assert!(!cutoffs.is_zero_retention(&tenant("beta")));
+        assert!(!cutoffs.is_zero_retention(&tenant("hobby")));
+    }
+
+    #[tokio::test]
+    async fn a_local_store_round_trips_without_an_object_store() {
+        let data_dir = tempdir("tenant-policy-local");
+        let dir = data_dir.join(TENANT_POLICY_PREFIX);
+        let policy = TenantPolicy::for_test_with_local_store(dir.clone());
+        policy.push(&tenant("acme"), "7d").await.unwrap();
+        assert_eq!(
+            policy.snapshot().unwrap().retention(&tenant("acme")),
+            Some(TenantRetention::Finite(days(7)))
+        );
+
+        let config = Config {
+            tenant_policy_token: Some("secret".to_string()),
+            retention_period: None,
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+        let restarted = TenantPolicy::load(&config, None).await.unwrap();
+        assert_eq!(
+            restarted.snapshot().unwrap().retention(&tenant("acme")),
+            Some(TenantRetention::Finite(days(7)))
+        );
+
+        // A crash leftover is expected and ignored; anything else is not.
+        std::fs::write(dir.join("acme.json.tmp"), b"garbage").unwrap();
+        assert!(TenantPolicy::load(&config, None).await.is_ok());
+        std::fs::write(dir.join("acme.txt"), b"garbage").unwrap();
+        assert!(TenantPolicy::load(&config, None).await.is_err());
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_policy_object_fails_the_load() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        storage
+            .put_tenant_policy("acme", b"{\"retention\":\"soon\"".to_vec())
+            .await
+            .unwrap();
+        let config = Config {
+            tenant_policy_token: Some("secret".to_string()),
+            retention_period: None,
+            ..Config::default()
+        };
+        assert!(TenantPolicy::load(&config, Some(storage)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failing_store_changes_neither_the_map_nor_the_object() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = TenantPolicy::for_test_with_store(storage.clone(), None);
+        policy.push(&tenant("acme"), "30d").await.unwrap();
+
+        // A malformed value is rejected before anything is written.
+        assert!(matches!(
+            policy.push(&tenant("acme"), "soon").await,
+            Err(PolicyError::Invalid(_))
+        ));
+        assert_eq!(policy.metrics.push_rejected.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            policy.snapshot().unwrap().retention(&tenant("acme")),
+            Some(TenantRetention::Finite(days(30))),
+            "a rejected push leaves the previous policy in force"
+        );
+        assert_eq!(storage.load_tenant_policies().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_delete_returns_the_tenant_to_unknown() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = TenantPolicy::for_test_with_store(storage.clone(), None);
+        policy.push(&tenant("acme"), "1ms").await.unwrap();
+        assert!(policy.query_floor_ns(&tenant("acme")).is_some());
+
+        policy.remove(&tenant("acme")).await.unwrap();
+        assert_eq!(
+            policy.query_floor_ns(&tenant("acme")),
+            None,
+            "an unknown tenant is never clamped"
+        );
+        assert!(storage.load_tenant_policies().await.unwrap().is_empty());
+        // Deleting an unknown tenant is a no-op, not an error.
+        policy.remove(&tenant("hobby")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_maximum_clamps_a_pushed_value_without_rewriting_it() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = TenantPolicy::for_test_with_store(storage, Some(days(7)));
+        policy.push(&tenant("acme"), "30d").await.unwrap();
+        policy.push(&tenant("intern"), "infinite").await.unwrap();
+
+        let map = policy.snapshot().unwrap();
+        assert_eq!(
+            map.retention(&tenant("acme")),
+            Some(TenantRetention::Finite(days(7)))
+        );
+        assert_eq!(
+            map.retention(&tenant("intern")),
+            Some(TenantRetention::Finite(days(7)))
+        );
+        // The clamp applies on read, so the pushed value is reported as sent
+        // and a raised maximum takes effect without a re-push.
+        assert_eq!(map.view(&tenant("acme")).unwrap().retention, "30d");
+        assert_eq!(map.infinite_tenant_count(), 1);
+    }
+
+    fn tempdir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "loggytracy-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 }

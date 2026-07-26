@@ -504,6 +504,80 @@
         assert_eq!(registry.snapshot()[0].meta().id, original_id);
     }
 
+    /// Deleting a tenant is `retention: "0"`, and deletion has to mean
+    /// something: the same part the threshold would have left alone is
+    /// rewritten when the expired rows belong to a tenant at zero retention.
+    #[tokio::test]
+    async fn a_tenant_at_zero_retention_ignores_the_rewrite_threshold() {
+        let dir = tmp_dir("zero-retention");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 4,
+            retention_period: None,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        // One expired row in four: exactly the shape the threshold leaves
+        // alone in `a_barely_expired_part_is_left_alone`.
+        let parts = part::flush_rows(
+            vec![
+                tenant_row("alpha", 1_000),
+                tenant_row("beta", 1_001),
+                tenant_row("beta", 1_002),
+                tenant_row("beta", 1_003),
+            ],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        registry.register(parts.clone()).unwrap();
+        let original_id = parts[0].meta.id.clone();
+
+        let policy = policy_with(&[
+            (
+                "alpha",
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::ZERO),
+            ),
+            ("beta", crate::tenant_policy::TenantRetention::Infinite),
+        ]);
+        let metrics = RuntimeMetrics::new();
+
+        merge_once(&registry, None, &config, &policy, &metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(registry.part_count(), 1);
+        let reader = registry.snapshot().remove(0);
+        assert_ne!(
+            reader.meta().id,
+            original_id,
+            "a deleted tenant's rows are reclaimed regardless of the threshold"
+        );
+        assert_eq!(reader.meta().row_count, 3);
+        assert!(
+            registry
+                .query(&tenant_id("alpha"), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            metrics
+                .retention_expired_rows_dropped
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        // The rows are gone, so the next tick has nothing left to reclaim and
+        // must not copy the part onto itself.
+        let rewritten_id = reader.meta().id.clone();
+        merge_once(&registry, None, &config, &policy, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(registry.snapshot()[0].meta().id, rewritten_id);
+    }
+
     /// An unknown tenant is never dropped, even from a part that merge is
     /// rewriting for another reason.
     #[tokio::test]

@@ -460,20 +460,20 @@ loggytracy_retention_expired_rows_dropped_total {}\n\
 loggytracy_retention_parts_rewritten_total {}\n\
 # TYPE loggytracy_retention_rewrite_skipped_total counter\n\
 loggytracy_retention_rewrite_skipped_total {}\n\
-# TYPE loggytracy_tenant_policy_fetch_success_total counter\n\
-loggytracy_tenant_policy_fetch_success_total {}\n\
-# TYPE loggytracy_tenant_policy_fetch_errors_total counter\n\
-loggytracy_tenant_policy_fetch_errors_total {}\n\
-# TYPE loggytracy_tenant_policy_fetch_latency_ns_total counter\n\
-loggytracy_tenant_policy_fetch_latency_ns_total {}\n\
+# TYPE loggytracy_tenant_policy_push_accepted_total counter\n\
+loggytracy_tenant_policy_push_accepted_total {}\n\
+# TYPE loggytracy_tenant_policy_push_rejected_total counter\n\
+loggytracy_tenant_policy_push_rejected_total {}\n\
+# TYPE loggytracy_tenant_policy_push_persist_errors_total counter\n\
+loggytracy_tenant_policy_push_persist_errors_total {}\n\
 # TYPE loggytracy_tenant_policy_known_tenants gauge\n\
 loggytracy_tenant_policy_known_tenants {}\n\
 # TYPE loggytracy_tenant_policy_infinite_tenants gauge\n\
 loggytracy_tenant_policy_infinite_tenants {}\n\
 # TYPE loggytracy_tenant_policy_unknown_tenants gauge\n\
 loggytracy_tenant_policy_unknown_tenants {}\n\
-# TYPE loggytracy_tenant_policy_snapshot_age_seconds gauge\n\
-loggytracy_tenant_policy_snapshot_age_seconds {}\n\
+# TYPE loggytracy_tenant_policy_last_push_age_seconds gauge\n\
+loggytracy_tenant_policy_last_push_age_seconds {}\n\
 # TYPE loggytracy_query_success_total counter\n\
 loggytracy_query_success_total {}\n\
 # TYPE loggytracy_query_errors_total counter\n\
@@ -519,17 +519,25 @@ loggytracy_force_flush_complete {}\n",
         m.retention_expired_rows_dropped.load(Ordering::Relaxed),
         m.retention_parts_rewritten.load(Ordering::Relaxed),
         m.retention_rewrite_skipped.load(Ordering::Relaxed),
-        state.tenant_policy.metrics.fetch_success.load(Ordering::Relaxed),
-        state.tenant_policy.metrics.fetch_errors.load(Ordering::Relaxed),
         state
             .tenant_policy
             .metrics
-            .fetch_latency_ns
+            .push_accepted
+            .load(Ordering::Relaxed),
+        state
+            .tenant_policy
+            .metrics
+            .push_rejected
+            .load(Ordering::Relaxed),
+        state
+            .tenant_policy
+            .metrics
+            .push_persist_errors
             .load(Ordering::Relaxed),
         policy.known_tenants,
         policy.infinite_tenants,
         policy.unknown_tenants,
-        policy.snapshot_age_seconds,
+        policy.last_push_age_seconds,
         m.query_success.load(Ordering::Relaxed),
         m.query_errors.load(Ordering::Relaxed),
         m.query_scanned_rows.load(Ordering::Relaxed),
@@ -549,7 +557,7 @@ struct TenantPolicyGauges {
     known_tenants: usize,
     infinite_tenants: usize,
     unknown_tenants: usize,
-    snapshot_age_seconds: u64,
+    last_push_age_seconds: u64,
 }
 
 /// `"infinite"` and *absent* keep the same data, so a control plane that
@@ -567,7 +575,7 @@ fn tenant_policy_gauges(state: &AppState) -> TenantPolicyGauges {
             known_tenants: 0,
             infinite_tenants: 0,
             unknown_tenants: 0,
-            snapshot_age_seconds: 0,
+            last_push_age_seconds: 0,
         };
     };
     let mut unknown: std::collections::BTreeSet<crate::tenant::TenantId> =
@@ -597,7 +605,7 @@ fn tenant_policy_gauges(state: &AppState) -> TenantPolicyGauges {
         known_tenants: snapshot.tenant_count(),
         infinite_tenants: snapshot.infinite_tenant_count(),
         unknown_tenants: unknown.len(),
-        snapshot_age_seconds: snapshot.age(std::time::SystemTime::now()).as_secs(),
+        last_push_age_seconds: snapshot.newest_push_age(std::time::SystemTime::now()).as_secs(),
     }
 }
 
