@@ -73,6 +73,17 @@ async fn main() {
     // 1 means "send no tenant header", which is what every run did before this
     // knob existed. Above 1 the workload rotates across that many tenants.
     let tenant_count = env_u64("LOGGYTRACY_LOAD_TENANTS", 1).max(1);
+    // Work, not wall time, is what a soak is actually after: memory stability,
+    // part accumulation and backlog trend are all functions of how much was
+    // processed. Driving harder reaches the same state sooner, so the duration
+    // below is a safety cap rather than the target.
+    let target_events = env_u64("LOGGYTRACY_LOAD_EVENTS", 0);
+    // How far back the restore probe reaches. It used to aim at the very first
+    // record of the run, which retention had usually already deleted by the
+    // time the probe ran — so the probe queried an empty range, no part was
+    // selected, and no restore was ever exercised. It has to land on data old
+    // enough to have been evicted and young enough to still be retained.
+    let restore_lookback_s = env_u64("LOGGYTRACY_LOAD_RESTORE_LOOKBACK_SECONDS", 60) as i64;
     let revision = std::env::var("LOGGYTRACY_BUILD_REVISION")
         .or_else(|_| std::env::var("GIT_COMMIT"))
         .unwrap_or_else(|_| "unknown".to_string());
@@ -140,7 +151,7 @@ async fn main() {
     }
 
     let mut next_send = Instant::now();
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && (target_events == 0 || events < target_events) {
         if let Some(interval) = push_interval {
             let now = Instant::now();
             if now < next_send {
@@ -208,10 +219,11 @@ async fn main() {
             // store. Only counted in steady state.
             if steady {
                 let earliest_s = (earliest_ns / 1_000_000_000) as i64;
+                let probe_start = now.saturating_sub(restore_lookback_s).max(earliest_s);
                 let restore_path = format!(
                     "/loki/api/v1/query_range?query=%7Bapp%3D%22m7-load%22%7D&start={}&end={}&step=60&limit=100&direction=forward",
-                    earliest_s,
-                    earliest_s + 120
+                    probe_start,
+                    probe_start + 60
                 );
                 let started = Instant::now();
                 match request(
@@ -458,6 +470,12 @@ async fn main() {
     // Added after construction: the literal is already at `json!`'s recursion
     // limit, and one more key inside it stops the macro from expanding.
     report["tenants"] = serde_json::json!(tenant_count);
+    report["target_events"] = serde_json::json!(target_events);
+    report["ended_on"] = serde_json::json!(if target_events > 0 && events >= target_events {
+        "event_target"
+    } else {
+        "duration_cap"
+    });
     let rendered = serde_json::to_string_pretty(&report).expect("report serialization");
     if let Ok(path) = std::env::var("LOGGYTRACY_LOAD_RESULT_PATH")
         && let Err(error) = std::fs::write(&path, format!("{rendered}\n"))
