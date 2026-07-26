@@ -18,17 +18,21 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
       윈도로 나눠 재작성한다. 큰 part가 zero-retention 행을 영구히 붙들지 못한다.
 - [x] **정책 토큰 없는 부팅 차단**: 저장된 tenant policy가 있는데 토큰이 없으면 부팅 실패.
       숨겨져 있던 삭제 데이터가 되살아나지 않는다.
-- [ ] **writer fencing**: manifest에 epoch/lease를 넣고 다른 epoch 관측 시 self-fence.
-      현재 같은 prefix로 두 프로세스를 띄우면 둘 다 정상 동작한다고 믿고 쓴다.
-- [ ] **테넌트 allowlist**: 아래 체크리스트에 완료로 표시돼 있으나 코드에는 없다.
-      `TenantId::parse`가 문자셋만 보므로 무제한 테넌트 생성이 가능하다.
+- [x] **writer fencing**: manifest의 `writer_epoch`를 시작 시 claim하고 모든 CAS에서 검증한다.
+      fence를 만나면 ingest 503, `/ready` 503, force-flush 재시도 중단, 종료 코드 1.
+      **M6 절차의 "구 인스턴스 완전 drain 후 신 인스턴스 기동"이 이제 강제된다.**
+- [x] **테넌트 allowlist**: `LOGGYTRACY_ALLOWED_TENANTS`. 목록 밖 테넌트는 403.
+      기본 테넌트가 목록에 없으면 부팅 실패.
+- [x] **온디스크 포맷 버전**: part·trace part `meta.json`의 `version`을 체크섬 검증 이전에 확인.
+- [x] **메타데이터 엔드포인트 가드**: `labels`/`label_values`/`series`/`index_stats`에
+      semaphore·타임아웃·`start`/`end`·`match[]` 개수 상한.
+- [x] **`/metrics` O(parts) 제거**: merge debt와 unknown tenant 게이지를 워커가 발행한다.
 - [ ] **테넌시** (진행 중). 설계·비용 모델·구현 체크리스트는
       [`docs/MULTI_TENANCY_DESIGN.md`](docs/MULTI_TENANCY_DESIGN.md).
       **테넌트를 저장 경로 분할 축으로 두는 기존 설계(`docs/ARCHITECTURE.md`의 "테넌시" 절)는
       R2 Class A 비용 때문에 폐기됐다** — 테넌트마다 객체를 쓰면 어떤 RPO에서도 $1 플랜 예산에
       맞지 않는다.
-  - [x] `X-Scope-OrgID` 추출 (Loki push + OTLP gRPC), 헤더 없는 요청 정책 설정.
-        **허용 목록 검증은 미구현** — 위 P0의 "테넌트 allowlist" 참조
+  - [x] `X-Scope-OrgID` 추출·허용 목록 검증 (Loki push + OTLP gRPC), 헤더 없는 요청 정책 설정
   - [x] WAL 레코드에 테넌트 기록 (재시작 후에도 소유자 유지, 기존 WAL은 기본 테넌트로 복구)
   - [x] 테넌트 공유 part: `(tenant, ts)` 정렬 + 테넌트 경계에 정렬된 row group + `meta.json`
         테넌트 인덱스 (로그·트레이스 양쪽)
@@ -67,9 +71,9 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
 ## P3 — M5 운영 검증
 
 - [ ] compaction 튜닝
-- [ ] `merge_max_input_bytes`(압축 크기)와 `merge_max_memory_bytes`(압축 해제 크기)의 단위 불일치 수정.
-      **분할 fallback은 구현됐으므로 더 이상 영구 실패는 아니다** — 남은 것은 그룹 선택 단계에서
-      압축률을 반영해 애초에 안 맞는 그룹을 만들지 않는 것이다.
+- [x] `merge_max_input_bytes`와 `merge_max_memory_bytes`의 단위 불일치 수정. part meta에
+      `materialized_bytes`를 기록해 그룹 선택과 읽기 예산이 같은 단위를 쓰고, `validate`가
+      `merge_max_input_bytes <= merge_max_memory_bytes`를 강제한다.
 - [x] retention 정책과 만료 데이터 삭제 구현 (retention 전용 타임아웃 knob 분리 포함)
 - [ ] 쿼리 메모리·범위·동시성 등 resource limit을 운영 목표에 맞게 조정
 - [ ] 명시적인 처리량·지연시간·메모리 목표를 정하고 부하 테스트 수행

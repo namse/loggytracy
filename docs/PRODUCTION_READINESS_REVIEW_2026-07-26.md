@@ -199,6 +199,12 @@ group당 bloom 필터가 테넌트 수에 비례한다. 압축률도 무너진�
 | P0-2 ingest backpressure | 수정됨 | memtable·WAL backlog를 O(1)로 추적하고, 상한 초과 시 journal append 이전에 `429` + `Retry-After` (OTLP는 `RESOURCE_EXHAUSTED`) |
 | N1(a) merge 분할 fallback | 수정됨 | 그룹은 절반씩, 단일 part는 row group 윈도로 나눠 재작성. 테넌트 삭제가 큰 part에서 영구 skip되지 않는다 |
 | N1(b) 정책 토큰 없는 부팅 | 수정됨 | 저장된 정책이 하나라도 있는데 토큰이 없으면 부팅 실패 |
+| N5 포맷 버전 필드 | 수정됨 | part·trace part `meta.json`에 `version`. 체크섬 검증 **이전**에 확인하므로 포맷 차이가 손상으로 보이지 않는다 |
+| P1-8 merge 상한 단위 | 수정됨 | part meta에 `materialized_bytes`. 그룹 선택과 읽기 예산이 같은 단위를 쓰고, `validate`가 두 상한의 순서를 강제한다 |
+| N4 `/metrics` O(parts) | 수정됨 | merge debt는 merge 워커가, unknown tenant는 retention 워커가 발행. 스크레이프는 읽기만 한다 |
+| N2 테넌트 allowlist | 수정됨 | `LOGGYTRACY_ALLOWED_TENANTS`. 목록 밖 테넌트는 403 |
+| P2-2 메타데이터 가드 | 수정됨 | semaphore·타임아웃·`start`/`end`·`match[]` 개수 상한 |
+| P1-4 writer fencing | 수정됨 | manifest의 `writer_epoch`. 시작 시 claim, 모든 CAS에서 검증, fence 시 self-fence 후 비정상 종료 |
 
 ### P0-1 — 수정 내용
 
@@ -246,6 +252,47 @@ tombstone(`old_dirs`)을 달고 나가므로 커밋은 여전히 한 트랜잭�
 예산을 넘는 설정 문제다. 아울러 retention 전용 그룹은 `meta.json`만 보고 이미 회수된 그룹을
 읽기 전에 걸러낸다.
 
+### N5·P1-8 — 수정 내용
+
+`meta.json`의 `version`은 체크섬 검증 **이전**에 확인한다. 체크섬은 구조체 위에서 계산되므로
+양쪽이 구조체가 무엇인지 합의한 뒤에야 의미가 있고, 순서를 반대로 하면 포맷 변경이 체크섬
+불일치로 보인다 — 그건 버전 차이가 아니라 디스크 고장처럼 읽힌다. manifest는 이미
+`format_version`을 갖고 있었다.
+
+P1-8은 part meta에 `materialized_bytes`(읽었을 때 실제로 차지하는 메모리)를 기록해 해결했다.
+`Row::materialized_bytes` 하나로 계산을 모아 그룹 선택과 읽기 예산이 어긋날 수 없게 했고,
+`estimated_part_bytes`의 `fs::metadata`가 사라져 N4도 함께 가벼워졌다.
+
+### N2·P2-2 — 수정 내용
+
+allowlist 밖 테넌트는 **403**이다. 400이 아닌 이유는 요청 자체는 정상이고 클라이언트가 고칠 것이
+없기 때문이다. 목록을 켜면서 기본 테넌트를 빼놓으면 헤더 없는 요청마다 목록 밖 테넌트가 생기므로
+`validate`가 거절한다.
+
+메타데이터 4종은 `MetadataGuard`를 획득한다. retention floor는 `start_ns`에 접어 넣어
+"클라이언트가 요청한 범위"와 "테넌트가 아직 볼 자격이 있는 범위"를 한 경계(`MetadataWindow`)로
+표현한다. `start`가 없으면 전체 히스토리가 아니라 `max_query_range`만큼만 거슬러 올라간다 —
+무한 기본값이 애초에 전체 part를 읽게 만든 원인이다. 빈 범위는 오류가 아니라 빈 응답이다.
+
+### P1-4 — 수정 내용
+
+`writer_epoch`를 별도 객체가 아니라 manifest 안에 둔 이유는 검사 비용이 0이기 때문이다. 모든
+쓰기는 이미 자기가 대체할 manifest를 읽는다. 시작 시 log·trace 양쪽에 같은 번호를 새기고
+(한쪽만 claim하면 트레이스 쓰기가 fencing되지 않는다), 이후 모든 CAS가 읽어 온 epoch를 검증한다.
+
+fence 감지는 `ObjectStorage`가 `ShutdownState`에 직접 알린다. 워커마다 fencing이 무엇인지 알
+필요 없이 flush·merge·retention·force-flush가 동일하게 반응한다.
+
+**self-fence 동작은 이 작업에서 내린 결정이다.** fence를 만난 force-flush는 재시도를 멈춘다.
+다른 모든 force-flush 실패는 일시적이라 무한 재시도가 옳지만 이것은 아니다 — 계속 돌면
+오케스트레이터가 죽일 때까지 프로세스가 살아 있고, 그 뒤 파드가 다른 노드에 스케줄되면 미flush
+데이터의 유일한 사본을 가진 디스크가 버려진다. M6가 막으려던 손실이 정확히 그 경로로 발생한다.
+종료 코드 1, 데이터는 WAL에 남으며 로그가 디스크 보존을 명시한다.
+
+**운영상의 함의:** 새 인스턴스는 시작 즉시 epoch를 claim한다. 따라서 M6 절차의 "구 인스턴스를
+완전히 drain한 뒤 신 인스턴스를 띄운다"가 이제 **강제**된다. 순서를 어기면 구 인스턴스는 조용히
+망가지는 대신 즉시 멈추고 비정상 종료한다.
+
 나머지는 `todo.md`에 남긴다.
 
 ---
@@ -258,20 +305,20 @@ tombstone(`old_dirs`)을 달고 나가므로 커밋은 여전히 한 트랜잭�
 - [x] P0-2 ingest backpressure (memtable/WAL backlog 상한 → 429)
 - [x] N1(a) merge 메모리 초과 시 분할 fallback (테넌트 삭제 보장)
 - [x] N1(b) 저장된 정책이 있는데 토큰이 없으면 부팅 실패
-- [ ] P1-4 writer fencing (manifest epoch/lease + self-fence)
-- [ ] P1-8 `merge_max_input_bytes`(압축) vs `merge_max_memory_bytes`(비압축) 단위 통일
+- [x] P1-4 writer fencing (manifest epoch + self-fence)
+- [x] P1-8 `merge_max_input_bytes` vs `merge_max_memory_bytes` 단위 통일
 
 ### 게이트 2 — 테넌시 마무리
 
-- [ ] N2 테넌트 allowlist
+- [x] N2 테넌트 allowlist
 - [ ] 테넌트별 스로틀·quota·`max_streams_per_user`, 테넌트 라벨 metrics
-- [ ] P2-2 메타데이터 엔드포인트 리소스 가드 + `start`/`end` 반영
-- [ ] N4 `/metrics` O(parts) 제거
+- [x] P2-2 메타데이터 엔드포인트 리소스 가드 + `start`/`end` 반영
+- [x] N4 `/metrics` O(parts) 제거
 - [ ] 기본 바인드를 신뢰 경계에 맞게 조정
 
 ### 게이트 3 — 운영 가능성
 
-- [ ] N5 part 포맷 버전 필드
+- [x] N5 part 포맷 버전 필드
 - [ ] P1-10 시작 시 일시 장애 재시도 (crash loop 제거)
 - [ ] P2-7 히스토그램 + 엔드포인트 라벨
 - [ ] P2-8 stdin 아닌 abort 경로
