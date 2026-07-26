@@ -198,25 +198,29 @@ async fn retention_once_at(
     let mut removed_trace_ids = Vec::new();
     {
         let _guard = registry.operation_lock().write_owned().await;
-        for (descriptor, dir) in &log_parts {
-            let still_active = registry
+        // One snapshot per registry, not one per candidate. This runs under the
+        // exclusive lifecycle lock, so a scan per candidate stalls flush, merge
+        // and queries for as long as the whole batch takes.
+        let active_log_dirs: std::collections::HashMap<String, std::path::PathBuf> = registry
+            .snapshot()
+            .into_iter()
+            .map(|reader| (reader.meta().id.clone(), reader.part().dir.clone()))
+            .collect();
+        let active_trace_dirs: std::collections::HashMap<String, std::path::PathBuf> =
+            trace_registry
                 .snapshot()
                 .into_iter()
-                .find(|reader| reader.meta().id == descriptor.id)
-                .is_some_and(|reader| reader.part().dir == *dir);
-            if still_active {
+                .map(|reader| (reader.part().meta.id.clone(), reader.part().dir.clone()))
+                .collect();
+        for (descriptor, dir) in &log_parts {
+            if active_log_dirs.get(&descriptor.id) == Some(dir) {
                 part::remove_part_dirs(std::slice::from_ref(dir))?;
                 removed_log_ids.push(descriptor.id.clone());
                 removed += 1;
             }
         }
         for (descriptor, dir) in &trace_parts {
-            let still_active = trace_registry
-                .snapshot()
-                .into_iter()
-                .find(|reader| reader.part().meta.id == descriptor.id)
-                .is_some_and(|reader| reader.part().dir == *dir);
-            if still_active {
+            if active_trace_dirs.get(&descriptor.id) == Some(dir) {
                 part::remove_part_dirs(std::slice::from_ref(dir))?;
                 removed_trace_ids.push(descriptor.id.clone());
                 removed += 1;

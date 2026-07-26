@@ -26,6 +26,17 @@ impl PartRegistry {
         self.operation_lock.clone()
     }
 
+    /// Every tenant that owns a segment in some part. Visits under the read
+    /// guard instead of going through `snapshot`, which would clone one `Arc`
+    /// per part; `/metrics` asks for this on every scrape.
+    pub fn visit_tenants(&self, mut visit: impl FnMut(&TenantId)) {
+        for reader in self.inner.read().unwrap().values() {
+            for segment in &reader.meta().tenants {
+                visit(&segment.tenant);
+            }
+        }
+    }
+
     pub fn load_from_disk(parts_root: &Path) -> Result<Self, String> {
         let registry = Self::new();
         registry.reload_from_disk(parts_root)?;

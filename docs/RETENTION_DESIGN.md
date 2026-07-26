@@ -101,6 +101,41 @@ design exists to avoid — plus durable job records reconciled across restarts.
 Best-effort retention needs none of that. Revisit only if a completion
 guarantee becomes a product requirement.
 
+### Rejected: an instance-side maximum
+
+`LOGGYTRACY_MAX_TENANT_RETENTION` capped every pushed value at a duration the
+operator set. It has been removed; this section is why.
+
+The cap was applied where the value was read, which structurally could only
+reach tenants that *had* a policy. A tenant the control plane never mentioned
+has no entry to clamp, so it kept everything. With the cap at `30d` that
+produced:
+
+| What the control plane said | Result |
+|---|---|
+| nothing at all | kept forever |
+| `"infinite"` — keep this forever | **deleted after 30 days** |
+
+**Asking for preservation cost data that staying silent would have kept.** That
+inverts the central safety rule: loggytracy invented a deletion nobody
+requested, from an instruction that said the opposite. It was also invisible —
+`GET` returned `"infinite"`, and `tenant_policy_infinite_tenants` counted the
+tenant as infinite, because both reported what was pushed rather than what was
+applied.
+
+Fixing the inversion the other way — clamping unknown tenants too — was
+rejected because it means the instance deleting data for tenants the control
+plane has never mentioned, which is the one thing this design refuses to do.
+Rejecting an over-long push with a `400` was rejected as a second authority on
+plans: the control plane already decides retention, and a value it cannot push
+is a plan it cannot sell.
+
+So the cap is gone and the control plane is the sole authority. Note that no
+guarantee was lost: a real "nothing on this box outlives *n*" bound never
+existed, because unknown tenants always bypassed it. If such a bound is ever
+needed it belongs in the control plane, which knows every tenant, rather than in
+an instance that only knows the ones it was told about.
+
 ## Decision
 
 **The control plane pushes one tenant's retention at a time. loggytracy
@@ -199,7 +234,9 @@ The request body is untrusted input.
   (`tenant.rs`). A malformed id is a `400`, never propagated into a path.
 - A malformed retention value is a `400`. Nothing partial can be stored, because
   one request carries one tenant.
-- Values are clamped to `LOGGYTRACY_MAX_TENANT_RETENTION` when set.
+- A well-formed value is applied exactly as sent. **Nothing caps, rounds or
+  otherwise reinterprets it** —
+  see [Rejected: an instance-side maximum](#rejected-an-instance-side-maximum).
 - The bearer token is compared in constant time. With no token configured the
   routes are not mounted at all.
 
@@ -295,18 +332,40 @@ and no job to track.
 
 Zero retention puts the cutoff at *now*, so:
 
-- every query for that tenant returns empty from the next request onward;
+- every query for that tenant returns empty from the next request onward, logs
+  and traces alike;
 - parts holding only that tenant are deleted whole on the next retention tick;
-- shared parts drop the tenant's rows the next time merge rewrites them.
+- shared **log** parts drop the tenant's rows the next time merge rewrites them.
 
 Because reclamation is best-effort, the last point would otherwise carry no
 bound at all — rows can survive in a large part indefinitely. So that the word
 *deletion* means something, **a tenant at zero retention ignores
-`retention_rewrite_threshold`**: any part still holding rows for it is eligible
-for rewrite regardless of the expired fraction. That turns "never" into "the
-next few merge ticks" without introducing job tracking.
+`retention_rewrite_threshold`**: any log part still holding rows for it is
+eligible for rewrite regardless of the expired fraction. That turns "never" into
+"the next few merge ticks" without introducing job tracking.
 
-It is still not a compliance-grade guarantee. loggytracy does not report when
+### What zero retention does not do
+
+Two limits, stated here because *deletion* is the operation whose expectations
+run furthest ahead of what this design delivers.
+
+**Shared trace parts are not rewritten, so the spans stay.** There is no trace
+merge (`Cutoffs::holds_zero_retention_rows` has exactly one caller,
+`merge/selection.rs`), so the bound above has no vehicle on the trace side. A
+trace part is deleted only once *every* tenant in it has expired — so if it also
+holds a tenant that is unknown or infinite, the deleted tenant's spans stay
+indefinitely. They are invisible to every Tempo handler from the next request
+onward, but the bytes are there. Closing this needs either a trace rewrite path
+or trace parts that are not shared across tenants; neither is built.
+
+**Ingest is not blocked.** The write path deliberately never consults a policy —
+that is what keeps retention off the hot path — so a deleted tenant that keeps
+sending is still accepted and still journalled. Its data is invisible
+immediately and reclaimed by the next tick or two, but "deleted" describes the
+data on disk, not the tenant's ability to write. Refusing the writes is a
+control-plane or gateway concern.
+
+Neither limit is a compliance-grade guarantee, and loggytracy never reports that
 the last byte is gone; see the rejected design above for what that would cost.
 
 `DELETE` on the policy endpoint is **not** tenant deletion. It returns the
@@ -324,15 +383,19 @@ table: "Trace part format — done"). Everything above applies symmetrically via
 | Variable | Default | Meaning |
 |---|---|---|
 | `LOGGYTRACY_TENANT_POLICY_TOKEN` | unset | Bearer token for the admin routes. Unset disables per-tenant retention entirely and the routes are not mounted. |
-| `LOGGYTRACY_MAX_TENANT_RETENTION` | unset | Clamp on any pushed value, applied where the value is read rather than where it is stored. |
 | `LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` | 0.5 | Expired-row fraction that forces a rewrite. Ignored for tenants at zero retention. |
 
 Checked in `config.rs` `validate` alongside the other retention settings.
+
+There is deliberately **no setting that bounds a pushed value.** The control
+plane is the sole authority on retention; see
+[Rejected: an instance-side maximum](#rejected-an-instance-side-maximum).
 
 Removed with the polling loop: `LOGGYTRACY_TENANT_POLICY_URL`,
 `..._INTERVAL`, `..._TIMEOUT`, `..._AUTH_HEADER`, `..._MAX_BYTES`. The
 direct `reqwest` dependency went with them: the only HTTP client left in the
 process is the one `object_store` uses to reach the bucket.
+`LOGGYTRACY_MAX_TENANT_RETENTION` is gone too, for a different reason.
 
 ## Metrics
 
@@ -358,10 +421,22 @@ M7):
   exists: with an empty map there is no newest push and it reads zero, so an
   alert on it must be paired with `known_tenants > 0`. The "never pushed at
   all" state belongs to `unknown_tenants`, not to this gauge.
-- `retention_expired_rows_dropped`, `retention_parts_rewritten`,
-  `retention_rewrite_skipped` (retention-only merge groups that could not be
-  read; a number that keeps rising means a part is permanently too large for
+- `retention_expired_rows_dropped` (every expired row a merge dropped, whatever
+  selected the group), `retention_parts_rewritten` (inputs of groups **only**
+  retention would have selected — the extra I/O retention is paying for, which
+  is why a size-driven merge that happens to drop expired rows is not counted
+  here), `retention_rewrite_skipped` (retention-only merge groups that could not
+  be read; a number that keeps rising means a part is permanently too large for
   `merge_max_memory_bytes`)
+- `merge_inputs_changed` (merge groups abandoned because another writer replaced
+  their inputs first — normally retention retiring an expired part). Benign on
+  its own: nothing was written and the next tick sees the new state. It is
+  counted rather than only logged because a number that keeps rising while
+  `merge_success` makes no progress is the one way to see the registry failing to
+  converge on the manifest.
+- `loggytracy_merge_debt_parts` counts both kinds of pending merge work, ordinary
+  groups and retention-forced ones, so retention backlog is visible before it
+  turns into `retention_rewrite_skipped`.
 
 `/metrics` stays operator-facing and process-wide; no tenant labels here (see
 `MULTI_TENANCY_DESIGN.md`, "Implementation status").
@@ -377,6 +452,8 @@ M7):
 | Tenant never pushed | Kept forever. Visible via `tenant_policy_unknown_tenants`. |
 | Control plane stops pushing | The last pushed policies stay in force forever. See [Accepted risks](#accepted-risks). |
 | Retention shortened (downgrade) | Query clamp effective on the next request; bytes reclaimed at the next merge. |
+| Tenant deleted (`retention: "0"`) | Invisible immediately. Log bytes reclaimed within a few merge ticks; spans in a shared trace part may stay indefinitely, and ingest keeps being accepted. See [What zero retention does not do](#what-zero-retention-does-not-do). |
+| Retention retires a part while merge is publishing it | The manifest CAS refuses the replacement, merge discards its own output and retries next tick. Counted in `merge_inputs_changed`; neither the store nor merge is marked unhealthy. |
 | Retention lengthened (upgrade) | Effective immediately for everything still on disk. |
 | Data already deleted before an upgrade | Gone. Retention lengthening cannot resurrect bytes — documented product behaviour. |
 | Upgrade push delayed or lost | Data keeps being deleted at the old, shorter retention meanwhile. See [Accepted risks](#accepted-risks). |
@@ -423,8 +500,7 @@ so such a gate would have nothing to measure.
 ### Already implemented, keep unchanged
 
 - [x] `src/tenant_policy.rs` — `TenantRetention` (`Finite(Duration)` /
-      `Infinite`), `Cutoffs`, duration parsing, `TenantId` re-validation,
-      clamping.
+      `Infinite`), `Cutoffs`, duration parsing, `TenantId` re-validation.
 - [x] `retention.rs` — per-tenant cutoff from segments; whole-part deletion
       keeps the existing path.
 - [x] `merge/scheduler.rs`, `merge/selection.rs` — `select_groups` admits parts
@@ -475,8 +551,12 @@ so such a gate would have nothing to measure.
       that tenant merge-eligible regardless of the threshold
 - [x] an unauthenticated or wrong-token push changes nothing
 - [x] a malformed tenant id or retention value is a `400` and stores nothing
-- [x] `LOGGYTRACY_MAX_TENANT_RETENTION` still clamps a pushed value
+- [x] a pushed value is reported and enforced exactly as sent, and an explicit
+      `infinite` keeps exactly as much as never being pushed
 - [x] setting both `RETENTION_PERIOD` and the token fails validation
+- [x] a merge whose inputs another writer replaced first is skipped, not
+      reported as a store failure, and `PartRegistry::replace` tolerates an
+      input already retired
 
 ### Three calls the intake design left open
 
@@ -486,11 +566,9 @@ but it also means two concurrent pushes for the *same* tenant could land in the
 store in one order and in the in-memory map in the other. A `tokio::sync::Mutex`
 covers the write and the swap together. Pushes are rare, so the cost is nil.
 
-**The maximum is applied on read, not on write.** The pushed string is stored
-verbatim and `LOGGYTRACY_MAX_TENANT_RETENTION` is applied wherever the value is
-used. Raising the maximum therefore takes effect without the control plane
-re-pushing every tenant, and a `GET` returns what was actually sent rather than
-what this instance decided to keep.
+**The pushed string is stored verbatim and applied verbatim.** A `GET` returns
+what was sent because that is also what is in force. The instance-side maximum
+that used to sit between the two is [gone](#rejected-an-instance-side-maximum).
 
 **A push is accepted while draining.** Ingest is rejected during shutdown, but a
 policy is not data this instance owns — it goes to the object store, which the
@@ -499,7 +577,7 @@ look like a control-plane outage.
 
 ## What the implementation settled that the design left open
 
-Five points where the deletion side had to make a call the design did not spell
+Six points where the deletion side had to make a call the design did not spell
 out. All of them survive the move to push intake.
 
 **A retention batch is not a replacement, and the manifest must know it.** Both
@@ -521,6 +599,29 @@ manifest write lands, rather than after both. A part that is absent from the
 manifest but still advertised by the registry is only serviceable until the
 orphan collector's grace period passes and its objects are deleted, so the
 window where a failure can produce one is kept to a single manifest operation.
+
+**Merge's commit point is the publish, and the two writers now overlap on
+purpose.** `select_groups` deliberately picks the parts retention cares about,
+so retention retiring a part while merge is mid-replacement stops being an
+accident and becomes routine. Two consequences had to be handled.
+
+A merge that finds its inputs already replaced is not a failure. The CAS refuses
+the replacement precisely so two outputs cannot both survive, and nothing was
+written — the same benign situation merge already detects *before* publishing
+and skips with a debug line. Treating the later detection as a store error
+marked the object store unhealthy and dropped `merge_healthy`, taking `/ready`
+to 503 for a tick over a race that cost nothing. It is now skipped and counted
+in `merge_inputs_changed`.
+
+And past a successful publish the replacement is committed: the manifest lists
+the output and no longer lists the inputs. Re-checking the registry there and
+discarding the output on a miss — which is what the code did, duplicating the
+pre-publish check — left the merged part in the manifest but in no registry
+while a stale input stayed registered and *absent* from the manifest, which is
+exactly the unserviceable state the paragraph above works to avoid. The check now
+runs only while the transaction is still abandonable. `PartRegistry::replace`
+already ignores ids that are gone, so reconciling to the manifest is the
+one-line path.
 
 **Retention does not mark; merge decides.** The design has retention flag a
 part as merge-eligible. The code has `merge_once` derive that itself from the
@@ -552,6 +653,11 @@ floor leaves the results whole rather than appearing shortened. That is the
 range semantics Tempo already has, and it errs toward hiding. All four are
 covered in `tempo/tests.rs`. `TraceTenantSegment` also carries no timestamps,
 so a segment's bound is taken from the `row_group_max_ts` entries it owns.
+
+This is also the reason `retention: "0"` cannot bound reclamation on the trace
+side, which the deletion section states outright rather than leaving to be
+inferred from here — see
+[What zero retention does not do](#what-zero-retention-does-not-do).
 
 **Label endpoints clamp at part granularity.** `labels`, `label_values`,
 `series` and `index_stats` have no range to clamp, so they take the floor

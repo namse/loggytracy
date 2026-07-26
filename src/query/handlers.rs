@@ -414,7 +414,12 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
         .unwrap_or(0);
     let checkpoint = crate::journal::read_checkpoint(state.journal.ckpt_path()).unwrap_or(0);
     let wal_backlog_bytes = wal_bytes.saturating_sub(checkpoint);
-    let merge_debt_parts = crate::merge::merge_debt_part_count(&state.parts, &state.config);
+    let merge_debt_cutoffs = state.tenant_policy.cutoffs_now();
+    let merge_debt_parts = crate::merge::merge_debt_part_count(
+        &state.parts,
+        &state.config,
+        merge_debt_cutoffs.as_ref(),
+    );
     let policy = tenant_policy_gauges(&state);
     let m = &state.metrics;
     format!(
@@ -450,6 +455,8 @@ loggytracy_flush_errors_total {}\n\
 loggytracy_merge_success_total {}\n\
 # TYPE loggytracy_merge_errors_total counter\n\
 loggytracy_merge_errors_total {}\n\
+# TYPE loggytracy_merge_inputs_changed_total counter\n\
+loggytracy_merge_inputs_changed_total {}\n\
 # TYPE loggytracy_retention_success_total counter\n\
 loggytracy_retention_success_total {}\n\
 # TYPE loggytracy_retention_errors_total counter\n\
@@ -516,6 +523,7 @@ loggytracy_force_flush_complete {}\n",
         m.flush_errors.load(Ordering::Relaxed),
         m.merge_success.load(Ordering::Relaxed),
         m.merge_errors.load(Ordering::Relaxed),
+        m.merge_inputs_changed.load(Ordering::Relaxed),
         m.retention_success.load(Ordering::Relaxed),
         m.retention_errors.load(Ordering::Relaxed),
         m.retention_expired_rows_dropped.load(Ordering::Relaxed),
@@ -587,21 +595,15 @@ fn tenant_policy_gauges(state: &AppState) -> TenantPolicyGauges {
     };
     let mut unknown: std::collections::BTreeSet<crate::tenant::TenantId> =
         std::collections::BTreeSet::new();
+    // Clones only the ids that turn out to be unknown, which is the rare case;
+    // a known tenant costs one map lookup.
     let mut note = |tenant: &crate::tenant::TenantId| {
         if snapshot.retention(tenant).is_none() {
             unknown.insert(tenant.clone());
         }
     };
-    for reader in state.parts.snapshot() {
-        for segment in &reader.meta().tenants {
-            note(&segment.tenant);
-        }
-    }
-    for reader in state.trace_parts.snapshot() {
-        for segment in &reader.part().meta.tenants {
-            note(&segment.tenant);
-        }
-    }
+    state.parts.visit_tenants(&mut note);
+    state.trace_parts.visit_tenants(&mut note);
     for tenant in state.memtable.tenants() {
         note(&tenant);
     }

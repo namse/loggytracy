@@ -27,22 +27,11 @@ pub enum TenantRetention {
     Infinite,
 }
 
-impl TenantRetention {
-    fn clamped(self, maximum: Option<Duration>) -> Self {
-        match (self, maximum) {
-            (Self::Finite(period), Some(maximum)) => Self::Finite(period.min(maximum)),
-            (Self::Infinite, Some(maximum)) => Self::Finite(maximum),
-            (retention, None) => retention,
-        }
-    }
-}
-
 /// What the control plane pushed for one tenant.
 ///
-/// The raw string is kept as it arrived, and `max_tenant_retention` is applied
-/// when the value is read rather than when it is stored: raising the clamp then
-/// takes effect without the control plane having to re-push every tenant, and a
-/// `GET` returns the value that was actually sent.
+/// The raw string is kept as it arrived so a `GET` returns what was sent. The
+/// control plane is the only authority on retention: nothing here rewrites,
+/// caps or otherwise reinterprets the value it pushed.
 #[derive(Clone)]
 struct PolicyEntry {
     retention: TenantRetention,
@@ -59,14 +48,11 @@ pub struct PolicyView {
 /// Every policy this instance knows, read by queries, retention and merge.
 pub struct PolicyMap {
     entries: BTreeMap<TenantId, PolicyEntry>,
-    max_retention: Option<Duration>,
 }
 
 impl PolicyMap {
     pub fn retention(&self, tenant: &TenantId) -> Option<TenantRetention> {
-        self.entries
-            .get(tenant)
-            .map(|entry| entry.retention.clamped(self.max_retention))
+        self.entries.get(tenant).map(|entry| entry.retention)
     }
 
     pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
@@ -80,8 +66,6 @@ impl PolicyMap {
         self.entries.len()
     }
 
-    /// Counts what the control plane said, not what the clamp turned it into,
-    /// so an operator can still tell an explicit `infinite` from a finite plan.
     pub fn infinite_tenant_count(&self) -> usize {
         self.entries
             .values()
@@ -402,7 +386,6 @@ fn read_local_policies(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 /// forever — loggytracy never invents a deletion.
 pub struct TenantPolicy {
     store: Option<PolicyStore>,
-    max_retention: Option<Duration>,
     policies: RwLock<Arc<PolicyMap>>,
     /// Serializes a write with the map swap that follows it. Two pushes for the
     /// same tenant are blind writes, so without this the store and the in-memory
@@ -415,21 +398,13 @@ impl TenantPolicy {
     /// A policy that is switched off: every tenant keeps everything, and the
     /// admin routes are not mounted.
     pub fn disabled() -> Self {
-        Self::with_entries(None, None, BTreeMap::new())
+        Self::with_entries(None, BTreeMap::new())
     }
 
-    fn with_entries(
-        store: Option<PolicyStore>,
-        max_retention: Option<Duration>,
-        entries: BTreeMap<TenantId, PolicyEntry>,
-    ) -> Self {
+    fn with_entries(store: Option<PolicyStore>, entries: BTreeMap<TenantId, PolicyEntry>) -> Self {
         Self {
             store,
-            max_retention,
-            policies: RwLock::new(Arc::new(PolicyMap {
-                entries,
-                max_retention,
-            })),
+            policies: RwLock::new(Arc::new(PolicyMap { entries })),
             write_lock: tokio::sync::Mutex::new(()),
             metrics: TenantPolicyMetrics::default(),
         }
@@ -453,11 +428,7 @@ impl TenantPolicy {
             tenants = entries.len(),
             "loaded per-tenant retention policies"
         );
-        Ok(Self::with_entries(
-            Some(store),
-            config.max_tenant_retention,
-            entries,
-        ))
+        Ok(Self::with_entries(Some(store), entries))
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -512,13 +483,17 @@ impl TenantPolicy {
             }
         };
         let raw = raw.trim().to_string();
+
+        // Stamped under the lock, not on arrival: two concurrent pushes for the
+        // same tenant commit in lock order, and a timestamp taken before the
+        // wait could let the one that commits last store the older `updated_at`
+        // and walk the push age backwards.
+        let _guard = self.write_lock.lock().await;
         let updated_at = SystemTime::now();
         let document = PolicyDocument {
             retention: raw.clone(),
             updated_at: format_timestamp(updated_at),
         };
-
-        let _guard = self.write_lock.lock().await;
         if let Err(error) = store.put(tenant, &document).await {
             self.metrics
                 .push_persist_errors
@@ -580,10 +555,7 @@ impl TenantPolicy {
         let mut policies = self.policies.write().unwrap();
         let mut entries = policies.entries.clone();
         change(&mut entries);
-        *policies = Arc::new(PolicyMap {
-            entries,
-            max_retention: self.max_retention,
-        });
+        *policies = Arc::new(PolicyMap { entries });
     }
 
     #[cfg(test)]
@@ -611,23 +583,18 @@ impl TenantPolicy {
     pub fn enabled_for_test() -> Self {
         Self::with_entries(
             Some(PolicyStore::Remote(Arc::new(ObjectStorage::in_memory()))),
-            None,
             BTreeMap::new(),
         )
     }
 
     #[cfg(test)]
-    pub fn for_test_with_store(store: Arc<ObjectStorage>, max_retention: Option<Duration>) -> Self {
-        Self::with_entries(
-            Some(PolicyStore::Remote(store)),
-            max_retention,
-            BTreeMap::new(),
-        )
+    pub fn for_test_with_store(store: Arc<ObjectStorage>) -> Self {
+        Self::with_entries(Some(PolicyStore::Remote(store)), BTreeMap::new())
     }
 
     #[cfg(test)]
     pub fn for_test_with_local_store(root: PathBuf) -> Self {
-        Self::with_entries(Some(PolicyStore::Local(root)), None, BTreeMap::new())
+        Self::with_entries(Some(PolicyStore::Local(root)), BTreeMap::new())
     }
 }
 
@@ -754,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn a_push_is_durable_and_survives_a_restart() {
         let storage = Arc::new(ObjectStorage::in_memory());
-        let policy = TenantPolicy::for_test_with_store(storage.clone(), None);
+        let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy.push(&tenant("acme"), "30d").await.unwrap();
         policy.push(&tenant("intern"), "infinite").await.unwrap();
         // A downgrade taken before the restart must still be in force after it.
@@ -856,7 +823,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_store_changes_neither_the_map_nor_the_object() {
         let storage = Arc::new(ObjectStorage::in_memory());
-        let policy = TenantPolicy::for_test_with_store(storage.clone(), None);
+        let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy.push(&tenant("acme"), "30d").await.unwrap();
 
         // A malformed value is rejected before anything is written.
@@ -876,7 +843,7 @@ mod tests {
     #[tokio::test]
     async fn a_delete_returns_the_tenant_to_unknown() {
         let storage = Arc::new(ObjectStorage::in_memory());
-        let policy = TenantPolicy::for_test_with_store(storage.clone(), None);
+        let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy.push(&tenant("acme"), "1ms").await.unwrap();
         assert!(policy.query_floor_ns(&tenant("acme")).is_some());
 
@@ -891,26 +858,37 @@ mod tests {
         policy.remove(&tenant("hobby")).await.unwrap();
     }
 
+    /// The control plane is the only authority on retention. A pushed value is
+    /// applied exactly as sent, and the two ways of saying "keep forever" —
+    /// an explicit `infinite` and never having been pushed — must produce the
+    /// same retention, or asking for preservation would cost data that staying
+    /// silent would have kept.
     #[tokio::test]
-    async fn the_maximum_clamps_a_pushed_value_without_rewriting_it() {
+    async fn nothing_reinterprets_a_pushed_value() {
         let storage = Arc::new(ObjectStorage::in_memory());
-        let policy = TenantPolicy::for_test_with_store(storage, Some(days(7)));
-        policy.push(&tenant("acme"), "30d").await.unwrap();
+        let policy = TenantPolicy::for_test_with_store(storage);
+        policy.push(&tenant("acme"), "3650d").await.unwrap();
         policy.push(&tenant("intern"), "infinite").await.unwrap();
 
         let map = policy.snapshot().unwrap();
         assert_eq!(
             map.retention(&tenant("acme")),
-            Some(TenantRetention::Finite(days(7)))
+            Some(TenantRetention::Finite(days(3650))),
+            "a long finite plan is honoured as sent"
         );
+        assert_eq!(map.view(&tenant("acme")).unwrap().retention, "3650d");
         assert_eq!(
             map.retention(&tenant("intern")),
-            Some(TenantRetention::Finite(days(7)))
+            Some(TenantRetention::Infinite)
         );
-        // The clamp applies on read, so the pushed value is reported as sent
-        // and a raised maximum takes effect without a re-push.
-        assert_eq!(map.view(&tenant("acme")).unwrap().retention, "30d");
         assert_eq!(map.infinite_tenant_count(), 1);
+
+        let cutoffs = policy.cutoffs_at(1_000).unwrap();
+        assert_eq!(
+            cutoffs.cutoff_ns(&tenant("intern")),
+            cutoffs.cutoff_ns(&tenant("never_pushed")),
+            "an explicit infinite keeps exactly as much as never being pushed"
+        );
     }
 
     fn tempdir(label: &str) -> PathBuf {

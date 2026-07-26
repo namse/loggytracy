@@ -55,7 +55,6 @@ pub struct Config {
     /// are the sole authority. Setting both is a validation error rather than a
     /// silently ignored setting.
     pub tenant_policy_token: Option<String>,
-    pub max_tenant_retention: Option<Duration>,
     /// Expired share of a part's rows that justifies one rewrite through
     /// merge. Below it the rows stay on disk, already invisible to queries.
     pub retention_rewrite_threshold: f64,
@@ -121,7 +120,6 @@ impl Default for Config {
             retention_grace_period: Duration::from_secs(60 * 60),
             max_retention_runtime: Duration::from_secs(120),
             tenant_policy_token: None,
-            max_tenant_retention: None,
             retention_rewrite_threshold: 0.5,
             max_query_range: None,
             max_query_scan_rows: 5_000_000,
@@ -278,7 +276,6 @@ impl Config {
             tenant_policy_token: std::env::var("LOGGYTRACY_TENANT_POLICY_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            max_tenant_retention: env_duration("LOGGYTRACY_MAX_TENANT_RETENTION", None)?,
             retention_rewrite_threshold: env_value(
                 "LOGGYTRACY_RETENTION_REWRITE_THRESHOLD",
                 defaults.retention_rewrite_threshold,
@@ -421,9 +418,6 @@ impl Config {
 exclusive: per-tenant retention replaces the global period"
                     .to_string(),
             );
-        }
-        if let Some(maximum) = self.max_tenant_retention {
-            positive_duration("max_tenant_retention", maximum)?;
         }
         if !self.retention_rewrite_threshold.is_finite()
             || self.retention_rewrite_threshold <= 0.0

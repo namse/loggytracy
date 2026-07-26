@@ -178,8 +178,10 @@ retention 설정이 조용히 무시되는 것이 가장 나쁜 결과이기 때
 - `LOGGYTRACY_TENANT_POLICY_TOKEN` (기본 미설정): 테넌트별 retention. 설정하면
   `PUT/GET/DELETE /loggytracy/api/v1/admin/tenants/{tenant}/retention` 라우트가 열리고,
   push된 정책이 유일한 권위가 된다. 미설정이면 라우트 자체가 없다. 함께 쓰는 값은
-  `LOGGYTRACY_MAX_TENANT_RETENTION` (push된 값의 상한),
   `LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` (기본 0.5 — part를 다시 쓸 만한 만료 행 비율).
+  push된 값을 깎는 설정은 **없다**. 인스턴스가 상한을 걸면 미상 테넌트에는 닿지 않아,
+  "영구 보존"이라고 명시한 테넌트가 아무 말도 없는 테넌트보다 데이터를 덜 갖게 된다
+  (`RETENTION_DESIGN.md`의 "Rejected: an instance-side maximum").
 
 정책은 테넌트당 객체 하나(`tenant_policies/<tenant>.json`)로 저장되고, 저장이 끝난 뒤에만
 `200`을 준다. 실패하면 `503`이고 control plane이 재시도한다. 시작 시 전부 읽어들이며 실패는

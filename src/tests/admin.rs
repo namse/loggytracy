@@ -76,7 +76,7 @@
     #[tokio::test]
     async fn a_push_is_stored_then_readable_and_deletable() {
         let storage = Arc::new(ObjectStorage::in_memory());
-        let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone(), None));
+        let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone()));
         let state = state_with(policy.clone(), Some(TOKEN));
 
         let (status, _) = call(&state, "GET", RETENTION_URI, Some(TOKEN), "").await;
@@ -119,10 +119,9 @@
 
     #[tokio::test]
     async fn a_failing_store_returns_503_and_applies_nothing() {
-        let policy = Arc::new(TenantPolicy::for_test_with_store(
-            Arc::new(ObjectStorage::in_memory_with_failing_writes()),
-            None,
-        ));
+        let policy = Arc::new(TenantPolicy::for_test_with_store(Arc::new(
+            ObjectStorage::in_memory_with_failing_writes(),
+        )));
         let state = state_with(policy.clone(), Some(TOKEN));
 
         let (status, _) = call(
@@ -158,7 +157,7 @@
     #[tokio::test]
     async fn an_unauthenticated_or_wrong_token_push_changes_nothing() {
         let storage = Arc::new(ObjectStorage::in_memory());
-        let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone(), None));
+        let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone()));
         let state = state_with(policy.clone(), Some(TOKEN));
 
         for token in [None, Some("wrong"), Some("control-plane-secre")] {
@@ -173,7 +172,7 @@
     #[tokio::test]
     async fn a_malformed_tenant_or_value_is_a_400_and_stores_nothing() {
         let storage = Arc::new(ObjectStorage::in_memory());
-        let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone(), None));
+        let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone()));
         let state = state_with(policy, Some(TOKEN));
 
         let (status, _) = call(
@@ -213,12 +212,14 @@
         }
     }
 
+    /// A pushed value is applied exactly as sent. The instance has no setting
+    /// that caps or rewrites it, so what a `GET` reports and what the query
+    /// floor enforces can never disagree.
     #[tokio::test]
-    async fn the_configured_maximum_still_clamps_a_pushed_value() {
-        let policy = Arc::new(TenantPolicy::for_test_with_store(
-            Arc::new(ObjectStorage::in_memory()),
-            Some(std::time::Duration::from_secs(7 * 24 * 60 * 60)),
-        ));
+    async fn a_pushed_value_is_reported_and_enforced_as_sent() {
+        let policy = Arc::new(TenantPolicy::for_test_with_store(Arc::new(
+            ObjectStorage::in_memory(),
+        )));
         let state = state_with(policy.clone(), Some(TOKEN));
 
         let (status, body) = call(
@@ -230,16 +231,71 @@
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        // Reported as pushed, applied as clamped.
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).unwrap()["retention"],
             "30d"
         );
         let floor_ns = policy.query_floor_ns(&tenant("acme")).unwrap();
-        let seven_days_ns = 7 * 24 * 60 * 60 * 1_000_000_000i64;
+        let thirty_days_ns = 30 * 24 * 60 * 60 * 1_000_000_000i64;
         let elapsed = crate::tenant_policy::now_ns() - floor_ns;
         assert!(
-            (elapsed - seven_days_ns).abs() < 1_000_000_000,
-            "the maximum clamps the effective retention to seven days"
+            (elapsed - thirty_days_ns).abs() < 1_000_000_000,
+            "the pushed thirty days is what the query floor enforces"
         );
     }
+
+    /// Asking for preservation must never cost data that staying silent would
+    /// have kept: an explicit `infinite` and a tenant the control plane has
+    /// never mentioned both leave queries unclamped.
+    #[tokio::test]
+    async fn an_explicit_infinite_keeps_as_much_as_never_being_pushed() {
+        let policy = Arc::new(TenantPolicy::for_test_with_store(Arc::new(
+            ObjectStorage::in_memory(),
+        )));
+        let state = state_with(policy.clone(), Some(TOKEN));
+
+        let (status, _) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            Some(TOKEN),
+            r#"{"retention":"infinite"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(policy.query_floor_ns(&tenant("acme")), None);
+        assert_eq!(policy.query_floor_ns(&tenant("never-pushed")), None);
+    }
+
+    /// `/metrics` is one positional `format!` over roughly forty-five counters,
+    /// so a name and a value can drift apart without the compiler noticing. Give
+    /// three of them distinct values and check each lands on its own line.
+    #[tokio::test]
+    async fn every_metric_name_carries_its_own_value() {
+        let policy = Arc::new(TenantPolicy::for_test_with_store(Arc::new(
+            ObjectStorage::in_memory(),
+        )));
+        let state = state_with(policy.clone(), Some(TOKEN));
+        use std::sync::atomic::Ordering;
+        state.metrics.merge_errors.store(11, Ordering::Relaxed);
+        state
+            .metrics
+            .merge_inputs_changed
+            .store(22, Ordering::Relaxed);
+        state.metrics.retention_success.store(33, Ordering::Relaxed);
+        policy.record_unauthorized();
+
+        let body = crate::query::metrics(axum::extract::State(state.clone())).await;
+        for (name, value) in [
+            ("loggytracy_merge_errors_total", "11"),
+            ("loggytracy_merge_inputs_changed_total", "22"),
+            ("loggytracy_retention_success_total", "33"),
+            ("loggytracy_tenant_policy_admin_unauthorized_total", "1"),
+        ] {
+            assert!(
+                body.lines().any(|line| line == format!("{name} {value}")),
+                "{name} should report {value}:\n{body}"
+            );
+        }
+    }
+

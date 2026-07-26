@@ -27,6 +27,17 @@ const TRACE_CATALOG_FILES: [&str; 2] = [TRACE_BLOOM_FILE, TRACE_META_FILE];
 const MAX_CAS_ATTEMPTS: usize = 16;
 const FLUSH_TRANSACTION_FILE: &str = "flush.txn";
 
+/// Prefix of the error `publish` returns when another writer already replaced
+/// the inputs of a replacement. The store is healthy and nothing was written:
+/// the CAS refused precisely so two outputs could not both survive. A caller
+/// must treat it as work skipped and retried on the next tick, never as a store
+/// failure — reporting it as one takes `/ready` to 503 over a benign race.
+pub const INPUTS_CHANGED_ERROR: &str = "manifest replacement conflict";
+
+pub fn is_inputs_changed_error(error: &str) -> bool {
+    error.starts_with(INPUTS_CHANGED_ERROR)
+}
+
 fn normalized_object_store_options<I>(variables: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,

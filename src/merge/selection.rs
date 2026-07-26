@@ -1,8 +1,15 @@
 /// Number of parts currently eligible for but not yet merged: the point-in-time
-/// merge backlog. Mirrors the scheduler's per-partition grouping and counts
-/// members of every group that meets `merge_min_part_count`, so the load report
-/// can attribute backpressure to accumulated small parts.
-pub fn merge_debt_part_count(registry: &PartRegistry, config: &Config) -> usize {
+/// merge backlog. Runs the scheduler's own `select_groups`, so the count covers
+/// both kinds of pending work — small parts accumulating into an ordinary group,
+/// and parts a retention rewrite has made eligible on their own. Counting only
+/// the first left retention-driven backlog invisible to operators, with
+/// `retention_rewrite_skipped` reporting only the rewrites that had already
+/// failed.
+pub fn merge_debt_part_count(
+    registry: &PartRegistry,
+    config: &Config,
+    cutoffs: Option<&Cutoffs>,
+) -> usize {
     let readers = registry.snapshot();
     if readers.is_empty() {
         return 0;
@@ -14,14 +21,11 @@ pub fn merge_debt_part_count(registry: &PartRegistry, config: &Config) -> usize 
             .or_default()
             .push(reader);
     }
-    let min_part_count = config.merge_min_part_count.max(2);
     let mut debt = 0usize;
     for (_partition, mut parts) in by_partition {
         parts.sort_by_key(|reader| reader.meta().row_count);
-        for group in group_for_merge(&parts, config) {
-            if group.len() >= min_part_count {
-                debt += group.len();
-            }
+        for group in select_groups(&parts, config, cutoffs) {
+            debt += group.parts.len();
         }
     }
     debt

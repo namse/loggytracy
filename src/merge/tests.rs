@@ -702,3 +702,201 @@
                 .is_err()
         );
     }
+
+    /// Retention retiring a part while merge is publishing is not a failure of
+    /// the store or of merge. The CAS refuses the replacement precisely so two
+    /// outputs cannot both survive; nothing was written, and the next tick sees
+    /// the new state. Reporting it as a store error took `/ready` to 503 — via
+    /// both `merge_healthy` and the object-store health flag — over a race that
+    /// cost nothing.
+    #[tokio::test]
+    async fn inputs_replaced_while_publishing_is_skipped_not_failed() {
+        let dir = tmp_dir("publish-inputs-changed");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 2,
+            merge_target_part_rows: 1000,
+            merge_max_part_rows: 10000,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+
+        let storage = Arc::new(crate::object_storage::ObjectStorage::in_memory());
+        let registry = Arc::new(PartRegistry::new());
+        let mut ids = Vec::new();
+        for batch in 0..2u64 {
+            let rows = make_rows(10, (batch * 1000) as i64, &format!("b{batch}"));
+            let parts = part::flush_rows(rows, &parts_root, config.row_group_size).unwrap();
+            storage.publish(&parts, &[]).await.unwrap();
+            ids.push(parts[0].meta.id.clone());
+            registry.register(parts).unwrap();
+        }
+        let cache = RemoteCache::new(storage.clone(), parts_root.clone());
+
+        // Retention retires one input from the manifest only. The registry
+        // still advertises it, so merge selects both and gets as far as the
+        // publish before the CAS notices.
+        storage
+            .publish(&[], std::slice::from_ref(&ids[1]))
+            .await
+            .unwrap();
+
+        let metrics = RuntimeMetrics::new();
+        merge_once(
+            &registry,
+            Some(&cache),
+            &config,
+            &TenantPolicy::disabled(),
+            &metrics,
+        )
+        .await
+        .expect("a replaced input is skipped, not reported as a merge failure");
+        assert!(
+            cache.is_remote_healthy(),
+            "the object store answered correctly and must not be marked unhealthy"
+        );
+        assert_eq!(
+            registry.part_count(),
+            2,
+            "the inputs are left for the next tick to re-evaluate"
+        );
+        assert_eq!(
+            metrics.merge_inputs_changed.load(Ordering::Relaxed),
+            1,
+            "skipping quietly must still be countable"
+        );
+    }
+
+    /// The commit point is the successful publish. Past it merge must reconcile
+    /// the registry to the manifest rather than abandon its output, so
+    /// `replace` has to tolerate an input another writer already retired —
+    /// otherwise merge would drop a part the manifest already lists and leave
+    /// the registry serving inputs the manifest no longer has.
+    #[test]
+    fn replace_tolerates_an_input_another_writer_already_retired() {
+        let dir = tmp_dir("replace-retired-input");
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+
+        let registry = PartRegistry::new();
+        let kept = part::flush_rows(make_rows(4, 0, "kept"), &parts_root, 16).unwrap();
+        let kept_id = kept[0].meta.id.clone();
+        registry.register(kept).unwrap();
+        let output = part::flush_rows(make_rows(4, 100, "output"), &parts_root, 16).unwrap();
+        let output_id = output[0].meta.id.clone();
+
+        let new_ids = registry
+            .replace(&[kept_id.clone(), "retired-by-retention".to_string()], output)
+            .expect("an already absent input must not fail the replacement");
+
+        assert_eq!(new_ids, vec![output_id.clone()]);
+        assert_eq!(registry.part_ids(), [output_id].into_iter().collect());
+        assert!(!registry.part_ids().contains(&kept_id));
+    }
+
+    /// `retention_parts_rewritten` answers "how much extra I/O is retention
+    /// paying for". A size-driven merge that happens to drop expired rows on the
+    /// way is I/O that was going to happen anyway, so only the rows belong in
+    /// the count — attributing the parts to retention overstated its cost and
+    /// made the number unusable for sizing.
+    #[tokio::test]
+    async fn an_ordinary_merge_that_drops_expired_rows_is_not_a_retention_rewrite() {
+        let dir = tmp_dir("ordinary-merge-drop");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 2,
+            merge_target_part_rows: 1000,
+            merge_max_part_rows: 10000,
+            retention_period: None,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        // Two parts in one partition reach merge_min_part_count on their own,
+        // so this group exists for size and not for retention. `beta` keeps the
+        // output non-empty; `alpha` has expired many times over.
+        for timestamp_ns in [1_000i64, 1_001] {
+            let parts = part::flush_rows(
+                vec![
+                    tenant_row("alpha", timestamp_ns),
+                    tenant_row("beta", timestamp_ns),
+                ],
+                &parts_root,
+                config.row_group_size,
+            )
+            .unwrap();
+            registry.register(parts).unwrap();
+        }
+        let policy = policy_with(&[(
+            "alpha",
+            crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_nanos(1)),
+        )]);
+        let metrics = RuntimeMetrics::new();
+
+        merge_once(&registry, None, &config, &policy, &metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(registry.part_count(), 1);
+        assert_eq!(
+            metrics
+                .retention_expired_rows_dropped
+                .load(Ordering::Relaxed),
+            2,
+            "the reclaimed rows are still counted"
+        );
+        assert_eq!(
+            metrics.retention_parts_rewritten.load(Ordering::Relaxed),
+            0,
+            "a merge that would have happened anyway is not a retention rewrite"
+        );
+    }
+
+    /// Merge debt is the operator's view of pending merge work. A part that only
+    /// retention would rewrite is pending merge work, so leaving it out hid
+    /// retention backlog entirely: `retention_rewrite_skipped` reports rewrites
+    /// that already failed, and nothing reported the ones still queued.
+    #[tokio::test]
+    async fn merge_debt_counts_a_retention_forced_group() {
+        let dir = tmp_dir("debt-retention-group");
+        let config = Config {
+            data_dir: dir.clone(),
+            // Nothing here can form an ordinary group.
+            merge_min_part_count: 4,
+            retention_period: None,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        let parts = part::flush_rows(
+            vec![
+                tenant_row("alpha", 1_000),
+                tenant_row("alpha", 1_001),
+                tenant_row("beta", 1_002),
+            ],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        registry.register(parts).unwrap();
+
+        assert_eq!(
+            merge_debt_part_count(&registry, &config, None),
+            0,
+            "with no policy there is no debt: the group is below the minimum"
+        );
+
+        let policy = policy_with(&[(
+            "alpha",
+            crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_nanos(1)),
+        )]);
+        let cutoffs = policy.cutoffs_now().unwrap();
+        assert_eq!(
+            merge_debt_part_count(&registry, &config, Some(&cutoffs)),
+            1,
+            "the part two thirds of which has expired is pending merge work"
+        );
+    }

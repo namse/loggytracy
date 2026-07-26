@@ -11,6 +11,13 @@ pub struct RuntimeMetrics {
     pub flush_errors: AtomicU64,
     pub merge_success: AtomicU64,
     pub merge_errors: AtomicU64,
+    /// Merge groups abandoned because another writer replaced their inputs
+    /// first. Benign on its own — retention retiring an expired part races with
+    /// merge by design, nothing was written, and the next tick sees the new
+    /// state. It is counted rather than only logged because a number that keeps
+    /// rising while `merge_success` makes no progress is the one way to see the
+    /// registry failing to converge on the manifest.
+    pub merge_inputs_changed: AtomicU64,
     pub retention_success: AtomicU64,
     pub retention_errors: AtomicU64,
     pub retention_expired_rows_dropped: AtomicU64,
@@ -39,6 +46,7 @@ impl RuntimeMetrics {
             flush_errors: AtomicU64::new(0),
             merge_success: AtomicU64::new(0),
             merge_errors: AtomicU64::new(0),
+            merge_inputs_changed: AtomicU64::new(0),
             retention_success: AtomicU64::new(0),
             retention_errors: AtomicU64::new(0),
             retention_expired_rows_dropped: AtomicU64::new(0),

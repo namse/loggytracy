@@ -359,7 +359,7 @@ impl ObjectStorage {
                 // ids that have only just expired.
                 if !added.is_empty() && present_removed != removed.len() {
                     return Err(format!(
-                        "manifest replacement conflict: expected {} input parts, found {present_removed}",
+                        "{INPUTS_CHANGED_ERROR}: expected {} input parts, found {present_removed}",
                         removed.len()
                     ));
                 }

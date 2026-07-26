@@ -29,6 +29,16 @@ impl TraceRegistry {
         self.operation_lock.clone()
     }
 
+    /// Every tenant that owns a segment in some trace part. See
+    /// `PartRegistry::visit_tenants`.
+    pub fn visit_tenants(&self, mut visit: impl FnMut(&TenantId)) {
+        for reader in self.inner.read().unwrap().values() {
+            for segment in &reader.part().meta.tenants {
+                visit(&segment.tenant);
+            }
+        }
+    }
+
     pub fn load_from_disk(
         traces_root: &Path,
         operation_lock: Arc<tokio::sync::RwLock<()>>,

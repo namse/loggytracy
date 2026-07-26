@@ -247,33 +247,60 @@ async fn merge_once(
                         tracing::debug!(partition = %partition, "merge inputs changed while preparing output");
                         continue;
                     }
+                    let mut manifest_committed = false;
                     if let Some(cache) = remote_cache {
                         let epoch = cache.remote_operation_epoch();
                         if let Err(error) = cache.storage.publish(&new_parts, &old_ids).await {
+                            if let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs) {
+                                tracing::warn!(%cleanup_error, "failed to remove unpublished merged parts");
+                            }
+                            // Inputs replaced under us is the same benign
+                            // situation the pre-publish check catches, only
+                            // noticed later. The store answered correctly and
+                            // nothing was written, so neither it nor merge is
+                            // unhealthy: the next tick sees the new state.
+                            if crate::object_storage::is_inputs_changed_error(&error) {
+                                metrics.merge_inputs_changed.fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(
+                                    partition = %partition,
+                                    "merge inputs were replaced while publishing"
+                                );
+                                continue;
+                            }
                             cache.mark_remote_unhealthy();
                             tracing::error!(
                                 %error,
                                 partition = %partition,
                                 "merged parts could not be published; keeping old parts"
                             );
-                            if let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs) {
-                                tracing::warn!(%cleanup_error, "failed to remove unpublished merged parts");
-                            }
                             errors.push(format!(
                                 "object-store merge publish failed for partition {partition}: {error}"
                             ));
                             continue;
                         }
                         cache.mark_remote_healthy_since(epoch);
+                        manifest_committed = true;
                     }
                     drop(part_guard);
                     let _visibility_guard = registry.operation_lock().write_owned().await;
-                    let active_ids = registry.part_ids();
-                    if old_ids.iter().any(|id| !active_ids.contains(id)) {
-                        if let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs) {
-                            tracing::warn!(%cleanup_error, "failed to clean merge output after final input replacement");
+                    // Only re-check while the replacement is still abandonable.
+                    // A successful publish is the commit point: the manifest
+                    // already lists the output and no longer lists the inputs,
+                    // and it only accepted the CAS because every input was
+                    // still present, so no other writer replaced them. Once
+                    // past it, discarding the output would leave the registry
+                    // serving inputs the manifest has dropped — whose objects
+                    // the orphan collector deletes after the grace period.
+                    // `replace` ignores ids that are already gone, so
+                    // retention retiring an input concurrently is harmless.
+                    if !manifest_committed {
+                        let active_ids = registry.part_ids();
+                        if old_ids.iter().any(|id| !active_ids.contains(id)) {
+                            if let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs) {
+                                tracing::warn!(%cleanup_error, "failed to clean merge output after final input replacement");
+                            }
+                            continue;
                         }
-                        continue;
                     }
                     match registry.replace(&old_ids, new_parts) {
                         Ok(_) => {
@@ -297,6 +324,14 @@ async fn merge_once(
                                 metrics
                                     .retention_expired_rows_dropped
                                     .fetch_add(dropped_rows as u64, Ordering::Relaxed);
+                            }
+                            // Only a group that nothing but retention would
+                            // have selected is a rewrite retention caused. A
+                            // size-driven merge that happened to drop expired
+                            // rows is already counted by the row counter, and
+                            // counting it here would hide how much extra I/O
+                            // retention is actually paying for.
+                            if retention_only {
                                 metrics
                                     .retention_parts_rewritten
                                     .fetch_add(old_ids.len() as u64, Ordering::Relaxed);
