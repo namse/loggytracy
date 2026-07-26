@@ -652,6 +652,31 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+
+        // Backpressure is a state, not a latch. Once flush has drained the
+        // buffer the next push must be accepted — otherwise a single burst
+        // takes the instance out of service permanently, which is worse than
+        // the unbounded growth this replaced.
+        let checkpoint = state.journal.checkpoint().await.unwrap();
+        state.memtable.commit_flush();
+        state.journal.set_checkpoint(checkpoint.offset).unwrap();
+
+        let accepted_again = push(
+            State(state.clone()),
+            protobuf_headers(),
+            Bytes::from(build_snappy_push("backpressure", "third line", now_secs())),
+        )
+        .await
+        .expect("a drained memtable accepts writes again");
+        assert_eq!(accepted_again, StatusCode::NO_CONTENT);
+        assert_eq!(
+            state
+                .metrics
+                .ingest_throttled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the release must not have been counted as another refusal"
+        );
     }
 
     #[tokio::test]

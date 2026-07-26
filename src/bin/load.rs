@@ -124,6 +124,11 @@ async fn main() {
     let mut pushes = 0u64;
     let mut events = 0u64;
     let mut push_errors = 0u64;
+    // A 429 is the server working: backpressure engaged and told the client to
+    // slow down. Counting it as an error made a correctly-defended run report a
+    // 99.5% error rate, which reads as a catastrophe rather than as the feature
+    // that prevented one.
+    let mut push_throttled = 0u64;
     let mut queries = 0u64;
     let mut query_errors = 0u64;
     let mut restore_probes = 0u64;
@@ -184,6 +189,7 @@ async fn main() {
                 pushes += 1;
                 events += entries_per_push as u64;
             }
+            Ok((429, _)) => push_throttled += 1,
             Ok(_) | Err(_) => push_errors += 1,
         }
 
@@ -353,6 +359,8 @@ async fn main() {
     let ack_p95 = ack["p95_ms"].as_f64().unwrap_or(f64::INFINITY);
     let ack_p99 = ack["p99_ms"].as_f64().unwrap_or(f64::INFINITY);
     let query_p95 = query["p95_ms"].as_f64().unwrap_or(f64::INFINITY);
+    // Throttled requests are excluded from both sides: they are neither work
+    // the server accepted nor work it failed at.
     let request_total = pushes + push_errors;
     let error_rate = if request_total == 0 {
         0.0
@@ -470,6 +478,7 @@ async fn main() {
     // Added after construction: the literal is already at `json!`'s recursion
     // limit, and one more key inside it stops the macro from expanding.
     report["tenants"] = serde_json::json!(tenant_count);
+    report["push_throttled"] = serde_json::json!(push_throttled);
     report["target_events"] = serde_json::json!(target_events);
     report["ended_on"] = serde_json::json!(if target_events > 0 && events >= target_events {
         "event_target"

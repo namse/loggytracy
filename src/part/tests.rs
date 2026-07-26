@@ -796,6 +796,68 @@
         assert!(error.contains("version 0"), "{error}");
     }
 
+    /// What tenant breadth costs a part.
+    ///
+    /// Row groups are cut at tenant boundaries, so the number of tenants in a
+    /// flush is a *lower bound* on the number of row groups — regardless of
+    /// `row_group_size`. Parquet carries per-column metadata for every row
+    /// group and this engine carries a bloom filter for every row group, so
+    /// that bound is a real cost, and the target workload is many small
+    /// tenants. This measures it rather than assuming it.
+    #[test]
+    fn tenant_breadth_sets_the_row_group_floor_and_what_that_costs() {
+        fn build(tenants: usize, rows_total: usize) -> (u32, u64, u64) {
+            let tmp = tempfile_dir();
+            let rows: Vec<Row> = (0..rows_total)
+                .map(|index| Row {
+                    tenant: TenantId::parse(&format!("t{:04}", index % tenants)).unwrap(),
+                    timestamp_ns: 1_700_000_000_000_000_000 + index as i64,
+                    labels: [("app".to_string(), "fragmentation".to_string())]
+                        .into_iter()
+                        .collect(),
+                    line: format!("row {index} with enough text to compress like a log line"),
+                    structured_metadata: vec![],
+                })
+                .collect();
+            let part = flush_rows(rows, &tmp, 8192).expect("flush").remove(0);
+            let on_disk = fs::metadata(part.data_path()).unwrap().len();
+            (
+                part.meta.row_group_count,
+                on_disk,
+                part.meta.materialized_bytes,
+            )
+        }
+
+        let rows_total = 5_000;
+        let (one_groups, one_bytes, one_materialized) = build(1, rows_total);
+        let (many_groups, many_bytes, many_materialized) = build(500, rows_total);
+
+        // Same rows, same `row_group_size`; only the tenant breadth differs.
+        assert_eq!(one_groups, 1, "one tenant fits one row group");
+        assert_eq!(
+            many_groups, 500,
+            "500 tenants force 500 row groups even though 8192 rows would fit in one"
+        );
+        assert_eq!(
+            one_materialized, many_materialized,
+            "the rows themselves are identical in size"
+        );
+
+        // The cost is entirely structural. Printed rather than asserted at a
+        // threshold: the ratio depends on the parquet writer and the data, and
+        // a hard bound here would be a test of zstd, not of this engine.
+        println!(
+            "tenant fragmentation: 1 tenant = {one_bytes} B / {one_groups} row groups, \
+500 tenants = {many_bytes} B / {many_groups} row groups, \
+ratio {:.2}x",
+            many_bytes as f64 / one_bytes as f64
+        );
+        assert!(
+            many_bytes > one_bytes,
+            "fragmentation cannot make the file smaller"
+        );
+    }
+
     #[test]
     fn bloom_handles_large_trigram_volume_in_single_row_group() {
         // row group 8192행 × 라인당 수십 trigram → unique 항목이 row 수의 수배~수십배.
