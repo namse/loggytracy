@@ -109,8 +109,8 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
 
 - [x] 관측성 gauge 보강 (merge debt gauge 추가; active part 수·WAL backlog·memtable bytes는 기존 `/metrics`에 존재)
 - [x] Tier B: `LatencyFaultStore` + `from_url` opt-in 래핑 (인프로세스 지연·장애 주입, 시드 재현)
-- [x] Tier C: `docker-compose.yml` MinIO + `scripts/run_load_s3.sh` (실제 S3 프로토콜)
-- [x] MinIO manifest CAS(`PutMode::Create`/`Update`) 동작 확인 (`OBJECT_STORE_CONDITIONAL_PUT=etag` 필요, 문서화 완료)
+- [x] ~~Tier C: MinIO~~ — **삭제됨.** `object_store` 크레이트를 신뢰하므로 S3 대상 테스트를 하지 않는다
+- [x] ~~MinIO manifest CAS 동작 확인~~ — 부팅 프리플라이트로 대체. 배포 대상 스토어 자기 자신에 대해 검사한다
 - [x] 부하 하네스 개선: target-rate pacing, warmup/steady-state 분리, 강제 eviction→restore, 목표 대비 pass/fail (`src/bin/load.rs`)
 - [x] `docs/M7_LOAD_RESULTS.md` 결과·머신 프로파일·병목 문서화
 - [x] **BLOCKER — WAL compaction 무한 wedge 버그 수정 (완료):** 첫 compaction 이후

@@ -72,6 +72,167 @@
         assert!(!root.join(FLUSH_TRANSACTION_FILE).exists());
     }
 
+    // ---------------------------------------------------------------------
+    // The crate boundary.
+    //
+    // Whether `object_store` implements S3 correctly is its problem. Ours is
+    // everything on this side of the call: what we hand it, and how we read
+    // what it hands back. A mistake here is silent — every write still
+    // succeeds — so this seam is tested more finely than anything around it.
+    // ---------------------------------------------------------------------
+
+    /// The single most dangerous line in the seam. `Overwrite` where `Update`
+    /// belongs disables compare-and-swap outright, and nothing downstream can
+    /// tell: the write succeeds either way. The `file://` branch is a
+    /// deliberate opt-out for a single-process development backend; every
+    /// other scheme must condition.
+    #[test]
+    fn put_mode_conditions_on_every_backend_except_the_local_one() {
+        let version = UpdateVersion {
+            e_tag: Some("etag-1".to_string()),
+            version: None,
+        };
+
+        let remote = ObjectStorage::in_memory();
+        assert!(
+            matches!(remote.put_mode(Some(version.clone())), PutMode::Update(_)),
+            "a known version on a remote store must produce a conditional update"
+        );
+        assert!(
+            matches!(remote.put_mode(None), PutMode::Create),
+            "no known version means the object must not exist yet"
+        );
+
+        let dir = temp_dir("put-mode-local");
+        let local = ObjectStorage::from_url(&format!("file://{}", dir.display())).unwrap();
+        assert!(
+            matches!(local.put_mode(Some(version)), PutMode::Overwrite),
+            "file:// opts out of CAS deliberately"
+        );
+        assert!(matches!(local.put_mode(None), PutMode::Create));
+    }
+
+    /// `local_manifest_overwrite` is what `put_mode` above branches on, so the
+    /// scheme test and the mode test are the same guarantee seen from two
+    /// sides. A scheme wrongly classified as local silently drops CAS.
+    #[test]
+    fn only_the_file_scheme_opts_out_of_conditional_writes() {
+        let dir = temp_dir("scheme-local");
+        let local = ObjectStorage::from_url(&format!("file://{}", dir.display())).unwrap();
+        assert!(local.local_manifest_overwrite);
+
+        for url in [
+            "s3://bucket/prefix",
+            "s3://bucket",
+            "memory:///",
+        ] {
+            let store = ObjectStorage::from_url(url)
+                .unwrap_or_else(|error| panic!("{url} should build: {error}"));
+            assert!(
+                !store.local_manifest_overwrite,
+                "{url} must keep compare-and-swap"
+            );
+        }
+    }
+
+    #[test]
+    fn from_url_rejects_what_it_cannot_address() {
+        assert!(ObjectStorage::from_url("not a url").is_err());
+        assert!(ObjectStorage::from_url("").is_err());
+        // A scheme object_store does not know must fail loudly rather than
+        // fall back to something that happens to work locally.
+        assert!(ObjectStorage::from_url("ftp://host/path").is_err());
+    }
+
+    /// The prefix comes from the URL path and every key is built by joining
+    /// onto it. Getting the join wrong puts this instance's objects somewhere
+    /// other than where its own reads look, or — worse — on top of another
+    /// deployment sharing the bucket.
+    #[test]
+    fn keys_are_built_under_the_url_prefix() {
+        let nested = ObjectStorage::from_url("s3://bucket/team/loggytracy").unwrap();
+        assert_eq!(
+            nested.manifest_path().as_ref(),
+            format!("team/loggytracy/{MANIFEST_FILE}")
+        );
+        assert_eq!(
+            nested
+                .part_path(
+                    &ManifestPart {
+                        id: "part-1".to_string(),
+                        partition: "2026-01-01".to_string(),
+                    },
+                    DATA_FILE
+                )
+                .as_ref(),
+            format!("team/loggytracy/parts/2026-01-01/part-1/{DATA_FILE}")
+        );
+        assert_eq!(
+            nested.tenant_policy_path("acme").as_ref(),
+            format!("team/loggytracy/{TENANT_POLICY_PREFIX}/acme.json")
+        );
+
+        // A bucket-root URL has an empty prefix, and the join must not leave a
+        // leading separator behind.
+        let root = ObjectStorage::from_url("s3://bucket").unwrap();
+        assert_eq!(root.manifest_path().as_ref(), MANIFEST_FILE);
+        assert!(!root.manifest_path().as_ref().starts_with('/'));
+    }
+
+    /// `object_store` reports "no such object" as an error, and for the
+    /// manifest that is not an error at all — it is the first boot. Reading it
+    /// as a failure would make an empty prefix unstartable; reading any *other*
+    /// error as an empty manifest would silently discard every registered part.
+    #[tokio::test]
+    async fn a_missing_manifest_is_the_first_boot_and_nothing_else_is() {
+        let storage = ObjectStorage::in_memory();
+        let manifest = storage
+            .load_manifest()
+            .await
+            .expect("an absent manifest is a valid empty state");
+        assert!(manifest.parts.is_empty());
+        assert_eq!(manifest.generation, 0);
+
+        // A present-but-unreadable manifest is the opposite case.
+        storage
+            .store
+            .put(&storage.manifest_path(), Bytes::from_static(b"{ not json").into())
+            .await
+            .unwrap();
+        assert!(
+            storage.load_manifest().await.is_err(),
+            "a corrupt manifest must never read as an empty one"
+        );
+    }
+
+    /// A manifest this build cannot interpret must stop the boot rather than
+    /// be treated as absent — the fallback for absent is "empty", which would
+    /// drop every part the newer writer registered.
+    #[tokio::test]
+    async fn an_unknown_manifest_format_version_is_refused() {
+        let storage = ObjectStorage::in_memory();
+        let future = serde_json::json!({
+            "format_version": MANIFEST_FORMAT_VERSION + 1,
+            "generation": 7,
+            "writer_epoch": 1,
+            "parts": [],
+        });
+        storage
+            .store
+            .put(
+                &storage.manifest_path(),
+                Bytes::from(serde_json::to_vec(&future).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+
+        let error = storage
+            .load_manifest()
+            .await
+            .expect_err("a newer format must not be guessed at");
+        assert!(error.contains("format version"), "{error}");
+    }
+
     #[test]
     fn object_store_environment_keys_are_normalized_and_explicit_values_win() {
         let options: BTreeMap<_, _> = normalized_object_store_options([

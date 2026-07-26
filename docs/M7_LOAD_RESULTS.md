@@ -1,5 +1,12 @@
 # M7 Load Validation Results
 
+> **Superseded (2026-07-26).** Tier C and its MinIO assets have been deleted:
+> the things it claimed to validate are `object_store`'s responsibility, and we
+> trust that crate. The crate boundary is now covered by fine-grained unit tests
+> on our side of the call plus a boot-time conditional-put preflight on the
+> other. See [`LOAD_VALIDATION.md`](LOAD_VALIDATION.md). The Tier C numbers
+> below are kept only as a record of what was run.
+>
 > **Status (2026-07-26).** The blocker both tiers hit — the WAL-compaction wedge —
 > is fixed, so these FAIL verdicts are historical: the runs must be repeated
 > before they say anything about the current build. The "validated on

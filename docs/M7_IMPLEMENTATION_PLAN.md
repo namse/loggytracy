@@ -1,5 +1,12 @@
 # M7 Implementation Plan
 
+> **Superseded in part (2026-07-26).** Tier C (local MinIO over the real S3
+> protocol) has been removed. Its stated purpose — validating conditional put,
+> path-style addressing, and multipart — is `object_store`'s responsibility, not
+> this repository's, and re-verifying a dependency was never our job. The
+> replacement is finer-grained testing on our side of the crate boundary plus a
+> boot-time preflight on the other. See [`LOAD_VALIDATION.md`](LOAD_VALIDATION.md).
+
 M7 closes the load-validation gate that M5 left open, using only a local
 developer machine. It does so without real cloud S3 by driving the engine under
 two complementary object-store backends:

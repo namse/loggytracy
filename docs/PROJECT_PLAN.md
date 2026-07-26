@@ -165,7 +165,7 @@ The implementation plan and design decisions are recorded in
 - [x] `RuntimeMetrics`/`/metrics` expose active part counts, WAL backlog, MemTable bytes, and merge debt as point-in-time gauges.
 - [x] `from_url` optionally wraps the constructed store in a latency/fault-injecting store when load knobs are set, and is a no-op otherwise.
 - [~] Tier B: a seeded, reproducible run drives the real server over a latency/fault-injected backend and recovers from injected object-store errors. Storage-layer lossless recovery is covered by a test; the full end-to-end run is blocked by the WAL-compaction wedge bug (see M7_LOAD_RESULTS.md).
-- [x] `docker-compose.yml` brings up MinIO and a load script runs the server against it end to end.
+- [x] ~~`docker-compose.yml` brings up MinIO and a load script runs the server against it end to end.~~ Done in M7, then **removed** on 2026-07-26: validating the S3 protocol is `object_store`'s job, not this repository's. See `LOAD_VALIDATION.md`.
 - [~] Tier C: manifest CAS is confirmed against MinIO over the real S3 protocol (needs `OBJECT_STORE_CONDITIONAL_PUT=etag`, documented). Remote restore/retention GC confirmation is blocked by the same wedge bug.
 - [x] The load harness paces to a target rate, splits warmup from steady state, forces eviction→restore, and emits an explicit per-target pass/fail verdict.
 - [ ] A run meets the agreed throughput, latency, memory, retention, and error-rate targets on target-class hardware; local runs are error-free with bounded RSS and correct backpressure, and the achieved numbers are recorded. (Blocked: WAL-compaction wedge bug.)
