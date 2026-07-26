@@ -16,6 +16,13 @@ pub async fn push(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, IngestError> {
+    if state.shutdown.is_fenced() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this instance has been fenced by a newer writer and is shutting down".to_string(),
+        )
+            .into());
+    }
     if state.shutdown.is_draining() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,

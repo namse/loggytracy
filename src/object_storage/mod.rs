@@ -38,6 +38,15 @@ pub fn is_inputs_changed_error(error: &str) -> bool {
     error.starts_with(INPUTS_CHANGED_ERROR)
 }
 
+/// Another process claimed the writer role. Unlike every other manifest
+/// failure this one is terminal: retrying cannot succeed, because the epoch
+/// this instance holds will never come back.
+pub const FENCED_ERROR: &str = "fenced by a newer writer";
+
+pub fn is_fenced_error(error: &str) -> bool {
+    error.starts_with(FENCED_ERROR)
+}
+
 fn normalized_object_store_options<I>(variables: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
@@ -81,6 +90,14 @@ impl From<&Part> for ManifestPart {
 pub struct Manifest {
     pub format_version: u32,
     pub generation: u64,
+    /// Which writer owns this prefix. Carried in the manifest rather than in
+    /// an object of its own so that checking it costs nothing: every write
+    /// already loads the manifest it is about to replace.
+    ///
+    /// Zero means unclaimed, which is what a manifest written before fencing
+    /// existed reads as and what a claim then bumps.
+    #[serde(default)]
+    pub writer_epoch: u64,
     pub parts: Vec<ManifestPart>,
 }
 
@@ -94,6 +111,8 @@ pub struct TraceManifestPart {
 pub struct TraceManifest {
     pub format_version: u32,
     pub generation: u64,
+    #[serde(default)]
+    pub writer_epoch: u64,
     pub parts: Vec<TraceManifestPart>,
 }
 
@@ -112,6 +131,7 @@ impl Default for TraceManifest {
         Self {
             format_version: MANIFEST_FORMAT_VERSION,
             generation: 0,
+            writer_epoch: 0,
             parts: Vec::new(),
         }
     }
@@ -122,6 +142,7 @@ impl Default for Manifest {
         Self {
             format_version: MANIFEST_FORMAT_VERSION,
             generation: 0,
+            writer_epoch: 0,
             parts: Vec::new(),
         }
     }

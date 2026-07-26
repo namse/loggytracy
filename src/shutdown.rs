@@ -20,6 +20,7 @@ use crate::trace_registry::TraceRegistry;
 /// the disk is discarded.
 pub struct ShutdownState {
     draining: AtomicBool,
+    fenced: AtomicBool,
     force_flush_complete: AtomicBool,
     pending_flush_bytes: AtomicU64,
     drain_tx: watch::Sender<bool>,
@@ -31,6 +32,7 @@ impl ShutdownState {
         let (drain_tx, _keep_rx) = watch::channel(false);
         Self {
             draining: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
             force_flush_complete: AtomicBool::new(false),
             pending_flush_bytes: AtomicU64::new(0),
             drain_tx,
@@ -47,6 +49,29 @@ impl ShutdownState {
 
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Acquire)
+    }
+
+    /// Another process owns the prefix now. Drains, and marks the drain as one
+    /// that cannot end in durability: everything this instance has not already
+    /// published belongs to a manifest it no longer owns, so retrying the
+    /// force-flush would loop until the orchestrator kills it.
+    ///
+    /// The unflushed data stays in the WAL on this disk. That is the honest
+    /// outcome — the alternative is publishing over a writer that has been
+    /// accepting traffic since, which loses whichever side is overwritten.
+    pub fn mark_fenced(&self) {
+        if !self.fenced.swap(true, Ordering::AcqRel) {
+            tracing::error!(
+                "fenced by a newer writer: this instance no longer owns the object-store prefix \
+and is shutting down. Unflushed data remains in the local WAL; do not discard this disk until \
+it has been reconciled."
+            );
+        }
+        self.begin_drain();
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::Acquire)
     }
 
     /// A receiver that resolves (via [`wait_for_drain`]) once draining starts.
@@ -148,6 +173,10 @@ pub enum ShutdownOutcome {
     /// a restart on this same disk recovers without loss, but the disk must not
     /// be discarded (no machine replacement).
     AbortedByOperator,
+    /// Another writer claimed the prefix. Retrying can never succeed, so the
+    /// drain stops immediately rather than looping until it is killed. Like
+    /// `AbortedByOperator` the WAL is intact and the disk must be kept.
+    Fenced,
 }
 
 /// Force every pending MemTable record and checkpoint to durable object storage.
@@ -207,6 +236,13 @@ where
             pending_checkpoint: &mut pending_checkpoint,
         };
 
+        if context.shutdown.is_fenced() {
+            // Checked before the attempt rather than only after a failure: the
+            // fence may have been observed by another worker, and a pass that
+            // would succeed locally must still not publish.
+            return ShutdownOutcome::Fenced;
+        }
+
         match flush::force_flush_pass(pass).await {
             Ok(true) => {
                 context.shutdown.set_pending_flush_bytes(0);
@@ -224,6 +260,10 @@ where
                 backoff = FORCE_FLUSH_MIN_BACKOFF;
                 tokio::task::yield_now().await;
                 continue;
+            }
+            Err(error) if crate::object_storage::is_fenced_error(&error) => {
+                context.shutdown.mark_fenced();
+                return ShutdownOutcome::Fenced;
             }
             Err(error) => {
                 attempt += 1;

@@ -398,6 +398,91 @@ async fn m6_force_flush_retries_until_object_store_recovers() {
     );
 }
 
+/// A fenced instance must stop, not retry. Every other force-flush failure is
+/// transient and worth waiting out; this one is not, and looping would keep the
+/// process alive until the orchestrator killed it — after which the pod can be
+/// rescheduled onto a different node and its disk, holding the only copy of the
+/// unflushed data, thrown away.
+#[tokio::test]
+async fn m6_a_fenced_writer_stops_instead_of_retrying_forever() {
+    let dir = tmp_data_dir("m6-fenced");
+    std::fs::create_dir_all(dir.join("parts")).unwrap();
+    std::fs::create_dir_all(dir.join("traces")).unwrap();
+    let config = Arc::new(Config {
+        data_dir: dir.clone(),
+        ..Config::default()
+    });
+
+    let memtable = Arc::new(MemTable::new());
+    let trace_memtable = Arc::new(crate::trace::TraceMemTable::new());
+    let journal = Arc::new(
+        Journal::spawn_with_traces(&config, memtable.clone(), trace_memtable.clone()).unwrap(),
+    );
+    ingest_once(&journal, &build_push_req()).await;
+    assert!(!memtable.is_empty());
+
+    let parts = Arc::new(PartRegistry::new());
+    let trace_registry = Arc::new(crate::trace_registry::TraceRegistry::new(
+        parts.operation_lock(),
+    ));
+
+    // Two instances over one backing store, in the order an orchestrator that
+    // ignores the drain would produce them.
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let old = crate::object_storage::ObjectStorage::sharing_store_for_test(store.clone());
+    let new = crate::object_storage::ObjectStorage::sharing_store_for_test(store);
+    old.claim_writer_epoch().await.unwrap();
+    new.claim_writer_epoch().await.unwrap();
+
+    let shutdown = Arc::new(ShutdownState::new());
+    old.set_fence_sink(shutdown.clone());
+    let remote_cache = Some(Arc::new(crate::object_storage::RemoteCache::new(
+        old,
+        dir.join("parts"),
+    )));
+    shutdown.begin_drain();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        finalize_flush_with_abort(
+            FinalizeContext {
+                shutdown: shutdown.clone(),
+                memtable: memtable.clone(),
+                trace_memtable: trace_memtable.clone(),
+                journal: journal.clone(),
+                registry: parts.clone(),
+                trace_registry: trace_registry.clone(),
+                remote_cache: remote_cache.clone(),
+                config: config.clone(),
+            },
+            std::time::Duration::from_secs(3600),
+            || tokio::sync::mpsc::channel::<()>(1).1,
+        ),
+    )
+    .await
+    .expect("a fenced force-flush must end on its own, without an operator");
+
+    assert_eq!(outcome, ShutdownOutcome::Fenced);
+    assert!(shutdown.is_fenced());
+    assert!(
+        !shutdown.is_flush_complete(),
+        "a fenced force-flush must not report durability"
+    );
+
+    // The data is still on this disk, which is why the exit code has to be
+    // non-zero and the disk has to be kept.
+    let replayed = MemTable::new();
+    crate::journal::replay(
+        journal.wal_path(),
+        journal.ckpt_path(),
+        &replayed,
+        &config.default_tenant,
+    )
+    .unwrap();
+    assert!(!replayed.is_empty(), "the WAL must still hold the records");
+}
+
 #[tokio::test]
 async fn m6_operator_abort_preserves_wal_for_restart_recovery() {
     let dir = tmp_data_dir("m6-abort");

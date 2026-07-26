@@ -88,6 +88,16 @@ pub async fn run(config: Arc<Config>) {
         .transpose()
         .unwrap_or_else(|error| panic!("object-store initialization failed: {error}"))
         .map(Arc::new);
+    // Claimed before anything else touches the prefix, and before the workers
+    // exist: from here on, any manifest write by an older instance fails
+    // instead of racing this one. The architecture always assumed a single
+    // writer; this is what makes the assumption hold when an orchestrator
+    // starts the replacement before the original has finished draining.
+    if let Some(storage) = &object_storage {
+        storage.claim_writer_epoch().await.unwrap_or_else(|error| {
+            panic!("failed to claim the object-store writer epoch: {error}")
+        });
+    }
     let remote_manifest = if let Some(storage) = &object_storage {
         let checkpoint = journal::read_checkpoint(&config.data_dir.join("journal.ckpt"))
             .unwrap_or_else(|error| panic!("failed to read journal checkpoint: {error}"));
@@ -159,6 +169,9 @@ pub async fn run(config: Arc<Config>) {
     let retention_healthy = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(RuntimeMetrics::new());
     let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
+    if let Some(storage) = &object_storage {
+        storage.set_fence_sink(shutdown.clone());
+    }
     // Loaded before the workers spawn, and fatal on failure — the same class as
     // a manifest that cannot be read. Booting with a silently empty map would
     // unclamp every query and hand back data a downgrade had already hidden.
@@ -439,6 +452,17 @@ pub async fn run(config: Arc<Config>) {
             tracing::error!(
                 "shutdown aborted before durability; acknowledged data is only on the WAL. \
 Restart on THIS disk to recover; do not discard the disk or replace the machine."
+            );
+            std::process::exit(1);
+        }
+        crate::shutdown::ShutdownOutcome::Fenced => {
+            // Same disposition as an operator abort, for a different reason:
+            // another writer owns the prefix, so publishing is not something
+            // this process can retry its way out of.
+            tracing::error!(
+                "shutdown after being fenced by a newer writer; acknowledged data is only on the \
+WAL. Reconcile THIS disk before discarding it, and check that two instances were not started \
+against the same LOGGYTRACY_OBJECT_STORE_URL."
             );
             std::process::exit(1);
         }

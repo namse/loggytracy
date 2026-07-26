@@ -923,12 +923,96 @@
         assert_eq!(ids, expected, "every acknowledged part must be present exactly once");
     }
 
+    /// The M6 replacement procedure says drain the old instance before
+    /// starting the new one. Orchestrators break that ordering routinely, and
+    /// until now both processes would have kept writing, each believing it was
+    /// the only one.
+    #[tokio::test]
+    async fn a_second_claim_fences_the_first_writer() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let old = ObjectStorage::sharing_store_for_test(store.clone());
+        let new = ObjectStorage::sharing_store_for_test(store);
+
+        assert_eq!(old.claim_writer_epoch().await.unwrap(), 1);
+
+        // The original still owns the prefix and can publish.
+        let dir = temp_dir("fenced-writer").join("parts");
+        let first = crate::part::flush_rows(vec![row("before takeover")], &dir, 100).unwrap();
+        old.publish(&first, &[]).await.expect("the owner publishes");
+
+        // The replacement takes over.
+        assert_eq!(new.claim_writer_epoch().await.unwrap(), 2);
+
+        let second = crate::part::flush_rows(vec![row("after takeover")], &dir, 100).unwrap();
+        let error = old
+            .publish(&second, &[])
+            .await
+            .expect_err("a fenced writer must not publish");
+        assert!(crate::object_storage::is_fenced_error(&error), "{error}");
+
+        // And the replacement is unaffected.
+        new.publish(&second, &[])
+            .await
+            .expect("the new owner publishes");
+        let manifest = new.load_manifest().await.unwrap();
+        assert_eq!(manifest.writer_epoch, 2);
+        assert_eq!(manifest.parts.len(), 2);
+    }
+
+    /// Trace writes go through a manifest of their own, so the claim has to
+    /// reach both or a takeover would fence only half of the old writer.
+    #[tokio::test]
+    async fn the_claim_fences_trace_writes_too() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let old = ObjectStorage::sharing_store_for_test(store.clone());
+        let new = ObjectStorage::sharing_store_for_test(store);
+        old.claim_writer_epoch().await.unwrap();
+        new.claim_writer_epoch().await.unwrap();
+
+        let dir = temp_dir("fenced-traces").join("traces");
+        let spans = vec![crate::trace::TraceSpan {
+            tenant: crate::tenant::test_tenant(),
+            trace_id: "ab".repeat(16),
+            span_id: "fenced".to_string(),
+            start_time_ns: 1_000,
+            end_time_ns: 2_000,
+            span: Default::default(),
+            resource: None,
+            resource_schema_url: String::new(),
+            scope: None,
+            scope_schema_url: String::new(),
+        }];
+        let parts = crate::trace_part::flush_trace_spans(spans, &dir, 100).unwrap();
+
+        let error = old
+            .publish_trace_parts(&parts)
+            .await
+            .expect_err("a fenced writer must not publish traces");
+        assert!(crate::object_storage::is_fenced_error(&error), "{error}");
+        assert!(new.publish_trace_parts(&parts).await.is_ok());
+    }
+
+    /// An unclaimed store keeps working. Fencing is only meaningful once
+    /// someone has taken ownership, and the local development backend never
+    /// does.
+    #[tokio::test]
+    async fn an_unclaimed_store_is_never_fenced() {
+        let storage = ObjectStorage::in_memory();
+        let dir = temp_dir("unclaimed").join("parts");
+        let parts = crate::part::flush_rows(vec![row("unclaimed")], &dir, 100).unwrap();
+        assert_eq!(storage.writer_epoch(), 0);
+        assert!(storage.publish(&parts, &[]).await.is_ok());
+    }
+
     #[test]
     fn manifest_rejects_relative_path_components() {
         for value in [".", "..", "a/b", ""] {
             let manifest = Manifest {
                 format_version: MANIFEST_FORMAT_VERSION,
                 generation: 1,
+                writer_epoch: 1,
                 parts: vec![ManifestPart {
                     id: value.to_string(),
                     partition: "2026-01-01".to_string(),

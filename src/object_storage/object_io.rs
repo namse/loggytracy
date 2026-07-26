@@ -322,6 +322,10 @@ impl ObjectStorage {
         let _guard = self.manifest_update.lock().await;
         for _ in 0..MAX_CAS_ATTEMPTS {
             let loaded = self.load_manifest_versioned().await?;
+            // Before any of the reasoning below: if another writer has claimed
+            // the prefix, none of it applies to a manifest this instance no
+            // longer owns.
+            self.check_epoch(loaded.manifest.writer_epoch)?;
             let mut next = loaded.manifest.clone();
             let removed: HashSet<&str> = removed_ids.iter().map(String::as_str).collect();
 

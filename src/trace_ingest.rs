@@ -52,6 +52,11 @@ impl TraceService for TraceIngestService {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        if self.shutdown.is_fenced() {
+            return Err(Status::unavailable(
+                "this instance has been fenced by a newer writer and is shutting down",
+            ));
+        }
         if self.shutdown.is_draining() {
             return Err(Status::unavailable("server is draining for shutdown"));
         }

@@ -445,6 +445,13 @@ pub async fn label_values(
 pub async fn ready(
     State(state): State<Arc<AppState>>,
 ) -> Result<&'static str, (StatusCode, String)> {
+    if state.shutdown.is_fenced() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fenced by a newer writer; this instance no longer owns the object-store prefix"
+                .to_string(),
+        ));
+    }
     if state.shutdown.is_draining() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,

@@ -12,6 +12,20 @@ pub struct ObjectStorage {
     /// process-local mutex plus LocalFileSystem's staged rename gives us an
     /// atomic replacement.
     local_manifest_overwrite: bool,
+    /// Told once, when the epoch check first fires.
+    ///
+    /// Held here rather than returned to each caller so that every writer —
+    /// flush, merge, retention, the final force-flush — reacts identically
+    /// without any of them having to know what fencing is. They all see an
+    /// ordinary manifest error; the drain has already begun by then.
+    fence_sink: std::sync::OnceLock<Arc<crate::shutdown::ShutdownState>>,
+    /// This instance's claim on the prefix, or 0 while unclaimed.
+    ///
+    /// The architecture assumes one writer; nothing used to enforce it, so two
+    /// processes on the same prefix each believed they owned it. The manifest
+    /// CAS stops a lost update but not two divergent local WALs, and not one
+    /// instance's retention expiring a part the other has just registered.
+    writer_epoch: AtomicU64,
 }
 
 /// Coordinates all mutations of the local object-store cache. Readers hold a
@@ -127,6 +141,8 @@ production or on shared/network storage."
             prefix,
             manifest_update: tokio::sync::Mutex::new(()),
             local_manifest_overwrite,
+            fence_sink: std::sync::OnceLock::new(),
+            writer_epoch: AtomicU64::new(0),
         })
     }
 
@@ -137,7 +153,23 @@ production or on shared/network storage."
             prefix: ObjectPath::from("loggytracy-test"),
             manifest_update: tokio::sync::Mutex::new(()),
             local_manifest_overwrite: false,
+            fence_sink: std::sync::OnceLock::new(),
+            writer_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Two handles over one backing store: what two processes pointed at the
+    /// same prefix actually look like.
+    #[cfg(test)]
+    pub fn sharing_store_for_test(store: Arc<dyn ObjectStore>) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            prefix: ObjectPath::from("loggytracy-test"),
+            manifest_update: tokio::sync::Mutex::new(()),
+            local_manifest_overwrite: false,
+            fence_sink: std::sync::OnceLock::new(),
+            writer_epoch: AtomicU64::new(0),
+        })
     }
 
     /// An in-memory store whose every write fails, for the paths that must
@@ -153,6 +185,8 @@ production or on shared/network storage."
             prefix: ObjectPath::from("loggytracy-test"),
             manifest_update: tokio::sync::Mutex::new(()),
             local_manifest_overwrite: false,
+            fence_sink: std::sync::OnceLock::new(),
+            writer_epoch: AtomicU64::new(0),
         }
     }
 
@@ -166,6 +200,8 @@ production or on shared/network storage."
             prefix: ObjectPath::from(prefix),
             manifest_update: tokio::sync::Mutex::new(()),
             local_manifest_overwrite: false,
+            fence_sink: std::sync::OnceLock::new(),
+            writer_epoch: AtomicU64::new(0),
         }
     }
 
@@ -235,6 +271,139 @@ production or on shared/network storage."
         Ok(self.load_manifest_versioned().await?.manifest)
     }
 
+    /// Where a detected fence is reported. Set once, during startup.
+    pub fn set_fence_sink(&self, shutdown: Arc<crate::shutdown::ShutdownState>) {
+        let _ = self.fence_sink.set(shutdown);
+    }
+
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch.load(Ordering::Acquire)
+    }
+
+    /// Take ownership of the prefix, and report the epoch taken.
+    ///
+    /// Called once at startup, before any worker runs. Both manifests carry
+    /// the same number so that whichever one a later write touches first
+    /// notices a takeover.
+    pub async fn claim_writer_epoch(&self) -> Result<u64, String> {
+        let mut claimed = None;
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let loaded = self.load_manifest_versioned().await?;
+            let epoch = loaded
+                .manifest
+                .writer_epoch
+                .checked_add(1)
+                .ok_or_else(|| "writer epoch overflow".to_string())?;
+            let mut next = loaded.manifest.clone();
+            next.writer_epoch = epoch;
+            next.generation = next
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| "manifest generation overflow".to_string())?;
+            if self
+                .try_put_manifest(&next, loaded.version, self.manifest_path())
+                .await?
+            {
+                claimed = Some(epoch);
+                break;
+            }
+        }
+        let Some(epoch) = claimed else {
+            return Err("writer epoch claim CAS retry limit exceeded".to_string());
+        };
+
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let (loaded, version) = self.load_trace_manifest_versioned().await?;
+            let mut next = loaded.clone();
+            next.writer_epoch = epoch;
+            next.generation = next
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| "trace manifest generation overflow".to_string())?;
+            let body = serde_json::to_vec_pretty(&next)
+                .map_err(|error| format!("failed to encode trace manifest: {error}"))?;
+            let mode = self.put_mode(version);
+            match self
+                .store
+                .put_opts(
+                    &self.trace_manifest_path(),
+                    body.into(),
+                    PutOptions {
+                        mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    // Published only once both manifests agree: a half-claimed
+                    // prefix would fence this instance off its own trace writes.
+                    self.writer_epoch.store(epoch, Ordering::Release);
+                    tracing::info!(epoch, "claimed the object-store writer epoch");
+                    return Ok(epoch);
+                }
+                Err(object_store::Error::Precondition { .. })
+                | Err(object_store::Error::AlreadyExists { .. }) => continue,
+                Err(error) => return Err(format!("failed to claim the trace manifest: {error}")),
+            }
+        }
+        Err("trace writer epoch claim CAS retry limit exceeded".to_string())
+    }
+
+    fn put_mode(&self, version: Option<UpdateVersion>) -> PutMode {
+        match version {
+            Some(_) if self.local_manifest_overwrite => PutMode::Overwrite,
+            Some(version) => PutMode::Update(version),
+            None => PutMode::Create,
+        }
+    }
+
+    async fn try_put_manifest(
+        &self,
+        manifest: &Manifest,
+        version: Option<UpdateVersion>,
+        path: ObjectPath,
+    ) -> Result<bool, String> {
+        let body = serde_json::to_vec_pretty(manifest)
+            .map_err(|error| format!("failed to encode manifest: {error}"))?;
+        let mode = self.put_mode(version);
+        match self
+            .store
+            .put_opts(
+                &path,
+                body.into(),
+                PutOptions {
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::Precondition { .. })
+            | Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            Err(error) => Err(format!("failed to update manifest: {error}")),
+        }
+    }
+
+    /// Refuse to write when the loaded manifest is owned by someone else.
+    ///
+    /// Checked on every CAS rather than periodically, so the fence lands on
+    /// the first write after a takeover instead of at the next poll.
+    fn check_epoch(&self, observed: u64) -> Result<(), String> {
+        let held = self.writer_epoch();
+        if held == 0 || observed == held {
+            return Ok(());
+        }
+        if let Some(shutdown) = self.fence_sink.get() {
+            shutdown.mark_fenced();
+        }
+        Err(format!(
+            "{FENCED_ERROR}: this instance holds writer epoch {held} but the manifest now carries \
+{observed}"
+        ))
+    }
+
     async fn load_trace_manifest_versioned(
         &self,
     ) -> Result<(TraceManifest, Option<UpdateVersion>), String> {
@@ -283,6 +452,7 @@ production or on shared/network storage."
         let _guard = self.manifest_update.lock().await;
         for _ in 0..MAX_CAS_ATTEMPTS {
             let (loaded, version) = self.load_trace_manifest_versioned().await?;
+            self.check_epoch(loaded.writer_epoch)?;
             let mut next = loaded.clone();
             for part in added {
                 let descriptor = TraceManifestPart {
@@ -352,6 +522,7 @@ production or on shared/network storage."
         let _guard = self.manifest_update.lock().await;
         for _ in 0..MAX_CAS_ATTEMPTS {
             let (loaded, version) = self.load_trace_manifest_versioned().await?;
+            self.check_epoch(loaded.writer_epoch)?;
             let present = loaded
                 .parts
                 .iter()
