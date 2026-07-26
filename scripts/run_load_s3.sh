@@ -8,6 +8,9 @@
 # It brings MinIO up via docker compose, creates the bucket, launches the release
 # server pointed at s3://loggytracy/loggytracy, runs the closed-loop load tool,
 # scrapes /metrics, and tears everything down.
+#
+# Latency injection is layered on top by default (see below): loopback MinIO is
+# sub-millisecond, which is the one way it is nothing like real S3.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -66,6 +69,27 @@ export LOGGYTRACY_CACHE_MAX_BYTES="${LOGGYTRACY_CACHE_MAX_BYTES:-33554432}"
 export LOGGYTRACY_CACHE_EVICTION_INTERVAL="${LOGGYTRACY_CACHE_EVICTION_INTERVAL:-5s}"
 export LOGGYTRACY_FLUSH_MAX_INTERVAL="${LOGGYTRACY_FLUSH_MAX_INTERVAL:-2s}"
 export LOGGYTRACY_MERGE_INTERVAL="${LOGGYTRACY_MERGE_INTERVAL:-10s}"
+
+# Latency injection ON TOP of the real S3 wire. `from_url` wraps whatever store
+# it built, so this composes with the AmazonS3 backend rather than replacing it:
+# real SigV4, real conditional PUT, real sockets, plus a tail MinIO on loopback
+# can never produce. That tail is the axis a local run otherwise cannot check,
+# and flush/restore latency is what decides whether the WAL backlog stays
+# bounded and what a cache-miss query costs.
+#
+# The injector adds base + uniform(0, jitter), so it cannot reproduce S3's
+# heavy tail. The values below are sized so the *maximum* lands near a real S3
+# p99 rather than so the median matches; that makes the median pessimistic,
+# which is the safe direction for a question of the form "is the backlog
+# bounded". Set both to 0 for the pure protocol run these numbers replaced.
+export LOGGYTRACY_OBJECT_STORE_LATENCY_MS="${LOGGYTRACY_OBJECT_STORE_LATENCY_MS:-20}"
+export LOGGYTRACY_OBJECT_STORE_LATENCY_JITTER_MS="${LOGGYTRACY_OBJECT_STORE_LATENCY_JITTER_MS:-180}"
+export LOGGYTRACY_OBJECT_STORE_READ_LATENCY_MS="${LOGGYTRACY_OBJECT_STORE_READ_LATENCY_MS:-15}"
+# Errors default to off: Tier B already covers write-error recovery, and the
+# thing this run adds is the tail. Setting it exercises publish/CAS retry
+# against a real ETag, which `file://` cannot do.
+export LOGGYTRACY_OBJECT_STORE_ERROR_RATE="${LOGGYTRACY_OBJECT_STORE_ERROR_RATE:-0}"
+export LOGGYTRACY_OBJECT_STORE_FAULT_SEED="${LOGGYTRACY_OBJECT_STORE_FAULT_SEED:-20260726}"
 
 echo "==> starting server"
 ./target/release/loggytracy >"$SERVER_LOG" 2>&1 &
