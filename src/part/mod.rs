@@ -49,6 +49,51 @@ const EXACT_FIELD_SCALAR_SCOPE: u8 = 0;
 /// is also the leading column.
 pub const TENANT_COLUMN: &str = "_tenant";
 
+/// The time span a metadata lookup is allowed to see.
+///
+/// Replaces the bare retention floor that these lookups used to take. Grafana
+/// sends `start`/`end` on every label and series call, and answering from the
+/// whole history both returns labels that do not exist in the range and reads
+/// every part to do it. The retention floor folds into `start_ns`, so one
+/// bound expresses both "what the client asked for" and "what the tenant is
+/// still entitled to".
+#[derive(Clone, Copy, Debug)]
+pub struct MetadataWindow {
+    pub start_ns: i64,
+    pub end_ns: i64,
+}
+
+impl MetadataWindow {
+    pub fn unbounded() -> Self {
+        Self {
+            start_ns: i64::MIN,
+            end_ns: i64::MAX,
+        }
+    }
+
+    pub fn clamped_to(self, retention_floor_ns: Option<i64>) -> Self {
+        match retention_floor_ns {
+            Some(floor_ns) => Self {
+                start_ns: self.start_ns.max(floor_ns),
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start_ns > self.end_ns
+    }
+
+    pub fn contains(&self, timestamp_ns: i64) -> bool {
+        timestamp_ns >= self.start_ns && timestamp_ns <= self.end_ns
+    }
+
+    pub fn overlaps(&self, min_ts_ns: i64, max_ts_ns: i64) -> bool {
+        max_ts_ns >= self.start_ns && min_ts_ns <= self.end_ns
+    }
+}
+
 pub type StreamMap = BTreeMap<String, BTreeMap<String, RoaringBitmap>>;
 
 #[derive(Clone, Copy)]

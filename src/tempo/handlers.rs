@@ -4,7 +4,7 @@ pub async fn trace_by_id(
     Path(trace_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(crate::tenant::TenantError::into_http)?;
     let trace_id =
         canonical_trace_id(&trace_id).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let mut spans = query_trace(&state, &tenant, &trace_id).await?;
@@ -41,7 +41,7 @@ pub async fn search(
     Query(params): Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(crate::tenant::TenantError::into_http)?;
     let limit = params.limit.unwrap_or(20);
     let max_search_limit = state
         .config
@@ -177,7 +177,7 @@ pub async fn search_tags(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(crate::tenant::TenantError::into_http)?;
     let guard = pin_all_trace_parts(&state, &tenant).await?;
     let spans = retained_spans(
         &state,
@@ -211,7 +211,7 @@ pub async fn search_tag_values(
     Path(tag): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(crate::tenant::TenantError::into_http)?;
     let guard = pin_all_trace_parts(&state, &tenant).await?;
     let spans = retained_spans(
         &state,

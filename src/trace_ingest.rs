@@ -57,7 +57,7 @@ impl TraceService for TraceIngestService {
         }
         self.ingest_gate.check_grpc()?;
         let tenant = crate::tenant::from_grpc_metadata(request.metadata(), &self.config)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            .map_err(crate::tenant::TenantError::into_grpc)?;
         let request = request.into_inner();
         if request.encoded_len() > MAX_OTLP_REQUEST_BYTES {
             return Err(Status::resource_exhausted(format!(

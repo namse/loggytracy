@@ -326,7 +326,7 @@
             None,
         );
 
-        assert_eq!(distinct_stream_count(&state, &test_tenant(), None), 1);
+        assert_eq!(distinct_stream_count(&state, &test_tenant(), crate::part::MetadataWindow::unbounded()), 1);
     }
 
     #[tokio::test]
@@ -1118,6 +1118,39 @@
         assert!(evaluation_times(0, (MAX_METRIC_EVALUATION_POINTS - 1) as i64, 1).is_ok());
     }
 
+    fn state_with_config(
+        config: Config,
+        memtable: Arc<MemTable>,
+        parts: Arc<PartRegistry>,
+    ) -> Arc<AppState> {
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
+        crate::test_support::state(
+            config.clone(),
+            memtable.clone(),
+            Arc::new(Journal::spawn(&config, memtable).unwrap()),
+            parts,
+            trace_parts,
+            None,
+        )
+    }
+
+    fn state_with(
+        data_dir: &std::path::Path,
+        memtable: Arc<MemTable>,
+        parts: Arc<PartRegistry>,
+    ) -> Arc<AppState> {
+        state_with_config(
+            Config {
+                data_dir: data_dir.to_path_buf(),
+                ..Config::default()
+            },
+            memtable,
+            parts,
+        )
+    }
+
     fn tenant_policy_state(
         data_dir: &std::path::Path,
         memtable: Arc<MemTable>,
@@ -1254,6 +1287,104 @@
             rendered.contains("loggytracy_tenant_policy_unknown_tenants 3\n"),
             "{rendered}"
         );
+    }
+
+    /// Grafana sends `start`/`end` on every label call. Answering from the
+    /// whole history both returns labels that do not exist in the requested
+    /// range and reads every part to find them.
+    #[tokio::test]
+    async fn metadata_endpoints_honour_the_requested_time_range() {
+        let data_dir = temp_dir();
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let hour_ns = 3_600_000_000_000i64;
+        let memtable = Arc::new(MemTable::new());
+        for (app, timestamp_ns) in [("recent", now_ns - hour_ns), ("ancient", now_ns - 48 * hour_ns)]
+        {
+            memtable.insert(
+                test_tenant(),
+                [("app".to_string(), app.to_string())].into_iter().collect(),
+                vec![LogEntry {
+                    timestamp_ns,
+                    line: format!("{app} line"),
+                    structured_metadata: Vec::new(),
+                }],
+            );
+        }
+        let state = state_with(&data_dir, memtable, Arc::new(PartRegistry::new()));
+
+        let window = |start_ns: i64| crate::query::MetadataParams {
+            start: Some(start_ns.to_string()),
+            end: Some(now_ns.to_string()),
+        };
+        let values_in = async |params| {
+            label_values(
+                State(state.clone()),
+                crate::tenant::test_tenant_headers(),
+                Path("app".to_string()),
+                Query(params),
+            )
+            .await
+            .unwrap()
+            .0
+            .data
+        };
+
+        assert_eq!(
+            values_in(window(now_ns - 2 * hour_ns)).await,
+            vec!["recent".to_string()],
+            "a value outside the range must not be offered"
+        );
+        let mut both = values_in(window(now_ns - 72 * hour_ns)).await;
+        both.sort();
+        assert_eq!(both, vec!["ancient".to_string(), "recent".to_string()]);
+
+        // A range entirely in the future is an empty answer, not an error:
+        // a dashboard asks this whenever its window outruns the data.
+        let empty = crate::query::MetadataParams {
+            start: Some((now_ns + hour_ns).to_string()),
+            end: Some((now_ns + 2 * hour_ns).to_string()),
+        };
+        assert!(values_in(empty).await.is_empty());
+    }
+
+    /// Every `match[]` is another full pass, so the count is a multiplier the
+    /// client picks. Left uncapped it was the cheapest way to make the server
+    /// do unbounded work.
+    #[tokio::test]
+    async fn series_refuses_more_matchers_than_the_limit() {
+        let data_dir = temp_dir();
+        let config = crate::config::Config {
+            data_dir: data_dir.clone(),
+            max_series_matchers: 2,
+            ..crate::config::Config::default()
+        };
+        config.validate().unwrap();
+        let state = state_with_config(config, Arc::new(MemTable::new()), Arc::new(PartRegistry::new()));
+
+        let one = "match%5B%5D=%7B%7D";
+        let accepted = series(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            RawQuery(Some([one, one].join("&"))),
+        )
+        .await;
+        assert!(accepted.is_ok());
+
+        let refused = match series(
+            State(state),
+            crate::tenant::test_tenant_headers(),
+            RawQuery(Some([one, one, one].join("&"))),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("more matchers than the limit must be refused"),
+        };
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+        assert!(refused.1.contains("match[]"), "{}", refused.1);
     }
 
     /// A tenant the control plane never mentioned reads its full history.
@@ -1402,6 +1533,7 @@
             State(state.clone()),
             crate::tenant::test_tenant_headers(),
             Path("app".to_string()),
+            Query(Default::default()),
         )
         .await
         .unwrap()
@@ -1409,7 +1541,11 @@
         .data;
         assert_eq!(values, vec!["fresh".to_string()]);
 
-        let stats = index_stats(State(state.clone()), crate::tenant::test_tenant_headers())
+        let stats = index_stats(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Query(Default::default()),
+        )
             .await
             .unwrap()
             .0;

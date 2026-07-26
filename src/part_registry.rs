@@ -6,7 +6,9 @@ use std::sync::{Arc, RwLock};
 use crate::logql::{LabelMatcher, LineFilter};
 use crate::memtable::{IndexStats, Labels, QueryResult, StreamResult};
 use crate::object_storage::Manifest;
-use crate::part::{ExactFieldPredicate, ExactFieldPruning, Part, PartReader, discover_parts};
+use crate::part::{
+    ExactFieldPredicate, ExactFieldPruning, MetadataWindow, Part, PartReader, discover_parts,
+};
 use crate::tenant::TenantId;
 
 pub struct PartRegistry {
@@ -425,24 +427,17 @@ impl PartRegistry {
     /// this prunes at part granularity: a part entirely below the floor
     /// contributes nothing, and one that straddles it contributes all of its
     /// labels. `None` prunes nothing.
-    fn within_retention(
-        reader: &PartReader,
-        tenant: &TenantId,
-        retention_floor_ns: Option<i64>,
-    ) -> bool {
-        let Some(floor_ns) = retention_floor_ns else {
-            return true;
-        };
+    fn within_window(reader: &PartReader, tenant: &TenantId, window: MetadataWindow) -> bool {
         reader
             .meta()
             .tenant_segment(tenant)
-            .is_some_and(|segment| segment.max_ts_ns >= floor_ns)
+            .is_some_and(|segment| window.overlaps(segment.min_ts_ns, segment.max_ts_ns))
     }
 
-    pub fn label_names(&self, tenant: &TenantId, retention_floor_ns: Option<i64>) -> Vec<String> {
+    pub fn label_names(&self, tenant: &TenantId, window: MetadataWindow) -> Vec<String> {
         let mut set = BTreeSet::new();
         for reader in self.snapshot() {
-            if !Self::within_retention(&reader, tenant, retention_floor_ns) {
+            if !Self::within_window(&reader, tenant, window) {
                 continue;
             }
             for name in reader.label_names(tenant) {
@@ -456,11 +451,11 @@ impl PartRegistry {
         &self,
         tenant: &TenantId,
         name: &str,
-        retention_floor_ns: Option<i64>,
+        window: MetadataWindow,
     ) -> Vec<String> {
         let mut set = BTreeSet::new();
         for reader in self.snapshot() {
-            if !Self::within_retention(&reader, tenant, retention_floor_ns) {
+            if !Self::within_window(&reader, tenant, window) {
                 continue;
             }
             for v in reader.label_values(tenant, name) {
@@ -474,11 +469,11 @@ impl PartRegistry {
         &self,
         tenant: &TenantId,
         matchers: &[LabelMatcher],
-        retention_floor_ns: Option<i64>,
+        window: MetadataWindow,
     ) -> Vec<Labels> {
         let mut set: std::collections::BTreeSet<Labels> = std::collections::BTreeSet::new();
         for reader in self.snapshot() {
-            if !Self::within_retention(&reader, tenant, retention_floor_ns) {
+            if !Self::within_window(&reader, tenant, window) {
                 continue;
             }
             for labels in reader.series(tenant, matchers) {
@@ -509,12 +504,12 @@ impl PartRegistry {
         }
     }
 
-    pub fn stats(&self, tenant: &TenantId, retention_floor_ns: Option<i64>) -> IndexStats {
+    pub fn stats(&self, tenant: &TenantId, window: MetadataWindow) -> IndexStats {
         let mut stream_set: BTreeSet<Labels> = BTreeSet::new();
         let mut entries = 0usize;
         let mut bytes = 0u64;
         for reader in self.snapshot() {
-            if !Self::within_retention(&reader, tenant, retention_floor_ns) {
+            if !Self::within_window(&reader, tenant, window) {
                 continue;
             }
             let Some(segment) = reader.meta().tenant_segment(tenant) else {

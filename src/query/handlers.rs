@@ -4,7 +4,7 @@ pub async fn query_range(
     Query(params): Query<QueryRangeParams>,
 ) -> Result<Json<LokiResponse<QueryRangeData>>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(crate::tenant::TenantError::into_http)?;
     let parsed = logql::parse_expr(&params.query)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
 
@@ -133,7 +133,7 @@ pub async fn query(
     Query(params): Query<QueryParams>,
 ) -> Result<Json<LokiResponse<QueryRangeData>>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(crate::tenant::TenantError::into_http)?;
     let parsed = logql::parse_expr(&params.query)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
 
@@ -275,18 +275,137 @@ fn duration_to_i64_ns(duration: std::time::Duration) -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+/// What every metadata endpoint has to acquire before it touches a registry.
+///
+/// These four used to have none of it: no concurrency bound, no deadline, and
+/// no time range, so each call read every part of every tenant it was allowed
+/// to see. They share the log scan semaphore rather than getting their own,
+/// because they compete for the same thing a log query does — the part readers.
+struct MetadataGuard {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    window: crate::part::MetadataWindow,
+    deadline: std::time::Instant,
+}
+
+impl MetadataGuard {
+    async fn acquire(
+        state: &Arc<AppState>,
+        tenant: &crate::tenant::TenantId,
+        params: &crate::query::MetadataParams,
+    ) -> Result<Option<Self>, (StatusCode, String)> {
+        let window = metadata_window(state, params)?.clamped_to(state.tenant_policy.query_floor_ns(tenant));
+        // An empty window is a valid question with an empty answer, not an
+        // error: a tenant whose retention already passed the requested range
+        // asks this on every dashboard refresh.
+        if window.is_empty() {
+            return Ok(None);
+        }
+        let permit = state
+            .query_scan_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "query semaphore closed".to_string(),
+                )
+            })?;
+        Ok(Some(Self {
+            _permit: permit,
+            window,
+            deadline: std::time::Instant::now() + state.config.max_query_runtime,
+        }))
+    }
+
+    /// Checked between units of work rather than enforced by a timer: these
+    /// lookups are synchronous walks, so the only place a deadline can act is
+    /// where the walk yields control back.
+    fn check_deadline(&self) -> Result<(), (StatusCode, String)> {
+        if std::time::Instant::now() > self.deadline {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "metadata query exceeded its time budget".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `series` takes its query string raw so it can read repeated `match[]`, so
+/// the time bounds have to come out of the same string rather than from an
+/// extractor.
+fn metadata_params_from_raw(
+    raw: &Option<String>,
+) -> Result<crate::query::MetadataParams, (StatusCode, String)> {
+    let Some(query) = raw else {
+        return Ok(crate::query::MetadataParams::default());
+    };
+    let mut params = crate::query::MetadataParams::default();
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "start" => params.start = Some(value.into_owned()),
+            "end" => params.end = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(params)
+}
+
+fn metadata_window(
+    state: &Arc<AppState>,
+    params: &crate::query::MetadataParams,
+) -> Result<crate::part::MetadataWindow, (StatusCode, String)> {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    let end_ns = match params.end.as_deref() {
+        Some(raw) => crate::query::parse_time_ns(raw).map_err(|e| (StatusCode::BAD_REQUEST, e))?,
+        None => now_ns,
+    };
+    // Absent `start` means the configured maximum range back from `end`, not
+    // all of history: an unbounded default here is what made these endpoints
+    // read every part.
+    let start_ns = match params.start.as_deref() {
+        Some(raw) => crate::query::parse_time_ns(raw).map_err(|e| (StatusCode::BAD_REQUEST, e))?,
+        None => state
+            .config
+            .max_query_range
+            .map(duration_to_i64_ns)
+            .map(|range| end_ns.saturating_sub(range))
+            .unwrap_or(i64::MIN),
+    };
+    if start_ns > end_ns {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "start must not be after end".to_string(),
+        ));
+    }
+    validate_query_range(&state.config, start_ns, end_ns)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(crate::part::MetadataWindow { start_ns, end_ns })
+}
+
 pub async fn labels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<crate::query::MetadataParams>,
 ) -> Result<Json<LokiResponse<Vec<String>>>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
+        .map_err(crate::tenant::TenantError::into_http)?;
+    let Some(guard) = MetadataGuard::acquire(&state, &tenant, &params).await? else {
+        return Ok(Json(LokiResponse {
+            status: "success",
+            data: Vec::new(),
+        }));
+    };
     let mut names = std::collections::BTreeSet::new();
-    for n in state.memtable.label_names(&tenant, retention_floor_ns) {
+    for n in state.memtable.label_names(&tenant, guard.window) {
         names.insert(n);
     }
-    for n in state.parts.label_names(&tenant, retention_floor_ns) {
+    guard.check_deadline()?;
+    for n in state.parts.label_names(&tenant, guard.window) {
         names.insert(n);
     }
     Ok(Json(LokiResponse {
@@ -299,15 +418,22 @@ pub async fn label_values(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(params): Query<crate::query::MetadataParams>,
 ) -> Result<Json<LokiResponse<Vec<String>>>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
+        .map_err(crate::tenant::TenantError::into_http)?;
+    let Some(guard) = MetadataGuard::acquire(&state, &tenant, &params).await? else {
+        return Ok(Json(LokiResponse {
+            status: "success",
+            data: Vec::new(),
+        }));
+    };
     let mut values = std::collections::BTreeSet::new();
-    for v in state.memtable.label_values(&tenant, &name, retention_floor_ns) {
+    for v in state.memtable.label_values(&tenant, &name, guard.window) {
         values.insert(v);
     }
-    for v in state.parts.label_values(&tenant, &name, retention_floor_ns) {
+    guard.check_deadline()?;
+    for v in state.parts.label_values(&tenant, &name, guard.window) {
         values.insert(v);
     }
     Ok(Json(LokiResponse {
@@ -379,13 +505,21 @@ pub async fn buildinfo() -> Json<serde_json::Value> {
 pub async fn index_stats(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<crate::query::MetadataParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
-    let mem = state.memtable.stats(&tenant, retention_floor_ns);
-    let disk = state.parts.stats(&tenant, retention_floor_ns);
-    let stream_count = distinct_stream_count(&state, &tenant, retention_floor_ns);
+        .map_err(crate::tenant::TenantError::into_http)?;
+    let Some(guard) = MetadataGuard::acquire(&state, &tenant, &params).await? else {
+        return Ok(Json(serde_json::json!({
+            "status": "success",
+            "data": { "streams": 0, "entries": 0, "bytes": 0 }
+        })));
+    };
+    let mem = state.memtable.stats(&tenant, guard.window);
+    guard.check_deadline()?;
+    let disk = state.parts.stats(&tenant, guard.window);
+    guard.check_deadline()?;
+    let stream_count = distinct_stream_count(&state, &tenant, guard.window);
     Ok(Json(serde_json::json!({
         "status": "success",
         "data": {
@@ -623,23 +757,35 @@ pub async fn series(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<LokiResponse<Vec<HashMap<String, String>>>>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
+        .map_err(crate::tenant::TenantError::into_http)?;
+    // `series` is the one metadata endpoint whose cost the client chooses:
+    // every `match[]` is another full pass. The cap bounds that multiplier,
+    // and the guard bounds each pass.
     let matchers = extract_match_params(&raw);
+    if matchers.len() > state.config.max_series_matchers {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "series request has {} match[] selectors, exceeding the maximum of {}",
+                matchers.len(),
+                state.config.max_series_matchers
+            ),
+        ));
+    }
+    let params = metadata_params_from_raw(&raw)?;
+    let Some(guard) = MetadataGuard::acquire(&state, &tenant, &params).await? else {
+        return Ok(Json(LokiResponse {
+            status: "success",
+            data: Vec::new(),
+        }));
+    };
     let mut all_series: Vec<Labels> = Vec::new();
     for matcher_str in &matchers {
+        guard.check_deadline()?;
         let parsed = logql::parse(matcher_str)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
-        all_series.extend(
-            state
-                .memtable
-                .series(&tenant, &parsed.matchers, retention_floor_ns),
-        );
-        all_series.extend(
-            state
-                .parts
-                .series(&tenant, &parsed.matchers, retention_floor_ns),
-        );
+        all_series.extend(state.memtable.series(&tenant, &parsed.matchers, guard.window));
+        all_series.extend(state.parts.series(&tenant, &parsed.matchers, guard.window));
     }
     all_series.sort();
     all_series.dedup();

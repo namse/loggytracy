@@ -12,6 +12,14 @@ pub struct Config {
     /// and `missing_tenant_policy` accepts it.
     pub default_tenant: TenantId,
     pub missing_tenant_policy: MissingTenantPolicy,
+    /// Tenants this instance accepts, or `None` for any well-formed id.
+    ///
+    /// The header is supplied by whatever sits in front of the engine and is
+    /// trusted without proof, so without a list any caller that can reach the
+    /// listener can mint tenants. Each new one costs a row group per part it
+    /// appears in, a `meta.json` segment, and a policy the control plane never
+    /// pushed — none of which anything else bounds.
+    pub allowed_tenants: Option<std::collections::BTreeSet<TenantId>>,
     pub max_batch_bytes: usize,
     pub max_batch_ms: u64,
     /// Largest accepted compressed push body. Also bounds the length a snappy
@@ -80,6 +88,9 @@ pub struct Config {
     pub max_metric_rows: usize,
     pub max_metric_series: usize,
     pub max_metric_samples: usize,
+    /// How many `match[]` selectors one `series` request may carry. Each one
+    /// is a separate full pass, so this bounds a multiplier the client picks.
+    pub max_series_matchers: usize,
     pub max_concurrent_query_scans: usize,
     pub max_concurrent_metric_evaluations: usize,
     pub max_query_runtime: Duration,
@@ -103,6 +114,7 @@ impl Default for Config {
             default_tenant: TenantId::parse("default")
                 .expect("the built-in default tenant is valid"),
             missing_tenant_policy: MissingTenantPolicy::UseDefault,
+            allowed_tenants: None,
             max_batch_bytes: 1024 * 1024,
             max_batch_ms: 200,
             max_push_bytes: 16 * 1024 * 1024,
@@ -146,6 +158,7 @@ impl Default for Config {
             max_metric_rows: 1_000_000,
             max_metric_series: 100_000,
             max_metric_samples: 5_000_000,
+            max_series_matchers: 32,
             max_concurrent_query_scans: 8,
             max_concurrent_metric_evaluations: 4,
             max_query_runtime: Duration::from_secs(30),
@@ -174,6 +187,7 @@ impl Config {
                     .map_err(|error| format!("invalid LOGGYTRACY_DEFAULT_TENANT: {error}"))?,
                 Err(_) => defaults.default_tenant.clone(),
             },
+            allowed_tenants: env_tenant_set("LOGGYTRACY_ALLOWED_TENANTS")?,
             missing_tenant_policy: match std::env::var("LOGGYTRACY_MISSING_TENANT_POLICY") {
                 Ok(raw) => raw.parse().map_err(|error| {
                     format!("invalid LOGGYTRACY_MISSING_TENANT_POLICY: {error}")
@@ -338,6 +352,10 @@ impl Config {
                 "LOGGYTRACY_MAX_METRIC_SAMPLES",
                 defaults.max_metric_samples,
             )?,
+            max_series_matchers: env_positive_usize(
+                "LOGGYTRACY_MAX_SERIES_MATCHERS",
+                defaults.max_series_matchers,
+            )?,
             max_concurrent_query_scans: env_positive_usize(
                 "LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS",
                 defaults.max_concurrent_query_scans,
@@ -458,6 +476,18 @@ selected above the read budget can never be merged",
         positive_duration("max_retention_runtime", self.max_retention_runtime)?;
         // A silently ignored retention setting is the worst possible outcome,
         // so the two modes fail at startup instead of quietly picking one.
+        // A default tenant outside the list would be minted by every request
+        // that omits the header, which is exactly what the list is for.
+        if let Some(allowed) = &self.allowed_tenants
+            && self.missing_tenant_policy == MissingTenantPolicy::UseDefault
+            && !allowed.contains(&self.default_tenant)
+        {
+            return Err(format!(
+                "default tenant {} is not in LOGGYTRACY_ALLOWED_TENANTS: add it, or set \
+LOGGYTRACY_MISSING_TENANT_POLICY=reject so headerless requests are refused instead",
+                self.default_tenant
+            ));
+        }
         if self.tenant_policy_token.is_some() && self.retention_period.is_some() {
             return Err(
                 "LOGGYTRACY_RETENTION_PERIOD and LOGGYTRACY_TENANT_POLICY_TOKEN are mutually \
@@ -539,6 +569,25 @@ where
             .map_err(|error| format!("invalid {name} {value:?}: {error}")),
         Err(_) => Ok(default),
     }
+}
+
+/// A comma-separated tenant allowlist. Empty or unset means no list at all,
+/// which is deliberately different from an empty list: the latter would accept
+/// nobody and is more likely a mistake than an intent.
+fn env_tenant_set(name: &str) -> Result<Option<std::collections::BTreeSet<TenantId>>, String> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(None);
+    };
+    let mut tenants = std::collections::BTreeSet::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        tenants.insert(
+            TenantId::parse(entry).map_err(|error| format!("invalid {name} entry: {error}"))?,
+        );
+    }
+    if tenants.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(tenants))
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64, String> {
@@ -703,6 +752,31 @@ mod tests {
             assert!(config.validate().is_err(), "{invalid} must be rejected");
         }
         config.retention_rewrite_threshold = 1.0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_that_the_default_tenant_is_itself_allowed() {
+        let mut config = Config {
+            allowed_tenants: Some(
+                [TenantId::parse("acme").expect("valid")]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Config::default()
+        };
+        // The default tenant is what a headerless request becomes, so leaving
+        // it out of the list would mint an unlisted tenant on every such push.
+        let error = config
+            .validate()
+            .expect_err("a default tenant outside the list must not start");
+        assert!(error.contains("default tenant"), "{error}");
+
+        config.missing_tenant_policy = MissingTenantPolicy::Reject;
+        assert!(config.validate().is_ok());
+
+        config.missing_tenant_policy = MissingTenantPolicy::UseDefault;
+        config.default_tenant = TenantId::parse("acme").expect("valid");
         assert!(config.validate().is_ok());
     }
 

@@ -92,6 +92,8 @@ impl std::str::FromStr for MissingTenantPolicy {
 pub enum TenantError {
     Missing,
     Invalid(String),
+    /// Well-formed, but not one this instance serves.
+    NotAllowed(TenantId),
 }
 
 impl fmt::Display for TenantError {
@@ -99,6 +101,12 @@ impl fmt::Display for TenantError {
         match self {
             Self::Missing => write!(f, "{TENANT_HEADER} is required but was not supplied"),
             Self::Invalid(reason) => write!(f, "invalid {TENANT_HEADER}: {reason}"),
+            // Names the tenant rather than the list: an operator debugging a
+            // rejected client needs to see what was sent, and the list is
+            // their own configuration.
+            Self::NotAllowed(tenant) => {
+                write!(f, "tenant {tenant} is not served by this instance")
+            }
         }
     }
 }
@@ -113,13 +121,44 @@ pub fn resolve(
     raw: Option<&str>,
     default_tenant: &TenantId,
     policy: MissingTenantPolicy,
+    allowed: Option<&std::collections::BTreeSet<TenantId>>,
 ) -> Result<TenantId, TenantError> {
-    match raw {
-        Some(value) => TenantId::parse(value).map_err(TenantError::Invalid),
+    let tenant = match raw {
+        Some(value) => TenantId::parse(value).map_err(TenantError::Invalid)?,
         None => match policy {
-            MissingTenantPolicy::UseDefault => Ok(default_tenant.clone()),
-            MissingTenantPolicy::Reject => Err(TenantError::Missing),
+            MissingTenantPolicy::UseDefault => default_tenant.clone(),
+            MissingTenantPolicy::Reject => return Err(TenantError::Missing),
         },
+    };
+    // Checked after parsing so a malformed id is still reported as malformed:
+    // the two failures send an operator to different places.
+    if let Some(allowed) = allowed
+        && !allowed.contains(&tenant)
+    {
+        return Err(TenantError::NotAllowed(tenant));
+    }
+    Ok(tenant)
+}
+
+impl TenantError {
+    /// An unlisted tenant is a well-formed request this instance declines to
+    /// serve, which is 403 rather than 400: the client has nothing to fix.
+    pub fn http_status(&self) -> axum::http::StatusCode {
+        match self {
+            Self::NotAllowed(_) => axum::http::StatusCode::FORBIDDEN,
+            Self::Missing | Self::Invalid(_) => axum::http::StatusCode::BAD_REQUEST,
+        }
+    }
+
+    pub fn into_http(self) -> (axum::http::StatusCode, String) {
+        (self.http_status(), self.to_string())
+    }
+
+    pub fn into_grpc(self) -> tonic::Status {
+        match self {
+            Self::NotAllowed(_) => tonic::Status::permission_denied(self.to_string()),
+            Self::Missing | Self::Invalid(_) => tonic::Status::invalid_argument(self.to_string()),
+        }
     }
 }
 
@@ -136,7 +175,12 @@ pub fn from_headers(
         ),
         None => None,
     };
-    resolve(raw, &config.default_tenant, config.missing_tenant_policy)
+    resolve(
+        raw,
+        &config.default_tenant,
+        config.missing_tenant_policy,
+        config.allowed_tenants.as_ref(),
+    )
 }
 
 /// Resolve the tenant for an OTLP gRPC request.
@@ -152,7 +196,12 @@ pub fn from_grpc_metadata(
         ),
         None => None,
     };
-    resolve(raw, &config.default_tenant, config.missing_tenant_policy)
+    resolve(
+        raw,
+        &config.default_tenant,
+        config.missing_tenant_policy,
+        config.allowed_tenants.as_ref(),
+    )
 }
 
 /// The tenant every test uses unless it is specifically exercising isolation.
@@ -208,21 +257,76 @@ mod tests {
         assert!(TenantId::parse("a\0b").is_err());
     }
 
+    /// The list is checked after parsing, so the two rejections stay distinct:
+    /// a malformed id is the client's bug, an unlisted one is the operator's
+    /// configuration.
+    #[test]
+    fn resolve_rejects_a_tenant_outside_the_allowlist() {
+        let default_tenant = TenantId::parse("default").unwrap();
+        let allowed: std::collections::BTreeSet<TenantId> =
+            [TenantId::parse("acme").unwrap()].into_iter().collect();
+
+        assert_eq!(
+            resolve(
+                Some("acme"),
+                &default_tenant,
+                MissingTenantPolicy::UseDefault,
+                Some(&allowed),
+            )
+            .unwrap(),
+            TenantId::parse("acme").unwrap()
+        );
+        assert!(matches!(
+            resolve(
+                Some("stranger"),
+                &default_tenant,
+                MissingTenantPolicy::UseDefault,
+                Some(&allowed),
+            ),
+            Err(TenantError::NotAllowed(_))
+        ));
+        assert!(matches!(
+            resolve(
+                Some("not a tenant"),
+                &default_tenant,
+                MissingTenantPolicy::UseDefault,
+                Some(&allowed),
+            ),
+            Err(TenantError::Invalid(_))
+        ));
+        // The default is subject to the list too, which is why `validate`
+        // refuses a configuration that leaves it out.
+        assert!(matches!(
+            resolve(
+                None,
+                &default_tenant,
+                MissingTenantPolicy::UseDefault,
+                Some(&allowed),
+            ),
+            Err(TenantError::NotAllowed(_))
+        ));
+    }
+
     #[test]
     fn resolve_applies_the_missing_header_policy() {
         let default_tenant = TenantId::parse("default").unwrap();
 
         assert_eq!(
-            resolve(None, &default_tenant, MissingTenantPolicy::UseDefault).unwrap(),
+            resolve(None, &default_tenant, MissingTenantPolicy::UseDefault, None).unwrap(),
             default_tenant
         );
         assert!(matches!(
-            resolve(None, &default_tenant, MissingTenantPolicy::Reject),
+            resolve(None, &default_tenant, MissingTenantPolicy::Reject, None),
             Err(TenantError::Missing)
         ));
         // An empty header is a client bug, not an absent header.
         assert!(matches!(
-            resolve(Some(""), &default_tenant, MissingTenantPolicy::UseDefault),
+            resolve(
+                Some(""),
+                &default_tenant,
+                MissingTenantPolicy::UseDefault,
+                None
+            ),
             Err(TenantError::Invalid(_))
         ));
     }

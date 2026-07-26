@@ -74,6 +74,14 @@ pub struct QueryRangeParams {
     step: Option<String>,
 }
 
+/// The `start`/`end` every Grafana metadata call sends and these endpoints
+/// used to ignore.
+#[derive(Default, serde::Deserialize)]
+pub struct MetadataParams {
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 pub struct QueryParams {
     query: String,
@@ -243,11 +251,11 @@ fn parse_limit(limit: Option<usize>, max_limit: usize) -> Result<usize, String> 
 fn distinct_stream_count(
     state: &AppState,
     tenant: &TenantId,
-    retention_floor_ns: Option<i64>,
+    window: crate::part::MetadataWindow,
 ) -> usize {
     let mut streams = std::collections::BTreeSet::new();
-    streams.extend(state.memtable.series(tenant, &[], retention_floor_ns));
-    streams.extend(state.parts.series(tenant, &[], retention_floor_ns));
+    streams.extend(state.memtable.series(tenant, &[], window));
+    streams.extend(state.parts.series(tenant, &[], window));
     streams.len()
 }
 

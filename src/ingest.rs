@@ -124,7 +124,7 @@ async fn push_inner(
     // Resolve the tenant before anything else touches the body: every input
     // limit, and the journal append itself, is attributed to it.
     let tenant = crate::tenant::from_headers(&headers, &state.config)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(crate::tenant::TenantError::into_http)?;
 
     let content_type = headers
         .get("content-type")
@@ -640,6 +640,54 @@ mod tests {
         )
         .await
         .expect("a retired backlog accepts writes again");
+    }
+
+    #[tokio::test]
+    async fn push_refuses_a_tenant_outside_the_allowlist() {
+        let config = Config {
+            data_dir: tmp_data_dir("tenant_allowlist"),
+            allowed_tenants: Some([crate::tenant::test_tenant()].into_iter().collect()),
+            ..Config::default()
+        };
+        let state = limits_state(config).await;
+
+        push(
+            State(state.clone()),
+            protobuf_headers(),
+            Bytes::from(build_snappy_push("listed", "accepted", now_secs())),
+        )
+        .await
+        .expect("a listed tenant is accepted");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(crate::tenant::TENANT_HEADER, "stranger".parse().unwrap());
+        headers.insert("content-type", "application/x-protobuf".parse().unwrap());
+        let refused = push(
+            State(state.clone()),
+            headers,
+            Bytes::from(build_snappy_push("stranger", "refused", now_secs())),
+        )
+        .await
+        .expect_err("an unlisted tenant must be refused");
+
+        // 403, not 400: the request is well formed and there is nothing the
+        // client can change about it.
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        assert!(
+            state
+                .memtable
+                .query(
+                    &crate::tenant::TenantId::parse("stranger").unwrap(),
+                    &[],
+                    &[],
+                    i64::MIN,
+                    i64::MAX,
+                    10,
+                    true
+                )
+                .is_empty(),
+            "a refused tenant must not have been written"
+        );
     }
 
     #[tokio::test]
