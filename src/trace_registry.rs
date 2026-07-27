@@ -145,6 +145,28 @@ impl TraceRegistry {
             .collect()
     }
 
+    /// The same set narrowed to a time range. Restoring a part is a download,
+    /// so this decides the cost of the request before any of it is paid.
+    pub fn tenant_part_ids_in_range(
+        &self,
+        tenant: &TenantId,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> std::collections::HashSet<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, reader)| {
+                reader
+                    .part()
+                    .meta
+                    .tenant_overlaps_range(tenant, start_ns, end_ns)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     pub fn missing_data_ids(
         &self,
         ids: &std::collections::HashSet<String>,
@@ -203,6 +225,17 @@ impl TraceRegistry {
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
     ) -> Result<Vec<TraceSpan>, String> {
+        self.query_range(tenant, None, scan_limit, cancellation)
+    }
+
+    /// Every span for the tenant, or only those starting inside `range`.
+    pub fn query_range(
+        &self,
+        tenant: &TenantId,
+        range: Option<(i64, i64)>,
+        scan_limit: Option<usize>,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Vec<TraceSpan>, String> {
         let mut spans = Vec::new();
         for reader in self.snapshot() {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -211,7 +244,13 @@ impl TraceRegistry {
             let remaining = scan_limit
                 .map(|limit| limit.saturating_sub(spans.len()))
                 .unwrap_or(usize::MAX);
-            spans.extend(reader.query_all_limited(tenant, remaining, cancellation)?);
+            let part_spans = match range {
+                Some((start_ns, end_ns)) => {
+                    reader.query_range_limited(tenant, start_ns, end_ns, remaining, cancellation)?
+                }
+                None => reader.query_all_limited(tenant, remaining, cancellation)?,
+            };
+            spans.extend(part_spans);
         }
         spans.sort_by(|left, right| {
             left.start_time_ns

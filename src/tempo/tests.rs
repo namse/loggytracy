@@ -320,13 +320,81 @@
         assert!(response["traces"].as_array().unwrap().is_empty());
     }
 
-    /// The tag endpoints have no range of their own, so they drop expired
-    /// spans before collecting names and values.
+    /// The tag endpoints now take Grafana's range, so a dropdown answers for
+    /// the window on screen instead of for the whole history — and, because the
+    /// range also narrows the pin set, without restoring every part to do it.
+    #[tokio::test]
+    async fn the_tag_endpoints_answer_for_the_requested_window() {
+        let (state, now_ns) = one_hour_floor();
+
+        let in_window = search_tags(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Query(TagParams {
+                start: Some((now_ns - 30 * 60 * 1_000_000_000).to_string()),
+                end: Some(now_ns.to_string()),
+                ..TagParams::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let names: Vec<&str> = in_window["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"fresh.attribute"), "{names:?}");
+
+        // A window that ends before anything was written has nothing to say,
+        // and says it without reading a part.
+        let empty = search_tags(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Query(TagParams {
+                start: Some((now_ns - 4 * HOUR_NS).to_string()),
+                end: Some((now_ns - 3 * HOUR_NS).to_string()),
+                ..TagParams::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(
+            empty["tags"].as_array().unwrap().is_empty(),
+            "a window below the retention floor holds no tags: {empty:?}"
+        );
+        // The intrinsics are a fixed list, not data, so they stay.
+        assert_eq!(empty["scopes"][2]["tags"][0], "duration");
+
+        let values = search_tag_values(
+            State(state),
+            crate::tenant::test_tenant_headers(),
+            Path("fresh.attribute".to_string()),
+            Query(TagParams {
+                start: Some((now_ns - 4 * HOUR_NS).to_string()),
+                end: Some((now_ns - 3 * HOUR_NS).to_string()),
+                ..TagParams::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(values["values"].as_array().unwrap().is_empty());
+    }
+
+    /// The tag endpoints drop expired spans before collecting names and
+    /// values, whether or not the client sent a range.
     #[tokio::test]
     async fn the_tag_endpoints_ignore_spans_below_the_retention_floor() {
         let (state, _now_ns) = one_hour_floor();
 
-        let tags = search_tags(State(state.clone()), crate::tenant::test_tenant_headers())
+        let tags = search_tags(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Query(TagParams::default()),
+        )
             .await
             .unwrap()
             .0;
@@ -343,6 +411,7 @@
             State(state.clone()),
             crate::tenant::test_tenant_headers(),
             Path("old.attribute".to_string()),
+            Query(TagParams::default()),
         )
         .await
         .unwrap()
@@ -353,6 +422,7 @@
             State(state),
             crate::tenant::test_tenant_headers(),
             Path("fresh.attribute".to_string()),
+            Query(TagParams::default()),
         )
         .await
         .unwrap()
@@ -405,7 +475,11 @@
         .0;
         assert_eq!(found["traces"].as_array().unwrap().len(), 3);
 
-        let tags = search_tags(State(state.clone()), crate::tenant::test_tenant_headers())
+        let tags = search_tags(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Query(TagParams::default()),
+        )
             .await
             .unwrap()
             .0;
@@ -421,6 +495,7 @@
             State(state),
             crate::tenant::test_tenant_headers(),
             Path("old.attribute".to_string()),
+            Query(TagParams::default()),
         )
         .await
         .unwrap()

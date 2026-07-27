@@ -59,6 +59,46 @@ impl TracePartMeta {
             .ok()
             .map(|index| self.tenants[index].row_group_start..self.tenants[index].row_group_end)
     }
+
+    /// The tenant's row groups whose span timestamps can reach `[start_ns,
+    /// end_ns]`.
+    ///
+    /// The tenant segment carries no timestamps of its own, but row groups do
+    /// and a tenant owns a contiguous range of them, so the bounds are already
+    /// on hand. Without this a tag lookup restores and scans every part the
+    /// tenant has ever written, which is the whole history for one dropdown.
+    pub fn tenant_row_groups_in_range(
+        &self,
+        tenant: &TenantId,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Vec<usize> {
+        let Some(groups) = self.tenant_row_groups(tenant) else {
+            return Vec::new();
+        };
+        groups
+            .filter(|row_group| {
+                let index = *row_group as usize;
+                match (
+                    self.row_group_min_ts.get(index),
+                    self.row_group_max_ts.get(index),
+                ) {
+                    (Some(min_ts), Some(max_ts)) => *max_ts >= start_ns && *min_ts <= end_ns,
+                    // Metadata that cannot answer must not be able to hide
+                    // data: an absent bound scans rather than prunes.
+                    _ => true,
+                }
+            })
+            .map(|row_group| row_group as usize)
+            .collect()
+    }
+
+    /// Whether any of the tenant's row groups reaches the range at all.
+    pub fn tenant_overlaps_range(&self, tenant: &TenantId, start_ns: i64, end_ns: i64) -> bool {
+        !self
+            .tenant_row_groups_in_range(tenant, start_ns, end_ns)
+            .is_empty()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -617,6 +657,28 @@ impl TracePartReader {
         };
         let selected: Vec<usize> = groups.map(|row_group| row_group as usize).collect();
         self.query_selected(tenant, selected, None, limit, cancellation)
+    }
+
+    /// The tenant's spans that start inside `[start_ns, end_ns]`.
+    ///
+    /// Row groups outside the range are never read, and the surviving spans
+    /// are filtered exactly, so the answer does not depend on where the flush
+    /// happened to cut a row group.
+    pub fn query_range_limited(
+        &self,
+        tenant: &TenantId,
+        start_ns: i64,
+        end_ns: i64,
+        limit: usize,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Vec<TraceSpan>, String> {
+        let selected = self
+            .part
+            .meta
+            .tenant_row_groups_in_range(tenant, start_ns, end_ns);
+        let mut spans = self.query_selected(tenant, selected, None, limit, cancellation)?;
+        spans.retain(|span| span.start_time_ns >= start_ns && span.start_time_ns <= end_ns);
+        Ok(spans)
     }
 
     fn query_selected(

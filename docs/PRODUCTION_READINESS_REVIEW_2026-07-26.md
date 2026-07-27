@@ -204,6 +204,7 @@ group당 bloom 필터가 테넌트 수에 비례한다. 압축률도 무너진�
 | P1-8 merge 상한 단위 | 수정됨 | part meta에 `materialized_bytes`. 그룹 선택과 읽기 예산이 같은 단위를 쓰고, `validate`가 두 상한의 순서를 강제한다 |
 | N4 `/metrics` O(parts) | 수정됨 | merge debt는 merge 워커가, unknown tenant는 retention 워커가 발행. 스크레이프는 읽기만 한다 |
 | N2 테넌트 allowlist | 수정됨 | `LOGGYTRACY_ALLOWED_TENANTS`. 목록 밖 테넌트는 403 |
+| N6 Tempo 시간 프루닝 | **부분 수정** | `search_tags`·`search_tag_values`가 `start`/`end`를 받고, 그 범위가 pin 집합과 row group 선택까지 내려간다. `search`는 손대지 않았다 — 아래 참고 |
 | P2-2 메타데이터 가드 | 수정됨 | semaphore·타임아웃·`start`/`end`·`match[]` 개수 상한 |
 | P1-4 writer fencing | 수정됨 | manifest의 `writer_epoch`. 시작 시 claim, 모든 CAS에서 검증, fence 시 self-fence 후 비정상 종료 |
 
@@ -328,7 +329,13 @@ fence 감지는 `ObjectStorage`가 `ShutdownState`에 직접 알린다. 워커�
 ### 게이트 4 — 규모 검증
 
 - [ ] N3 테넌트 다수 환경의 row group 파편화 측정
-- [ ] N6 Tempo 시간 프루닝
+- [x] N6 Tempo 태그 엔드포인트 시간 프루닝
+- [ ] **N6 잔여: `search`의 시간 프루닝은 의미 결정이 먼저다.** 지금 `search`는 트레이스의
+      *가장 이른* 스팬이 창 안에 있을 때만 반환한다. 그 스팬이 창이 닿지 않는 row group에
+      있을 수 있으므로, 프루닝은 비용만이 아니라 **어떤 트레이스가 나오는지를 바꾼다**.
+      경계에 걸친 트레이스에서 `startTimeUnixNano`와 `durationMs`도 달라진다.
+      Tempo 본래 의미는 "스팬 하나라도 창에 겹치면 반환"이라 지금 구현이 더 좁다.
+      의미를 Tempo에 맞추기로 하면 프루닝은 따라온다 — 순서가 그 반대다
 - [ ] P1-11 part 수 O(N) 경로 개선
 - [ ] P1-5 memtable flush deep clone 제거
 - [ ] P1-9 eviction을 `spawn_blocking` + 인메모리 메타데이터로

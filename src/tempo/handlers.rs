@@ -107,12 +107,18 @@ pub async fn search(
         .transpose()
         .map_err(client_error)?;
 
-    let guard = pin_all_trace_parts(&state, &tenant).await?;
+    // Deliberately unrestricted, unlike the tag endpoints below. A trace is
+    // returned on its *earliest* span falling inside the window, and that span
+    // can sit in a row group the window does not touch, so pruning here would
+    // change which traces come back rather than only what it costs to find
+    // them. Narrowing this needs the search semantics settled first.
+    let guard = pin_all_trace_parts(&state, &tenant, None).await?;
     let spans = scan_trace_spans(
         guard,
         state.journal.clone(),
         state.trace_parts.clone(),
         tenant.clone(),
+        None,
         None,
         state.config.clone(),
         state.trace_scan_semaphore.clone(),
@@ -171,26 +177,29 @@ pub async fn search(
 pub async fn search_tags(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<TagParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
         .map_err(crate::tenant::TenantError::into_http)?;
-    let guard = pin_all_trace_parts(&state, &tenant).await?;
-    let spans = retained_spans(
-        &state,
-        &tenant,
-        scan_trace_spans(
-            guard,
-            state.journal.clone(),
-            state.trace_parts.clone(),
-            tenant.clone(),
-            None,
-            state.config.clone(),
-            state.trace_scan_semaphore.clone(),
-        )
-        .await?,
-    );
-    let tags = collect_tags(&spans);
+    let Some(range) = tag_range(&state, &tenant, &params)? else {
+        return Ok(Json(empty_tags()));
+    };
+    let guard = pin_all_trace_parts(&state, &tenant, Some(range)).await?;
+    let spans = scan_trace_spans(
+        guard,
+        state.journal.clone(),
+        state.trace_parts.clone(),
+        tenant.clone(),
+        None,
+        Some(range),
+        state.config.clone(),
+        state.trace_scan_semaphore.clone(),
+    )
+    .await?;
+    let tags = params.truncate(collect_tags(&spans));
     let (resource_tags, span_tags) = collect_scoped_tags(&spans);
+    let resource_tags = params.truncate(resource_tags);
+    let span_tags = params.truncate(span_tags);
     Ok(Json(serde_json::json!({
         "tags": tags,
         "scopes": [
@@ -205,41 +214,109 @@ pub async fn search_tag_values(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(tag): Path<String>,
+    Query(params): Query<TagParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let tenant = crate::tenant::from_headers(&headers, &state.config)
         .map_err(crate::tenant::TenantError::into_http)?;
-    let guard = pin_all_trace_parts(&state, &tenant).await?;
-    let spans = retained_spans(
-        &state,
-        &tenant,
-        scan_trace_spans(
-            guard,
-            state.journal.clone(),
-            state.trace_parts.clone(),
-            tenant.clone(),
-            None,
-            state.config.clone(),
-            state.trace_scan_semaphore.clone(),
-        )
-        .await?,
-    );
+    let Some(range) = tag_range(&state, &tenant, &params)? else {
+        return Ok(Json(serde_json::json!({ "tag": tag, "values": [] })));
+    };
+    let guard = pin_all_trace_parts(&state, &tenant, Some(range)).await?;
+    let spans = scan_trace_spans(
+        guard,
+        state.journal.clone(),
+        state.trace_parts.clone(),
+        tenant.clone(),
+        None,
+        Some(range),
+        state.config.clone(),
+        state.trace_scan_semaphore.clone(),
+    )
+    .await?;
     let values: BTreeSet<String> = spans
         .iter()
         .filter_map(|span| span.tag_value(&tag))
         .collect();
+    let values = params.truncate(values);
     Ok(Json(serde_json::json!({ "tag": tag, "values": values })))
 }
 
 
-/// Drop spans the tenant's retention no longer covers. Used by the tag
-/// endpoints, which have no time range of their own to clamp.
-fn retained_spans(
+/// The window a tag lookup covers.
+///
+/// Grafana sends `start`/`end` on every tag call. Answering from the whole
+/// history both returns tags that do not exist in the range and restores every
+/// part the tenant ever wrote to do it — one dropdown, the entire archive.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagParams {
+    pub start: Option<String>,
+    pub end: Option<String>,
+    /// Accepted and ignored. Grafana sends it on tag calls and
+    /// `deny_unknown_fields` would turn that into a 400.
+    #[serde(default, rename = "q")]
+    #[allow(dead_code)]
+    pub query: Option<String>,
+    /// How many names or values the client wants back.
+    pub limit: Option<usize>,
+}
+
+impl TagParams {
+    /// Truncate a tag result to what the client asked for. The window already
+    /// bounds the work; this only bounds the response.
+    fn truncate<T>(&self, values: impl IntoIterator<Item = T>) -> Vec<T> {
+        let mut values: Vec<T> = values.into_iter().collect();
+        if let Some(limit) = self.limit {
+            values.truncate(limit);
+        }
+        values
+    }
+}
+
+/// Resolve the tag window, or `None` when retention has already emptied it.
+///
+/// The retention floor folds in here, so one bound expresses both what the
+/// client asked for and what the tenant is still entitled to — the same shape
+/// the log metadata endpoints settled on.
+fn tag_range(
     state: &AppState,
     tenant: &TenantId,
-    mut spans: Vec<TraceSpan>,
-) -> Vec<TraceSpan> {
-    if let Some(floor_ns) = state.tenant_policy.query_floor_ns(tenant) {
-        spans.retain(|span| span.start_time_ns >= floor_ns);
+    params: &TagParams,
+) -> Result<Option<(i64, i64)>, (StatusCode, String)> {
+    let end = params
+        .end
+        .as_deref()
+        .map(crate::query::parse_time_ns)
+        .transpose()
+        .map_err(client_error)?
+        .unwrap_or_else(|| state.clock.now_ns());
+    let start = params
+        .start
+        .as_deref()
+        .map(crate::query::parse_time_ns)
+        .transpose()
+        .map_err(client_error)?
+        .unwrap_or(i64::MIN);
+    if start > end {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "tag search start must not be after end".to_string(),
+        ));
     }
-    spans
+    let start = match state.tenant_policy.query_floor_ns(tenant) {
+        Some(floor_ns) => start.max(floor_ns),
+        None => start,
+    };
+    Ok((start <= end).then_some((start, end)))
+}
+
+fn empty_tags() -> serde_json::Value {
+    serde_json::json!({
+        "tags": [],
+        "scopes": [
+            { "name": "resource", "tags": [] },
+            { "name": "span", "tags": [] },
+            { "name": "intrinsic", "tags": ["duration", "name", "status"] },
+        ],
+    })
 }

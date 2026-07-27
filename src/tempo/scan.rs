@@ -5,6 +5,10 @@ async fn scan_trace_spans(
     trace_parts: Arc<TraceRegistry>,
     tenant: TenantId,
     trace_id: Option<String>,
+    // When set, only spans starting inside it are read. Row groups outside
+    // the range are never touched, which is what keeps a tag lookup from
+    // restoring the tenant's whole history.
+    range: Option<(i64, i64)>,
     config: Arc<crate::config::Config>,
     scan_semaphore: Arc<Semaphore>,
 ) -> Result<Vec<TraceSpan>, (StatusCode, String)> {
@@ -32,6 +36,9 @@ async fn scan_trace_spans(
                 .trace_memtable()
                 .snapshot_limited(&tenant, max_trace_spans)?,
         };
+        if let Some((start_ns, end_ns)) = range {
+            spans.retain(|span| span.start_time_ns >= start_ns && span.start_time_ns <= end_ns);
+        }
         let remaining = max_trace_spans.saturating_sub(spans.len());
         let part_spans = match trace_id.as_deref() {
             Some(trace_id) => trace_parts.query_trace_id(
@@ -40,7 +47,12 @@ async fn scan_trace_spans(
                 Some(remaining),
                 Some(&task_cancellation),
             )?,
-            None => trace_parts.query_all(&tenant, Some(remaining), Some(&task_cancellation))?,
+            None => trace_parts.query_range(
+                &tenant,
+                range,
+                Some(remaining),
+                Some(&task_cancellation),
+            )?,
         };
         spans.extend(part_spans);
         Ok::<_, String>(spans)
@@ -81,6 +93,7 @@ async fn query_trace(
         state.trace_parts.clone(),
         tenant.clone(),
         Some(trace_id.to_string()),
+        None,
         state.config.clone(),
         state.trace_scan_semaphore.clone(),
     )
@@ -121,14 +134,23 @@ async fn pin_trace_parts(
     .map_err(|error| error.into_http())
 }
 
+/// Pin the tenant's trace parts, narrowed to a time range when the caller has
+/// one. Pinning is what downloads a part body, so the range has to reach this
+/// far or the scan-side pruning saves nothing.
 async fn pin_all_trace_parts(
     state: &AppState,
     tenant: &TenantId,
+    range: Option<(i64, i64)>,
 ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, (StatusCode, String)> {
     crate::remote_lifecycle::pin_remote_parts(
         state.parts.operation_lock(),
         state.remote_cache.clone(),
-        || state.trace_parts.tenant_part_ids(tenant),
+        || match range {
+            Some((start_ns, end_ns)) => state
+                .trace_parts
+                .tenant_part_ids_in_range(tenant, start_ns, end_ns),
+            None => state.trace_parts.tenant_part_ids(tenant),
+        },
         |required| state.trace_parts.missing_data_ids(required),
         crate::remote_lifecycle::RemoteDomain::Traces,
         state.config.max_trace_restore_runtime,
