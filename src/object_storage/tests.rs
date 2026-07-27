@@ -929,7 +929,7 @@
             }],
         };
         let spans = crate::trace::normalize_request(&test_tenant(), request).unwrap();
-        let parts = crate::trace_part::flush_trace_spans(spans, &root, 100).unwrap();
+        let parts = crate::trace_part::flush_trace_spans(&spans, &root, 100).unwrap();
         let manifest = storage.publish_trace_parts(&parts).await.unwrap();
         assert_eq!(manifest.parts.len(), 1);
 
@@ -984,7 +984,7 @@
             }],
         };
         let spans = crate::trace::normalize_request(&test_tenant(), request).unwrap();
-        let parts = crate::trace_part::flush_trace_spans(spans, &root, 100).unwrap();
+        let parts = crate::trace_part::flush_trace_spans(&spans, &root, 100).unwrap();
 
         let manifest = storage.reconcile_trace_local_cache(&root).await.unwrap();
 
@@ -1020,7 +1020,7 @@
             }],
         };
         let spans = crate::trace::normalize_request(&test_tenant(), request).unwrap();
-        let parts = crate::trace_part::flush_trace_spans(spans, &source, 100).unwrap();
+        let parts = crate::trace_part::flush_trace_spans(&spans, &source, 100).unwrap();
         let manifest = storage.publish_trace_parts(&parts).await.unwrap();
         let root = temp_dir("trace-symlink-cache").join("traces");
         let descriptor = &manifest.parts[0];
@@ -1298,7 +1298,7 @@
             scope: None,
             scope_schema_url: String::new(),
         }];
-        let parts = crate::trace_part::flush_trace_spans(spans, &dir, 100).unwrap();
+        let parts = crate::trace_part::flush_trace_spans(&spans, &dir, 100).unwrap();
 
         let error = old
             .publish_trace_parts(&parts)
@@ -1389,9 +1389,9 @@
                 scope_schema_url: String::new(),
             });
         }
-        let first = crate::trace_part::flush_trace_spans(vec![spans[0].clone()], &root, 100).unwrap();
+        let first = crate::trace_part::flush_trace_spans(&[spans[0].clone()], &root, 100).unwrap();
         let second =
-            crate::trace_part::flush_trace_spans(vec![spans[1].clone()], &root, 100).unwrap();
+            crate::trace_part::flush_trace_spans(&[spans[1].clone()], &root, 100).unwrap();
         storage.publish_trace_parts(&first).await.unwrap();
         storage.publish_trace_parts(&second).await.unwrap();
 

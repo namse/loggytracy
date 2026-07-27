@@ -201,8 +201,13 @@ struct TraceMetaFile {
     integrity: TracePartIntegrity,
 }
 
+/// Writes the flushing buffer without taking ownership of it.
+///
+/// The buffer stays shared with the memtable until the flush commits, because
+/// an abort has to put it back. Bucketing by reference is what keeps that from
+/// costing a second copy of everything being flushed.
 pub fn flush_trace_spans(
-    spans: Vec<TraceSpan>,
+    spans: &[TraceSpan],
     traces_root: &Path,
     row_group_size: usize,
 ) -> io::Result<Vec<TracePart>> {
@@ -216,7 +221,7 @@ pub fn flush_trace_spans(
         ));
     }
     fs::create_dir_all(traces_root.join(".tmp"))?;
-    let mut by_partition: BTreeMap<String, Vec<TraceSpan>> = BTreeMap::new();
+    let mut by_partition: BTreeMap<String, Vec<&TraceSpan>> = BTreeMap::new();
     for span in spans {
         by_partition
             .entry(partition_of(span.start_time_ns))
@@ -277,7 +282,7 @@ fn write_trace_part_files(
     dir: &Path,
     id: &str,
     partition: &str,
-    spans: &[TraceSpan],
+    spans: &[&TraceSpan],
     row_group_size: usize,
 ) -> io::Result<()> {
     write_trace_parquet(&dir.join(TRACE_DATA_FILE), spans, row_group_size)?;
@@ -340,7 +345,7 @@ fn trace_schema() -> Arc<Schema> {
     ]))
 }
 
-fn trace_row_group_batch(schema: &Arc<Schema>, spans: &[TraceSpan]) -> io::Result<RecordBatch> {
+fn trace_row_group_batch(schema: &Arc<Schema>, spans: &[&TraceSpan]) -> io::Result<RecordBatch> {
     let tenants: Vec<&str> = spans.iter().map(|span| span.tenant.as_str()).collect();
     let starts: Vec<i64> = spans.iter().map(|span| span.start_time_ns).collect();
     let ends: Vec<i64> = spans.iter().map(|span| span.end_time_ns).collect();
@@ -348,7 +353,7 @@ fn trace_row_group_batch(schema: &Arc<Schema>, spans: &[TraceSpan]) -> io::Resul
     let span_ids: Vec<&str> = spans.iter().map(|span| span.span_id.as_str()).collect();
     let payloads: Vec<String> = spans
         .iter()
-        .map(|span| serde_json::to_string(&TraceSpanFile::from(span)).map_err(io::Error::other))
+        .map(|span| serde_json::to_string(&TraceSpanFile::from(*span)).map_err(io::Error::other))
         .collect::<io::Result<_>>()?;
     let payload_refs: Vec<&str> = payloads.iter().map(String::as_str).collect();
     RecordBatch::try_new(
@@ -365,7 +370,7 @@ fn trace_row_group_batch(schema: &Arc<Schema>, spans: &[TraceSpan]) -> io::Resul
     .map_err(io::Error::other)
 }
 
-fn write_trace_parquet(path: &Path, spans: &[TraceSpan], row_group_size: usize) -> io::Result<()> {
+fn write_trace_parquet(path: &Path, spans: &[&TraceSpan], row_group_size: usize) -> io::Result<()> {
     let schema = trace_schema();
     let bounds = row_group_bounds(spans, row_group_size);
     let file = fs::File::create(path)?;
@@ -386,7 +391,7 @@ fn write_trace_parquet(path: &Path, spans: &[TraceSpan], row_group_size: usize) 
     sync_file(path)
 }
 
-fn write_trace_bloom(path: &Path, spans: &[TraceSpan], row_group_size: usize) -> io::Result<()> {
+fn write_trace_bloom(path: &Path, spans: &[&TraceSpan], row_group_size: usize) -> io::Result<()> {
     let bounds = row_group_bounds(spans, row_group_size);
     let mut encoded = Vec::new();
     encoded.extend_from_slice(TRACE_BLOOM_MAGIC);
@@ -409,7 +414,7 @@ fn write_trace_bloom(path: &Path, spans: &[TraceSpan], row_group_size: usize) ->
 }
 
 /// Row-group boundaries that never straddle a tenant.
-fn row_group_bounds(spans: &[TraceSpan], row_group_size: usize) -> Vec<(usize, usize)> {
+fn row_group_bounds(spans: &[&TraceSpan], row_group_size: usize) -> Vec<(usize, usize)> {
     let mut bounds = Vec::new();
     let mut segment_start = 0usize;
     while segment_start < spans.len() {
@@ -430,7 +435,7 @@ fn row_group_bounds(spans: &[TraceSpan], row_group_size: usize) -> Vec<(usize, u
 }
 
 fn trace_tenant_segments(
-    spans: &[TraceSpan],
+    spans: &[&TraceSpan],
     bounds: &[(usize, usize)],
 ) -> Vec<TraceTenantSegment> {
     let mut segments: Vec<TraceTenantSegment> = Vec::new();
@@ -878,7 +883,7 @@ mod tests {
     fn trace_part_round_trip_and_bloom_pruning() {
         let root =
             std::env::temp_dir().join(format!("loggytracy-trace-part-{}", uuid::Uuid::new_v4()));
-        let parts = flush_trace_spans(spans(), &root, 1).unwrap();
+        let parts = flush_trace_spans(&spans(), &root, 1).unwrap();
         assert_eq!(parts.len(), 1);
         let reader = TracePartReader::open(parts.into_iter().next().unwrap()).unwrap();
         assert!(reader.may_match_trace_id(&test_tenant(), &"01".repeat(16)));
@@ -904,7 +909,7 @@ mod tests {
     fn trace_catalog_can_open_without_parquet_body() {
         let root =
             std::env::temp_dir().join(format!("loggytracy-trace-catalog-{}", uuid::Uuid::new_v4()));
-        let parts = flush_trace_spans(spans(), &root, 2).unwrap();
+        let parts = flush_trace_spans(&spans(), &root, 2).unwrap();
         let part = parts.into_iter().next().unwrap();
         fs::remove_file(part.data_path()).unwrap();
         let reader = TracePartReader::open_cached(load_trace_part(&part.dir).unwrap()).unwrap();
@@ -944,7 +949,7 @@ mod tests {
             std::env::temp_dir().join(format!("loggytracy-trace-tenant-{}", uuid::Uuid::new_v4()));
         let mut spans = tenant_spans("globex", 9, 300);
         spans.extend(tenant_spans("acme", 1, 100));
-        let part = flush_trace_spans(spans, &root, 1).unwrap().remove(0);
+        let part = flush_trace_spans(&spans, &root, 1).unwrap().remove(0);
 
         let acme = TenantId::parse("acme").unwrap();
         let globex = TenantId::parse("globex").unwrap();

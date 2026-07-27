@@ -596,8 +596,9 @@ the code, the note says which.
 - [x] P1-1 / N6 Tempo time pruning — `search` and both tag endpoints. `search` also changed rule: a trace matches on span overlap rather than on its earliest span, which is Tempo's semantics and the one the row-group bounds can answer
 - [x] P1-3 group-commit latency structure — the batch loop no longer waits out `max_batch_ms` on an empty channel; the default is now zero linger
 - [x] P1-5 MemTable size tracked in O(1)
-- [ ] P1-5 remaining: remove the flush deep clone
-- [ ] P1-9 move eviction to `spawn_blocking` + in-memory metadata
+- [x] P1-5 flush deep clone removed — the snapshot is shared with the flush through an `Arc`, on both the log and trace memtables
+- [x] P1-9 eviction moved to `spawn_blocking`, carrying the lock guard with it so the atomicity against a reader pinning a part is unchanged
+- [ ] P1-9 remaining: serve eviction from in-memory metadata instead of walking the tree with `read_dir`
 - [x] Instrument the layout axis — `part_tenant_segments`, `part_sidecar_resident_bytes`, `part_meta_bytes`. These are what a Tier D run has to answer before the N3 mitigation can be chosen
 - [ ] Sustained load for **at least 24 hours** at the target specification (4 vCPU / 16 GiB). Real S3 is out of scope; local MinIO is the limit ([`LOAD_VALIDATION.md`](LOAD_VALIDATION.md))
 - [ ] Measure startup time, flush latency, and query-planning time with at least 10,000 parts

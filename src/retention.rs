@@ -696,7 +696,7 @@ mod tests {
             span_for("alpha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1_000),
             span_for("beta", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1_000),
         ];
-        let parts = crate::trace_part::flush_trace_spans(spans, &traces_root, 100).unwrap();
+        let parts = crate::trace_part::flush_trace_spans(&spans, &traces_root, 100).unwrap();
         let registry = Arc::new(PartRegistry::new());
         let trace_registry = Arc::new(TraceRegistry::standalone());
         trace_registry.register(parts.clone()).unwrap();

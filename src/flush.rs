@@ -232,6 +232,8 @@ async fn flush_once(
     }
     let rows = part::rows_from_snapshot(&ckpt.snapshot);
     let trace_spans = ckpt.trace_snapshot;
+    // An `Arc` clone: the flush reads the buffer the memtable still holds for
+    // the abort path, rather than being handed a copy of it.
     let trace_spans_for_flush = trace_spans.clone();
     let total_rows = rows.len().saturating_add(trace_spans.len());
     // Prevent eviction from observing a freshly committed directory before
@@ -254,7 +256,7 @@ async fn flush_once(
         move || {
             let log_parts = part::flush_rows(rows, &parts_root, row_group_size)?;
             let trace_parts = match trace_part::flush_trace_spans(
-                trace_spans_for_flush,
+                &trace_spans_for_flush,
                 &traces_root,
                 row_group_size,
             ) {

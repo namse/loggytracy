@@ -338,23 +338,47 @@ pub async fn run(config: Arc<Config>) {
                     _ = ticker.tick() => {}
                     _ = crate::shutdown::wait_for_drain(&mut drain_rx) => return,
                 }
-                let _guard = registry.operation_lock().write_owned().await;
+                let guard = registry.operation_lock().write_owned().await;
                 let eligible = registry.part_ids();
-                let (log_result, trace_result) = match cache.storage.evict_cache(
-                    &cache.parts_root,
-                    config.cache_max_bytes,
-                    &eligible,
-                ) {
-                    Ok(bytes) => {
-                        let trace_budget = config.cache_max_bytes.saturating_sub(bytes);
-                        let result = cache.storage.evict_trace_cache(
-                            &cache.trace_parts_root(),
-                            trace_budget,
-                            &trace_registry.part_ids(),
-                        );
-                        (Ok(bytes), result)
+                let trace_eligible = trace_registry.part_ids();
+                // Eviction walks the whole parts tree with `read_dir` and a
+                // `symlink_metadata` per entry. That is synchronous work, and
+                // running it inline blocked a runtime worker for as long as the
+                // tree took to traverse — on the same thread pool serving the
+                // queries this lock is already holding up.
+                //
+                // The guard moves into the blocking task rather than being
+                // released first. Deciding what to evict and doing it has to
+                // stay atomic with respect to a reader pinning a part, or
+                // eviction could delete a body a query had just claimed.
+                let cache_for_eviction = cache.clone();
+                let budget = config.cache_max_bytes;
+                let evicted = tokio::task::spawn_blocking(move || {
+                    let _guard = guard;
+                    match cache_for_eviction.storage.evict_cache(
+                        &cache_for_eviction.parts_root,
+                        budget,
+                        &eligible,
+                    ) {
+                        Ok(bytes) => {
+                            let trace_budget = budget.saturating_sub(bytes);
+                            let result = cache_for_eviction.storage.evict_trace_cache(
+                                &cache_for_eviction.trace_parts_root(),
+                                trace_budget,
+                                &trace_eligible,
+                            );
+                            (Ok(bytes), result)
+                        }
+                        Err(error) => (Err(error), Ok(0)),
                     }
-                    Err(error) => (Err(error), Ok(0)),
+                })
+                .await;
+                let (log_result, trace_result) = match evicted {
+                    Ok(results) => results,
+                    // The blocking pool is shared, so a panic in another task
+                    // cannot reach here; this is a join failure, which means
+                    // the eviction did not run rather than that it half ran.
+                    Err(error) => (Err(format!("eviction task failed: {error}")), Ok(0)),
                 };
                 match (log_result, trace_result) {
                     (Ok(bytes), Ok(trace_bytes)) => {

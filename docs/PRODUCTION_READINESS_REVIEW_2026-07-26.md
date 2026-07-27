@@ -159,8 +159,8 @@ Only status is confirmed here; see the previous document for details.
 |---|---|
 | P1-2 OTLP log ingest unimplemented | **Fixed** — `LogsService` on the gRPC listener, plus `POST /v1/logs` and `/v1/traces` on the HTTP one. Both transports share one admission and normalization path |
 | P1-3 group commit consumes batch timer | **Fixed** — the batch loop no longer waits out `max_batch_ms` on an empty channel, and the default is now zero linger |
-| P1-5 MemTable O(rows) size calculation + flush deep clone | Size calculation **fixed** (with P0-2), deep clone open |
-| P1-9 eviction holds write lock during synchronous directory traversal | Open |
+| P1-5 MemTable O(rows) size calculation + flush deep clone | **Fixed** — size in O(1) (with P0-2); the snapshot is now shared with the flush through an `Arc` instead of copied |
+| P1-9 eviction holds write lock during synchronous directory traversal | **Partly fixed** — the walk runs in `spawn_blocking` with the guard moved into it, so it no longer blocks a runtime worker. It still traverses with `read_dir` rather than reading in-memory metadata |
 | P1-10 object-store startup errors panic | **Fixed** — retried within `LOGGYTRACY_STARTUP_RETRY_BUDGET`. The remaining `panic!` sites are the deliberate give-up past that budget |
 | P1-11 startup/flush cost linear in part count | Open |
 | P2-1 Loki/Tempo API gaps | **Mostly fixed** — `tail`, `index/volume(_range)`, `detected_labels`, `detected_fields`, `format_query`, JSON push, Tempo v2 tags and `/api/echo`. `patterns` and the `delete` API remain, both deliberately |

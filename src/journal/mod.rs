@@ -74,8 +74,8 @@ fn take_compaction_fault(wal_path: &Path, fault: CompactionFault) -> bool {
 
 pub struct CheckpointSnapshot {
     pub offset: u64,
-    pub snapshot: MemTableSnapshot,
-    pub trace_snapshot: Vec<TraceSpan>,
+    pub snapshot: Arc<MemTableSnapshot>,
+    pub trace_snapshot: Arc<Vec<TraceSpan>>,
 }
 
 /// A decoded tenant-framed WAL record: who wrote it, what kind it is, and the

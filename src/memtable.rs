@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::logql::{LabelMatcher, LineFilter};
 use crate::part::MetadataWindow;
@@ -34,7 +34,13 @@ pub struct QueryResult {
 
 pub struct MemTable {
     inner: RwLock<MemTableSnapshot>,
-    flushing: RwLock<Option<MemTableSnapshot>>,
+    /// The snapshot a flush is currently writing, shared with the flush rather
+    /// than copied to it.
+    ///
+    /// It was cloned, which doubled the memtable's memory at exactly the moment
+    /// the memtable is largest — and the failure mode this guards against is a
+    /// flush that cannot keep up, where the buffer is larger still.
+    flushing: RwLock<Option<Arc<MemTableSnapshot>>>,
     /// Live byte totals for the two buffers, maintained by every mutation.
     ///
     /// Walking the entries instead would be O(rows) under a read lock, and the
@@ -96,6 +102,14 @@ fn snapshot_bytes(snapshot: &MemTableSnapshot) -> u64 {
 /// byte counters exactly equal to a full walk without either side having to
 /// perform one — the collision count is bounded by the stream count, not the
 /// row count.
+/// Take ownership of a shared snapshot, copying only if someone else still
+/// holds it. On the paths that call this the other reference has already been
+/// dropped, so the copy is a fallback that keeps a stray share from being
+/// silently discarded rather than an expected cost.
+fn unwrap_snapshot(snapshot: Arc<MemTableSnapshot>) -> MemTableSnapshot {
+    Arc::try_unwrap(snapshot).unwrap_or_else(|shared| (*shared).clone())
+}
+
 fn merge_snapshot(target: &mut MemTableSnapshot, source: MemTableSnapshot) -> u64 {
     let mut redundant_overhead = 0u64;
     for (tenant, streams) in source {
@@ -189,15 +203,21 @@ impl MemTable {
         self.inner_bytes.fetch_add(delta, Ordering::Relaxed);
     }
 
-    pub fn begin_flush(&self) -> MemTableSnapshot {
+    /// Move the buffer into the flushing slot and hand the flush a share of it.
+    ///
+    /// The `Arc` is what makes this cheap: reads consult the flushing snapshot
+    /// as well as the live buffer, so it has to stay reachable here, but there
+    /// is no reason for the flush to hold a second copy of it.
+    pub fn begin_flush(&self) -> Arc<MemTableSnapshot> {
         let mut inner = self.inner.write().unwrap();
         let mut flushing = self.flushing.write().unwrap();
         let mut snapshot = std::mem::take(&mut *inner);
         let moved = self.inner_bytes.swap(0, Ordering::Relaxed);
         let mut redundant_overhead = 0;
         if let Some(previous_snapshot) = flushing.take() {
-            redundant_overhead = merge_snapshot(&mut snapshot, previous_snapshot);
+            redundant_overhead = merge_snapshot(&mut snapshot, unwrap_snapshot(previous_snapshot));
         }
+        let snapshot = Arc::new(snapshot);
         *flushing = Some(snapshot.clone());
         // `flushing_bytes` already covers the snapshot that was merged in.
         self.flushing_bytes
@@ -211,11 +231,15 @@ impl MemTable {
         self.flushing_bytes.store(0, Ordering::Relaxed);
     }
 
-    pub fn abort_flush(&self, snapshot: MemTableSnapshot) {
+    pub fn abort_flush(&self, snapshot: Arc<MemTableSnapshot>) {
         let mut inner = self.inner.write().unwrap();
-        let redundant_overhead = merge_snapshot(&mut inner, snapshot);
+        // Clearing the slot first drops this snapshot's other reference, so the
+        // unwrap below takes ownership instead of copying. The lock order is
+        // the one every other path uses — inner, then flushing — because
+        // reversing it here would be the deadlock the ordering exists to avoid.
         let mut flushing = self.flushing.write().unwrap();
         *flushing = None;
+        let redundant_overhead = merge_snapshot(&mut inner, unwrap_snapshot(snapshot));
         // The aborted snapshot is the one `flushing_bytes` was counting, so it
         // moves back wholesale rather than being recomputed.
         let returned = self.flushing_bytes.swap(0, Ordering::Relaxed);
@@ -485,7 +509,7 @@ impl MemTable {
         let mut bytes = 0u64;
         let inner = self.inner.read().unwrap();
         let flushing = self.flushing.read().unwrap();
-        for snapshot in std::iter::once(&*inner).chain(flushing.as_ref()) {
+        for snapshot in std::iter::once(&*inner).chain(flushing.as_deref()) {
             for tenant_streams in snapshot.values() {
                 streams += tenant_streams.len();
                 for stream in tenant_streams.values() {
@@ -542,7 +566,7 @@ mod tests {
         let walked = |table: &MemTable| {
             let inner = table.inner.read().unwrap();
             let flushing = table.flushing.read().unwrap();
-            snapshot_bytes(&inner) + flushing.as_ref().map(snapshot_bytes).unwrap_or(0)
+            snapshot_bytes(&inner) + flushing.as_deref().map(snapshot_bytes).unwrap_or(0)
         };
         let tenant = crate::tenant::test_tenant();
         let labels: Labels = [("app".to_string(), "sizes".to_string())]
@@ -699,6 +723,63 @@ mod tests {
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1, "abort_flush should restore data to inner");
         assert!(!mt.is_empty());
+    }
+
+    /// The snapshot is shared with the flush, not copied to it. The copy
+    /// doubled memtable memory at exactly the moment the memtable is largest,
+    /// and the failure this guards against — a flush that cannot keep up — is
+    /// where the buffer is larger still.
+    #[test]
+    fn a_flush_shares_the_snapshot_instead_of_duplicating_it() {
+        let memtable = MemTable::new();
+        memtable.insert(
+            sample_tenant(),
+            sample_labels(),
+            vec![sample_entry("shared", 100)],
+        );
+
+        let snapshot = memtable.begin_flush();
+        assert_eq!(
+            Arc::strong_count(&snapshot),
+            2,
+            "the flush and the memtable hold the same snapshot, not two of them"
+        );
+
+        // Committing releases the memtable's share, leaving the flush's own.
+        memtable.commit_flush();
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+    }
+
+    /// Aborting has to put the entries back, which needs ownership. The
+    /// memtable's share is dropped first so that ownership is taken rather than
+    /// the snapshot being copied on the way back in.
+    #[test]
+    fn an_aborted_flush_returns_its_entries_without_copying_them() {
+        let memtable = MemTable::new();
+        memtable.insert(
+            sample_tenant(),
+            sample_labels(),
+            vec![sample_entry("returned", 100)],
+        );
+        let before = memtable.approximate_size();
+
+        let snapshot = memtable.begin_flush();
+        assert!(
+            memtable
+                .query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .len()
+                == 1
+        );
+        memtable.abort_flush(snapshot);
+
+        let results = memtable.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true);
+        let total: usize = results.iter().map(|stream| stream.entries.len()).sum();
+        assert_eq!(total, 1, "the aborted entries are back in the live buffer");
+        assert_eq!(
+            memtable.approximate_size(),
+            before,
+            "and the accounting returns with them"
+        );
     }
 
     #[test]
