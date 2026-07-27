@@ -2115,3 +2115,75 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         let (status, _) = get_json(&state, "/loki/api/v1/format_query?query=%7Bapp%3D").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+
+    /// The quota reaches the HTTP query path, and it answers 429 rather than
+    /// 500 — the difference between "come back later" and "this is broken".
+    #[tokio::test]
+    async fn a_tenant_over_its_query_quota_is_refused_with_429() {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let config = Config {
+            data_dir: dir.clone(),
+            default_tenant_query_scan_bytes_per_second: Some(1),
+            tenant_ingest_burst: std::time::Duration::from_nanos(1),
+            max_push_bytes: 1,
+            ..Config::default()
+        };
+        // Backed by a part, not the memtable: the scan budget is charged on
+        // bytes read out of parts, which is where a query's real cost is.
+        let parts = Arc::new(PartRegistry::new());
+        parts
+            .register(
+                part::flush_rows(
+                    vec![Row {
+                        tenant: test_tenant(),
+                        timestamp_ns: 1_700_000_000_000_000_000,
+                        labels: [("app".to_string(), "quota".to_string())]
+                            .into_iter()
+                            .collect::<Labels>(),
+                        line: "a line long enough to cost some scan budget".to_string(),
+                        structured_metadata: Vec::new(),
+                    }],
+                    &dir.join("parts"),
+                    config.row_group_size,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::standalone());
+        let state = crate::test_support::state(
+            config.clone(),
+            memtable.clone(),
+            Arc::new(Journal::spawn(&config, memtable).unwrap()),
+            parts,
+            trace_parts,
+            None,
+        );
+
+        let uri = "/loki/api/v1/query_range?query=%7Bapp%3D%22quota%22%7D";
+        let (first, _) = get_json(&state, uri).await;
+        assert_eq!(first, StatusCode::OK, "the first query runs and pays after");
+
+        let (second, body) = get_json(&state, uri).await;
+        assert_eq!(
+            second,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the next query pays for the last one: {body}"
+        );
+        assert_eq!(
+            state
+                .metrics
+                .query_quota_rejected
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "counted apart from queries this instance failed to answer"
+        );
+        assert_eq!(
+            state
+                .metrics
+                .query_errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a refused query is not a failed one"
+        );
+    }

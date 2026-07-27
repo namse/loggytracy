@@ -22,8 +22,16 @@ const MAX_METRIC_SAMPLES: usize = 5_000_000;
 const MAX_LOG_LIMIT: usize = 100_000;
 const MAX_LOG_SCAN_ROWS: usize = 5_000_000;
 
+/// Marks a refusal that belongs to the tenant's own quota rather than to the
+/// query. Carried in the message because the scan path reports `String`, and
+/// the distinction matters to the client: a 429 is worth retrying later and a
+/// 400 never is.
+pub(crate) const TENANT_QUOTA_PREFIX: &str = "tenant quota: ";
+
 fn metric_error_status(error: &str) -> StatusCode {
-    if error.starts_with("metric query exceeds") || error.starts_with("query exceeds") {
+    if error.starts_with(TENANT_QUOTA_PREFIX) {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if error.starts_with("metric query exceeds") || error.starts_with("query exceeds") {
         StatusCode::BAD_REQUEST
     } else if error == "query timed out"
         || error == "metric query timed out"

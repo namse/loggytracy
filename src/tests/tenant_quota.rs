@@ -113,11 +113,11 @@
         let clock = Clock::fixed(0);
         let policy = Arc::new(TenantPolicy::enabled_with_clock(clock.clone()));
         policy
-            .push(&tenant("premium"), "7d", Some("1MiB/s"))
+            .push(&tenant("premium"), "7d", Some("1MiB/s"), None)
             .await
             .unwrap();
         policy
-            .push(&tenant("blocked"), "7d", Some("0"))
+            .push(&tenant("blocked"), "7d", Some("0"), None)
             .await
             .unwrap();
         let config = Config {
@@ -193,4 +193,126 @@
             quota.buckets.lock().unwrap().len() < SWEEP_EVERY as usize,
             "idle buckets that have refilled must not be kept"
         );
+    }
+
+    /// Reading and writing are separate resources. A shared bucket would let a
+    /// tenant's queries decide whether its writes are accepted, which is a
+    /// coupling nobody asked for and nobody could reason about.
+    #[test]
+    fn the_read_budget_and_the_write_budget_are_not_the_same_budget() {
+        let clock = Clock::fixed(0);
+        let config = Config {
+            default_tenant_ingest_bytes_per_second: Some(1_000),
+            default_tenant_query_scan_bytes_per_second: Some(1_000),
+            tenant_ingest_burst: Duration::from_secs(1),
+            max_push_bytes: 100,
+            ..Config::default()
+        };
+        let quota = Arc::new(quota(
+            config,
+            clock,
+            Arc::new(TenantPolicy::disabled()),
+        ));
+        let acme = tenant("acme");
+
+        // Drain the read budget entirely.
+        quota.charge_scan(&acme, 100_000);
+        quota
+            .begin_query(&acme)
+            .expect_err("the read budget is spent");
+
+        // Writing is unaffected.
+        quota
+            .check(&acme, 1_000)
+            .expect("a spent read budget must not refuse a write");
+    }
+
+    /// The scan charge lands after the query, so an overrun is bounded at one
+    /// query rather than prevented. That is the deliberate trade: the cost of a
+    /// query is not knowable before running it.
+    #[test]
+    fn a_query_that_overruns_is_refused_on_the_next_one_and_recovers() {
+        let clock = Clock::fixed(0);
+        let config = Config {
+            default_tenant_query_scan_bytes_per_second: Some(1_000),
+            tenant_ingest_burst: Duration::from_secs(1),
+            max_push_bytes: 1,
+            ..Config::default()
+        };
+        let quota = Arc::new(quota(
+            config,
+            clock.clone(),
+            Arc::new(TenantPolicy::disabled()),
+        ));
+        let acme = tenant("acme");
+
+        let slot = quota.begin_query(&acme).expect("the first query is allowed");
+        drop(slot);
+        quota.charge_scan(&acme, 10_000);
+
+        quota
+            .begin_query(&acme)
+            .expect_err("the next query pays for the last one");
+
+        // And the budget refills, so this is throttling rather than a ban.
+        clock.advance(Duration::from_secs(60));
+        quota
+            .begin_query(&acme)
+            .expect("the budget refills over time");
+    }
+
+    /// A tenant issuing many concurrent scans would otherwise hold every permit
+    /// of the shared query semaphore and queue everyone else behind it.
+    #[test]
+    fn one_tenant_cannot_hold_every_query_slot() {
+        let config = Config {
+            max_concurrent_queries_per_tenant: 2,
+            ..Config::default()
+        };
+        let quota = Arc::new(quota(
+            config,
+            Clock::fixed(0),
+            Arc::new(TenantPolicy::disabled()),
+        ));
+        let loud = tenant("loud");
+
+        let first = quota.begin_query(&loud).unwrap();
+        let second = quota.begin_query(&loud).unwrap();
+        let refused = quota
+            .begin_query(&loud)
+            .expect_err("a third concurrent query is over the limit");
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+
+        // The limit is per tenant, not global.
+        let quiet = quota
+            .begin_query(&tenant("quiet"))
+            .expect("another tenant has its own slots");
+
+        // Slots are released by dropping, including on a cancelled query.
+        drop(first);
+        quota
+            .begin_query(&loud)
+            .expect("finishing a query frees its slot");
+        drop(second);
+        drop(quiet);
+    }
+
+    /// Rate 0 on the read side is a suspended account: it still owns its data
+    /// and must not be able to read it.
+    #[tokio::test]
+    async fn a_query_rate_of_zero_refuses_every_query() {
+        let clock = Clock::fixed(0);
+        let policy = Arc::new(TenantPolicy::enabled_with_clock(clock.clone()));
+        policy
+            .push(&tenant("suspended"), "7d", None, Some("0"))
+            .await
+            .unwrap();
+        policy
+            .push(&tenant("active"), "7d", None, Some("1MiB/s"))
+            .await
+            .unwrap();
+        let quota = Arc::new(quota(Config::default(), clock, policy));
+
+        quota.begin_query(&tenant("suspended")).unwrap_err();
+        quota.begin_query(&tenant("active")).unwrap();
     }

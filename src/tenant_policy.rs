@@ -51,6 +51,22 @@ pub enum TenantIngestRate {
     BytesPerSecond(u64),
 }
 
+/// How much a tenant may read from this instance, in bytes of scanned data per
+/// second.
+///
+/// The read counterpart to [`TenantIngestRate`], and shaped the same way for
+/// the same reason: plans differ per tenant and change after launch. Scanning
+/// is the expensive side of this engine — a single query can walk gigabytes —
+/// and until now nothing bounded one tenant's share of that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TenantQueryRate {
+    Unlimited,
+    /// Zero means the tenant may not query. That is a real state — a suspended
+    /// account still owns its data and must not be able to read it — and it is
+    /// spelled the same way `retention: "0"` and `ingest_rate: "0"` are.
+    BytesPerSecond(u64),
+}
+
 /// What the control plane pushed for one tenant.
 ///
 /// The raw strings are kept as they arrived so a `GET` returns what was sent.
@@ -67,6 +83,8 @@ struct PolicyEntry {
     /// default for tenants nothing is known about.
     ingest_rate: Option<TenantIngestRate>,
     raw_ingest_rate: Option<String>,
+    query_rate: Option<TenantQueryRate>,
+    raw_query_rate: Option<String>,
     updated_at: SystemTime,
 }
 
@@ -74,6 +92,7 @@ struct PolicyEntry {
 pub struct PolicyView {
     pub retention: String,
     pub ingest_rate: Option<String>,
+    pub query_rate: Option<String>,
     pub updated_at: SystemTime,
 }
 
@@ -94,10 +113,15 @@ impl PolicyMap {
         self.entries.get(tenant).and_then(|entry| entry.ingest_rate)
     }
 
+    pub fn query_rate(&self, tenant: &TenantId) -> Option<TenantQueryRate> {
+        self.entries.get(tenant).and_then(|entry| entry.query_rate)
+    }
+
     pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
         self.entries.get(tenant).map(|entry| PolicyView {
             retention: entry.raw.clone(),
             ingest_rate: entry.raw_ingest_rate.clone(),
+            query_rate: entry.raw_query_rate.clone(),
             updated_at: entry.updated_at,
         })
     }
@@ -273,6 +297,8 @@ struct PolicyDocument {
     /// before it had a version field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ingest_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    query_rate: Option<String>,
     updated_at: String,
 }
 
@@ -358,6 +384,15 @@ impl PolicyStore {
                     })
                 })
                 .transpose()?;
+            let query_rate = document
+                .query_rate
+                .as_deref()
+                .map(|raw| {
+                    parse_query_rate(raw).map_err(|error| {
+                        format!("invalid query_rate {raw:?} in {file_name:?}: {error}")
+                    })
+                })
+                .transpose()?;
             let updated_at = parse_timestamp(&document.updated_at).map_err(|error| {
                 format!(
                     "invalid updated_at {:?} in {file_name:?}: {error}",
@@ -371,6 +406,8 @@ impl PolicyStore {
                     raw: document.retention,
                     ingest_rate,
                     raw_ingest_rate: document.ingest_rate,
+                    query_rate,
+                    raw_query_rate: document.query_rate,
                     updated_at,
                 },
             );
@@ -579,6 +616,7 @@ resurrect data those policies had already expired",
         tenant: &TenantId,
         raw: &str,
         raw_ingest_rate: Option<&str>,
+        raw_query_rate: Option<&str>,
     ) -> Result<PolicyView, PolicyError> {
         let Some(store) = &self.store else {
             return Err(PolicyError::Invalid(
@@ -599,8 +637,16 @@ resurrect data those policies had already expired",
                 return Err(PolicyError::Invalid(error));
             }
         };
+        let query_rate = match raw_query_rate.map(parse_query_rate).transpose() {
+            Ok(rate) => rate,
+            Err(error) => {
+                self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(PolicyError::Invalid(error));
+            }
+        };
         let raw = raw.trim().to_string();
         let raw_ingest_rate = raw_ingest_rate.map(|rate| rate.trim().to_string());
+        let raw_query_rate = raw_query_rate.map(|rate| rate.trim().to_string());
 
         // Stamped under the lock, not on arrival: two concurrent pushes for the
         // same tenant commit in lock order, and a timestamp taken before the
@@ -611,6 +657,7 @@ resurrect data those policies had already expired",
         let document = PolicyDocument {
             retention: raw.clone(),
             ingest_rate: raw_ingest_rate.clone(),
+            query_rate: raw_query_rate.clone(),
             updated_at: format_timestamp(updated_at),
         };
         if let Err(error) = store.put(tenant, &document).await {
@@ -627,6 +674,8 @@ resurrect data those policies had already expired",
                     raw: raw.clone(),
                     ingest_rate,
                     raw_ingest_rate: raw_ingest_rate.clone(),
+                    query_rate,
+                    raw_query_rate: raw_query_rate.clone(),
                     updated_at,
                 },
             );
@@ -635,6 +684,7 @@ resurrect data those policies had already expired",
         Ok(PolicyView {
             retention: raw,
             ingest_rate: raw_ingest_rate,
+            query_rate: raw_query_rate,
             updated_at,
         })
     }
@@ -646,6 +696,10 @@ resurrect data those policies had already expired",
     /// of one of them silently meaning unlimited.
     pub fn ingest_rate(&self, tenant: &TenantId) -> Option<TenantIngestRate> {
         self.snapshot()?.ingest_rate(tenant)
+    }
+
+    pub fn query_rate(&self, tenant: &TenantId) -> Option<TenantQueryRate> {
+        self.snapshot()?.query_rate(tenant)
     }
 
     /// Return the tenant to *unknown*, which keeps its data forever. This is
@@ -705,6 +759,8 @@ resurrect data those policies had already expired",
                         raw,
                         ingest_rate: None,
                         raw_ingest_rate: None,
+                        query_rate: None,
+                        raw_query_rate: None,
                         updated_at: SystemTime::now(),
                     },
                 );
@@ -796,6 +852,13 @@ pub fn parse_retention(raw: &str) -> Result<TenantRetention, String> {
 /// suffix-less case for the same reason a bare number is not a duration: a
 /// value whose unit has to be guessed is a value that will eventually be
 /// guessed wrong.
+pub fn parse_query_rate(raw: &str) -> Result<TenantQueryRate, String> {
+    match parse_ingest_rate(raw)? {
+        TenantIngestRate::Unlimited => Ok(TenantQueryRate::Unlimited),
+        TenantIngestRate::BytesPerSecond(rate) => Ok(TenantQueryRate::BytesPerSecond(rate)),
+    }
+}
+
 pub fn parse_ingest_rate(raw: &str) -> Result<TenantIngestRate, String> {
     let value = raw.trim();
     if value.eq_ignore_ascii_case("unlimited") {
@@ -891,13 +954,19 @@ mod tests {
     async fn a_push_is_durable_and_survives_a_restart() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy.push(&tenant("acme"), "30d", None).await.unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None)
+            .push(&tenant("acme"), "30d", None, None)
+            .await
+            .unwrap();
+        policy
+            .push(&tenant("intern"), "infinite", None, None)
             .await
             .unwrap();
         // A downgrade taken before the restart must still be in force after it.
-        policy.push(&tenant("acme"), "7d", None).await.unwrap();
+        policy
+            .push(&tenant("acme"), "7d", None, None)
+            .await
+            .unwrap();
         assert_eq!(
             policy.metrics.push_accepted.load(Ordering::Relaxed),
             3,
@@ -951,7 +1020,10 @@ mod tests {
         let data_dir = tempdir("tenant-policy-local");
         let dir = data_dir.join(TENANT_POLICY_PREFIX);
         let policy = TenantPolicy::for_test_with_local_store(dir.clone());
-        policy.push(&tenant("acme"), "7d", None).await.unwrap();
+        policy
+            .push(&tenant("acme"), "7d", None, None)
+            .await
+            .unwrap();
         assert_eq!(
             policy.snapshot().unwrap().retention(&tenant("acme")),
             Some(TenantRetention::Finite(days(7)))
@@ -1004,7 +1076,10 @@ mod tests {
         let start_ns = 1_800_000_000_000_000_000i64;
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
-        policy.push(&tenant("acme"), "7d", None).await.unwrap();
+        policy
+            .push(&tenant("acme"), "7d", None, None)
+            .await
+            .unwrap();
 
         let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
         let floor = || policy.query_floor_ns(&tenant("acme")).expect("finite");
@@ -1041,7 +1116,10 @@ mod tests {
         let start_ns = 1_800_000_000_000_000_000i64;
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
-        policy.push(&tenant("acme"), "1d", None).await.unwrap();
+        policy
+            .push(&tenant("acme"), "1d", None, None)
+            .await
+            .unwrap();
 
         clock.advance(Duration::from_secs(2 * 24 * 60 * 60));
         assert!(
@@ -1054,7 +1132,10 @@ mod tests {
 
         // The control plane upgrades the tenant. The row is still on disk, and
         // the new plan covers it again.
-        policy.push(&tenant("acme"), "30d", None).await.unwrap();
+        policy
+            .push(&tenant("acme"), "30d", None, None)
+            .await
+            .unwrap();
         assert!(
             !policy
                 .cutoffs_now()
@@ -1078,7 +1159,7 @@ mod tests {
         TenantPolicy::load(&with_token, Some(storage.clone()))
             .await
             .expect("an empty store boots")
-            .push(&tenant("acme"), "0", None)
+            .push(&tenant("acme"), "0", None, None)
             .await
             .expect("the deletion is stored");
 
@@ -1111,11 +1192,14 @@ mod tests {
     async fn a_failing_store_changes_neither_the_map_nor_the_object() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy.push(&tenant("acme"), "30d", None).await.unwrap();
+        policy
+            .push(&tenant("acme"), "30d", None, None)
+            .await
+            .unwrap();
 
         // A malformed value is rejected before anything is written.
         assert!(matches!(
-            policy.push(&tenant("acme"), "soon", None).await,
+            policy.push(&tenant("acme"), "soon", None, None).await,
             Err(PolicyError::Invalid(_))
         ));
         assert_eq!(policy.metrics.push_rejected.load(Ordering::Relaxed), 1);
@@ -1131,7 +1215,10 @@ mod tests {
     async fn a_delete_returns_the_tenant_to_unknown() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy.push(&tenant("acme"), "1ms", None).await.unwrap();
+        policy
+            .push(&tenant("acme"), "1ms", None, None)
+            .await
+            .unwrap();
         assert!(policy.query_floor_ns(&tenant("acme")).is_some());
 
         policy.remove(&tenant("acme")).await.unwrap();
@@ -1154,9 +1241,12 @@ mod tests {
     async fn nothing_reinterprets_a_pushed_value() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage);
-        policy.push(&tenant("acme"), "3650d", None).await.unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None)
+            .push(&tenant("acme"), "3650d", None, None)
+            .await
+            .unwrap();
+        policy
+            .push(&tenant("intern"), "infinite", None, None)
             .await
             .unwrap();
 

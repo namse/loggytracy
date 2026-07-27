@@ -37,6 +37,10 @@ async fn run_metric_query(
 struct MetricQueryResult {
     series: Vec<MetricSeries>,
     scanned_rows: u64,
+    /// Carried so the tenant's scan budget is charged in bytes on both paths.
+    /// Rows would be a different unit for the same bucket, and a metric query
+    /// over wide lines would then look cheap.
+    scanned_bytes: u64,
 }
 
 async fn run_metric_query_with_stats(
@@ -46,8 +50,17 @@ async fn run_metric_query_with_stats(
     evaluation_times: Vec<i64>,
     scan_start_override: Option<i64>,
 ) -> Result<MetricQueryResult, String> {
+    // The same bound as the log path. A metric query is a scan with an
+    // aggregation on top, so exempting it would leave the cheaper of the two
+    // limited and the more expensive one free.
+    let _slot = state
+        .tenant_quota
+        .begin_query(&tenant)
+        .map_err(|error| format!("{TENANT_QUOTA_PREFIX}{}", error.message))?;
+    let quota = state.tenant_quota.clone();
+    let quota_tenant = tenant.clone();
     let cancellation = Arc::new(AtomicBool::new(false));
-    run_metric_query_with_stats_cancellable(
+    let result = run_metric_query_with_stats_cancellable(
         state,
         tenant,
         expr,
@@ -55,7 +68,11 @@ async fn run_metric_query_with_stats(
         scan_start_override,
         cancellation,
     )
-    .await
+    .await;
+    if let Ok(execution) = &result {
+        quota.charge_scan(&quota_tenant, execution.scanned_bytes);
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -112,6 +129,7 @@ async fn run_metric_query_with_stats_cancellable(
     let input_memory = estimated_query_memory_bytes(&execution.results);
     let streams = execution.results;
     let scanned_rows = execution.scanned_rows;
+    let scanned_bytes = execution.scanned_bytes;
     let grouping_fields = expr.grouping_fields();
     let mut entries = Vec::new();
     for stream in streams {
@@ -192,6 +210,7 @@ async fn run_metric_query_with_stats_cancellable(
             .map(|(labels, samples)| MetricSeries { labels, samples })
             .collect(),
         scanned_rows,
+        scanned_bytes,
     })
 }
 

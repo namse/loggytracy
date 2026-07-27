@@ -572,7 +572,8 @@ the code, the note says which.
 - [x] Document TLS unsupported as an architecture decision (`ARCHITECTURE.md`, "Transport security")
 - [x] P0-3 `X-Scope-OrgID` extraction and tenant isolation — as a *shared*-object axis, not a storage-path one. Per-tenant objects were rejected on Class A cost; see [`MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md)
 - [x] P0-3 per-tenant ingest rate — `ingest_rate` on the pushed policy, enforced before the body is decompressed
-- [ ] P0-3 remaining: per-tenant query-scan quota, stream-cardinality limit, per-tenant concurrency, tenant-labeled metrics
+- [x] P0-3 per-tenant query-scan quota (`query_rate` on the pushed policy) and per-tenant query concurrency
+- [ ] P0-3 remaining: stream-cardinality limit, tenant-labeled metrics
 - [x] N2 tenant allowlist (`LOGGYTRACY_ALLOWED_TENANTS`)
 - [x] Default bind moved inside the trust boundary — loopback unless configured, and startup says which side of it the listener landed on
 - [x] P2-2 resource guards on metadata endpoints (semaphore, timeout, `start`/`end`, `match[]` count)

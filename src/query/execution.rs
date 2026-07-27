@@ -246,6 +246,15 @@ async fn run_unified_query_with_stats(
     forward: bool,
     scan_budget: Option<usize>,
 ) -> Result<QueryExecution, String> {
+    // Held for the whole scan. Every read path funnels through here — logs,
+    // tail, volume, detected fields, restore probes — so the tenant's share of
+    // this instance is bounded in one place rather than at each handler.
+    let _slot = state
+        .tenant_quota
+        .begin_query(&tenant)
+        .map_err(|error| format!("{TENANT_QUOTA_PREFIX}{}", error.message))?;
+    let quota = state.tenant_quota.clone();
+    let quota_tenant = tenant.clone();
     let cancellation = Arc::new(AtomicBool::new(false));
     let metrics = state.metrics.clone();
     let started = std::time::Instant::now();
@@ -277,6 +286,10 @@ async fn run_unified_query_with_stats(
             metrics
                 .query_scanned_bytes
                 .fetch_add(execution.scanned_bytes, std::sync::atomic::Ordering::Relaxed);
+            // Charged with what the scan actually read. A query's cost is not
+            // knowable before running it, so the tenant pays afterwards and an
+            // overrun is bounded at one query rather than prevented.
+            quota.charge_scan(&quota_tenant, execution.scanned_bytes);
         }
         Err(_) => {
             metrics

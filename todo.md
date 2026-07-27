@@ -49,7 +49,9 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
   - [x] **Per-tenant ingest rate** — `ingest_rate` rides the same push as retention. The control plane sets the
         number; this side only owns the field and enforcement points. Check before decompression so an over-limit
         tenant cannot consume CPU.
-  - [ ] Per-tenant query-scan quotas/semaphores and tenant-labeled metrics
+  - [x] Per-tenant query-scan quota and concurrency — `query_rate` rides the same pushed
+        policy as `ingest_rate`, charged after a scan with what it actually read
+  - [ ] Tenant-labeled metrics
   - [ ] Durable monthly usage accounting — **this belongs to the control plane, not the instance.** A month spans
         instances and outlives them. This side only exports per-tenant usage for the control plane to account for.
 - [x] Document TLS unsupported as an architecture decision

@@ -22,6 +22,9 @@ struct RetentionRequest {
     /// tenant — the body is the whole policy, not a patch of it.
     #[serde(default)]
     ingest_rate: Option<String>,
+    /// The read side of the same policy. Optional for the same reason.
+    #[serde(default)]
+    query_rate: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -30,6 +33,8 @@ pub struct RetentionResponse {
     retention: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ingest_rate: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_rate: Option<String>,
     updated_at: String,
 }
 
@@ -53,19 +58,26 @@ pub async fn put_retention(
     })?;
     let view = state
         .tenant_policy
-        .push(&tenant, &request.retention, request.ingest_rate.as_deref())
+        .push(
+            &tenant,
+            &request.retention,
+            request.ingest_rate.as_deref(),
+            request.query_rate.as_deref(),
+        )
         .await
         .map_err(into_http)?;
     tracing::info!(
         %tenant,
         retention = %view.retention,
         ingest_rate = view.ingest_rate.as_deref().unwrap_or("unset"),
+        query_rate = view.query_rate.as_deref().unwrap_or("unset"),
         "tenant policy updated"
     );
     Ok(Json(RetentionResponse {
         tenant: tenant.as_str().to_string(),
         retention: view.retention,
         ingest_rate: view.ingest_rate,
+        query_rate: view.query_rate,
         updated_at: rfc3339(view.updated_at),
     }))
 }
@@ -87,6 +99,7 @@ pub async fn get_retention(
         tenant: tenant.as_str().to_string(),
         retention: view.retention,
         ingest_rate: view.ingest_rate,
+        query_rate: view.query_rate,
         updated_at: rfc3339(view.updated_at),
     }))
 }

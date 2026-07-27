@@ -37,6 +37,8 @@ environment variables (`OBJECT_STORE_*` takes precedence). For S3-compatible sto
 | `LOGGYTRACY_ALLOWED_TENANTS` | unset (allow all) | Comma-separated list. Tenants outside the list receive 403. **Because the header value supplied by the upstream is trusted without proof, anyone who can reach the listener can create any tenant when this list is unset** |
 | `LOGGYTRACY_TENANT_POLICY_TOKEN` | unset (disabled) | Enables the per-tenant policy admin API and disables global retention |
 | `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` | unset (unlimited) | Default for tenants whose rate has not been pushed by the control plane |
+| `LOGGYTRACY_DEFAULT_TENANT_QUERY_SCAN_BYTES_PER_SECOND` | none (unlimited) | Read-side default for tenants the control plane has pushed no `query_rate` for |
+| `LOGGYTRACY_MAX_CONCURRENT_QUERIES_PER_TENANT` | 4 | Queries one tenant may run at once. The scan rate bounds work over time; this bounds how much happens simultaneously, so one tenant cannot take every permit of the shared query semaphore |
 | `LOGGYTRACY_TENANT_INGEST_BURST` | `10s` | Time during which an unused tenant rate can accumulate for one burst. Capacity never falls below `MAX_PUSH_BYTES` |
 
 **Constraint:** startup is refused when `MISSING_TENANT_POLICY=default` but the default tenant is absent
@@ -53,8 +55,15 @@ second such as `4MiB/s`, `0` (writes disabled), or `unlimited`.
 
 ```
 PUT /loggytracy/api/v1/admin/tenants/{tenant}/retention
-{"retention": "7d", "ingest_rate": "4MiB/s"}
+{"retention": "7d", "ingest_rate": "4MiB/s", "query_rate": "64MiB/s"}
 ```
+
+`query_rate` is the read side, in bytes of *scanned* data per second. It is
+charged after a query completes with what the scan actually read, because the
+cost of a query is not knowable before running it — so a tenant that overruns is
+refused on its next query rather than mid-scan, which bounds the overrun at one
+query instead of preventing it. `0` means the tenant may not query at all, which
+is a real state: a suspended account still owns its data.
 
 The body is the complete policy, not a patch. If it is pushed without `ingest_rate`, the existing value
 is **cleared** and reverts to the default above.

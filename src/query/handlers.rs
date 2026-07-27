@@ -593,6 +593,9 @@ loggytracy_ingest_throttled_total {}\n\
 # HELP loggytracy_ingest_quota_rejected_total Requests refused for exceeding the tenant's own ingest rate, as opposed to this instance being behind.\n\
 # TYPE loggytracy_ingest_quota_rejected_total counter\n\
 loggytracy_ingest_quota_rejected_total {}\n\
+# HELP loggytracy_query_quota_rejected_total Queries refused by the tenant's own read quota, as opposed to queries this instance failed to answer.\n\
+# TYPE loggytracy_query_quota_rejected_total counter\n\
+loggytracy_query_quota_rejected_total {}\n\
 # TYPE loggytracy_memtable_buffered_bytes gauge\n\
 loggytracy_memtable_buffered_bytes {}\n\
 # TYPE loggytracy_flush_success_total counter\n\
@@ -686,6 +689,7 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         m.ingest_errors.load(Ordering::Relaxed),
         m.ingest_throttled.load(Ordering::Relaxed),
         m.ingest_quota_rejected.load(Ordering::Relaxed),
+        m.query_quota_rejected.load(Ordering::Relaxed),
         state.ingest_gate.buffered_bytes(),
         m.flush_success.load(Ordering::Relaxed),
         m.flush_errors.load(Ordering::Relaxed),

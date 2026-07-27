@@ -11,7 +11,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::metrics::RuntimeMetrics;
 use crate::tenant::TenantId;
-use crate::tenant_policy::{TenantIngestRate, TenantPolicy};
+use crate::tenant_policy::{TenantIngestRate, TenantPolicy, TenantQueryRate};
 
 /// Enforces the per-tenant ingest rate the control plane pushed.
 ///
@@ -34,7 +34,47 @@ pub struct TenantQuota {
     metrics: Arc<RuntimeMetrics>,
     policy: Arc<TenantPolicy>,
     buckets: Mutex<HashMap<TenantId, Bucket>>,
+    /// The read side, kept in its own map so a tenant reading hard cannot
+    /// spend the budget that decides whether its writes are accepted. They are
+    /// separate resources and a shared bucket would couple them.
+    scan_buckets: Mutex<HashMap<TenantId, Bucket>>,
+    /// Queries a tenant currently has in flight.
+    ///
+    /// The rate bucket bounds total work over time; this bounds work happening
+    /// at once. Without it one tenant issuing many concurrent scans takes every
+    /// permit of the shared query semaphore, and the other tenants queue behind
+    /// it however small their queries are.
+    in_flight: Mutex<HashMap<TenantId, u32>>,
     checks: std::sync::atomic::AtomicU64,
+}
+
+/// Releases a tenant's in-flight slot however the query ends, including a
+/// cancelled future. A leaked slot is permanent: the tenant loses that much
+/// concurrency for the life of the process.
+pub struct QuerySlot {
+    quota: Arc<TenantQuota>,
+    tenant: TenantId,
+}
+
+impl std::fmt::Debug for QuerySlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QuerySlot")
+            .field("tenant", &self.tenant)
+            .finish()
+    }
+}
+
+impl Drop for QuerySlot {
+    fn drop(&mut self) {
+        let mut in_flight = self.quota.in_flight.lock().unwrap();
+        if let Some(count) = in_flight.get_mut(&self.tenant) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                in_flight.remove(&self.tenant);
+            }
+        }
+    }
 }
 
 struct Bucket {
@@ -66,6 +106,8 @@ impl TenantQuota {
             metrics,
             policy,
             buckets: Mutex::new(HashMap::new()),
+            scan_buckets: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
             checks: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -93,16 +135,131 @@ impl TenantQuota {
             TenantIngestRate::Unlimited => return Ok(()),
             TenantIngestRate::BytesPerSecond(rate) => rate,
         };
+        self.charge(&self.buckets, tenant, rate, bytes, "write", "ingest rate")
+    }
+
+    /// Charge a completed query's scanned bytes against the tenant's read rate.
+    ///
+    /// Charged *after* the scan, with what it actually read, because the cost
+    /// of a query is not knowable before running it — an estimate would either
+    /// refuse cheap queries or let expensive ones through. A tenant that
+    /// overruns is therefore refused on its *next* query, which bounds the
+    /// overrun at one query rather than preventing it.
+    pub fn charge_scan(&self, tenant: &TenantId, bytes: u64) {
+        let TenantQueryRate::BytesPerSecond(rate) = self.resolve_query(tenant) else {
+            return;
+        };
+        if rate == 0 {
+            return;
+        }
+        let capacity = self.capacity(rate);
+        let refill_per_ns = rate as f64 / 1e9;
+        let now_ns = self.clock.now_ns();
+
+        let mut buckets = self.scan_buckets.lock().unwrap();
+        let bucket = buckets.entry(tenant.clone()).or_insert(Bucket {
+            available: capacity,
+            capacity,
+            refill_per_ns,
+            updated_ns: now_ns,
+        });
+        bucket.capacity = capacity;
+        bucket.refill_per_ns = refill_per_ns;
+        let elapsed_ns = now_ns.saturating_sub(bucket.updated_ns).max(0);
+        bucket.available = (bucket.available + elapsed_ns as f64 * refill_per_ns).min(capacity);
+        bucket.updated_ns = now_ns;
+
+        // The read bucket may go into debt, which the write bucket may not.
+        // A write is refused before it happens, so its bucket never owes
+        // anything; a scan has already run by the time its cost is known, so
+        // the overrun has to be recorded somewhere. Debt is what makes the
+        // charge proportional — reading twice the budget costs twice the wait,
+        // where clamping at zero would make every overrun cost the same.
+        //
+        // Bounded at one bucket, so a single enormous query cannot lock a
+        // tenant out for longer than its budget takes to refill once.
+        bucket.available = (bucket.available - bytes as f64).max(-capacity);
+        drop(buckets);
+        self.maybe_sweep();
+    }
+
+    /// Whether the tenant may start another query, and the slot it holds while
+    /// it runs.
+    pub fn begin_query(self: &Arc<Self>, tenant: &TenantId) -> Result<QuerySlot, IngestError> {
+        if let TenantQueryRate::BytesPerSecond(0) = self.resolve_query(tenant) {
+            return Err(self.query_refused(format!(
+                "tenant {tenant} is not permitted to query: its query rate is 0"
+            )));
+        }
+        // Checked before the concurrency slot so an exhausted budget is
+        // reported as a budget, not as contention. The test is for debt rather
+        // than for emptiness: the bucket refills continuously, so "any budget
+        // at all" is satisfied a nanosecond after it is spent.
+        if let Some(available) = self.available_scan_budget(tenant)
+            && available < 0.0
+        {
+            return Err(self.query_refused(format!(
+                "tenant {tenant} is over its query scan rate; the budget refills over time"
+            )));
+        }
+
+        let limit = self.config.max_concurrent_queries_per_tenant as u32;
+        let mut in_flight = self.in_flight.lock().unwrap();
+        let count = in_flight.entry(tenant.clone()).or_insert(0);
+        if *count >= limit {
+            let running = *count;
+            drop(in_flight);
+            return Err(self.query_refused(format!(
+                "tenant {tenant} already has {running} queries in flight, at its limit of {limit}"
+            )));
+        }
+        *count += 1;
+        drop(in_flight);
+        Ok(QuerySlot {
+            quota: self.clone(),
+            tenant: tenant.clone(),
+        })
+    }
+
+    /// Remaining scan budget, or `None` when the tenant has no finite rate.
+    fn available_scan_budget(&self, tenant: &TenantId) -> Option<f64> {
+        let TenantQueryRate::BytesPerSecond(rate) = self.resolve_query(tenant) else {
+            return None;
+        };
+        if rate == 0 {
+            return Some(0.0);
+        }
+        let now_ns = self.clock.now_ns();
+        let buckets = self.scan_buckets.lock().unwrap();
+        let Some(bucket) = buckets.get(tenant) else {
+            // No bucket is a full bucket: nothing has been spent.
+            return Some(self.capacity(rate));
+        };
+        let elapsed_ns = now_ns.saturating_sub(bucket.updated_ns).max(0);
+        Some((bucket.available + elapsed_ns as f64 * bucket.refill_per_ns).min(bucket.capacity))
+    }
+
+    /// One token bucket, shared by the read and write paths so the two cannot
+    /// drift apart in how they refill, clamp or report.
+    fn charge(
+        &self,
+        buckets: &Mutex<HashMap<TenantId, Bucket>>,
+        tenant: &TenantId,
+        rate: u64,
+        bytes: u64,
+        verb: &str,
+        what: &str,
+    ) -> Result<(), IngestError> {
         if rate == 0 {
             return Err(self.refused(format!(
-                "tenant {tenant} is not permitted to write: its ingest rate is 0"
+                "tenant {tenant} is not permitted to {verb}: its {what} is 0"
             )));
         }
         let capacity = self.capacity(rate);
         let refill_per_ns = rate as f64 / 1e9;
         let now_ns = self.clock.now_ns();
 
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = buckets.lock().unwrap();
         let bucket = buckets.entry(tenant.clone()).or_insert(Bucket {
             available: capacity,
             capacity,
@@ -122,10 +279,15 @@ impl TenantQuota {
         if bucket.available < bytes as f64 {
             let missing = bytes as f64 - bucket.available;
             let retry_after = Duration::from_secs_f64((missing / rate as f64).clamp(0.0, 3600.0));
+            // Spend what is there anyway. A refused request still consumed the
+            // budget it was measured against on the read path, and on the write
+            // path the bucket is already empty, so this only matters for making
+            // the two behave identically.
+            bucket.available = 0.0;
             drop(buckets);
             return Err(self.refused_with_retry(
                 format!(
-                    "tenant {tenant} is over its ingest rate of {rate} bytes/s; \
+                    "tenant {tenant} is over its {what} of {rate} bytes/s; \
 this request needs {bytes} bytes of budget"
                 ),
                 retry_after,
@@ -149,6 +311,16 @@ this request needs {bytes} bytes of budget"
     /// configured default when it has said nothing. A tenant the control plane
     /// does not know is treated the same whether per-tenant policy is off or
     /// simply silent about it.
+    fn resolve_query(&self, tenant: &TenantId) -> TenantQueryRate {
+        if let Some(rate) = self.policy.query_rate(tenant) {
+            return rate;
+        }
+        match self.config.default_tenant_query_scan_bytes_per_second {
+            Some(rate) => TenantQueryRate::BytesPerSecond(rate),
+            None => TenantQueryRate::Unlimited,
+        }
+    }
+
     fn resolve(&self, tenant: &TenantId) -> TenantIngestRate {
         if let Some(rate) = self.policy.ingest_rate(tenant) {
             return rate;
@@ -181,6 +353,19 @@ this request needs {bytes} bytes of budget"
             let refilled = bucket.available + elapsed_ns as f64 * bucket.refill_per_ns;
             refilled < bucket.capacity
         });
+    }
+
+    /// A read-side refusal, counted apart from the write-side one so an
+    /// operator can tell which half of a tenant's quota is binding.
+    fn query_refused(&self, message: String) -> IngestError {
+        self.metrics
+            .query_quota_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        IngestError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message,
+            retry_after: Some(self.config.backpressure_retry_after),
+        }
     }
 
     fn refused(&self, message: String) -> IngestError {

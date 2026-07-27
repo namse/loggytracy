@@ -119,6 +119,18 @@ pub struct Config {
     /// without that floor a low rate would reject the same request forever,
     /// which is the latching failure the backpressure gate is careful to avoid.
     pub tenant_ingest_burst: Duration,
+    /// Query scan rate for tenants the control plane has pushed no rate for.
+    /// The read counterpart to `default_tenant_ingest_bytes_per_second`, with
+    /// the same division of responsibility: plans are pushed, this is the
+    /// answer for a tenant nothing is known about.
+    pub default_tenant_query_scan_bytes_per_second: Option<u64>,
+    /// Queries one tenant may have running at once.
+    ///
+    /// The scan rate bounds a tenant's total work over time; this bounds how
+    /// much of it happens simultaneously. Without it a single tenant issuing
+    /// concurrent scans takes every permit of the shared query semaphore and
+    /// the other tenants queue behind it however small their queries are.
+    pub max_concurrent_queries_per_tenant: usize,
     /// Expired share of a part's rows that justifies one rewrite through
     /// merge. Below it the rows stay on disk, already invisible to queries.
     pub retention_rewrite_threshold: f64,
@@ -209,6 +221,8 @@ impl Default for Config {
             tenant_policy_token: None,
             default_tenant_ingest_bytes_per_second: None,
             tenant_ingest_burst: Duration::from_secs(10),
+            default_tenant_query_scan_bytes_per_second: None,
+            max_concurrent_queries_per_tenant: 4,
             retention_rewrite_threshold: 0.5,
             max_concurrent_tails: 8,
             tail_poll_interval: Duration::from_secs(1),
@@ -389,6 +403,14 @@ impl Config {
             tenant_ingest_burst: env_required_duration(
                 "LOGGYTRACY_TENANT_INGEST_BURST",
                 defaults.tenant_ingest_burst,
+            )?,
+            default_tenant_query_scan_bytes_per_second: env_optional_u64(
+                "LOGGYTRACY_DEFAULT_TENANT_QUERY_SCAN_BYTES_PER_SECOND",
+                defaults.default_tenant_query_scan_bytes_per_second,
+            )?,
+            max_concurrent_queries_per_tenant: env_positive_usize(
+                "LOGGYTRACY_MAX_CONCURRENT_QUERIES_PER_TENANT",
+                defaults.max_concurrent_queries_per_tenant,
             )?,
             retention_rewrite_threshold: env_value(
                 "LOGGYTRACY_RETENTION_REWRITE_THRESHOLD",

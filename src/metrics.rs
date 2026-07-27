@@ -16,6 +16,11 @@ pub struct RuntimeMetrics {
     /// behind and an operator should scale or tune it, this one says the
     /// instance is healthy and the tenant asked for more than it was sold.
     pub ingest_quota_rejected: AtomicU64,
+    /// Queries refused by the tenant's own read quota — its scan rate or its
+    /// concurrency limit. Separate from `query_errors`, which counts queries
+    /// this instance failed to answer: this one says the instance was willing
+    /// and the tenant was over what it was sold.
+    pub query_quota_rejected: AtomicU64,
     /// Point-in-time backlog gauges, published by the workers that already walk
     /// the structures they describe. Computing them per scrape instead was
     /// O(parts × tenants) of work on an unauthenticated endpoint, and the
@@ -66,6 +71,7 @@ impl RuntimeMetrics {
             ingest_errors: AtomicU64::new(0),
             ingest_throttled: AtomicU64::new(0),
             ingest_quota_rejected: AtomicU64::new(0),
+            query_quota_rejected: AtomicU64::new(0),
             merge_debt_parts: AtomicU64::new(0),
             unknown_tenants: AtomicU64::new(0),
             flush_success: AtomicU64::new(0),
