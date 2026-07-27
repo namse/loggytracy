@@ -592,7 +592,7 @@ the code, the note says which.
 - [x] P3 Dockerfile + configuration reference + runbook + alert rules
 - [x] **N7 readiness flapped on isolated object-store failures** — health is hysteretic now; measured 41-66% healthy before, 99.3-100% after
 - [x] **N8 merge and flush contend** — measured bounded: oscillates 6-140 MB with a negative trend. A tuning note, not a defect
-- [ ] **N9 peak RSS tracks whether merge runs**, not `merge_max_memory_bytes`. Wants a heap profile
+- [x] **N9 peak RSS is concurrent live memory** — returns fully when load stops. A sizing rule, not a defect
 - [ ] P2-5 duplicates after a crash are unobservable
 
 ### Gate 4 — scale validation

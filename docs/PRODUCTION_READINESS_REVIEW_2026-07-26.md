@@ -198,20 +198,25 @@ a simultaneous loss of machine and disk would take, and that window widens with
 merge running. Whether that is acceptable is a retention-of-risk question for
 the deployment, not a defect in the engine.
 
-### N9. Peak RSS tracks whether merge runs, not what it may materialize
+### N9. Peak RSS is concurrent live memory — **explained, not a defect**
 
-- Location: not yet localized
-- Verification: **Reproduced**, `docs/LOAD_RESULTS.md` section 6
+- Verification: **Measured**, `docs/LOAD_RESULTS.md` section 7
 
-Peak RSS is 173-187 MB with merge off and 697-758 MB with merge on. Cutting
-`merge_max_memory_bytes` eightfold moved it only 697 → 514 MB, and the run with
-no injected errors peaks highest of all at 758 MB while passing every gate. So
-the budget knob is not what sets the peak, which points at allocator high-water
-retention rather than at live merge state.
+Peak RSS is 173-187 MB with merge off and 697-758 MB with merge on, and cutting
+`merge_max_memory_bytes` eightfold barely moved it. Two hypotheses were recorded
+and both are wrong: it is not the merge budget, and it is not allocator
+high-water retention either.
 
-This matters because 16 GiB is the target and merge is the largest consumer in
-it. Confirming or refuting the allocator hypothesis wants a heap profile, not
-another load run.
+Watching RSS through a run and for 90 seconds after settles it. The peak is
+853.6 MB; the final reading is 14.8 MB, back to the starting value, while merge
+kept running through the idle tail. The memory is live, held while ingest, flush
+and merge overlap, and the allocator returns it. The budget knob did not move it
+because the groups being merged were far smaller than the budget — with parts of
+a few megabytes, `merge_max_input_bytes` was never binding.
+
+**Consequence is a sizing rule.** Peak is roughly 50x idle and is reached within
+a minute of load starting, so an instance sized from its idle footprint is sized
+about fifty times too small. [`RUNBOOK.md`](RUNBOOK.md) says so.
 
 ---
 

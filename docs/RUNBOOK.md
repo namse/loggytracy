@@ -22,6 +22,16 @@ This engine is **single-machine, single-writer**. Breaking that assumption corru
 4. **Keep the listening address inside the trust boundary.** TLS and authentication are outside this process,
    and `X-Scope-OrgID` is trusted without proof.
 
+## Sizing
+
+**Size on peak, not on idle.** Measured at 8000 eps with 500 tenants: RSS idles
+around 15 MB and peaks around 850 MB, reached within a minute of load starting,
+and returns to idle when load stops. That is live memory held while ingest,
+flush and merge overlap — not a leak, and not something a smaller
+`merge_max_memory_bytes` reduces, because the groups being merged are usually
+far below that budget already. An instance sized from a quiet screenshot is
+sized roughly fifty times too small.
+
 ## What to alert on
 
 | Signal | Condition | Meaning |

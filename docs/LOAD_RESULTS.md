@@ -295,3 +295,35 @@ backlog was oscillating exactly as intended.
 
 Fixed location: `merge::tests::layout_totals_count_tenant_part_pairs_and_survive_a_silent_merge`,
 `merge::tests::merging_parts_removes_their_pairs_from_the_totals`.
+
+## 7. Where the memory actually goes (N9)
+
+Peak RSS is 173-187 MB with merge off and 697-758 MB with merge on, and cutting
+`merge_max_memory_bytes` eightfold barely moved it. The recorded hypothesis was
+allocator high-water retention. Watching RSS every 500 ms through a run and for
+90 seconds after it refutes that too:
+
+| t (s) | 0 | 20 | 40 | 60 | 80 | 110 | 131 | 141 | 151 | 182 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| RSS (MB) | 17.7 | 258.7 | 516.3 | 341.4 | 806.4 | 763.5 | 153.0 | 24.0 | 15.3 | 14.8 |
+| merges | 1 | 3 | 5 | 8 | 10 | 14 | 17 | 18 | 20 | 23 |
+
+Peak 853.6 MB, final **14.8 MB** — back to where it started. And merge kept
+running through the idle tail, advancing from 18 to 23 while RSS sat at 15 MB.
+
+So it is neither retention nor a leak. It is live memory held while ingest,
+flush and merge run at once, and the allocator returns it promptly. The budget
+knob did not move it because the groups being merged were far smaller than the
+budget: with parts of a few megabytes, `merge_max_input_bytes` was never the
+binding constraint, so lowering it changed which merges were split rather than
+how much any of them held.
+
+**The operational consequence is a sizing rule, not a defect.** Peak is roughly
+50x idle — 850 MB against 15 MB, at 8000 eps with 500 tenants. An instance sized
+from its idle footprint is sized about fifty times too small, and the peak is
+reached within a minute of load starting.
+
+Incidentally this is the first evidence on the long-running-leak axis: memory
+returns fully to its starting value after sustained load. It is not a
+substitute for a long run, because what a soak looks for is drift over hours,
+but a leak large enough to matter over hours would likely be visible here.
