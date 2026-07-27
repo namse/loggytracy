@@ -18,8 +18,8 @@ string mean "disabled" and are valid only for knobs that can be disabled.
 |---|---|---|
 | `LOGGYTRACY_DATA_DIR` | `./data` | WAL, checkpoint, and local part cache. **This directory is the only copy of unflushed data.** Do not discard this disk during hardware replacement |
 | `LOGGYTRACY_OBJECT_STORE_URL` | unset (local-only) | `s3://bucket/prefix` or `file:///path`. **When unset, only the local disk is used without S3 tiering** — unsuitable for production because the disk becomes the source of truth |
-| `LOGGYTRACY_LISTEN_ADDR` | `0.0.0.0:3100` | Loki-compatible HTTP. TLS is unsupported, so it must remain **inside the trust boundary** |
-| `LOGGYTRACY_OTLP_GRPC_ADDR` | `0.0.0.0:4317` | OTLP gRPC. The trace and **log** services share this listener. Same trust-boundary requirement |
+| `LOGGYTRACY_LISTEN_ADDR` | `127.0.0.1:3100` | Loki-compatible HTTP. **Loopback by default**: there is no TLS and no authentication here, so reaching this listener from off the machine has to be a decision rather than the result of not making one. A container that receives traffic sets this to `0.0.0.0:3100` |
+| `LOGGYTRACY_OTLP_GRPC_ADDR` | `127.0.0.1:4317` | OTLP gRPC. The trace and **log** services share this listener. Loopback by default for the same reason |
 
 `file://` is for **single-process development and does not provide CAS**. Using it on shared or network
 storage causes manifest lost updates, which means data loss. `from_url` logs a warning at startup.

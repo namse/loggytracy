@@ -461,6 +461,16 @@ pub async fn run(config: Arc<Config>) {
         });
     }
 
+    if config.retention_period.is_none() && config.tenant_policy_token.is_none() {
+        // Neither mechanism is configured, so nothing ever expires. This is a
+        // legitimate configuration for a fixed-size dataset and a data-loss
+        // trap for anything else, and it is silent either way without this.
+        tracing::warn!(
+            "no retention is configured: neither LOGGYTRACY_RETENTION_PERIOD nor \
+LOGGYTRACY_TENANT_POLICY_TOKEN is set, so the object store grows without bound"
+        );
+    }
+    announce_bind(&config.otlp_grpc_addr, "LOGGYTRACY_OTLP_GRPC_ADDR");
     let otlp_addr = config
         .otlp_grpc_addr
         .parse()
@@ -504,6 +514,7 @@ pub async fn run(config: Arc<Config>) {
         .await
         .expect("failed to bind");
     tracing::info!(addr = %config.listen_addr, "loggytracy listening");
+    announce_bind(&config.listen_addr, "LOGGYTRACY_LISTEN_ADDR");
     let mut http_drain = shutdown.subscribe();
     let http_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -569,10 +580,74 @@ against the same LOGGYTRACY_OBJECT_STORE_URL."
     }
 }
 
+/// Say plainly which side of the trust boundary a listener ended up on.
+///
+/// Loopback is the default, so a deployment that forgot to configure the
+/// address gets a log line explaining why nothing can reach it rather than a
+/// silent success. A non-loopback address is the operator's decision, and the
+/// line records that it was made — there is no TLS or authentication here, so
+/// whatever draws the boundary is outside this process.
+fn is_loopback_addr(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr);
+    matches!(
+        host.trim_matches(['[', ']']),
+        "127.0.0.1" | "::1" | "localhost"
+    )
+}
+
+fn announce_bind(addr: &str, knob: &str) {
+    let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr);
+    let loopback = matches!(
+        host.trim_matches(['[', ']']),
+        "127.0.0.1" | "::1" | "localhost"
+    );
+    if loopback {
+        tracing::info!(
+            %addr,
+            "bound to loopback only; set {knob} to accept traffic from outside this machine"
+        );
+    } else {
+        tracing::warn!(
+            %addr,
+            "bound to a non-loopback address: this process has no TLS and no authentication, \
+        and X-Scope-OrgID is trusted without proof. Keep it inside a trust boundary"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    /// The default has to be the safe one, because the unsafe configuration is
+    /// the one that works. There is no TLS or authentication here and
+    /// `X-Scope-OrgID` is trusted without proof, so a listener reachable from
+    /// off the machine is a decision, not a default.
+    #[test]
+    fn the_default_listeners_stay_inside_the_machine() {
+        let config = Config::default();
+        assert!(
+            is_loopback_addr(&config.listen_addr),
+            "{}",
+            config.listen_addr
+        );
+        assert!(
+            is_loopback_addr(&config.otlp_grpc_addr),
+            "{}",
+            config.otlp_grpc_addr
+        );
+    }
+
+    #[test]
+    fn a_bind_address_is_classified_by_host_not_by_spelling() {
+        for addr in ["127.0.0.1:3100", "localhost:3100", "[::1]:4317"] {
+            assert!(is_loopback_addr(addr), "{addr}");
+        }
+        for addr in ["0.0.0.0:3100", "10.0.0.4:3100", "[::]:4317"] {
+            assert!(!is_loopback_addr(addr), "{addr}");
+        }
+    }
 
     /// The whole point of virtual time. This budget is five minutes by default;
     /// asserting anything about it against a real clock would mean a five-minute

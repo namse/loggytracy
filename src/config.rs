@@ -5,6 +5,15 @@ use crate::tenant::{MissingTenantPolicy, TenantId};
 
 #[derive(Clone)]
 pub struct Config {
+    /// Loopback by default, and deliberately so.
+    ///
+    /// There is no TLS and no authentication in this process, and
+    /// `X-Scope-OrgID` is trusted without proof — so the listener has to sit
+    /// inside a trust boundary something else draws. A default of `0.0.0.0`
+    /// makes the unsafe configuration the one you get by not deciding, and the
+    /// mistake is invisible: it works. Binding loopback fails the other way,
+    /// where the symptom is a connection refused and the startup log says
+    /// exactly what was bound.
     pub listen_addr: String,
     pub otlp_grpc_addr: String,
     pub data_dir: PathBuf,
@@ -74,6 +83,14 @@ pub struct Config {
     pub object_store_url: Option<String>,
     pub cache_max_bytes: u64,
     pub cache_eviction_interval: Duration,
+    /// Global retention, or `None` for unbounded.
+    ///
+    /// Unbounded is the right default only because it is not the mechanism:
+    /// per-tenant retention is pushed by the control plane, and configuring
+    /// both is a validation error rather than a precedence rule. A default
+    /// period here would silently delete data the control plane believes it
+    /// still owns. Startup warns when neither is configured, since unbounded
+    /// with nothing pushed means the object store grows forever.
     pub retention_period: Option<Duration>,
     pub retention_interval: Duration,
     pub retention_batch_size: usize,
@@ -150,8 +167,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:3100".to_string(),
-            otlp_grpc_addr: "0.0.0.0:4317".to_string(),
+            listen_addr: "127.0.0.1:3100".to_string(),
+            otlp_grpc_addr: "127.0.0.1:4317".to_string(),
             data_dir: PathBuf::from("./data"),
             default_tenant: TenantId::parse("default")
                 .expect("the built-in default tenant is valid"),

@@ -574,7 +574,7 @@ the code, the note says which.
 - [x] P0-3 per-tenant ingest rate — `ingest_rate` on the pushed policy, enforced before the body is decompressed
 - [ ] P0-3 remaining: per-tenant query-scan quota, stream-cardinality limit, per-tenant concurrency, tenant-labeled metrics
 - [x] N2 tenant allowlist (`LOGGYTRACY_ALLOWED_TENANTS`)
-- [ ] Adjust the default bind to the trust boundary (`0.0.0.0` → require explicit configuration)
+- [x] Default bind moved inside the trust boundary — loopback unless configured, and startup says which side of it the listener landed on
 - [x] P2-2 resource guards on metadata endpoints (semaphore, timeout, `start`/`end`, `match[]` count)
 - [x] P2-3 validate snappy reported length + expose body limit
 - [x] P1-7 label/line size limits
@@ -586,7 +586,7 @@ the code, the note says which.
 - [x] P2-7 latency histograms (p95/p99 derivable). Endpoint labels are still absent
 - [x] P2-8 non-stdin abort (`SIGUSR1`) + the orchestrator requirement and the two ways out documented in [`RUNBOOK.md`](RUNBOOK.md)
 - [x] P2-9 warn on `file://` production misuse (opt-in enforcement remains)
-- [ ] P2-4 decide `retention_period` default (document rationale if infinite)
+- [x] P2-4 `retention_period` default decided — unbounded, because per-tenant retention is the mechanism and a global default would delete data the control plane believes it owns. Startup warns when neither is configured
 - [x] P3 Dockerfile + configuration reference + runbook + alert rules
 - [ ] P2-5 duplicates after a crash are unobservable
 

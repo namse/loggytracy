@@ -46,7 +46,7 @@ Therefore, deployments must satisfy the following requirements.
 - Perform authentication and authorization outside this process (at a proxy or gateway), and pass the
   proxy-verified tenant as `X-Scope-OrgID`. The engine trusts this header — **tenant isolation fails if
   the engine is directly reachable from a network location where the header can be forged.**
-- Do not use a `0.0.0.0` bind outside local development.
+- The listeners bind loopback by default. A `0.0.0.0` bind is a deliberate configuration and belongs only behind something that terminates TLS and authenticates.
 
 ## Validation environment — do not test against S3
 
