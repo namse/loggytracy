@@ -349,226 +349,135 @@ impl ObjectStorage {
         Ok(())
     }
 
+    /// Evict Parquet bodies until the cache fits `max_bytes`, oldest first.
+    ///
+    /// Driven by the part directories the registry holds rather than by walking
+    /// the tree. The walk was two levels of `read_dir` plus a
+    /// `symlink_metadata` per entry, over every directory on disk, to arrive at
+    /// exactly the set the registry already knows — everything not in it was
+    /// skipped anyway, because absence from the registry does not prove a
+    /// directory is disposable. It may be local-only data from a period when
+    /// object storage was disabled, or an interrupted transaction awaiting
+    /// operator recovery. So the walk cost scaled with the disk while the
+    /// result scaled with the registry.
+    ///
+    /// The safety checks stay per directory: a path taken from the registry is
+    /// still checked for symlinks and for containment in the cache root, since
+    /// what those guard against is a cache tree that has been tampered with,
+    /// not a caller that passed the wrong list.
     pub fn evict_cache(
         &self,
         parts_root: &Path,
         max_bytes: u64,
-        eligible_part_ids: &HashSet<String>,
+        part_dirs: &[PathBuf],
     ) -> Result<u64, String> {
-        let mut cached = Vec::new();
-        let mut total = 0u64;
-        let canonical_root = match std::fs::symlink_metadata(parts_root) {
-            Ok(_) => validate_cache_root(parts_root)?,
+        self.evict_bodies(parts_root, max_bytes, part_dirs, DATA_FILE, "cache")
+    }
+
+    /// `domain` only names the cache in error messages. An operator reading
+    /// "refusing symlinked trace cache file" knows which tree to look at;
+    /// collapsing both into one wording would take that away.
+    fn evict_bodies(
+        &self,
+        cache_root: &Path,
+        max_bytes: u64,
+        part_dirs: &[PathBuf],
+        data_file: &str,
+        domain: &str,
+    ) -> Result<u64, String> {
+        let canonical_root = match std::fs::symlink_metadata(cache_root) {
+            Ok(_) => validate_cache_root(cache_root)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(error) => return Err(error.to_string()),
         };
-        let partitions = match std::fs::read_dir(parts_root) {
-            Ok(entries) => entries,
-            Err(error) => return Err(error.to_string()),
-        };
-        for partition in partitions {
-            let partition = partition.map_err(|error| error.to_string())?;
-            if partition.file_name().to_string_lossy().starts_with('.') {
-                continue;
+
+        let mut cached = Vec::new();
+        let mut total = 0u64;
+        for dir in part_dirs {
+            match std::fs::symlink_metadata(dir) {
+                Ok(_) => {}
+                // A registered part whose directory is gone is the eviction's
+                // own past work, or a restore that has not run yet. Neither is
+                // an error here.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
             }
-            let partition_metadata =
-                std::fs::symlink_metadata(partition.path()).map_err(|error| error.to_string())?;
-            if partition_metadata.file_type().is_symlink() {
-                return Err(format!(
-                    "refusing symlinked cache partition {}",
-                    partition.path().display()
-                ));
-            }
-            if !partition_metadata.is_dir() {
-                continue;
-            }
-            ensure_existing_cache_dir(&canonical_root, &partition.path())?;
-            for entry in std::fs::read_dir(partition.path()).map_err(|error| error.to_string())? {
-                let entry = entry.map_err(|error| error.to_string())?;
-                let entry_metadata =
-                    std::fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
-                if entry_metadata.file_type().is_symlink() {
+            ensure_existing_cache_dir(&canonical_root, dir)?;
+
+            // The bound applies to evictable Parquet bodies. Metadata, bloom
+            // filters, and stream indexes form the small persistent catalog
+            // required to plan selective restores.
+            let data_path = dir.join(data_file);
+            let bytes = match std::fs::symlink_metadata(&data_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
                     return Err(format!(
-                        "refusing symlinked cache part {}",
-                        entry.path().display()
+                        "refusing symlinked {domain} file {}",
+                        data_path.display()
                     ));
                 }
-                if !entry_metadata.is_dir() {
-                    continue;
+                Ok(metadata) if metadata.is_file() => metadata.len(),
+                Ok(_) => {
+                    return Err(format!(
+                        "{domain} data path is not a file: {}",
+                        data_path.display()
+                    ));
                 }
-                ensure_existing_cache_dir(&canonical_root, &entry.path())?;
-                let id = entry.file_name().to_string_lossy().into_owned();
-                if !eligible_part_ids.contains(&id) {
-                    // Absence from the current registry does not prove that a
-                    // directory is disposable. It may be local-only data from
-                    // a period when object storage was disabled, or an
-                    // interrupted transaction requiring operator recovery.
-                    // Cache eviction only removes bodies belonging to active
-                    // manifest parts; retention can clean confirmed stale
-                    // generations separately.
-                    continue;
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(error.to_string()),
+            };
+            let access_path = dir.join(".access");
+            let accessed = match std::fs::symlink_metadata(&access_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(format!(
+                        "refusing symlinked {domain} access marker {}",
+                        access_path.display()
+                    ));
                 }
-                // The bound applies to evictable Parquet bodies. Metadata,
-                // bloom filters, and stream indexes form the small persistent
-                // catalog required to plan selective restores.
-                let data_path = entry.path().join(DATA_FILE);
-                let bytes = match std::fs::symlink_metadata(&data_path) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(format!(
-                            "refusing symlinked cache data file {}",
-                            data_path.display()
-                        ));
-                    }
-                    Ok(metadata) if metadata.is_file() => metadata.len(),
-                    Ok(_) => {
-                        return Err(format!(
-                            "cache data path is not a file: {}",
-                            data_path.display()
-                        ));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-                    Err(error) => return Err(error.to_string()),
-                };
-                let access_path = entry.path().join(".access");
-                let accessed = match std::fs::symlink_metadata(&access_path) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(format!(
-                            "refusing symlinked cache access marker {}",
-                            access_path.display()
-                        ));
-                    }
-                    Ok(metadata) => metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        entry_metadata.modified().unwrap_or(std::time::UNIX_EPOCH)
-                    }
-                    Err(error) => return Err(error.to_string()),
-                };
-                total = total.saturating_add(bytes);
-                if bytes > 0 {
-                    cached.push((accessed, bytes, entry.path()));
+                Ok(metadata) => metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::symlink_metadata(dir)
+                        .map_err(|error| error.to_string())?
+                        .modified()
+                        .unwrap_or(std::time::UNIX_EPOCH)
                 }
+                Err(error) => return Err(error.to_string()),
+            };
+            total = total.saturating_add(bytes);
+            if bytes > 0 {
+                cached.push((accessed, bytes, dir.clone()));
             }
         }
+
         cached.sort_by_key(|(accessed, _, _)| *accessed);
         for (_, bytes, dir) in cached {
             if total <= max_bytes {
                 break;
             }
-            let data_path = dir.join(DATA_FILE);
+            let data_path = dir.join(data_file);
             match std::fs::remove_file(&data_path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(format!(
-                        "failed to evict cached data file {}: {error}",
-                        data_path.display()
-                    ));
-                }
+                Err(error) => return Err(error.to_string()),
             }
-            let _ = std::fs::remove_file(dir.join(".access"));
-            part::fsync_dir(&dir).map_err(|error| error.to_string())?;
             total = total.saturating_sub(bytes);
         }
         Ok(total)
     }
 
+    /// The trace side of `evict_cache`, driven the same way and for the same
+    /// reason.
     pub fn evict_trace_cache(
         &self,
         traces_root: &Path,
         max_bytes: u64,
-        eligible_part_ids: &HashSet<String>,
+        part_dirs: &[PathBuf],
     ) -> Result<u64, String> {
-        let canonical_root = match std::fs::symlink_metadata(traces_root) {
-            Ok(_) => validate_cache_root(traces_root)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(error.to_string()),
-        };
-        let mut cached = Vec::new();
-        let mut total = 0u64;
-        for partition in std::fs::read_dir(traces_root).map_err(|error| error.to_string())? {
-            let partition = partition.map_err(|error| error.to_string())?;
-            if partition.file_name().to_string_lossy().starts_with('.') {
-                continue;
-            }
-            let metadata =
-                std::fs::symlink_metadata(partition.path()).map_err(|error| error.to_string())?;
-            if metadata.file_type().is_symlink() {
-                return Err(format!(
-                    "refusing symlinked trace cache partition {}",
-                    partition.path().display()
-                ));
-            }
-            if !metadata.is_dir() {
-                continue;
-            }
-            ensure_existing_cache_dir(&canonical_root, &partition.path())?;
-            for entry in std::fs::read_dir(partition.path()).map_err(|error| error.to_string())? {
-                let entry = entry.map_err(|error| error.to_string())?;
-                let metadata =
-                    std::fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
-                if metadata.file_type().is_symlink() {
-                    return Err(format!(
-                        "refusing symlinked trace cache part {}",
-                        entry.path().display()
-                    ));
-                }
-                if !metadata.is_dir() {
-                    continue;
-                }
-                ensure_existing_cache_dir(&canonical_root, &entry.path())?;
-                validate_trace_cache_files(&entry.path())?;
-                let id = entry.file_name().to_string_lossy().into_owned();
-                if !eligible_part_ids.contains(&id) {
-                    continue;
-                }
-                let data_path = entry.path().join(TRACE_DATA_FILE);
-                let bytes = match std::fs::symlink_metadata(&data_path) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(format!(
-                            "refusing symlinked trace data file {}",
-                            data_path.display()
-                        ));
-                    }
-                    Ok(metadata) if metadata.is_file() => metadata.len(),
-                    Ok(_) => {
-                        return Err(format!(
-                            "trace cache data path is not a file: {}",
-                            data_path.display()
-                        ));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-                    Err(error) => return Err(error.to_string()),
-                };
-                total = total.saturating_add(bytes);
-                if bytes > 0 {
-                    cached.push((
-                        metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                        bytes,
-                        data_path,
-                    ));
-                }
-            }
-        }
-        cached.sort_by_key(|(accessed, _, _)| *accessed);
-        for (_, bytes, data_path) in cached {
-            if total <= max_bytes {
-                break;
-            }
-            match std::fs::remove_file(&data_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(format!(
-                        "failed to evict trace data file {}: {error}",
-                        data_path.display()
-                    ));
-                }
-            }
-            if let Some(parent) = data_path.parent() {
-                part::fsync_dir(parent).map_err(|error| error.to_string())?;
-            }
-            total = total.saturating_sub(bytes);
-        }
-        Ok(total)
+        self.evict_bodies(
+            traces_root,
+            max_bytes,
+            part_dirs,
+            TRACE_DATA_FILE,
+            "trace cache",
+        )
     }
 }

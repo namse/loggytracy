@@ -180,6 +180,16 @@ impl TraceRegistry {
             .collect()
     }
 
+    /// See `PartRegistry::part_dirs`.
+    pub fn part_dirs(&self) -> Vec<std::path::PathBuf> {
+        self.inner
+            .read()
+            .unwrap()
+            .values()
+            .map(|reader| reader.part().dir.clone())
+            .collect()
+    }
+
     pub fn part_ids(&self) -> std::collections::HashSet<String> {
         self.inner.read().unwrap().keys().cloned().collect()
     }

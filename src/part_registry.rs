@@ -436,6 +436,17 @@ impl PartRegistry {
         self.inner.read().unwrap().len()
     }
 
+    /// Every registered part's directory. What eviction walks instead of the
+    /// filesystem.
+    pub fn part_dirs(&self) -> Vec<std::path::PathBuf> {
+        self.inner
+            .read()
+            .unwrap()
+            .values()
+            .map(|reader| reader.part().dir.clone())
+            .collect()
+    }
+
     pub fn part_ids(&self) -> std::collections::HashSet<String> {
         self.inner.read().unwrap().keys().cloned().collect()
     }

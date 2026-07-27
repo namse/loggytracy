@@ -363,8 +363,8 @@ pub async fn run(config: Arc<Config>) {
                     _ = crate::shutdown::wait_for_drain(&mut drain_rx) => return,
                 }
                 let guard = registry.operation_lock().write_owned().await;
-                let eligible = registry.part_ids();
-                let trace_eligible = trace_registry.part_ids();
+                let eligible = registry.part_dirs();
+                let trace_eligible = trace_registry.part_dirs();
                 // Eviction walks the whole parts tree with `read_dir` and a
                 // `symlink_metadata` per entry. That is synchronous work, and
                 // running it inline blocked a runtime worker for as long as the

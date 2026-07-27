@@ -754,7 +754,7 @@
         let storage = ObjectStorage::in_memory();
         let root = temp_dir("evict").join("parts");
         let parts = part::flush_rows(vec![row("evict me")], &root, 100).unwrap();
-        let eligible = [parts[0].meta.id.clone()].into_iter().collect();
+        let eligible = vec![parts[0].dir.clone()];
         assert_eq!(storage.evict_cache(&root, 0, &eligible).unwrap(), 0);
         assert!(!parts[0].data_path().exists());
         assert!(parts[0].meta_path().exists());
@@ -770,7 +770,7 @@
         stale_row.timestamp_ns += 1;
         let stale = part::flush_rows(vec![stale_row], &root, 100).unwrap();
         let active_bytes = std::fs::metadata(active[0].data_path()).unwrap().len();
-        let eligible = [active[0].meta.id.clone()].into_iter().collect();
+        let eligible = vec![active[0].dir.clone()];
 
         assert_eq!(
             storage.evict_cache(&root, u64::MAX, &eligible).unwrap(),
@@ -804,9 +804,17 @@
         assert!(restore_error.contains("symlinked cache directory"));
         assert_eq!(std::fs::read(&outside_data).unwrap(), b"must survive");
 
-        let eligible = [descriptor.id.clone()].into_iter().collect();
+        // Eviction is driven by the registry's part directories now, so it
+        // never enumerates partitions. A symlinked partition is still refused,
+        // by the containment check on the part directory itself: canonicalizing
+        // it resolves through the symlink and lands outside the cache root.
+        let eligible = vec![cache.join(&descriptor.partition).join(&descriptor.id)];
         let eviction_error = storage.evict_cache(&cache, 0, &eligible).unwrap_err();
-        assert!(eviction_error.contains("symlinked cache partition"));
+        assert!(
+            eviction_error.contains("escapes root")
+                || eviction_error.contains("refusing unsafe cache directory"),
+            "{eviction_error}"
+        );
         assert_eq!(std::fs::read(&outside_data).unwrap(), b"must survive");
 
         let empty_storage = ObjectStorage::in_memory();
@@ -824,7 +832,7 @@
         let file_error = storage.restore_catalog(&cache).await.unwrap_err();
         assert!(file_error.contains("symlinked cache file"));
         let eviction_error = storage.evict_cache(&cache, 0, &eligible).unwrap_err();
-        assert!(eviction_error.contains("symlinked cache data file"));
+        assert!(eviction_error.contains("refusing symlinked cache file"));
         assert_eq!(std::fs::read(&outside_data).unwrap(), b"must survive");
     }
 
@@ -890,7 +898,7 @@
         assert!(restore_error.contains("unsafe cache root"));
         assert!(outside_data.exists());
 
-        let eligible = [parts[0].meta.id.clone()].into_iter().collect();
+        let eligible = vec![parts[0].dir.clone()];
         let eviction_error = storage.evict_cache(&cache_link, 0, &eligible).unwrap_err();
         assert!(eviction_error.contains("unsafe cache root"));
         assert!(outside_data.exists());
@@ -945,7 +953,7 @@
         assert!(parts[0].data_path().exists());
 
         storage
-            .evict_trace_cache(&root, 0, &std::iter::once(id.clone()).collect())
+            .evict_trace_cache(&root, 0, &[parts[0].dir.clone()])
             .unwrap();
         assert!(!parts[0].data_path().exists());
         storage
@@ -1032,7 +1040,7 @@
 
         let restore_error = storage.restore_trace_catalog(&root).await.unwrap_err();
         assert!(restore_error.contains("symlinked trace cache file"));
-        let eligible = std::iter::once(descriptor.id.clone()).collect();
+        let eligible = vec![root.join(&descriptor.partition).join(&descriptor.id)];
         let eviction_error = storage.evict_trace_cache(&root, 0, &eligible).unwrap_err();
         assert!(eviction_error.contains("symlinked trace cache file"));
         assert_eq!(std::fs::read(&outside).unwrap(), b"must survive");
@@ -1461,5 +1469,43 @@
             peak <= super::RESTORE_CONCURRENCY as u64,
             "restore exceeded its own bound (peak in flight {peak}); an unbounded fan-out \
 opens a connection per part"
+        );
+    }
+
+    /// Eviction visits the registry's parts, not the tree. Directories on disk
+    /// that no registered part points at are neither read nor removed — which
+    /// is what the walk already did by skipping them, at the cost of walking
+    /// them first.
+    #[test]
+    fn eviction_touches_only_the_parts_it_was_given() {
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("evict-scope").join("parts");
+        let evictable = part::flush_rows(vec![row("evictable")], &root, 100).unwrap();
+        let mut other = row("untouched");
+        other.timestamp_ns += 1;
+        let untouched = part::flush_rows(vec![other], &root, 100).unwrap();
+
+        // A directory the registry knows nothing about: local-only data, or an
+        // interrupted transaction awaiting operator recovery.
+        let stray = root.join("2020-01-01").join("stray-part");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join(DATA_FILE), b"not eviction's business").unwrap();
+
+        storage
+            .evict_cache(&root, 0, &[evictable[0].dir.clone()])
+            .unwrap();
+
+        assert!(!evictable[0].data_path().exists(), "the given part is evicted");
+        assert!(
+            evictable[0].meta_path().exists(),
+            "its catalog survives: only bodies are evictable"
+        );
+        assert!(
+            untouched[0].data_path().exists(),
+            "a registered part that was not passed is left alone"
+        );
+        assert!(
+            stray.join(DATA_FILE).exists(),
+            "and a directory nothing points at is not eviction's to remove"
         );
     }

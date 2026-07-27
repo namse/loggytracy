@@ -506,7 +506,7 @@
         storage.publish(&published_parts, &[]).await.unwrap();
         let parts = Arc::new(PartRegistry::load_from_disk(&parts_root).unwrap());
         storage
-            .evict_cache(&parts_root, 0, &parts.part_ids())
+            .evict_cache(&parts_root, 0, &parts.part_dirs())
             .unwrap();
         assert!(parts.has_missing_cache_files());
 
@@ -580,9 +580,7 @@
             .publish(&new, &[old[0].meta.id.clone()])
             .await
             .unwrap();
-        let eligible = [old[0].meta.id.clone(), new[0].meta.id.clone()]
-            .into_iter()
-            .collect();
+        let eligible = vec![old[0].dir.clone(), new[0].dir.clone()];
         storage.evict_cache(&parts_root, 0, &eligible).unwrap();
 
         let memtable = Arc::new(MemTable::new());
@@ -1042,7 +1040,7 @@
         storage.publish(&published, &[]).await.unwrap();
         let parts = Arc::new(PartRegistry::load_from_disk(&parts_root).unwrap());
         storage
-            .evict_cache(&parts_root, 0, &parts.part_ids())
+            .evict_cache(&parts_root, 0, &parts.part_dirs())
             .unwrap();
         let state = test_state(
             &data_dir,
@@ -1098,7 +1096,7 @@
         storage.publish(&flushed, &[]).await.unwrap();
         let parts = Arc::new(PartRegistry::load_from_disk(&parts_root).unwrap());
         storage
-            .evict_cache(&parts_root, 0, &parts.part_ids())
+            .evict_cache(&parts_root, 0, &parts.part_dirs())
             .unwrap();
         assert!(!flushed[0].data_path().exists());
         let state = test_state(
