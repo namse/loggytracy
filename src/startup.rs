@@ -432,7 +432,7 @@ pub async fn run(config: Arc<Config>) {
         AppStateDependencies {
             memtable,
             journal,
-            parts,
+            parts: parts.clone(),
             trace_parts: trace_registry,
             flush_healthy,
             merge_healthy,
@@ -493,6 +493,7 @@ LOGGYTRACY_TENANT_POLICY_TOKEN is set, so the object store grows without bound"
         ingest_gate,
         tenant_quota,
         clock.clone(),
+        parts,
     );
     let otlp_task_health = otlp_healthy;
     let mut otlp_drain = shutdown.subscribe();

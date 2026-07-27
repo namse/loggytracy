@@ -112,6 +112,8 @@ pub async fn logs(
         ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
         clock: &state.clock,
+        parts: &state.parts,
+        memtable: &state.memtable,
     };
     ingest.admit_transport()?;
     let encoding = OtlpEncoding::from_headers(&headers)?;

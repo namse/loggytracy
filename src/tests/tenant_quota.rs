@@ -113,11 +113,11 @@
         let clock = Clock::fixed(0);
         let policy = Arc::new(TenantPolicy::enabled_with_clock(clock.clone()));
         policy
-            .push(&tenant("premium"), "7d", Some("1MiB/s"), None)
+            .push(&tenant("premium"), "7d", Some("1MiB/s"), None, None)
             .await
             .unwrap();
         policy
-            .push(&tenant("blocked"), "7d", Some("0"), None)
+            .push(&tenant("blocked"), "7d", Some("0"), None, None)
             .await
             .unwrap();
         let config = Config {
@@ -304,15 +304,134 @@
         let clock = Clock::fixed(0);
         let policy = Arc::new(TenantPolicy::enabled_with_clock(clock.clone()));
         policy
-            .push(&tenant("suspended"), "7d", None, Some("0"))
+            .push(&tenant("suspended"), "7d", None, Some("0"), None)
             .await
             .unwrap();
         policy
-            .push(&tenant("active"), "7d", None, Some("1MiB/s"))
+            .push(&tenant("active"), "7d", None, Some("1MiB/s"), None)
             .await
             .unwrap();
         let quota = Arc::new(quota(Config::default(), clock, policy));
 
         quota.begin_query(&tenant("suspended")).unwrap_err();
         quota.begin_query(&tenant("active")).unwrap();
+    }
+
+    /// A tenant at its stream limit keeps writing to the streams it has. The
+    /// limit exists to stop a client that mints label values, and cutting off
+    /// its existing streams would punish the wrong thing — the tenant's real
+    /// logs would stop while the runaway labels were the problem.
+    #[test]
+    fn the_stream_limit_refuses_new_streams_and_keeps_existing_ones() {
+        use crate::memtable::{Labels, LogEntry, MemTable};
+        use crate::part_registry::PartRegistry;
+
+        fn labels(app: &str) -> Labels {
+            [("app".to_string(), app.to_string())].into_iter().collect()
+        }
+        fn entry() -> Vec<LogEntry> {
+            vec![LogEntry {
+                timestamp_ns: 1,
+                line: "x".to_string(),
+                structured_metadata: vec![],
+            }]
+        }
+
+        let config = Config {
+            default_tenant_max_streams: Some(2),
+            ..Config::default()
+        };
+        let quota = quota(config, Clock::fixed(0), Arc::new(TenantPolicy::disabled()));
+        let parts = PartRegistry::new();
+        let memtable = MemTable::new();
+        let acme = tenant("acme");
+
+        quota
+            .admit_stream(&acme, &labels("one"), &parts, &memtable)
+            .unwrap();
+        memtable.insert(acme.clone(), labels("one"), entry());
+        quota
+            .admit_stream(&acme, &labels("two"), &parts, &memtable)
+            .unwrap();
+        memtable.insert(acme.clone(), labels("two"), entry());
+
+        let refused = quota
+            .admit_stream(&acme, &labels("three"), &parts, &memtable)
+            .expect_err("a third stream is over the limit");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+
+        // The streams it already has keep working.
+        quota
+            .admit_stream(&acme, &labels("one"), &parts, &memtable)
+            .expect("an existing stream is never refused");
+
+        // And the limit is per tenant.
+        quota
+            .admit_stream(&tenant("other"), &labels("three"), &parts, &memtable)
+            .expect("another tenant has its own budget");
+    }
+
+    /// Parts and buffers are unioned, not summed. A stream that has been
+    /// flushed lives in both for as long as the buffer holds it, and summing
+    /// would count it twice — charging a tenant for streams it does not have.
+    #[tokio::test]
+    async fn a_flushed_stream_is_not_counted_twice() {
+        use crate::memtable::{Labels, LogEntry, MemTable};
+        use crate::part_registry::PartRegistry;
+
+        let dir = std::env::temp_dir().join(format!("loggytracy-streams-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            default_tenant_max_streams: Some(2),
+            ..Config::default()
+        };
+        let quota = quota(config.clone(), Clock::fixed(0), Arc::new(TenantPolicy::disabled()));
+        let parts = PartRegistry::new();
+        let memtable = MemTable::new();
+        let acme = tenant("acme");
+
+        let stream: Labels = [("app".to_string(), "flushed".to_string())]
+            .into_iter()
+            .collect();
+        // The same stream in both places, which is what a flush in progress
+        // looks like.
+        parts
+            .register(
+                crate::part::flush_rows(
+                    vec![crate::part::Row {
+                        tenant: acme.clone(),
+                        timestamp_ns: 1,
+                        labels: stream.clone(),
+                        line: "on disk".to_string(),
+                        structured_metadata: vec![],
+                    }],
+                    &dir,
+                    config.row_group_size,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        memtable.insert(
+            acme.clone(),
+            stream.clone(),
+            vec![LogEntry {
+                timestamp_ns: 2,
+                line: "buffered".to_string(),
+                structured_metadata: vec![],
+            }],
+        );
+
+        assert_eq!(parts.tenant_stream_count(&acme), 1);
+        // One stream held, so a second is still allowed. Summing the two
+        // sources would have counted two and refused it.
+        quota
+            .admit_stream(
+                &acme,
+                &[("app".to_string(), "new".to_string())]
+                    .into_iter()
+                    .collect(),
+                &parts,
+                &memtable,
+            )
+            .expect("the flushed stream must be counted once");
     }

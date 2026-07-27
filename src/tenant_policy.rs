@@ -85,6 +85,14 @@ struct PolicyEntry {
     raw_ingest_rate: Option<String>,
     query_rate: Option<TenantQueryRate>,
     raw_query_rate: Option<String>,
+    /// Distinct log streams the tenant may hold at once, or `None` when the
+    /// control plane has said nothing.
+    ///
+    /// Stream cardinality is the one cost here that neither retention nor merge
+    /// reclaims on its own: `stream.idx` is an eviction-exempt catalog, so a
+    /// tenant that mints a label value per request turns disk into something
+    /// nothing takes back.
+    max_streams: Option<u64>,
     updated_at: SystemTime,
 }
 
@@ -93,6 +101,7 @@ pub struct PolicyView {
     pub retention: String,
     pub ingest_rate: Option<String>,
     pub query_rate: Option<String>,
+    pub max_streams: Option<u64>,
     pub updated_at: SystemTime,
 }
 
@@ -117,11 +126,16 @@ impl PolicyMap {
         self.entries.get(tenant).and_then(|entry| entry.query_rate)
     }
 
+    pub fn max_streams(&self, tenant: &TenantId) -> Option<u64> {
+        self.entries.get(tenant).and_then(|entry| entry.max_streams)
+    }
+
     pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
         self.entries.get(tenant).map(|entry| PolicyView {
             retention: entry.raw.clone(),
             ingest_rate: entry.raw_ingest_rate.clone(),
             query_rate: entry.raw_query_rate.clone(),
+            max_streams: entry.max_streams,
             updated_at: entry.updated_at,
         })
     }
@@ -299,6 +313,8 @@ struct PolicyDocument {
     ingest_rate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     query_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_streams: Option<u64>,
     updated_at: String,
 }
 
@@ -408,6 +424,7 @@ impl PolicyStore {
                     raw_ingest_rate: document.ingest_rate,
                     query_rate,
                     raw_query_rate: document.query_rate,
+                    max_streams: document.max_streams,
                     updated_at,
                 },
             );
@@ -617,6 +634,7 @@ resurrect data those policies had already expired",
         raw: &str,
         raw_ingest_rate: Option<&str>,
         raw_query_rate: Option<&str>,
+        max_streams: Option<u64>,
     ) -> Result<PolicyView, PolicyError> {
         let Some(store) = &self.store else {
             return Err(PolicyError::Invalid(
@@ -658,6 +676,7 @@ resurrect data those policies had already expired",
             retention: raw.clone(),
             ingest_rate: raw_ingest_rate.clone(),
             query_rate: raw_query_rate.clone(),
+            max_streams,
             updated_at: format_timestamp(updated_at),
         };
         if let Err(error) = store.put(tenant, &document).await {
@@ -676,6 +695,7 @@ resurrect data those policies had already expired",
                     raw_ingest_rate: raw_ingest_rate.clone(),
                     query_rate,
                     raw_query_rate: raw_query_rate.clone(),
+                    max_streams,
                     updated_at,
                 },
             );
@@ -685,6 +705,7 @@ resurrect data those policies had already expired",
             retention: raw,
             ingest_rate: raw_ingest_rate,
             query_rate: raw_query_rate,
+            max_streams,
             updated_at,
         })
     }
@@ -700,6 +721,10 @@ resurrect data those policies had already expired",
 
     pub fn query_rate(&self, tenant: &TenantId) -> Option<TenantQueryRate> {
         self.snapshot()?.query_rate(tenant)
+    }
+
+    pub fn max_streams(&self, tenant: &TenantId) -> Option<u64> {
+        self.snapshot()?.max_streams(tenant)
     }
 
     /// Return the tenant to *unknown*, which keeps its data forever. This is
@@ -761,6 +786,7 @@ resurrect data those policies had already expired",
                         raw_ingest_rate: None,
                         query_rate: None,
                         raw_query_rate: None,
+                        max_streams: None,
                         updated_at: SystemTime::now(),
                     },
                 );
@@ -955,16 +981,16 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "30d", None, None)
+            .push(&tenant("acme"), "30d", None, None, None)
             .await
             .unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None, None)
+            .push(&tenant("intern"), "infinite", None, None, None)
             .await
             .unwrap();
         // A downgrade taken before the restart must still be in force after it.
         policy
-            .push(&tenant("acme"), "7d", None, None)
+            .push(&tenant("acme"), "7d", None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1021,7 +1047,7 @@ mod tests {
         let dir = data_dir.join(TENANT_POLICY_PREFIX);
         let policy = TenantPolicy::for_test_with_local_store(dir.clone());
         policy
-            .push(&tenant("acme"), "7d", None, None)
+            .push(&tenant("acme"), "7d", None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1077,7 +1103,7 @@ mod tests {
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
         policy
-            .push(&tenant("acme"), "7d", None, None)
+            .push(&tenant("acme"), "7d", None, None, None)
             .await
             .unwrap();
 
@@ -1117,7 +1143,7 @@ mod tests {
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
         policy
-            .push(&tenant("acme"), "1d", None, None)
+            .push(&tenant("acme"), "1d", None, None, None)
             .await
             .unwrap();
 
@@ -1133,7 +1159,7 @@ mod tests {
         // The control plane upgrades the tenant. The row is still on disk, and
         // the new plan covers it again.
         policy
-            .push(&tenant("acme"), "30d", None, None)
+            .push(&tenant("acme"), "30d", None, None, None)
             .await
             .unwrap();
         assert!(
@@ -1159,7 +1185,7 @@ mod tests {
         TenantPolicy::load(&with_token, Some(storage.clone()))
             .await
             .expect("an empty store boots")
-            .push(&tenant("acme"), "0", None, None)
+            .push(&tenant("acme"), "0", None, None, None)
             .await
             .expect("the deletion is stored");
 
@@ -1193,13 +1219,13 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "30d", None, None)
+            .push(&tenant("acme"), "30d", None, None, None)
             .await
             .unwrap();
 
         // A malformed value is rejected before anything is written.
         assert!(matches!(
-            policy.push(&tenant("acme"), "soon", None, None).await,
+            policy.push(&tenant("acme"), "soon", None, None, None).await,
             Err(PolicyError::Invalid(_))
         ));
         assert_eq!(policy.metrics.push_rejected.load(Ordering::Relaxed), 1);
@@ -1216,7 +1242,7 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "1ms", None, None)
+            .push(&tenant("acme"), "1ms", None, None, None)
             .await
             .unwrap();
         assert!(policy.query_floor_ns(&tenant("acme")).is_some());
@@ -1242,11 +1268,11 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage);
         policy
-            .push(&tenant("acme"), "3650d", None, None)
+            .push(&tenant("acme"), "3650d", None, None, None)
             .await
             .unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None, None)
+            .push(&tenant("intern"), "infinite", None, None, None)
             .await
             .unwrap();
 

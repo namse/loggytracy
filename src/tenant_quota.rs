@@ -221,6 +221,66 @@ impl TenantQuota {
         })
     }
 
+    /// Whether the tenant may hold this stream, given what it already holds.
+    ///
+    /// Stream cardinality is the one cost neither retention nor merge reclaims
+    /// on its own: `stream.idx` is an eviction-exempt catalog, so a tenant that
+    /// mints a label value per request turns disk into something nothing takes
+    /// back. The limit is therefore on the *set*, not on a rate.
+    ///
+    /// Only a stream that is new to both the parts and the buffers can be
+    /// refused. An existing stream is always accepted, so a tenant that is over
+    /// its limit keeps working with what it has rather than going dark.
+    pub fn admit_stream(
+        &self,
+        tenant: &TenantId,
+        labels: &crate::memtable::Labels,
+        parts: &crate::part_registry::PartRegistry,
+        memtable: &crate::memtable::MemTable,
+    ) -> Result<(), IngestError> {
+        let Some(limit) = self.resolve_max_streams(tenant) else {
+            return Ok(());
+        };
+        let key = crate::part_registry::stream_key(labels);
+        if parts.contains_stream(tenant, key) || memtable.contains_stream(tenant, labels) {
+            return Ok(());
+        }
+        // Reached only when a genuinely new stream appears, which is the rare
+        // path. The buffered set is small — bounded by what one flush interval
+        // accumulates — and it is walked to count only the streams the parts do
+        // not already have, so the two sources are unioned rather than summed.
+        let buffered_only = memtable
+            .tenant_streams(tenant)
+            .iter()
+            .filter(|labels| {
+                !parts.contains_stream(tenant, crate::part_registry::stream_key(labels))
+            })
+            .count();
+        let live = parts
+            .tenant_stream_count(tenant)
+            .saturating_add(buffered_only) as u64;
+        if live >= limit {
+            self.metrics
+                .stream_limit_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "tenant {tenant} already holds {live} streams, at its limit of {limit}; \
+this write would create another"
+                ),
+            )
+                .into());
+        }
+        Ok(())
+    }
+
+    fn resolve_max_streams(&self, tenant: &TenantId) -> Option<u64> {
+        self.policy
+            .max_streams(tenant)
+            .or(self.config.default_tenant_max_streams)
+    }
+
     /// Remaining scan budget, or `None` when the tenant has no finite rate.
     fn available_scan_budget(&self, tenant: &TenantId) -> Option<f64> {
         let TenantQueryRate::BytesPerSecond(rate) = self.resolve_query(tenant) else {

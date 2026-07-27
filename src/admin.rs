@@ -25,6 +25,9 @@ struct RetentionRequest {
     /// The read side of the same policy. Optional for the same reason.
     #[serde(default)]
     query_rate: Option<String>,
+    /// Distinct log streams the tenant may hold at once.
+    #[serde(default)]
+    max_streams: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -35,6 +38,8 @@ pub struct RetentionResponse {
     ingest_rate: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     query_rate: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_streams: Option<u64>,
     updated_at: String,
 }
 
@@ -63,6 +68,7 @@ pub async fn put_retention(
             &request.retention,
             request.ingest_rate.as_deref(),
             request.query_rate.as_deref(),
+            request.max_streams,
         )
         .await
         .map_err(into_http)?;
@@ -78,6 +84,7 @@ pub async fn put_retention(
         retention: view.retention,
         ingest_rate: view.ingest_rate,
         query_rate: view.query_rate,
+        max_streams: view.max_streams,
         updated_at: rfc3339(view.updated_at),
     }))
 }
@@ -100,6 +107,7 @@ pub async fn get_retention(
         retention: view.retention,
         ingest_rate: view.ingest_rate,
         query_rate: view.query_rate,
+        max_streams: view.max_streams,
         updated_at: rfc3339(view.updated_at),
     }))
 }

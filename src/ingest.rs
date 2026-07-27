@@ -213,6 +213,10 @@ async fn push_inner(
             )
         })?;
         validate_labels(&labels, limits).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        state
+            .tenant_quota
+            .admit_stream(&tenant, &labels, &state.parts, &state.memtable)
+            .map_err(|error| (error.status, error.message))?;
         let entries: Vec<LogEntry> = stream
             .entries
             .iter()
@@ -338,6 +342,9 @@ async fn accept_streams(
     let timestamp_window = TimestampWindow::from_config(limits, &state.clock);
     for (labels, entries) in &parsed {
         validate_labels(labels, limits).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        state
+            .tenant_quota
+            .admit_stream(&tenant, labels, &state.parts, &state.memtable)?;
         for entry in entries {
             timestamp_window
                 .validate(entry.timestamp_ns)

@@ -51,6 +51,8 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
         tenant cannot consume CPU.
   - [x] Per-tenant query-scan quota and concurrency — `query_rate` rides the same pushed
         policy as `ingest_rate`, charged after a scan with what it actually read
+  - [x] Per-tenant stream cardinality limit — `max_streams` on the pushed policy, enforced
+        against the union of what the tenant holds in parts and in the buffers
   - [ ] Tenant-labeled metrics
   - [ ] Durable monthly usage accounting — **this belongs to the control plane, not the instance.** A month spans
         instances and outlives them. This side only exports per-tenant usage for the control plane to account for.

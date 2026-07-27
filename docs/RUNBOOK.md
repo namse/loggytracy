@@ -34,6 +34,7 @@ This engine is **single-machine, single-writer**. Breaking that assumption corru
 | `loggytracy_merge_debt_parts` | Upward trend | Merge cannot keep up; query-planning cost rises |
 | `loggytracy_retention_rewrite_skipped_total` | Increasing | A part is too large to rewrite. **Tenant deletion is not complete** |
 | `loggytracy_tenant_policy_unknown_tenants` | Greater than 0 | Unknown tenants are accumulating data from the control plane's perspective |
+| `loggytracy_stream_limit_rejected_total` | Increasing | A tenant is creating streams past its limit. **Usually a client putting a request id or timestamp in a label**, not a plan being outgrown — check the label names before raising anything |
 | `loggytracy_query_quota_rejected_total` | Increasing | A tenant is over its read quota — scan rate or concurrency. Like the ingest one: a plan question, not a scaling one |
 | `loggytracy_ingest_quota_rejected_total` | Increasing | A tenant exceeded its rate. **Different from `ingest_throttled_total`** — the server is healthy and the tenant is sending more than its plan allows; this is a plan issue, not a scaling issue |
 | `loggytracy_pending_flush_bytes` | Does not reach 0 while draining | Shutdown has not reached durability |

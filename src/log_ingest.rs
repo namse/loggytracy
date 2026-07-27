@@ -35,6 +35,7 @@ pub struct LogIngestService {
     ingest_gate: Arc<IngestGate>,
     tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
     clock: Arc<crate::clock::Clock>,
+    parts: Arc<crate::part_registry::PartRegistry>,
 }
 
 impl LogIngestService {
@@ -45,6 +46,7 @@ impl LogIngestService {
         ingest_gate: Arc<IngestGate>,
         tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
         clock: Arc<crate::clock::Clock>,
+        parts: Arc<crate::part_registry::PartRegistry>,
     ) -> Self {
         Self {
             journal,
@@ -53,6 +55,7 @@ impl LogIngestService {
             ingest_gate,
             tenant_quota,
             clock,
+            parts,
         }
     }
 
@@ -76,6 +79,11 @@ pub struct OtlpLogIngest<'a> {
     pub ingest_gate: &'a IngestGate,
     pub tenant_quota: &'a crate::tenant_quota::TenantQuota,
     pub clock: &'a crate::clock::Clock,
+    /// Needed for the stream-cardinality check, which has to know what the
+    /// tenant already holds on disk. Carried here rather than looked up
+    /// because OTLP does not go through `AppState`.
+    pub parts: &'a crate::part_registry::PartRegistry,
+    pub memtable: &'a crate::memtable::MemTable,
 }
 
 impl OtlpLogIngest<'_> {
@@ -153,6 +161,8 @@ impl OtlpLogIngest<'_> {
         for (labels, entries) in &streams {
             crate::ingest::validate_labels(labels, self.config)
                 .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+            self.tenant_quota
+                .admit_stream(&tenant, labels, self.parts, self.memtable)?;
             for entry in entries {
                 if entry.line.len() > self.config.max_line_bytes {
                     return Err((
@@ -218,6 +228,8 @@ impl LogsService for LogIngestService {
             ingest_gate: &self.ingest_gate,
             tenant_quota: &self.tenant_quota,
             clock: &self.clock,
+            parts: &self.parts,
+            memtable: self.journal.log_memtable(),
         };
         ingest.admit_transport().map_err(ingest_error_to_status)?;
         let tenant = crate::tenant::from_grpc_metadata(request.metadata(), &self.config)

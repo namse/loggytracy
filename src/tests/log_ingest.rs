@@ -19,6 +19,7 @@
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             crate::clock::Clock::system(),
+            Arc::new(crate::part_registry::PartRegistry::new()),
         );
         (memtable, service)
     }
@@ -159,6 +160,7 @@
             IngestGate::for_test(&journal, &config),
             crate::tenant_quota::TenantQuota::for_test(&config),
             crate::clock::Clock::system(),
+            Arc::new(crate::part_registry::PartRegistry::new()),
         );
         let status = service
             .export(tenant_request(request(vec![record("while draining")])))
@@ -179,6 +181,7 @@
             IngestGate::for_test(&journal, &quota_config),
             crate::tenant_quota::TenantQuota::for_test(&quota_config),
             crate::clock::Clock::system(),
+            Arc::new(crate::part_registry::PartRegistry::new()),
         );
         // The first export drains the one-byte bucket, the second finds it empty.
         let _ = quota_service

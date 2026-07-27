@@ -11,6 +11,93 @@ use crate::part::{
 };
 use crate::tenant::TenantId;
 
+/// The streams a part holds, per tenant.
+///
+/// A part's stream list is shared across its tenants, so it is filtered through
+/// each tenant's row groups — the same path a `series` query takes, and for the
+/// same reason: the part-wide list would attribute a neighbour's streams to
+/// every tenant in the part.
+fn reader_stream_keys(reader: &PartReader) -> Vec<(TenantId, Vec<u64>)> {
+    reader
+        .meta()
+        .tenants
+        .iter()
+        .map(|segment| {
+            let keys = reader
+                .series(&segment.tenant, &[])
+                .iter()
+                .map(stream_key)
+                .collect();
+            (segment.tenant.clone(), keys)
+        })
+        .collect()
+}
+
+/// A stream's identity, hashed.
+///
+/// Hashed rather than stored: the point of a cardinality limit is that this set
+/// stays small, but "small" is per tenant and there can be many tenants, and a
+/// `Labels` map per entry would cost far more than the limit it enforces. A
+/// collision would count a genuinely new stream as one that already exists,
+/// which admits one stream too many rather than refusing a legitimate one — the
+/// direction a limit should err in.
+pub fn stream_key(labels: &Labels) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (name, value) in labels {
+        name.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Per-tenant stream sets, reference counted.
+///
+/// A stream lives in every part that holds a row for it, so removing one part
+/// must not remove the stream while another still has it. The count is what
+/// makes register/replace/unregister reversible.
+#[derive(Default)]
+struct StreamCensus {
+    tenants: HashMap<TenantId, HashMap<u64, u32>>,
+}
+
+impl StreamCensus {
+    fn add(&mut self, tenant: &TenantId, keys: impl IntoIterator<Item = u64>) {
+        let streams = self.tenants.entry(tenant.clone()).or_default();
+        for key in keys {
+            *streams.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    fn remove(&mut self, tenant: &TenantId, keys: impl IntoIterator<Item = u64>) {
+        let Some(streams) = self.tenants.get_mut(tenant) else {
+            return;
+        };
+        for key in keys {
+            if let Some(count) = streams.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    streams.remove(&key);
+                }
+            }
+        }
+        if streams.is_empty() {
+            self.tenants.remove(tenant);
+        }
+    }
+
+    fn contains(&self, tenant: &TenantId, key: u64) -> bool {
+        self.tenants
+            .get(tenant)
+            .is_some_and(|streams| streams.contains_key(&key))
+    }
+
+    fn count(&self, tenant: &TenantId) -> usize {
+        self.tenants.get(tenant).map_or(0, HashMap::len)
+    }
+}
+
 /// What the shared-part layout costs across the current part set.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct LayoutTotals {
@@ -57,6 +144,9 @@ pub struct PartRegistry {
     /// on an unauthenticated endpoint. Maintaining them here costs O(1) per
     /// registry change and cannot fall out of step with the set it describes.
     layout: RwLock<LayoutTotals>,
+    /// Which streams each tenant currently has on disk, so ingest can tell a
+    /// new stream from one that already exists without walking every part.
+    streams: RwLock<StreamCensus>,
     operation_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
@@ -65,6 +155,7 @@ impl PartRegistry {
         Self {
             inner: RwLock::new(HashMap::new()),
             layout: RwLock::new(LayoutTotals::default()),
+            streams: RwLock::new(StreamCensus::default()),
             operation_lock: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
@@ -217,13 +308,20 @@ impl PartRegistry {
         let ids = opened.iter().map(|(id, _)| id.clone()).collect();
         let mut inner = self.inner.write().unwrap();
         let mut layout = self.layout.write().unwrap();
+        let mut census = self.streams.write().unwrap();
         for (id, reader) in opened {
             // Registering an id that is already present replaces it, so its
-            // predecessor has to leave the totals with it.
+            // predecessor has to leave the derived indexes with it.
             if let Some(previous) = inner.insert(id, reader.clone()) {
                 layout.remove(&previous);
+                for (tenant, keys) in reader_stream_keys(&previous) {
+                    census.remove(&tenant, keys);
+                }
             }
             layout.add(&reader);
+            for (tenant, keys) in reader_stream_keys(&reader) {
+                census.add(&tenant, keys);
+            }
         }
         Ok(ids)
     }
@@ -231,9 +329,13 @@ impl PartRegistry {
     pub fn unregister(&self, ids: &[String]) {
         let mut inner = self.inner.write().unwrap();
         let mut layout = self.layout.write().unwrap();
+        let mut census = self.streams.write().unwrap();
         for id in ids {
             if let Some(removed) = inner.remove(id) {
                 layout.remove(&removed);
+                for (tenant, keys) in reader_stream_keys(&removed) {
+                    census.remove(&tenant, keys);
+                }
             }
         }
     }
@@ -262,15 +364,25 @@ impl PartRegistry {
         let new_ids: Vec<String> = opened.iter().map(|(id, _)| id.clone()).collect();
         let mut inner = self.inner.write().unwrap();
         let mut layout = self.layout.write().unwrap();
+        let mut census = self.streams.write().unwrap();
         for (id, reader) in opened {
             if let Some(previous) = inner.insert(id, reader.clone()) {
                 layout.remove(&previous);
+                for (tenant, keys) in reader_stream_keys(&previous) {
+                    census.remove(&tenant, keys);
+                }
             }
             layout.add(&reader);
+            for (tenant, keys) in reader_stream_keys(&reader) {
+                census.add(&tenant, keys);
+            }
         }
         for id in old_ids {
             if let Some(removed) = inner.remove(id) {
                 layout.remove(&removed);
+                for (tenant, keys) in reader_stream_keys(&removed) {
+                    census.remove(&tenant, keys);
+                }
             }
         }
         Ok(new_ids)
@@ -284,14 +396,29 @@ impl PartRegistry {
         *self.layout.read().unwrap()
     }
 
-    /// Rebuild the totals from a whole set, for the paths that replace it
-    /// outright rather than adding and removing.
+    /// Rebuild the derived indexes from a whole set, for the paths that replace
+    /// it outright rather than adding and removing.
     fn reset_layout(&self, readers: &HashMap<String, Arc<PartReader>>) {
         let mut totals = LayoutTotals::default();
+        let mut census = StreamCensus::default();
         for reader in readers.values() {
             totals.add(reader);
+            for (tenant, keys) in reader_stream_keys(reader) {
+                census.add(&tenant, keys);
+            }
         }
         *self.layout.write().unwrap() = totals;
+        *self.streams.write().unwrap() = census;
+    }
+
+    /// Whether the tenant already has this stream on disk.
+    pub fn contains_stream(&self, tenant: &TenantId, key: u64) -> bool {
+        self.streams.read().unwrap().contains(tenant, key)
+    }
+
+    /// Distinct streams the tenant has on disk.
+    pub fn tenant_stream_count(&self, tenant: &TenantId) -> usize {
+        self.streams.read().unwrap().count(tenant)
     }
 
     pub fn part_count(&self) -> usize {

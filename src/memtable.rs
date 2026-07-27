@@ -94,14 +94,6 @@ fn snapshot_bytes(snapshot: &MemTableSnapshot) -> u64 {
     bytes
 }
 
-/// Merge `source` into `target`, reporting the stream overhead the merge made
-/// redundant.
-///
-/// A stream present in both buffers was counted once in each, but the merged
-/// buffer holds one copy of its identity. Returning the difference keeps the
-/// byte counters exactly equal to a full walk without either side having to
-/// perform one — the collision count is bounded by the stream count, not the
-/// row count.
 /// Take ownership of a shared snapshot, copying only if someone else still
 /// holds it. On the paths that call this the other reference has already been
 /// dropped, so the copy is a fallback that keeps a stray share from being
@@ -110,6 +102,14 @@ fn unwrap_snapshot(snapshot: Arc<MemTableSnapshot>) -> MemTableSnapshot {
     Arc::try_unwrap(snapshot).unwrap_or_else(|shared| (*shared).clone())
 }
 
+/// Merge `source` into `target`, reporting the stream overhead the merge made
+/// redundant.
+///
+/// A stream present in both buffers was counted once in each, but the merged
+/// buffer holds one copy of its identity. Returning the difference keeps the
+/// byte counters exactly equal to a full walk without either side having to
+/// perform one — the collision count is bounded by the stream count, not the
+/// row count.
 fn merge_snapshot(target: &mut MemTableSnapshot, source: MemTableSnapshot) -> u64 {
     let mut redundant_overhead = 0u64;
     for (tenant, streams) in source {
@@ -247,6 +247,48 @@ impl MemTable {
             returned.saturating_sub(redundant_overhead),
             Ordering::Relaxed,
         );
+    }
+
+    /// Whether the tenant already has this stream buffered, in either the live
+    /// buffer or the one being flushed. Both count: a stream mid-flush is not a
+    /// new stream, and treating it as one would charge a tenant twice for it
+    /// every time a flush is in progress.
+    pub fn contains_stream(&self, tenant: &TenantId, labels: &Labels) -> bool {
+        if self
+            .inner
+            .read()
+            .unwrap()
+            .get(tenant)
+            .is_some_and(|streams| streams.contains_key(labels))
+        {
+            return true;
+        }
+        self.flushing
+            .read()
+            .unwrap()
+            .as_deref()
+            .and_then(|snapshot| snapshot.get(tenant))
+            .is_some_and(|streams| streams.contains_key(labels))
+    }
+
+    /// Every stream the tenant has buffered. Small by construction — it is
+    /// bounded by what a flush interval accumulates — and only walked when a
+    /// genuinely new stream appears.
+    pub fn tenant_streams(&self, tenant: &TenantId) -> Vec<Labels> {
+        let mut streams: BTreeSet<Labels> = BTreeSet::new();
+        if let Some(buffered) = self.inner.read().unwrap().get(tenant) {
+            streams.extend(buffered.keys().cloned());
+        }
+        if let Some(flushing) = self
+            .flushing
+            .read()
+            .unwrap()
+            .as_deref()
+            .and_then(|snapshot| snapshot.get(tenant))
+        {
+            streams.extend(flushing.keys().cloned());
+        }
+        streams.into_iter().collect()
     }
 
     pub fn is_empty(&self) -> bool {
