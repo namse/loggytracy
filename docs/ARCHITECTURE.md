@@ -28,7 +28,7 @@ the Parquet physical format and S3 tiering.
 | Indexes | Stream index + per-block trigram bloom filter (no inverted index) |
 | Query language | LogQL — high-usage subset only, with clear errors for unsupported syntax |
 | API | Loki HTTP API compatible (direct Grafana Loki data source), with the Tempo API for traces |
-| Ingest protocols | Loki push (protobuf+snappy) + OTLP gRPC (traces and logs) |
+| Ingest protocols | Loki push (protobuf+snappy) + OTLP, over gRPC (`:4317`) or HTTP (`POST /v1/logs`, `/v1/traces` on the Loki listener), traces and logs |
 | Transport security | **TLS is unsupported.** Only plain HTTP/gRPC is provided; a reverse proxy or service mesh handles end-to-end encryption |
 | Multi-tenancy | Multi-tenant. `X-Scope-OrgID` identifies tenants, and tenants are the unit of throttling and quota |
 | Validation environment | **Do not test against S3** (neither real cloud nor local MinIO). Trust the `object_store` crate and test our code closely up to the crate boundary |

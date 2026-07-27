@@ -7,11 +7,12 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use prost014::Message;
 use tonic::{Request, Response, Status};
 
-use crate::backpressure::IngestGate;
+use crate::backpressure::{IngestError, IngestGate};
 use crate::config::Config;
 use crate::journal::Journal;
 use crate::shutdown::ShutdownState;
 use crate::trace::normalize_request;
+use axum::http::StatusCode;
 
 pub const MAX_OTLP_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_OTLP_SPANS: usize = 100_000;
@@ -49,55 +50,124 @@ impl TraceIngestService {
     }
 }
 
-#[tonic::async_trait]
-impl TraceService for TraceIngestService {
-    async fn export(
-        &self,
-        request: Request<ExportTraceServiceRequest>,
-    ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+/// Accepting one OTLP trace export, independent of how it arrived. The trace
+/// counterpart to [`crate::log_ingest::OtlpLogIngest`], and split for the same
+/// reason: a limit enforced on gRPC and forgotten on HTTP is not a limit.
+pub struct OtlpTraceIngest<'a> {
+    pub journal: &'a Journal,
+    pub shutdown: &'a ShutdownState,
+    pub ingest_gate: &'a IngestGate,
+    pub tenant_quota: &'a crate::tenant_quota::TenantQuota,
+}
+
+impl OtlpTraceIngest<'_> {
+    pub fn admit_transport(&self) -> Result<(), IngestError> {
         if self.shutdown.is_fenced() {
-            return Err(Status::unavailable(
-                "this instance has been fenced by a newer writer and is shutting down",
-            ));
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this instance has been fenced by a newer writer and is shutting down".to_string(),
+            )
+                .into());
         }
         if self.shutdown.is_draining() {
-            return Err(Status::unavailable("server is draining for shutdown"));
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server is draining for shutdown".to_string(),
+            )
+                .into());
         }
-        self.ingest_gate.check_grpc()?;
-        let tenant = crate::tenant::from_grpc_metadata(request.metadata(), &self.config)
-            .map_err(crate::tenant::TenantError::into_grpc)?;
-        let request = request.into_inner();
+        self.ingest_gate.check()
+    }
+
+    pub fn admit_tenant(
+        &self,
+        tenant: &crate::tenant::TenantId,
+        encoded_len: usize,
+    ) -> Result<(), IngestError> {
         // Charged on the encoded size, before normalization walks the spans,
         // for the same reason the Loki path charges before decompressing.
-        self.tenant_quota
-            .check_grpc(&tenant, request.encoded_len() as u64)?;
-        if request.encoded_len() > MAX_OTLP_REQUEST_BYTES {
-            return Err(Status::resource_exhausted(format!(
-                "OTLP request exceeds the maximum of {MAX_OTLP_REQUEST_BYTES} bytes"
-            )));
+        self.tenant_quota.check(tenant, encoded_len as u64)?;
+        if encoded_len > MAX_OTLP_REQUEST_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("OTLP request exceeds the maximum of {MAX_OTLP_REQUEST_BYTES} bytes"),
+            )
+                .into());
         }
+        Ok(())
+    }
+
+    pub async fn accept(
+        &self,
+        tenant: crate::tenant::TenantId,
+        request: ExportTraceServiceRequest,
+    ) -> Result<(), IngestError> {
         let span_count = request
             .resource_spans
             .iter()
             .flat_map(|resource| resource.scope_spans.iter())
             .map(|scope| scope.spans.len())
             .try_fold(0usize, |count, spans| count.checked_add(spans))
-            .ok_or_else(|| Status::resource_exhausted("OTLP span count overflow"))?;
+            .ok_or_else(|| {
+                IngestError::from((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "OTLP span count overflow".to_string(),
+                ))
+            })?;
         if span_count > MAX_OTLP_SPANS {
-            return Err(Status::resource_exhausted(format!(
-                "OTLP request contains more than {MAX_OTLP_SPANS} spans"
-            )));
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("OTLP request contains more than {MAX_OTLP_SPANS} spans"),
+            )
+                .into());
         }
         let spans = normalize_request(&tenant, request.clone())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
         let mut encoded = Vec::new();
         request.encode(&mut encoded).map_err(|error| {
-            Status::invalid_argument(format!("failed to encode request: {error}"))
+            (
+                StatusCode::BAD_REQUEST,
+                format!("failed to encode request: {error}"),
+            )
         })?;
         self.journal
             .append_trace(tenant, encoded, spans)
             .await
-            .map_err(|error| Status::internal(format!("journal write failed: {error}")))?;
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("journal write failed: {error}"),
+                )
+            })?;
+        Ok(())
+    }
+}
+
+#[tonic::async_trait]
+impl TraceService for TraceIngestService {
+    async fn export(
+        &self,
+        request: Request<ExportTraceServiceRequest>,
+    ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        use crate::log_ingest::ingest_error_to_status;
+
+        let ingest = OtlpTraceIngest {
+            journal: &self.journal,
+            shutdown: &self.shutdown,
+            ingest_gate: &self.ingest_gate,
+            tenant_quota: &self.tenant_quota,
+        };
+        ingest.admit_transport().map_err(ingest_error_to_status)?;
+        let tenant = crate::tenant::from_grpc_metadata(request.metadata(), &self.config)
+            .map_err(crate::tenant::TenantError::into_grpc)?;
+        let request = request.into_inner();
+        ingest
+            .admit_tenant(&tenant, request.encoded_len())
+            .map_err(ingest_error_to_status)?;
+        ingest
+            .accept(tenant, request)
+            .await
+            .map_err(ingest_error_to_status)?;
         Ok(Response::new(ExportTraceServiceResponse::default()))
     }
 }

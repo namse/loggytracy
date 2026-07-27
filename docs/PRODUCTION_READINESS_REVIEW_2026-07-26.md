@@ -157,7 +157,7 @@ Only status is confirmed here; see the previous document for details.
 
 | Item | Status |
 |---|---|
-| P1-2 OTLP log ingest unimplemented | **Fixed** — `LogsService` is registered on the same listener. OTLP/HTTP is still absent |
+| P1-2 OTLP log ingest unimplemented | **Fixed** — `LogsService` on the gRPC listener, plus `POST /v1/logs` and `/v1/traces` on the HTTP one. Both transports share one admission and normalization path |
 | P1-3 group commit consumes batch timer | Open |
 | P1-5 MemTable O(rows) size calculation + flush deep clone | Size calculation **fixed** (with P0-2), deep clone open |
 | P1-9 eviction holds write lock during synchronous directory traversal | Open |
@@ -337,7 +337,7 @@ The rest remains in `todo.md`.
 ### Gate 5 — feature completeness
 
 - [x] P1-2 OTLP logs — implement/register `LogsService`
-- [ ] P1-2 remaining: OTLP/HTTP (`/v1/logs`, `/v1/traces`). `otlphttp` is also common in Alloy configurations
+- [x] P1-2 OTLP/HTTP (`/v1/logs`, `/v1/traces`), protobuf and JSON
 - [ ] P2-1 Loki API gaps
 - [ ] P2-5 duplicate observability → deduplication
 - [ ] LogQL improvements in P1 of `todo.md`

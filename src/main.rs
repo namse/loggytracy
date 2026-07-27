@@ -13,6 +13,7 @@ mod memtable;
 mod merge;
 mod metrics;
 mod object_storage;
+mod otlp_http;
 mod otlp_log;
 mod part;
 mod part_registry;

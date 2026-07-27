@@ -4,16 +4,15 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 
-use crate::{AppState, admin, ingest, query, tempo};
+use crate::{AppState, admin, ingest, otlp_http, query, tempo};
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    // Without this the push route silently inherits axum's 2 MiB default, so an
-    // Alloy tuned to larger batches gets an unexplained 413 with no knob to
-    // turn. The handler enforces the same bound for a precise error message.
-    let push_body_limit = DefaultBodyLimit::max(state.config.max_push_bytes);
+    // Each ingest route carries its own body limit, so they are merged as
+    // separate routers rather than layered onto one. `Router::layer` applies to
+    // every route registered before it, which would leave the effective limit
+    // of a route depending on where in this chain it happens to sit.
     let router = Router::new()
-        .route("/loki/api/v1/push", post(ingest::push))
-        .layer(push_body_limit)
+        .merge(ingest_router(state.config.max_push_bytes))
         .route("/loki/api/v1/query_range", get(query::query_range))
         .route("/loki/api/v1/tail", get(query::tail))
         .route("/loki/api/v1/query", get(query::query))
@@ -38,6 +37,27 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         None => router,
     };
     router.with_state(state)
+}
+
+/// The write routes, each with the body limit it enforces.
+///
+/// Without an explicit limit these inherit axum's 2 MiB default, so an Alloy
+/// tuned to larger batches gets an unexplained 413 with no knob to turn. Each
+/// handler enforces the same bound again for a precise error message.
+fn ingest_router(max_push_bytes: usize) -> Router<Arc<AppState>> {
+    let loki = Router::new()
+        .route("/loki/api/v1/push", post(ingest::push))
+        .layer(DefaultBodyLimit::max(max_push_bytes));
+    // OTLP over HTTP, on the same listener as the Loki API. A collector
+    // configured with `otlphttp` is at least as common as one using gRPC, and
+    // it is the only option behind a proxy that does not carry gRPC. The limit
+    // matches what the gRPC services accept, so a collector sees one size
+    // whichever transport it picks.
+    let otlp = Router::new()
+        .route("/v1/logs", post(otlp_http::logs))
+        .route("/v1/traces", post(otlp_http::traces))
+        .layer(DefaultBodyLimit::max(otlp_http::MAX_OTLP_HTTP_BODY_BYTES));
+    loki.merge(otlp)
 }
 
 fn admin_router() -> Router<Arc<AppState>> {
