@@ -591,7 +591,7 @@ the code, the note says which.
 - [x] P2-4 `retention_period` default decided — unbounded, because per-tenant retention is the mechanism and a global default would delete data the control plane believes it owns. Startup warns when neither is configured
 - [x] P3 Dockerfile + configuration reference + runbook + alert rules
 - [x] **N7 readiness flapped on isolated object-store failures** — health is hysteretic now; measured 41-66% healthy before, 99.3-100% after
-- [ ] **N8 merge and flush contend** — WAL backlog ends 5x higher with merge on. Bounded or not is unanswered
+- [x] **N8 merge and flush contend** — measured bounded: oscillates 6-140 MB with a negative trend. A tuning note, not a defect
 - [ ] **N9 peak RSS tracks whether merge runs**, not `merge_max_memory_bytes`. Wants a heap profile
 - [ ] P2-5 duplicates after a crash are unobservable
 

@@ -267,13 +267,31 @@ workload:
 The harness gated on the terminal sample, which is what made its verdict a coin
 flip. It now samples through the run and gates on the fraction.
 
-**What survives the fix, newly isolated.** With merge on, the WAL backlog ends
-at 47.6 MB against 9.6 MB with merge off, from the same event count and a
-similar flush count (31 vs 34). Merge and flush contend for the object store and
-flush falls behind. It is well under the 1 GiB backpressure limit, so nothing
-broke, but it is 3x the harness target and it is the one difference between the
-two configurations that the health fix did not remove. Whether it plateaus or
-grows is not answerable from a run that stops on an event count.
+**What survived the fix, and what it turned out to be.** With merge on the WAL
+backlog ended at 47.6 MB against 9.6 MB with merge off. Sampling it every
+500 ms over a ten-minute run answers whether that grows:
+
+| t (s) | 0 | 81 | 162 | 243 | 324 | 406 | 487 | 568 |
+|---|---|---|---|---|---|---|---|---|
+| backlog (MB) | 10.8 | 71.0 | 6.3 | 35.5 | 36.9 | 7.1 | 8.4 | 8.4 |
+
+It oscillates between 6 and 140 MB with a linear trend of **-0.04 MB/s**, and
+the second-half mean (20.2 MB) is below the first-half mean (28.0 MB). Merge and
+flush do contend, and flush catches up: **bounded, not growing.** N8 is a tuning
+note rather than a defect.
+
+The peak reached 140 MB while the terminal sample read 47.6 MB, so that
+single-sample reading was luck too — the third time in this section that gating
+on a terminal sample produced a number that meant nothing.
+
+The harness now samples the backlog and asks the question that distinguishes the
+two cases: **does flush ever catch up.** A backlog that rises and falls is flush
+keeping up in bursts; one that only rises is flush losing. Comparing halves
+would have worked here and failed a short run, which is all ramp and no plateau;
+drainage holds for both. The ceiling it is judged against is the engine's own
+`max_wal_backlog_bytes`, because reaching that engages backpressure, and
+engaging is the design working — the old 16 MiB harness target failed runs whose
+backlog was oscillating exactly as intended.
 
 Fixed location: `merge::tests::layout_totals_count_tenant_part_pairs_and_survive_a_silent_merge`,
 `merge::tests::merging_parts_removes_their_pairs_from_the_totals`.

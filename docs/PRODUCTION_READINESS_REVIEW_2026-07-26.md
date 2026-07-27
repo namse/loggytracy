@@ -177,19 +177,26 @@ by one more round of failures — bounded, where the guard's failure mode was no
 `loggytracy_remote_consecutive_failures` exposes the pressure the flag now hides
 below its threshold. Measured after: 99.3-100% healthy, 0-2 transitions.
 
-### N8. Merge and flush contend, and the WAL backlog shows it
+### N8. Merge and flush contend — **measured, and it is bounded**
 
-- Location: not yet localized
-- Verification: **Reproduced** (four runs), `docs/LOAD_RESULTS.md` section 6
+- Verification: **Measured**, `docs/LOAD_RESULTS.md` section 6
 
-With merge enabled the WAL backlog ends at 47.6 MB; with merge disabled, 9.6 MB
-— same event count, similar flush count (31 vs 34), same injected error rate.
-Well under the 1 GiB backpressure limit, so nothing breaks, and it is the one
-difference between the two configurations that the N7 fix did not remove.
+With merge enabled the WAL backlog runs several times higher than with it
+disabled. Sampled every 500 ms over ten minutes it oscillates between 6 and
+140 MB with a linear trend of -0.04 MB/s and a second-half mean below the first
+half's. Merge and flush contend and flush catches up, so this is a tuning note
+rather than a defect: the contention costs backlog depth, not divergence.
 
-Whether the backlog plateaus or grows is not answerable from a run that
-terminates on an event count. That is the next measurement, and it decides
-whether this is a tuning note or a defect.
+It also produced the third instance in this investigation of a terminal sample
+meaning nothing — the peak was 140 MB while the run ended at 47.6 MB. The
+harness now samples the backlog and gates on whether flush ever drains it,
+against the engine's own `max_wal_backlog_bytes` rather than a number the
+harness invented.
+
+What is not settled is the depth itself. 140 MB of unflushed WAL is 140 MB that
+a simultaneous loss of machine and disk would take, and that window widens with
+merge running. Whether that is acceptable is a retention-of-risk question for
+the deployment, not a defect in the engine.
 
 ### N9. Peak RSS tracks whether merge runs, not what it may materialize
 
