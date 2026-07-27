@@ -57,7 +57,12 @@ fn write_meta(
         integrity,
     };
     meta.integrity.metadata_crc32 = metadata_crc32(&meta).map_err(io::Error::other)?;
-    let s = serde_json::to_string_pretty(&meta).map_err(io::Error::other)?;
+    // Compact, not pretty. `tenants` and the two row-group timestamp arrays
+    // all scale with tenant breadth, and pretty-printing puts every element of
+    // them on its own indented line — whitespace that startup then parses for
+    // every part. The checksum is taken over the canonical `to_vec` form, so
+    // the file's layout was never part of what it verifies.
+    let s = serde_json::to_string(&meta).map_err(io::Error::other)?;
     fs::write(path, s)?;
     sync_file(path)?;
     Ok(())

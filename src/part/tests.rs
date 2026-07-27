@@ -13,13 +13,16 @@
         bytes
     }
 
-    fn encode_btf2(line_blooms: &[BloomFilter], exact_blooms: &[BloomFilter]) -> Vec<u8> {
+    fn encode_btf2(line_blooms: &[BloomFilter], exact_blooms: &[Option<BloomFilter>]) -> Vec<u8> {
         assert_eq!(line_blooms.len(), exact_blooms.len());
         let mut bytes = Vec::new();
         bytes.extend_from_slice(BLOOM_MAGIC_V2);
         bytes.extend_from_slice(&(line_blooms.len() as u32).to_le_bytes());
         for (line, exact) in line_blooms.iter().zip(exact_blooms) {
-            for bloom in [line, exact] {
+            // V2 had no way to say "nothing indexed here", so it spent an empty
+            // filter. Reproducing that is what makes this a real downgrade.
+            let empty = BloomFilter::with_capacity(1, 0.01);
+            for bloom in [line, exact.as_ref().unwrap_or(&empty)] {
                 let encoded = bloom.encode();
                 bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(&encoded);
@@ -172,7 +175,7 @@
         rows[0].structured_metadata = vec![("trace_id".to_string(), "first".to_string())];
         rows[1].structured_metadata = vec![("trace_id".to_string(), "second".to_string())];
         let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
-        assert_eq!(&fs::read(part.bloom_path()).unwrap()[..4], BLOOM_MAGIC_V3);
+        assert_eq!(&fs::read(part.bloom_path()).unwrap()[..4], BLOOM_MAGIC_V4);
         let reader = PartReader::open(part).unwrap();
 
         let selected = reader.select_row_groups_with_exact_fields(&test_tenant(),
@@ -219,6 +222,84 @@
             &[],
             &[],
             &[ExactFieldPredicate::new("missing", "")],
+            i64::MIN,
+            i64::MAX,
+        ));
+    }
+
+    /// A row group with nothing to index spends no exact-field filter.
+    ///
+    /// `optimal_bits` has a 1024-bit floor, so the empty filter V3 stored cost
+    /// 140 bytes whether or not there was a token to put in it, and
+    /// tenant-aligned row groups charge that per tenant per part. Absence has
+    /// to keep pruning exactly as the empty filter did, which is the second
+    /// half of this test.
+    #[test]
+    fn a_row_group_with_no_exact_field_token_stores_no_filter() {
+        let tmp = tempfile_dir();
+        let mut plain = make_rows();
+        for row in &mut plain {
+            row.line = "nothing here parses as a field".to_string();
+            row.structured_metadata = vec![];
+        }
+        let plain_part = flush_rows(plain.clone(), &tmp, 1).unwrap().remove(0);
+        let plain_bytes = fs::metadata(plain_part.bloom_path()).unwrap().len();
+
+        let mut indexed = plain;
+        for row in &mut indexed {
+            row.structured_metadata = vec![("trace_id".to_string(), "abc".to_string())];
+        }
+        let indexed_part = flush_rows(indexed, &tempfile_dir(), 1).unwrap().remove(0);
+        let indexed_bytes = fs::metadata(indexed_part.bloom_path()).unwrap().len();
+
+        let row_groups = plain_part.meta.row_group_count as u64;
+        assert!(row_groups >= 2, "need more than one row group to see a floor");
+        assert!(
+            indexed_bytes >= plain_bytes + 140 * row_groups,
+            "an unused filter used to cost the 1024-bit floor per row group: \
+{indexed_bytes} vs {plain_bytes} over {row_groups} row groups"
+        );
+
+        // Absence prunes. A predicate on a field the row group never indexed
+        // cannot match it, which is the same answer the all-zero filter gave.
+        let reader = PartReader::open(plain_part).unwrap();
+        assert!(
+            reader
+                .select_row_groups_with_exact_fields(
+                    &test_tenant(),
+                    &[],
+                    &[],
+                    &[ExactFieldPredicate::new("trace_id", "abc")],
+                    QueryTimeRange {
+                        start_ns: i64::MIN,
+                        end_ns: i64::MAX,
+                        include_end: true,
+                    },
+                )
+                .is_empty(),
+            "no token indexed means no exact-field predicate can match"
+        );
+        // The conservative cases still are: a stream label is not in this
+        // filter at all, and an empty value stands for field absence.
+        let app = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "test".to_string()).unwrap();
+        assert!(!reader
+            .select_row_groups_with_exact_fields(
+                &test_tenant(),
+                std::slice::from_ref(&app),
+                &[],
+                &[ExactFieldPredicate::new("app", "test")],
+                QueryTimeRange {
+                    start_ns: i64::MIN,
+                    end_ns: i64::MAX,
+                    include_end: true,
+                },
+            )
+            .is_empty());
+        assert!(reader.may_match_exact_fields(
+            &test_tenant(),
+            &[],
+            &[],
+            &[ExactFieldPredicate::new("trace_id", "")],
             i64::MIN,
             i64::MAX,
         ));
@@ -804,9 +885,15 @@
     /// group and this engine carries a bloom filter for every row group, so
     /// that bound is a real cost, and the target workload is many small
     /// tenants. This measures it rather than assuming it.
+    ///
+    /// The unit is a (tenant, part) pair, not a row: the fixed cost below is
+    /// spent per tenant per part it appears in, so it is largest in ratio for
+    /// the tenants with the least data. `index_resident_bytes` is called out
+    /// separately because the local cache budget does not cover it — that part
+    /// stays in memory for as long as the part is open.
     #[test]
     fn tenant_breadth_sets_the_row_group_floor_and_what_that_costs() {
-        fn build(tenants: usize, rows_total: usize) -> (u32, u64, u64) {
+        fn build(tenants: usize, rows_total: usize) -> (u32, u64, u64, u64, u64, u64) {
             let tmp = tempfile_dir();
             let rows: Vec<Row> = (0..rows_total)
                 .map(|index| Row {
@@ -821,16 +908,23 @@
                 .collect();
             let part = flush_rows(rows, &tmp, 8192).expect("flush").remove(0);
             let on_disk = fs::metadata(part.data_path()).unwrap().len();
+            let bloom = fs::metadata(part.bloom_path()).unwrap().len();
+            let reader = PartReader::open(part).expect("open");
             (
-                part.meta.row_group_count,
+                reader.meta().row_group_count,
                 on_disk,
-                part.meta.materialized_bytes,
+                bloom,
+                reader.meta().meta_bytes,
+                reader.index_resident_bytes(),
+                reader.meta().materialized_bytes,
             )
         }
 
         let rows_total = 5_000;
-        let (one_groups, one_bytes, one_materialized) = build(1, rows_total);
-        let (many_groups, many_bytes, many_materialized) = build(500, rows_total);
+        let (one_groups, one_bytes, one_bloom, one_meta, one_resident, one_materialized) =
+            build(1, rows_total);
+        let (many_groups, many_bytes, many_bloom, many_meta, many_resident, many_materialized) =
+            build(500, rows_total);
 
         // Same rows, same `row_group_size`; only the tenant breadth differs.
         assert_eq!(one_groups, 1, "one tenant fits one row group");
@@ -852,9 +946,21 @@
 ratio {:.2}x",
             many_bytes as f64 / one_bytes as f64
         );
+        println!(
+            "  per (tenant, part) pair: parquet {:.0} B, bloom {:.0} B, meta.json {:.0} B, \
+resident {:.0} B",
+            (many_bytes - one_bytes) as f64 / many_groups as f64,
+            (many_bloom - one_bloom) as f64 / many_groups as f64,
+            (many_meta - one_meta) as f64 / many_groups as f64,
+            (many_resident - one_resident) as f64 / many_groups as f64,
+        );
         assert!(
             many_bytes > one_bytes,
             "fragmentation cannot make the file smaller"
+        );
+        assert!(
+            many_resident > one_resident,
+            "every extra row group carries its own filters into memory"
         );
     }
 

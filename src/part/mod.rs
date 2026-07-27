@@ -40,6 +40,14 @@ pub const PART_META_VERSION: u32 = 1;
 const BLOOM_MAGIC_V1: &[u8; 4] = b"BTF1";
 const BLOOM_MAGIC_V2: &[u8; 4] = b"BTF2";
 const BLOOM_MAGIC_V3: &[u8; 4] = b"BTF3";
+/// As V3, except a row group that indexed no exact-field token stores a
+/// zero-length filter instead of an empty one.
+///
+/// V3 spent a filter per row group whether or not there was anything to put in
+/// it, and `optimal_bits` has a 1024-bit floor, so a row group with no
+/// structured metadata and no parser fields still cost 140 bytes on disk and
+/// the same resident. Tenant-aligned row groups make that per tenant per part.
+const BLOOM_MAGIC_V4: &[u8; 4] = b"BTF4";
 const STREAM_MAGIC: &[u8; 4] = b"SIX1";
 
 const EXACT_FIELD_TOKEN_MAGIC: &[u8; 4] = b"FEQ1";

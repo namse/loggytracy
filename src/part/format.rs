@@ -307,7 +307,7 @@ fn write_parquet(
 fn write_bloom(path: &Path, rows: &[Row], row_group_size: usize) -> io::Result<()> {
     let bounds = row_group_bounds(rows, row_group_size);
     let mut buf = Vec::new();
-    buf.extend_from_slice(BLOOM_MAGIC_V3);
+    buf.extend_from_slice(BLOOM_MAGIC_V4);
     buf.extend_from_slice(&(bounds.len() as u32).to_le_bytes());
     for (start, end) in &bounds {
         let mut unique_trigrams: BTreeSet<[u8; 3]> = BTreeSet::new();
@@ -328,12 +328,19 @@ fn write_bloom(path: &Path, rows: &[Row], row_group_size: usize) -> io::Result<(
                 }
             }
         }
-        let exact_capacity = exact_capacity.max(1);
-        let mut exact_fields = BloomFilter::with_capacity(exact_capacity, 0.01);
+        // No token to index means no filter. A filter built for zero items
+        // still costs the `optimal_bits` floor, and an all-zero filter and an
+        // absent one prune identically — the absent one just does it without
+        // occupying 140 bytes in every row group of every part.
+        let mut exact_fields =
+            (exact_capacity > 0).then(|| BloomFilter::with_capacity(exact_capacity, 0.01));
         for row in &rows[*start..*end] {
             for tri in crate::bloom::trigrams(&row.line) {
                 unique_trigrams.insert(tri);
             }
+            let Some(exact_fields) = &mut exact_fields else {
+                continue;
+            };
             for (name, value) in &row.structured_metadata {
                 for value in crate::logql::canonical_index_values(value) {
                     exact_fields.insert(&encode_exact_field_token(name, &value)?);
@@ -355,7 +362,9 @@ fn write_bloom(path: &Path, rows: &[Row], row_group_size: usize) -> io::Result<(
         let bytes = bloom.encode();
         buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&bytes);
-        let bytes = exact_fields.encode();
+        let bytes = exact_fields
+            .map(|exact_fields| exact_fields.encode())
+            .unwrap_or_default();
         buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&bytes);
     }
