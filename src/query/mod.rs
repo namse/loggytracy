@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -345,6 +345,7 @@ include!("execution.rs");
 include!("restore.rs");
 include!("metrics.rs");
 include!("handlers.rs");
+include!("loki_extra.rs");
 include!("tail.rs");
 
 #[cfg(test)]

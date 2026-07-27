@@ -371,11 +371,11 @@ Endpoints called by the Grafana Loki data source but missing:
 | Endpoint | Impact |
 |---|---|
 | ~~`/loki/api/v1/tail` (WebSocket)~~ | **implemented.** Polls the ordinary query path rather than pushing from ingest, so it inherits every limit, the retention clamp and tenant isolation instead of reimplementing them |
-| `/loki/api/v1/index/volume`, `volume_range` | Explore volume histogram fails |
-| `/loki/api/v1/patterns` | Pattern exploration fails |
-| `/loki/api/v1/detected_fields`, `detected_labels` | Field exploration fails in Grafana 11+ |
-| `/loki/api/v1/format_query` | Query-format button fails |
-| `/loki/api/v1/delete` (delete API) | Cannot handle GDPR/deletion requests |
+| ~~`/loki/api/v1/index/volume`, `volume_range`~~ | **implemented.** Expressed as `bytes_over_time` and answered by the metric evaluator, so it inherits the scan budgets, the retention clamp and the tenant scope |
+| `/loki/api/v1/patterns` | **not implemented, deliberately.** Pattern mining is a heuristic with no compatibility contract — two implementations disagree and both are "right" — and it needs a full scan to produce a guess. Worth doing only once there is a reason to prefer one heuristic |
+| ~~`/loki/api/v1/detected_fields`, `detected_labels`~~ | **implemented.** Labels with cardinality from the same sources `labels` reads; fields from structured metadata over a bounded sample |
+| ~~`/loki/api/v1/format_query`~~ | **implemented as a validator.** It does not rewrite: a faithful renderer for the whole LogQL surface is a second grammar to keep in step with the parser, and a formatter that silently changes a query is worse than one that leaves it alone |
+| `/loki/api/v1/delete` (delete API) | **open.** Deletion exists per tenant (`retention: "0"`, applied through merge rewrite), but a Loki-shaped delete *request* needs durable request state and query-time masking. That belongs in `RETENTION_DESIGN.md` as a design, not improvised here |
 
 Implemented but inaccurate:
 
@@ -596,7 +596,8 @@ At minimum, the following are needed.
 
 - [ ] P1-2 OTLP logs (or correct the documentation)
 - [x] P2-1 `tail` (WebSocket live tail) and time ranges for `labels`/`series`
-- [ ] P2-1 remaining: `index/volume`, `patterns`, `detected_fields`, `format_query`, `delete`
+- [x] P2-1 `index/volume`, `volume_range`, `detected_labels`, `detected_fields`, `format_query`
+- [ ] P2-1 remaining: `patterns` and the `delete` API — both deliberate, see the table above
 - [ ] P2-5 duplicate observability → implement dedup later (`todo.md` P2)
 - [ ] LogQL improvements in P1 of `todo.md`
 

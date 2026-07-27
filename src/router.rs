@@ -21,6 +21,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/loki/api/v1/label/{name}/values", get(query::label_values))
         .route("/loki/api/v1/status/buildinfo", get(query::buildinfo))
         .route("/loki/api/v1/index/stats", get(query::index_stats))
+        .route("/loki/api/v1/index/volume", get(query::index_volume))
+        .route(
+            "/loki/api/v1/index/volume_range",
+            get(query::index_volume_range),
+        )
+        .route("/loki/api/v1/format_query", get(query::format_query))
+        .route("/loki/api/v1/detected_labels", get(query::detected_labels))
+        .route("/loki/api/v1/detected_fields", get(query::detected_fields))
         .route("/metrics", get(query::metrics))
         .route("/api/traces/{trace_id}", get(tempo::trace_by_id))
         .route("/api/search", get(tempo::search))

@@ -1833,3 +1833,224 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             101
         );
     }
+
+    async fn get_json(state: &Arc<AppState>, uri: &str) -> (StatusCode, serde_json::Value) {
+        let request = axum::http::Request::builder()
+            .uri(uri)
+            .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = crate::build_router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn volume_state() -> (Arc<AppState>, i64) {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
+        let base_ns = 1_700_000_000_000_000_000;
+        for (app, line) in [("a", "aaaa"), ("a", "bbbbbb"), ("b", "cc")] {
+            memtable.insert(
+                test_tenant(),
+                [("app".to_string(), app.to_string())]
+                    .into_iter()
+                    .collect::<Labels>(),
+                vec![LogEntry {
+                    timestamp_ns: base_ns,
+                    line: line.to_string(),
+                    structured_metadata: vec![],
+                }],
+            );
+        }
+        (state, base_ns)
+    }
+
+    /// Volume is `bytes_over_time` under a different name, so it is answered by
+    /// the metric evaluator rather than by a scan of its own. That is what puts
+    /// it inside the same scan budgets, retention clamp and tenant scope.
+    #[tokio::test]
+    async fn index_volume_reports_bytes_per_stream() {
+        let (state, base_ns) = volume_state();
+
+        let (status, body) = get_json(
+            &state,
+            &format!(
+                "/loki/api/v1/index/volume?query=%7B%7D&start={}&end={}",
+                base_ns - 1_000_000_000,
+                base_ns + 1_000_000_000
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["resultType"], "vector");
+
+        let mut by_app: BTreeMap<String, f64> = BTreeMap::new();
+        for series in body["data"]["result"].as_array().unwrap() {
+            by_app.insert(
+                series["metric"]["app"].as_str().unwrap().to_string(),
+                series["value"][1].as_str().unwrap().parse().unwrap(),
+            );
+        }
+        // "aaaa" + "bbbbbb" against "cc".
+        assert_eq!(by_app["a"], 10.0);
+        assert_eq!(by_app["b"], 2.0);
+    }
+
+    /// The histogram above Explore's results is the ranged form, which has to
+    /// come back as a matrix for Grafana to plot it — one point per step that
+    /// has data, so the bars line up with when the lines were written.
+    #[tokio::test]
+    async fn index_volume_range_returns_a_matrix() {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
+        let base_ns = 1_700_000_000_000_000_000;
+        for offset in 0..3i64 {
+            memtable.insert(
+                test_tenant(),
+                [("app".to_string(), "a".to_string())]
+                    .into_iter()
+                    .collect::<Labels>(),
+                vec![LogEntry {
+                    timestamp_ns: base_ns + offset * 1_000_000_000,
+                    line: "aaaa".to_string(),
+                    structured_metadata: vec![],
+                }],
+            );
+        }
+
+        let (status, body) = get_json(
+            &state,
+            &format!(
+                "/loki/api/v1/index/volume_range?query=%7Bapp%3D%22a%22%7D&start={}&end={}&step=1s",
+                base_ns,
+                base_ns + 2_000_000_000
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["resultType"], "matrix");
+        let series = body["data"]["result"].as_array().unwrap();
+        assert_eq!(series.len(), 1, "the selector narrowed it to one stream");
+        assert_eq!(series[0]["metric"]["app"], "a");
+        let values = series[0]["values"].as_array().unwrap();
+        assert_eq!(
+            values.len(),
+            3,
+            "one bucket per second, each holding its own line: {}",
+            series[0]
+        );
+        for value in values {
+            assert_eq!(value[1], "4", "each bucket sees exactly one four-byte line");
+        }
+    }
+
+    /// `targetLabels` aggregates, which is how Explore asks for volume by one
+    /// dimension rather than per stream.
+    #[tokio::test]
+    async fn index_volume_aggregates_by_target_labels() {
+        let (state, base_ns) = volume_state();
+        let (status, body) = get_json(
+            &state,
+            &format!(
+                "/loki/api/v1/index/volume?query=%7B%7D&start={}&end={}&targetLabels=app&limit=1",
+                base_ns - 1_000_000_000,
+                base_ns + 1_000_000_000
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let series = body["data"]["result"].as_array().unwrap();
+        assert_eq!(series.len(), 1, "limit caps the series returned");
+        assert_eq!(
+            series[0]["metric"]["app"], "a",
+            "and it keeps the largest, not an arbitrary one"
+        );
+    }
+
+    /// The filter sidebar in Grafana 11+ reads this. Cardinality is what makes
+    /// it useful, and it comes from the same sources `labels` answers from.
+    #[tokio::test]
+    async fn detected_labels_reports_cardinality_per_label() {
+        let (state, _base_ns) = volume_state();
+        let (status, body) = get_json(&state, "/loki/api/v1/detected_labels").await;
+        assert_eq!(status, StatusCode::OK);
+        let labels = body["detectedLabels"].as_array().unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0]["label"], "app");
+        assert_eq!(labels[0]["cardinality"], 2);
+    }
+
+    /// Detected fields come from structured metadata, with a type guessed from
+    /// the values actually seen. The guess is a hint, so values that disagree
+    /// fall back to string rather than to the first one that parsed.
+    #[tokio::test]
+    async fn detected_fields_reports_structured_metadata_with_a_type() {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
+        memtable.insert(
+            test_tenant(),
+            [("app".to_string(), "fields".to_string())]
+                .into_iter()
+                .collect::<Labels>(),
+            vec![
+                LogEntry {
+                    timestamp_ns: 1_700_000_000_000_000_000,
+                    line: "one".to_string(),
+                    structured_metadata: vec![
+                        ("status".to_string(), "200".to_string()),
+                        ("trace_id".to_string(), "abc".to_string()),
+                    ],
+                },
+                LogEntry {
+                    timestamp_ns: 1_700_000_001_000_000_000,
+                    line: "two".to_string(),
+                    structured_metadata: vec![
+                        ("status".to_string(), "500".to_string()),
+                        ("trace_id".to_string(), "def".to_string()),
+                    ],
+                },
+            ],
+        );
+
+        let (status, body) = get_json(&state, "/loki/api/v1/detected_fields").await;
+        assert_eq!(status, StatusCode::OK);
+        let fields: BTreeMap<String, serde_json::Value> = body["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| (field["label"].as_str().unwrap().to_string(), field.clone()))
+            .collect();
+        assert_eq!(fields["status"]["type"], "int");
+        assert_eq!(fields["status"]["cardinality"], 2);
+        assert_eq!(fields["trace_id"]["type"], "string");
+    }
+
+    /// The format button validates. It deliberately does not rewrite: an
+    /// invalid query is a 400 with the parse error, and a valid one comes back
+    /// as sent rather than as something the client did not write.
+    #[tokio::test]
+    async fn format_query_validates_without_rewriting() {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable, Arc::new(PartRegistry::new()), None);
+
+        let (status, body) =
+            get_json(&state, "/loki/api/v1/format_query?query=%20%7Bapp%3D%22a%22%7D%20").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], r#"{app="a"}"#);
+
+        let (status, _) = get_json(&state, "/loki/api/v1/format_query?query=%7Bapp%3D").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
