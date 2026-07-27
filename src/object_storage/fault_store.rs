@@ -137,12 +137,32 @@ fn splitmix64(mut value: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Decrements the in-flight count however the read leaves, including a
+/// cancelled future, so the peak cannot drift upward across a restore that
+/// abandons its remaining downloads on the first error.
+struct InFlightGuard<'a> {
+    counter: &'a AtomicU64,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Wraps `inner` with seeded latency and write-error injection.
 #[derive(Debug)]
 pub(crate) struct LatencyFaultStore {
     inner: Arc<dyn ObjectStore>,
     config: FaultConfig,
     operation_counter: AtomicU64,
+    /// Reads currently inside `shape_read`, and the high-water mark of that.
+    ///
+    /// Concurrency measured where it happens. Inferring it from elapsed time
+    /// works only if nothing else can stretch the clock, and under virtual time
+    /// a pending blocking task is enough to make that untrue.
+    reads_in_flight: AtomicU64,
+    peak_reads_in_flight: AtomicU64,
 }
 
 impl LatencyFaultStore {
@@ -151,7 +171,15 @@ impl LatencyFaultStore {
             inner,
             config,
             operation_counter: AtomicU64::new(0),
+            reads_in_flight: AtomicU64::new(0),
+            peak_reads_in_flight: AtomicU64::new(0),
         }
+    }
+
+    /// The most reads this store ever had open at once.
+    #[cfg(test)]
+    pub(crate) fn peak_reads_in_flight(&self) -> u64 {
+        self.peak_reads_in_flight.load(Ordering::Relaxed)
     }
 
     /// One deterministic draw keyed by the seed and the operation index. The
@@ -203,6 +231,12 @@ impl LatencyFaultStore {
     }
 
     async fn shape_read(&self) {
+        let in_flight = self.reads_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_reads_in_flight
+            .fetch_max(in_flight, Ordering::Relaxed);
+        let _guard = InFlightGuard {
+            counter: &self.reads_in_flight,
+        };
         let draw = self.next_draw();
         self.sleep(self.config.read_latency, draw).await;
     }
