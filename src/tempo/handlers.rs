@@ -107,19 +107,25 @@ pub async fn search(
         .transpose()
         .map_err(client_error)?;
 
-    // Deliberately unrestricted, unlike the tag endpoints below. A trace is
-    // returned on its *earliest* span falling inside the window, and that span
-    // can sit in a row group the window does not touch, so pruning here would
-    // change which traces come back rather than only what it costs to find
-    // them. Narrowing this needs the search semantics settled first.
-    let guard = pin_all_trace_parts(&state, &tenant, None).await?;
+    // A trace matches when any of its spans overlaps the window.
+    //
+    // This used to require the trace's *earliest* span to fall inside it,
+    // which is both narrower than Tempo — a request that began before the
+    // window and was still running inside it is exactly what an operator
+    // searches for — and impossible to prune for, because that earliest span
+    // can sit in a row group the window never touches. Overlap is the rule the
+    // row-group bounds already answer, so the scan reads only the row groups
+    // that can contribute and the restore set narrows with it. Every trace the
+    // old rule returned still matches: its earliest span was in the window, so
+    // the trace overlaps it.
+    let guard = pin_all_trace_parts(&state, &tenant, Some((start, end))).await?;
     let spans = scan_trace_spans(
         guard,
         state.journal.clone(),
         state.trace_parts.clone(),
         tenant.clone(),
         None,
-        None,
+        Some((start, end)),
         state.config.clone(),
         state.trace_scan_semaphore.clone(),
     )
@@ -146,9 +152,10 @@ pub async fn search(
             .map(|span| span.end_time_ns)
             .max()
             .unwrap_or(root.end_time_ns);
-        if start_time < start || start_time > end {
-            continue;
-        }
+        // Summarized from the spans that overlap the window, not from the
+        // whole trace: reading the rest would mean restoring the parts the
+        // window was pruned to avoid. A trace opened from these results is
+        // fetched by id and shows its full extent there.
         let duration = end_time.saturating_sub(start_time);
         if min_duration.is_some_and(|minimum| duration < minimum)
             || max_duration.is_some_and(|maximum| duration > maximum)

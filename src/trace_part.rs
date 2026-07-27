@@ -101,6 +101,15 @@ impl TracePartMeta {
     }
 }
 
+/// Whether a span touches `[start_ns, end_ns]` at any point.
+///
+/// The one definition of "in the window" for spans, shared by the part reader
+/// and the memtable side of a scan so the two halves of a query cannot answer
+/// differently.
+pub fn span_overlaps(span: &TraceSpan, start_ns: i64, end_ns: i64) -> bool {
+    span.end_time_ns >= start_ns && span.start_time_ns <= end_ns
+}
+
 #[derive(Clone, Debug)]
 pub struct TracePart {
     pub dir: PathBuf,
@@ -659,7 +668,14 @@ impl TracePartReader {
         self.query_selected(tenant, selected, None, limit, cancellation)
     }
 
-    /// The tenant's spans that start inside `[start_ns, end_ns]`.
+    /// The tenant's spans that overlap `[start_ns, end_ns]`.
+    ///
+    /// A span is in the window when any part of it is, not only when it
+    /// started there: a request that began before the window and was still
+    /// running inside it is exactly the one an operator is looking for. That
+    /// also makes this the same predicate the row-group bounds already answer,
+    /// since those record the earliest start and the latest end, so the filter
+    /// and the pruning cannot disagree.
     ///
     /// Row groups outside the range are never read, and the surviving spans
     /// are filtered exactly, so the answer does not depend on where the flush
@@ -677,7 +693,7 @@ impl TracePartReader {
             .meta
             .tenant_row_groups_in_range(tenant, start_ns, end_ns);
         let mut spans = self.query_selected(tenant, selected, None, limit, cancellation)?;
-        spans.retain(|span| span.start_time_ns >= start_ns && span.start_time_ns <= end_ns);
+        spans.retain(|span| span_overlaps(span, start_ns, end_ns));
         Ok(spans)
     }
 

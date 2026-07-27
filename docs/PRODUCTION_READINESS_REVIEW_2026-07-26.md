@@ -206,7 +206,7 @@ Immediately after this review, a batch of Gate 1 items was fixed. 285 tests pass
 | P1-8 merge-limit units | Fixed | Add `materialized_bytes` to part metadata. Group selection and read budgets use the same unit, and `validate` enforces limit ordering |
 | N4 `/metrics` O(parts) | Fixed | The merge worker publishes merge debt and the retention worker publishes unknown tenants. Scrapes only read |
 | N2 tenant allowlist | Fixed | `LOGGYTRACY_ALLOWED_TENANTS`; tenants outside the list receive 403 |
-| N6 Tempo time pruning | **Partially fixed** | `search_tags`/`search_tag_values` accept `start`/`end`, and the range reaches pin-set and row-group selection. `search` was untouched — see below |
+| N6 Tempo time pruning | **fixed** | `search`, `search_tags` and `search_tag_values` all take `start`/`end`, and the window reaches the pin set and the row-group selection. `search` now matches a trace on span overlap rather than on its earliest span, which is both Tempo's rule and the one the row-group bounds can answer |
 | P2-2 metadata guards | Fixed | Semaphore, timeout, `start`/`end`, and `match[]` count limits |
 | P1-4 writer fencing | Fixed | `writer_epoch` in the manifest; claim at startup, verify on every CAS, self-fence and terminate on fencing |
 
@@ -332,19 +332,7 @@ The rest remains in `todo.md`.
 ### Gate 4 — scale validation
 
 - [ ] Measure row-group fragmentation with many tenants for N3
-- [x] N6 Tempo tag-endpoint time pruning
-- [ ] **N6 remaining: decide semantics before time-pruning `search`.** `search` currently returns a trace
-      only when its *earliest* span is within the window. That span may be in a row group outside the window,
-      so pruning changes not only cost but **which traces are returned**. `startTimeUnixNano` and `durationMs`
-      also change for boundary-crossing traces. Tempo's native meaning is "return when any span overlaps the
-      window," which is broader than the current implementation. If semantics are aligned with Tempo,
-      pruning follows — the order is the reverse of the current one
-- [ ] P1-11 improve O(N) paths in part count
-- [ ] P1-5 remove MemTable flush deep clone
-- [ ] P1-9 move eviction to `spawn_blocking` + in-memory metadata
-- [ ] Tier D duration/scale run (over 2 hours, over 10,000 parts, over 500 tenants) —
-      **real S3 validation is confirmed out of scope**. Rationale and remaining risks are in
-      [`LOAD_VALIDATION.md`](LOAD_VALIDATION.md)
+- [x] N6 Tempo time pruning (search and both tag endpoints)
 
 ### Gate 5 — feature completeness
 

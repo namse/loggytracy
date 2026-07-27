@@ -37,7 +37,7 @@ async fn scan_trace_spans(
                 .snapshot_limited(&tenant, max_trace_spans)?,
         };
         if let Some((start_ns, end_ns)) = range {
-            spans.retain(|span| span.start_time_ns >= start_ns && span.start_time_ns <= end_ns);
+            spans.retain(|span| crate::trace_part::span_overlaps(span, start_ns, end_ns));
         }
         let remaining = max_trace_spans.saturating_sub(spans.len());
         let part_spans = match trace_id.as_deref() {

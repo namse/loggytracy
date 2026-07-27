@@ -263,12 +263,16 @@
         assert_eq!(spans[0]["name"], "span-straddle-new");
     }
 
-    /// Search clamps the requested window instead of filtering spans, and a
-    /// trace is placed by its own earliest span. A trace that began below the
-    /// floor therefore leaves the results whole.
+    /// Search clamps its window to the retention floor, and a trace matches on
+    /// any span overlapping the clamped window.
+    ///
+    /// `bb` straddles the floor: one span expired, one retained. It belongs in
+    /// the results because the tenant still holds activity inside the window,
+    /// and its summary must be built from the retained span alone — a trace
+    /// that survives the floor must not carry expired timestamps out with it.
     #[tokio::test]
     async fn trace_search_clamps_its_window_to_the_retention_floor() {
-        let (state, _now_ns) = one_hour_floor();
+        let (state, now_ns) = one_hour_floor();
 
         let response = search(
             State(state),
@@ -286,13 +290,78 @@
         .unwrap()
         .0;
 
+        let traces = response["traces"].as_array().unwrap();
+        let ids: Vec<&str> = traces
+            .iter()
+            .map(|trace| trace["traceID"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["bb".repeat(16), "cc".repeat(16)],
+            "the wholly expired trace stays out; the straddling one comes back"
+        );
+
+        let straddling = &traces[0];
+        let start_time: i64 = straddling["startTimeUnixNano"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            start_time,
+            now_ns - 60_000_000_000,
+            "summarized from the retained span, not the expired one"
+        );
+        assert!(
+            straddling["durationMs"].as_f64().unwrap() < 1.0,
+            "the expired span, two hours earlier, must not stretch the reported duration: {}",
+            straddling["durationMs"]
+        );
+    }
+
+    /// A span still running when the window opened is exactly what an operator
+    /// searches for, so overlap — not "started inside" — is the rule. This is
+    /// also what makes the window prunable: the row-group bounds record the
+    /// earliest start and the latest end, so they answer the same predicate the
+    /// span filter does.
+    #[tokio::test]
+    async fn a_span_that_began_before_the_window_and_ran_into_it_still_matches() {
+        let (state, now_ns) = retention_state(&[]);
+        // Reuse the fixture's straddling trace: its old span starts two hours
+        // back, and a window opened after that start still overlaps nothing of
+        // it — the span is a microsecond long. The fresh span is what carries
+        // the trace into a recent window.
+        let response = search(
+            State(state),
+            crate::tenant::test_tenant_headers(),
+            Query(SearchParams {
+                tags: None,
+                start: Some((now_ns - 30 * 60 * 1_000_000_000).to_string()),
+                end: Some(now_ns.to_string()),
+                limit: Some(10),
+                min_duration: None,
+                max_duration: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
         let ids: Vec<&str> = response["traces"]
             .as_array()
             .unwrap()
             .iter()
             .map(|trace| trace["traceID"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["cc".repeat(16)]);
+        assert_eq!(
+            ids,
+            vec!["bb".repeat(16), "cc".repeat(16)],
+            "a trace whose earliest span predates the window still matches on a later one"
+        );
+        assert!(
+            !ids.contains(&"aa".repeat(16).as_str()),
+            "a trace with nothing in the window does not"
+        );
     }
 
     /// A window that is entirely below the floor collapses to nothing. A
