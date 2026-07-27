@@ -555,48 +555,56 @@ At minimum, the following are needed.
 
 ## Production-readiness gates (recommended order)
 
+Status is kept current here; the numbered sections above are the original
+findings and are not rewritten. Where a fix changed a decision rather than only
+the code, the note says which.
+
 ### Gate 1 — data safety (do not deploy without this)
 
-- [ ] Fix P0-1 WAL-compaction wedge + consecutive-compaction tests + injection at each crash point
-- [ ] Document P0-1 recovery (remove the stale state file from an existing wedge)
-- [ ] P0-2 ingest backpressure (MemTable/WAL-backlog limit → 429)
-- [ ] P1-4 writer fencing (manifest epoch/lease + self-fence)
+- [x] P0-1 WAL-compaction wedge — intent record removed durably on success; a surviving phase-2 record is treated as complete, so an already-wedged instance recovers on upgrade alone
+- [x] P0-2 ingest backpressure (MemTable/WAL-backlog limit → 429, before journal append)
+- [x] P1-4 writer fencing (manifest `writer_epoch`, claimed at startup, verified on every CAS, self-fence on loss)
 - [x] P1-6 timestamp acceptance window
-- [ ] Fix P1-8 merge-limit unit mismatch + group-splitting fallback on failure
+- [x] P1-8 merge-limit unit mismatch — `materialized_bytes` in part metadata, plus the group-splitting fallback
 
 ### Gate 2 — multi-tenancy and input defenses
 
 - [x] Document TLS unsupported as an architecture decision (`ARCHITECTURE.md`, "Transport security")
-- [ ] P0-3 extract `X-Scope-OrgID` + introduce it as a storage-path partition axis
-- [ ] P0-3 per-tenant throttles/quotas (ingest rate, cardinality, capacity, concurrent queries) + tenant-labeled metrics
+- [x] P0-3 `X-Scope-OrgID` extraction and tenant isolation — as a *shared*-object axis, not a storage-path one. Per-tenant objects were rejected on Class A cost; see [`MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md)
+- [x] P0-3 per-tenant ingest rate — `ingest_rate` on the pushed policy, enforced before the body is decompressed
+- [ ] P0-3 remaining: per-tenant query-scan quota, stream-cardinality limit, per-tenant concurrency, tenant-labeled metrics
+- [x] N2 tenant allowlist (`LOGGYTRACY_ALLOWED_TENANTS`)
 - [ ] Adjust the default bind to the trust boundary (`0.0.0.0` → require explicit configuration)
-- [ ] P2-2 resource guards on metadata endpoints
+- [x] P2-2 resource guards on metadata endpoints (semaphore, timeout, `start`/`end`, `match[]` count)
 - [x] P2-3 validate snappy reported length + expose body limit
-- [x] P1-7 label/line size limits (stream-count limit together with multi-tenancy)
+- [x] P1-7 label/line size limits
 
 ### Gate 3 — operability
 
-- [ ] P1-10 retry transient failures at startup (remove crash loop)
+- [x] P1-10 retry transient object-store failures at startup (`LOGGYTRACY_STARTUP_RETRY_BUDGET`). The remaining `panic!` sites are the deliberate give-up past that budget, where the orchestrator's restart backoff is the better place to escalate
 - [x] P2-6 honor `RUST_LOG`, default `info`
-- [ ] P2-7 histogram + endpoint labels (p95/p99 observable)
+- [x] P2-7 latency histograms (p95/p99 derivable). Endpoint labels are still absent
 - [ ] P2-8 non-stdin abort path + document orchestrator deployment requirements
 - [x] P2-9 warn on `file://` production misuse (opt-in enforcement remains)
 - [ ] P2-4 decide `retention_period` default (document rationale if infinite)
-- [ ] P3 Dockerfile + configuration reference + runbook + alert rules
+- [x] P3 Dockerfile + configuration reference + runbook + alert rules
+- [ ] P2-5 duplicates after a crash are unobservable
 
 ### Gate 4 — scale validation
 
 - [ ] P1-11 improve the O(N) part-count paths (parallel catalog restore, manifest delta)
-- [ ] P1-1 Tempo search time pruning
-- [ ] P1-3 improve group-commit latency structure
-- [ ] P1-5 track MemTable size in O(1), remove flush clone
+- [x] P1-1 / N6 Tempo time pruning — `search` and both tag endpoints. `search` also changed rule: a trace matches on span overlap rather than on its earliest span, which is Tempo's semantics and the one the row-group bounds can answer
+- [x] P1-3 group-commit latency structure — the batch loop no longer waits out `max_batch_ms` on an empty channel; the default is now zero linger
+- [x] P1-5 MemTable size tracked in O(1)
+- [ ] P1-5 remaining: remove the flush deep clone
 - [ ] P1-9 move eviction to `spawn_blocking` + in-memory metadata
-- [ ] Sustained load for **at least 24 hours** against real S3 + target specification (4 vCPU / 16 GiB) (`todo.md` P2)
+- [x] Instrument the layout axis — `part_tenant_segments`, `part_sidecar_resident_bytes`, `part_meta_bytes`. These are what a Tier D run has to answer before the N3 mitigation can be chosen
+- [ ] Sustained load for **at least 24 hours** at the target specification (4 vCPU / 16 GiB). Real S3 is out of scope; local MinIO is the limit ([`LOAD_VALIDATION.md`](LOAD_VALIDATION.md))
 - [ ] Measure startup time, flush latency, and query-planning time with at least 10,000 parts
 
 ### Gate 5 — feature completeness
 
-- [ ] P1-2 OTLP logs (or correct the documentation)
+- [x] P1-2 OTLP logs — `LogsService` on gRPC, `POST /v1/logs` and `/v1/traces` on HTTP, protobuf and JSON
 - [x] P2-1 `tail` (WebSocket live tail) and time ranges for `labels`/`series`
 - [x] P2-1 `index/volume`, `volume_range`, `detected_labels`, `detected_fields`, `format_query`
 - [ ] P2-1 remaining: `patterns` and the `delete` API — both deliberate, see the table above

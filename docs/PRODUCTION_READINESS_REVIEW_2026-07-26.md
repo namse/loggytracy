@@ -24,9 +24,9 @@ Changes since the previous review:
 | P0-1 WAL compaction wedge | Open | **Open** (reproduced in this review) |
 | P0-2 ingest backpressure | Open | **Open** (no 429 path in the code) |
 | P0-3 multi-tenancy not implemented | Open | **Identification, isolation, and retention closed**, throttles/quotas open |
-| P1-1 Tempo search restores everything | Open | Partially improved (narrowed to tenant range, no time pruning) |
-| P1-4 writer fencing | Open | Open |
-| P1-8 merge-limit unit mismatch | Open | **Open + higher severity** (see N1) |
+| P1-1 Tempo search restores everything | Open | **Fixed since** — the window reaches the pin set and the row-group selection (see N6) |
+| P1-4 writer fencing | Open | **Fixed since** — manifest `writer_epoch` |
+| P1-8 merge-limit unit mismatch | Open | **Fixed since** — `materialized_bytes`, plus the split fallback (see N1) |
 
 ## Reproduced in this review
 
@@ -158,17 +158,17 @@ Only status is confirmed here; see the previous document for details.
 | Item | Status |
 |---|---|
 | P1-2 OTLP log ingest unimplemented | **Fixed** — `LogsService` on the gRPC listener, plus `POST /v1/logs` and `/v1/traces` on the HTTP one. Both transports share one admission and normalization path |
-| P1-3 group commit consumes batch timer | Open |
+| P1-3 group commit consumes batch timer | **Fixed** — the batch loop no longer waits out `max_batch_ms` on an empty channel, and the default is now zero linger |
 | P1-5 MemTable O(rows) size calculation + flush deep clone | Size calculation **fixed** (with P0-2), deep clone open |
 | P1-9 eviction holds write lock during synchronous directory traversal | Open |
-| P1-10 object-store startup errors panic | Open (8 `panic!` sites in `startup.rs`) |
+| P1-10 object-store startup errors panic | **Fixed** — retried within `LOGGYTRACY_STARTUP_RETRY_BUDGET`. The remaining `panic!` sites are the deliberate give-up past that budget |
 | P1-11 startup/flush cost linear in part count | Open |
-| P2-1 Loki/Tempo API gaps | Open |
-| P2-2 resource guards on metadata endpoints | Open (`labels`/`label_values`/`series`/`index_stats` also ignore `start`/`end`) |
+| P2-1 Loki/Tempo API gaps | **Mostly fixed** — `tail`, `index/volume(_range)`, `detected_labels`, `detected_fields`, `format_query`, JSON push, Tempo v2 tags and `/api/echo`. `patterns` and the `delete` API remain, both deliberately |
+| P2-2 resource guards on metadata endpoints | **Fixed** — semaphore, timeout, `start`/`end`, and `match[]` count limits |
 | P2-5 duplicates after a crash unobservable | Open |
-| P2-7 `/metrics` has no histograms or labels | Open (worsened by N4; per-scrape WAL-backlog `stat` removed with P0-2) |
+| P2-7 `/metrics` has no histograms or labels | **Partly fixed** — latency histograms are there, so p95/p99 is derivable. Endpoint labels are still absent |
 | P2-8 stdin abort ineffective in containers | Open |
-| P3 deployment assets | Open (Dockerfile, configuration reference, and runbook all missing) |
+| P3 deployment assets | **Fixed** — Dockerfile, [`CONFIGURATION.md`](CONFIGURATION.md), [`RUNBOOK.md`](RUNBOOK.md) |
 | P2 real S3 validation | **Confirmed out of scope** — local MinIO is the limit ([`LOAD_VALIDATION.md`](LOAD_VALIDATION.md)) |
 
 ---
