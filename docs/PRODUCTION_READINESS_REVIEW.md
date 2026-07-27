@@ -592,7 +592,8 @@ the code, the note says which.
 
 ### Gate 4 — scale validation
 
-- [ ] P1-11 improve the O(N) part-count paths (parallel catalog restore, manifest delta)
+- [x] P1-11 catalog restore overlaps its downloads, and reconcile stops re-reading the manifest per merge group
+- [ ] P1-11 remaining: the manifest is still one document rewritten in full on every flush. Generational deltas plus periodic snapshots are a format change and belong with the Tier D numbers
 - [x] P1-1 / N6 Tempo time pruning — `search` and both tag endpoints. `search` also changed rule: a trace matches on span overlap rather than on its earliest span, which is Tempo's semantics and the one the row-group bounds can answer
 - [x] P1-3 group-commit latency structure — the batch loop no longer waits out `max_batch_ms` on an empty channel; the default is now zero linger
 - [x] P1-5 MemTable size tracked in O(1)

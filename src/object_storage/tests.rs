@@ -1417,3 +1417,51 @@
                 .is_empty()
         );
     }
+
+    /// Restore was one round trip at a time, so its cost was `parts × latency`
+    /// against a store where latency is the dominant term. Virtual time makes
+    /// that measurable exactly: with a fixed per-GET delay, the elapsed time is
+    /// the number of sequential rounds, so the assertion is about concurrency
+    /// rather than about how fast the machine is.
+    #[tokio::test(start_paused = true)]
+    async fn restoring_a_catalog_overlaps_its_downloads() {
+        const PARTS: usize = 32;
+        const READ_MS: u64 = 100;
+
+        let root = temp_dir("restore-concurrency");
+        let parts_root = root.join("parts");
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = super::fault_store::FaultConfig::for_test(0, READ_MS, 0, 0.0, 7);
+        let store: Arc<dyn ObjectStore> = Arc::new(super::fault_store::LatencyFaultStore::new(
+            inner.clone(),
+            config,
+        ));
+        let storage = ObjectStorage::from_store(store, "restore-concurrency");
+
+        for index in 0..PARTS {
+            let parts = crate::part::flush_rows(
+                vec![row(&format!("part-{index}"))],
+                &parts_root,
+                16,
+            )
+            .unwrap();
+            storage.publish(&parts, &[]).await.unwrap();
+        }
+        // Drop the local catalog so every part has to come back from the store.
+        std::fs::remove_dir_all(&parts_root).unwrap();
+
+        let started = tokio::time::Instant::now();
+        let manifest = storage.restore_catalog(&parts_root).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(manifest.parts.len(), PARTS);
+        // Each part is three catalog files plus the manifest read, so the
+        // sequential floor is far above this. The bound being asserted is that
+        // the work overlaps at all, not the exact schedule.
+        let sequential_floor = std::time::Duration::from_millis(READ_MS * PARTS as u64);
+        assert!(
+            elapsed < sequential_floor,
+            "restore took {elapsed:?}, which is no better than one part at a time \
+({sequential_floor:?})"
+        );
+    }

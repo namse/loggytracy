@@ -147,8 +147,17 @@ impl ObjectStorage {
             return self.restore_catalog(parts_root).await;
         }
 
+        // Re-read only after this loop has changed the manifest itself. It was
+        // fetched once per merge group, which on a large manifest is a
+        // multi-megabyte GET per group to observe a document only this loop
+        // writes — the writer epoch already excludes anyone else.
+        let mut manifest = self.load_manifest().await?;
+        let mut manifest_is_stale = false;
         for index in merge_order {
-            let manifest = self.load_manifest().await?;
+            if manifest_is_stale {
+                manifest = self.load_manifest().await?;
+                manifest_is_stale = false;
+            }
             let active: HashSet<&str> =
                 manifest.parts.iter().map(|part| part.id.as_str()).collect();
             let active_inputs = groups[index]
@@ -169,6 +178,7 @@ impl ObjectStorage {
             if active_inputs == groups[index].old_ids.len() {
                 self.publish(&groups[index].added, &groups[index].old_ids)
                     .await?;
+                manifest_is_stale = true;
                 continue;
             }
             if merge_group_reaches_active_output(index, &groups, &active) {
@@ -201,14 +211,42 @@ impl ObjectStorage {
             .await
             .map_err(|error| error.to_string())?;
         validate_cache_root(parts_root)?;
+        // Deciding what is missing is local work and stays sequential; the
+        // downloads are what the round trips are spent on.
+        let mut missing = Vec::new();
         for descriptor in &manifest.parts {
             let final_dir = cache_part_dir(parts_root, descriptor)?;
             if open_manifest_part(&final_dir, descriptor, false).is_ok() {
                 continue;
             }
-            self.download_part(descriptor, parts_root, false).await?;
+            missing.push(descriptor);
         }
+        self.download_parts(missing, parts_root, false).await?;
         Ok(manifest)
+    }
+
+    /// Download a set of parts with bounded concurrency.
+    ///
+    /// The first error wins and the rest are abandoned. A partial restore is
+    /// already the state the caller has to handle — it is what a crash mid-way
+    /// leaves — so finishing the remaining downloads before reporting failure
+    /// would spend round trips to reach the same outcome.
+    async fn download_parts(
+        &self,
+        descriptors: Vec<&ManifestPart>,
+        parts_root: &Path,
+        include_data: bool,
+    ) -> Result<(), String> {
+        // Chunked rather than a sliding window: the difference is a partly
+        // idle tail per chunk, and in exchange the concurrency is obvious from
+        // reading it and the borrow of `self` stays a plain one.
+        for chunk in descriptors.chunks(RESTORE_CONCURRENCY) {
+            let downloads = chunk
+                .iter()
+                .map(|descriptor| self.download_part(descriptor, parts_root, include_data));
+            futures_util::future::try_join_all(downloads).await?;
+        }
+        Ok(())
     }
 
     /// Restores the Parquet bodies for a selected set of parts. The caller
@@ -223,16 +261,18 @@ impl ObjectStorage {
         }
         let manifest = self.load_manifest().await?;
         let mut restored = HashSet::new();
+        let mut missing = Vec::new();
         for descriptor in &manifest.parts {
             if !ids.contains(&descriptor.id) {
                 continue;
             }
             let final_dir = cache_part_dir(parts_root, descriptor)?;
             if open_manifest_part(&final_dir, descriptor, true).is_err() {
-                self.download_part(descriptor, parts_root, true).await?;
+                missing.push(descriptor);
             }
             restored.insert(descriptor.id.clone());
         }
+        self.download_parts(missing, parts_root, true).await?;
         let missing: Vec<_> = ids.difference(&restored).cloned().collect();
         if !missing.is_empty() {
             return Err(format!(

@@ -18,6 +18,15 @@ const MANIFEST_FILE: &str = "manifest.json";
 const UPLOAD_MARKER_FILE: &str = ".object-store-uploading";
 const PART_FILES: [&str; 4] = [DATA_FILE, BLOOM_FILE, STREAM_INDEX_FILE, META_FILE];
 const CATALOG_FILES: [&str; 3] = [BLOOM_FILE, STREAM_INDEX_FILE, META_FILE];
+/// Part downloads in flight while restoring a catalog or a set of bodies.
+///
+/// Restore was sequential, so its cost was `parts × round trip` — a startup on
+/// a 10,000-part manifest spent tens of thousands of round trips one at a time,
+/// against a store whose latency is the dominant term and whose throughput is
+/// not. The bound exists because the opposite mistake is just as easy: an
+/// unbounded fan-out opens a connection per part and turns a restore into a
+/// self-inflicted outage of the store it is reading.
+const RESTORE_CONCURRENCY: usize = 16;
 const MANIFEST_FORMAT_VERSION: u32 = 1;
 const TRACE_MANIFEST_FILE: &str = "trace-manifest.json";
 /// Per-tenant retention policies, one object per tenant. Deliberately outside
