@@ -51,13 +51,13 @@ pub async fn push(
 /// Timestamps outside it are rejected: a far-past entry lands in a partition
 /// retention already swept, and a far-future entry lands in one whose
 /// `max_ts_ns` never falls behind the retention cutoff, so it is never expired.
-struct TimestampWindow {
+pub struct TimestampWindow {
     oldest_ns: Option<i64>,
     newest_ns: Option<i64>,
 }
 
 impl TimestampWindow {
-    fn from_config(config: &Config, clock: &crate::clock::Clock) -> Self {
+    pub fn from_config(config: &Config, clock: &crate::clock::Clock) -> Self {
         let now_ns = clock.now_ns();
         Self {
             oldest_ns: config
@@ -69,7 +69,7 @@ impl TimestampWindow {
         }
     }
 
-    fn validate(&self, timestamp_ns: i64) -> Result<(), String> {
+    pub fn validate(&self, timestamp_ns: i64) -> Result<(), String> {
         if self.oldest_ns.is_some_and(|oldest| timestamp_ns < oldest) {
             return Err(format!(
                 "entry timestamp {timestamp_ns} is older than the accepted window; \
@@ -90,7 +90,7 @@ fn duration_to_ns(duration: std::time::Duration) -> i64 {
     duration.as_nanos().min(i64::MAX as u128) as i64
 }
 
-fn validate_labels(
+pub fn validate_labels(
     labels: &std::collections::BTreeMap<String, String>,
     config: &Config,
 ) -> Result<(), String> {

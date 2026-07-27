@@ -27,7 +27,7 @@ Rust로 만드는 싱글 머신 log + trace 엔진. VictoriaLogs의 논리 설�
 | 인덱스 | stream index + 블록별 trigram bloom filter (역인덱스 없음) |
 | 쿼리 언어 | LogQL — 사용 빈도 높은 subset만, 미지원 문법은 명확한 에러 |
 | API | Loki HTTP API 호환 (Grafana Loki 데이터소스 직결), 트레이스는 Tempo API |
-| Ingest 프로토콜 | Loki push (protobuf+snappy) + OTLP (gRPC) |
+| Ingest 프로토콜 | Loki push (protobuf+snappy) + OTLP gRPC (트레이스·로그) |
 | 전송 보안 | **TLS를 지원하지 않는다.** 평문 HTTP/gRPC만 제공하며, 종단 암호화가 필요하면 리버스 프록시나 서비스 메시가 담당한다 |
 | 테넌시 | 멀티테넌트. `X-Scope-OrgID`로 테넌트를 구분하고, 테넌트가 스로틀·quota의 단위가 된다 |
 | 검증 환경 | **S3를 대상으로 테스트하지 않는다** (실 클라우드도, 로컬 MinIO도). `object_store` 크레이트를 신뢰하고, 크레이트 호출 직전까지의 우리 코드를 세밀하게 테스트한다 |

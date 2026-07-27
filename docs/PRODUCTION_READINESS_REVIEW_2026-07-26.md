@@ -156,7 +156,7 @@ group당 bloom 필터가 테넌트 수에 비례한다. 압축률도 무너진�
 
 | 항목 | 상태 |
 |---|---|
-| P1-2 OTLP 로그 미구현 | 열림 (`startup.rs:372`에 등록된 gRPC 서비스는 trace 하나) |
+| P1-2 OTLP 로그 미구현 | **수정됨** — `LogsService`가 같은 리스너에 등록된다. OTLP/HTTP는 여전히 없다 |
 | P1-3 group commit이 batch 타이머 소진 | 열림 |
 | P1-5 memtable O(rows) 크기 계산 + flush deep clone | 크기 계산은 **수정됨**(P0-2와 함께), deep clone은 열림 |
 | P1-9 eviction이 write lock 잡고 동기 디렉터리 순회 | 열림 |
@@ -345,7 +345,8 @@ fence 감지는 `ObjectStorage`가 `ShutdownState`에 직접 알린다. 워커�
 
 ### 게이트 5 — 기능 완성도
 
-- [ ] P1-2 OTLP 로그 (또는 문서 정정)
+- [x] P1-2 OTLP 로그 — `LogsService` 구현·등록
+- [ ] P1-2 잔여: OTLP/HTTP(`/v1/logs`, `/v1/traces`). Alloy 구성에서 `otlphttp`도 흔하다
 - [ ] P2-1 Loki API 공백
 - [ ] P2-5 중복 관측 가능성 → dedup
 - [ ] `todo.md` P1의 LogQL 기능 보강

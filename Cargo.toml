@@ -12,7 +12,7 @@ prost = "0.13"
 prost-types = "0.13"
 prost014 = { package = "prost", version = "0.14.4" }
 tonic = { version = "0.14.6", features = ["transport"] }
-opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic", "trace", "with-serde"] }
+opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic", "trace", "logs", "with-serde"] }
 snap = "1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

@@ -19,7 +19,7 @@
 | `LOGGYTRACY_DATA_DIR` | `./data` | WAL·체크포인트·로컬 part 캐시. **이 디렉터리가 곧 미flush 데이터의 유일한 사본이다.** 장비 교체 시 이 디스크를 버리면 안 된다 |
 | `LOGGYTRACY_OBJECT_STORE_URL` | 없음 (로컬 전용) | `s3://버킷/prefix` 또는 `file:///경로`. **미설정이면 S3 계층화 없이 로컬 디스크만 쓴다** — 디스크가 곧 source of truth가 되므로 운영에는 부적합 |
 | `LOGGYTRACY_LISTEN_ADDR` | `0.0.0.0:3100` | Loki 호환 HTTP. TLS는 지원하지 않으므로 **신뢰 경계 안**에 두어야 한다 |
-| `LOGGYTRACY_OTLP_GRPC_ADDR` | `0.0.0.0:4317` | OTLP 트레이스 gRPC. 위와 같음 |
+| `LOGGYTRACY_OTLP_GRPC_ADDR` | `0.0.0.0:4317` | OTLP gRPC. 트레이스와 **로그** 서비스가 같은 리스너에 붙는다. 위와 같음 |
 
 `file://`은 **CAS를 하지 않는 단일 프로세스 개발용**이다. 공유·네트워크 스토리지에 쓰면 manifest
 lost update가 나고, 그건 곧 데이터 손실이다. `from_url`이 기동 시 경고를 남긴다.

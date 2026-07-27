@@ -87,6 +87,76 @@ pub fn validate_field_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Encode normalized streams as the `PushRequest` the journal stores.
+pub fn encode_push_request(
+    streams: &[(
+        std::collections::BTreeMap<String, String>,
+        Vec<crate::memtable::LogEntry>,
+    )],
+) -> Vec<u8> {
+    use prost::Message;
+
+    let request = PushRequest {
+        streams: streams
+            .iter()
+            .map(|(labels, entries)| StreamAdapter {
+                labels: format_labels(labels),
+                entries: entries
+                    .iter()
+                    .map(|entry| EntryAdapter {
+                        timestamp: Some(::prost_types::Timestamp {
+                            seconds: entry.timestamp_ns.div_euclid(1_000_000_000),
+                            nanos: entry.timestamp_ns.rem_euclid(1_000_000_000) as i32,
+                        }),
+                        line: entry.line.clone(),
+                        structured_metadata: entry
+                            .structured_metadata
+                            .iter()
+                            .map(|(name, value)| LabelPairAdapter {
+                                name: name.clone(),
+                                value: value.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                hash: 0,
+            })
+            .collect(),
+    };
+    request.encode_to_vec()
+}
+
+/// Render a label set back into the wire form `parse_labels` reads.
+///
+/// The journal stores a log record as a Loki `PushRequest` whatever protocol
+/// it arrived on, so replay has exactly one decoder. That makes this the
+/// inverse of `parse_labels` and it has to escape everything that function
+/// unescapes — a label value with a quote in it would otherwise produce a
+/// record that replays as a parse error, which is a WAL that cannot be read.
+pub fn format_labels(labels: &std::collections::BTreeMap<String, String>) -> String {
+    let mut out = String::from("{");
+    for (index, (name, value)) in labels.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(name);
+        out.push_str("=\"");
+        for character in value.chars() {
+            match character {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                other => out.push(other),
+            }
+        }
+        out.push('"');
+    }
+    out.push('}');
+    out
+}
+
 pub fn parse_labels(s: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
     let s = s.trim();
     let s = s

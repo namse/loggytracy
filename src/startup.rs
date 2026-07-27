@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::app_state::AppStateDependencies;
 use crate::flush;
+use crate::log_ingest;
 use crate::merge;
 use crate::metrics::RuntimeMetrics;
 use crate::object_storage::{ObjectStorage, RemoteCache};
@@ -441,17 +442,30 @@ pub async fn run(config: Arc<Config>) {
         .parse()
         .unwrap_or_else(|error| panic!("invalid OTLP gRPC address: {error}"));
     let otlp_service = trace_ingest::TraceIngestService::new(
+        otlp_journal.clone(),
+        shutdown.clone(),
+        config.clone(),
+        ingest_gate.clone(),
+        tenant_quota.clone(),
+    );
+    // Logs and traces share the listener, the journal and the drain signal.
+    // `ARCHITECTURE.md` has described OTLP as an ingest protocol from the
+    // start; until this was registered, a collector exporting logs to it got
+    // `UNIMPLEMENTED`.
+    let otlp_log_service = log_ingest::LogIngestService::new(
         otlp_journal,
         shutdown.clone(),
         config.clone(),
         ingest_gate,
         tenant_quota,
+        clock.clone(),
     );
     let otlp_task_health = otlp_healthy;
     let mut otlp_drain = shutdown.subscribe();
     let otlp_handle = tokio::spawn(async move {
         let result = tonic::transport::Server::builder()
             .add_service(otlp_service.into_server())
+            .add_service(otlp_log_service.into_server())
             .serve_with_shutdown(otlp_addr, async move {
                 crate::shutdown::wait_for_drain(&mut otlp_drain).await;
             })
