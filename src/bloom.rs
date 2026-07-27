@@ -72,6 +72,11 @@ impl BloomFilter {
         self.num_bits
     }
 
+    /// Bytes this filter holds in memory for as long as its part is open.
+    pub fn resident_bytes(&self) -> usize {
+        self.bits.len()
+    }
+
     #[allow(dead_code)]
     pub fn k(&self) -> u32 {
         self.k

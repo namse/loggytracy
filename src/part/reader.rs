@@ -66,6 +66,14 @@ pub struct PartReader {
     exact_field_bloom_canonical: bool,
     stream_index: StreamMap,
     stream_labels: Vec<String>,
+    /// Bytes the blooms and the stream index occupy for as long as this reader
+    /// lives. Recorded at open because that is the only moment the sizes are
+    /// free: recomputing it per scrape would walk every filter of every part.
+    ///
+    /// These are not covered by the local cache budget — eviction reclaims
+    /// `data.parquet` and leaves the sidecars resident — so this is the part of
+    /// a part that a growing part count charges to RSS.
+    index_resident_bytes: u64,
 }
 
 struct DecodedBlooms {
@@ -219,6 +227,7 @@ impl PartReader {
         if require_data || part.data_path().exists() {
             open_part_data(&part, true)?;
         }
+        let index_resident_bytes = resident_bytes(&decoded_blooms, &stream_index);
         Ok(Self {
             part,
             bloom: decoded_blooms.line,
@@ -226,7 +235,13 @@ impl PartReader {
             exact_field_bloom_canonical: decoded_blooms.exact_fields_canonical,
             stream_index,
             stream_labels,
+            index_resident_bytes,
         })
+    }
+
+    /// See [`PartReader::index_resident_bytes`].
+    pub fn index_resident_bytes(&self) -> u64 {
+        self.index_resident_bytes
     }
 
     pub fn part(&self) -> &Part {
@@ -839,6 +854,32 @@ fn row_group_matches_index(rg: u32, matchers: &[LabelMatcher], index: &StreamMap
         }
     }
     true
+}
+
+/// What the decoded sidecars cost in memory.
+///
+/// Counts the payloads a reader keeps alive — filter bit vectors, index keys
+/// and posting lists — rather than the encoded file sizes, because the encoded
+/// form is not what stays resident. Container and allocator overhead is not
+/// modelled; this is a floor, and it is the term that scales with part count.
+fn resident_bytes(blooms: &DecodedBlooms, stream_index: &StreamMap) -> u64 {
+    let mut total: u64 = 0;
+    for bloom in &blooms.line {
+        total = total.saturating_add(bloom.resident_bytes() as u64);
+    }
+    if let Some(exact) = &blooms.exact_fields {
+        for bloom in exact {
+            total = total.saturating_add(bloom.resident_bytes() as u64);
+        }
+    }
+    for (name, values) in stream_index {
+        total = total.saturating_add(name.len() as u64);
+        for (value, bitmap) in values {
+            total = total.saturating_add(value.len() as u64);
+            total = total.saturating_add(bitmap.serialized_size() as u64);
+        }
+    }
+    total
 }
 
 fn decode_blooms(buf: &[u8], expected_count: usize) -> Result<DecodedBlooms, String> {

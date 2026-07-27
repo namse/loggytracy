@@ -211,6 +211,12 @@ pub struct PartMeta {
     pub materialized_bytes: u64,
     pub stream_labels: Vec<String>,
     pub streams: Vec<Labels>,
+    /// Size of `meta.json` on disk, recorded when it was read.
+    ///
+    /// Startup parses this file for every part before serving anything, and
+    /// `tenants` makes its size scale with tenant breadth, so this is the
+    /// concrete cost of the per-tenant index rather than an estimate of it.
+    pub meta_bytes: u64,
     integrity: PartIntegrity,
 }
 

@@ -184,6 +184,7 @@ pub fn load_part(dir: &Path) -> Result<Part, String> {
         materialized_bytes: meta_file.materialized_bytes,
         stream_labels: meta_file.stream_labels,
         streams,
+        meta_bytes: meta_str.len() as u64,
         integrity: meta_file.integrity,
     };
     Ok(Part {

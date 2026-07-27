@@ -569,6 +569,15 @@ loggytracy_cache_healthy {}\n\
 loggytracy_wal_backlog_bytes {}\n\
 # TYPE loggytracy_merge_debt_parts gauge\n\
 loggytracy_merge_debt_parts {}\n\
+# HELP loggytracy_part_tenant_segments (tenant, part) pairs. The shared-part layout spends a row group, two blooms and a metadata segment per pair.\n\
+# TYPE loggytracy_part_tenant_segments gauge\n\
+loggytracy_part_tenant_segments {}\n\
+# HELP loggytracy_part_sidecar_resident_bytes Bloom and stream-index bytes held resident by open parts. Not covered by the local cache budget.\n\
+# TYPE loggytracy_part_sidecar_resident_bytes gauge\n\
+loggytracy_part_sidecar_resident_bytes {}\n\
+# HELP loggytracy_part_meta_bytes Total meta.json across parts, which startup parses before serving.\n\
+# TYPE loggytracy_part_meta_bytes gauge\n\
+loggytracy_part_meta_bytes {}\n\
 # TYPE loggytracy_ingest_requests_total counter\n\
 loggytracy_ingest_requests_total {}\n\
 # TYPE loggytracy_ingest_errors_total counter\n\
@@ -656,6 +665,9 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         cache_healthy as u8,
         wal_backlog_bytes,
         merge_debt_parts,
+        m.part_tenant_segments.load(Ordering::Relaxed),
+        m.part_sidecar_resident_bytes.load(Ordering::Relaxed),
+        m.part_meta_bytes.load(Ordering::Relaxed),
         m.ingest_requests.load(Ordering::Relaxed),
         m.ingest_errors.load(Ordering::Relaxed),
         m.ingest_throttled.load(Ordering::Relaxed),

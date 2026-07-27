@@ -429,6 +429,13 @@ async fn main() {
         "trace_part_count": gauge(&end_metrics, "loggytracy_trace_part_count"),
         "wal_backlog_bytes": gauge(&end_metrics, "loggytracy_wal_backlog_bytes"),
         "merge_debt_parts": gauge(&end_metrics, "loggytracy_merge_debt_parts"),
+        // The layout axis. `part_tenant_segments` divided by `part_count` is
+        // the average tenant breadth of a part, and divided by the tenant
+        // count it is how many parts an average tenant is spread across —
+        // which is what decides whether the per-pair fixed cost matters.
+        "part_tenant_segments": gauge(&end_metrics, "loggytracy_part_tenant_segments"),
+        "part_sidecar_resident_bytes": gauge(&end_metrics, "loggytracy_part_sidecar_resident_bytes"),
+        "part_meta_bytes": gauge(&end_metrics, "loggytracy_part_meta_bytes"),
     });
 
     let mut report = serde_json::json!({

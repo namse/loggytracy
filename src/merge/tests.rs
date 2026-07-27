@@ -136,6 +136,81 @@
         assert_eq!(registry.part_count(), 2);
     }
 
+    /// The shared-part layout charges per (tenant, part) pair, not per row. A
+    /// tenant with almost no data still pays a row group, two blooms and a
+    /// `meta.json` segment in every part it appears in, and that pair count is
+    /// what these gauges exist to make visible before a load run has to guess
+    /// at it.
+    #[tokio::test]
+    async fn layout_gauges_count_tenant_part_pairs_not_rows() {
+        async fn measure(label: &str, tenants: usize) -> (u64, u64, u64, usize) {
+            let dir = tmp_dir(label);
+            let config = Config {
+                data_dir: dir.clone(),
+                // No merging: this measures the part set as flushed, so the
+                // only difference between the two runs is tenant breadth.
+                merge_min_part_count: 100,
+                ..Config::default()
+            };
+            let parts_root = dir.join("parts");
+            std::fs::create_dir_all(&parts_root).unwrap();
+            let registry = Arc::new(PartRegistry::new());
+
+            let mut labels: Labels = std::collections::BTreeMap::new();
+            labels.insert("app".to_string(), "test".to_string());
+            for batch in 0..4u64 {
+                let rows: Vec<part::Row> = (0..200)
+                    .map(|row_index| part::Row {
+                        tenant: crate::tenant::TenantId::parse(&format!(
+                            "t{:04}",
+                            row_index % tenants
+                        ))
+                        .unwrap(),
+                        timestamp_ns: (batch * 1000) as i64 + row_index as i64,
+                        labels: labels.clone(),
+                        line: format!("batch {batch} row {row_index} of a log line"),
+                        structured_metadata: vec![],
+                    })
+                    .collect();
+                let parts = part::flush_rows(rows, &parts_root, config.row_group_size).unwrap();
+                registry.register(parts).unwrap();
+            }
+
+            let metrics = RuntimeMetrics::new();
+            merge_once(&registry, None, &config, &TenantPolicy::disabled(), &metrics)
+                .await
+                .unwrap();
+            let rows: u64 = registry
+                .snapshot()
+                .iter()
+                .map(|reader| reader.meta().row_count)
+                .sum();
+            assert_eq!(rows, 800, "same rows in both runs");
+            (
+                metrics.part_tenant_segments.load(Ordering::Relaxed),
+                metrics.part_sidecar_resident_bytes.load(Ordering::Relaxed),
+                metrics.part_meta_bytes.load(Ordering::Relaxed),
+                registry.part_count(),
+            )
+        }
+
+        let (narrow_pairs, narrow_sidecar, narrow_meta, narrow_parts) =
+            measure("layout-narrow", 1).await;
+        let (wide_pairs, wide_sidecar, wide_meta, wide_parts) = measure("layout-wide", 20).await;
+
+        assert_eq!(narrow_parts, wide_parts, "same part count in both runs");
+        assert_eq!(narrow_pairs, 4, "one tenant in each of four parts");
+        assert_eq!(wide_pairs, 80, "twenty tenants in each of four parts");
+        assert!(
+            wide_sidecar > narrow_sidecar,
+            "a pair carries its own blooms: {wide_sidecar} should exceed {narrow_sidecar}"
+        );
+        assert!(
+            wide_meta > narrow_meta,
+            "a pair carries its own metadata segment: {wide_meta} should exceed {narrow_meta}"
+        );
+    }
+
     #[test]
     fn malformed_merge_tombstone_is_rejected_before_old_parts_are_touched() {
         let dir = tmp_dir("malformed_tombstone");
