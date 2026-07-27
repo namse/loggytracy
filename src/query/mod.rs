@@ -1,11 +1,13 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use serde::Serialize;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::logql::{self};
@@ -343,6 +345,7 @@ include!("execution.rs");
 include!("restore.rs");
 include!("metrics.rs");
 include!("handlers.rs");
+include!("tail.rs");
 
 #[cfg(test)]
 mod tests {

@@ -15,6 +15,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/loki/api/v1/push", post(ingest::push))
         .layer(push_body_limit)
         .route("/loki/api/v1/query_range", get(query::query_range))
+        .route("/loki/api/v1/tail", get(query::tail))
         .route("/loki/api/v1/query", get(query::query))
         .route("/loki/api/v1/series", get(query::series))
         .route("/loki/api/v1/labels", get(query::labels))

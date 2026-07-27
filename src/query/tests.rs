@@ -1613,3 +1613,223 @@
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0]["app"], "fresh");
     }
+
+    fn tail_labels() -> Labels {
+        [("app".to_string(), "tailed".to_string())]
+            .into_iter()
+            .collect()
+    }
+
+    fn tail_entry(timestamp_ns: i64, line: &str) -> LogEntry {
+        LogEntry {
+            timestamp_ns,
+            line: line.to_string(),
+            structured_metadata: vec![],
+        }
+    }
+
+    fn tail_query() -> logql::LogQuery {
+        match logql::parse_expr(r#"{app="tailed"}"#).unwrap() {
+            logql::QueryExpr::Logs(query) => query,
+            logql::QueryExpr::Metric(_) => unreachable!("the fixture is a log selector"),
+        }
+    }
+
+    /// A tail must send each line exactly once. A cursor alone cannot do that:
+    /// advancing past the newest timestamp drops every other entry sharing that
+    /// nanosecond, and stopping on it resends them. Lines written as one batch
+    /// routinely share a timestamp, so this is the ordinary case, not an edge.
+    #[tokio::test]
+    async fn a_tail_sends_each_line_once_even_when_timestamps_collide() {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
+
+        let collision_ns = 1_700_000_000_000_000_000;
+        memtable.insert(
+            test_tenant(),
+            tail_labels(),
+            vec![
+                tail_entry(collision_ns, "first"),
+                tail_entry(collision_ns, "second"),
+            ],
+        );
+
+        let mut cursor = TailCursor::new(collision_ns - 1);
+        let query = tail_query();
+        let first = tail_poll(&state, &test_tenant(), &query, &mut cursor, collision_ns, 100)
+            .await
+            .expect("the first poll delivers both lines");
+        let lines = tail_lines(&first);
+        assert_eq!(lines, vec!["first", "second"]);
+
+        // Nothing new: the same window must not resend what it already sent.
+        assert!(
+            tail_poll(&state, &test_tenant(), &query, &mut cursor, collision_ns, 100)
+                .await
+                .is_none(),
+            "a repeated poll over the same window has nothing to send"
+        );
+
+        // A third line at the very same nanosecond still has to arrive.
+        memtable.insert(
+            test_tenant(),
+            tail_labels(),
+            vec![tail_entry(collision_ns, "third")],
+        );
+        let third = tail_poll(&state, &test_tenant(), &query, &mut cursor, collision_ns, 100)
+            .await
+            .expect("a late arrival at the same timestamp is not lost");
+        assert_eq!(tail_lines(&third), vec!["third"]);
+    }
+
+    /// A burst larger than one poll's limit is left for the next poll, not
+    /// skipped. The tail falls behind rather than losing lines, which is what
+    /// makes reporting an empty `dropped_entries` true rather than a stub.
+    #[tokio::test]
+    async fn a_burst_larger_than_the_limit_is_delivered_across_polls() {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
+
+        let base_ns = 1_700_000_000_000_000_000;
+        let entries: Vec<LogEntry> = (0..5)
+            .map(|index| tail_entry(base_ns + index, &format!("line-{index}")))
+            .collect();
+        memtable.insert(test_tenant(), tail_labels(), entries);
+
+        let mut cursor = TailCursor::new(base_ns - 1);
+        let query = tail_query();
+        let end_ns = base_ns + 10;
+
+        let first = tail_poll(&state, &test_tenant(), &query, &mut cursor, end_ns, 2)
+            .await
+            .expect("the oldest two arrive first");
+        assert_eq!(tail_lines(&first), vec!["line-0", "line-1"]);
+        assert_eq!(first["dropped_entries"].as_array().unwrap().len(), 0);
+
+        let second = tail_poll(&state, &test_tenant(), &query, &mut cursor, end_ns, 2)
+            .await
+            .expect("the next poll continues rather than skipping ahead");
+        assert_eq!(tail_lines(&second), vec!["line-2", "line-3"]);
+
+        let third = tail_poll(&state, &test_tenant(), &query, &mut cursor, end_ns, 2)
+            .await
+            .expect("and drains the rest");
+        assert_eq!(tail_lines(&third), vec!["line-4"]);
+    }
+
+    fn tail_lines(payload: &serde_json::Value) -> Vec<String> {
+        payload["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|stream| stream["values"].as_array().unwrap().iter())
+            .map(|value| value[1].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Perform a real WebSocket handshake against a real listener and return
+    /// the status line.
+    ///
+    /// `oneshot` cannot reach this handler: the upgrade extractor needs the
+    /// `OnUpgrade` extension that only a live hyper connection attaches, so a
+    /// hand-built request is rejected before any of the handler's own
+    /// validation runs. A test built that way would pass without proving
+    /// anything about the endpoint.
+    async fn tail_handshake_status(state: Arc<AppState>, query: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::build_router(state)).await.ok();
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /loki/api/v1/tail?query={query} HTTP/1.1\r\n\
+Host: localhost\r\n\
+{}: {}\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+Sec-WebSocket-Version: 13\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            crate::tenant::TENANT_HEADER,
+            test_tenant().as_str(),
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = vec![0u8; 256];
+        let read = stream.read(&mut response).await.unwrap();
+        let status_line = String::from_utf8_lossy(&response[..read]);
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .expect("a status line")
+            .parse()
+            .expect("a status code");
+        drop(stream);
+        server.abort();
+        status
+    }
+
+    /// Everything a tail can reject is rejected before the upgrade. A client
+    /// that gets a 101 followed by an immediate close cannot tell a bad query
+    /// from a server fault.
+    #[tokio::test]
+    async fn a_tail_rejects_what_it_cannot_follow_before_upgrading() {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable, Arc::new(PartRegistry::new()), None);
+
+        assert_eq!(
+            tail_handshake_status(state.clone(), "%7Bapp%3D").await,
+            400,
+            "an unparseable selector"
+        );
+        assert_eq!(
+            tail_handshake_status(
+                state.clone(),
+                "rate(%7Bapp%3D%22tailed%22%7D%5B5m%5D)"
+            )
+            .await,
+            400,
+            "a metric expression has no stream to follow"
+        );
+        assert_eq!(
+            tail_handshake_status(state, "%7Bapp%3D%22tailed%22%7D").await,
+            101,
+            "and a followable query upgrades"
+        );
+    }
+
+    /// A tail is a poll loop with an open socket, so the count of them is
+    /// bounded and the refusal happens where the client can read it.
+    #[tokio::test]
+    async fn a_tail_beyond_the_connection_limit_is_refused_with_429() {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable, Arc::new(PartRegistry::new()), None);
+
+        let held: Vec<_> = (0..state.config.max_concurrent_tails)
+            .map(|_| {
+                Arc::clone(&state.tail_semaphore)
+                    .try_acquire_owned()
+                    .expect("the limit is not reached yet")
+            })
+            .collect();
+
+        assert_eq!(
+            tail_handshake_status(state.clone(), "%7Bapp%3D%22tailed%22%7D").await,
+            429
+        );
+
+        // And it is the limit doing it, not the endpoint: the same request
+        // upgrades once a slot frees.
+        drop(held);
+        assert_eq!(
+            tail_handshake_status(state, "%7Bapp%3D%22tailed%22%7D").await,
+            101
+        );
+    }

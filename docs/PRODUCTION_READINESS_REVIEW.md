@@ -370,7 +370,7 @@ Endpoints called by the Grafana Loki data source but missing:
 
 | Endpoint | Impact |
 |---|---|
-| `/loki/api/v1/tail` (WebSocket) | Grafana **Live tail unavailable** |
+| ~~`/loki/api/v1/tail` (WebSocket)~~ | **implemented.** Polls the ordinary query path rather than pushing from ingest, so it inherits every limit, the retention clamp and tenant isolation instead of reimplementing them |
 | `/loki/api/v1/index/volume`, `volume_range` | Explore volume histogram fails |
 | `/loki/api/v1/patterns` | Pattern exploration fails |
 | `/loki/api/v1/detected_fields`, `detected_labels` | Field exploration fails in Grafana 11+ |
@@ -595,7 +595,8 @@ At minimum, the following are needed.
 ### Gate 5 — feature completeness
 
 - [ ] P1-2 OTLP logs (or correct the documentation)
-- [ ] P2-1 Loki API gaps (especially `tail`, and time ranges for `labels`/`series`)
+- [x] P2-1 `tail` (WebSocket live tail) and time ranges for `labels`/`series`
+- [ ] P2-1 remaining: `index/volume`, `patterns`, `detected_fields`, `format_query`, `delete`
 - [ ] P2-5 duplicate observability → implement dedup later (`todo.md` P2)
 - [ ] LogQL improvements in P1 of `todo.md`
 

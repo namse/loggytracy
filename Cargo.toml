@@ -6,7 +6,7 @@ default-run = "loggytracy"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 prost = "0.13"
 prost-types = "0.13"

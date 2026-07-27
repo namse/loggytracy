@@ -105,6 +105,15 @@ pub struct Config {
     /// Expired share of a part's rows that justifies one rewrite through
     /// merge. Below it the rows stay on disk, already invisible to queries.
     pub retention_rewrite_threshold: f64,
+    /// Live tail connections one instance will hold at once.
+    ///
+    /// A tail is a poll loop with an open socket, so this bounds scheduled
+    /// work rather than a burst: the connections that do not fit are refused
+    /// at the upgrade, where the client can see why.
+    pub max_concurrent_tails: usize,
+    /// How often a live tail asks for new lines. This is the tail's latency
+    /// floor and its cost per connection at the same time.
+    pub tail_poll_interval: Duration,
     pub max_query_range: Option<Duration>,
     pub max_query_scan_rows: usize,
     pub max_query_scan_bytes: u64,
@@ -184,6 +193,8 @@ impl Default for Config {
             default_tenant_ingest_bytes_per_second: None,
             tenant_ingest_burst: Duration::from_secs(10),
             retention_rewrite_threshold: 0.5,
+            max_concurrent_tails: 8,
+            tail_poll_interval: Duration::from_secs(1),
             max_query_range: None,
             max_query_scan_rows: 5_000_000,
             max_query_scan_bytes: 2 * 1024 * 1024 * 1024,
@@ -365,6 +376,14 @@ impl Config {
             retention_rewrite_threshold: env_value(
                 "LOGGYTRACY_RETENTION_REWRITE_THRESHOLD",
                 defaults.retention_rewrite_threshold,
+            )?,
+            max_concurrent_tails: env_positive_usize(
+                "LOGGYTRACY_MAX_CONCURRENT_TAILS",
+                defaults.max_concurrent_tails,
+            )?,
+            tail_poll_interval: env_required_duration(
+                "LOGGYTRACY_TAIL_POLL_INTERVAL",
+                defaults.tail_poll_interval,
             )?,
             max_query_range: env_duration("LOGGYTRACY_MAX_QUERY_RANGE", None)?,
             max_query_scan_rows: env_positive_usize(

@@ -20,6 +20,9 @@ pub struct AppState {
     pub query_scan_semaphore: Arc<tokio::sync::Semaphore>,
     pub metric_evaluation_semaphore: Arc<tokio::sync::Semaphore>,
     pub trace_scan_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bounds live tail connections. Held for the life of a socket, unlike the
+    /// scan semaphores, which a tail borrows per poll.
+    pub tail_semaphore: Arc<tokio::sync::Semaphore>,
     pub memtable: Arc<MemTable>,
     pub journal: Arc<Journal>,
     pub parts: Arc<PartRegistry>,
@@ -93,6 +96,7 @@ impl AppState {
             trace_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_trace_scans,
             )),
+            tail_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_tails)),
             config,
             memtable: dependencies.memtable,
             journal: dependencies.journal,

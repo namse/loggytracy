@@ -157,6 +157,8 @@ becomes disk usage that cannot be evicted**.
 | `LOGGYTRACY_MAX_QUERY_RUNTIME` | `30s` | Also the timeout for metadata endpoints |
 | `LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS` | 8 | Shared with metadata endpoints |
 | `LOGGYTRACY_MAX_SERIES_MATCHERS` | 32 | Number of `match[]` entries for `series`. Each matcher is a full pass |
+| `LOGGYTRACY_MAX_CONCURRENT_TAILS` | 8 | Live tail (`/loki/api/v1/tail`) connections held at once. Over the limit the upgrade is refused with 429 rather than accepted and dropped |
+| `LOGGYTRACY_TAIL_POLL_INTERVAL` | `1s` | How often a live tail asks for new lines. This is both its latency floor and its cost per connection |
 | `LOGGYTRACY_MAX_RESTORE_RUNTIME` | `25s` | Cache-miss restore timeout |
 
 ### Metric queries
