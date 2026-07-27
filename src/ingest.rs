@@ -139,13 +139,6 @@ async fn push_inner(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if content_type.contains("application/json") {
-        return Err((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "JSON push is not supported, use protobuf+snappy".to_string(),
-        )
-            .into());
-    }
     let limits = &state.config;
     if body.len() > limits.max_push_bytes {
         return Err((
@@ -158,6 +151,23 @@ async fn push_inner(
         )
             .into());
     }
+    // Promtail and several SDKs push JSON. It carries the same streams as the
+    // protobuf form, so it decodes into the same shape and then follows the
+    // same path — the limits below and the journal encoding are not repeated
+    // for it.
+    if content_type.contains("application/json") {
+        let request: JsonPushRequest = serde_json::from_slice(&body).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid JSON push body: {error}"),
+            )
+        })?;
+        let parsed = request
+            .into_streams()
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        return accept_streams(state, tenant, parsed).await;
+    }
+
     // The snappy header declares the decompressed length and `decompress_vec`
     // allocates it before validating the stream, so an attacker-chosen header
     // would otherwise size the allocation. Check the declared length first.
@@ -194,8 +204,7 @@ async fn push_inner(
     })?;
 
     let timestamp_window = TimestampWindow::from_config(limits, &state.clock);
-    let mut parsed: Vec<(std::collections::BTreeMap<String, String>, Vec<LogEntry>)> =
-        Vec::with_capacity(push_req.streams.len());
+    let mut parsed: ParsedStreams = Vec::with_capacity(push_req.streams.len());
     for stream in &push_req.streams {
         let labels = proto::parse_labels(&stream.labels).map_err(|e| {
             (
@@ -241,6 +250,8 @@ async fn push_inner(
         parsed.push((labels, entries));
     }
 
+    // The protobuf body is already the journal's encoding, so it is stored as
+    // it arrived rather than re-encoded from `parsed`.
     state
         .journal
         .append(tenant, decompressed, parsed)
@@ -252,6 +263,109 @@ async fn push_inner(
             )
         })?;
 
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Decoded streams, in the shape every ingest path converges on before the
+/// input limits and the journal append.
+pub type ParsedStreams = Vec<(crate::memtable::Labels, Vec<LogEntry>)>;
+
+/// The Loki JSON push body.
+///
+/// A value is `[timestamp_ns, line]` with an optional third element carrying
+/// structured metadata, which is how Loki spells it and therefore what the
+/// clients that use this form send.
+#[derive(serde::Deserialize)]
+struct JsonPushRequest {
+    streams: Vec<JsonStream>,
+}
+
+#[derive(serde::Deserialize)]
+struct JsonStream {
+    stream: std::collections::BTreeMap<String, String>,
+    values: Vec<JsonValue>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum JsonValue {
+    WithMetadata(String, String, std::collections::BTreeMap<String, String>),
+    Bare(String, String),
+}
+
+impl JsonPushRequest {
+    fn into_streams(self) -> Result<ParsedStreams, String> {
+        let mut streams = Vec::with_capacity(self.streams.len());
+        for stream in self.streams {
+            // The same names the protobuf path rejects. A reserved label would
+            // collide with a part column, and the check has to happen wherever
+            // labels enter rather than only where they are parsed from text.
+            for name in stream.stream.keys() {
+                proto::validate_label_name(name)?;
+            }
+            let mut entries = Vec::with_capacity(stream.values.len());
+            for value in stream.values {
+                let (timestamp, line, metadata) = match value {
+                    JsonValue::WithMetadata(timestamp, line, metadata) => {
+                        (timestamp, line, metadata.into_iter().collect())
+                    }
+                    JsonValue::Bare(timestamp, line) => (timestamp, line, Vec::new()),
+                };
+                let timestamp_ns: i64 = timestamp.trim().parse().map_err(|_| {
+                    format!("entry timestamp {timestamp:?} is not a nanosecond count")
+                })?;
+                entries.push(LogEntry {
+                    timestamp_ns,
+                    line,
+                    structured_metadata: metadata,
+                });
+            }
+            streams.push((stream.stream, entries));
+        }
+        Ok(streams)
+    }
+}
+
+/// Validate already-decoded streams and append them, whatever encoding they
+/// arrived in. The limits are the point: they exist to bound what reaches the
+/// journal, so they cannot belong to one body format.
+async fn accept_streams(
+    state: &Arc<AppState>,
+    tenant: crate::tenant::TenantId,
+    parsed: ParsedStreams,
+) -> Result<StatusCode, IngestError> {
+    let limits = &state.config;
+    let timestamp_window = TimestampWindow::from_config(limits, &state.clock);
+    for (labels, entries) in &parsed {
+        validate_labels(labels, limits).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        for entry in entries {
+            timestamp_window
+                .validate(entry.timestamp_ns)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+            if entry.line.len() > limits.max_line_bytes {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "log line is {} bytes, exceeding the maximum of {}",
+                        entry.line.len(),
+                        limits.max_line_bytes
+                    ),
+                )
+                    .into());
+            }
+        }
+    }
+    let encoded = proto::encode_push_request(&parsed);
+    state
+        .journal
+        .append(tenant, encoded, parsed)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("journal write failed: {error}"),
+            )
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -846,6 +960,113 @@ mod tests {
         push(State(state.clone()), protobuf_headers(), body)
             .await
             .expect("the budget refills");
+    }
+
+    /// Promtail and several SDKs push JSON. It carries the same streams as the
+    /// protobuf form, so it has to end up in the same place — including in the
+    /// WAL, which stores one encoding whatever arrived, so replay keeps one
+    /// decoder.
+    #[tokio::test]
+    async fn a_json_push_lands_in_the_same_place_a_protobuf_one_does() {
+        let config = Config {
+            data_dir: tmp_data_dir("json_push"),
+            ..Config::default()
+        };
+        let state = limits_state(config.clone()).await;
+        let now = now_secs() * 1_000_000_000;
+
+        let body = format!(
+            r#"{{"streams":[{{"stream":{{"app":"json"}},"values":[["{now}","from json"],["{now}","with metadata",{{"trace_id":"abc"}}]]}}]}}"#
+        );
+        let mut headers = crate::tenant::test_tenant_headers();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        push(State(state.clone()), headers, Bytes::from(body))
+            .await
+            .expect("a JSON push is accepted");
+
+        let results = state
+            .memtable
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true);
+        assert_eq!(results[0].labels["app"], "json");
+        let lines: Vec<&str> = results
+            .iter()
+            .flat_map(|stream| stream.entries.iter())
+            .map(|entry| entry.line.as_str())
+            .collect();
+        assert_eq!(lines, vec!["from json", "with metadata"]);
+        assert_eq!(
+            results[0].entries[1].structured_metadata,
+            vec![("trace_id".to_string(), "abc".to_string())],
+            "the optional third element is structured metadata"
+        );
+
+        // The WAL holds one encoding whatever the body was.
+        let replayed = Arc::new(MemTable::new());
+        journal::replay_with_traces(
+            &config.data_dir.join("journal.wal"),
+            &config.data_dir.join("journal.ckpt"),
+            &replayed,
+            &crate::trace::TraceMemTable::new(),
+            &config.default_tenant,
+        )
+        .expect("the WAL replays");
+        let replayed_lines: Vec<String> = replayed
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .iter()
+            .flat_map(|stream| stream.entries.iter())
+            .map(|entry| entry.line.clone())
+            .collect();
+        assert_eq!(replayed_lines, vec!["from json", "with metadata"]);
+    }
+
+    /// A JSON body is not exempt from the limits a protobuf body answers to.
+    #[tokio::test]
+    async fn a_json_push_answers_to_the_same_limits() {
+        let state = limits_state(Config {
+            data_dir: tmp_data_dir("json_push_limits"),
+            max_line_bytes: 8,
+            ..Config::default()
+        })
+        .await;
+        let now = now_secs() * 1_000_000_000;
+        let mut headers = crate::tenant::test_tenant_headers();
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let oversized = format!(
+            r#"{{"streams":[{{"stream":{{"app":"json"}},"values":[["{now}","far too long a line"]]}}]}}"#
+        );
+        let refused = push(
+            State(state.clone()),
+            headers.clone(),
+            Bytes::from(oversized),
+        )
+        .await
+        .expect_err("an oversized line is refused");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+
+        // A reserved label name collides with a part column, and the check has
+        // to apply wherever labels enter rather than only where they are
+        // parsed from the protobuf text form.
+        let reserved =
+            format!(r#"{{"streams":[{{"stream":{{"_msg":"x"}},"values":[["{now}","short"]]}}]}}"#);
+        let refused = push(State(state.clone()), headers.clone(), Bytes::from(reserved))
+            .await
+            .expect_err("a reserved label name is refused");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+
+        let malformed = r#"{"streams":[{"stream":{},"values":[["not-a-timestamp","x"]]}]}"#;
+        let refused = push(State(state.clone()), headers, Bytes::from(malformed))
+            .await
+            .expect_err("a non-numeric timestamp is refused");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+
+        assert!(
+            state
+                .memtable
+                .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .is_empty(),
+            "no refused push may have been written"
+        );
     }
 
     #[tokio::test]

@@ -571,3 +571,50 @@
         .0;
         assert_eq!(values["values"].as_array().unwrap().len(), 1);
     }
+
+    /// The current Grafana Tempo datasource tries the v2 tag APIs first. They
+    /// answer from the same traversal as v1 — v2 dropped the flat tag list and
+    /// pairs each value with a type, and neither is a second scan.
+    #[tokio::test]
+    async fn the_v2_tag_apis_answer_from_the_same_traversal_as_v1() {
+        let (state, _now_ns) = retention_state(&[]);
+
+        let v2 = search_tags_v2(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Query(TagParams::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(
+            v2.get("tags").is_none(),
+            "v2 keeps only the scoped list: {v2}"
+        );
+        let scopes = v2["scopes"].as_array().expect("scoped tags");
+        let span_scope = scopes
+            .iter()
+            .find(|scope| scope["name"] == "span")
+            .expect("a span scope");
+        let names: Vec<&str> = span_scope["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"fresh.attribute"), "{names:?}");
+
+        let values = search_tag_values_v2(
+            State(state),
+            crate::tenant::test_tenant_headers(),
+            Path("fresh.attribute".to_string()),
+            Query(TagParams::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        let values = values["tagValues"].as_array().expect("typed values");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["value"], "fresh.attribute-value");
+        assert_eq!(values[0]["type"], "string");
+    }

@@ -317,6 +317,56 @@ fn tag_range(
     Ok((start <= end).then_some((start, end)))
 }
 
+/// `/api/v2/search/tags` — the same tags, in the shape the current Grafana
+/// Tempo datasource asks for first. v2 dropped the flat `tags` list and keeps
+/// only the scoped one, which v1 already carries, so this is v1 without the
+/// duplicate rather than a second traversal.
+pub async fn search_tags_v2(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    params: Query<TagParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut response = search_tags(state, headers, params).await?.0;
+    Ok(Json(serde_json::json!({
+        "scopes": response["scopes"].take(),
+    })))
+}
+
+/// `/api/v2/search/tag/{tag}/values` — values with their type. v1 returns bare
+/// strings; v2 pairs each with a type so the datasource can offer typed
+/// comparisons in the query builder.
+pub async fn search_tag_values_v2(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    tag: Path<String>,
+    params: Query<TagParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = search_tag_values(state, headers, tag, params).await?.0;
+    let values: Vec<serde_json::Value> = response["values"]
+        .as_array()
+        .map(|values| values.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .map(|value| {
+            serde_json::json!({
+                // Attribute values are stored as strings here whatever they
+                // were in the span, so claiming a narrower type would be a
+                // guess the query builder then acts on.
+                "type": "string",
+                "value": value,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "tagValues": values })))
+}
+
+/// `/api/echo` — the datasource's reachability probe. It reads nothing and is
+/// answered before anything else can fail, which is the whole point of it.
+pub async fn echo() -> &'static str {
+    "echo"
+}
+
 fn empty_tags() -> serde_json::Value {
     serde_json::json!({
         "tags": [],

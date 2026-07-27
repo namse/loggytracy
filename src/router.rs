@@ -37,6 +37,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/search/tag/{tag}/values",
             get(tempo::search_tag_values),
         )
+        // The current Grafana Tempo datasource tries the v2 tag APIs first and
+        // falls back to v1, so without these every tag lookup pays a failed
+        // request before the one that works.
+        .route("/api/v2/search/tags", get(tempo::search_tags_v2))
+        .route(
+            "/api/v2/search/tag/{tag}/values",
+            get(tempo::search_tag_values_v2),
+        )
+        .route("/api/echo", get(tempo::echo))
         .route("/ready", get(query::ready));
     // Without a token there is no per-tenant retention at all, so the admin
     // surface does not exist rather than existing unauthenticated.

@@ -383,11 +383,13 @@ Implemented but inaccurate:
   (`handlers.rs:199, 213, 290, 426`). Grafana always sends a time range, so dropdowns include labels
   that do not exist in that range; every request also scans the full history.
 - `label_values` does not support Loki's `query` parameter (filter values with a matcher).
-- JSON push is rejected with `415 "JSON push not supported in M0"` — the error retains a milestone name,
-  and Promtail/some SDKs use JSON push.
+- ~~JSON push rejected with 415~~ — **implemented.** It decodes into the same streams the protobuf form
+  produces and follows the same path, so the input limits and the journal encoding are not repeated for it.
 - `buildinfo` hardcodes `revision: "unknown"`, `branch: "main"` (`handlers.rs:281`). There is no way to identify the deployed revision.
 
-Tempo also lacks the v2 APIs (`/api/v2/search/tags`, `/api/v2/search/tag/{tag}/values`) and `/api/echo`.
+~~Tempo also lacks the v2 APIs and `/api/echo`~~ — **implemented.** The datasource tries v2 first and falls
+back to v1, so without them every tag lookup paid a failed request before the one that worked. v2 answers
+from the same traversal as v1.
 The latest Grafana Tempo data source tries v2 first.
 
 ### P2-2. No resource guards on metadata endpoints
