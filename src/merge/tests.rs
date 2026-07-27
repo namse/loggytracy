@@ -139,16 +139,21 @@
     /// The shared-part layout charges per (tenant, part) pair, not per row. A
     /// tenant with almost no data still pays a row group, two blooms and a
     /// `meta.json` segment in every part it appears in, and that pair count is
-    /// what these gauges exist to make visible before a load run has to guess
-    /// at it.
+    /// what these totals exist to make visible.
+    ///
+    /// They live on the registry rather than being published by a worker,
+    /// because the configuration that produces a large part set is the one that
+    /// turns merge off — a merge-tick gauge reads zero in exactly the case it
+    /// was added to describe. That was not a hypothetical: it is what the first
+    /// run measuring this actually reported.
     #[tokio::test]
-    async fn layout_gauges_count_tenant_part_pairs_not_rows() {
-        async fn measure(label: &str, tenants: usize) -> (u64, u64, u64, usize) {
+    async fn layout_totals_count_tenant_part_pairs_and_survive_a_silent_merge() {
+        async fn measure(label: &str, tenants: usize) -> (crate::part_registry::LayoutTotals, u64) {
             let dir = tmp_dir(label);
             let config = Config {
                 data_dir: dir.clone(),
-                // No merging: this measures the part set as flushed, so the
-                // only difference between the two runs is tenant breadth.
+                // No merging, which is both the interesting case and the one
+                // the previous implementation could not report on.
                 merge_min_part_count: 100,
                 ..Config::default()
             };
@@ -176,39 +181,95 @@
                 registry.register(parts).unwrap();
             }
 
-            let metrics = RuntimeMetrics::new();
-            merge_once(&registry, None, &config, &TenantPolicy::disabled(), &metrics)
-                .await
-                .unwrap();
+            // A merge tick that does nothing must not change the answer.
+            merge_once(
+                &registry,
+                None,
+                &config,
+                &TenantPolicy::disabled(),
+                &RuntimeMetrics::new(),
+            )
+            .await
+            .unwrap();
+
             let rows: u64 = registry
                 .snapshot()
                 .iter()
                 .map(|reader| reader.meta().row_count)
                 .sum();
             assert_eq!(rows, 800, "same rows in both runs");
-            (
-                metrics.part_tenant_segments.load(Ordering::Relaxed),
-                metrics.part_sidecar_resident_bytes.load(Ordering::Relaxed),
-                metrics.part_meta_bytes.load(Ordering::Relaxed),
-                registry.part_count(),
-            )
+            (registry.layout_totals(), registry.part_count() as u64)
         }
 
-        let (narrow_pairs, narrow_sidecar, narrow_meta, narrow_parts) =
-            measure("layout-narrow", 1).await;
-        let (wide_pairs, wide_sidecar, wide_meta, wide_parts) = measure("layout-wide", 20).await;
+        let (narrow, narrow_parts) = measure("layout-narrow", 1).await;
+        let (wide, wide_parts) = measure("layout-wide", 20).await;
 
         assert_eq!(narrow_parts, wide_parts, "same part count in both runs");
-        assert_eq!(narrow_pairs, 4, "one tenant in each of four parts");
-        assert_eq!(wide_pairs, 80, "twenty tenants in each of four parts");
+        assert_eq!(narrow.tenant_segments, 4, "one tenant in each of four parts");
+        assert_eq!(wide.tenant_segments, 80, "twenty tenants in each of four parts");
         assert!(
-            wide_sidecar > narrow_sidecar,
-            "a pair carries its own blooms: {wide_sidecar} should exceed {narrow_sidecar}"
+            wide.sidecar_resident_bytes > narrow.sidecar_resident_bytes,
+            "a pair carries its own blooms: {} should exceed {}",
+            wide.sidecar_resident_bytes,
+            narrow.sidecar_resident_bytes
         );
         assert!(
-            wide_meta > narrow_meta,
-            "a pair carries its own metadata segment: {wide_meta} should exceed {narrow_meta}"
+            wide.meta_bytes > narrow.meta_bytes,
+            "a pair carries its own metadata segment: {} should exceed {}",
+            wide.meta_bytes,
+            narrow.meta_bytes
         );
+    }
+
+    /// The totals are maintained as the set changes, so a merge that replaces
+    /// parts has to take the old pairs out with the inputs. A total that only
+    /// ever grows would read as unbounded fragmentation on an engine that was
+    /// consolidating correctly.
+    #[tokio::test]
+    async fn merging_parts_removes_their_pairs_from_the_totals() {
+        let dir = tmp_dir("layout-merge");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 2,
+            merge_target_part_rows: 10_000,
+            merge_max_part_rows: 100_000,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+
+        let mut labels: Labels = std::collections::BTreeMap::new();
+        labels.insert("app".to_string(), "test".to_string());
+        for batch in 0..4u64 {
+            let rows: Vec<part::Row> = (0..40)
+                .map(|row_index| part::Row {
+                    tenant: crate::tenant::TenantId::parse(&format!("t{:02}", row_index % 5))
+                        .unwrap(),
+                    timestamp_ns: (batch * 1000) as i64 + row_index as i64,
+                    labels: labels.clone(),
+                    line: format!("batch {batch} row {row_index}"),
+                    structured_metadata: vec![],
+                })
+                .collect();
+            let parts = part::flush_rows(rows, &parts_root, config.row_group_size).unwrap();
+            registry.register(parts).unwrap();
+        }
+        let before = registry.layout_totals();
+        assert_eq!(before.tenant_segments, 20, "five tenants in each of four parts");
+
+        merge_once_without_retention(&registry, None, &config)
+            .await
+            .unwrap();
+
+        let after = registry.layout_totals();
+        assert_eq!(registry.part_count(), 1);
+        assert_eq!(
+            after.tenant_segments, 5,
+            "one part holding five tenants, not the sum of what came before"
+        );
+        assert!(after.sidecar_resident_bytes < before.sidecar_resident_bytes);
+        assert!(after.meta_bytes < before.meta_bytes);
     }
 
     #[test]

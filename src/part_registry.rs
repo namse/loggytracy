@@ -11,8 +11,52 @@ use crate::part::{
 };
 use crate::tenant::TenantId;
 
+/// What the shared-part layout costs across the current part set.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct LayoutTotals {
+    /// `Σ parts.tenants.len()` — the number of (tenant, part) pairs, which is
+    /// the unit this layout actually charges in.
+    pub tenant_segments: u64,
+    /// Bloom and stream-index bytes held resident by open parts. The local
+    /// cache budget does not cover these.
+    pub sidecar_resident_bytes: u64,
+    /// Total `meta.json` across parts, which startup parses before serving.
+    pub meta_bytes: u64,
+}
+
+impl LayoutTotals {
+    fn add(&mut self, reader: &PartReader) {
+        self.tenant_segments = self
+            .tenant_segments
+            .saturating_add(reader.meta().tenants.len() as u64);
+        self.sidecar_resident_bytes = self
+            .sidecar_resident_bytes
+            .saturating_add(reader.index_resident_bytes());
+        self.meta_bytes = self.meta_bytes.saturating_add(reader.meta().meta_bytes);
+    }
+
+    fn remove(&mut self, reader: &PartReader) {
+        self.tenant_segments = self
+            .tenant_segments
+            .saturating_sub(reader.meta().tenants.len() as u64);
+        self.sidecar_resident_bytes = self
+            .sidecar_resident_bytes
+            .saturating_sub(reader.index_resident_bytes());
+        self.meta_bytes = self.meta_bytes.saturating_sub(reader.meta().meta_bytes);
+    }
+}
+
 pub struct PartRegistry {
     inner: RwLock<HashMap<String, Arc<PartReader>>>,
+    /// Running totals for the layout gauges, maintained as the set changes.
+    ///
+    /// These were published from the merge tick, which meant they read zero in
+    /// exactly the configuration that produces the part counts they exist to
+    /// describe — measuring part accumulation requires turning merge off.
+    /// Recomputing per scrape is the other trap, since it is O(parts × tenants)
+    /// on an unauthenticated endpoint. Maintaining them here costs O(1) per
+    /// registry change and cannot fall out of step with the set it describes.
+    layout: RwLock<LayoutTotals>,
     operation_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
@@ -20,6 +64,7 @@ impl PartRegistry {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            layout: RwLock::new(LayoutTotals::default()),
             operation_lock: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
@@ -91,7 +136,9 @@ impl PartRegistry {
             opened.push((id, Arc::new(reader)));
         }
         let count = opened.len();
-        *self.inner.write().unwrap() = opened.into_iter().collect();
+        let readers: HashMap<String, Arc<PartReader>> = opened.into_iter().collect();
+        self.reset_layout(&readers);
+        *self.inner.write().unwrap() = readers;
         if count > 0 {
             tracing::info!(parts = count, "loaded parts from disk");
         }
@@ -168,14 +215,26 @@ impl PartRegistry {
             opened.push((id, Arc::new(reader)));
         }
         let ids = opened.iter().map(|(id, _)| id.clone()).collect();
-        self.inner.write().unwrap().extend(opened);
+        let mut inner = self.inner.write().unwrap();
+        let mut layout = self.layout.write().unwrap();
+        for (id, reader) in opened {
+            // Registering an id that is already present replaces it, so its
+            // predecessor has to leave the totals with it.
+            if let Some(previous) = inner.insert(id, reader.clone()) {
+                layout.remove(&previous);
+            }
+            layout.add(&reader);
+        }
         Ok(ids)
     }
 
     pub fn unregister(&self, ids: &[String]) {
         let mut inner = self.inner.write().unwrap();
+        let mut layout = self.layout.write().unwrap();
         for id in ids {
-            inner.remove(id);
+            if let Some(removed) = inner.remove(id) {
+                layout.remove(&removed);
+            }
         }
     }
 
@@ -202,17 +261,37 @@ impl PartRegistry {
 
         let new_ids: Vec<String> = opened.iter().map(|(id, _)| id.clone()).collect();
         let mut inner = self.inner.write().unwrap();
+        let mut layout = self.layout.write().unwrap();
         for (id, reader) in opened {
-            inner.insert(id, reader);
+            if let Some(previous) = inner.insert(id, reader.clone()) {
+                layout.remove(&previous);
+            }
+            layout.add(&reader);
         }
         for id in old_ids {
-            inner.remove(id);
+            if let Some(removed) = inner.remove(id) {
+                layout.remove(&removed);
+            }
         }
         Ok(new_ids)
     }
 
     pub fn snapshot(&self) -> Vec<Arc<PartReader>> {
         self.inner.read().unwrap().values().cloned().collect()
+    }
+
+    pub fn layout_totals(&self) -> LayoutTotals {
+        *self.layout.read().unwrap()
+    }
+
+    /// Rebuild the totals from a whole set, for the paths that replace it
+    /// outright rather than adding and removing.
+    fn reset_layout(&self, readers: &HashMap<String, Arc<PartReader>>) {
+        let mut totals = LayoutTotals::default();
+        for reader in readers.values() {
+            totals.add(reader);
+        }
+        *self.layout.write().unwrap() = totals;
     }
 
     pub fn part_count(&self) -> usize {

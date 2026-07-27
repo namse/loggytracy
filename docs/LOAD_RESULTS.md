@@ -103,7 +103,7 @@ The memtable limit was **lowered to 8 MiB** and events were pushed without pacin
 | Ack p50 / p95 / p99 | 5.9 / 12.1 / 16.2 ms |
 | Final memtable | 8.19 MB (just below the 8 MiB limit) |
 | WAL backlog | 8.36 MB (bounded) |
-| Peak RSS | 4.95 MB |
+| Peak RSS | **not measured** — see the correction below |
 | Flush successes / injected-error recoveries | 64 / 2 |
 
 **How to read this:** When ingest greatly exceeds flush capacity, the system does not buffer without
@@ -115,6 +115,17 @@ Fixed locations (logic): `ingest::tests::push_is_refused_once_the_memtable_is_ov
 `ingest::tests::push_is_refused_once_the_wal_backlog_is_over_its_limit` — both test **engaging and
 clearing**. Latched backpressure would permanently remove an instance from service after one burst,
 which is worse than unbounded growth.
+
+### Corrections to this run
+
+**The peak RSS recorded here was the load generator's, not the server's.**
+`current_rss_bytes` read `std::process::id()`, which inside the harness is the
+harness. So the figure was a few megabytes of request buffers, it was compared
+against a 4 GiB gate it could never exceed, and it was written down as an engine
+result. The number that gives it away is in the table above: a 4.95 MB peak
+next to an 8 MiB memtable in the same run. The harness now takes the server PID
+and reports `null` when it was not given one — a gate that cannot measure must
+not pass.
 
 ### Harness defect revealed by this run
 
@@ -169,3 +180,43 @@ Recorded honestly.
   count remains bounded, so measuring this requires a separate configuration with merge disabled. Run 4 is
   the first step in that direction.
 - **Object-store operation counts.** They are a proxy for cost estimation, but there is no instrumentation.
+
+## 6. The layout axis, measured (N3)
+
+500 tenants, 400,000 events, `file://` with Tier B fault injection, retention
+off. Two runs differing only in whether merge runs.
+
+| | parts | (tenant, part) pairs | pairs/part | parts/tenant | sidecar resident | `meta.json` | peak RSS |
+|---|---|---|---|---|---|---|---|
+| merge off (`3600s`) | 38 | 3,309 | 87.1 | 6.62 | 1.55 MB | 645 KB | 187 MB |
+| merge on (`8s`) | 7 | 927 | 132.4 | 1.85 | 539 KB | 179 KB | 697 MB |
+
+Per pair: **468 B resident** (bloom + stream index) and **195 B of
+`meta.json`**. Both are within a few percent of what the unit test prints for a
+synthetic part, so the model behind the earlier analysis holds on a real
+workload.
+
+**Merge is the lever on pair count, as predicted.** Turning it on cuts pairs by
+3.6x and parts-per-tenant from 6.6 to 1.85. Pair count tracks parts, and merge
+is what bounds parts.
+
+**But it is not the lever on peak RSS — it is the opposite.** The merge-on run
+peaks at 697 MB against 187 MB with merge off, because merge materializes the
+parts it reads and `merge_max_memory_bytes` is 1 GiB. At this scale the sidecars
+are 0.5–1.5 MB while merge transiently uses hundreds of megabytes, so **the
+binding memory constraint is the merge budget, not fragmentation.** That
+reverses the working assumption these gauges were added to test.
+
+Extrapolating the resident cost to the 10,000-part configuration P1-11 cares
+about, at the same tenant breadth: ~870,000 pairs, ~407 MB of resident
+sidecars. Material on a 16 GiB target, and still smaller than one merge.
+
+**Not explained:** the merge-on run ends `FAIL` on behaviour — `remote_healthy`
+0, flush not progressing, WAL backlog unbounded at the final sample — under 3%
+injected write errors. The merge-off run passes. The run terminates on event
+count, so this is the state at that instant rather than a sustained one, but it
+is not dismissed here; it is a separate question from the layout numbers above
+and wants its own run.
+
+Fixed location: `merge::tests::layout_totals_count_tenant_part_pairs_and_survive_a_silent_merge`,
+`merge::tests::merging_parts_removes_their_pairs_from_the_totals`.

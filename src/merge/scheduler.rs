@@ -55,33 +55,6 @@ async fn merge_once_without_retention(
     .await
 }
 
-/// What the current part set costs in the units the shared-part layout
-/// charges in: (tenant, part) pairs, resident sidecar bytes, and the
-/// `meta.json` startup has to parse.
-///
-/// Published from the merge tick for the same reason `merge_debt_parts` is:
-/// this loop already holds the snapshot, and a scrape that recomputed it would
-/// be doing O(parts) work on an unauthenticated endpoint. All three read fields
-/// recorded when the part was opened, so the pass is a sum, not a walk of the
-/// filters themselves.
-fn publish_layout_gauges(readers: &[Arc<PartReader>], metrics: &RuntimeMetrics) {
-    let mut tenant_segments: u64 = 0;
-    let mut sidecar_bytes: u64 = 0;
-    let mut meta_bytes: u64 = 0;
-    for reader in readers {
-        tenant_segments = tenant_segments.saturating_add(reader.meta().tenants.len() as u64);
-        sidecar_bytes = sidecar_bytes.saturating_add(reader.index_resident_bytes());
-        meta_bytes = meta_bytes.saturating_add(reader.meta().meta_bytes);
-    }
-    metrics
-        .part_tenant_segments
-        .store(tenant_segments, Ordering::Relaxed);
-    metrics
-        .part_sidecar_resident_bytes
-        .store(sidecar_bytes, Ordering::Relaxed);
-    metrics.part_meta_bytes.store(meta_bytes, Ordering::Relaxed);
-}
-
 async fn merge_once(
     registry: &PartRegistry,
     remote_cache: Option<&RemoteCache>,
@@ -90,9 +63,6 @@ async fn merge_once(
     metrics: &RuntimeMetrics,
 ) -> Result<(), String> {
     let readers = registry.snapshot();
-    // Published before the empty check so that retiring the last part drives
-    // these back to zero instead of leaving the previous tick's numbers up.
-    publish_layout_gauges(&readers, metrics);
     if readers.is_empty() {
         return Ok(());
     }

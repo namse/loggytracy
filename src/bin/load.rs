@@ -146,6 +146,11 @@ async fn main() {
     let mut restore_probe_latency = Vec::new();
     let mut metric_steady = Vec::new();
     let mut tempo_steady = Vec::new();
+    // Absent when the harness was not told which process to watch. Reporting
+    // nothing is the point: a gate that cannot measure must not pass.
+    let server_pid = std::env::var("LOGGYTRACY_LOAD_SERVER_PID")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok());
     let mut rss_peak_bytes = 0u64;
 
     let mut otlp_client = TraceServiceClient::connect(format!("http://{otlp_address}"))
@@ -299,8 +304,10 @@ async fn main() {
             }
         }
 
-        if pushes.is_multiple_of(10) {
-            rss_peak_bytes = rss_peak_bytes.max(current_rss_bytes().unwrap_or(0));
+        if pushes.is_multiple_of(10)
+            && let Some(pid) = server_pid
+        {
+            rss_peak_bytes = rss_peak_bytes.max(server_rss_bytes(pid).unwrap_or(0));
         }
     }
 
@@ -411,14 +418,26 @@ async fn main() {
         "ack_p95": target_row(ack_p95, targets.ack_p95_ms),
         "ack_p99": target_row(ack_p99, targets.ack_p99_ms),
         "query_p95": target_row(query_p95, targets.query_p95_ms),
-        "rss_peak_bytes": target_row(rss_peak_bytes as f64, targets.rss_max_bytes as f64),
+        "rss_peak_bytes": match server_pid {
+            Some(_) => target_row(rss_peak_bytes as f64, targets.rss_max_bytes as f64),
+            None => serde_json::json!({
+                "measured": serde_json::Value::Null,
+                "target": targets.rss_max_bytes,
+                "pass": serde_json::Value::Null,
+                "note": "not measured: set LOGGYTRACY_LOAD_SERVER_PID to the server process",
+            }),
+        },
         "error_rate": target_row(error_rate, targets.max_error_rate),
         "wal_backlog_bytes": target_row(wal_backlog_end as f64, targets.wal_backlog_max_bytes as f64),
     });
+    // An unmeasured RSS neither passes nor fails: it is excluded here and
+    // reported as null, so a run that could not watch the server does not read
+    // as one that watched it and found nothing wrong.
+    let rss_pass = server_pid.is_none() || rss_peak_bytes <= targets.rss_max_bytes;
     let numeric_pass = ack_p95 <= targets.ack_p95_ms
         && ack_p99 <= targets.ack_p99_ms
         && query_p95 <= targets.query_p95_ms
-        && rss_peak_bytes <= targets.rss_max_bytes
+        && rss_pass
         && error_rate <= targets.max_error_rate;
 
     let terminal_gauges = serde_json::json!({
@@ -465,7 +484,7 @@ async fn main() {
         "restore_probe_latency_ms": latency_summary(&restore_probe_latency),
         "metric_latency_ms": latency_summary(&metric_steady),
         "tempo_latency_ms": latency_summary(&tempo_steady),
-        "rss_peak_bytes": rss_peak_bytes,
+        "rss_peak_bytes": server_pid.map(|_| rss_peak_bytes),
         "restore_success_delta": restore_success_delta,
         "restore_errors_delta": restore_errors_delta,
         "eviction_delta": eviction_delta,
@@ -683,10 +702,18 @@ fn percentile(values: &[f64], percentile: f64) -> f64 {
     values[index.min(values.len() - 1)]
 }
 
-fn current_rss_bytes() -> Option<u64> {
+/// Resident memory of the **server**, not of this harness.
+///
+/// This read `std::process::id()`, which is the load generator — a process that
+/// holds a few megabytes of request buffers and nothing else. So the reported
+/// peak was always small, always passed its gate, and was recorded in
+/// `LOAD_RESULTS.md` as an engine result. The number that made it obvious in
+/// hindsight is there in that document: a 4.95 MB peak next to an 8 MiB
+/// memtable in the same run.
+fn server_rss_bytes(pid: u32) -> Option<u64> {
     let output = Command::new("ps")
         .args(["-o", "rss=", "-p"])
-        .arg(std::process::id().to_string())
+        .arg(pid.to_string())
         .output()
         .ok()?;
     let kilobytes = String::from_utf8_lossy(&output.stdout)

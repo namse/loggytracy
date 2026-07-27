@@ -22,21 +22,6 @@ pub struct RuntimeMetrics {
     /// numbers are only as fresh as a worker tick either way.
     pub merge_debt_parts: AtomicU64,
     pub unknown_tenants: AtomicU64,
-    /// `Σ parts.tenants.len()` — the number of (tenant, part) pairs.
-    ///
-    /// The unit the shared-part layout actually charges in. A row group, two
-    /// blooms and a `meta.json` segment are spent per pair, so a tenant with
-    /// almost no data still costs whatever this count says it does, and the
-    /// count is driven by how far a tenant's writes are spread across parts
-    /// rather than by how much it writes.
-    pub part_tenant_segments: AtomicU64,
-    /// Bytes of bloom filters and stream indexes held resident by open parts.
-    /// The local cache budget does not cover these, so this is what a growing
-    /// part count charges to RSS.
-    pub part_sidecar_resident_bytes: AtomicU64,
-    /// Total `meta.json` on disk across parts — what startup has to parse
-    /// before the instance serves anything.
-    pub part_meta_bytes: AtomicU64,
     pub flush_success: AtomicU64,
     pub flush_errors: AtomicU64,
     pub merge_success: AtomicU64,
@@ -83,9 +68,6 @@ impl RuntimeMetrics {
             ingest_quota_rejected: AtomicU64::new(0),
             merge_debt_parts: AtomicU64::new(0),
             unknown_tenants: AtomicU64::new(0),
-            part_tenant_segments: AtomicU64::new(0),
-            part_sidecar_resident_bytes: AtomicU64::new(0),
-            part_meta_bytes: AtomicU64::new(0),
             flush_success: AtomicU64::new(0),
             flush_errors: AtomicU64::new(0),
             merge_success: AtomicU64::new(0),

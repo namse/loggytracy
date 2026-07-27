@@ -546,6 +546,9 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
     // snapshots they describe. A scrape must not be able to ask for a walk of
     // every part's tenant index.
     let merge_debt_parts = m_merge_debt(&state);
+    // Read rather than computed: the registry maintains these as its set
+    // changes, so they are current whether or not any worker has ticked.
+    let layout = state.parts.layout_totals();
     let policy = tenant_policy_gauges(&state);
     let m = &state.metrics;
     format!(
@@ -668,9 +671,9 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         cache_healthy as u8,
         wal_backlog_bytes,
         merge_debt_parts,
-        m.part_tenant_segments.load(Ordering::Relaxed),
-        m.part_sidecar_resident_bytes.load(Ordering::Relaxed),
-        m.part_meta_bytes.load(Ordering::Relaxed),
+        layout.tenant_segments,
+        layout.sidecar_resident_bytes,
+        layout.meta_bytes,
         m.ingest_requests.load(Ordering::Relaxed),
         m.ingest_errors.load(Ordering::Relaxed),
         m.ingest_throttled.load(Ordering::Relaxed),
