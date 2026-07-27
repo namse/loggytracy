@@ -11,6 +11,7 @@ use crate::object_storage::RemoteCache;
 use crate::part_registry::PartRegistry;
 use crate::shutdown::ShutdownState;
 use crate::tenant_policy::TenantPolicy;
+use crate::tenant_quota::TenantQuota;
 use crate::trace_registry::TraceRegistry;
 
 /// Runtime resources shared by HTTP handlers and background workers.
@@ -36,6 +37,10 @@ pub struct AppState {
     /// Shared with the OTLP service so both protocols answer to one set of
     /// thresholds.
     pub ingest_gate: Arc<IngestGate>,
+    /// Per-tenant ingest rate, from the pushed policy. Distinct from
+    /// `ingest_gate`, which asks whether *this instance* can take more; this
+    /// one asks whether *this tenant* may send more.
+    pub tenant_quota: Arc<TenantQuota>,
     /// Wall clock. Injected so the boundaries that depend on it — which
     /// timestamps ingest accepts, what range a query defaults to — can be
     /// tested at the edge instead of relative to whatever `now` happened to be.
@@ -69,8 +74,15 @@ impl AppState {
             config.clone(),
             dependencies.metrics.clone(),
         ));
+        let tenant_quota = Arc::new(TenantQuota::new(
+            config.clone(),
+            dependencies.clock.clone(),
+            dependencies.metrics.clone(),
+            dependencies.tenant_policy.clone(),
+        ));
         Self {
             ingest_gate,
+            tenant_quota,
             clock: dependencies.clock,
             query_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_query_scans,

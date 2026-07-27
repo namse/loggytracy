@@ -85,6 +85,23 @@ pub struct Config {
     /// are the sole authority. Setting both is a validation error rather than a
     /// silently ignored setting.
     pub tenant_policy_token: Option<String>,
+    /// Ingest rate for tenants the control plane has pushed no rate for.
+    ///
+    /// This is a default, not a plan: per-tenant rates are pushed, because
+    /// plans differ between tenants and change after launch, and neither of
+    /// those fits in this process's environment. What belongs here is the
+    /// answer for a tenant nothing is known about — including every tenant
+    /// when per-tenant policy is switched off entirely. `None` is unlimited,
+    /// which is the pre-quota behaviour.
+    pub default_tenant_ingest_bytes_per_second: Option<u64>,
+    /// How long a tenant may bank an unused rate for and spend at once.
+    ///
+    /// Logs arrive in bursts, so a bucket sized at exactly one second of rate
+    /// would refuse ordinary traffic. The capacity is also floored at
+    /// `max_push_bytes` so that a single legal body always eventually fits:
+    /// without that floor a low rate would reject the same request forever,
+    /// which is the latching failure the backpressure gate is careful to avoid.
+    pub tenant_ingest_burst: Duration,
     /// Expired share of a part's rows that justifies one rewrite through
     /// merge. Below it the rows stay on disk, already invisible to queries.
     pub retention_rewrite_threshold: f64,
@@ -164,6 +181,8 @@ impl Default for Config {
             retention_grace_period: Duration::from_secs(60 * 60),
             max_retention_runtime: Duration::from_secs(120),
             tenant_policy_token: None,
+            default_tenant_ingest_bytes_per_second: None,
+            tenant_ingest_burst: Duration::from_secs(10),
             retention_rewrite_threshold: 0.5,
             max_query_range: None,
             max_query_scan_rows: 5_000_000,
@@ -335,6 +354,14 @@ impl Config {
             tenant_policy_token: std::env::var("LOGGYTRACY_TENANT_POLICY_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
+            default_tenant_ingest_bytes_per_second: env_optional_u64(
+                "LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND",
+                defaults.default_tenant_ingest_bytes_per_second,
+            )?,
+            tenant_ingest_burst: env_required_duration(
+                "LOGGYTRACY_TENANT_INGEST_BURST",
+                defaults.tenant_ingest_burst,
+            )?,
             retention_rewrite_threshold: env_value(
                 "LOGGYTRACY_RETENTION_REWRITE_THRESHOLD",
                 defaults.retention_rewrite_threshold,

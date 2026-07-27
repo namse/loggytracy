@@ -418,8 +418,9 @@ This is the gap `PRODUCTION_READINESS_REVIEW.md:276` records as
 | Partition on `(tier, day)` | **rejected** — retention baked in at write time cannot honour a plan change; superseded by [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
 | Sidecar consolidation | **not done** — still four `PART_FILES` |
 | Range GET / per-`(part, tenant)` cache | **not done** |
-| Quotas, per-tenant semaphores, tenant-labelled metrics | **not done** |
-| Durable usage accounting | **not done** |
+| Ingest rate quota | **done** — `ingest_rate` rides the same pushed policy as retention (`4MiB/s`, `0`, `unlimited`), enforced per tenant before the body is decompressed. `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` covers tenants the control plane has said nothing about |
+| Query-scan and stream-count quotas, per-tenant semaphores, tenant-labelled metrics | **not done** |
+| Durable usage accounting | **not done** — and deliberately so for the *monthly* budget: a month is spent across instances and outlives any of them, so the control plane holds it. What an instance can answer for is its own share, which is the rate above |
 
 `/metrics` deliberately keeps process-wide gauges (`global_stats`): it is the
 operator scrape, not a tenant-facing endpoint.

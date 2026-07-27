@@ -32,6 +32,7 @@
 | `loggytracy_merge_debt_parts` | 상승 추세 | merge가 못 따라간다. 쿼리 계획 비용이 오른다 |
 | `loggytracy_retention_rewrite_skipped_total` | 증가 | 너무 커서 재작성 못 하는 part가 있다. **테넌트 삭제가 완료되지 않는다** |
 | `loggytracy_tenant_policy_unknown_tenants` | 0보다 큼 | control plane이 모르는 테넌트가 데이터를 쌓고 있다 |
+| `loggytracy_ingest_quota_rejected_total` | 증가 | 테넌트가 자기 rate를 넘겼다. **`ingest_throttled_total`과 다르다** — 이쪽은 서버가 멀쩡하고 테넌트가 산 것보다 많이 보내는 중이다. 스케일이 아니라 플랜 문제 |
 | `loggytracy_pending_flush_bytes` | draining 중 0으로 안 감 | 종료가 durability에 도달하지 못하고 있다 |
 | `loggytracy_part_sidecar_resident_bytes` | RSS 예산 대비 상승 | 사이드카는 캐시 축출 대상이 아니다. part 수에 선형인 상주 메모리 |
 | `loggytracy_part_tenant_segments` | `part_count × 테넌트 수`에 근접 | 테넌트마다 거의 모든 part에 흩어져 있다. 공유 part의 고정비를 최대로 내는 상태 |

@@ -117,6 +117,90 @@
         assert!(storage.load_tenant_policies().await.unwrap().is_empty());
     }
 
+    /// The ingest rate rides on the same push as retention, survives a
+    /// restart with it, and is reported as sent. The last part matters most:
+    /// a body without `ingest_rate` clears the rate rather than keeping it,
+    /// because the body is the policy and not a patch of it.
+    #[tokio::test]
+    async fn an_ingest_rate_rides_the_same_push_and_a_body_without_one_clears_it() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone()));
+        let state = state_with(policy.clone(), Some(TOKEN));
+
+        let (status, body) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            Some(TOKEN),
+            r#"{"retention":"30d","ingest_rate":"4MiB/s"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["ingest_rate"], "4MiB/s");
+        assert_eq!(
+            policy.ingest_rate(&tenant("acme")),
+            Some(crate::tenant_policy::TenantIngestRate::BytesPerSecond(
+                4 * 1024 * 1024
+            ))
+        );
+
+        // Durable, and readable back through a restart.
+        let reload_config = Config {
+            tenant_policy_token: Some(TOKEN.to_string()),
+            retention_period: None,
+            ..Config::default()
+        };
+        let reloaded = TenantPolicy::load(&reload_config, Some(storage.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.ingest_rate(&tenant("acme")),
+            Some(crate::tenant_policy::TenantIngestRate::BytesPerSecond(
+                4 * 1024 * 1024
+            )),
+            "a rate that does not survive a restart is not a policy"
+        );
+
+        let (status, body) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            Some(TOKEN),
+            r#"{"retention":"30d"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&body)
+                .unwrap()
+                .get("ingest_rate")
+                .is_none()
+        );
+        assert_eq!(
+            policy.ingest_rate(&tenant("acme")),
+            None,
+            "omitting the field clears it; the body is the whole policy"
+        );
+
+        // A value that cannot be parsed stores nothing at all, retention
+        // included: a partially applied push is worse than a rejected one.
+        let (status, _) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            Some(TOKEN),
+            r#"{"retention":"7d","ingest_rate":"quickly"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            policy.view(&tenant("acme")).unwrap().retention,
+            "30d",
+            "the rejected push must not have changed retention either"
+        );
+    }
+
     #[tokio::test]
     async fn a_failing_store_returns_503_and_applies_nothing() {
         let policy = Arc::new(TenantPolicy::for_test_with_store(Arc::new(

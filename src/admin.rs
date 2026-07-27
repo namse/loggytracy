@@ -17,12 +17,19 @@ pub const MAX_ADMIN_BODY_BYTES: usize = 4 * 1024;
 #[derive(Deserialize)]
 struct RetentionRequest {
     retention: String,
+    /// Optional so a control plane that only manages retention keeps working
+    /// unchanged. Omitting it clears any rate previously pushed for the
+    /// tenant — the body is the whole policy, not a patch of it.
+    #[serde(default)]
+    ingest_rate: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct RetentionResponse {
     tenant: String,
     retention: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingest_rate: Option<String>,
     updated_at: String,
 }
 
@@ -46,13 +53,19 @@ pub async fn put_retention(
     })?;
     let view = state
         .tenant_policy
-        .push(&tenant, &request.retention)
+        .push(&tenant, &request.retention, request.ingest_rate.as_deref())
         .await
         .map_err(into_http)?;
-    tracing::info!(%tenant, retention = %view.retention, "tenant retention updated");
+    tracing::info!(
+        %tenant,
+        retention = %view.retention,
+        ingest_rate = view.ingest_rate.as_deref().unwrap_or("unset"),
+        "tenant policy updated"
+    );
     Ok(Json(RetentionResponse {
         tenant: tenant.as_str().to_string(),
         retention: view.retention,
+        ingest_rate: view.ingest_rate,
         updated_at: rfc3339(view.updated_at),
     }))
 }
@@ -73,6 +86,7 @@ pub async fn get_retention(
     Ok(Json(RetentionResponse {
         tenant: tenant.as_str().to_string(),
         retention: view.retention,
+        ingest_rate: view.ingest_rate,
         updated_at: rfc3339(view.updated_at),
     }))
 }

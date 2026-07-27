@@ -46,8 +46,13 @@ M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을
   - [x] ~~`(tier, day)` 파티셔닝~~ — 폐기. 쓰기 시점에 retention을 고정하면 플랜 변경이
         기존 데이터에 반영되지 않는다. 파티션은 `day` 유지
   - [ ] part 사이드카 4개→1개 통합, Parquet range read(P2), `(part, tenant)` 로컬 캐시 키
-  - [ ] 테넌트별 스로틀·quota·세마포어, 테넌트 라벨 metrics
-  - [ ] 월간 사용량 durable 회계 (`FlushTransaction`에 연동)
+  - [x] **테넌트별 ingest rate** — `ingest_rate`가 retention과 같은 push에 실린다.
+        숫자는 control plane이 정하고 이쪽은 필드와 강제 지점만 갖는다. body를
+        압축 해제하기 전에 검사하므로 초과한 테넌트가 CPU를 못 쓴다
+  - [ ] 테넌트별 쿼리 스캔 quota·세마포어, 테넌트 라벨 metrics
+  - [ ] 월간 사용량 durable 회계 — **인스턴스가 아니라 control plane의 몫이다.**
+        한 달치는 여러 인스턴스에 걸쳐 쓰이고 인스턴스보다 오래 산다. 여기서 할 일은
+        control plane이 회계할 수 있도록 테넌트별 사용량을 내보내는 것까지다
 - [x] TLS 미지원을 아키텍처 결정으로 명문화
 - [x] ingest 입력 제한 (body/압축 해제 길이/라인/라벨 개수·길이/타임스탬프 수용 윈도우)
 

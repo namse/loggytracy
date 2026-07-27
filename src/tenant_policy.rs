@@ -29,21 +29,51 @@ pub enum TenantRetention {
     Infinite,
 }
 
+/// How fast one tenant may write to this instance.
+///
+/// A *rate*, deliberately, and not the monthly volume budget the plan sells.
+/// A monthly budget is platform-wide state — several instances can serve the
+/// same tenant, and the month outlives any of them — so the control plane is
+/// the only place that can hold it. What an instance can enforce on its own is
+/// the share of itself it hands to one tenant, and that is what protects the
+/// other tenants on it from a neighbour's burst.
+///
+/// The numbers are not decided here. Plans differ, they change after launch,
+/// and a value compiled in or read from this instance's environment could be
+/// neither per-tenant nor changed without a restart. This is the field the
+/// control plane pushes into; [`TenantIngestRate`] is only its shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TenantIngestRate {
+    Unlimited,
+    /// Zero is a legal value and means the tenant may not write at all, the
+    /// same way `retention: "0"` is how a tenant is deleted rather than a
+    /// degenerate case of keeping data.
+    BytesPerSecond(u64),
+}
+
 /// What the control plane pushed for one tenant.
 ///
-/// The raw string is kept as it arrived so a `GET` returns what was sent. The
-/// control plane is the only authority on retention: nothing here rewrites,
-/// caps or otherwise reinterprets the value it pushed.
+/// The raw strings are kept as they arrived so a `GET` returns what was sent.
+/// The control plane is the only authority here: nothing rewrites, caps or
+/// otherwise reinterprets the values it pushed.
 #[derive(Clone)]
 struct PolicyEntry {
     retention: TenantRetention,
     raw: String,
+    /// `None` for a policy pushed before ingest rates existed, which is left
+    /// distinct from an explicit `unlimited` for the same reason an unknown
+    /// tenant is distinct from an infinite one: only one of them is an answer
+    /// the control plane gave. An absent rate falls back to the configured
+    /// default for tenants nothing is known about.
+    ingest_rate: Option<TenantIngestRate>,
+    raw_ingest_rate: Option<String>,
     updated_at: SystemTime,
 }
 
 /// One tenant's policy as the admin endpoints report it.
 pub struct PolicyView {
     pub retention: String,
+    pub ingest_rate: Option<String>,
     pub updated_at: SystemTime,
 }
 
@@ -57,9 +87,17 @@ impl PolicyMap {
         self.entries.get(tenant).map(|entry| entry.retention)
     }
 
+    /// The rate the control plane pushed for this tenant, or `None` when it
+    /// has said nothing — in which case the caller applies the configured
+    /// default rather than inventing one here.
+    pub fn ingest_rate(&self, tenant: &TenantId) -> Option<TenantIngestRate> {
+        self.entries.get(tenant).and_then(|entry| entry.ingest_rate)
+    }
+
     pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
         self.entries.get(tenant).map(|entry| PolicyView {
             retention: entry.raw.clone(),
+            ingest_rate: entry.raw_ingest_rate.clone(),
             updated_at: entry.updated_at,
         })
     }
@@ -229,6 +267,12 @@ enum PolicyStore {
 #[derive(Serialize, Deserialize)]
 struct PolicyDocument {
     retention: String,
+    /// Absent in every policy stored before ingest rates existed. `default`
+    /// rather than required, because a stored policy that suddenly fails to
+    /// deserialize is a fatal boot — the same trap `meta.json` fell into
+    /// before it had a version field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ingest_rate: Option<String>,
     updated_at: String,
 }
 
@@ -305,6 +349,15 @@ impl PolicyStore {
                     document.retention
                 )
             })?;
+            let ingest_rate = document
+                .ingest_rate
+                .as_deref()
+                .map(|raw| {
+                    parse_ingest_rate(raw).map_err(|error| {
+                        format!("invalid ingest_rate {raw:?} in {file_name:?}: {error}")
+                    })
+                })
+                .transpose()?;
             let updated_at = parse_timestamp(&document.updated_at).map_err(|error| {
                 format!(
                     "invalid updated_at {:?} in {file_name:?}: {error}",
@@ -316,6 +369,8 @@ impl PolicyStore {
                 PolicyEntry {
                     retention,
                     raw: document.retention,
+                    ingest_rate,
+                    raw_ingest_rate: document.ingest_rate,
                     updated_at,
                 },
             );
@@ -514,7 +569,17 @@ resurrect data those policies had already expired",
     /// The order is the whole point of the push shape: a success is a promise
     /// that the policy survives a restart, so the control plane's retry loop
     /// terminates on a real guarantee.
-    pub async fn push(&self, tenant: &TenantId, raw: &str) -> Result<PolicyView, PolicyError> {
+    /// A push carries the whole policy, so omitting `ingest_rate` clears it
+    /// rather than leaving the previous value in place. Merging instead would
+    /// make the stored state depend on the order of pushes, and a control
+    /// plane retrying a push it believes to be complete would silently keep a
+    /// rate it thinks it removed.
+    pub async fn push(
+        &self,
+        tenant: &TenantId,
+        raw: &str,
+        raw_ingest_rate: Option<&str>,
+    ) -> Result<PolicyView, PolicyError> {
         let Some(store) = &self.store else {
             return Err(PolicyError::Invalid(
                 "per-tenant retention is not enabled".to_string(),
@@ -527,7 +592,15 @@ resurrect data those policies had already expired",
                 return Err(PolicyError::Invalid(error));
             }
         };
+        let ingest_rate = match raw_ingest_rate.map(parse_ingest_rate).transpose() {
+            Ok(rate) => rate,
+            Err(error) => {
+                self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(PolicyError::Invalid(error));
+            }
+        };
         let raw = raw.trim().to_string();
+        let raw_ingest_rate = raw_ingest_rate.map(|rate| rate.trim().to_string());
 
         // Stamped under the lock, not on arrival: two concurrent pushes for the
         // same tenant commit in lock order, and a timestamp taken before the
@@ -537,6 +610,7 @@ resurrect data those policies had already expired",
         let updated_at = self.clock.now();
         let document = PolicyDocument {
             retention: raw.clone(),
+            ingest_rate: raw_ingest_rate.clone(),
             updated_at: format_timestamp(updated_at),
         };
         if let Err(error) = store.put(tenant, &document).await {
@@ -551,6 +625,8 @@ resurrect data those policies had already expired",
                 PolicyEntry {
                     retention,
                     raw: raw.clone(),
+                    ingest_rate,
+                    raw_ingest_rate: raw_ingest_rate.clone(),
                     updated_at,
                 },
             );
@@ -558,8 +634,18 @@ resurrect data those policies had already expired",
         self.metrics.push_accepted.fetch_add(1, Ordering::Relaxed);
         Ok(PolicyView {
             retention: raw,
+            ingest_rate: raw_ingest_rate,
             updated_at,
         })
+    }
+
+    /// The rate the control plane pushed for `tenant`, or `None` when it has
+    /// said nothing about it — including when per-tenant policy is off
+    /// entirely. The caller applies the configured default in that case, so
+    /// that "policy disabled" and "tenant unknown" behave identically instead
+    /// of one of them silently meaning unlimited.
+    pub fn ingest_rate(&self, tenant: &TenantId) -> Option<TenantIngestRate> {
+        self.snapshot()?.ingest_rate(tenant)
     }
 
     /// Return the tenant to *unknown*, which keeps its data forever. This is
@@ -617,6 +703,8 @@ resurrect data those policies had already expired",
                     PolicyEntry {
                         retention,
                         raw,
+                        ingest_rate: None,
+                        raw_ingest_rate: None,
                         updated_at: SystemTime::now(),
                     },
                 );
@@ -701,6 +789,39 @@ pub fn parse_retention(raw: &str) -> Result<TenantRetention, String> {
     Ok(TenantRetention::Finite(Duration::from_nanos(nanos)))
 }
 
+/// Parses an ingest rate: a byte size per second, or the literal `unlimited`.
+///
+/// `"0"` is accepted and means the tenant may not write, mirroring
+/// `retention: "0"`. The unit is bytes per second and is not optional in the
+/// suffix-less case for the same reason a bare number is not a duration: a
+/// value whose unit has to be guessed is a value that will eventually be
+/// guessed wrong.
+pub fn parse_ingest_rate(raw: &str) -> Result<TenantIngestRate, String> {
+    let value = raw.trim();
+    if value.eq_ignore_ascii_case("unlimited") {
+        return Ok(TenantIngestRate::Unlimited);
+    }
+    let value = value.strip_suffix("/s").map(str::trim_end).unwrap_or(value);
+    let (number, unit) = if let Some(number) = value.strip_suffix("KiB") {
+        (number, 1024u64)
+    } else if let Some(number) = value.strip_suffix("MiB") {
+        (number, 1024 * 1024u64)
+    } else if let Some(number) = value.strip_suffix("GiB") {
+        (number, 1024 * 1024 * 1024u64)
+    } else if let Some(number) = value.strip_suffix('B') {
+        (number, 1u64)
+    } else {
+        (value, 1u64)
+    };
+    let number: u64 = number.trim().parse().map_err(|_| {
+        "expected a byte rate such as 512KiB/s, 4MiB/s, 0, or the literal \"unlimited\"".to_string()
+    })?;
+    let bytes = number
+        .checked_mul(unit)
+        .ok_or_else(|| "ingest rate overflow".to_string())?;
+    Ok(TenantIngestRate::BytesPerSecond(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,10 +891,13 @@ mod tests {
     async fn a_push_is_durable_and_survives_a_restart() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy.push(&tenant("acme"), "30d").await.unwrap();
-        policy.push(&tenant("intern"), "infinite").await.unwrap();
+        policy.push(&tenant("acme"), "30d", None).await.unwrap();
+        policy
+            .push(&tenant("intern"), "infinite", None)
+            .await
+            .unwrap();
         // A downgrade taken before the restart must still be in force after it.
-        policy.push(&tenant("acme"), "7d").await.unwrap();
+        policy.push(&tenant("acme"), "7d", None).await.unwrap();
         assert_eq!(
             policy.metrics.push_accepted.load(Ordering::Relaxed),
             3,
@@ -827,7 +951,7 @@ mod tests {
         let data_dir = tempdir("tenant-policy-local");
         let dir = data_dir.join(TENANT_POLICY_PREFIX);
         let policy = TenantPolicy::for_test_with_local_store(dir.clone());
-        policy.push(&tenant("acme"), "7d").await.unwrap();
+        policy.push(&tenant("acme"), "7d", None).await.unwrap();
         assert_eq!(
             policy.snapshot().unwrap().retention(&tenant("acme")),
             Some(TenantRetention::Finite(days(7)))
@@ -880,7 +1004,7 @@ mod tests {
         let start_ns = 1_800_000_000_000_000_000i64;
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
-        policy.push(&tenant("acme"), "7d").await.unwrap();
+        policy.push(&tenant("acme"), "7d", None).await.unwrap();
 
         let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
         let floor = || policy.query_floor_ns(&tenant("acme")).expect("finite");
@@ -917,7 +1041,7 @@ mod tests {
         let start_ns = 1_800_000_000_000_000_000i64;
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
-        policy.push(&tenant("acme"), "1d").await.unwrap();
+        policy.push(&tenant("acme"), "1d", None).await.unwrap();
 
         clock.advance(Duration::from_secs(2 * 24 * 60 * 60));
         assert!(
@@ -930,7 +1054,7 @@ mod tests {
 
         // The control plane upgrades the tenant. The row is still on disk, and
         // the new plan covers it again.
-        policy.push(&tenant("acme"), "30d").await.unwrap();
+        policy.push(&tenant("acme"), "30d", None).await.unwrap();
         assert!(
             !policy
                 .cutoffs_now()
@@ -954,7 +1078,7 @@ mod tests {
         TenantPolicy::load(&with_token, Some(storage.clone()))
             .await
             .expect("an empty store boots")
-            .push(&tenant("acme"), "0")
+            .push(&tenant("acme"), "0", None)
             .await
             .expect("the deletion is stored");
 
@@ -987,11 +1111,11 @@ mod tests {
     async fn a_failing_store_changes_neither_the_map_nor_the_object() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy.push(&tenant("acme"), "30d").await.unwrap();
+        policy.push(&tenant("acme"), "30d", None).await.unwrap();
 
         // A malformed value is rejected before anything is written.
         assert!(matches!(
-            policy.push(&tenant("acme"), "soon").await,
+            policy.push(&tenant("acme"), "soon", None).await,
             Err(PolicyError::Invalid(_))
         ));
         assert_eq!(policy.metrics.push_rejected.load(Ordering::Relaxed), 1);
@@ -1007,7 +1131,7 @@ mod tests {
     async fn a_delete_returns_the_tenant_to_unknown() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy.push(&tenant("acme"), "1ms").await.unwrap();
+        policy.push(&tenant("acme"), "1ms", None).await.unwrap();
         assert!(policy.query_floor_ns(&tenant("acme")).is_some());
 
         policy.remove(&tenant("acme")).await.unwrap();
@@ -1030,8 +1154,11 @@ mod tests {
     async fn nothing_reinterprets_a_pushed_value() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage);
-        policy.push(&tenant("acme"), "3650d").await.unwrap();
-        policy.push(&tenant("intern"), "infinite").await.unwrap();
+        policy.push(&tenant("acme"), "3650d", None).await.unwrap();
+        policy
+            .push(&tenant("intern"), "infinite", None)
+            .await
+            .unwrap();
 
         let map = policy.snapshot().unwrap();
         assert_eq!(

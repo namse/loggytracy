@@ -25,6 +25,7 @@ mod startup;
 mod tempo;
 mod tenant;
 mod tenant_policy;
+mod tenant_quota;
 #[cfg(test)]
 mod test_support;
 mod trace;

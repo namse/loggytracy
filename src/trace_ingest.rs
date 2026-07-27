@@ -22,6 +22,7 @@ pub struct TraceIngestService {
     shutdown: Arc<ShutdownState>,
     config: Arc<Config>,
     ingest_gate: Arc<IngestGate>,
+    tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
 }
 
 impl TraceIngestService {
@@ -30,12 +31,14 @@ impl TraceIngestService {
         shutdown: Arc<ShutdownState>,
         config: Arc<Config>,
         ingest_gate: Arc<IngestGate>,
+        tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
     ) -> Self {
         Self {
             journal,
             shutdown,
             config,
             ingest_gate,
+            tenant_quota,
         }
     }
 
@@ -64,6 +67,10 @@ impl TraceService for TraceIngestService {
         let tenant = crate::tenant::from_grpc_metadata(request.metadata(), &self.config)
             .map_err(crate::tenant::TenantError::into_grpc)?;
         let request = request.into_inner();
+        // Charged on the encoded size, before normalization walks the spans,
+        // for the same reason the Loki path charges before decompressing.
+        self.tenant_quota
+            .check_grpc(&tenant, request.encoded_len() as u64)?;
         if request.encoded_len() > MAX_OTLP_REQUEST_BYTES {
             return Err(Status::resource_exhausted(format!(
                 "OTLP request exceeds the maximum of {MAX_OTLP_REQUEST_BYTES} bytes"
@@ -156,8 +163,13 @@ mod tests {
         let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
         shutdown.begin_drain();
         let ingest_gate = IngestGate::for_test(&journal, &config);
-        let service =
-            TraceIngestService::new(journal, shutdown, Arc::new(config.clone()), ingest_gate);
+        let service = TraceIngestService::new(
+            journal,
+            shutdown,
+            Arc::new(config.clone()),
+            ingest_gate,
+            crate::tenant_quota::TenantQuota::for_test(&config),
+        );
 
         let status = service.export(tenant_request(request())).await.unwrap_err();
 
@@ -196,6 +208,7 @@ mod tests {
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
             ingest_gate,
+            crate::tenant_quota::TenantQuota::for_test(&config),
         );
 
         service
@@ -237,6 +250,7 @@ mod tests {
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
             ingest_gate,
+            crate::tenant_quota::TenantQuota::for_test(&config),
         );
         let response = service.export(tenant_request(request())).await.unwrap();
         assert!(response.into_inner().partial_success.is_none());
@@ -287,6 +301,7 @@ mod tests {
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
             ingest_gate,
+            crate::tenant_quota::TenantQuota::for_test(&config),
         );
         let mut invalid = request();
         invalid.resource_spans[0].scope_spans[0].spans[0].trace_id = vec![0; 16];
@@ -320,6 +335,7 @@ mod tests {
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
             ingest_gate,
+            crate::tenant_quota::TenantQuota::for_test(&config),
         );
         let mut oversized = request();
         oversized.resource_spans[0].scope_spans[0].spans[0].name =
@@ -356,6 +372,7 @@ mod tests {
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
             ingest_gate,
+            crate::tenant_quota::TenantQuota::for_test(&config),
         );
         let mut too_many = request();
         too_many.resource_spans[0].scope_spans[0].spans = vec![Span::default(); MAX_OTLP_SPANS + 1];
@@ -408,6 +425,7 @@ mod tests {
             Arc::new(crate::shutdown::ShutdownState::new()),
             Arc::new(config.clone()),
             ingest_gate,
+            crate::tenant_quota::TenantQuota::for_test(&config),
         );
         service.export(tenant_request(request())).await.unwrap();
         for _ in 0..100 {

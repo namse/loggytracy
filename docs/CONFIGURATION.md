@@ -35,13 +35,32 @@ lost update가 나고, 그건 곧 데이터 손실이다. `from_url`이 기동 �
 | `LOGGYTRACY_DEFAULT_TENANT` | `default` | `X-Scope-OrgID` 없는 요청이 귀속될 테넌트 |
 | `LOGGYTRACY_MISSING_TENANT_POLICY` | `default` | `default` 또는 `reject`. 헤더 없는 요청을 기본 테넌트로 받을지 거절할지 |
 | `LOGGYTRACY_ALLOWED_TENANTS` | 없음 (전부 허용) | 쉼표 구분 목록. 목록 밖 테넌트는 403. **헤더는 앞단이 붙인 값을 증명 없이 신뢰하므로, 목록이 없으면 리스너에 닿는 누구나 테넌트를 만들 수 있다** |
-| `LOGGYTRACY_TENANT_POLICY_TOKEN` | 없음 (기능 꺼짐) | 설정하면 테넌트별 retention admin API가 열리고 전역 retention은 쓸 수 없게 된다 |
+| `LOGGYTRACY_TENANT_POLICY_TOKEN` | 없음 (기능 꺼짐) | 설정하면 테넌트별 정책 admin API가 열리고 전역 retention은 쓸 수 없게 된다 |
+| `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` | 없음 (무제한) | control plane이 rate를 밀어주지 않은 테넌트에 적용할 기본값 |
+| `LOGGYTRACY_TENANT_INGEST_BURST` | `10s` | 테넌트가 쓰지 않은 rate를 적립해 한 번에 쓸 수 있는 시간. 용량은 `MAX_PUSH_BYTES` 아래로 내려가지 않는다 |
 
 **제약:** `MISSING_TENANT_POLICY=default`인데 `ALLOWED_TENANTS`에 기본 테넌트가 없으면 기동하지
 않는다 — 헤더 없는 요청마다 목록 밖 테넌트가 생기기 때문이다.
 
 **제약:** 저장된 테넌트 정책이 하나라도 있는데 `TENANT_POLICY_TOKEN`이 없으면 기동하지 않는다.
 토큰이 없으면 쿼리 클램프가 사라져 삭제된 데이터가 되살아난다.
+
+### 테넌트별 ingest rate는 여기 있지 않다
+
+플랜마다 다르고 출시 후에도 바뀌므로 **control plane이 테넌트마다 push한다.** 정책 body의
+`ingest_rate` 필드이며 `retention`과 같은 레코드에 산다. 값은 `4MiB/s` 같은 초당 바이트,
+`0`(쓰기 금지), `unlimited` 중 하나다.
+
+```
+PUT /loggytracy/api/v1/admin/tenants/{tenant}/retention
+{"retention": "7d", "ingest_rate": "4MiB/s"}
+```
+
+body는 정책 전체이지 patch가 아니다. `ingest_rate`를 빼고 push하면 기존 값이 **지워지고**
+위의 기본값으로 돌아간다.
+
+이 rate는 인스턴스 하나에 대한 몫이지 플랜이 파는 월 사용량이 아니다. 한 달치는 여러
+인스턴스에 걸쳐 쓰이고 인스턴스보다 오래 사는 상태라 control plane만 들고 있을 수 있다.
 
 ## Ingest 입력 제한
 

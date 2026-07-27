@@ -422,6 +422,7 @@ pub async fn run(config: Arc<Config>) {
     ));
 
     let ingest_gate = state.ingest_gate.clone();
+    let tenant_quota = state.tenant_quota.clone();
     let app = router::build_router(state);
 
     // A SIGTERM/SIGINT starts draining: new ingest is rejected, and every drain
@@ -444,6 +445,7 @@ pub async fn run(config: Arc<Config>) {
         shutdown.clone(),
         config.clone(),
         ingest_gate,
+        tenant_quota,
     );
     let otlp_task_health = otlp_healthy;
     let mut otlp_drain = shutdown.subscribe();

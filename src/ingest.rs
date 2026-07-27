@@ -44,7 +44,7 @@ pub async fn push(
             .ingest_errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    result.map_err(IngestError::from)
+    result
 }
 
 /// Accepted timestamp band around the server clock, resolved once per request.
@@ -124,11 +124,15 @@ async fn push_inner(
     state: &Arc<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, IngestError> {
     // Resolve the tenant before anything else touches the body: every input
     // limit, and the journal append itself, is attributed to it.
     let tenant = crate::tenant::from_headers(&headers, &state.config)
         .map_err(crate::tenant::TenantError::into_http)?;
+    // Charged on the wire size, before the body is decompressed or decoded: a
+    // tenant over its rate must not be able to spend this instance's CPU on a
+    // request that will not be accepted.
+    state.tenant_quota.check(&tenant, body.len() as u64)?;
 
     let content_type = headers
         .get("content-type")
@@ -139,7 +143,8 @@ async fn push_inner(
         return Err((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "JSON push is not supported, use protobuf+snappy".to_string(),
-        ));
+        )
+            .into());
     }
     let limits = &state.config;
     if body.len() > limits.max_push_bytes {
@@ -150,7 +155,8 @@ async fn push_inner(
                 body.len(),
                 limits.max_push_bytes
             ),
-        ));
+        )
+            .into());
     }
     // The snappy header declares the decompressed length and `decompress_vec`
     // allocates it before validating the stream, so an attacker-chosen header
@@ -168,7 +174,8 @@ async fn push_inner(
                 "push declares {declared} decompressed bytes, exceeding the maximum of {}",
                 limits.max_decompressed_push_bytes
             ),
-        ));
+        )
+            .into());
     }
     let decompressed = snap::raw::Decoder::new()
         .decompress_vec(&body)
@@ -771,6 +778,74 @@ mod tests {
                 .is_empty(),
             "a refused tenant must not have been written"
         );
+    }
+
+    /// The quota is a different refusal from backpressure: the instance is
+    /// healthy and the tenant asked for more than its policy grants. It is
+    /// counted apart, it carries `Retry-After`, and — the part that matters —
+    /// it does not latch, so the tenant recovers on its own.
+    #[tokio::test]
+    async fn push_is_refused_once_the_tenant_is_over_its_ingest_rate() {
+        let clock = crate::clock::Clock::fixed(now_secs() * 1_000_000_000);
+        let config = Config {
+            data_dir: tmp_data_dir("tenant_rate"),
+            default_tenant_ingest_bytes_per_second: Some(64),
+            tenant_ingest_burst: std::time::Duration::from_secs(1),
+            max_push_bytes: 64,
+            ..Config::default()
+        };
+        let memtable = Arc::new(MemTable::new());
+        let journal = Arc::new(journal::Journal::spawn(&config, memtable.clone()).unwrap());
+        let state = crate::test_support::state_with_clock(
+            config,
+            memtable,
+            journal,
+            Arc::new(PartRegistry::new()),
+            Arc::new(crate::trace_registry::TraceRegistry::standalone()),
+            None,
+            clock.clone(),
+        );
+
+        let now = clock.now_ns() / 1_000_000_000;
+        let body = Bytes::from(build_snappy_push("acme", "a line worth some bytes", now));
+        push(State(state.clone()), protobuf_headers(), body.clone())
+            .await
+            .expect("the first push fits the banked budget");
+
+        let refused = loop {
+            match push(State(state.clone()), protobuf_headers(), body.clone()).await {
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            refused.retry_after.is_some(),
+            "a throttled client has to be told how long to wait"
+        );
+        assert_eq!(
+            state
+                .metrics
+                .ingest_quota_rejected
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "counted apart from backpressure, which says something else"
+        );
+        assert_eq!(
+            state
+                .metrics
+                .ingest_throttled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "this instance is not behind; the tenant is over its own rate"
+        );
+
+        // And it lets go. A rate limit that latches takes the tenant out of
+        // service permanently, which is worse than the burst it refused.
+        clock.advance(std::time::Duration::from_secs(60));
+        push(State(state.clone()), protobuf_headers(), body)
+            .await
+            .expect("the budget refills");
     }
 
     #[tokio::test]

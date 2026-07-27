@@ -11,6 +11,11 @@ pub struct RuntimeMetrics {
     /// from `ingest_errors`: this one says the server is healthy and saying no,
     /// which is the signal an operator scales or tunes flush on.
     pub ingest_throttled: AtomicU64,
+    /// Requests refused because the tenant was over the ingest rate its policy
+    /// grants. Separate from `ingest_throttled`: that one says this instance is
+    /// behind and an operator should scale or tune it, this one says the
+    /// instance is healthy and the tenant asked for more than it was sold.
+    pub ingest_quota_rejected: AtomicU64,
     /// Point-in-time backlog gauges, published by the workers that already walk
     /// the structures they describe. Computing them per scrape instead was
     /// O(parts × tenants) of work on an unauthenticated endpoint, and the
@@ -75,6 +80,7 @@ impl RuntimeMetrics {
             ingest_requests: AtomicU64::new(0),
             ingest_errors: AtomicU64::new(0),
             ingest_throttled: AtomicU64::new(0),
+            ingest_quota_rejected: AtomicU64::new(0),
             merge_debt_parts: AtomicU64::new(0),
             unknown_tenants: AtomicU64::new(0),
             part_tenant_segments: AtomicU64::new(0),
