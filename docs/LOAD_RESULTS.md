@@ -211,12 +211,47 @@ Extrapolating the resident cost to the 10,000-part configuration P1-11 cares
 about, at the same tenant breadth: ~870,000 pairs, ~407 MB of resident
 sidecars. Material on a 16 GiB target, and still smaller than one merge.
 
-**Not explained:** the merge-on run ends `FAIL` on behaviour — `remote_healthy`
-0, flush not progressing, WAL backlog unbounded at the final sample — under 3%
-injected write errors. The merge-off run passes. The run terminates on event
-count, so this is the state at that instant rather than a sustained one, but it
-is not dismissed here; it is a separate question from the layout numbers above
-and wants its own run.
+### Following the FAIL: two hypotheses, both wrong, one bug
+
+The merge-on run ends `FAIL` while merge-off passes. Two explanations were
+proposed and both were tested.
+
+| run | verdict | peak RSS | flushes | `remote_healthy` at end |
+|---|---|---|---|---|
+| merge off, 3% write errors | PASS | 187 MB | 38 | true |
+| merge on, 3% write errors | FAIL | 697 MB | 31 | **false** |
+| merge on, **0%** errors | PASS | 758 MB | 72 | true |
+| merge on, 3% errors, merge budget 1 GiB → 128 MiB | FAIL | 514 MB | 31 | **false** |
+
+**"Peak RSS is the merge budget" — wrong.** Cutting `merge_max_memory_bytes`
+eightfold moved peak RSS 697 → 514 MB and changed no verdict. The no-error run
+peaks *higher* at 758 MB and passes. Peak RSS tracks whether merge runs at all,
+not what it is allowed to materialize, which points at allocator high-water
+retention rather than at a budget worth tuning.
+
+**"The FAIL is memory pressure from merge" — wrong.** The no-error run has the
+highest RSS of the four and passes.
+
+**What it actually is.** `mark_remote_healthy_since(epoch)` restores health with
+a CAS from exactly the unhealthy state of the epoch the caller observed *before*
+its operation. The guard is deliberate and right on its own terms: a success
+that started before a newer failure must not clear that failure. But every
+worker reports independently — flush, merge and retention each capture an epoch
+and CAS afterwards — and any failure anywhere between one worker's capture and
+its CAS defeats that worker's recovery. **The chance of health being restored
+therefore falls as the number of concurrent reporters rises**, which is exactly
+the difference between the two 3% runs: merge off has fewer reporters and
+recovers; merge on does not.
+
+Four fault seeds were tried and all four fail, so it is not a seeded artifact.
+Seed 333 fails with **zero merge errors**, so it is not merge's own failures
+either — merge participates in the epoch race by reporting its successes.
+
+Not yet distinguished: whether health is permanently stuck or merely has a low
+duty cycle under load. `/ready` reads this flag, so the difference is between an
+instance that never returns to service and one that flaps — both bad, and both
+worse than the injected error rate they come from. Sampling `remote_healthy`
+over the run rather than at its end would separate them.
 
 Fixed location: `merge::tests::layout_totals_count_tenant_part_pairs_and_survive_a_silent_merge`,
 `merge::tests::merging_parts_removes_their_pairs_from_the_totals`.

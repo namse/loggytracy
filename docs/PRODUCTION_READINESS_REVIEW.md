@@ -588,6 +588,7 @@ the code, the note says which.
 - [x] P2-9 warn on `file://` production misuse (opt-in enforcement remains)
 - [x] P2-4 `retention_period` default decided — unbounded, because per-tenant retention is the mechanism and a global default would delete data the control plane believes it owns. Startup warns when neither is configured
 - [x] P3 Dockerfile + configuration reference + runbook + alert rules
+- [ ] **N7 remote health recovery is defeated by concurrent reporters** — `/ready` stays false after an error rate the engine survived (`PRODUCTION_READINESS_REVIEW_2026-07-26.md`)
 - [ ] P2-5 duplicates after a crash are unobservable
 
 ### Gate 4 — scale validation

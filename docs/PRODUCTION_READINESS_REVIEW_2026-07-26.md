@@ -149,6 +149,32 @@ improvement). But `search` computes start/end and passes `scan_trace_spans(..., 
 after scanning** (`tempo/handlers.rs:113-130`), while `search_tags`/`search_tag_values` have no time
 parameters. One Grafana tag-dropdown opening still restores all traces for that tenant.
 
+### N7. Remote health recovery is defeated by having more than one reporter
+
+- Location: `mark_remote_healthy_since` (`src/object_storage/catalog.rs:84`)
+- Verification: **Reproduced** — four fault seeds, `docs/LOAD_RESULTS.md` section 6
+
+A success restores health with a CAS from exactly the unhealthy state of the
+epoch the caller observed before its operation. On its own terms the guard is
+right: a success that began before a newer failure must not clear that failure.
+
+The problem is that flush, merge and retention each report independently. Any
+failure anywhere between one worker's epoch capture and its CAS defeats *that
+worker's* recovery, so the probability of health being restored falls as
+reporters multiply. Measured: with 3% injected write errors, the run with merge
+disabled ends healthy and the run with merge enabled ends unhealthy, at every
+seed tried — including a seed with zero merge errors, since merge participates
+in the race by reporting its successes.
+
+`/ready` reads this flag. The failure is therefore an instance that an
+orchestrator keeps out of service because of an error rate it survived.
+
+**Fix direction**: restore health on the evidence that the store works now
+rather than on an epoch comparison — for example, let any success at an epoch at
+least as new as the last observed failure clear it, or track consecutive
+failures instead of a single flag. Whichever is chosen, one worker's recovery
+must not be cancelled by another worker's unrelated failure.
+
 ---
 
 ## Still open from the previous review
