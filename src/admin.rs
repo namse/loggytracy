@@ -130,6 +130,60 @@ pub async fn delete_retention(
     Ok(StatusCode::OK)
 }
 
+/// `GET …/tenants/{tenant}/usage` — what one tenant is currently costing this
+/// instance.
+///
+/// Deliberately here rather than as labels on `/metrics`. That endpoint is
+/// unauthenticated and process-wide by design, and a label per tenant would
+/// multiply every series by the tenant count — on a workload whose whole point
+/// is many small tenants, that is the cardinality problem this engine bounds
+/// everywhere else. The reader that actually needs per-tenant numbers is the
+/// control plane, which is already authenticated here and already asks per
+/// tenant.
+pub async fn get_usage(
+    State(state): State<Arc<AppState>>,
+    Path(raw_tenant): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    authorize(&state, &headers)?;
+    let tenant = parse_tenant(&raw_tenant)?;
+
+    let window = crate::part::MetadataWindow {
+        start_ns: i64::MIN,
+        end_ns: i64::MAX,
+    };
+    let on_disk = state.parts.stats(&tenant, window);
+    let buffered = state.memtable.stats(&tenant, window);
+    // The union, for the same reason the limit uses it: a flushed stream lives
+    // in both until the buffer is cleared.
+    let streams = state
+        .memtable
+        .tenant_streams(&tenant)
+        .iter()
+        .filter(|labels| {
+            !state
+                .parts
+                .contains_stream(&tenant, crate::part_registry::stream_key(labels))
+        })
+        .count()
+        + state.parts.tenant_stream_count(&tenant);
+    let (ingest_budget, query_budget) = state.tenant_quota.budget_snapshot(&tenant);
+
+    Ok(Json(serde_json::json!({
+        "tenant": tenant.as_str(),
+        "streams": streams,
+        "max_streams": state.tenant_quota.max_streams_for(&tenant),
+        "parts": state.parts.tenant_part_count(&tenant),
+        "entries": on_disk.entries + buffered.entries,
+        "bytes": on_disk.bytes + buffered.bytes,
+        // Remaining tokens, not consumption: the control plane holds the
+        // monthly ledger, and what an instance can answer is how close this
+        // tenant is to being refused right now.
+        "ingest_budget_bytes": ingest_budget,
+        "query_budget_bytes": query_budget,
+    })))
+}
+
 /// The tenant id arrives in the request path and ends up in an object key, so
 /// it goes through the same allowlist as an ingest header rather than a
 /// path-specific check.

@@ -53,7 +53,9 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
         policy as `ingest_rate`, charged after a scan with what it actually read
   - [x] Per-tenant stream cardinality limit — `max_streams` on the pushed policy, enforced
         against the union of what the tenant holds in parts and in the buffers
-  - [ ] Tenant-labeled metrics
+  - [x] Per-tenant usage — `GET .../tenants/{tenant}/usage` on the admin API. **Not** labels on
+        `/metrics`: that scrape is unauthenticated and process-wide by design, and a label per
+        tenant is the cardinality problem this engine bounds everywhere else
   - [ ] Durable monthly usage accounting — **this belongs to the control plane, not the instance.** A month spans
         instances and outlives them. This side only exports per-tenant usage for the control plane to account for.
 - [x] Document TLS unsupported as an architecture decision

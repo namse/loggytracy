@@ -416,6 +416,17 @@ impl PartRegistry {
         self.streams.read().unwrap().contains(tenant, key)
     }
 
+    /// Parts holding at least one row for the tenant. Its share of the
+    /// (tenant, part) pairs the layout charges in.
+    pub fn tenant_part_count(&self, tenant: &TenantId) -> usize {
+        self.inner
+            .read()
+            .unwrap()
+            .values()
+            .filter(|reader| reader.meta().tenant_segment(tenant).is_some())
+            .count()
+    }
+
     /// Distinct streams the tenant has on disk.
     pub fn tenant_stream_count(&self, tenant: &TenantId) -> usize {
         self.streams.read().unwrap().count(tenant)

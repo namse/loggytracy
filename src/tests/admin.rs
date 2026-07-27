@@ -383,3 +383,86 @@
         }
     }
 
+
+    /// Per-tenant numbers live here, not as labels on `/metrics`.
+    ///
+    /// That endpoint is unauthenticated and process-wide by design, and a label
+    /// per tenant would multiply every series by the tenant count — on a
+    /// workload whose whole point is many small tenants, that is the
+    /// cardinality problem this engine bounds everywhere else. The reader that
+    /// needs per-tenant numbers is the control plane, which is already
+    /// authenticated here.
+    #[tokio::test]
+    async fn per_tenant_usage_is_authenticated_and_scoped_to_one_tenant() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = Arc::new(TenantPolicy::for_test_with_store(storage));
+        let state = state_with(policy, Some(TOKEN));
+        let uri = "/loggytracy/api/v1/admin/tenants/acme/usage";
+
+        let (status, _) = call(&state, "GET", uri, None, "").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "usage names a tenant, so it is not public"
+        );
+
+        state.memtable.insert(
+            tenant("acme"),
+            [("app".to_string(), "usage".to_string())]
+                .into_iter()
+                .collect(),
+            vec![crate::memtable::LogEntry {
+                timestamp_ns: 1_700_000_000_000_000_000,
+                line: "counted".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+
+        let (status, body) = call(&state, "GET", uri, Some(TOKEN), "").await;
+        assert_eq!(status, StatusCode::OK);
+        let usage: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(usage["tenant"], "acme");
+        assert_eq!(usage["streams"], 1);
+        assert_eq!(usage["entries"], 1);
+
+        // A different tenant sees its own zeroes, not acme's numbers.
+        let (status, body) = call(
+            &state,
+            "GET",
+            "/loggytracy/api/v1/admin/tenants/other/usage",
+            Some(TOKEN),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let other: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(other["streams"], 0);
+        assert_eq!(other["entries"], 0);
+    }
+
+    /// `/metrics` stays free of tenant labels, which is the decision the usage
+    /// endpoint exists to preserve rather than an oversight.
+    #[tokio::test]
+    async fn the_operator_scrape_carries_no_tenant_labels() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = Arc::new(TenantPolicy::for_test_with_store(storage));
+        let state = state_with(policy, Some(TOKEN));
+        state.memtable.insert(
+            tenant("acme"),
+            [("app".to_string(), "scrape".to_string())]
+                .into_iter()
+                .collect(),
+            vec![crate::memtable::LogEntry {
+                timestamp_ns: 1,
+                line: "x".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+
+        let rendered = crate::query::metrics(axum::extract::State(state)).await;
+        assert!(
+            !rendered.contains("acme"),
+            "a tenant id in the operator scrape is a series per tenant"
+        );
+        assert!(rendered.contains("loggytracy_stream_limit_rejected_total"));
+    }

@@ -574,7 +574,7 @@ the code, the note says which.
 - [x] P0-3 per-tenant ingest rate — `ingest_rate` on the pushed policy, enforced before the body is decompressed
 - [x] P0-3 per-tenant query-scan quota (`query_rate` on the pushed policy) and per-tenant query concurrency
 - [x] P0-3 stream-cardinality limit (`max_streams` on the pushed policy)
-- [ ] P0-3 remaining: tenant-labeled metrics
+- [x] P0-3 per-tenant usage — on the authenticated admin API rather than as `/metrics` labels, which would multiply every series by the tenant count
 - [x] N2 tenant allowlist (`LOGGYTRACY_ALLOWED_TENANTS`)
 - [x] Default bind moved inside the trust boundary — loopback unless configured, and startup says which side of it the listener landed on
 - [x] P2-2 resource guards on metadata endpoints (semaphore, timeout, `start`/`end`, `match[]` count)

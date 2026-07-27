@@ -275,6 +275,41 @@ this write would create another"
         Ok(())
     }
 
+    /// What a tenant currently has left of each budget, for the control plane
+    /// to read. `None` means that budget is unlimited for this tenant.
+    pub fn budget_snapshot(&self, tenant: &TenantId) -> (Option<f64>, Option<f64>) {
+        let ingest = match self.resolve(tenant) {
+            TenantIngestRate::Unlimited => None,
+            TenantIngestRate::BytesPerSecond(rate) => {
+                Some(self.available(&self.buckets, tenant, rate))
+            }
+        };
+        (ingest, self.available_scan_budget(tenant))
+    }
+
+    /// Remaining tokens in a bucket, refilled to now without spending any.
+    fn available(
+        &self,
+        buckets: &Mutex<HashMap<TenantId, Bucket>>,
+        tenant: &TenantId,
+        rate: u64,
+    ) -> f64 {
+        if rate == 0 {
+            return 0.0;
+        }
+        let now_ns = self.clock.now_ns();
+        let buckets = buckets.lock().unwrap();
+        let Some(bucket) = buckets.get(tenant) else {
+            return self.capacity(rate);
+        };
+        let elapsed_ns = now_ns.saturating_sub(bucket.updated_ns).max(0);
+        (bucket.available + elapsed_ns as f64 * bucket.refill_per_ns).min(bucket.capacity)
+    }
+
+    pub fn max_streams_for(&self, tenant: &TenantId) -> Option<u64> {
+        self.resolve_max_streams(tenant)
+    }
+
     fn resolve_max_streams(&self, tenant: &TenantId) -> Option<u64> {
         self.policy
             .max_streams(tenant)

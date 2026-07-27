@@ -85,5 +85,9 @@ fn admin_router() -> Router<Arc<AppState>> {
                 .get(admin::get_retention)
                 .delete(admin::delete_retention),
         )
+        .route(
+            "/loggytracy/api/v1/admin/tenants/{tenant}/usage",
+            get(admin::get_usage),
+        )
         .layer(DefaultBodyLimit::max(admin::MAX_ADMIN_BODY_BYTES))
 }
