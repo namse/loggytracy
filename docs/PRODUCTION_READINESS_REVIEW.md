@@ -1,71 +1,70 @@
-# 프로덕션 레디 리뷰 (2026-07-25)
+# Production readiness review (2026-07-25)
 
-리뷰 대상 리비전: `56afbbe` (M7 완료 시점, working tree clean)
-리뷰 범위: `src/` 전체 (22,436 LOC), `docs/`, 배포 자산
-테스트 상태: `cargo test` 211개 전부 통과
+Reviewed revision: `56afbbe` (M7 completion, working tree clean)
+Review scope: entire `src/` (22,436 LOC), `docs/`, and deployment assets
+Test status: all 211 `cargo test` tests passed
 
-## 판정
+## Verdict
 
-**현재 상태로는 프로덕션 투입 불가.** 기능 완성도(LogQL subset, Loki/Tempo API, S3 계층화,
-graceful shutdown, retention, merge)는 상당히 높고 크래시 복구 불변량은 코드와 주석 수준에서
-꼼꼼하게 설계되어 있다. 그러나 다음 세 가지가 동시에 성립한다.
+**Not production-ready in its current state.** Feature completeness (LogQL subset, Loki/Tempo API, S3
+tiering, graceful shutdown, retention, and merge) is high, and crash-recovery invariants are carefully
+designed at the code and comment level. However, all three of the following hold simultaneously.
 
-1. 오브젝트 스토어 백엔드에서 **flush 루프가 두 번째 compaction에서 영구 정지**한다 (재시작으로도 복구 불가).
-2. **ingest backpressure가 전혀 없다.** flush가 멈춰도 계속 `204`를 반환하며 RAM/디스크가 무한 증가한다.
-3. **테넌시가 구현되지 않았다.** `X-Scope-OrgID`를 파싱하지 않아 테넌트 간 데이터가 섞이고,
-   테넌트별 스로틀·quota를 걸 대상 자체가 없다.
+1. On object-store backends, **the flush loop permanently stops on the second compaction** and cannot recover by restarting.
+2. **There is no ingest backpressure.** Even when flush stops, the server keeps returning `204` while RAM and disk grow without bound.
+3. **Multi-tenancy is not implemented.** `X-Scope-OrgID` is not parsed, so tenant data is mixed and there is no target for per-tenant throttles or quotas.
 
-(1)과 (2)의 조합은 "장애 발생 → 자동 OOM/디스크 풀"을 보장한다. 이 세 개가 프로덕션 게이트다.
+(1) and (2) together guarantee "failure → automatic OOM/full disk." These three items are the production gate.
 
-TLS는 이후 **범위 밖으로 확정**되었다 (`docs/ARCHITECTURE.md` "전송 보안 — TLS 미지원").
-종단 암호화와 인증·인가는 리버스 프록시가 담당하며, 그 대신 리스닝 주소를 신뢰 경계 안에 두는 것이
-배포 요구사항이 된다.
+TLS was later **confirmed out of scope** (`docs/ARCHITECTURE.md`, "Transport security — TLS unsupported").
+The reverse proxy handles end-to-end encryption and authentication/authorization; in return, the listening
+address must remain inside the trust boundary as a deployment requirement.
 
-아래는 심각도별 전체 목록이다. `확인` 필드는 이 리뷰에서 실제로 재현/실행해 확인한 것과
-코드 독해로 판단한 것을 구분한다.
+The complete list by severity follows. The `Verification` field distinguishes items reproduced or executed
+in this review from those inferred by reading the code.
 
-## 수정 반영 이력
+## Change history
 
-리뷰 이후 **입력 검증·설정·관측성 계열의 국소 수정**을 한 배치로 처리했다. 각 항목 본문에
-`수정됨` / `부분 수정`으로 표시하고 남은 작업을 함께 적었다.
+After the review, a batch of **localized input-validation, configuration, and observability fixes** was
+applied. Each item is marked `fixed` / `partially fixed` in its body, with remaining work recorded.
 
-| 항목 | 상태 |
+| Item | Status |
 |---|---|
-| P1-6 타임스탬프 수용 윈도우 | 수정됨 |
-| P1-7 라벨/라인 크기 제한 | 부분 수정 (스트림 수 상한은 테넌시 대기) |
-| P2-3 snappy 신고 길이 검증 + body 상한 knob | 수정됨 |
-| P2-4 retention 전용 타임아웃 knob | 부분 수정 |
-| P2-6 `RUST_LOG` 반영 | 수정됨 |
-| P2-9 `file://` 경고 | 부분 수정 (opt-in 강제는 미적용) |
-| TLS 미지원 / 테넌시 요구사항 문서화 | 완료 (`ARCHITECTURE.md`) |
+| P1-6 timestamp acceptance window | Fixed |
+| P1-7 label/line size limits | Partially fixed (stream-count limit awaits multi-tenancy) |
+| P2-3 snappy reported-length validation + body limit knob | Fixed |
+| P2-4 retention-specific timeout knob | Partially fixed |
+| P2-6 honor `RUST_LOG` | Fixed |
+| P2-9 `file://` warning | Partially fixed (opt-in enforcement not applied) |
+| Document TLS unsupported / multi-tenancy requirements | Complete (`ARCHITECTURE.md`) |
 
-배치에서 **의도적으로 제외한 것**: P0-1(WAL compaction)과 P0-2(backpressure)는 durability·
-hot-path 변경이라 각각 전용 크래시 주입 테스트와 O(1) 크기 추적(P1-5)이 선행되어야 한다.
-국소 수정과 섞으면 회귀 원인 추적이 어려워지므로 별도 작업으로 남겼다.
+**Intentionally excluded from that batch:** P0-1 (WAL compaction) and P0-2 (backpressure) change durability
+and the hot path, so dedicated crash-injection tests and O(1) size tracking (P1-5) must come first.
+They remain separate work because mixing them with localized fixes would make regression causes harder to trace.
 
 ---
 
-## P0 — 프로덕션 게이트 (이것 없이는 배포 금지)
+## P0 — production gates (do not deploy without these)
 
-### P0-1. WAL compaction이 두 번째 호출에서 영구 wedge (재시작으로도 복구 불가)
+### P0-1. WAL compaction permanently wedges on the second call (not recoverable by restart)
 
-- 위치: `src/journal/compaction.rs:1-30`, `src/journal/replay.rs:27`
-- 확인: **재현 완료** (임시 테스트 작성 후 원복)
+- Location: `src/journal/compaction.rs:1-30`, `src/journal/replay.rs:27`
+- Verification: **Reproduced** (temporary test was written and reverted)
 
-`docs/M7_LOAD_RESULTS.md`가 이미 이 블로커를 기록하고 있으나, 리뷰 과정에서 **두 개의 서브 케이스와
-재시작으로도 복구되지 않는다는 사실**을 추가로 확인했다.
+`docs/M7_LOAD_RESULTS.md` already recorded this blocker, but the review additionally confirmed **two
+subcases and that a restart cannot recover it.**
 
-성공한 compaction 후 `journal.wal.compact.state`(phase=2)가 삭제되지 않고 남는다. compaction은 WAL을
-잘라내고 checkpoint를 0으로 리셋하므로 이후 offset은 **새 좌표계**에 산다. 다음 compaction은 옛 좌표계의
-stale offset과 비교되어 세 갈래로 갈린다.
+After successful compaction, `journal.wal.compact.state` (phase=2) remains instead of being deleted.
+Compaction truncates the WAL and resets checkpoint to 0, so later offsets use a **new coordinate system**.
+The next compaction compares against an offset from the old system and takes one of three paths.
 
-| 다음 offset | 코드 경로 | 결과 |
+| Next offset | Code path | Result |
 |---|---|---|
-| `< state.offset` | `compaction.rs:22-27` | `Err("WAL compaction checkpoint moved backwards")` → **영구 wedge** |
-| `== state.offset` | `compaction.rs:12-20` | 조용히 no-op 반환. **WAL이 잘리지 않음** (M7 문서에 없던 케이스) |
-| `> state.offset` | fall-through | 우연히 정상 동작 |
+| `< state.offset` | `compaction.rs:22-27` | `Err("WAL compaction checkpoint moved backwards")` → **permanent wedge** |
+| `== state.offset` | `compaction.rs:12-20` | Quietly returns no-op. **WAL is not truncated** (case missing from the M7 document) |
+| `> state.offset` | fall-through | Happens to work |
 
-재현 결과 (첫 레코드 32B, 두 번째 31B):
+Reproduction result (first record 32 B, second 31 B):
 
 ```
 first_offset=32 wal_after_first=0 second_offset=31
@@ -73,573 +72,558 @@ result=Err(Custom { kind: InvalidInput, error: "WAL compaction checkpoint moved 
 wal_after_second=31
 ```
 
-두 번째 배치가 첫 배치보다 조금이라도 작으면 즉시 wedge된다. 실 트래픽에서는 거의 확정적으로 발생한다.
+If the second batch is even slightly smaller than the first, it wedges immediately. This is nearly certain in real traffic.
 
-**M7 문서에 없는 추가 사실 — 재시작으로 복구되지 않는다.** `recover_unfinished_compaction`은
-`replay.rs:27`에서 `state.phase != 1`이면 즉시 return하므로, 재시작해도 phase=2 state 파일이
-그대로 남아 같은 wedge를 다시 만난다. 유일한 복구 수단은 운영자가 `journal.wal.compact.state`를
-수동 삭제하는 것이다. 이 사실이 문서화되어 있지 않다.
+**Additional fact missing from the M7 document — restart does not recover it.** `recover_unfinished_compaction`
+returns immediately at `replay.rs:27` when `state.phase != 1`, so the phase-2 state file remains after restart
+and the same wedge recurs. The only recovery is for an operator to manually delete `journal.wal.compact.state`.
+This was undocumented.
 
-wedge 이후 동작: `flush.rs:52-91`이 매 tick 같은 doomed offset을 재시도 → 항상 실패 → `continue`로
-새 flush 진입 자체가 차단. `part_count` 동결, WAL·MemTable 무한 증가, `/ready` 503, 그런데
-**ingest는 계속 204를 반환**한다.
+After the wedge, `flush.rs:52-91` retries the same doomed offset every tick → always fails → `continue`
+blocks entry into a new flush. `part_count` freezes, WAL and MemTable grow without bound, `/ready` is 503,
+but **ingest continues returning 204**.
 
-**수정 방향**
-- compaction 성공 직후 state 파일을 제거하고 그 제거를 durable하게(부모 디렉터리 fsync) 만든다.
-- 재시작 시 살아남은 phase=2 state는 "이미 완료"로 간주해 제거한다 (`replay.rs`의 early-return 수정).
-- absolute offset 비교를 좌표계 세대(generation) 개념으로 교체하는 것을 권한다. 현재는 세 갈래
-  분기 전부가 "offset이 같은 좌표계에 있다"는 무효한 전제에 서 있다.
-- 테스트 게이트: **연속 2회 이상 성공 compaction** 케이스가 현재 테스트에 없다
-  (`src/journal/tests.rs`의 compaction 테스트 4개 모두 단일 compaction). 크기가 감소/동일/증가하는
-  세 케이스 + 각 크래시 지점 주입 테스트를 추가해야 한다.
+**Remediation**
+- Remove the state file immediately after successful compaction and make that removal durable (fsync the parent directory).
+- On restart, treat surviving phase-2 state as "already complete" and remove it (fix the early return in `replay.rs`).
+- Replace absolute-offset comparisons with a coordinate-system generation. All three current branches assume invalidly that offsets share a coordinate system.
+- Test gate: there is currently no **two or more consecutive successful compactions** case
+  (all four compaction tests in `src/journal/tests.rs` cover one compaction). Add shrinking, equal, and growing size cases plus crash injection at each crash point.
 
-### P0-2. ingest backpressure 부재 — 장애 시 무한 증가 후 OOM
+### P0-2. No ingest backpressure — unbounded growth and OOM during failure
 
-- 위치: `src/ingest.rs:17` (draining 체크만 존재), `src/memtable.rs:92`, `src/config.rs` (관련 knob 없음)
-- 확인: 코드 독해 + P0-1 재현 시 동작 확인
+- Location: `src/ingest.rs:17` (only the draining check), `src/memtable.rs:92`, `src/config.rs` (no related knob)
+- Verification: Code inspection + behavior observed while reproducing P0-1
 
-`push`는 `is_draining()`만 검사한다. 다음 어떤 것도 ingest를 막지 않는다.
+`push` checks only `is_draining()`. None of the following blocks ingest.
 
-- MemTable 바이트 상한 없음
-- WAL backlog 상한 없음 (`loggytracy_wal_backlog_bytes`는 노출만 하고 gating에 미사용)
-- flush 연속 실패 카운트 기반 차단 없음
-- `429 Too Many Requests` 경로가 코드 전체에 존재하지 않음
+- No MemTable byte limit
+- No WAL backlog limit (`loggytracy_wal_backlog_bytes` is exposed but unused for gating)
+- No block based on consecutive flush failures
+- No `429 Too Many Requests` path anywhere in the code
 
-따라서 S3 장애든 P0-1이든 flush가 멈추면 서버는 계속 `204`로 ack하면서 RAM과 디스크를 소진한다.
-`/ready`가 503으로 바뀌지만 Alloy는 `/ready`를 보지 않으므로 아무 효과가 없다. M7 런에서
-`wal_backlog_bytes=19.9 MB`로 상한을 넘긴 것이 이 경로다.
+Therefore, when flush stops due to an S3 failure or P0-1, the server keeps acking with `204` until it
+exhausts RAM and disk. `/ready` changes to 503, but Alloy does not check `/ready`, so this has no effect.
+The M7 run exceeded the limit through this path with `wal_backlog_bytes=19.9 MB`.
 
-**수정 방향**
-- `LOGGYTRACY_MAX_MEMTABLE_BYTES`, `LOGGYTRACY_MAX_WAL_BACKLOG_BYTES` 도입. 초과 시 journal append
-  **이전에** `429`(재시도 유도) 반환. Alloy는 429에 backoff하므로 클라이언트 WAL이 안전망 역할을 한다.
-- soft/hard 2단 임계값을 권한다: soft에서 `Retry-After`와 함께 429, hard에서 503.
-- `ARCHITECTURE.md`의 "Alloy WAL을 안전망으로 전제"는 서버가 거절 신호를 줄 때만 성립한다.
-  현재는 서버가 ack해버리므로 그 전제가 깨져 있다.
+**Remediation**
+- Add `LOGGYTRACY_MAX_MEMTABLE_BYTES` and `LOGGYTRACY_MAX_WAL_BACKLOG_BYTES`. Above the limit, return `429`
+  **before** journal append to induce retry. Alloy backs off on 429, so the client WAL acts as a safety net.
+- Use two soft/hard thresholds: 429 with `Retry-After` at soft and 503 at hard.
+- The `ARCHITECTURE.md` assumption of "Alloy WAL as a safety net" holds only when the server sends a rejection signal.
+  It is currently broken because the server acknowledges instead.
 
-### P0-3. 멀티테넌시 미구현 — 테넌트별 스로틀·quota의 전제가 없음
+### P0-3. Multi-tenancy not implemented — no basis for per-tenant throttles and quotas
 
-- 위치: `src/router.rs` 전체 (미들웨어 없음), `src/ingest.rs`, `src/trace_ingest.rs`
-- 확인: `rg`로 tenant 관련 코드 전무 확인
+- Location: entire `src/router.rs` (no middleware), `src/ingest.rs`, `src/trace_ingest.rs`
+- Verification: `rg` confirmed no tenant-related code
 
-**TLS는 범위 밖으로 확정되었다** (`docs/ARCHITECTURE.md`의 "전송 보안 — TLS 미지원"). 종단 암호화와
-인증·인가는 리버스 프록시가 담당한다. 따라서 이 항목의 게이트는 **테넌시**다.
+**TLS was confirmed out of scope** (`docs/ARCHITECTURE.md`, "Transport security — TLS unsupported").
+The reverse proxy handles end-to-end encryption and authentication/authorization. Therefore, this item's gate is **multi-tenancy**.
 
-`X-Scope-OrgID`를 **파싱하지 않는다.** Loki/Tempo 데이터소스와 Alloy가 테넌트 헤더를 보내도 전부
-한 네임스페이스에 섞인다. 결과:
+`X-Scope-OrgID` is **not parsed**. Even when Loki/Tempo data sources and Alloy send tenant headers, everything is mixed in one namespace. Results:
 
-- 테넌트 A의 로그가 테넌트 B의 쿼리에 그대로 나온다 (조용한 데이터 유출).
-- **테넌트별 스로틀·quota를 걸 대상이 존재하지 않는다.** 한 테넌트의 폭주가 전체를 죽인다.
-  이것이 P0-2(backpressure 부재)와 결합하면 "한 테넌트가 서버를 OOM시킬 수 있다"가 된다.
-- 테넌트별 retention, 용량 회계, 삭제 요청 대응이 모두 불가능하다.
+- Tenant A's logs appear directly in tenant B's queries (silent data leakage).
+- **There is no target for per-tenant throttles and quotas.** One tenant's surge can kill the whole service.
+  Combined with P0-2 (no backpressure), this means "one tenant can OOM the server."
+- Per-tenant retention, capacity accounting, and deletion requests are all impossible.
 
-**수정 방향** (아키텍처 문서의 "테넌시" 절이 목표 설계)
-- ingest·쿼리 양쪽에서 `X-Scope-OrgID`를 추출한다. OTLP는 gRPC 메타데이터의 동명 키.
-  헤더 부재 시 정책(기본 테넌트 수용 vs 거절)을 설정으로 노출한다.
-- 테넌트를 **저장 경로의 분할 축**으로 넣는다 (manifest/part 경로). 스트림 라벨로 처리하면
-  테넌트별 회계와 삭제가 전체 스캔이 된다.
-- quota 대상: ingest rate, 활성 스트림 수, 저장 용량, 동시 쿼리, 쿼리 스캔 예산.
-  초과 시 ingest `429` (Alloy가 backoff + 자체 WAL로 버팀).
-- 모든 quota/거절 카운터에 테넌트 라벨을 붙여 `/metrics`에 노출한다 (P2-7의 라벨 부재와 함께 처리).
+**Remediation** (the "Multi-tenancy" section of the architecture document is the target design)
+- Extract `X-Scope-OrgID` on both ingest and query. OTLP uses the same gRPC metadata key. Expose the missing-header policy (accept as default tenant vs reject) in configuration.
+- Make tenants a **storage-path partitioning axis** (manifest/part paths). Treating them as stream labels would make per-tenant accounting and deletion require full scans.
+- Quota targets: ingest rate, active stream count, storage capacity, concurrent queries, and query scan budget. Return ingest `429` above the limit (Alloy backs off and relies on its own WAL).
+- Expose every quota/rejection counter on `/metrics` with a tenant label (together with P2-7's missing labels).
 
-**참고 — 프록시 신뢰 전제**: 엔진은 `X-Scope-OrgID`를 검증 없이 신뢰한다. 헤더를 위조할 수 있는
-네트워크 위치에서 엔진에 직접 접근이 가능하면 테넌트 격리가 무너진다. 리스닝 주소를 신뢰 경계
-안에 두는 것이 배포 요구사항이며, `0.0.0.0` 기본 바인드(`src/config.rs`)는 이 요구사항과 어긋난다.
+**Note — proxy trust assumption**: The engine trusts `X-Scope-OrgID` without verification. Tenant isolation
+fails if the engine is directly reachable from a network location where the header can be forged. Keeping
+the listening address inside the trust boundary is a deployment requirement, and the default `0.0.0.0` bind
+(`src/config.rs`) conflicts with that requirement.
 
 ---
 
-## P1 — 실사용 시 곧 문제가 되는 것
+## P1 — problems soon encountered in real use
 
-### P1-1. Tempo search가 전체 trace part를 S3에서 복원한 뒤 전량 스캔
+### P1-1. Tempo search restores every trace part from S3 and scans all of them
 
-- 위치: `src/tempo/handlers.rs:96, 159, 185` → `src/tempo/scan.rs:114` `pin_all_trace_parts`
-- 확인: 코드 독해 (`state.trace_parts.part_ids()` = 전체 ID 집합)
+- Location: `src/tempo/handlers.rs:96, 159, 185` → `src/tempo/scan.rs:114` `pin_all_trace_parts`
+- Verification: Code inspection (`state.trace_parts.part_ids()` = complete ID set)
 
-`trace_by_id`는 bloom pruning(`candidate_part_ids`)을 제대로 쓴다. 그러나 `search`,
-`search_tags`, `search_tag_values` 세 엔드포인트는 모두 `pin_all_trace_parts`를 호출해
-**시간 범위와 무관하게 모든 trace part 본문을 로컬로 복원**한 뒤 전량 스캔한다.
-`search`의 start/end 필터는 스캔이 끝난 후 `handlers.rs:130`에서 적용된다.
-`search_tags` / `search_tag_values`는 시간 범위 파라미터 자체가 없다.
+`trace_by_id` correctly uses bloom pruning (`candidate_part_ids`). However, `search`, `search_tags`, and
+`search_tag_values` all call `pin_all_trace_parts`, **restoring every trace-part body locally regardless of
+time range** and then scanning all of them. `search` applies its start/end filter at `handlers.rs:130` after
+the scan. `search_tags` / `search_tag_values` have no time-range parameters at all.
 
-Grafana의 Tempo 데이터소스는 태그 드롭다운을 열 때마다 `search/tags`를 호출한다. 즉
-**UI를 한 번 열면 전체 trace 데이터셋이 S3에서 다운로드된다.** 캐시 상한(`cache_max_bytes`)을
-넘으면 다운로드 → eviction → 재다운로드가 반복되어 S3 요청 비용과 대역폭이 폭증한다.
+Grafana's Tempo data source calls `search/tags` whenever a tag dropdown opens. Thus **opening the UI once
+downloads the entire trace dataset from S3.** Once the cache limit (`cache_max_bytes`) is exceeded, download
+→ eviction → redownload repeats, causing S3 request costs and bandwidth to explode.
 
-**수정 방향**: trace part meta의 `min_ts_ns`/`max_ts_ns`로 시간 프루닝을 pin 단계에서 적용하고,
-tags/tag_values에 시간 범위 파라미터를 지원한다(Tempo API에 `start`/`end`가 있다). 태그
-카탈로그는 part 사이드카에 미리 집계해 본문 복원 없이 답하는 것이 정석이다.
+**Remediation**: Apply time pruning during pin using `min_ts_ns`/`max_ts_ns` from trace-part metadata and
+support time-range parameters for tags/tag_values (the Tempo API has `start`/`end`). The standard approach
+is to pre-aggregate the tag catalog in a part sidecar and answer without restoring bodies.
 
-### P1-2. OTLP 로그 수집이 구현되지 않았는데 문서는 지원한다고 기술
+### P1-2. Documents claim OTLP log ingest support, but it is not implemented
 
-- 위치: `src/startup.rs:342` — `add_service(otlp_service.into_server())`가 `TraceServiceServer` 하나뿐
-- 확인: 코드 독해 (`LogsService` 구현·등록 없음)
+- Location: `src/startup.rs:342` — `add_service(otlp_service.into_server())` registers only one `TraceServiceServer`
+- Verification: Code inspection (no `LogsService` implementation or registration)
 
-`docs/ARCHITECTURE.md`는 "Ingest 프로토콜: Loki push (protobuf+snappy) + OTLP (gRPC)"라고 적고,
-데이터 모델은 "로그와 스팬 모두 wide event로 통일"이라고 기술한다. 그러나 실제 등록된 gRPC 서비스는
-trace 하나이며, Alloy가 `otelcol.exporter.otlp`로 **로그**를 보내면 `UNIMPLEMENTED`가 난다.
-OTLP/HTTP(`/v1/traces`, `/v1/logs`)도 없다 — Alloy 구성에서 `otlphttp`가 흔한 선택지다.
+`docs/ARCHITECTURE.md` says "Ingest protocols: Loki push (protobuf+snappy) + OTLP (gRPC)" and the data
+model says logs and spans are unified as wide events. In reality, only the trace gRPC service is registered,
+and Alloy sending **logs** through `otelcol.exporter.otlp` receives `UNIMPLEMENTED`. OTLP/HTTP (`/v1/traces`,
+`/v1/logs`) is also absent — `otlphttp` is a common Alloy configuration.
 
-**수정 방향**: 구현하거나(권장: LogsService + OTLP/HTTP 라우트), 문서에서 "로그는 Loki push 전용"으로
-정정한다. 문서와 구현의 불일치 자체가 도입 단계에서 신뢰를 깎는다.
+**Remediation**: Implement it (recommended: `LogsService` + OTLP/HTTP routes), or correct the document to
+say "logs are Loki-push only." A documentation/implementation mismatch itself damages adoption confidence.
 
-### P1-3. group commit이 항상 batch 타이머를 소진 — 커넥션당 ~5 push/s 상한
+### P1-3. Group commit always consumes the batch timer — ~5 push/s per connection
 
-- 위치: `src/journal/writer.rs:230-231`
-- 확인: 코드 독해 + `docs/M7_LOAD_RESULTS.md`의 측정치와 일치
+- Location: `src/journal/writer.rs:230-231`
+- Verification: Code inspection, consistent with measurements in `docs/M7_LOAD_RESULTS.md`
 
-배치 루프는 `batch_bytes < max_batch_bytes`인 동안 `timeout_at(deadline, rx.recv())`로 대기한다.
-후속 요청이 없어도 **`max_batch_ms`(기본 200ms) 전체를 기다린다.** 따라서 모든 push의 ack 지연은
-사실상 200ms 고정이고, 단일 커넥션 처리량은 ~5 push/s로 고정된다.
+While `batch_bytes < max_batch_bytes`, the batch loop waits with `timeout_at(deadline, rx.recv())`.
+Even when no follow-up request exists, it waits the full **`max_batch_ms` (200 ms by default).** Thus every
+push has effectively fixed 200 ms ack latency and one connection is capped at ~5 push/s.
 
-M7 문서는 이를 "클라이언트 아티팩트"로 분류했지만, 서버가 채널이 빈 것을 알면서도 타이머를
-소진하는 것은 서버 측 설계 문제다. 정석 group commit은 **즉시 write를 시작하고, fsync 진행 중에
-도착한 요청이 다음 배치를 만든다.** 현재 구현은 도착을 기다렸다가 write한다.
+The M7 document classified this as a "client artifact," but consuming the timer while the server knows the
+channel is empty is a server-side design problem. Correct group commit **starts writing immediately, with
+requests arriving during fsync forming the next batch.** The current implementation waits for arrivals before writing.
 
-영향: Alloy 인스턴스 수가 적은 환경(소규모 배포, 단일 노드 k8s)에서 처리량 상한이 매우 낮다.
-`max_batch_ms`를 낮추면 fsync 횟수가 늘어 디스크가 병목이 되는 trade-off로 밀린다.
+Impact: In environments with few Alloy instances (small deployments, single-node k8s), the throughput cap is
+very low. Lowering `max_batch_ms` trades the problem for more fsyncs and a disk bottleneck.
 
-**수정 방향**: 첫 레코드 도착 즉시 write+fsync 시작, fsync 중 도착분을 다음 배치로 모으는 구조로 전환.
-`max_batch_ms`는 상한이 아니라 fsync가 즉시 끝날 때의 상한으로만 작동해야 한다.
+**Remediation**: Start write+fsync as soon as the first record arrives and collect arrivals during fsync into
+the next batch. `max_batch_ms` should act only as a ceiling when fsync completes immediately, not as a mandatory wait.
 
-### P1-4. 단일 writer 가정을 강제하는 장치가 없음 (split-brain)
+### P1-4. No mechanism enforces the single-writer assumption (split brain)
 
-- 위치: `src/object_storage/catalog.rs` (lease/fencing token 없음)
-- 확인: 코드 독해
+- Location: `src/object_storage/catalog.rs` (no lease/fencing token)
+- Verification: Code inspection
 
-아키텍처는 "싱글 머신, 단일 writer"를 전제하지만 이를 **강제하는 메커니즘이 없다.** 같은
-`LOGGYTRACY_OBJECT_STORE_URL` prefix로 두 프로세스를 띄우면 둘 다 정상 동작한다고 믿고 쓴다.
-manifest CAS가 lost update는 막지만 다음을 막지 못한다.
+The architecture assumes "single machine, single writer," but **nothing enforces it.** Two processes with
+the same `LOGGYTRACY_OBJECT_STORE_URL` prefix both believe they can operate normally. Manifest CAS prevents
+lost updates but not the following.
 
-- 두 프로세스의 로컬 WAL/캐시가 서로 다른 히스토리를 가진다.
-- 각자의 retention이 상대가 방금 등록한 part를 만료 대상으로 판단할 수 있다.
-- M6의 장비 교체 절차에서 구 인스턴스가 완전히 죽기 전에 신 인스턴스가 뜨면 정확히 이 상태가 된다.
+- The two processes' local WALs/caches have different histories.
+- Each retention worker can treat a part just registered by the other as expired.
+- M6 hardware replacement reaches exactly this state if the new instance starts before the old one is fully dead.
 
-M6 절차가 순서를 잘 정의해두었지만, 순서를 지키게 **강제**하는 것과 문서로 부탁하는 것은 다르다.
-운영 자동화(k8s rolling update 등)가 절차를 어기는 것은 흔한 일이다.
+M6 defines the order well, but **enforcing** the order is different from requesting it in documentation.
+Operational automation (k8s rolling updates and so on) commonly violates procedures.
 
-**수정 방향**: manifest에 writer epoch/lease를 넣고, CAS 시 자신의 epoch를 검증한다. 다른 epoch가
-관측되면 즉시 self-fence(ingest 거부 + 프로세스 종료). 오브젝트 스토어만으로 구현 가능하다.
+**Remediation**: Add a writer epoch/lease to the manifest and verify the own epoch during CAS. On observing
+another epoch, immediately self-fence (reject ingest and terminate). This can be implemented with object storage alone.
 
-### P1-5. MemTable flush가 전체 스냅샷을 deep clone, size 계산이 O(rows)
+### P1-5. MemTable flush deep-clones the full snapshot and size calculation is O(rows)
 
-- 위치: `src/memtable.rs:98-113` (`begin_flush`의 `snapshot.clone()`), `src/memtable.rs:135-170`
-- 확인: 코드 독해
+- Location: `src/memtable.rs:98-113` (`snapshot.clone()` in `begin_flush`), `src/memtable.rs:135-170`
+- Verification: Code inspection
 
-두 가지 문제가 겹친다.
+Two problems overlap.
 
-1. `begin_flush`가 `snapshot.clone()`으로 전체 엔트리를 복제한다 → flush 순간 메모리 2배.
-2. `approximate_size()`가 모든 스트림의 모든 엔트리를 순회한다. `flush_loop`이 이를
-   `flush_check_interval`(기본 500ms)마다 호출하고, `finalize_flush`는 루프마다 호출한다.
+1. `begin_flush` duplicates every entry with `snapshot.clone()` → memory doubles at flush time.
+2. `approximate_size()` walks every entry in every stream. `flush_loop` calls it every
+   `flush_check_interval` (500 ms by default), and `finalize_flush` calls it every loop.
 
-정상 시(1 MiB memtable)에는 무해하다. 문제는 **장애 시**다. memtable이 커질수록 500ms마다의
-O(rows) 순회가 CPU를 태우고, 그 순회가 `inner` RwLock read를 잡고 있는 동안 `insert`의
-write lock이 대기한다 → ingest 지연이 memtable 크기에 비례해 악화된다. 즉 P0-2의 무한 증가
-시나리오에서 지연이 선형으로 나빠지며 상황을 가속한다.
+This is harmless in normal operation (1 MiB memtable). The problem is **failure**. As the memtable grows,
+the O(rows) walk every 500 ms consumes CPU, and `insert` waits for its write lock while the walk holds the
+`inner` RwLock read lock → ingest latency worsens with memtable size. In P0-2's unbounded-growth scenario,
+latency degrades linearly and accelerates the situation.
 
-**수정 방향**: `AtomicU64` 누적 카운터로 크기를 O(1) 추적한다(insert/commit/abort에서 갱신).
-`begin_flush`의 clone은 `Arc`로 공유하거나 flushing 버퍼를 move + 필요 시 재삽입으로 바꾼다.
+**Remediation**: Track size in O(1) with an `AtomicU64` accumulator (update on insert/commit/abort).
+Share the `begin_flush` clone with `Arc`, or move the flushing buffer and reinsert it when needed.
 
-### P1-6. 타임스탬프 수용 윈도우가 없어 파티션이 무한 증식 — **수정됨**
+### P1-6. No timestamp acceptance window causes unbounded partition growth — **fixed**
 
-- 위치: `src/part/format.rs:1-5` (`partition_of`), `src/ingest.rs:78` (i64 범위만 검증)
-- 확인: 코드 독해
+- Location: `src/part/format.rs:1-5` (`partition_of`), `src/ingest.rs:78` (only validates i64 range)
+- Verification: Code inspection
 
-ingest는 타임스탬프가 i64 나노초 범위에 드는지만 본다. 파티션은 UTC 일자 단위이므로,
-시계가 틀린 클라이언트나 **단위 착오**(초/밀리초를 나노초로 보내는 매우 흔한 실수)가
-수천 개의 파티션 디렉터리를 만든다. 게다가
+Ingest checks only that timestamps fit the i64 nanosecond range. Because partitions are UTC-day based,
+a clock-wrong client or a **unit mistake** (the common error of sending seconds/milliseconds as nanoseconds)
+can create thousands of partition directories. In addition:
 
-- 미래 날짜 part는 retention cutoff(`max_ts_ns < cutoff`)에 걸리지 않아 **영구히 남는다.**
-- `DateTime::from_timestamp(...).unwrap_or_default()`는 변환 실패를 조용히 `1970-01-01`로 매핑한다.
+- A future-date part never reaches the retention cutoff (`max_ts_ns < cutoff`) and **remains forever.**
+- `DateTime::from_timestamp(...).unwrap_or_default()` silently maps conversion failure to `1970-01-01`.
 
-Loki에는 `reject_old_samples`, `creation_grace_period`가 있다. 여기에는 동등한 방어가 없다.
+Loki has `reject_old_samples` and `creation_grace_period`; there was no equivalent defense here.
 
-**수정 완료**: `LOGGYTRACY_MAX_TIMESTAMP_AGE`(기본 7d) / `LOGGYTRACY_MAX_TIMESTAMP_SKEW`(기본 1h)를
-도입해 journal append 이전에 400으로 거절한다(`src/ingest.rs`의 `TimestampWindow`). `off`로
-비활성화하면 과거 데이터 일괄 적재가 가능하다.
+**Fixed**: Introduced `LOGGYTRACY_MAX_TIMESTAMP_AGE` (7d by default) / `LOGGYTRACY_MAX_TIMESTAMP_SKEW`
+(1h by default) and reject with 400 before journal append (`TimestampWindow` in `src/ingest.rs`).
+Disabling with `off` allows bulk loading historical data.
 
-**남은 작업**: 거절 카운터를 metrics에 노출하는 것은 P2-7(라벨 있는 metric)과 함께 처리한다.
-`partition_of`의 `unwrap_or_default()`는 i64 나노초 범위 안에서는 항상 유효한 날짜를 만들므로
-실질 위험이 없어 그대로 두었다.
+**Remaining work**: Expose rejection counters in metrics together with P2-7 (labeled metrics).
+`unwrap_or_default()` in `partition_of` remains because every i64 nanosecond value produces a valid date,
+so there is no practical risk.
 
-### P1-7. 라벨/라인/스트림 카디널리티 제한 전무 — **부분 수정**
+### P1-7. No label/line/stream-cardinality limits — **partially fixed**
 
-- 위치: `src/proto.rs:90-140` (`parse_labels`), `src/memtable.rs:92`
-- 확인: 코드 독해
+- Location: `src/proto.rs:90-140` (`parse_labels`), `src/memtable.rs:92`
+- Verification: Code inspection
 
-Loki가 가진 다음 제한들이 전혀 없다.
+The following Loki limits are entirely absent.
 
-| Loki 제한 | loggytracy |
+| Loki limit | loggytracy |
 |---|---|
 | `max_label_names_per_series` (30) | `max_label_names_per_stream` ✓ |
 | `max_label_name_length` (1024) | `max_label_name_bytes` ✓ |
 | `max_label_value_length` (2048) | `max_label_value_bytes` ✓ |
 | `max_line_size` | `max_line_bytes` ✓ |
-| `max_streams_per_user` | **없음** — 테넌시 필요 |
-| `max_entries_limit_per_query` | `max_log_limit`으로 있음 ✓ |
+| `max_streams_per_user` | **Missing** — requires multi-tenancy |
+| `max_entries_limit_per_query` | Present as `max_log_limit` ✓ |
 
-라벨 하나에 request ID를 실수로 넣은 클라이언트 하나가 memtable 스트림 HashMap과 part의
-stream index를 폭발시킬 수 있다. stream index는 캐시 상한에서 제외되는 "작은 영속 카탈로그"로
-설계되어 있어(`cache.rs`의 `CATALOG_FILES` 주석) 카디널리티 폭발이 곧 **evict 불가능한
-디스크 사용량**이 된다.
+A client that accidentally puts a request ID in one label can explode the MemTable stream HashMap and
+the part stream index. The stream index is designed as a "small persistent catalog" excluded from the
+cache limit (the `CATALOG_FILES` comment in `cache.rs`), so cardinality explosion becomes **non-evictable disk usage**.
 
-**수정 완료**: 라벨 개수·이름 길이·값 길이·라인 크기 상한을 `src/ingest.rs`의 `validate_labels`와
-라인 검사로 적용한다. 모두 journal append 이전이므로 거절된 요청은 WAL에 남지 않는다.
+**Fixed**: Apply limits for label count, name length, value length, and line size through `validate_labels`
+and line validation in `src/ingest.rs`. All run before journal append, so rejected requests do not reach the WAL.
 
-**남은 작업**: 활성 스트림 수 상한(`max_streams_per_user`)은 **테넌시 없이는 의미가 없다** —
-전역 상한은 한 테넌트가 다른 테넌트의 ingest를 막는 도구가 되어버린다. P0-3과 함께 처리한다.
+**Remaining work**: An active-stream limit (`max_streams_per_user`) is **meaningless without multi-tenancy** —
+a global limit would let one tenant block another tenant's ingest. Address it with P0-3.
 
-### P1-8. merge 기본 설정이 서로 모순 — 대형 그룹 merge가 영구 실패
+### P1-8. Merge defaults conflict — large-group merges fail permanently
 
-- 위치: `src/merge/selection.rs:31-76` (`group_for_merge`), `src/merge/selection.rs:89-120`
-- 확인: 코드 독해 + 기본값 계산
+- Location: `src/merge/selection.rs:31-76` (`group_for_merge`), `src/merge/selection.rs:89-120`
+- Verification: Code inspection + default-value calculation
 
-그룹 선택은 `estimated_part_bytes`(= **압축된** parquet 파일 크기)를
-`merge_max_input_bytes`(512 MiB)와 비교한다. 그런데 실제 읽기는
-`read_all_rows_with_limit`이 **압축 해제된** row 바이트를 `merge_max_memory_bytes`(1 GiB)와
-비교한다. zstd + dictionary는 로그 텍스트에서 5~20배가 흔하므로 두 상한은 압축률만큼 어긋나 있다.
+Group selection compares `estimated_part_bytes` (= **compressed** Parquet file size) with
+`merge_max_input_bytes` (512 MiB). Actual reads compare **decompressed** row bytes in
+`read_all_rows_with_limit` with `merge_max_memory_bytes` (1 GiB). A 5–20x compression ratio is common for
+log text with zstd + dictionary, so the limits diverge by the compression ratio.
 
-행 수 기준으로도 위험하다. `merge_target_part_rows` = 1,000,000이고 1 KiB 라인이면
-압축 해제 크기는 약 1 GiB — 기본 상한에 딱 걸린다. `merge_max_part_rows` = 4,000,000까지
-그룹이 자라면 확실히 초과한다.
+Rows are also risky. With `merge_target_part_rows` = 1,000,000 and 1 KiB lines, decompressed size is about
+1 GiB, exactly at the default limit. If a group grows to `merge_max_part_rows` = 4,000,000, it certainly exceeds it.
 
-초과 시 `Err("merge exceeds the maximum of ... materialized bytes")`가 나고 `merge_once`는
-`continue`한다. 그러나 **다음 tick에 같은 그룹이 같은 방식으로 선택되어 같은 이유로 실패한다.**
-더 작은 그룹으로 물러서는 fallback이 없다. 결과: merge 영구 실패 → part 수 무한 증가 →
-쿼리 계획 비용 증가 → `merge_healthy=false`로 `/ready` 503 고착.
+When exceeded, it returns `Err("merge exceeds the maximum of ... materialized bytes")` and `merge_once`
+continues. But **the same group is selected the same way on the next tick and fails for the same reason.**
+There is no fallback to a smaller group. Result: permanent merge failure → unbounded part growth → higher
+query-planning cost → `/ready` stuck at 503 with `merge_healthy=false`.
 
-**수정 방향**
-- 두 상한을 같은 단위로 통일하거나, 그룹 선택 시 압축률 추정치(part meta에 uncompressed size 기록)를 쓴다.
-- 메모리 초과 실패 시 그룹을 절반으로 쪼개 재시도하는 fallback을 넣는다.
-- 근본적으로는 merge를 streaming k-way merge로 바꿔 전량 materialize를 없앤다
-  (`todo.md` P2의 "Parquet range read"와 같은 축).
+**Remediation**
+- Use the same unit for both limits, or use a compression-ratio estimate during group selection (record uncompressed size in part metadata).
+- Add a fallback that halves the group and retries on memory-limit failure.
+- Ultimately replace merge with a streaming k-way merge to avoid materializing everything
+  (the same axis as "Parquet range read" in P2 of `todo.md`).
 
-### P1-9. 캐시 eviction이 registry write lock을 잡고 동기 디렉터리 순회
+### P1-9. Cache eviction holds the registry write lock during synchronous directory traversal
 
-- 위치: `src/startup.rs:242-250`, `src/object_storage/cache.rs`의 `evict_cache`/`evict_trace_cache`
-- 확인: 코드 독해
+- Location: `src/startup.rs:242-250`, `evict_cache`/`evict_trace_cache` in `src/object_storage/cache.rs`
+- Verification: Code inspection
 
-eviction 워커는 `registry.operation_lock().write_owned()`를 잡은 뒤 `evict_cache`를 호출한다.
-`evict_cache`는 `async` 함수가 아니고 `spawn_blocking`으로도 감싸지 않은 **동기 함수**이며,
-parts 트리 전체를 `read_dir` + 항목마다 `symlink_metadata`로 순회한다.
+The eviction worker takes `registry.operation_lock().write_owned()` and then calls `evict_cache`.
+`evict_cache` is a **synchronous function**, neither async nor wrapped in `spawn_blocking`, and traverses the
+entire parts tree with `read_dir` + `symlink_metadata` for every entry.
 
-두 가지가 동시에 나쁘다.
+Two things are bad simultaneously.
 
-1. 그 순회 시간 내내 **모든 쿼리·flush·merge·retention이 차단**된다 (write lock).
-2. tokio 워커 스레드를 블로킹한다 (기본 30초마다).
+1. **All queries, flush, merge, and retention are blocked** throughout the traversal (write lock).
+2. A Tokio worker thread is blocked (every 30 seconds by default).
 
-part 수가 수만 개가 되면 순회당 수만 번의 stat syscall이 발생한다. 이것이 쿼리 p99에
-주기적인 스파이크로 나타난다.
+With tens of thousands of parts, every traversal performs tens of thousands of stat syscalls. This appears
+as periodic spikes in query p99.
 
-**수정 방향**: `spawn_blocking`으로 옮기고, 크기·access time 정보를 registry에 인메모리로
-유지해 디스크 순회 자체를 없앤다. write lock은 실제 파일 삭제 구간만 잡는다.
+**Remediation**: Move it to `spawn_blocking` and keep size/access-time data in the registry so disk traversal
+disappears. Hold the write lock only during actual file deletion.
 
-### P1-10. 시작 시 오브젝트 스토어 오류가 곧 패닉 → S3 일시 장애에 crash loop
+### P1-10. Object-store startup errors panic immediately → crash loop on transient S3 failures
 
-- 위치: `src/startup.rs:83, 87, 91, 95, 109`
-- 확인: 코드 독해
+- Location: `src/startup.rs:83, 87, 91, 95, 109`
+- Verification: Code inspection
 
-startup은 object store 초기화, flush transaction 복구, local cache reconcile, trace reconcile
-전부를 `panic!`으로 처리한다. **일시적 네트워크 오류와 실제 데이터 손상을 구분하지 않는다.**
-S3가 몇 초 흔들리는 동안 프로세스가 재시작하면 그대로 패닉하고, 오케스트레이터가 재시작하면
-다시 패닉한다 → crash loop. crash loop 동안 ingest는 완전 중단이고, 그 사이 Alloy WAL이
-차오른다.
+Startup handles object-store initialization, flush-transaction recovery, local-cache reconciliation, and
+trace reconciliation all with `panic!`. It **does not distinguish transient network errors from actual data
+corruption.** If the process restarts while S3 is unstable for a few seconds, it panics; the orchestrator
+restarts it and it panics again → crash loop. Ingest stops completely during the loop while the Alloy WAL fills.
 
-**수정 방향**: 복구 가능한 I/O 오류는 backoff 재시도하고 그 동안 `/ready`를 503으로 유지한다
-(리스너는 띄워 `/ready`가 응답 가능해야 한다). 진짜 무결성 위반(manifest 형식 오류, 검증 실패)만
-패닉으로 남긴다.
+**Remediation**: Retry recoverable I/O errors with backoff while keeping `/ready` at 503 (the listener must
+be up so `/ready` can respond). Leave only real integrity violations (manifest format errors, validation
+failures) as panics.
 
-### P1-11. 시작 시간과 flush 비용이 part 수에 선형
+### P1-11. Startup time and flush cost are linear in part count
 
-- 위치: `src/object_storage/cache.rs`의 `restore_catalog`, `src/object_storage/catalog.rs`의 manifest CAS
-- 확인: 코드 독해
+- Location: `restore_catalog` in `src/object_storage/cache.rs`, manifest CAS in `src/object_storage/catalog.rs`
+- Verification: Code inspection
 
-두 가지 O(N) 경로가 있다.
+There are two O(N) paths.
 
-1. `restore_catalog`이 manifest의 **모든** part에 대해 로컬 존재 확인 후 없으면 카탈로그 파일을
-   **순차** 다운로드한다. 병렬화가 없다. part 10,000개면 왕복 수만 번이 직렬로 일어난다.
-   더구나 `reconcile_local_cache`는 `restore_catalog`을 시작과 끝에 두 번 호출하고, merge 그룹마다
-   `load_manifest()`를 다시 호출한다.
-2. manifest는 **모든 part를 담은 단일 JSON**이고 flush마다(기본 5초) 전체가 CAS로 재작성된다.
-   part 10,000개면 매 5초마다 수 MB를 PUT한다. S3 요청 비용과 CAS 충돌 확률이 함께 오른다.
+1. `restore_catalog` checks local existence for **every** part in the manifest and then downloads missing catalog
+   files **sequentially**. There is no parallelism. With 10,000 parts, tens of thousands of round trips are serial.
+   `reconcile_local_cache` also calls `restore_catalog` twice, at the beginning and end, and calls
+   `load_manifest()` again for every merge group.
+2. The manifest is **one JSON containing every part**, rewritten in full by CAS on every flush (5 seconds by default).
+   With 10,000 parts, several megabytes are PUT every five seconds. S3 request cost and CAS collision probability both rise.
 
-`docs/M7_LOAD_RESULTS.md`의 런은 part가 3개였으므로 이 축은 전혀 검증되지 않았다.
+The run in `docs/M7_LOAD_RESULTS.md` had three parts, so this axis was not validated at all.
 
-**수정 방향**: 카탈로그 다운로드 병렬화(bounded concurrency), `reconcile_local_cache`의 중복
-`load_manifest`/`restore_catalog` 제거. 중기적으로는 manifest를 세대별 delta + 주기적 스냅샷
-구조로 바꿔 flush당 쓰기량을 O(변경분)으로 만든다.
+**Remediation**: Parallelize catalog downloads (bounded concurrency) and remove duplicate
+`load_manifest`/`restore_catalog` calls from `reconcile_local_cache`. In the medium term, change the manifest
+to generational deltas plus periodic snapshots so each flush writes O(changes).
 
 ---
 
-## P2 — 운영 품질 / 호환성
+## P2 — operational quality / compatibility
 
-### P2-1. Loki API 호환 공백
+### P2-1. Loki API compatibility gaps
 
-- 위치: `src/router.rs`
-- 확인: 코드 독해 + Loki API 대조
+- Location: `src/router.rs`
+- Verification: Code inspection + comparison with the Loki API
 
-Grafana Loki 데이터소스가 호출하는데 없는 엔드포인트:
+Endpoints called by the Grafana Loki data source but missing:
 
-| 엔드포인트 | 영향 |
+| Endpoint | Impact |
 |---|---|
-| `/loki/api/v1/tail` (WebSocket) | Grafana **Live tail 동작 불가** |
-| `/loki/api/v1/index/volume`, `volume_range` | Explore의 volume 히스토그램 실패 |
-| `/loki/api/v1/patterns` | 패턴 탐색 실패 |
-| `/loki/api/v1/detected_fields`, `detected_labels` | Grafana 11+ 필드 탐색 실패 |
-| `/loki/api/v1/format_query` | 쿼리 포맷 버튼 실패 |
-| `/loki/api/v1/delete` (삭제 API) | GDPR/삭제 요청 대응 불가 |
+| `/loki/api/v1/tail` (WebSocket) | Grafana **Live tail unavailable** |
+| `/loki/api/v1/index/volume`, `volume_range` | Explore volume histogram fails |
+| `/loki/api/v1/patterns` | Pattern exploration fails |
+| `/loki/api/v1/detected_fields`, `detected_labels` | Field exploration fails in Grafana 11+ |
+| `/loki/api/v1/format_query` | Query-format button fails |
+| `/loki/api/v1/delete` (delete API) | Cannot handle GDPR/deletion requests |
 
-동작하지만 부정확한 것:
+Implemented but inaccurate:
 
-- `labels`, `label_values`, `series`, `index_stats`가 **`start`/`end`를 완전히 무시**한다
-  (`handlers.rs:199, 213, 290, 426`). Grafana는 항상 시간 범위를 보내므로, 드롭다운에
-  "그 범위에 존재하지 않는 라벨"까지 전부 나온다. 동시에 매 요청이 전체 히스토리를 훑는다.
-- `label_values`가 Loki의 `query` 파라미터(매처로 값 필터링)를 지원하지 않는다.
-- JSON push가 `415 "JSON push not supported in M0"`로 거절된다 — 에러 메시지에 마일스톤
-  이름이 남아 있고, Promtail/일부 SDK는 JSON push를 쓴다.
-- `buildinfo`가 `revision: "unknown"`, `branch: "main"`을 하드코딩한다 (`handlers.rs:281`).
-  배포된 리비전을 확인할 방법이 없다.
+- `labels`, `label_values`, `series`, and `index_stats` **completely ignore `start`/`end`**
+  (`handlers.rs:199, 213, 290, 426`). Grafana always sends a time range, so dropdowns include labels
+  that do not exist in that range; every request also scans the full history.
+- `label_values` does not support Loki's `query` parameter (filter values with a matcher).
+- JSON push is rejected with `415 "JSON push not supported in M0"` — the error retains a milestone name,
+  and Promtail/some SDKs use JSON push.
+- `buildinfo` hardcodes `revision: "unknown"`, `branch: "main"` (`handlers.rs:281`). There is no way to identify the deployed revision.
 
-Tempo 쪽도 v2 API(`/api/v2/search/tags`, `/api/v2/search/tag/{tag}/values`)와 `/api/echo`가 없다.
-최신 Grafana Tempo 데이터소스는 v2를 먼저 시도한다.
+Tempo also lacks the v2 APIs (`/api/v2/search/tags`, `/api/v2/search/tag/{tag}/values`) and `/api/echo`.
+The latest Grafana Tempo data source tries v2 first.
 
-### P2-2. 메타데이터 엔드포인트에 리소스 가드 없음
+### P2-2. No resource guards on metadata endpoints
 
-- 위치: `src/query/handlers.rs:199, 213, 290, 426`
-- 확인: 코드 독해
+- Location: `src/query/handlers.rs:199, 213, 290, 426`
+- Verification: Code inspection
 
-로그/메트릭 쿼리 경로는 semaphore + 타임아웃 + scan 예산 + 메모리 예산을 잘 갖췄다. 그런데
-`labels`, `label_values`, `series`, `index_stats`는 **semaphore도, 타임아웃도, 범위 검증도 없다.**
-`series`는 `match[]`를 개수 제한 없이 받아 매처마다 전체 part를 훑는다. P0-3(무인증)과 결합하면
-가장 값싼 DoS 경로다.
+Log/metric query paths have semaphores, timeouts, scan budgets, and memory budgets. However,
+`labels`, `label_values`, `series`, and `index_stats` have **no semaphore, timeout, or range validation.**
+`series` accepts unlimited `match[]` entries and scans every part for each matcher. Combined with P0-3
+(no authentication), this is the cheapest DoS path.
 
-### P2-3. snappy 압축 해제가 신고된 길이를 그대로 할당, body 상한이 설정 불가 — **수정됨**
+### P2-3. Snappy decompression allocates the reported length, and body limit is not configurable — **fixed**
 
-- 위치: `src/ingest.rs:54`
-- 확인: `snap-1.1.2` 소스 확인 (`decompress.rs`의 `vec![0; decompress_len(input)?]`)
+- Location: `src/ingest.rs:54`
+- Verification: Inspected `snap-1.1.2` source (`vec![0; decompress_len(input)?]` in `decompress.rs`)
 
-`decompress_vec`는 검증 전에 **헤더가 신고한 길이만큼 즉시 할당**한다. snappy의
-`MAX_INPUT_SIZE`는 `u32::MAX`이므로 수 바이트짜리 varint 헤더로 최대 4 GiB 할당을 유발할 수 있다.
-`MAX_RECORD_BYTES`(256 MiB) 검증은 압축 해제 **후에** 일어난다.
+`decompress_vec` **immediately allocates the length reported by the header** before validation. Snappy's
+`MAX_INPUT_SIZE` is `u32::MAX`, so a varint header only a few bytes long can trigger an allocation up to 4 GiB.
+`MAX_RECORD_BYTES` (256 MiB) validation happens **after** decompression.
 
-리눅스 기본 overcommit에서는 `vec![0; n]`이 lazy zero page라 RSS 영향이 제한적이므로 즉시
-치명적이지는 않다. 그러나 overcommit을 끈 환경이나 VA 압박 상황에서는 실패하며, 무엇보다
-"신뢰할 수 없는 입력이 할당 크기를 정한다"는 자체가 고쳐야 할 패턴이다.
+With Linux's default overcommit, `vec![0; n]` uses lazy zero pages so RSS impact is initially limited.
+It fails with overcommit disabled or under virtual-address pressure, and more importantly, "untrusted input
+determines allocation size" is itself a pattern that must be fixed.
 
-함께 있는 문제: **body 크기 상한이 설정 불가**하다. axum의 암묵적 기본값 2 MiB를 그대로 쓰므로
-Alloy의 배치 크기를 키운 운영자는 원인 불명의 `413`을 만나고, 조절할 env knob이 없다.
+Related problem: **the body-size limit is not configurable.** The implicit 2 MiB axum default is used,
+so an operator who increases Alloy's batch size encounters an unexplained `413` with no environment knob to adjust.
 
-**수정 완료**: `snap::raw::decompress_len`으로 신고 길이를 먼저 확인해
-`LOGGYTRACY_MAX_DECOMPRESSED_PUSH_BYTES`(기본 64 MiB)를 넘으면 `413`으로 거절한다.
-`DefaultBodyLimit`을 `LOGGYTRACY_MAX_PUSH_BYTES`(기본 16 MiB)로 노출했고, 핸들러도 같은 상한을
-검사해 axum의 무정보 413 대신 구체적인 에러 메시지를 준다.
+**Fixed**: Check the reported length first with `snap::raw::decompress_len` and reject with `413` when it
+exceeds `LOGGYTRACY_MAX_DECOMPRESSED_PUSH_BYTES` (64 MiB by default). Expose `DefaultBodyLimit` as
+`LOGGYTRACY_MAX_PUSH_BYTES` (16 MiB by default), and have the handler check the same limit to provide a
+specific error instead of axum's uninformative 413.
 
-### P2-4. retention이 로컬 본문을 manifest CAS보다 먼저 삭제 — **부분 수정**
+### P2-4. Retention deletes local bodies before manifest CAS — **partially fixed**
 
-- 위치: `src/retention.rs:130-165`
-- 확인: 코드 독해
+- Location: `src/retention.rs:130-165`
+- Verification: Code inspection
 
-로컬 part 디렉터리를 먼저 지우고(write lock 안) 그 다음 remote manifest CAS를 한다. 크래시
-안전성은 주석대로 확보되지만, **CAS가 실패하면** 해당 part는 registry에 등록된 채 manifest에도
-살아있고 로컬 본문만 없는 상태로 남는다(`removed_log_ids`의 `unregister`는 CAS 성공 후에만 실행).
-다음 retention 패스까지 그 part를 복원해야 하는 쿼리는 실패한다. 수렴은 하지만 그 사이 쿼리
-결과가 에러가 된다.
+It deletes local part directories first (under the write lock) and then performs remote manifest CAS.
+Crash safety is as described in the comments, but **when CAS fails**, the part remains registered in the
+registry and manifest while only its local body is missing (`removed_log_ids` calls `unregister` only after
+CAS succeeds). Queries that need to restore the part fail until the next retention pass. It converges, but
+query results error in the meantime.
 
-부수 문제:
-- ~~retention/GC 타임아웃에 `config.max_restore_runtime`(25초)을 재사용한다~~ →
-  **수정됨**: `LOGGYTRACY_MAX_RETENTION_RUNTIME`(기본 120초)을 분리했다. 기존 25초는 전체 prefix를
-  LIST하는 GC에는 너무 짧아 대규모 버킷에서 타임아웃 실패를 반복할 값이었다.
-- `garbage_collect_orphans`가 매번 `parts`와 `trace_parts` prefix **전체를 LIST**한다.
-  object 수에 선형인 LIST 비용이 retention이 뭔가 지울 때마다 발생한다.
-- `retention_period` 기본값이 `None`(무한)이다. 기본 설정 배포는 S3와 디스크가 영원히 자란다.
+Related problems:
+- ~~Retention/GC timeout reuses `config.max_restore_runtime` (25 seconds)~~ → **Fixed**:
+  `LOGGYTRACY_MAX_RETENTION_RUNTIME` (120 seconds by default) is separate. The old 25 seconds was too short
+  for GC listing an entire prefix and would repeatedly time out on large buckets.
+- `garbage_collect_orphans` LISTs the entire `parts` and `trace_parts` prefixes every time. LIST cost linear
+  in object count occurs whenever retention deletes anything.
+- `retention_period` defaults to `None` (infinite). A default deployment grows S3 and disk forever.
 
-### P2-5. 크래시 후 중복 로그가 관측 불가능
+### P2-5. Duplicated logs after a crash cannot be observed
 
-- 위치: `docs/ARCHITECTURE.md`의 at-least-once 항목, `todo.md` P2
-- 확인: 문서 + 코드 독해
+- Location: at-least-once item in `docs/ARCHITECTURE.md`, P2 in `todo.md`
+- Verification: Documentation + code inspection
 
-at-least-once 트레이드오프 자체는 의식적 결정으로 문서화되어 있다. 문제는 **중복이 발생했는지
-알 방법이 없다는 것**이다. 크래시 복구 시 재생된 레코드 수를 세는 metric도, 경고 로그도 없다.
-운영자는 "지금 보고 있는 count_over_time 결과가 중복 때문에 부풀려진 것인지" 판단할 근거가 없다.
+The at-least-once trade-off is documented as a conscious decision. The problem is that **there is no way
+to know whether duplicates occurred.** There is no metric counting records replayed during crash recovery
+and no warning log. Operators cannot determine whether the `count_over_time` result they see is inflated by duplicates.
 
-**수정 방향**: dedup 구현 전이라도 `loggytracy_replay_records_total`,
-`loggytracy_replay_duplicate_window_bytes` 같은 gauge를 노출하고, 복구 시 WARN 로그로
-"이 시점 이후 구간에 중복이 있을 수 있음"을 남긴다.
+**Remediation**: Even before deduplication, expose gauges such as `loggytracy_replay_records_total` and
+`loggytracy_replay_duplicate_window_bytes`, and emit a WARN during recovery saying "duplicates may exist
+after this point."
 
-### P2-6. 로그 레벨 하드코딩 — `RUST_LOG` 무시 — **수정됨**
+### P2-6. Log level hardcoded — ignores `RUST_LOG` — **fixed**
 
-- 위치: `src/main.rs:40` — `.with_env_filter("loggytracy=debug,info")`
-- 확인: 코드 독해
+- Location: `src/main.rs:40` — `.with_env_filter("loggytracy=debug,info")`
+- Verification: Code inspection
 
-프로덕션에서 `loggytracy=debug`가 강제되며 운영자가 바꿀 수 없다. 로그 양·비용 문제이기도 하고,
-장애 시 임시로 trace 레벨을 올리는 것도 불가능하다.
+Production forces `loggytracy=debug` and operators cannot change it. This is a log-volume/cost problem and
+also prevents temporarily increasing the trace level during a failure.
 
-**수정 완료**: `EnvFilter::try_from_default_env()`로 `RUST_LOG`를 반영하고, 미설정 시 기본값을
-`loggytracy=info,warn`으로 낮췄다.
+**Fixed**: Honor `RUST_LOG` with `EnvFilter::try_from_default_env()` and lower the default to
+`loggytracy=info,warn` when unset.
 
-### P2-7. `/metrics`로 SLO를 계산할 수 없음
+### P2-7. `/metrics` cannot calculate SLOs
 
-- 위치: `src/metrics.rs`, `src/query/handlers.rs:299-420`
-- 확인: 코드 독해
+- Location: `src/metrics.rs`, `src/query/handlers.rs:299-420`
+- Verification: Code inspection
 
-- 히스토그램/summary가 없다. 지연은 `*_latency_ns_total` 누적합뿐이라 **p95/p99를 구할 수 없다.**
-  M5/M7 목표표가 p95/p99로 쓰여 있는데 운영 중에는 그 지표를 볼 수 없다.
-- 라벨이 전혀 없다. 엔드포인트별·상태코드별 에러율을 낼 수 없다.
-- `# HELP`가 없다.
-- 버전/리비전 정보 metric이 없다.
-- `merge_debt_part_count`가 매 스크레이프마다 `estimated_part_bytes` → part마다 `fs::metadata`를
-  호출한다(`selection.rs:78-82`). part 수만큼의 stat syscall이 스크레이프 주기마다 발생한다.
+- There are no histograms/summaries. Latency is only the sum `*_latency_ns_total`, so **p95/p99 cannot be calculated.**
+  M5/M7 target tables use p95/p99, but those metrics are unavailable in operation.
+- There are no labels, so error rates cannot be calculated per endpoint or status code.
+- There are no `# HELP` lines.
+- There is no version/revision metric.
+- Every scrape makes `merge_debt_part_count` call `estimated_part_bytes` → `fs::metadata` for every part
+  (`selection.rs:78-82`). A stat syscall per part occurs on every scrape interval.
 
-### P2-8. shutdown의 운영자 abort가 컨테이너 환경에서 동작하지 않음
+### P2-8. Shutdown operator abort does not work in container environments
 
-- 위치: `src/shutdown.rs`의 `spawn_abort_watcher`, `startup.rs`의 종료 시퀀스
-- 확인: 코드 독해 (코드 주석도 일부 인정하고 있음)
+- Location: `spawn_abort_watcher` in `src/shutdown.rs`, shutdown sequence in `startup.rs`
+- Verification: Code inspection (some code comments also acknowledge it)
 
-force-flush는 하드 타임아웃 없이 무한 재시도하고, 유일한 탈출구가 **stdin에 `exit` 입력**이다.
-systemd나 컨테이너에서 stdin은 TTY가 아니므로 이 경로는 사용 불가다(코드도
-"stdin is unavailable; operator-initiated shutdown abort is disabled"로 인지하고 있다).
+Force-flush retries forever without a hard timeout, and the only escape is **typing `exit` on stdin**.
+Under systemd or in a container, stdin is not a TTY and this path is unusable (the code acknowledges
+"stdin is unavailable; operator-initiated shutdown abort is disabled").
 
-그 결과 컨테이너 환경의 실제 동작은 이렇게 된다. S3가 죽은 상태에서 SIGTERM →
-force-flush 무한 재시도 → 오케스트레이터의 `terminationGracePeriodSeconds`(기본 30초) 만료 →
-**SIGKILL**. 데이터는 WAL에 있으므로 손실은 없지만, 오케스트레이터는 그 다음 파드를
-**다른 노드에 스케줄**할 수 있고 그러면 그 디스크가 버려진다. 즉 M6가 막으려던 손실이
-정확히 그 경로로 발생한다.
+The actual container behavior is: SIGTERM while S3 is down → infinite force-flush retries → orchestrator
+`terminationGracePeriodSeconds` expires (30 seconds by default) → **SIGKILL**. Data is in the WAL and is
+not lost, but the orchestrator can **schedule the next pod on another node**, discarding that disk. The
+loss M6 intended to prevent occurs through exactly this path.
 
-`startup.rs`가 abort 시 exit code 1을 반환하는 것은 좋은 설계지만, **SIGKILL에는 exit code가 없다.**
+Returning exit code 1 on abort in `startup.rs` is good design, but **SIGKILL has no exit code.**
 
-**수정 방향**: stdin 대신 관리용 엔드포인트나 시그널(SIGUSR1)로 abort를 받는다. 더 중요하게,
-운영 문서에 "이 워크로드는 StatefulSet + 고정 PV여야 하고 `terminationGracePeriodSeconds`는
-사실상 무한이어야 한다"를 명문화하고, `/ready` + `pending_flush_bytes`를 보고 교체를 진행하는
-컨트롤러 절차를 제공해야 한다.
+**Remediation**: Receive abort through an administrative endpoint or signal (SIGUSR1) instead of stdin.
+More importantly, state in the operations documentation that this workload must use a StatefulSet + fixed
+PV and `terminationGracePeriodSeconds` must be effectively infinite, and provide a controller procedure
+that replaces hardware based on `/ready` + `pending_flush_bytes`.
 
-### P2-9. `file://` 백엔드가 CAS 없이 overwrite — 프로덕션 오사용 방어 없음 — **부분 수정**
+### P2-9. `file://` backend overwrites without CAS — no production-misuse defense — **partially fixed**
 
-- 위치: `src/object_storage/catalog.rs`의 `local_manifest_overwrite`
-- 확인: 코드 독해
+- Location: `local_manifest_overwrite` in `src/object_storage/catalog.rs`
+- Verification: Code inspection
 
-`file://` 스킴은 `PutMode::Overwrite`로 폴백한다(프로세스 내 mutex + rename에 의존).
-주석은 "single-process development backend"라고 명시하지만, **런타임에 아무 경고도 없다.**
-누군가 NFS 마운트를 `file://`로 지정하면 조용히 CAS 없는 manifest 갱신이 되고, P1-4의
-split-brain과 결합해 manifest lost update가 발생한다.
+The `file://` scheme falls back to `PutMode::Overwrite` (relying on an in-process mutex + rename).
+Comments say "single-process development backend," but **there is no runtime warning.** If someone points
+`file://` at an NFS mount, manifest updates silently lack CAS and combine with P1-4 split brain to cause lost updates.
 
-**수정 완료**: `ObjectStorage::from_url`이 `file://` 스킴을 감지하면 CAS 없이 overwrite를 쓴다는
-사실과 공유/네트워크 스토리지에 쓰지 말라는 경고를 WARN으로 남긴다.
+**Fixed**: When `ObjectStorage::from_url` detects the `file://` scheme, it emits a WARN that writes
+overwrite without CAS and must not use shared/network storage.
 
-**남은 작업**: 명시적 opt-in(`LOGGYTRACY_ALLOW_UNSAFE_LOCAL_STORE`) 요구는 부하 하네스 스크립트가
-`file://`에 의존하므로 함께 정리해야 한다.
+**Remaining work**: Requiring explicit opt-in (`LOGGYTRACY_ALLOW_UNSAFE_LOCAL_STORE`) must be coordinated
+with the load-harness script, which depends on `file://`.
 
-### P2-10. 과부하 신호(429)가 없어 Alloy가 backoff할 수 없음
+### P2-10. No overload signal (429), so Alloy cannot back off
 
-- 위치: `src/ingest.rs`, `src/trace_ingest.rs`
-- 확인: 코드 독해
+- Location: `src/ingest.rs`, `src/trace_ingest.rs`
+- Verification: Code inspection
 
-현재 응답 매핑은 파싱 실패 → 400(Alloy가 drop, 적절), journal 실패 → 500(Alloy가 재시도, 적절)이다.
-그런데 **과부하 상태를 표현하는 429가 없다.** 서버가 감당 못 하는 상황에서 클라이언트에게
-"천천히 보내라"고 말할 방법이 없고, 그래서 P0-2의 무한 증가가 완화되지 않는다.
-OTLP 쪽도 `RESOURCE_EXHAUSTED`를 크기 초과에만 쓰고 부하에는 쓰지 않는다.
+Current response mapping is parse failure → 400 (Alloy drops it, correctly), journal failure → 500 (Alloy
+retries, correctly). But **there is no 429 to represent overload.** When the server cannot cope, it cannot
+tell the client to "slow down," so P0-2's unbounded growth is not mitigated. OTLP also uses `RESOURCE_EXHAUSTED`
+only for size overflow, not load.
 
 ---
 
-## P3 — 배포·문서 자산 부재
+## P3 — missing deployment and documentation assets
 
-확인: `ls` (해당 파일들이 존재하지 않음)
+Verification: `ls` (the files do not exist)
 
-| 항목 | 상태 |
+| Item | Status |
 |---|---|
-| Dockerfile | 없음 |
-| k8s manifest / helm chart | 없음 |
-| systemd unit | 없음 |
-| 설정 레퍼런스 문서 | 없음 — 40여 개 env knob이 `src/config.rs`에만 존재 |
-| 운영 runbook | 부분 (ARCHITECTURE.md의 shutdown 절차만) |
-| 백업·DR 절차 | 없음 (S3가 source of truth인데 버전관리/복제 정책 미기술) |
-| SLO/용량 산정 가이드 | 없음 (M5 목표표는 계획 문서 안에만) |
-| 알람 룰 예시 | 없음 |
-| 실제 S3 검증 | 미완 (`todo.md` P2, MinIO만 검증됨) |
+| Dockerfile | Missing |
+| k8s manifest / Helm chart | Missing |
+| systemd unit | Missing |
+| Configuration reference | Missing — roughly 40 environment knobs exist only in `src/config.rs` |
+| Operations runbook | Partial (only the shutdown procedure in `ARCHITECTURE.md`) |
+| Backup/DR procedure | Missing (S3 is the source of truth, but versioning/replication policy is undocumented) |
+| SLO/capacity guide | Missing (M5 target table exists only in the plan document) |
+| Example alert rules | Missing |
+| Real S3 validation | Incomplete (`todo.md` P2; only MinIO validated) |
 
-`docker-compose.yml`은 MinIO 부하 테스트용이며 서비스 자체를 배포하지 않는다.
-`scripts/`도 부하 하네스 두 개뿐이다.
+`docker-compose.yml` is for MinIO load tests and does not deploy the service itself.
+`scripts/` contains only two load harnesses.
 
-최소한 다음이 필요하다.
-- 설정 레퍼런스 (`docs/CONFIGURATION.md`): knob별 의미, 기본값, 튜닝 방향, 상호 제약
-  (P1-8의 `merge_max_input_bytes` vs `merge_max_memory_bytes` 같은 것)
-- runbook: wedge 복구(`journal.wal.compact.state` 수동 삭제 포함), S3 장애 대응,
-  디스크 풀 대응, 장비 교체 체크리스트
-- 알람: `flush_errors` 증가율, `wal_backlog_bytes`, `merge_debt_parts`, `remote_healthy`,
-  `pending_flush_bytes`
+At minimum, the following are needed.
+- Configuration reference (`docs/CONFIGURATION.md`): meaning, defaults, tuning direction, and mutual constraints for each knob (such as P1-8's `merge_max_input_bytes` vs `merge_max_memory_bytes`)
+- Runbook: wedge recovery (including manual deletion of `journal.wal.compact.state`), S3 failure response, full-disk response, and hardware-replacement checklist
+- Alerts: increase rate of `flush_errors`, `wal_backlog_bytes`, `merge_debt_parts`, `remote_healthy`, and `pending_flush_bytes`
 
 ---
 
-## 프로덕션 레디 게이트 (권장 순서)
+## Production-readiness gates (recommended order)
 
-### 게이트 1 — 데이터 안전성 (이것 없이 배포 금지)
+### Gate 1 — data safety (do not deploy without this)
 
-- [ ] P0-1 WAL compaction wedge 수정 + 연속 compaction 테스트 + 각 크래시 지점 주입 테스트
-- [ ] P0-1 복구 절차 문서화 (기존 wedge 상태에서 stale state 파일 제거)
-- [ ] P0-2 ingest backpressure (memtable/WAL backlog 상한 → 429)
+- [ ] Fix P0-1 WAL-compaction wedge + consecutive-compaction tests + injection at each crash point
+- [ ] Document P0-1 recovery (remove the stale state file from an existing wedge)
+- [ ] P0-2 ingest backpressure (MemTable/WAL-backlog limit → 429)
 - [ ] P1-4 writer fencing (manifest epoch/lease + self-fence)
-- [x] P1-6 타임스탬프 수용 윈도우
-- [ ] P1-8 merge 상한 단위 불일치 수정 + 실패 시 그룹 분할 fallback
+- [x] P1-6 timestamp acceptance window
+- [ ] Fix P1-8 merge-limit unit mismatch + group-splitting fallback on failure
 
-### 게이트 2 — 테넌시와 입력 방어
+### Gate 2 — multi-tenancy and input defenses
 
-- [x] TLS 미지원을 아키텍처 결정으로 명문화 (`ARCHITECTURE.md` "전송 보안")
-- [ ] P0-3 `X-Scope-OrgID` 추출 + 저장 경로 분할 축으로 도입
-- [ ] P0-3 테넌트별 스로틀·quota (ingest rate, 카디널리티, 용량, 동시 쿼리) + 테넌트 라벨 metrics
-- [ ] 기본 바인드를 신뢰 경계에 맞게 조정 (`0.0.0.0` → 명시적 설정 요구)
-- [ ] P2-2 메타데이터 엔드포인트 리소스 가드
-- [x] P2-3 snappy 신고 길이 검증 + body 상한 노출
-- [x] P1-7 라벨/라인 크기 제한 (스트림 수 상한은 테넌시와 함께)
+- [x] Document TLS unsupported as an architecture decision (`ARCHITECTURE.md`, "Transport security")
+- [ ] P0-3 extract `X-Scope-OrgID` + introduce it as a storage-path partition axis
+- [ ] P0-3 per-tenant throttles/quotas (ingest rate, cardinality, capacity, concurrent queries) + tenant-labeled metrics
+- [ ] Adjust the default bind to the trust boundary (`0.0.0.0` → require explicit configuration)
+- [ ] P2-2 resource guards on metadata endpoints
+- [x] P2-3 validate snappy reported length + expose body limit
+- [x] P1-7 label/line size limits (stream-count limit together with multi-tenancy)
 
-### 게이트 3 — 운영 가능성
+### Gate 3 — operability
 
-- [ ] P1-10 시작 시 일시 장애 재시도 (crash loop 제거)
-- [x] P2-6 `RUST_LOG` 반영, 기본 `info`
-- [ ] P2-7 히스토그램 + 엔드포인트 라벨 (p95/p99 관측 가능)
-- [ ] P2-8 stdin 아닌 abort 경로 + 오케스트레이터 배치 요구사항 문서화
-- [x] P2-9 `file://` 프로덕션 오사용 경고 (opt-in 강제는 남음)
-- [ ] P2-4 `retention_period` 기본값 결정 (무한 유지 시 그 이유를 문서화)
-- [ ] P3 Dockerfile + 설정 레퍼런스 + runbook + 알람 룰
+- [ ] P1-10 retry transient failures at startup (remove crash loop)
+- [x] P2-6 honor `RUST_LOG`, default `info`
+- [ ] P2-7 histogram + endpoint labels (p95/p99 observable)
+- [ ] P2-8 non-stdin abort path + document orchestrator deployment requirements
+- [x] P2-9 warn on `file://` production misuse (opt-in enforcement remains)
+- [ ] P2-4 decide `retention_period` default (document rationale if infinite)
+- [ ] P3 Dockerfile + configuration reference + runbook + alert rules
 
-### 게이트 4 — 규모 검증
+### Gate 4 — scale validation
 
-- [ ] P1-11 part 수 O(N) 경로 개선 (카탈로그 병렬 복원, manifest delta)
-- [ ] P1-1 Tempo search 시간 프루닝
-- [ ] P1-3 group commit 지연 구조 개선
-- [ ] P1-5 memtable size O(1) 추적, flush clone 제거
-- [ ] P1-9 eviction을 `spawn_blocking` + 인메모리 메타데이터로
-- [ ] 실제 S3 + 목표 사양(4 vCPU / 16 GiB)에서 **최소 24시간** 지속 부하 (`todo.md` P2)
-- [ ] part 10,000개 이상 상태에서 시작 시간·flush 지연·쿼리 계획 시간 측정
+- [ ] P1-11 improve the O(N) part-count paths (parallel catalog restore, manifest delta)
+- [ ] P1-1 Tempo search time pruning
+- [ ] P1-3 improve group-commit latency structure
+- [ ] P1-5 track MemTable size in O(1), remove flush clone
+- [ ] P1-9 move eviction to `spawn_blocking` + in-memory metadata
+- [ ] Sustained load for **at least 24 hours** against real S3 + target specification (4 vCPU / 16 GiB) (`todo.md` P2)
+- [ ] Measure startup time, flush latency, and query-planning time with at least 10,000 parts
 
-### 게이트 5 — 기능 완성도
+### Gate 5 — feature completeness
 
-- [ ] P1-2 OTLP 로그 (또는 문서 정정)
-- [ ] P2-1 Loki API 공백 (특히 `tail`, `labels`/`series`의 시간 범위 반영)
-- [ ] P2-5 중복 관측 가능성 → 이후 dedup 구현 (`todo.md` P2)
-- [ ] `todo.md` P1의 LogQL 기능 보강
-
----
-
-## 잘 되어 있는 부분
-
-리뷰 중 특히 견고하다고 판단한 것들 — 앞으로 수정할 때 깨뜨리지 말아야 할 자산이다.
-
-- **크래시 복구 불변량이 코드와 주석 양쪽에 명시적이다.** flush transaction, merge tombstone
-  연쇄 복구, upload marker, phase 기반 compaction intent — 각 크래시 지점에서 무엇이 보장되는지
-  주석이 이유까지 적고 있다. 이 수준은 드물다.
-- **경로 안전성 검증이 일관되다.** `is_safe_path_component`, symlink 거부, canonical root 확인이
-  캐시·manifest·transaction 경로 전반에 빠짐없이 들어가 있다.
-- **로그/메트릭 쿼리 경로의 리소스 예산이 촘촘하다.** scan rows/bytes, materialized memory,
-  concurrency semaphore, 타임아웃, cancellation flag가 모두 있고 테스트도 있다.
-- **remote health의 epoch 기반 CAS**(`catalog.rs`의 `remote_state`)로 오래된 성공이 최신 실패를
-  덮지 않게 한 것은 정확한 처리다.
-- **flush 가시성 전환이 단일 write lock 안에 있어** part 등록과 memtable commit이 원자적이다.
-- **M7 부하 검증이 스스로 블로커를 찾아냈고, 그것을 숨기지 않고 FAIL로 기록했다.**
-  `docs/M7_LOAD_RESULTS.md`의 근본 원인 분석은 이 리뷰의 재현 결과와 정확히 일치한다.
-- 211개 테스트가 전부 통과하며, 특히 저널·part·object_storage 경로의 크래시 주입 테스트가 실질적이다.
+- [ ] P1-2 OTLP logs (or correct the documentation)
+- [ ] P2-1 Loki API gaps (especially `tail`, and time ranges for `labels`/`series`)
+- [ ] P2-5 duplicate observability → implement dedup later (`todo.md` P2)
+- [ ] LogQL improvements in P1 of `todo.md`
 
 ---
 
-## 부록 — P0-1 재현 방법
+## Strong areas
 
-`src/journal/tests.rs`에 아래를 추가하면 재현된다 (두 번째 레코드가 첫 번째보다 작아야 한다).
+Items judged especially robust during the review — assets that must not be broken by future changes.
+
+- **Crash-recovery invariants are explicit in both code and comments.** Flush transactions, merge-tombstone
+  chain recovery, upload markers, and phase-based compaction intent explain what each crash point guarantees
+  and why. This level is rare.
+- **Path-safety validation is consistent.** `is_safe_path_component`, symlink rejection, and canonical-root
+  checks cover cache, manifest, and transaction paths.
+- **Resource budgets on log/metric query paths are tight.** Scan rows/bytes, materialized memory, concurrency
+  semaphores, timeouts, and cancellation flags all exist and are tested.
+- **Epoch-based CAS for remote health** (`remote_state` in `catalog.rs`) correctly prevents an old success from
+  overwriting a newer failure.
+- **Flush visibility transition is inside one write lock,** making part registration and MemTable commit atomic.
+- **M7 load validation found its own blocker and recorded it as FAIL instead of hiding it.** The root-cause analysis
+  in `docs/M7_LOAD_RESULTS.md` exactly matches this review's reproduction.
+- All 211 tests pass, and crash-injection tests on journal, part, and object-storage paths are substantive.
+
+---
+
+## Appendix — reproducing P0-1
+
+Add the following to `src/journal/tests.rs` to reproduce it (the second record must be smaller than the first).
 
 ```rust
 #[tokio::test]
@@ -658,7 +642,7 @@ async fn two_consecutive_compactions_wedge() {
 }
 ```
 
-관측 결과:
+Observed result:
 
 ```
 first_offset=32 wal_after_first=0 second_offset=31
@@ -666,5 +650,5 @@ result=Err(Custom { kind: InvalidInput, error: "WAL compaction checkpoint moved 
 wal_after_second=31
 ```
 
-두 번째 레코드를 첫 번째와 **같은 크기**로 만들면 `offset == state.offset` 분기를 타서
-`Ok`가 반환되지만 WAL이 잘리지 않는다 (조용한 no-op).
+If the second record is made **the same size** as the first, the `offset == state.offset` branch returns
+`Ok`, but the WAL is not truncated (a silent no-op).

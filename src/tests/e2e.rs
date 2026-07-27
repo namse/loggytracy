@@ -232,7 +232,7 @@
 
     #[tokio::test]
     async fn e2e_partial_flush_then_restart() {
-        // 일부 flush, 일부 in-flight. 재시작 시 두 곳 모두에서 복원.
+        // Some data is flushed and some is in flight; recover it from both locations on restart.
         let dir = tmp_data_dir("partial");
         let config = Config {
             data_dir: dir.clone(),
@@ -304,7 +304,7 @@
         let registry = PartRegistry::load_from_disk(&parts_root).unwrap();
         assert_eq!(registry.part_count(), 1);
 
-        // 존재하는 부분문자열
+        // An existing substring.
         let f = crate::logql::LineFilter::Contains("database".to_string());
         let r = registry
             .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
@@ -312,7 +312,7 @@
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
 
-        // 존재하지 않는 부분문자열 — bloom 프루닝
+        // A nonexistent substring — bloom pruning.
         let f = crate::logql::LineFilter::Contains("zzzzzz-no-such-substr".to_string());
         let r = registry
             .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
@@ -323,7 +323,7 @@
 
     #[tokio::test]
     async fn e2e_double_restart_without_flush_no_loss() {
-        // #1 회귀: flush 없이 "재시작 → 재시작" 두 번 해도 in-flight 데이터가 유지되어야 한다.
+        // #1 regression: in-flight data must survive two "restart -> restart" cycles without flushing.
         let dir = tmp_data_dir("double_restart");
         let config = Config {
             data_dir: dir.clone(),
@@ -334,11 +334,11 @@
         let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
         let raw = build_push_req();
         ingest_once(&journal, &raw).await;
-        // flush 없이 종료
+        // Shut down without flushing.
         drop(journal);
         drop(memtable);
 
-        // 첫 재시작
+        // First restart.
         let memtable1 = MemTable::new();
         recover(&config, &memtable1).expect("recover 1");
         let r1 = memtable1.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
@@ -346,7 +346,7 @@
         assert_eq!(t1, 3, "first restart should restore in-flight data");
         drop(memtable1);
 
-        // 두 번째 재시작 — checkpoint가 전진하지 않았으므로 동일 데이터가 다시 복원되어야 함
+        // Second restart — the same data must be recovered because checkpoint did not advance.
         let memtable2 = MemTable::new();
         recover(&config, &memtable2).expect("recover 2");
         let r2 = memtable2.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);

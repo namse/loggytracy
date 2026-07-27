@@ -842,9 +842,9 @@ fn row_group_matches_index(rg: u32, matchers: &[LabelMatcher], index: &StreamMap
     for m in matchers {
         match m.op {
             MatcherOp::Eq => {
-                // {label=""}는 라벨 부재를 매치한다. stream index에는 라벨이
-                // 없는 스트림의 entry가 기록되지 않으므로, value가 빈 문자열이면
-                // 보수적으로 통과시킨다 (memtable과의 정합성).
+                // {label=""} matches a missing label. The stream index has no entry for
+                // streams without the label, so conservatively allow an empty value
+                // to keep this consistent with the memtable path.
                 if m.value.is_empty() {
                     continue;
                 }

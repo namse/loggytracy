@@ -129,7 +129,7 @@ fn flush_rows_internal(
             rollback_committed(&committed_dirs);
             return Err(e);
         }
-        // rename의 내구성을 보장하기 위해 부모(파티션) 디렉터리와 parts_root를 fsync.
+        // Fsync the parent (partition) directory and parts_root to make the rename durable.
         if let Some(parent) = final_dir.parent()
             && let Err(e) = fsync_dir(parent)
         {
@@ -372,4 +372,3 @@ fn write_bloom(path: &Path, rows: &[Row], row_group_size: usize) -> io::Result<(
     sync_file(path)?;
     Ok(())
 }
-

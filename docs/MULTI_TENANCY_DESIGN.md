@@ -6,7 +6,7 @@ a fresh context should be able to start implementing from this document alone.
 Status: **accepted; steps 1, 2 (partly), and 4 are implemented, plus per-tenant
 retention end to end ([`RETENTION_DESIGN.md`](RETENTION_DESIGN.md)).** See
 [Implementation status](#implementation-status) for what actually landed.
-Supersedes the "테넌시" section of
+Supersedes the "Multi-tenancy" section of
 `ARCHITECTURE.md` (lines 48-65), which specified tenant-as-path-axis. That
 approach is rejected here on cost grounds — see [Why not tenant-per-path](#why-not-tenant-per-path).
 
@@ -401,7 +401,7 @@ the same keep-existing / drop-new semantics as `fn0/src/metric_gate.rs`, and
 report drops back as `fn0.logs.dropped`.
 
 This is the gap `PRODUCTION_READINESS_REVIEW.md:276` records as
-`max_streams_per_user` — "없음 — 테넌시 필요".
+`max_streams_per_user` — "missing — requires multi-tenancy".
 
 ## Implementation status
 
@@ -532,7 +532,7 @@ those tenants through a separate per-tenant path instead.
 
 ## Related documents
 
-- `ARCHITECTURE.md` — engine architecture; its "테넌시" section (48-65) is
+- `ARCHITECTURE.md` — engine architecture; its "Multi-tenancy" section (48-65) is
   superseded by this document
 - `PRODUCTION_READINESS_REVIEW.md` — P0-3 (119-145) is the production gate this
   design closes; line 276 records the missing `max_streams_per_user`

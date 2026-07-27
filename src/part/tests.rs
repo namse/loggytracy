@@ -808,12 +808,12 @@
 
     #[test]
     fn label_eq_empty_matches_missing_label_in_part() {
-        // {app=""}는 라벨 부재를 매치한다. memtable 경로는 이미 그렇게 동작하므로
-        // part 경로에서도 보수적으로 통과시켜 정합성을 맞춰야 한다.
+        // {app=""} matches a missing label. The memtable path already behaves this way,
+        // so the part path must conservatively allow it for consistency.
         let tmp = tempfile_dir();
         let mut labels: Labels = BTreeMap::new();
         labels.insert("host".to_string(), "h1".to_string());
-        // app 라벨 부재
+        // The app label is missing.
         let rows: Vec<Row> = vec![Row {
             tenant: test_tenant(),
             timestamp_ns: 1_700_000_000_000_000_000,
@@ -966,9 +966,10 @@ resident {:.0} B",
 
     #[test]
     fn bloom_handles_large_trigram_volume_in_single_row_group() {
-        // row group 8192행 × 라인당 수십 trigram → unique 항목이 row 수의 수배~수십배.
-        // 이전 구현(capacity=row 수)은 fill ratio ~99%로 도달해 거짓 양성이 발생하지만,
-        // 새 구현(unique trigram 수로 capacity)은 존재하지 않는 부분문자열을 정확히 프루닝.
+        // An 8192-row group with dozens of trigrams per line produces several to dozens of times
+        // as many unique items as rows. The old implementation (capacity = row count) reached
+        // a fill ratio near 99% and produced false positives, while the new implementation
+        // (capacity = unique trigram count) accurately prunes absent substrings.
         let tmp = tempfile_dir();
         let mut labels: Labels = BTreeMap::new();
         labels.insert("app".to_string(), "test".to_string());
@@ -1080,9 +1081,9 @@ resident {:.0} B",
 
     #[test]
     fn merge_tombstone_cleanup_during_discover() {
-        // merge에서 새 part rename + tombstone 기록 후 old_dirs 삭제 전 crash 시
-        // 재시작 시 discover_parts가 tombstone을 발견해 old_dirs를 정리하고
-        // 새 part 1개만 로드하는 것을 검증.
+        // If a crash occurs after renaming the new part and recording the tombstone in merge,
+        // but before deleting old_dirs, verify that on restart discover_parts finds the tombstone,
+        // cleans up old_dirs, and loads only the one new part.
         let tmp = tempfile_dir();
         let parts_root = tmp.join("parts");
         std::fs::create_dir_all(&parts_root).unwrap();
@@ -1123,7 +1124,7 @@ resident {:.0} B",
             .map(|p| p.dir.clone())
             .collect();
 
-        // 모의 merge: 두 스트림의 rows를 모아 새 part 생성
+        // Simulated merge: collect rows from two streams and create a new part.
         let mut l3: Labels = BTreeMap::new();
         l3.insert("app".to_string(), "old1".to_string());
         let mut l4: Labels = BTreeMap::new();
@@ -1149,7 +1150,7 @@ resident {:.0} B",
         let new_dir = merged_parts[0].dir.clone();
         write_merge_tombstone(&new_dir, &parts_root, &old_dirs).expect("tombstone write");
 
-        // crash 시뮬레이션: old_dirs는 그대로, tombstone은 새 part 디렉터리에 있음.
+        // Simulate a crash: old_dirs remain, and the tombstone is in the new part directory.
         for old_dir in &old_dirs {
             assert!(
                 old_dir.exists(),

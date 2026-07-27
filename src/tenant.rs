@@ -253,7 +253,7 @@ mod tests {
         assert!(TenantId::parse("..").is_err());
         assert!(TenantId::parse("a/b").is_err());
         assert!(TenantId::parse("a b").is_err());
-        assert!(TenantId::parse("한글").is_err());
+        assert!(TenantId::parse("文字").is_err());
         assert!(TenantId::parse("a\0b").is_err());
     }
 

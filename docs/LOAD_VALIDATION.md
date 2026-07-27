@@ -1,254 +1,256 @@
-# 부하 검증 정책 — 로컬 MinIO가 상한이다
+# Load-validation policy — local MinIO is not the target
 
-## 결정
+## Decision
 
-**이 리포지토리는 S3를 대상으로 한 테스트를 하지 않는다. 실 클라우드도, 로컬 MinIO도 하지 않는다.**
+**This repository does not test against S3. That means neither real cloud storage nor local MinIO.**
 
-두 개의 서로 다른 이유가 겹친다.
+Two different reasons lead to this decision.
 
-- **실 클라우드** — 인디 프로젝트이고, 실 계정에서 의미 있는 기간·규모의 부하를 거는 비용을
-  감당할 계획이 없다. 앞선 리뷰들이 게이트로 적어 둔 "실제 S3에서 최소 24시간 지속 부하"는
-  이 결정에 따라 폐기한다.
-- **로컬 MinIO** — 비용 문제가 아니다. **우리가 `object_store` 크레이트를 신뢰하기 때문이다.**
-  S3 프로토콜 구현이 맞는지는 그 크레이트의 책임이고, 그것을 Docker를 띄워 재검증하는 것은
-  우리 일이 아니다. `docker-compose.yml`과 `scripts/run_load_s3.sh`는 이 결정에 따라 삭제했다.
+- **Real cloud** — This is an indie project, and there are no plans to pay for meaningful duration and
+  scale in a real account. Earlier reviews listed "at least 24 hours of sustained load on real S3" as a
+  gate; that gate is retired by this decision.
+- **Local MinIO** — Cost is not the issue. **We trust the `object_store` crate.** Correct S3 protocol
+  implementation is that crate's responsibility, and spinning up Docker to revalidate it is not our job.
+  `docker-compose.yml` and `scripts/run_load_s3.sh` were deleted accordingly.
 
-대신 **크레이트를 호출하기 직전까지의 우리 코드를 아주 세밀하게** 테스트한다. 그 경계가 어디이고
-왜 거기가 위험한지가 아래 "원칙"이다.
+Instead, **test our code in detail up to the point immediately before the crate is called.** The following
+principle explains where that boundary is and why it is risky.
 
 ---
 
-## 원칙 — 우리 코드만 테스트한다
+## Principle — test only our code
 
-이 문서의 초판은 "MinIO가 S3 wire 프로토콜·조건부 PUT 시맨스·multipart를 검증한다"를 로컬 검증의
-핵심 가치로 적었다. **그건 틀렸다.** 그 목록은 전부 `object_store` 크레이트의 책임이고, 그게
-틀렸으면 크레이트 버그이며, 크레이트에는 자기 테스트 스위트가 있다. Docker를 띄워 남의
-라이브러리를 재검증하는 것은 우리 일이 아니다.
+The first edition of this document described "MinIO validating the S3 wire protocol, conditional PUT
+semantics, and multipart" as the core value of local validation. **That was wrong.** Everything in that
+list is the `object_store` crate's responsibility; if it is wrong, it is a crate bug, and the crate has
+its own test suite. Running Docker to revalidate another library is not our job.
 
-우리 코드에 실제로 있는 위험은 그 아래 한 칸이다.
+The actual risk in our code is one layer below that.
 
-> `object_store`가 조건부 PUT을 제대로 구현했는가 (X — 크레이트 일)
-> **이 바이너리가 이 환경변수로 만들어 낸 스토어가 CAS를 실제로 하고 있는가** (O — 우리 일)
+> Does `object_store` implement conditional PUT correctly? (X — crate responsibility)
+> **Does the store created by this binary with these environment variables actually perform CAS?** (O — our responsibility)
 
-`from_url`은 환경변수를 소문자로 바꿔 `object_store`에 그대로 넘긴다. 돌려받은 스토어가 조건부
-쓰기를 하는지 확인하는 코드는 없었다. `OBJECT_STORE_CONDITIONAL_PUT`을 틀리면 이 엔진의 모든
-manifest 보장 — lost update 방지, merge 입력 재검증, writer fencing — 이 아무것도 아닌 것 위에
-서게 된다.
+`from_url` lowercases the environment variables and passes them directly to `object_store`. There was
+no code checking whether the returned store performed conditional writes. If `OBJECT_STORE_CONDITIONAL_PUT`
+is wrong, every manifest guarantee in this engine — lost-update prevention, merge-input revalidation, and
+writer fencing — rests on nothing.
 
-**그래서 이것은 부하 테스트가 아니라 부팅 프리플라이트로 해결했다**
-(`ObjectStorage::verify_conditional_put`). 부팅 때 프로브 객체로 *거절되어야 할 쓰기가 거절되는지*
-를 직접 확인하고, 아니면 기동을 거부한다. 긍정 경로는 아무것도 증명하지 못한다 — 빈 prefix의 첫
-manifest 쓰기는 조건이 지켜지든 말든 성공하기 때문이다.
+**So this is solved by a startup preflight, not a load test**
+(`ObjectStorage::verify_conditional_put`). At startup, it directly checks with a probe object that *a
+write that should be rejected is rejected*, and refuses startup otherwise. The positive path proves nothing:
+the first manifest write in an empty prefix succeeds whether conditions are honored or not.
 
-### 경계 이쪽 편에서 세밀하게 테스트하는 것
+### What to test closely on our side of the boundary
 
-크레이트에 넘기는 것과 크레이트가 돌려준 것을 읽는 방식 — 여기가 우리 몫이고, 여기서 나는 버그는
-**전부 조용하다**(쓰기가 다 성공한다). 그래서 이 이음매는 주변 어느 코드보다 촘촘하게 건다.
+What we pass to the crate and how we interpret what it returns — this is our responsibility, and bugs here
+are **all silent** (every write succeeds). Therefore, test this seam more tightly than any surrounding code.
 
-| 우리 코드 | 틀리면 무슨 일이 나는가 | 테스트 |
+| Our code | What happens if it is wrong | Test |
 |---|---|---|
-| `put_mode` — 버전 → `PutMode` | `Update` 자리에 `Overwrite`가 가면 **CAS가 통째로 사라진다.** 아무도 눈치채지 못한다 | `put_mode_conditions_on_every_backend_except_the_local_one` |
-| `from_url`의 스킴 판정 | `file` 아닌 스킴이 로컬로 분류되면 위와 같은 결과 | `only_the_file_scheme_opts_out_of_conditional_writes` |
-| URL → prefix → 키 조합 | 자기가 쓴 곳과 다른 곳을 읽거나, 버킷을 공유하는 다른 배포 위에 쓴다 | `keys_are_built_under_the_url_prefix` |
-| `NotFound` 해석 | 없는 manifest를 오류로 읽으면 첫 부팅이 불가능해지고, 반대로 **다른** 오류를 빈 manifest로 읽으면 등록된 part가 전부 사라진다 | `a_missing_manifest_is_the_first_boot_and_nothing_else_is` |
-| `format_version` 해석 | 모르는 버전을 "없음"으로 처리하면 최신 writer가 등록한 part를 버린다 | `an_unknown_manifest_format_version_is_refused` |
-| 환경변수 → `object_store` 설정 키 | CAS 설정이 전달되지 않는다 | `object_store_environment_keys_are_normalized_and_explicit_values_win` |
-| 조건부 쓰기가 실제로 강제되는가 | 위 전부의 최종 방어선 | `the_preflight_refuses_a_store_that_ignores_conditions` |
+| `put_mode` — version → `PutMode` | If `Overwrite` replaces `Update`, **CAS disappears completely** without anyone noticing | `put_mode_conditions_on_every_backend_except_the_local_one` |
+| `from_url` scheme classification | Classifying a non-`file` scheme as local has the same result | `only_the_file_scheme_opts_out_of_conditional_writes` |
+| URL → prefix → key composition | Read somewhere other than where we wrote, or write over another deployment sharing the bucket | `keys_are_built_under_the_url_prefix` |
+| `NotFound` interpretation | Treating a missing manifest as an error makes first boot impossible; treating **another** error as an empty manifest makes every registered part disappear | `a_missing_manifest_is_the_first_boot_and_nothing_else_is` |
+| `format_version` interpretation | Treating an unknown version as "absent" discards parts registered by a newer writer | `an_unknown_manifest_format_version_is_refused` |
+| Environment variables → `object_store` configuration keys | CAS configuration is not passed through | `object_store_environment_keys_are_normalized_and_explicit_values_win` |
+| Whether conditional writes are actually enforced | Final defense for all of the above | `the_preflight_refuses_a_store_that_ignores_conditions` |
 
-위 두 개는 **변이 테스트로 이빨을 확인했다.** `put_mode`를 항상 `Overwrite`로 바꾸면 해당 테스트만
-실패하고 **기존 CAS 경합 테스트는 전부 통과한다** — 조용한 실패라는 말이 정확히 이 뜻이다.
-프리플라이트도 이 변이는 잡지 못한다(프리플라이트는 `put_mode`를 거치지 않고 모드를 직접 지정한다).
-그래서 두 층이 모두 필요하다.
+The first two were checked with **mutation tests**. Changing `put_mode` to always use `Overwrite` makes
+only that test fail while **all existing CAS-contention tests pass** — this is exactly what silent failure
+means. The preflight does not catch this mutation either (it specifies the mode directly without going
+through `put_mode`). Both layers are therefore necessary.
 
-프리플라이트가 부하 테스트보다 나은 이유는 셋이다.
+The preflight is better than a load test for three reasons.
 
-| | MinIO 부하 런 | 부팅 프리플라이트 |
+| | MinIO load run | Startup preflight |
 |---|---|---|
-| 검증 대상 스토어 | 로컬 MinIO | **실제 배포 대상 스토어** (아래 R4가 해결된다) |
-| 비용 | Docker + 벤치마크 스크립트 | 부팅당 왕복 몇 회 |
-| 성격 | 테스트 | **방어** — 잘못된 설정으로는 뜨지 않는다 |
+| Validation target | Local MinIO | **Actual deployment target store** (R4 below is solved) |
+| Cost | Docker + benchmark script | A few round trips per startup |
+| Nature | Test | **Defense** — bad configuration cannot start |
 
-조건을 무시하는 가짜 스토어에 대해 프리플라이트가 실제로 기동을 막는지는 `cargo test`가
-검증한다(`the_preflight_refuses_a_store_that_ignores_conditions`). Docker 없이 병렬로 돈다.
+`cargo test` verifies that the preflight actually blocks a fake store that ignores conditions
+(`the_preflight_refuses_a_store_that_ignores_conditions`). It runs in parallel without Docker.
 
-## 그러면 로컬 부하 런은 무엇을 위한 것인가
+## What is the local load run for, then?
 
-**우리 코드가 부하 아래에서 하는 행동**이다. 백엔드가 무엇이냐와는 상관이 없다.
+It tests **what our code does under load**. The backend does not matter.
 
-| 항목 | 왜 우리 것인가 |
+| Item | Why it is ours |
 |---|---|
-| flush·merge·retention 루프가 계속 전진하는가 | 전부 우리가 쓴 루프다. M7에서 WAL compaction wedge를 잡아낸 것이 정확히 이 축이다 |
-| WAL backlog가 유계인가, backpressure가 걸리고 풀리는가 | 우리가 정한 임계값과 우리가 쓴 게이트다 |
-| RSS가 안정적인가 | 우리 자료구조다 |
-| eviction → restore 왕복 | 캐시 정책과 복원 경로가 우리 것이다 |
-| part 수가 커질 때의 시작 시간·flush 지연·쿼리 계획 시간 (P1-11) | 백엔드가 아니라 **데이터 양과 실행 시간**의 함수다 |
-| 테넌트 수에 비례하는 row group 파편화 (N3) | 우리 part 포맷의 성질이다 |
-| graceful shutdown 무손실, writer fencing | 우리 시퀀스다 |
+| Whether flush/merge/retention loops keep progressing | They are all our loops. The M7 WAL-compaction wedge was found on exactly this axis |
+| Whether WAL backlog is bounded and backpressure engages and clears | Our thresholds and gates |
+| Whether RSS is stable | Our data structures |
+| Eviction → restore round trip | Our cache policy and restore path |
+| Startup time, flush latency, and query-planning time as part count grows (P1-11) | A function of **data volume and execution time**, not the backend |
+| Row-group fragmentation proportional to tenant count (N3) | A property of our part format |
+| Lossless graceful shutdown and writer fencing | Our sequence |
 
-이 목록에 오브젝트 스토어 백엔드가 무엇인지에 **의존하는 항목이 하나도 없다.** 그래서 부하 런은
-`file://` + 지연 주입(Tier B)으로 충분하고, MinIO는 선택이다.
-
----
-
-## 무엇이 검증되지 않는가 (남은 위험)
-
-### R1. 지연 분포의 꼬리 (가장 큰 미검증 위험)
-
-루프백 MinIO의 왕복은 1 ms 미만이고 분포가 거의 평평하다. 실제 S3/R2는 p50이 수십 ms,
-p99가 수백 ms~수 초이며 꼬리가 두껍다. ack 경로는 오브젝트 스토어를 타지 않으므로 영향이 없지만,
-**flush·merge·retention·restore는 전부 영향을 받는다.** flush 지연이 늘면 WAL backlog와
-backpressure 임계값 튜닝이 통째로 달라지고, restore 지연은 캐시 미스 쿼리의 p95에 직결된다.
-
-**완화 — 이건 상당 부분 메울 수 있고, Docker가 필요 없다.** 지연 주입 래퍼는 백엔드를 가리지
-않으므로 `file://` 위에서 실 S3에 가까운 꼬리를 그대로 준다. 우리가 답하려는 질문은 "이 지연에서
-flush 루프가 전진하고 백로그가 유계인가"이고, 그 질문에 백엔드가 무엇인지는 관계가 없다.
-
-이 주입이 못 하는 것: 주입이 `object_store` 클라이언트 **위**에서 일어나므로 클라이언트 자체의
-재시도·백오프 층은 타지 않는다. 실제 S3라면 5xx의 상당수를 그 층이 흡수하고 엔진은 보지도 못한다.
-따라서 이 주입은 엔진에 **더 비관적**이다 — 안전한 방향이다. 재시도 층 자체는 크레이트의 일이라
-우리가 검증할 대상이 아니다.
-
-그리고 주입기는 `base + uniform(0, jitter)`라 **두꺼운 꼬리를 만들 수 없다.** 그래서 값은
-중앙값을 맞추지 않고 *최댓값*이 실 S3 p99 근처에 오도록 잡았다. 중앙값이 비관적으로 나오지만,
-"이 지연에서 백로그가 유계인가"라는 질문에는 그 방향이 옳다.
-
-### R2. 스로틀링
-
-S3는 prefix 단위로 요청률을 제한한다(대략 PUT 3,500/s, GET 5,500/s). 초과하면
-`503 SlowDown`이 온다. R2도 자체 한도가 있다. **MinIO는 로컬에서 절대 스로틀하지 않는다.**
-
-다만 숫자를 놓고 보면 이 위험은 작다. 기본 설정에서 manifest는 `flush_max_interval` 5초마다
-한 번 쓰이므로 **0.2 PUT/s**다. part 객체를 합쳐도 1 PUT/s 안팎이고, merge·retention 버스트를
-10배로 잡아도 10 PUT/s 수준이다. 한도와 **네 자릿수** 차이다. 게다가 part 객체는 키가 전부 달라
-hot-key가 아니다 — hot-key인 것은 manifest 하나뿐인데(P1-11) 그게 0.2 PUT/s다.
-
-**완화 없음이지만, 만들 값어치도 없다.** 정확한 `503 SlowDown` 재현은 fault를 클라이언트
-*아래*에 두어야 하므로 프록시가 필요한데(MinIO 자체 요청 제한 설정, toxiproxy는 TCP 레벨이라
-상태코드 불가, 또는 S3 에러 XML을 돌려주는 소형 리버스 프록시), 위 계산을 보면 그 비용을 쓸
-이유가 없다. 첫 실 배포에서 관찰만 한다.
-
-### R3. 비용
-
-이 프로젝트의 설계는 R2 Class A 비용에 지배당해 왔다(테넌트별 객체 분할을 폐기한 이유가 그것이다,
-[`MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md)). MinIO는 비용 신호를 전혀 주지 않는다.
-
-**부분 완화:** 금액은 못 재도 **연산 횟수는 로컬에서 잴 수 있다.** flush 1회·merge 1회·retention
-1회당 PUT/GET/LIST가 몇 번인지는 백엔드와 무관하다. 이것을 세면 요금표를 곱하는 것만 남는다.
-현재 그 계측이 없다 — `todo.md`에 남겨 두었다.
-
-### R4. 제공자별 조건부 PUT 시맨스 차이 — **해결됨**
-
-S3, R2, MinIO의 조건부 PUT 동작은 세부가 다르다. MinIO에서 CAS가 동작한다는 것이 R2에서
-동작한다는 뜻은 아니다.
-
-**해결:** 부팅 프리플라이트가 **배포 대상 스토어 자기 자신**에 대해 이것을 확인한다. 로컬에서
-아무리 돌려도 답할 수 없던 질문을, 답할 수 있는 유일한 장소에서 답하게 만든 것이다. 실패하면
-기동하지 않으므로, 잘못 설정된 채로 쓰기를 받는 창이 없다.
-
-### R5. 실 네트워크 장애 양상
-
-DNS 실패, TLS 핸드셰이크 실패, 연결 리셋, 부분 응답 — Tier B의 인프로세스 주입은 이것들을
-`object_store::Error`로 흉내 낼 뿐 와이어에서 재현하지 않는다.
-
-**완화:** 엔진의 방어는 백엔드와 무관하게 동작한다(무한 재시도 + health 게이팅 + backpressure).
-장애 *종류*보다 장애 *지속*에 대한 반응이 중요하고, 그것은 Tier B로 검증된다.
+None of these items **depends on which object-store backend is used.** Therefore, a load run with
+`file://` + latency injection (Tier B) is sufficient, and MinIO is optional.
 
 ---
 
-## 로컬 검증 절차
+## What is not validated (remaining risks)
 
-"Tier B/C"라는 이름은 [`M7_IMPLEMENTATION_PLAN.md`](M7_IMPLEMENTATION_PLAN.md)에서 왔다(A는
-없다). 그 계획서는 Tier C의 존재 이유를 "in-memory와 file 백엔드가 타지 않는 조건부 put·
-path-style·multipart를 검증한다"로 적었는데, 위 원칙에 따르면 **그건 검증할 이유가 없는
-목록**이다. 그래서 Tier C는 게이트에서 내렸다.
+### R1. Latency-distribution tail (largest unvalidated risk)
 
-### Tier B — 부하 런 (`scripts/run_load_local.sh`) — **기본**
+Loopback MinIO round trips are below 1 ms and nearly flat. Real S3/R2 has a p50 of tens of milliseconds,
+p99 of hundreds of milliseconds to seconds, and a thick tail. The ack path does not use object storage,
+but **flush, merge, retention, and restore are all affected.** More flush latency changes WAL-backlog and
+backpressure-limit tuning completely, while restore latency directly affects cache-miss query p95.
 
-우리 서버 바이너리를 띄우고 `file://` 위에 `LatencyFaultStore`로 지연·오류를 주입한다. 시드가
-고정돼 재현 가능하고 외부 프로세스가 필요 없다. **위 "우리 코드" 표의 전 항목과 R1·R5를 담당한다.**
-지연 주입 래퍼는 백엔드를 가리지 않으므로, 실 S3에 가까운 꼬리를 여기서 그대로 줄 수 있다.
+**Mitigation — this can be largely covered without Docker.** The latency-injection wrapper is backend-
+agnostic, so it can provide a tail close to real S3 over `file://`. The question is "does the flush loop
+progress and does the backlog remain bounded at this latency?" The backend is irrelevant to that question.
 
-### ~~Tier C — MinIO~~ — **삭제됨**
+What this injection cannot do: because it occurs **above** the `object_store` client, it does not exercise
+the client's own retry/backoff layer. Real S3 would absorb many 5xx responses there before the engine saw
+them. Therefore, this injection is **more pessimistic** for the engine — a safe direction. The retry layer
+itself belongs to the crate and is not ours to validate.
 
-`docker-compose.yml`과 `scripts/run_load_s3.sh`를 지웠다. 그 티어가 검증한다고 계획서가 적어 둔
-목록이 전부 `object_store`의 책임이었기 때문이다. 크레이트를 신뢰한다는 것은 그 크레이트가 하는
-일을 우리가 다시 확인하지 않는다는 뜻이고, 그 결정을 코드베이스에 반영한 것이 이 삭제다.
+The injector is `base + uniform(0, jitter)`, so it **cannot produce a thick tail.** Values are therefore
+chosen so the *maximum*, rather than the median, is near real S3 p99. The median is pessimistic, but that
+is the right direction for asking whether the backlog is bounded at this latency.
 
-크레이트 경계 **이쪽**은 위 표대로 `cargo test`가 Docker 없이 병렬로 검사하고, 경계 **저쪽**은
-프리플라이트가 실제 배포 대상 스토어에 대해 부팅 때 검사한다. 그 사이에 MinIO가 설 자리가 없다.
+### R2. Throttling
 
-### Tier D — 지속·규모 (신규, 미실행)
+S3 limits request rates per prefix (approximately PUT 3,500/s and GET 5,500/s). Exceeding them returns
+`503 SlowDown`. R2 has its own limits. **MinIO never throttles locally.**
 
-기존 두 티어는 수십 초짜리다. 남은 축(P1-11의 O(N) 경로, N3 파편화, 장시간 누수)은 **시간과
-양**의 문제이므로 로컬에서 그대로 잴 수 있다. 초기 목표값:
+The risk is small given the numbers. With the default configuration, the manifest is written once every
+five seconds by `flush_max_interval`, or **0.2 PUT/s**. Part objects add about 1 PUT/s, and even a 10x
+merge/retention burst is about 10 PUT/s. That is **four orders of magnitude** below the limit. Part-object
+keys are also all different and are not hot keys — the only hot key is the manifest (P1-11), at 0.2 PUT/s.
 
-| 항목 | 값 | 이유 |
+**There is no mitigation, but it is not worth building one.** Reproducing exact `503 SlowDown` requires
+placing the fault *below* the client, which requires a proxy (MinIO request-limit settings, toxiproxy at
+the TCP layer without status codes, or a small reverse proxy returning S3 error XML). The calculation
+above does not justify that cost. Observe it during the first real deployment.
+
+### R3. Cost
+
+This project's design has been dominated by R2 Class A costs (the reason tenant-per-object partitioning
+was discarded, [`MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md)). MinIO provides no cost signal.
+
+**Partial mitigation:** Even though amounts cannot be measured, **operation counts can be measured locally.**
+The number of PUT/GET/LIST operations per flush, merge, and retention cycle is backend-independent. Count
+them and only multiplying by the pricing table remains. There is no instrumentation yet; it is recorded in `todo.md`.
+
+### R4. Provider-specific conditional PUT semantics — **resolved**
+
+Conditional PUT behavior differs in details between S3, R2, and MinIO. CAS working on MinIO does not
+mean it works on R2.
+
+**Resolution:** The startup preflight checks this against **the deployment target store itself**. A question
+that could never be answered by running locally is answered at the only place where it can be answered.
+Failure blocks startup, so there is no window in which writes are accepted under a bad configuration.
+
+### R5. Real network failure modes
+
+DNS failures, TLS handshake failures, connection resets, and partial responses — Tier B's in-process
+injection simulates these only as `object_store::Error`; it does not reproduce them on the wire.
+
+**Mitigation:** The engine's defenses work independently of the backend (unbounded retries + health gating
++ backpressure). Response to failure *duration* matters more than failure *type*, and Tier B validates that.
+
+---
+
+## Local validation procedure
+
+The names "Tier B/C" come from [`M7_IMPLEMENTATION_PLAN.md`](M7_IMPLEMENTATION_PLAN.md) (there is no A).
+That plan described Tier C's purpose as validating conditional put, path-style, and multipart behavior
+that in-memory and file backends do not exercise. Under the principle above, **those are not things to
+validate here**, so Tier C was removed from the gate.
+
+### Tier B — load run (`scripts/run_load_local.sh`) — **default**
+
+Start our server binary and inject latency and errors with `LatencyFaultStore` over `file://`. The seed is
+fixed for reproducibility and no external process is needed. **It covers every item in the "our code" table
+above and R1/R5.** Because the latency wrapper is backend-agnostic, it can provide a tail close to real S3 here.
+
+### ~~Tier C — MinIO~~ — **removed**
+
+`docker-compose.yml` and `scripts/run_load_s3.sh` were deleted because everything the plan said this tier
+would validate was the responsibility of `object_store`. Trusting the crate means we do not verify its work
+again; this deletion records that decision in the codebase.
+
+`cargo test` checks **this side** of the crate boundary in parallel without Docker, as in the table above;
+the preflight checks **the other side** at startup against the actual deployment target. There is no place
+for MinIO between them.
+
+### Tier D — duration and scale (new, not run)
+
+The existing two tiers run for tens of seconds. The remaining axes (P1-11's O(N) path, N3 fragmentation,
+and long-running leaks) are problems of **time and volume**, so they can be measured locally. Initial targets:
+
+| Item | Value | Reason |
 |---|---|---|
-| 백엔드 | Tier B 구성 (`file://` + 지연 주입) | 이 표의 항목 중 백엔드에 의존하는 것이 없다. Docker를 요구할 이유가 없다 |
-| **종료 조건** | **처리 이벤트 수** (`LOGGYTRACY_LOAD_EVENTS`) | 메모리 안정성·part 누적·백로그 추세는 전부 *처리한 작업량*의 함수다. 시간은 그 대리 변수였고, 대리 변수로서도 나빴다 — 더 세게 밀면 같은 상태에 더 빨리 도달한다. 시간(`LOAD_SECONDS`)은 안전 상한으로만 둔다 |
-| ~~part 수 도달 10,000개~~ | **별도 구성 필요** | merge가 정상 동작하는 한 part 수는 유계로 유지된다. P1-11(시작 시간이 part 수에 선형)을 재려면 merge를 사실상 끈 구성이 필요하고, 그건 "정상 상태 안정성"과 다른 질문이라 같은 런에 섞을 수 없다 |
-| 테넌트 수 | 500개 이상 | row group 파편화(N3)가 드러나는 규모 |
-| 재시작 | 런 중 최소 1회 | 그 part 수에서의 시작 시간 실측 |
+| Backend | Tier B configuration (`file://` + latency injection) | None of the items in this table depends on the backend, so Docker is unnecessary |
+| **Termination condition** | **Processed event count** (`LOGGYTRACY_LOAD_EVENTS`) | Memory stability, part accumulation, and backlog trends are functions of *work processed*. Time was a proxy and a poor one — pushing harder reaches the same state sooner. Time (`LOAD_SECONDS`) is only a safety cap |
+| ~~Reach 10,000 parts~~ | **Separate configuration required** | Part count stays bounded while merge works normally. Measuring P1-11 (startup time linear in part count) requires effectively disabling merge, which asks a different question from steady-state stability and cannot be mixed into the same run |
+| Tenant count | At least 500 | Scale at which row-group fragmentation (N3) appears |
+| Restart | At least once during the run | Measure startup time at that part count |
 
-### 수용 기준
+### Acceptance criteria
 
-머신이 목표 사양(4 vCPU / 16 GiB)이 아니므로 **절대 수치는 게이트가 아니라 기록**이다. 게이트는
-행위 불변량이다.
+Because the machine is not the target specification (4 vCPU / 16 GiB), **absolute values are records, not
+gates**. Gates are behavioral invariants.
 
-- [ ] ack된 데이터의 유실 0 (재시작 후 replay로 확인)
-- [ ] WAL backlog 유계 — 상한을 넘으면 429가 나오고, 부하가 걷히면 해소된다
-- [ ] RSS가 설정한 상한 아래에서 안정 (증가 추세 없음)
-- [ ] flush·merge·retention이 전부 진행 중 (`*_success_total`이 증가, `*_errors_total`이 정체)
-- [ ] eviction → restore 왕복 성공, restore 오류 0
-- [ ] graceful shutdown이 무손실 (M6 리허설)
-- [ ] 두 인스턴스를 같은 prefix에 띄우면 구 인스턴스가 fence되고 비정상 종료
-- [ ] p50/p95/p99·RSS·part 수·시작 시간을 **기록** (판정하지 않음)
+- [ ] Zero loss of acked data (confirmed by replay after restart)
+- [ ] WAL backlog is bounded — 429 appears above the limit and clears when load subsides
+- [ ] RSS is stable below the configured limit (no upward trend)
+- [ ] Flush, merge, and retention all progress (`*_success_total` increases, `*_errors_total` stays flat)
+- [ ] Eviction → restore round trip succeeds, with zero restore errors
+- [ ] Graceful shutdown is lossless (M6 rehearsal)
+- [ ] When two instances use the same prefix, the old instance is fenced and exits abnormally
+- [ ] **Record** p50/p95/p99, RSS, part count, and startup time (do not gate on them)
 
-#### eviction → restore를 관측하려면
+#### Observing eviction → restore
 
-기본 구성으로는 관측되지 않는다. merge가 8초마다 최근 part로 통합하고 그 결과물은 방금 로컬에
-쓴 것이라 항상 존재하며, retention이 20초 만에 옛 데이터를 지워 프로브가 빈 범위를 질의한다.
-둘 다 그 자체로는 정상 동작이다.
+This is not observed with the default configuration. Merge consolidates recent parts every eight seconds,
+and its result was just written locally so it always exists; retention deletes old data after 20 seconds,
+leaving the probe to query an empty range. Both behaviors are normal on their own.
 
-관측하려면 세 가지를 함께 바꾼다.
+Change all three settings together to observe it.
 
 ```
-LOGGYTRACY_MERGE_INTERVAL=3600s     # part가 쌓이게 둔다
-LOGGYTRACY_RETENTION_PERIOD=off     # 프로브가 겨냥할 옛 데이터를 남긴다
-LOGGYTRACY_CACHE_MAX_BYTES=524288   # 작업 집합이 캐시를 넘게 한다
+LOGGYTRACY_MERGE_INTERVAL=3600s     # let parts accumulate
+LOGGYTRACY_RETENTION_PERIOD=off     # retain old data for the probe
+LOGGYTRACY_CACHE_MAX_BYTES=524288   # make the working set exceed the cache
 LOGGYTRACY_LOAD_RESTORE_LOOKBACK_SECONDS=40
 ```
 
-이 구성에서 축출 111회, part 66개, `restore_observed: true`, 복원 오류 0을 확인했다
-(복원 지연 p50 31ms / p95 749ms / p99 1.6s).
+With this configuration, 111 evictions, 66 parts, `restore_observed: true`, and zero restore errors were
+observed (restore latency p50 31 ms / p95 749 ms / p99 1.6 s).
 
-**한 가지 남은 한계:** 프로브는 "복원해서 읽었다"와 "아무것도 매칭되지 않았다"를 구분하지 못한다
-— 둘 다 200이다. `restore_observed`는 서버 쪽 카운터로 확인하므로 이 런은 유효하지만, 프로브
-자체가 읽은 행 수를 확인하도록 만드는 것이 더 낫다.
+**One remaining limitation:** The probe cannot distinguish "restored and read" from "nothing matched" —
+both return 200. This run is valid because `restore_observed` is confirmed by a server-side counter, but it
+would be better for the probe itself to verify the number of rows read.
 
-측정한 숫자는 [`LOAD_RESULTS.md`](LOAD_RESULTS.md)에 남긴다. 채팅이나 터미널에만 있던 숫자는
-사라지고, 사라진 숫자는 다음에 다시 재게 된다. 판정과 함께 머신 프로파일·빌드 리비전·시드를
-반드시 적고, 목표 사양이 아닌 머신의 수치를 목표 대비 합격으로 적지 않는다.
+Record measurements in [`LOAD_RESULTS.md`](LOAD_RESULTS.md). Numbers kept only in chat or a terminal
+disappear and must be measured again. Always record the machine profile, build revision, and seed with the
+result, and never call values from a non-target machine a pass against the target.
 
-**재현 가능한 것은 문서가 아니라 테스트로 둔다.** 부하 런이 필요한 것만 런으로 남긴다 —
-backpressure가 걸리고 풀리는가, 타임스탬프 경계, 파편화 비율은 전부 결정론적이므로 `cargo test`가
-검사하고 문서는 숫자만 인용한다.
+**Keep reproducible facts in tests, not in prose.** Keep runs only for things that require load — whether
+backpressure engages and clears, timestamp boundaries, and fragmentation ratios are deterministic, so
+`cargo test` checks them and this document quotes only numbers.
 
 ---
 
-## 첫 실 배포 절차
+## First real-deployment procedure
 
-로컬 검증이 끝났다고 위 R1~R5가 사라지지 않는다. 실제로 처음 붙이는 시점에 다음을 순서대로 한다.
+Completing local validation does not remove R1–R5. When connecting for the first time, do the following in order.
 
-1. **CAS 확인 — 자동이다 (R4).** 프리플라이트가 부팅 때 스스로 검사하고, 통과하지 못하면 기동을
-   거부한다. 기동 거부 메시지에 무엇을 설정해야 하는지가 적혀 있다. 사람이 할 일은 없다.
-2. **소규모 카나리 (R1).** 실 트래픽의 일부만 흘리며 `remote_restore_latency_ns_total`과
-   `flush_errors_total`을 본다. 로컬 측정치와 자릿수가 다르면 `flush_max_interval`과
-   캐시 상한을 그 자릿수에 맞춰 다시 잡는다.
-3. **스로틀 관찰 (R2).** 위 계산상 걸릴 가능성은 낮지만, 걸린다면 조용히 걸리지 않는다 —
-   `flush_errors_total`의 증가가 `503`/`SlowDown`과 함께 온다. 1차 대응은 flush 주기를 늘리는
-   것이고, 근본 대응은 manifest를 세대별 delta + 주기적 스냅샷으로 바꾸는 것이다(P1-11).
-4. **비용 확인 (R3).** 첫 청구 주기를 반드시 확인한다. 로컬 연산 횟수 계측이 있다면 그 예측치와
-   대조하고, 없다면 이 시점이 계측을 붙일 이유가 된다.
+1. **CAS check — automatic (R4).** The preflight checks itself at startup and refuses to run if it fails.
+   The startup-rejection message says what to configure. Nothing is required from a person.
+2. **Small canary (R1).** Send only a fraction of real traffic and watch `remote_restore_latency_ns_total`
+   and `flush_errors_total`. If their scale differs from local measurements, retune `flush_max_interval`
+   and the cache limit to that scale.
+3. **Observe throttling (R2).** The calculation suggests it is unlikely, but it will not be silent if it
+   occurs — growth in `flush_errors_total` comes with `503`/`SlowDown`. The first response is to increase
+   the flush interval; the fundamental response is to change the manifest to generational deltas plus
+   periodic snapshots (P1-11).
+4. **Check cost (R3).** Check the first billing cycle. If local operation-count instrumentation exists,
+   compare it with the estimate; if not, this is a reason to add it.
 
-이 네 가지가 확인되기 전까지는 **운영 중인 관측 데이터의 유일한 사본을 이 엔진에 두지 않는다.**
+Until these four items are confirmed, **do not make this engine the only copy of operational observability data.**

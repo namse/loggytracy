@@ -1,176 +1,177 @@
-# 설정 레퍼런스
+# Configuration reference
 
-모든 설정은 환경변수다. `Config::from_env`가 읽고 `Config::validate`가 검사하며, 검사에 걸리면
-기동하지 않는다 — 잘못된 설정으로 뜨는 것보다 안 뜨는 것이 낫다는 판단이다.
+All settings are environment variables. `Config::from_env` reads them and `Config::validate` checks
+them; if validation fails, startup is refused because not starting is safer than running with a bad configuration.
 
-이 문서가 `src/config.rs`의 knob을 하나도 빠뜨리지 않았는지는 테스트가 강제한다
-(`every_configuration_knob_is_documented`). 코드에 knob을 추가하고 여기 적지 않으면 빌드가 아니라
-테스트가 깨진다.
+Tests enforce that this document does not omit any knob from `src/config.rs`
+(`every_configuration_knob_is_documented`). Adding a knob to the code without documenting it here
+breaks the tests rather than the build.
 
-기간 값은 `500ms`, `30s`, `5m`, `2h`, `7d` 형식이다. `off`/`none`/빈 문자열은 "끔"을 뜻하며,
-끌 수 있는 knob에만 유효하다.
+Duration values use formats such as `500ms`, `30s`, `5m`, `2h`, and `7d`. `off`/`none`/an empty
+string mean "disabled" and are valid only for knobs that can be disabled.
 
 ---
 
-## 반드시 정해야 하는 것
+## Required settings
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_DATA_DIR` | `./data` | WAL·체크포인트·로컬 part 캐시. **이 디렉터리가 곧 미flush 데이터의 유일한 사본이다.** 장비 교체 시 이 디스크를 버리면 안 된다 |
-| `LOGGYTRACY_OBJECT_STORE_URL` | 없음 (로컬 전용) | `s3://버킷/prefix` 또는 `file:///경로`. **미설정이면 S3 계층화 없이 로컬 디스크만 쓴다** — 디스크가 곧 source of truth가 되므로 운영에는 부적합 |
-| `LOGGYTRACY_LISTEN_ADDR` | `0.0.0.0:3100` | Loki 호환 HTTP. TLS는 지원하지 않으므로 **신뢰 경계 안**에 두어야 한다 |
-| `LOGGYTRACY_OTLP_GRPC_ADDR` | `0.0.0.0:4317` | OTLP gRPC. 트레이스와 **로그** 서비스가 같은 리스너에 붙는다. 위와 같음 |
+| `LOGGYTRACY_DATA_DIR` | `./data` | WAL, checkpoint, and local part cache. **This directory is the only copy of unflushed data.** Do not discard this disk during hardware replacement |
+| `LOGGYTRACY_OBJECT_STORE_URL` | unset (local-only) | `s3://bucket/prefix` or `file:///path`. **When unset, only the local disk is used without S3 tiering** — unsuitable for production because the disk becomes the source of truth |
+| `LOGGYTRACY_LISTEN_ADDR` | `0.0.0.0:3100` | Loki-compatible HTTP. TLS is unsupported, so it must remain **inside the trust boundary** |
+| `LOGGYTRACY_OTLP_GRPC_ADDR` | `0.0.0.0:4317` | OTLP gRPC. The trace and **log** services share this listener. Same trust-boundary requirement |
 
-`file://`은 **CAS를 하지 않는 단일 프로세스 개발용**이다. 공유·네트워크 스토리지에 쓰면 manifest
-lost update가 나고, 그건 곧 데이터 손실이다. `from_url`이 기동 시 경고를 남긴다.
+`file://` is for **single-process development and does not provide CAS**. Using it on shared or network
+storage causes manifest lost updates, which means data loss. `from_url` logs a warning at startup.
 
-`object_store`에 넘어가는 자격증명·엔드포인트는 `AWS_*` 또는 `OBJECT_STORE_*` 환경변수로 준다
-(`OBJECT_STORE_*`가 우선). S3 호환 스토어에서는 **`OBJECT_STORE_CONDITIONAL_PUT=etag`가 사실상
-필수**이며, 빠지면 부팅 프리플라이트가 기동을 거부한다.
+Credentials and endpoints passed to `object_store` are supplied through `AWS_*` or `OBJECT_STORE_*`
+environment variables (`OBJECT_STORE_*` takes precedence). For S3-compatible stores,
+**`OBJECT_STORE_CONDITIONAL_PUT=etag` is effectively required**; without it, the startup preflight refuses to run.
 
-## 테넌시
+## Multi-tenancy
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_DEFAULT_TENANT` | `default` | `X-Scope-OrgID` 없는 요청이 귀속될 테넌트 |
-| `LOGGYTRACY_MISSING_TENANT_POLICY` | `default` | `default` 또는 `reject`. 헤더 없는 요청을 기본 테넌트로 받을지 거절할지 |
-| `LOGGYTRACY_ALLOWED_TENANTS` | 없음 (전부 허용) | 쉼표 구분 목록. 목록 밖 테넌트는 403. **헤더는 앞단이 붙인 값을 증명 없이 신뢰하므로, 목록이 없으면 리스너에 닿는 누구나 테넌트를 만들 수 있다** |
-| `LOGGYTRACY_TENANT_POLICY_TOKEN` | 없음 (기능 꺼짐) | 설정하면 테넌트별 정책 admin API가 열리고 전역 retention은 쓸 수 없게 된다 |
-| `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` | 없음 (무제한) | control plane이 rate를 밀어주지 않은 테넌트에 적용할 기본값 |
-| `LOGGYTRACY_TENANT_INGEST_BURST` | `10s` | 테넌트가 쓰지 않은 rate를 적립해 한 번에 쓸 수 있는 시간. 용량은 `MAX_PUSH_BYTES` 아래로 내려가지 않는다 |
+| `LOGGYTRACY_DEFAULT_TENANT` | `default` | Tenant assigned to requests without `X-Scope-OrgID` |
+| `LOGGYTRACY_MISSING_TENANT_POLICY` | `default` | `default` or `reject`; whether requests without a header are assigned to the default tenant or rejected |
+| `LOGGYTRACY_ALLOWED_TENANTS` | unset (allow all) | Comma-separated list. Tenants outside the list receive 403. **Because the header value supplied by the upstream is trusted without proof, anyone who can reach the listener can create any tenant when this list is unset** |
+| `LOGGYTRACY_TENANT_POLICY_TOKEN` | unset (disabled) | Enables the per-tenant policy admin API and disables global retention |
+| `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` | unset (unlimited) | Default for tenants whose rate has not been pushed by the control plane |
+| `LOGGYTRACY_TENANT_INGEST_BURST` | `10s` | Time during which an unused tenant rate can accumulate for one burst. Capacity never falls below `MAX_PUSH_BYTES` |
 
-**제약:** `MISSING_TENANT_POLICY=default`인데 `ALLOWED_TENANTS`에 기본 테넌트가 없으면 기동하지
-않는다 — 헤더 없는 요청마다 목록 밖 테넌트가 생기기 때문이다.
+**Constraint:** startup is refused when `MISSING_TENANT_POLICY=default` but the default tenant is absent
+from `ALLOWED_TENANTS`, because every request without a header would create a tenant outside the list.
 
-**제약:** 저장된 테넌트 정책이 하나라도 있는데 `TENANT_POLICY_TOKEN`이 없으면 기동하지 않는다.
-토큰이 없으면 쿼리 클램프가 사라져 삭제된 데이터가 되살아난다.
+**Constraint:** startup is refused when any tenant policy is stored but `TENANT_POLICY_TOKEN` is absent.
+Without the token, query clamping disappears and deleted data can reappear.
 
-### 테넌트별 ingest rate는 여기 있지 않다
+### Per-tenant ingest rates are not configured here
 
-플랜마다 다르고 출시 후에도 바뀌므로 **control plane이 테넌트마다 push한다.** 정책 body의
-`ingest_rate` 필드이며 `retention`과 같은 레코드에 산다. 값은 `4MiB/s` 같은 초당 바이트,
-`0`(쓰기 금지), `unlimited` 중 하나다.
+Because rates vary by plan and can change after launch, **the control plane pushes them per tenant.**
+They are the `ingest_rate` field in the policy body, alongside `retention`. The value is bytes per
+second such as `4MiB/s`, `0` (writes disabled), or `unlimited`.
 
 ```
 PUT /loggytracy/api/v1/admin/tenants/{tenant}/retention
 {"retention": "7d", "ingest_rate": "4MiB/s"}
 ```
 
-body는 정책 전체이지 patch가 아니다. `ingest_rate`를 빼고 push하면 기존 값이 **지워지고**
-위의 기본값으로 돌아간다.
+The body is the complete policy, not a patch. If it is pushed without `ingest_rate`, the existing value
+is **cleared** and reverts to the default above.
 
-이 rate는 인스턴스 하나에 대한 몫이지 플랜이 파는 월 사용량이 아니다. 한 달치는 여러
-인스턴스에 걸쳐 쓰이고 인스턴스보다 오래 사는 상태라 control plane만 들고 있을 수 있다.
+This rate applies to one instance; it is not the monthly usage sold by a plan. Monthly usage spans
+multiple instances and outlives any instance, so only the control plane can own that state.
 
-## Ingest 입력 제한
+## Ingest input limits
 
-전부 저널에 쓰기 **전**에 검사하므로, 거절된 요청은 WAL에 남지 않는다.
+All limits are checked **before** writing to the journal, so rejected requests leave no WAL record.
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_MAX_PUSH_BYTES` | 16 MiB | 압축된 push 본문 상한 |
-| `LOGGYTRACY_MAX_DECOMPRESSED_PUSH_BYTES` | 64 MiB | snappy 헤더가 신고한 길이의 상한. 헤더가 할당 크기를 정하지 못하게 막는다 |
-| `LOGGYTRACY_MAX_LINE_BYTES` | 256 KiB | 로그 라인 하나 |
-| `LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM` | 30 | 스트림당 라벨 개수 |
+| `LOGGYTRACY_MAX_PUSH_BYTES` | 16 MiB | Maximum compressed push body size |
+| `LOGGYTRACY_MAX_DECOMPRESSED_PUSH_BYTES` | 64 MiB | Maximum length reported by the snappy header; prevents the header from determining the allocation size |
+| `LOGGYTRACY_MAX_LINE_BYTES` | 256 KiB | Maximum size of one log line |
+| `LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM` | 30 | Maximum labels per stream |
 | `LOGGYTRACY_MAX_LABEL_NAME_BYTES` | 1024 | |
 | `LOGGYTRACY_MAX_LABEL_VALUE_BYTES` | 2048 | |
-| `LOGGYTRACY_MAX_TIMESTAMP_AGE` | `7d` (`off` 가능) | 이보다 오래된 타임스탬프 거절 |
-| `LOGGYTRACY_MAX_TIMESTAMP_SKEW` | `1h` (`off` 가능) | 이보다 미래인 타임스탬프 거절. **미래 part는 retention cutoff에 영원히 걸리지 않는다** — 초/밀리초를 나노초로 보내는 단위 착오가 흔하다 |
+| `LOGGYTRACY_MAX_TIMESTAMP_AGE` | `7d` (`off` allowed) | Reject timestamps older than this |
+| `LOGGYTRACY_MAX_TIMESTAMP_SKEW` | `1h` (`off` allowed) | Reject timestamps farther in the future than this. **A future part never reaches the retention cutoff** — confusing seconds or milliseconds with nanoseconds is common |
 
-과거 데이터를 일괄 적재할 때만 두 타임스탬프 knob을 `off`로 둔다.
+Set both timestamp knobs to `off` only when bulk-loading historical data.
 
 ## Backpressure
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_MAX_MEMTABLE_BYTES` | 256 MiB (`off` 가능) | 두 memtable 합계가 넘으면 429 |
-| `LOGGYTRACY_MAX_WAL_BACKLOG_BYTES` | 1 GiB (`off` 가능) | 미flush WAL이 넘으면 429 |
-| `LOGGYTRACY_BACKPRESSURE_RETRY_AFTER` | `1s` | 429에 실리는 `Retry-After` |
+| `LOGGYTRACY_MAX_MEMTABLE_BYTES` | 256 MiB (`off` allowed) | Return 429 when the two memtables exceed this combined size |
+| `LOGGYTRACY_MAX_WAL_BACKLOG_BYTES` | 1 GiB (`off` allowed) | Return 429 when unflushed WAL exceeds this size |
+| `LOGGYTRACY_BACKPRESSURE_RETRY_AFTER` | `1s` | `Retry-After` value included in 429 responses |
 
-**제약:** `MAX_MEMTABLE_BYTES`는 `FLUSH_MAX_BYTES`보다 작을 수 없다 — flush에게 옮기라고 시키지도
-않은 데이터를 이유로 쓰기를 거절하게 된다.
+**Constraint:** `MAX_MEMTABLE_BYTES` cannot be smaller than `FLUSH_MAX_BYTES`, or writes would be
+rejected for data that has not even reached the threshold at which flushing is requested.
 
-끄면 예전 동작(무한 증가 후 OOM)으로 돌아간다. 클라이언트가 429에 backoff하고 자체 WAL로 버티는
-것이 아키텍처의 전제이므로, 끄는 것은 그 전제를 깨는 일이다.
+Disabling these limits restores the old behavior of growing without bound until OOM. The architecture
+assumes clients back off on 429 and rely on their own WAL, so disabling them breaks that assumption.
 
-## 저널과 flush
+## Journal and flush
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_MAX_BATCH_BYTES` | 1 MiB | 한 번의 write+fsync에 묶는 최대 바이트 |
-| `LOGGYTRACY_MAX_BATCH_MS` | `0` (대기 없음) | **0이 기본이자 권장.** group commit은 쓰기 뒤에서 형성된다 — write/fsync 하는 동안 도착한 것이 다음 배치가 된다. 올리면 커넥션당 처리량이 `1000/이 값` pushes/s로 묶인다. fsync가 대기보다 비싼 디스크에서만 올린다 |
-| `LOGGYTRACY_FLUSH_MAX_BYTES` | 1 MiB | memtable이 이만큼 차면 flush |
-| `LOGGYTRACY_FLUSH_MAX_INTERVAL` | `5s` | 크기에 못 미쳐도 이 주기로 flush. **예상치 못한 디스크 손실 시의 RPO가 이 값이다** |
-| `LOGGYTRACY_FLUSH_CHECK_INTERVAL` | `500ms` | flush 루프가 조건을 확인하는 주기 |
-| `LOGGYTRACY_ROW_GROUP_SIZE` | 8192 (최대 65536) | Parquet row group 행 수. 테넌트 경계에서도 끊기므로 **실제 row group 수의 하한은 part 안의 테넌트 수**다 |
+| `LOGGYTRACY_MAX_BATCH_BYTES` | 1 MiB | Maximum bytes grouped into one write+fsync |
+| `LOGGYTRACY_MAX_BATCH_MS` | `0` (no wait) | **0 is the default and recommended.** Group commit forms behind writes: data arriving during write/fsync goes into the next batch. A nonzero value caps per-connection throughput at `1000/this value` pushes/s. Increase it only on disks where fsync costs more than waiting |
+| `LOGGYTRACY_FLUSH_MAX_BYTES` | 1 MiB | Flush when the memtable reaches this size |
+| `LOGGYTRACY_FLUSH_MAX_INTERVAL` | `5s` | Flush at this interval even when the size threshold is not reached. **This value is the RPO for unexpected disk loss** |
+| `LOGGYTRACY_FLUSH_CHECK_INTERVAL` | `500ms` | Interval at which the flush loop checks conditions |
+| `LOGGYTRACY_ROW_GROUP_SIZE` | 8192 (maximum 65536) | Parquet row group row count. Groups also stop at tenant boundaries, so **the number of tenants in a part is a lower bound for the actual row group count** |
 
 ## Merge
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
 | `LOGGYTRACY_MERGE_INTERVAL` | `30s` | |
-| `LOGGYTRACY_MERGE_MIN_PART_COUNT` | 4 (최소 2) | 이보다 적으면 일반 merge를 하지 않는다 |
-| `LOGGYTRACY_MERGE_TARGET_PART_ROWS` | 1,000,000 | 출력 목표 행 수 (soft) |
-| `LOGGYTRACY_MERGE_MAX_PART_ROWS` | 4,000,000 | 출력 상한 (hard) |
-| `LOGGYTRACY_MERGE_MAX_INPUT_BYTES` | 512 MiB | 그룹 하나의 입력 상한. **비압축(materialized) 바이트** |
-| `LOGGYTRACY_MERGE_MAX_MEMORY_BYTES` | 1 GiB | 한 번의 읽기가 materialize할 수 있는 하드 상한 |
+| `LOGGYTRACY_MERGE_MIN_PART_COUNT` | 4 (minimum 2) | Do not perform a normal merge below this count |
+| `LOGGYTRACY_MERGE_TARGET_PART_ROWS` | 1,000,000 | Target output row count (soft) |
+| `LOGGYTRACY_MERGE_MAX_PART_ROWS` | 4,000,000 | Maximum output row count (hard) |
+| `LOGGYTRACY_MERGE_MAX_INPUT_BYTES` | 512 MiB | Input limit for one group. **Uncompressed (materialized) bytes** |
+| `LOGGYTRACY_MERGE_MAX_MEMORY_BYTES` | 1 GiB | Hard limit that one read can materialize |
 | `LOGGYTRACY_MERGE_MAX_GROUPS_PER_TICK` | 16 | |
 
-**제약:** `MERGE_MAX_INPUT_BYTES <= MERGE_MAX_MEMORY_BYTES`. 두 값 모두 part meta에 기록된
-`materialized_bytes`(읽었을 때 실제로 차지하는 메모리)와 비교되므로 단위가 같다. 상한을 넘으면
-그룹을 절반씩, 단일 part는 row group 윈도로 나눠 재작성하므로 영구 실패는 없다.
+**Constraint:** `MERGE_MAX_INPUT_BYTES <= MERGE_MAX_MEMORY_BYTES`. Both values are compared with
+`materialized_bytes` recorded in part metadata (the memory actually occupied when read), so their units
+match. If a limit is exceeded, groups are split in half and a single part is rewritten in row-group
+windows, so the operation cannot fail permanently.
 
 ## Retention
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_RETENTION_PERIOD` | 없음 (**무한 보관**) | 전역 보관 기간. 미설정이면 S3와 디스크가 영원히 자란다 |
+| `LOGGYTRACY_RETENTION_PERIOD` | unset (**retain forever**) | Global retention period. If unset, S3 and the disk grow forever |
 | `LOGGYTRACY_RETENTION_INTERVAL` | `5m` | |
-| `LOGGYTRACY_RETENTION_BATCH_SIZE` | 100 | 한 tick에 처리할 part 수 |
-| `LOGGYTRACY_RETENTION_GRACE_PERIOD` | `1h` | orphan 객체를 지우기 전 유예 |
-| `LOGGYTRACY_MAX_RETENTION_RUNTIME` | `2m` | retention/GC 오브젝트 스토어 작업 타임아웃 |
-| `LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` | 0.5 | part의 만료 행 비율이 이 값을 넘으면 재작성. 테넌트 삭제(`retention: "0"`)는 이 값을 무시한다 |
+| `LOGGYTRACY_RETENTION_BATCH_SIZE` | 100 | Number of parts processed per tick |
+| `LOGGYTRACY_RETENTION_GRACE_PERIOD` | `1h` | Grace period before deleting orphan objects |
+| `LOGGYTRACY_MAX_RETENTION_RUNTIME` | `2m` | Object-store operation timeout for retention/GC |
+| `LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` | 0.5 | Rewrite when the expired-row fraction of a part exceeds this value. Tenant deletion (`retention: "0"`) ignores this value |
 
-**제약:** `RETENTION_PERIOD`와 `TENANT_POLICY_TOKEN`은 동시에 설정할 수 없다. 테넌트별 retention이
-전역 기간을 대체하며, 조용히 하나가 무시되는 것보다 기동 실패가 낫다.
+**Constraint:** `RETENTION_PERIOD` and `TENANT_POLICY_TOKEN` cannot be set together. Per-tenant
+retention replaces the global period, and startup failure is safer than silently ignoring one setting.
 
-## 캐시
+## Cache
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_CACHE_MAX_BYTES` | 10 GiB | 로컬 part 캐시 상한. 넘으면 LRU eviction |
+| `LOGGYTRACY_CACHE_MAX_BYTES` | 10 GiB | Local part cache limit. Exceeding it triggers LRU eviction |
 | `LOGGYTRACY_CACHE_EVICTION_INTERVAL` | `30s` | |
 
-stream index 등 작은 카탈로그 파일은 eviction 대상이 아니다. 따라서 **라벨 카디널리티가 폭발하면
-evict 불가능한 디스크 사용량**이 된다.
+Small catalog files such as the stream index are not evicted. Therefore, **a label-cardinality explosion
+becomes disk usage that cannot be evicted**.
 
-## 쿼리 리소스 상한
+## Query resource limits
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_MAX_QUERY_RANGE` | 없음 | 요청 가능한 최대 시간 범위 |
+| `LOGGYTRACY_MAX_QUERY_RANGE` | unset | Maximum requested time range |
 | `LOGGYTRACY_MAX_QUERY_SCAN_ROWS` | 5,000,000 | |
 | `LOGGYTRACY_MAX_QUERY_SCAN_BYTES` | 2 GiB | |
 | `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES` | 512 MiB | |
-| `LOGGYTRACY_MAX_LOG_LIMIT` | 100,000 | `limit` 파라미터 상한 |
-| `LOGGYTRACY_MAX_QUERY_RUNTIME` | `30s` | 메타데이터 엔드포인트의 타임아웃이기도 하다 |
-| `LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS` | 8 | 메타데이터 엔드포인트와 공유한다 |
-| `LOGGYTRACY_MAX_SERIES_MATCHERS` | 32 | `series`의 `match[]` 개수. 매처 하나가 전체 패스 하나다 |
-| `LOGGYTRACY_MAX_RESTORE_RUNTIME` | `25s` | 캐시 미스 복원 타임아웃 |
+| `LOGGYTRACY_MAX_LOG_LIMIT` | 100,000 | Maximum `limit` parameter |
+| `LOGGYTRACY_MAX_QUERY_RUNTIME` | `30s` | Also the timeout for metadata endpoints |
+| `LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS` | 8 | Shared with metadata endpoints |
+| `LOGGYTRACY_MAX_SERIES_MATCHERS` | 32 | Number of `match[]` entries for `series`. Each matcher is a full pass |
+| `LOGGYTRACY_MAX_RESTORE_RUNTIME` | `25s` | Cache-miss restore timeout |
 
-### 메트릭 쿼리
+### Metric queries
 
-| 변수 | 기본값 |
+| Variable | Default |
 |---|---|
 | `LOGGYTRACY_MAX_METRIC_EVALUATION_POINTS` | 10,000 |
 | `LOGGYTRACY_MAX_METRIC_ROWS` | 1,000,000 |
 | `LOGGYTRACY_MAX_METRIC_SERIES` | 100,000 |
-| `LOGGYTRACY_MAX_METRIC_SAMPLES` | (`config.rs` 참조) |
+| `LOGGYTRACY_MAX_METRIC_SAMPLES` | (see `config.rs`) |
 | `LOGGYTRACY_MAX_CONCURRENT_METRIC_EVALUATIONS` | 4 |
 
-### 트레이스 쿼리
+### Trace queries
 
-| 변수 | 기본값 |
+| Variable | Default |
 |---|---|
 | `LOGGYTRACY_MAX_TRACE_SPANS` | 100,000 |
 | `LOGGYTRACY_MAX_TRACE_SEARCH_LIMIT` | 1,000 |
@@ -178,51 +179,49 @@ evict 불가능한 디스크 사용량**이 된다.
 | `LOGGYTRACY_MAX_TRACE_QUERY_RUNTIME` | `30s` |
 | `LOGGYTRACY_MAX_TRACE_RESTORE_RUNTIME` | `25s` |
 
-## 기동과 종료
+## Startup and shutdown
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_STARTUP_RETRY_BUDGET` | `5m` | 오브젝트 스토어 기동 단계를 이 시간까지 재시도한다. 일시 장애를 흡수하되, 넘기면 종료해 오케스트레이터의 재시작 backoff에 넘긴다 |
-| `LOGGYTRACY_SHUTDOWN_FLUSH_WARN_AFTER` | `30s` | force-flush가 이만큼 실패하면 stdout에 운영자 경고 |
+| `LOGGYTRACY_STARTUP_RETRY_BUDGET` | `5m` | Retry object-store startup steps for this duration. Absorb transient failures, then exit and let the orchestrator apply restart backoff |
+| `LOGGYTRACY_SHUTDOWN_FLUSH_WARN_AFTER` | `30s` | Warn the operator on stdout when force-flush has failed for this long |
 
-## 부하 하네스 전용 (운영에서 쓰지 않는다)
+## Load harness only (do not use in production)
 
-`scripts/run_load_local.sh`가 쓰는 인프로세스 지연·오류 주입이다. 하나라도 설정되면 래퍼가
-활성화되므로, **운영 환경에는 절대 두지 않는다.**
+These settings inject in-process latency and errors for `scripts/run_load_local.sh`. Setting any of them
+activates the wrapper, so **never set them in production.**
 
-| 변수 | 설명 |
+| Variable | Description |
 |---|---|
-| `LOGGYTRACY_OBJECT_STORE_LATENCY_MS` | 쓰기 지연 base |
-| `LOGGYTRACY_OBJECT_STORE_READ_LATENCY_MS` | 읽기 지연 base (미설정 시 쓰기 값) |
-| `LOGGYTRACY_OBJECT_STORE_LATENCY_JITTER_MS` | 위에 더해지는 `uniform(0, jitter)` |
-| `LOGGYTRACY_OBJECT_STORE_ERROR_RATE` | 0.0~1.0. **쓰기에만** 주입된다 |
-| `LOGGYTRACY_OBJECT_STORE_FAULT_SEED` | 재현용 시드 |
+| `LOGGYTRACY_OBJECT_STORE_LATENCY_MS` | Base write latency |
+| `LOGGYTRACY_OBJECT_STORE_READ_LATENCY_MS` | Base read latency (write value when unset) |
+| `LOGGYTRACY_OBJECT_STORE_LATENCY_JITTER_MS` | Added `uniform(0, jitter)` |
+| `LOGGYTRACY_OBJECT_STORE_ERROR_RATE` | 0.0–1.0. Injected **only into writes** |
+| `LOGGYTRACY_OBJECT_STORE_FAULT_SEED` | Reproduction seed |
 
-## 시계
+## Clocks
 
-프로덕션에서 설정할 것은 없다. 다만 시간 의존 동작이 어떻게 검사되는지는 알아 둘 값어치가 있다.
+There is nothing to configure in production. It is still useful to understand how time-dependent behavior is tested.
 
-- **단조 시계**(flush 주기, force-flush backoff, 기동 재시도 예산)는 `tokio::time::Instant`를 쓴다.
-  `tokio::time::pause()`가 이것을 가상화하므로, 5분짜리 예산을 10밀리초에 검사한다.
-- **벽시계**(타임스탬프 수용 윈도우, 쿼리 기본 범위, retention cutoff)는 `Clock`을 통해 읽는다.
-  테스트가 시계를 세우고 밀 수 있어서 경계를 정확히 겨냥할 수 있다 — 데이터를 과거로 조작하는
-  대신 시간을 움직인다.
+- **Monotonic clock** (flush interval, force-flush backoff, startup retry budget) uses `tokio::time::Instant`.
+  `tokio::time::pause()` virtualizes it, so a five-minute budget can be tested in ten milliseconds.
+- **Wall clock** (timestamp acceptance window, default query range, retention cutoff) is read through `Clock`.
+  Tests can freeze and advance the clock to target boundaries precisely instead of changing data into the past.
 
-## 로깅
+## Logging
 
-`RUST_LOG`를 그대로 따른다. 미설정 시 `loggytracy=info,warn`.
+The process follows `RUST_LOG` directly. When unset, it uses `loggytracy=info,warn`.
 
 ---
 
-## 튜닝의 출발점
+## Tuning starting points
 
-- **RPO를 줄이고 싶다** → `FLUSH_MAX_INTERVAL`을 낮춘다. 오브젝트 스토어 쓰기 횟수가 그만큼 는다
-- **ack 지연이 높다** → `MAX_BATCH_MS`가 0인지 먼저 본다. 0이 아니면 그 값이 곧 지연의 하한이다
-- **WAL backlog가 는다** → flush가 ingest를 못 따라가는 것이다. 429가 나오는지 보고
-  (`loggytracy_ingest_throttled_total`), 안 나오면 상한이 너무 높은 것이다
-- **`/ready`가 503에서 안 돌아온다** → `/metrics`의 `*_errors_total` 중 무엇이 늘고 있는지 본다.
-  flush·merge·retention·오브젝트 스토어·로컬 캐시가 각각 독립적으로 readiness를 내린다
-- **디스크가 찬다** → `CACHE_MAX_BYTES`를 줄이거나 `RETENTION_PERIOD`를 설정한다. 후자가
-  미설정이면 아무것도 지워지지 않는다
-- **p95/p99를 보고 싶다** → `loggytracy_query_latency_ms_bucket`에 `histogram_quantile`을 쓴다.
-  `*_latency_ns_total`은 평균만 준다
+- **Want a smaller RPO** → Lower `FLUSH_MAX_INTERVAL`. Object-store writes increase accordingly
+- **High ack latency** → First check whether `MAX_BATCH_MS` is 0. If not, that value is the latency floor
+- **WAL backlog is growing** → Flush cannot keep up with ingest. Check for 429 responses
+  (`loggytracy_ingest_throttled_total`); if none appear, the limit is too high
+- **`/ready` stays at 503** → Check which `/metrics` `*_errors_total` is increasing.
+  Flush, merge, retention, object store, and local cache each lower readiness independently
+- **The disk is filling** → Reduce `CACHE_MAX_BYTES` or set `RETENTION_PERIOD`. Nothing is deleted when the latter is unset
+- **Want p95/p99** → Apply `histogram_quantile` to `loggytracy_query_latency_ms_bucket`.
+  `*_latency_ns_total` provides only an average

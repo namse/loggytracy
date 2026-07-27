@@ -102,7 +102,7 @@ fn group_for_merge(parts: &[Arc<PartReader>], config: &Config) -> Vec<Vec<Arc<Pa
     let min_part_count = config.merge_min_part_count.max(2);
     for r in parts {
         if r.meta().row_count >= config.merge_max_part_rows {
-            // 이미 큰 part는 merge 그룹에 넣지 않음
+            // Do not add an already-large part to a merge group.
             continue;
         }
 

@@ -339,7 +339,7 @@ mod tests {
             .expect("push");
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        // push가 204를 반환한 시점에 writer가 이미 insert했는지 확인 (#2 원자성)
+        // Verify that the writer has inserted the data when push returns 204 (#2 atomicity).
         let results = memtable.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
@@ -939,7 +939,7 @@ mod tests {
             assert_eq!(status, StatusCode::NO_CONTENT);
         }
 
-        // flush_loop가 모든 데이터를 part로 내려보낼 때까지 대기
+        // Wait for flush_loop to write all data to a part.
         let matcher = crate::logql::LabelMatcher::new(
             "app".to_string(),
             crate::logql::MatcherOp::Eq,
@@ -960,7 +960,7 @@ mod tests {
                 )
                 .expect("part query");
             flushed_total = r.iter().map(|s| s.entries.len()).sum::<usize>();
-            // flush가 commit_flush까지 끝난 시점에서 inner와 flushing 모두 비어있어야 한다.
+            // Once flush reaches commit_flush, both inner and flushing should be empty.
             if flushed_total == 3 && memtable.is_empty() {
                 break;
             }
@@ -971,20 +971,20 @@ mod tests {
             "flush did not persist all 3 entries to parts"
         );
 
-        // memtable도 완전히 비워졌는지 확인 (모두 flush됨)
+        // Verify that the memtable is completely empty (everything was flushed).
         assert!(
             memtable.is_empty(),
             "memtable should be empty after full flush"
         );
 
-        // 서버 종료 시뮬레이션
+        // Simulate server shutdown.
         flush_handle.abort();
         drop(state);
         drop(parts);
         drop(journal);
         drop(memtable);
 
-        // 재시작: recovery + parts 로드
+        // Restart: recover and load parts.
         let memtable2 = MemTable::new();
         let wal = dir.join("journal.wal");
         let ckpt = dir.join("journal.ckpt");

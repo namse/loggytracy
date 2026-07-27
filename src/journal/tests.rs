@@ -619,8 +619,8 @@
         let h = harness("ckpt_clear").await;
         push(&h, make_push_req(&[("{app=\"a\"}", vec![("x", 1)])])).await;
         let ckpt = h.journal.checkpoint().await.unwrap();
-        // checkpoint는 inner를 비우고 flushing 버퍼로 옮김; unified_query는 여전히 해당 데이터를 본다.
-        // flush 완료를 시뮬레이션하기 위해 commit_flush 호출.
+        // checkpoint clears inner and moves the data to the flushing buffer; unified_query still sees it.
+        // Call commit_flush to simulate completed flushing.
         h.memtable.commit_flush();
         h.journal.set_checkpoint(ckpt.offset).unwrap();
         assert_eq!(h.memtable.approximate_size(), 0);

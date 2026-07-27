@@ -296,8 +296,8 @@
 
     #[test]
     fn unsupported_unicode_stage_returns_error_instead_of_panicking() {
-        assert!(parse("{} |가가가가가가가").is_err());
-        assert!(parse("{} 가가가가가가가").is_err());
-        let query = parse(r#"{app="\가"}"#).unwrap();
-        assert_eq!(query.matchers[0].value, r#"\가"#);
+        assert!(parse("{} |文字文字文字文字文字文字文字").is_err());
+        assert!(parse("{} 文字文字文字文字文字文字文字").is_err());
+        let query = parse(r#"{app="\文"}"#).unwrap();
+        assert_eq!(query.matchers[0].value, r#"\文"#);
     }

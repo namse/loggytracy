@@ -39,5 +39,5 @@ COPY --from=build /src/target/release/loggytracy /usr/local/bin/loggytracy
 
 EXPOSE 3100 4317
 # No TLS in this process by design; put it behind a proxy inside a trust
-# boundary. See docs/ARCHITECTURE.md, "전송 보안".
+# boundary. See docs/ARCHITECTURE.md, "Transport security".
 ENTRYPOINT ["/usr/local/bin/loggytracy"]

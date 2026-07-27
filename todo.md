@@ -1,133 +1,131 @@
 # TODO
 
-M3의 현재 범위 밖으로 미뤄 둔 작업과 후속 마일스톤 작업을 정리한다.
+This tracks work deferred beyond M3's current scope and work for later milestones.
 
-프로덕션 레디 게이트 전체 목록은 [`docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md`](docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md)에 있다
-(직전 리뷰는 [`docs/PRODUCTION_READINESS_REVIEW.md`](docs/PRODUCTION_READINESS_REVIEW.md)).
+The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md`](docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md)
+(previous review: [`docs/PRODUCTION_READINESS_REVIEW.md`](docs/PRODUCTION_READINESS_REVIEW.md)).
 
-## P0 — 프로덕션 게이트
+## P0 — production gates
 
-- [x] **WAL compaction wedge 수정** (아래 P5의 BLOCKER와 같은 항목). intent 레코드를 성공 직후
-      durable 제거하고, 남아 있는 phase-2 레코드는 완료로 간주해 제거한다 — 이미 wedge된 인스턴스도
-      업그레이드만으로 복구되므로 수동 삭제 절차가 필요 없다.
-- [x] **ingest backpressure**: memtable/WAL backlog 상한 초과 시 journal append 이전에 `429`
-      (+`Retry-After`, OTLP는 `RESOURCE_EXHAUSTED`). memtable·WAL backlog 크기를 O(1)로 추적한다.
-      knob: `LOGGYTRACY_MAX_MEMTABLE_BYTES`, `LOGGYTRACY_MAX_WAL_BACKLOG_BYTES`,
+- [x] **Fix WAL compaction wedge** (same item as the P5 BLOCKER below). Remove the intent record durably
+      immediately after success, and treat remaining phase-2 records as complete and remove them — already
+      wedged instances recover through an upgrade, so no manual deletion procedure is needed.
+- [x] **Ingest backpressure**: return `429` before journal append when MemTable/WAL backlog limits are exceeded
+      (+`Retry-After`, OTLP uses `RESOURCE_EXHAUSTED`). Track MemTable/WAL backlog size in O(1).
+      Knobs: `LOGGYTRACY_MAX_MEMTABLE_BYTES`, `LOGGYTRACY_MAX_WAL_BACKLOG_BYTES`,
       `LOGGYTRACY_BACKPRESSURE_RETRY_AFTER`.
-- [x] **테넌트 삭제 보장**: merge가 메모리 상한을 넘으면 그룹을 절반씩, 단일 part는 row group
-      윈도로 나눠 재작성한다. 큰 part가 zero-retention 행을 영구히 붙들지 못한다.
-- [x] **정책 토큰 없는 부팅 차단**: 저장된 tenant policy가 있는데 토큰이 없으면 부팅 실패.
-      숨겨져 있던 삭제 데이터가 되살아나지 않는다.
-- [x] **writer fencing**: manifest의 `writer_epoch`를 시작 시 claim하고 모든 CAS에서 검증한다.
-      fence를 만나면 ingest 503, `/ready` 503, force-flush 재시도 중단, 종료 코드 1.
-      **M6 절차의 "구 인스턴스 완전 drain 후 신 인스턴스 기동"이 이제 강제된다.**
-- [x] **테넌트 allowlist**: `LOGGYTRACY_ALLOWED_TENANTS`. 목록 밖 테넌트는 403.
-      기본 테넌트가 목록에 없으면 부팅 실패.
-- [x] **온디스크 포맷 버전**: part·trace part `meta.json`의 `version`을 체크섬 검증 이전에 확인.
-- [x] **메타데이터 엔드포인트 가드**: `labels`/`label_values`/`series`/`index_stats`에
-      semaphore·타임아웃·`start`/`end`·`match[]` 개수 상한.
-- [x] **`/metrics` O(parts) 제거**: merge debt와 unknown tenant 게이지를 워커가 발행한다.
-- [ ] **테넌시** (진행 중). 설계·비용 모델·구현 체크리스트는
+- [x] **Guarantee tenant deletion**: split groups in half when merge exceeds the memory limit, and rewrite a
+      single part in row-group windows. Large parts cannot retain zero-retention rows forever.
+- [x] **Block startup without the policy token**: fail startup when a tenant policy is stored but the token is
+      missing, so hidden deleted data does not reappear.
+- [x] **Writer fencing**: claim the manifest's `writer_epoch` at startup and verify it on every CAS.
+      On fencing, return ingest 503, `/ready` 503, stop force-flush retries, and exit with code 1.
+      **M6's "fully drain the old instance before starting the new one" procedure is now enforced.**
+- [x] **Tenant allowlist**: `LOGGYTRACY_ALLOWED_TENANTS`. Tenants outside the list receive 403.
+      Startup fails if the default tenant is not in the list.
+- [x] **On-disk format version**: Check `version` in part/trace-part `meta.json` before checksum validation.
+- [x] **Metadata endpoint guards**: Add semaphore, timeout, `start`/`end`, and `match[]` count limits to
+      `labels`/`label_values`/`series`/`index_stats`.
+- [x] **Remove O(parts) from `/metrics`**: Workers publish merge-debt and unknown-tenant gauges.
+- [ ] **Multi-tenancy** (in progress). The design, cost model, and implementation checklist are in
       [`docs/MULTI_TENANCY_DESIGN.md`](docs/MULTI_TENANCY_DESIGN.md).
-      **테넌트를 저장 경로 분할 축으로 두는 기존 설계(`docs/ARCHITECTURE.md`의 "테넌시" 절)는
-      R2 Class A 비용 때문에 폐기됐다** — 테넌트마다 객체를 쓰면 어떤 RPO에서도 $1 플랜 예산에
-      맞지 않는다.
-  - [x] `X-Scope-OrgID` 추출·허용 목록 검증 (Loki push + OTLP gRPC), 헤더 없는 요청 정책 설정
-  - [x] WAL 레코드에 테넌트 기록 (재시작 후에도 소유자 유지, 기존 WAL은 기본 테넌트로 복구)
-  - [x] 테넌트 공유 part: `(tenant, ts)` 정렬 + 테넌트 경계에 정렬된 row group + `meta.json`
-        테넌트 인덱스 (로그·트레이스 양쪽)
-  - [x] 격리 표면: MemTable·PartRegistry·TraceRegistry·쿼리·카탈로그 조회에 테넌트 필수 인자화
-  - [x] 테넌트별 retention 삭제 경로 — 테넌트 인덱스로 만료 판정, whole delete + merge 재작성,
-        모든 읽기 경로 클램프. 설계·근거는 [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
-  - [x] 정책 수신을 폴링 → **push**로 교체. 테넌트 하나씩 `PUT`, 오브젝트 스토어에 저장 후 ack,
-        시작 시 로드(실패는 치명적). 테넌트 삭제 = retention `0`(rewrite threshold 무시).
-        폴링과 직접 `reqwest` 의존성 제거 — 오브젝트 스토어 외에는 나가는 호출이 없다.
-        상세는 [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
-  - [x] ~~`(tier, day)` 파티셔닝~~ — 폐기. 쓰기 시점에 retention을 고정하면 플랜 변경이
-        기존 데이터에 반영되지 않는다. 파티션은 `day` 유지
-  - [ ] part 사이드카 4개→1개 통합, Parquet range read(P2), `(part, tenant)` 로컬 캐시 키
-  - [x] **테넌트별 ingest rate** — `ingest_rate`가 retention과 같은 push에 실린다.
-        숫자는 control plane이 정하고 이쪽은 필드와 강제 지점만 갖는다. body를
-        압축 해제하기 전에 검사하므로 초과한 테넌트가 CPU를 못 쓴다
-  - [ ] 테넌트별 쿼리 스캔 quota·세마포어, 테넌트 라벨 metrics
-  - [ ] 월간 사용량 durable 회계 — **인스턴스가 아니라 control plane의 몫이다.**
-        한 달치는 여러 인스턴스에 걸쳐 쓰이고 인스턴스보다 오래 산다. 여기서 할 일은
-        control plane이 회계할 수 있도록 테넌트별 사용량을 내보내는 것까지다
-- [x] TLS 미지원을 아키텍처 결정으로 명문화
-- [x] ingest 입력 제한 (body/압축 해제 길이/라인/라벨 개수·길이/타임스탬프 수용 윈도우)
+      **The previous design using tenants as a storage-path axis (`docs/ARCHITECTURE.md`, "Multi-tenancy")
+      was discarded because of R2 Class A costs** — writing objects per tenant does not fit the $1 plan
+      budget at any RPO.
+  - [x] Extract and validate `X-Scope-OrgID` (Loki push + OTLP gRPC), and configure the missing-header policy
+  - [x] Record the tenant in WAL records (owner survives restart; existing WAL recovers under the default tenant)
+  - [x] Shared tenant parts: `(tenant, ts)` sort + row groups aligned to tenant boundaries + tenant index in
+        `meta.json` (for both logs and traces)
+  - [x] Isolation surface: require tenant arguments for MemTable, PartRegistry, TraceRegistry, queries, and catalog reads
+  - [x] Per-tenant retention deletion path — determine expiration from the tenant index, whole-delete + merge rewrite,
+        and clamp every read path. Design and rationale: [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
+  - [x] Replace policy polling with **push**. `PUT` one tenant at a time, store it in object storage, then ack;
+        load all at startup (failure is fatal). Tenant deletion = retention `0` (ignores rewrite threshold).
+        Removed polling and the direct `reqwest` dependency — object storage is the only outbound call.
+        Details: [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
+  - [x] ~~`(tier, day)` partitioning~~ — rejected. Fixing retention at write time does not apply plan changes
+        to existing data. Partitions remain by `day`.
+  - [ ] Consolidate four part sidecars into one, add Parquet range reads (P2), and use `(part, tenant)` local cache keys
+  - [x] **Per-tenant ingest rate** — `ingest_rate` rides the same push as retention. The control plane sets the
+        number; this side only owns the field and enforcement points. Check before decompression so an over-limit
+        tenant cannot consume CPU.
+  - [ ] Per-tenant query-scan quotas/semaphores and tenant-labeled metrics
+  - [ ] Durable monthly usage accounting — **this belongs to the control plane, not the instance.** A month spans
+        instances and outlives them. This side only exports per-tenant usage for the control plane to account for.
+- [x] Document TLS unsupported as an architecture decision
+- [x] Ingest input limits (body/decompressed length/line/label count and length/timestamp acceptance window)
 
-## P1 — LogQL 기능 보강
+## P1 — LogQL improvements
 
-- [ ] `line_format`, `label_format` 지원
-- [ ] `unwrap` 및 `quantile_over_time` 지원
-- [ ] binary/vector 연산자 지원
-- [ ] `without`, offset, subquery 지원
-- [ ] JSON의 top-level array와 `null` 값에 대한 Loki 호환 semantics 지원
-- [ ] 빈 문자열 equality, stream-label field, `_extracted` 충돌 이름에 대한 exact-field pruning 개선
+- [ ] Support `line_format`, `label_format`
+- [ ] Support `unwrap` and `quantile_over_time`
+- [ ] Support binary/vector operators
+- [ ] Support `without`, offset, and subqueries
+- [ ] Support Loki-compatible semantics for JSON top-level arrays and `null` values
+- [ ] Improve exact-field pruning for empty-string equality, stream-label fields, and `_extracted` name collisions
 
-## P2 — 정확성·스토리지 성능
+## P2 — correctness and storage performance
 
-- [ ] crash replay로 발생할 수 있는 중복 로그 deduplication
-- [ ] Parquet range read 도입 (**테넌시 선행 작업** — 공유 part에서 테넌트 byte range만 읽어야 하므로
-      더 이상 선택적 최적화가 아니다)
-- [ ] 메트릭 평가를 bounded in-memory 계산에서 streaming/pre-aggregation 방식으로 개선
-- [x] ~~실제 S3를 이용한 배포 환경 검증~~ — **범위 밖으로 확정.** 인디 프로젝트이므로 부하 검증의
-      상한은 로컬 MinIO다. 무엇이 검증되고 무엇이 남은 위험인지, 그리고 첫 실 배포에서 무엇을
-      확인해야 하는지는 [`docs/LOAD_VALIDATION.md`](docs/LOAD_VALIDATION.md)
+- [ ] Deduplicate duplicate logs that can result from crash replay
+- [ ] Add Parquet range reads (**multi-tenancy prerequisite** — shared parts must read only a tenant's byte range,
+      so this is no longer an optional optimization)
+- [ ] Improve metric evaluation from bounded in-memory computation to streaming/pre-aggregation
+- [x] ~~Validate a deployment environment using real S3~~ — **confirmed out of scope.** This is an indie project,
+      so local MinIO is the upper bound for load validation. What is validated, what risks remain, and what to
+      check on the first real deployment are in [`docs/LOAD_VALIDATION.md`](docs/LOAD_VALIDATION.md)
 
-## P3 — M5 운영 검증
+## P3 — M5 operational validation
 
-- [ ] compaction 튜닝
-- [x] `merge_max_input_bytes`와 `merge_max_memory_bytes`의 단위 불일치 수정. part meta에
-      `materialized_bytes`를 기록해 그룹 선택과 읽기 예산이 같은 단위를 쓰고, `validate`가
-      `merge_max_input_bytes <= merge_max_memory_bytes`를 강제한다.
-- [x] retention 정책과 만료 데이터 삭제 구현 (retention 전용 타임아웃 knob 분리 포함)
-- [ ] 쿼리 메모리·범위·동시성 등 resource limit을 운영 목표에 맞게 조정
-- [ ] **Tier D 지속·규모 런** — 2시간 이상 연속, part 10,000개 이상, 테넌트 500개 이상, 런 중
-      재시작 1회. 기존 Tier B/C는 수십 초짜리라 P1-11(O(N) 경로)과 N3(row group 파편화)를
-      건드리지 못한다. 수용 기준은 [`docs/LOAD_VALIDATION.md`](docs/LOAD_VALIDATION.md)
-- [x] **CAS 프리플라이트** — 부팅 시 조건부 쓰기가 실제로 강제되는지 자가 점검하고, 아니면 기동
-      거부. 배포 대상 스토어 자기 자신에 대해 돌기 때문에 로컬 검증으로는 답할 수 없던 축이 해결된다
-- [ ] **오브젝트 스토어 연산 횟수 계측** — flush/merge/retention 1회당 PUT·GET·LIST 횟수.
-      금액은 로컬에서 못 재지만 횟수는 백엔드와 무관하므로 잴 수 있고, 이 설계는 R2 Class A
-      비용에 지배당해 왔으므로 이 숫자가 곧 비용 예측이다
-- [x] 부하 테스트 결과와 병목 구간을 문서화 — [`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md).
-      재현 가능한 것은 테스트로 고정하고 문서는 숫자만 인용한다
-- [ ] **N3 완화**: 테넌트 500개면 같은 5,000행이 24.7배(28 KB → 691 KB)가 된다. row group이
-      테넌트 경계에서 끊기므로 테넌트 수가 row group 수의 하한이고, Parquet 컬럼 메타데이터와
-      bloom 필터가 거기 비례한다. 목표 워크로드가 작은 테넌트 다수라 설계 판단에 직접 들어간다
-- [ ] 부하 프로브가 읽은 행 수를 확인하도록 개선 — 지금은 "복원해서 읽었다"와 "아무것도
-      매칭되지 않았다"를 구분하지 못한다
+- [ ] Tune compaction
+- [x] Fix the unit mismatch between `merge_max_input_bytes` and `merge_max_memory_bytes`. Record
+      `materialized_bytes` in part metadata so group selection and read budgets use the same unit, and have
+      `validate` enforce `merge_max_input_bytes <= merge_max_memory_bytes`.
+- [x] Implement retention policies and expired-data deletion (including a separate retention timeout knob)
+- [ ] Tune resource limits such as query memory, range, and concurrency to operational targets
+- [ ] **Tier D duration/scale run** — over 2 hours, over 10,000 parts, over 500 tenants, and one restart during
+      the run. Existing Tier B/C runs last tens of seconds and cannot exercise P1-11 (O(N) paths) or N3
+      (row-group fragmentation). Acceptance criteria are in [`docs/LOAD_VALIDATION.md`](docs/LOAD_VALIDATION.md)
+- [x] **CAS preflight** — verify at startup that conditional writes are enforced and refuse startup otherwise.
+      Running against the deployment target itself resolves what local validation could not answer.
+- [ ] **Measure object-store operation counts** — PUT/GET/LIST per flush/merge/retention cycle. Amounts cannot
+      be measured locally, but counts are backend-independent and measurable; because this design has been
+      dominated by R2 Class A costs, these counts are the cost estimate.
+- [x] Document load-test results and bottlenecks — [`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md).
+      Keep reproducible facts in tests and quote only numbers in the document.
+- [ ] **Mitigate N3**: With 500 tenants, the same 5,000 rows become 24.7x (28 KB → 691 KB). Row groups stop
+      at tenant boundaries, so tenant count is a lower bound for row-group count and Parquet column metadata
+      and bloom filters scale with it. The target workload has many small tenants, so this directly affects design.
+- [ ] Improve the load probe to verify rows read — it currently cannot distinguish "restored and read" from
+      "nothing matched."
 
-## P4 — M6 장비 교체
+## P4 — M6 hardware replacement
 
-상세 계획: [`docs/M6_IMPLEMENTATION_PLAN.md`](docs/M6_IMPLEMENTATION_PLAN.md)
+Detailed plan: [`docs/M6_IMPLEMENTATION_PLAN.md`](docs/M6_IMPLEMENTATION_PLAN.md)
 
-- [x] graceful shutdown 핸들러 구현 (SIGTERM/SIGINT 수신 시 drain 시퀀스 시작, 시퀀스가 프로세스 종료 담당)
-- [x] ingest 차단: draining 중 Loki push 503, OTLP UNAVAILABLE (journal append 이전)
+- [x] Implement graceful-shutdown handler (SIGTERM/SIGINT starts the drain sequence, which owns process termination)
+- [x] Block ingest: Loki push 503 and OTLP UNAVAILABLE while draining (before journal append)
 - [x] in-flight drain: axum `with_graceful_shutdown` + tonic `serve_with_shutdown`
-- [x] background 워커(flush/merge/retention/eviction) 정상 종료 후 최종 force-flush
-- [x] force-flush 함수 구현: 임계값 무시하고 MemTable·pending checkpoint 소진, S3 업로드/manifest 갱신 완료 대기
-- [x] object-store 지속 실패 시 무한 재시도 + stdout 경고 + 운영자 stdin 입력으로만 종료 (하드 타임아웃 없음)
-- [x] 강제 종료 후 재시작 시 저널 replay로 무손실 자동 복구
-- [x] drain-status readiness: draining 중 `/ready` 503 + `/metrics`에 pending bytes/flush 완료 노출
-- [x] 장비 교체 리허설 (새 인스턴스가 무손실로 트래픽 재개)
-- [x] fresh-context 리뷰 (남은 게이트) — `docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md`
+- [x] Final force-flush after background workers (flush/merge/retention/eviction) shut down normally
+- [x] Implement force-flush: ignore thresholds, drain MemTable/pending checkpoint, and wait for S3 upload/manifest update completion
+- [x] Infinite retry + stdout warning on persistent object-store failure; exit only from operator stdin input (no hard timeout)
+- [x] Automatic lossless recovery through journal replay after forced termination and restart
+- [x] Drain-status readiness: `/ready` 503 while draining + pending bytes/flush completion exposed in `/metrics`
+- [x] Hardware replacement rehearsal (new instance resumes traffic without loss)
+- [x] Fresh-context review (remaining gates) — `docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md`
 
-## P5 — M7 로컬 S3 부하 검증
+## P5 — M7 local S3 load validation
 
-상세 계획: [`docs/M7_IMPLEMENTATION_PLAN.md`](docs/M7_IMPLEMENTATION_PLAN.md)
+Detailed plan: [`docs/M7_IMPLEMENTATION_PLAN.md`](docs/M7_IMPLEMENTATION_PLAN.md)
 
-- [x] 관측성 gauge 보강 (merge debt gauge 추가; active part 수·WAL backlog·memtable bytes는 기존 `/metrics`에 존재)
-- [x] Tier B: `LatencyFaultStore` + `from_url` opt-in 래핑 (인프로세스 지연·장애 주입, 시드 재현)
-- [x] ~~Tier C: MinIO~~ — **삭제됨.** `object_store` 크레이트를 신뢰하므로 S3 대상 테스트를 하지 않는다
-- [x] ~~MinIO manifest CAS 동작 확인~~ — 부팅 프리플라이트로 대체. 배포 대상 스토어 자기 자신에 대해 검사한다
-- [x] 부하 하네스 개선: target-rate pacing, warmup/steady-state 분리, 강제 eviction→restore, 목표 대비 pass/fail (`src/bin/load.rs`)
-- [x] `docs/M7_LOAD_RESULTS.md` 결과·머신 프로파일·병목 문서화
-- [x] **BLOCKER — WAL compaction 무한 wedge 버그 수정 (완료):** 첫 compaction 이후
-  phase-2 compaction-state 파일이 제거되지 않아, 좌표계가 리셋된 다음 compaction offset이
-  stale offset과 비교되어 `"WAL compaction checkpoint moved backwards"`로 flush 루프가 영구
-  wedge됨. 장애 주입 없이 Tier B(`file://`)·Tier C(MinIO) 양쪽에서 재현. object-store 백엔드
-  런에서만 발생(로컬 전용은 `set_checkpoint` 경로라 무관). 이 수정 전에는 M7 수용 기준의
-  "무손실 회복 + bounded backlog" 런을 통과할 수 없음.
-
+- [x] Strengthen observability gauges (add merge-debt gauge; active part count, WAL backlog, and MemTable bytes already exist in `/metrics`)
+- [x] Tier B: wrap `LatencyFaultStore` + `from_url` opt-in (in-process latency/fault injection, reproducible seed)
+- [x] ~~Tier C: MinIO~~ — **removed.** Do not test against S3 because the `object_store` crate is trusted
+- [x] ~~Verify MinIO manifest CAS~~ — replaced by startup preflight, which checks the deployment target store itself
+- [x] Improve load harness: target-rate pacing, separate warmup/steady state, forced eviction→restore, pass/fail against targets (`src/bin/load.rs`)
+- [x] Document results, machine profile, and bottlenecks in `docs/M7_LOAD_RESULTS.md`
+- [x] **BLOCKER — fix the infinite WAL compaction wedge (complete):** After the first compaction, the phase-2
+  compaction-state file was not removed. After the coordinate system reset, the compaction offset was compared
+  with a stale offset and the flush loop permanently wedged with `"WAL compaction checkpoint moved backwards"`.
+  It reproduced without fault injection in both Tier B (`file://`) and Tier C (MinIO). It occurred only on the
+  object-store backend path (local-only mode uses `set_checkpoint`). Before this fix, the M7 acceptance run
+  "lossless recovery + bounded backlog" could not pass.

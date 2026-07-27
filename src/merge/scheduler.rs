@@ -126,9 +126,9 @@ async fn merge_once(
     'partitions: for (partition, mut parts) in by_partition {
         parts.sort_by_key(|r| r.meta().row_count);
 
-        // 너무 큰 단일 part는 제외 (이미 충분히 큼)
-        // 작은 part들을 그룹지어 합친다. 단순화: 파티션 내에서 merge_min_part_count개 이상이면
-        // 가장 작은 것부터 merge_target_part_rows에 도달할 때까지 그룹화.
+        // Exclude an oversized single part (it is already large enough).
+        // Group small parts for merging. Simplification: within a partition, group from the smallest
+        // parts until merge_target_part_rows is reached once there are at least merge_min_part_count.
         let groups = select_groups(&parts, config, cutoffs.as_ref());
         for MergeGroup {
             parts: group,

@@ -655,9 +655,8 @@ mod tests {
 
     #[test]
     fn flushing_buffer_visible_during_flush() {
-        // begin_flush는 inner를 비우고 flushing 버퍼로 옮긴다.
-        // unified_query는 flushing 버퍼까지 조회하므로 flush 진행 중에도
-        // 데이터는 사라지지 않는다 (이슈 #2 복구).
+        // begin_flush clears inner and moves the data to the flushing buffer.
+        // unified_query also scans the flushing buffer, so data is not lost during flushing (#2 regression).
         let mt = MemTable::new();
         mt.insert(
             sample_tenant(),
@@ -704,7 +703,7 @@ mod tests {
 
     #[test]
     fn begin_flush_keeps_query_consistent_with_concurrent_insert() {
-        // flush 진행 중 새로 들어온 데이터도 보여야 한다.
+        // Data inserted while flushing is in progress must also be visible.
         let mt = MemTable::new();
         mt.insert(
             sample_tenant(),
@@ -713,7 +712,7 @@ mod tests {
         );
 
         let _snapshot = mt.begin_flush();
-        // flush 진행 중 새 데이터 수신
+        // Receive new data while flushing is in progress.
         mt.insert(
             sample_tenant(),
             sample_labels(),
