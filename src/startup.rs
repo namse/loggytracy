@@ -596,12 +596,7 @@ fn is_loopback_addr(addr: &str) -> bool {
 }
 
 fn announce_bind(addr: &str, knob: &str) {
-    let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr);
-    let loopback = matches!(
-        host.trim_matches(['[', ']']),
-        "127.0.0.1" | "::1" | "localhost"
-    );
-    if loopback {
+    if is_loopback_addr(addr) {
         tracing::info!(
             %addr,
             "bound to loopback only; set {knob} to accept traffic from outside this machine"
