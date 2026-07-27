@@ -593,7 +593,7 @@ the code, the note says which.
 - [x] **N7 readiness flapped on isolated object-store failures** — health is hysteretic now; measured 41-66% healthy before, 99.3-100% after
 - [x] **N8 merge and flush contend** — measured bounded: oscillates 6-140 MB with a negative trend. A tuning note, not a defect
 - [x] **N9 peak RSS is concurrent live memory** — returns fully when load stops. A sizing rule, not a defect
-- [ ] P2-5 duplicates after a crash are unobservable
+- [x] P2-5 duplicates after a crash are observable — startup reports what replay put back, as a WARN and as a gauge. Removing them is deduplication, still open
 
 ### Gate 4 — scale validation
 
@@ -615,7 +615,7 @@ the code, the note says which.
 - [x] P2-1 `tail` (WebSocket live tail) and time ranges for `labels`/`series`
 - [x] P2-1 `index/volume`, `volume_range`, `detected_labels`, `detected_fields`, `format_query`
 - [ ] P2-1 remaining: `patterns` and the `delete` API — both deliberate, see the table above
-- [ ] P2-5 duplicate observability → implement dedup later (`todo.md` P2)
+- [ ] P2-5 deduplication itself (`todo.md` P2)
 - [ ] LogQL improvements in P1 of `todo.md`
 
 ---

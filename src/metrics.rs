@@ -26,6 +26,18 @@ pub struct RuntimeMetrics {
     /// is generating labels, which is a client bug far more often than it is a
     /// plan being outgrown.
     pub stream_limit_rejected: AtomicU64,
+    /// Records and entries the last startup replayed out of the WAL.
+    ///
+    /// Delivery is at-least-once: the checkpoint advances after a flush, so a
+    /// crash in between leaves records that are already durable in parts and
+    /// replay writes them again. The trade is deliberate, but until these
+    /// existed nothing said it had happened — an operator could not tell a
+    /// restart that duplicated nothing from one that duplicated a minute of
+    /// logs, and neither could anyone reading a query result. They are set once
+    /// at startup and never move, so a non-zero value describes this process's
+    /// own recovery rather than a rate.
+    pub wal_replayed_records: AtomicU64,
+    pub wal_replayed_entries: AtomicU64,
     /// Point-in-time backlog gauges, published by the workers that already walk
     /// the structures they describe. Computing them per scrape instead was
     /// O(parts × tenants) of work on an unauthenticated endpoint, and the
@@ -78,6 +90,8 @@ impl RuntimeMetrics {
             ingest_quota_rejected: AtomicU64::new(0),
             query_quota_rejected: AtomicU64::new(0),
             stream_limit_rejected: AtomicU64::new(0),
+            wal_replayed_records: AtomicU64::new(0),
+            wal_replayed_entries: AtomicU64::new(0),
             merge_debt_parts: AtomicU64::new(0),
             unknown_tenants: AtomicU64::new(0),
             flush_success: AtomicU64::new(0),

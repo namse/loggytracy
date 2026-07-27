@@ -599,6 +599,12 @@ loggytracy_query_quota_rejected_total {}\n\
 # HELP loggytracy_stream_limit_rejected_total Writes refused for creating a stream past the tenant's limit. Far more often a client minting label values than a plan being outgrown.\n\
 # TYPE loggytracy_stream_limit_rejected_total counter\n\
 loggytracy_stream_limit_rejected_total {}\n\
+# HELP loggytracy_wal_replayed_records Records this process replayed from the WAL at startup. Non-zero means the previous run did not shut down cleanly.\n\
+# TYPE loggytracy_wal_replayed_records gauge\n\
+loggytracy_wal_replayed_records {}\n\
+# HELP loggytracy_wal_replayed_entries Log entries in those records — the upper bound on how many lines this restart may have duplicated.\n\
+# TYPE loggytracy_wal_replayed_entries gauge\n\
+loggytracy_wal_replayed_entries {}\n\
 # TYPE loggytracy_memtable_buffered_bytes gauge\n\
 loggytracy_memtable_buffered_bytes {}\n\
 # TYPE loggytracy_flush_success_total counter\n\
@@ -694,6 +700,8 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         m.ingest_quota_rejected.load(Ordering::Relaxed),
         m.query_quota_rejected.load(Ordering::Relaxed),
         m.stream_limit_rejected.load(Ordering::Relaxed),
+        m.wal_replayed_records.load(Ordering::Relaxed),
+        m.wal_replayed_entries.load(Ordering::Relaxed),
         state.ingest_gate.buffered_bytes(),
         m.flush_success.load(Ordering::Relaxed),
         m.flush_errors.load(Ordering::Relaxed),

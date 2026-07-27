@@ -234,7 +234,7 @@ Only status is confirmed here; see the previous document for details.
 | P1-11 startup/flush cost linear in part count | **Partly fixed** — restore overlaps its downloads and reconcile no longer re-reads the manifest per merge group. The manifest is still rewritten in full per flush |
 | P2-1 Loki/Tempo API gaps | **Mostly fixed** — `tail`, `index/volume(_range)`, `detected_labels`, `detected_fields`, `format_query`, JSON push, Tempo v2 tags and `/api/echo`. `patterns` and the `delete` API remain, both deliberately |
 | P2-2 resource guards on metadata endpoints | **Fixed** — semaphore, timeout, `start`/`end`, and `match[]` count limits |
-| P2-5 duplicates after a crash unobservable | Open |
+| P2-5 duplicates after a crash unobservable | **Fixed** — startup reports replayed records and entries, as a WARN and as `loggytracy_wal_replayed_entries`. An upper bound on what a restart may have duplicated; removing them is deduplication, still open |
 | P2-7 `/metrics` has no histograms or labels | **Partly fixed** — latency histograms are there, so p95/p99 is derivable. Endpoint labels are still absent |
 | P2-8 stdin abort ineffective in containers | **Fixed** — `SIGUSR1` abandons a stuck force-flush and exits non-zero. stdin is kept for interactive use |
 | P3 deployment assets | **Fixed** — Dockerfile, [`CONFIGURATION.md`](CONFIGURATION.md), [`RUNBOOK.md`](RUNBOOK.md) |

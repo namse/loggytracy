@@ -73,7 +73,7 @@ budget is exhausted: {error}"
 }
 
 #[allow(dead_code)]
-pub fn recover(config: &Config, memtable: &MemTable) -> Result<(), String> {
+pub fn recover(config: &Config, memtable: &MemTable) -> Result<journal::ReplayReport, String> {
     recover_with_traces(config, memtable, &trace::TraceMemTable::new())
 }
 
@@ -81,7 +81,7 @@ pub fn recover_with_traces(
     config: &Config,
     memtable: &MemTable,
     trace_memtable: &trace::TraceMemTable,
-) -> Result<(), String> {
+) -> Result<journal::ReplayReport, String> {
     let parts_root = config.data_dir.join("parts");
     std::fs::create_dir_all(&parts_root).map_err(|e| e.to_string())?;
     cleanup_tmp(&parts_root)?;
@@ -91,18 +91,34 @@ pub fn recover_with_traces(
 
     let wal_path = config.data_dir.join("journal.wal");
     let ckpt_path = config.data_dir.join("journal.ckpt");
-    let (ckpt_start, replay_end) = journal::replay_with_traces(
+    let replay = journal::replay_reporting(
         &wal_path,
         &ckpt_path,
         memtable,
         trace_memtable,
         &config.default_tenant,
     )?;
-    tracing::info!(
-        checkpoint = ckpt_start,
-        replay_end,
-        "journal recovery complete"
-    );
+    let (ckpt_start, replay_end) = (replay.checkpoint, replay.end_offset);
+    if replay.records > 0 {
+        // Said at WARN rather than INFO. Delivery is at-least-once, so these
+        // entries may already be durable in parts and about to be written
+        // again — the number is the upper bound on what this restart
+        // duplicated, and it is the only place that says so.
+        tracing::warn!(
+            records = replay.records,
+            entries = replay.entries,
+            checkpoint = ckpt_start,
+            replay_end,
+            "journal replay put records back: the previous run did not checkpoint them, so up to \
+this many entries may be duplicated in storage"
+        );
+    } else {
+        tracing::info!(
+            checkpoint = ckpt_start,
+            replay_end,
+            "journal recovery complete"
+        );
+    }
 
     if wal_path.exists()
         && replay_end
@@ -120,7 +136,7 @@ pub fn recover_with_traces(
         drop(f);
         tracing::info!(replay_end, "truncated corrupt WAL tail");
     }
-    Ok(())
+    Ok(replay)
 }
 
 pub async fn run(config: Arc<Config>) {
@@ -133,7 +149,7 @@ pub async fn run(config: Arc<Config>) {
     let memtable = Arc::new(MemTable::new());
     let trace_memtable = Arc::new(trace::TraceMemTable::new());
 
-    recover_with_traces(&config, &memtable, &trace_memtable)
+    let replay = recover_with_traces(&config, &memtable, &trace_memtable)
         .unwrap_or_else(|e| panic!("recovery failed: {e}"));
 
     let object_storage = config
@@ -227,6 +243,14 @@ pub async fn run(config: Arc<Config>) {
     let merge_healthy = Arc::new(AtomicBool::new(true));
     let retention_healthy = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(RuntimeMetrics::new());
+    // Published once. These describe this process's own recovery rather than a
+    // rate, so a scrape after any uptime still reports what the restart did.
+    metrics
+        .wal_replayed_records
+        .store(replay.records, Ordering::Relaxed);
+    metrics
+        .wal_replayed_entries
+        .store(replay.entries, Ordering::Relaxed);
     let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
     if let Some(storage) = &object_storage {
         storage.set_fence_sink(shutdown.clone());

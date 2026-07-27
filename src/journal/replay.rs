@@ -9,6 +9,22 @@ pub fn replay(
     replay_with_traces(wal_path, ckpt_path, memtable, &traces, default_tenant)
 }
 
+/// What a replay put back, so a restart can be told from a clean start.
+///
+/// Delivery is at-least-once by design: the checkpoint advances after a flush,
+/// so a crash in between leaves records in the WAL that are already durable in
+/// parts, and replay writes them a second time. That trade is deliberate and
+/// documented, but until now nothing said it had happened — an operator could
+/// not tell a restart that duplicated nothing from one that duplicated a
+/// minute of logs, and neither could anyone reading a query result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplayReport {
+    pub checkpoint: u64,
+    pub end_offset: u64,
+    pub records: u64,
+    pub entries: u64,
+}
+
 pub fn replay_with_traces(
     wal_path: &Path,
     ckpt_path: &Path,
@@ -16,16 +32,33 @@ pub fn replay_with_traces(
     trace_memtable: &TraceMemTable,
     default_tenant: &TenantId,
 ) -> Result<(u64, u64), String> {
+    replay_reporting(wal_path, ckpt_path, memtable, trace_memtable, default_tenant)
+        .map(|report| (report.checkpoint, report.end_offset))
+}
+
+pub fn replay_reporting(
+    wal_path: &Path,
+    ckpt_path: &Path,
+    memtable: &MemTable,
+    trace_memtable: &TraceMemTable,
+    default_tenant: &TenantId,
+) -> Result<ReplayReport, String> {
     recover_unfinished_compaction(wal_path, ckpt_path).map_err(|e| e.to_string())?;
     let checkpoint = read_checkpoint(ckpt_path).map_err(|e| e.to_string())?;
-    replay_from(
+    let mut report = ReplayReport {
+        checkpoint,
+        ..ReplayReport::default()
+    };
+    let end = replay_from(
         wal_path,
         checkpoint,
         memtable,
         trace_memtable,
         default_tenant,
-    )
-    .map(|end| (checkpoint, end))
+        &mut report,
+    )?;
+    report.end_offset = end;
+    Ok(report)
 }
 
 fn recover_unfinished_compaction(wal_path: &Path, ckpt_path: &Path) -> Result<(), IoError> {
@@ -67,6 +100,7 @@ fn replay_from(
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
     default_tenant: &TenantId,
+    report: &mut ReplayReport,
 ) -> Result<u64, String> {
     if !wal_path.exists() {
         if checkpoint == 0 {
@@ -140,7 +174,7 @@ fn replay_from(
         {
             match kind {
                 TENANT_RECORD_KIND_LOGS => {
-                    replay_log_record(&tenant, payload, offset, memtable)?;
+                    report.entries += replay_log_record(&tenant, payload, offset, memtable)?;
                 }
                 TENANT_RECORD_KIND_TRACES => {
                     replay_trace_record(&tenant, payload, offset, trace_memtable)?;
@@ -157,10 +191,11 @@ fn replay_from(
             // still see the old data under its configured default.
             replay_trace_record(default_tenant, trace_data, offset, trace_memtable)?;
         } else {
-            replay_log_record(default_tenant, &data, offset, memtable)?;
+            report.entries += replay_log_record(default_tenant, &data, offset, memtable)?;
         }
         offset += (RECORD_HEADER_SIZE + len) as u64;
         replayed += 1;
+        report.records += 1;
     }
     if replayed > 0 {
         tracing::info!(replayed, offset, "journal replay complete");
@@ -168,14 +203,17 @@ fn replay_from(
     Ok(offset)
 }
 
+/// Returns the entries put back, which is what an operator needs to size the
+/// duplication a restart may have caused.
 fn replay_log_record(
     tenant: &TenantId,
     payload: &[u8],
     offset: u64,
     memtable: &MemTable,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let request = PushRequest::decode(payload)
         .map_err(|e| format!("journal protobuf decode failed at offset {offset}: {e}"))?;
+    let mut replayed_entries = 0u64;
     for stream in &request.streams {
         let labels = proto::parse_labels(&stream.labels)
             .map_err(|e| format!("journal record has invalid labels at offset {offset}: {e}"))?;
@@ -196,10 +234,11 @@ fn replay_log_record(
                         .collect(),
                 })
             })
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<Vec<LogEntry>, String>>()?;
+        replayed_entries += entries.len() as u64;
         memtable.insert(tenant.clone(), labels, entries);
     }
-    Ok(())
+    Ok(replayed_entries)
 }
 
 fn replay_trace_record(

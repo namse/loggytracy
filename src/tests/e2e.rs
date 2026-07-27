@@ -661,3 +661,51 @@
         let stranger = get("initech", query_uri).await;
         assert_eq!(stranger["data"]["result"], serde_json::json!([]));
     }
+
+    /// Delivery is at-least-once, so a restart between flush and checkpoint
+    /// writes records that are already durable a second time. The trade is
+    /// deliberate; what was missing is any way to know it happened. An operator
+    /// could not tell a restart that duplicated nothing from one that
+    /// duplicated a minute of logs.
+    #[tokio::test]
+    async fn a_replay_reports_what_it_put_back() {
+        let dir = tmp_data_dir("replay-report");
+        let config = Config {
+            data_dir: dir.clone(),
+            ..Config::default()
+        };
+        let memtable = Arc::new(MemTable::new());
+        let journal = Arc::new(crate::journal::Journal::spawn(&config, memtable.clone()).unwrap());
+        ingest_once(&journal, &build_push_req()).await;
+        ingest_once(&journal, &build_push_req()).await;
+        drop(journal);
+
+        // Nothing checkpointed, so recovery replays both records.
+        let recovered = Arc::new(MemTable::new());
+        let report = crate::startup::recover(&config, &recovered).expect("recover");
+        assert_eq!(report.records, 2, "both records came back");
+        assert!(report.entries >= 2, "and the entries in them: {report:?}");
+        assert_eq!(report.checkpoint, 0);
+
+        // A second recovery over the same WAL reports the same, because the
+        // checkpoint still has not moved. That is the case the number exists
+        // for: recovery is not idempotent with respect to duplication.
+        let again = Arc::new(MemTable::new());
+        let second = crate::startup::recover(&config, &again).expect("recover again");
+        assert_eq!(second.records, report.records);
+    }
+
+    /// A clean start replays nothing, so the number distinguishes the two
+    /// rather than always being non-zero.
+    #[tokio::test]
+    async fn a_clean_start_reports_no_replay() {
+        let dir = tmp_data_dir("clean-start");
+        let config = Config {
+            data_dir: dir.clone(),
+            ..Config::default()
+        };
+        let memtable = Arc::new(MemTable::new());
+        let report = crate::startup::recover(&config, &memtable).expect("recover");
+        assert_eq!(report.records, 0);
+        assert_eq!(report.entries, 0);
+    }

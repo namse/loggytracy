@@ -44,6 +44,7 @@ sized roughly fifty times too small.
 | `loggytracy_merge_debt_parts` | Upward trend | Merge cannot keep up; query-planning cost rises |
 | `loggytracy_retention_rewrite_skipped_total` | Increasing | A part is too large to rewrite. **Tenant deletion is not complete** |
 | `loggytracy_tenant_policy_unknown_tenants` | Greater than 0 | Unknown tenants are accumulating data from the control plane's perspective |
+| `loggytracy_wal_replayed_entries` | Non-zero after a restart | The previous run did not shut down cleanly. **This is the upper bound on log lines this restart may have duplicated** — delivery is at-least-once, so records the WAL still held may already have been durable |
 | `loggytracy_stream_limit_rejected_total` | Increasing | A tenant is creating streams past its limit. **Usually a client putting a request id or timestamp in a label**, not a plan being outgrown — check the label names before raising anything |
 | `loggytracy_query_quota_rejected_total` | Increasing | A tenant is over its read quota — scan rate or concurrency. Like the ingest one: a plan question, not a scaling one |
 | `loggytracy_ingest_quota_rejected_total` | Increasing | A tenant exceeded its rate. **Different from `ingest_throttled_total`** — the server is healthy and the tenant is sending more than its plan allows; this is a plan issue, not a scaling issue |
@@ -162,7 +163,12 @@ is attached to a terminal. `SIGUSR1` is the one that works in a deployment.
 The WAL remains. Restarting on the **same disk** lets replay recover unflushed data.
 
 Because delivery is at-least-once, **some logs may be duplicated** if termination happens at a flush boundary.
-This is an intentional trade-off (`ARCHITECTURE.md`), and the lack of a way to observe duplicates is a known gap.
+This is an intentional trade-off (`ARCHITECTURE.md`).
+
+How much was duplicated is now observable. Startup logs a WARN naming the record and entry counts it
+replayed, and `loggytracy_wal_replayed_entries` holds the entry count for the life of the process. It is an
+upper bound, not a measurement: those entries may have been durable already, or may not have been. Nothing
+removes the duplicates yet — that is deduplication, still open in `todo.md`.
 
 ## Backups
 
