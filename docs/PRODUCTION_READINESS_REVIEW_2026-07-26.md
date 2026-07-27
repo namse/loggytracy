@@ -149,31 +149,62 @@ improvement). But `search` computes start/end and passes `scan_trace_spans(..., 
 after scanning** (`tempo/handlers.rs:113-130`), while `search_tags`/`search_tag_values` have no time
 parameters. One Grafana tag-dropdown opening still restores all traces for that tenant.
 
-### N7. Remote health recovery is defeated by having more than one reporter
+### N7. A single failed request marked the object store down — **fixed**
 
-- Location: `mark_remote_healthy_since` (`src/object_storage/catalog.rs:84`)
-- Verification: **Reproduced** — four fault seeds, `docs/LOAD_RESULTS.md` section 6
+- Location: `RemoteCache` health state (`src/object_storage/catalog.rs`)
+- Verification: **Reproduced and fixed**, `docs/LOAD_RESULTS.md` section 6
 
-A success restores health with a CAS from exactly the unhealthy state of the
-epoch the caller observed before its operation. On its own terms the guard is
-right: a success that began before a newer failure must not clear that failure.
+`/ready` reads `remote_healthy`, and one failed object-store request set it.
+At a 3% injected write-error rate — which the engine survives with no ingest
+errors and no lost data — the flag flipped 14-17 times a minute and read false
+34-59% of the time. That is an instance an orchestrator pulls in and out of
+service over an error rate that cost nothing.
 
-The problem is that flush, merge and retention each report independently. Any
-failure anywhere between one worker's epoch capture and its CAS defeats *that
-worker's* recovery, so the probability of health being restored falls as
-reporters multiply. Measured: with 3% injected write errors, the run with merge
-disabled ends healthy and the run with merge enabled ends unhealthy, at every
-seed tried — including a seed with zero merge errors, since merge participates
-in the race by reporting its successes.
+The first explanation recorded here was wrong and is left in
+[`LOAD_RESULTS.md`](LOAD_RESULTS.md) rather than quietly replaced: it blamed the
+epoch guard in `mark_remote_healthy_since`, predicting that recovery degrades as
+reporters multiply. Sampling the flag through a run refutes that — the
+configuration with *fewer* reporters has the *worse* duty cycle. Both flapped,
+and the PASS/FAIL difference between them was which side of a signal changing
+every few seconds the terminal sample happened to land on.
 
-`/ready` reads this flag. The failure is therefore an instance that an
-orchestrator keeps out of service because of an error rate it survived.
+**Fixed**: health is hysteretic. Three consecutive failures with no success
+between them mark the store down; one success clears it. Callers report the
+outcome of the operation they finished instead of capturing an epoch first,
+which removed the guard along with its call-site ceremony. What is given up is
+that a slow success predating an outage now resets the count, delaying detection
+by one more round of failures — bounded, where the guard's failure mode was not.
+`loggytracy_remote_consecutive_failures` exposes the pressure the flag now hides
+below its threshold. Measured after: 99.3-100% healthy, 0-2 transitions.
 
-**Fix direction**: restore health on the evidence that the store works now
-rather than on an epoch comparison — for example, let any success at an epoch at
-least as new as the last observed failure clear it, or track consecutive
-failures instead of a single flag. Whichever is chosen, one worker's recovery
-must not be cancelled by another worker's unrelated failure.
+### N8. Merge and flush contend, and the WAL backlog shows it
+
+- Location: not yet localized
+- Verification: **Reproduced** (four runs), `docs/LOAD_RESULTS.md` section 6
+
+With merge enabled the WAL backlog ends at 47.6 MB; with merge disabled, 9.6 MB
+— same event count, similar flush count (31 vs 34), same injected error rate.
+Well under the 1 GiB backpressure limit, so nothing breaks, and it is the one
+difference between the two configurations that the N7 fix did not remove.
+
+Whether the backlog plateaus or grows is not answerable from a run that
+terminates on an event count. That is the next measurement, and it decides
+whether this is a tuning note or a defect.
+
+### N9. Peak RSS tracks whether merge runs, not what it may materialize
+
+- Location: not yet localized
+- Verification: **Reproduced**, `docs/LOAD_RESULTS.md` section 6
+
+Peak RSS is 173-187 MB with merge off and 697-758 MB with merge on. Cutting
+`merge_max_memory_bytes` eightfold moved it only 697 → 514 MB, and the run with
+no injected errors peaks highest of all at 758 MB while passing every gate. So
+the budget knob is not what sets the peak, which points at allocator high-water
+retention rather than at live merge state.
+
+This matters because 16 GiB is the target and merge is the largest consumer in
+it. Confirming or refuting the allocator hypothesis wants a heap profile, not
+another load run.
 
 ---
 

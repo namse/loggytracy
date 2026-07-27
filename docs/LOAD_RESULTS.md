@@ -232,26 +232,48 @@ retention rather than at a budget worth tuning.
 **"The FAIL is memory pressure from merge" — wrong.** The no-error run has the
 highest RSS of the four and passes.
 
-**What it actually is.** `mark_remote_healthy_since(epoch)` restores health with
-a CAS from exactly the unhealthy state of the epoch the caller observed *before*
-its operation. The guard is deliberate and right on its own terms: a success
-that started before a newer failure must not clear that failure. But every
-worker reports independently — flush, merge and retention each capture an epoch
-and CAS afterwards — and any failure anywhere between one worker's capture and
-its CAS defeats that worker's recovery. **The chance of health being restored
-therefore falls as the number of concurrent reporters rises**, which is exactly
-the difference between the two 3% runs: merge off has fewer reporters and
-recovers; merge on does not.
+**What it actually is — and the explanation that was wrong.** The first
+diagnosis offered here was that health recovery degrades as reporters multiply:
+`mark_remote_healthy_since(epoch)` restored health only by CAS from the epoch
+the caller observed before its operation, so a failure by any other worker in
+between defeated that worker's recovery. Sampling `remote_healthy` every 250 ms
+through a run refutes it — the run with **fewer** reporters has the **worse**
+duty cycle:
 
-Four fault seeds were tried and all four fail, so it is not a seeded artifact.
-Seed 333 fails with **zero merge errors**, so it is not merge's own failures
-either — merge participates in the epoch race by reporting its successes.
+| run | healthy | transitions | longest unhealthy |
+|---|---|---|---|
+| merge on, 3% errors | 66.4% | 14 in 75 s | 11.5 s |
+| merge off, 3% errors | 41.0% | 17 in 48 s | 4.2 s |
 
-Not yet distinguished: whether health is permanently stuck or merely has a low
-duty cycle under load. `/ready` reads this flag, so the difference is between an
-instance that never returns to service and one that flaps — both bad, and both
-worse than the injected error rate they come from. Sampling `remote_healthy`
-over the run rather than at its end would separate them.
+Both flap. The PASS/FAIL split between them was the terminal sample landing on
+different sides of a signal that changes every few seconds — luck, not a
+behavioural difference.
+
+The actual defect is simpler: **a single failed request meant "the store is
+down"**, and `/ready` reads that. At a 3% write-error rate — which the engine
+survives with no ingest errors and no lost data — readiness flipped 14-17 times
+a minute. An orchestrator watching it pulls the instance in and out of service
+over an error rate that cost nothing.
+
+Health is now hysteretic: three consecutive failures with no success between
+them mark the store down, and one success clears it. Re-measured on the same
+workload:
+
+| run | healthy | transitions |
+|---|---|---|
+| merge on, 3% errors | **99.3%** | 2 |
+| merge off, 3% errors | **100.0%** | 0 |
+
+The harness gated on the terminal sample, which is what made its verdict a coin
+flip. It now samples through the run and gates on the fraction.
+
+**What survives the fix, newly isolated.** With merge on, the WAL backlog ends
+at 47.6 MB against 9.6 MB with merge off, from the same event count and a
+similar flush count (31 vs 34). Merge and flush contend for the object store and
+flush falls behind. It is well under the 1 GiB backpressure limit, so nothing
+broke, but it is 3x the harness target and it is the one difference between the
+two configurations that the health fix did not remove. Whether it plateaus or
+grows is not answerable from a run that stops on an event count.
 
 Fixed location: `merge::tests::layout_totals_count_tenant_part_pairs_and_survive_a_silent_merge`,
 `merge::tests::merging_parts_removes_their_pairs_from_the_totals`.

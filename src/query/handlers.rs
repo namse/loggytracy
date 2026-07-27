@@ -566,6 +566,9 @@ loggytracy_part_count {}\n\
 loggytracy_trace_part_count {}\n\
 # TYPE loggytracy_remote_healthy gauge\n\
 loggytracy_remote_healthy {}\n\
+# HELP loggytracy_remote_consecutive_failures Object-store failures since the last success. The health flag hides these below its threshold, so this is where a degrading store shows before it is declared down.\n\
+# TYPE loggytracy_remote_consecutive_failures gauge\n\
+loggytracy_remote_consecutive_failures {}\n\
 # TYPE loggytracy_cache_healthy gauge\n\
 loggytracy_cache_healthy {}\n\
 # TYPE loggytracy_wal_backlog_bytes gauge\n\
@@ -668,6 +671,11 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         state.parts.part_count(),
         state.trace_parts.part_count(),
         remote_healthy as u8,
+        state
+            .remote_cache
+            .as_ref()
+            .map(|cache| cache.consecutive_remote_failures())
+            .unwrap_or(0),
         cache_healthy as u8,
         wal_backlog_bytes,
         merge_debt_parts,

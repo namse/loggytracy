@@ -152,6 +152,12 @@ async fn main() {
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok());
     let mut rss_peak_bytes = 0u64;
+    // Sampled through the run, not read once at the end. `remote_healthy` is a
+    // point-in-time flag, so gating on its terminal value made the verdict
+    // depend on where the run happened to stop: at a 3% error rate the same
+    // configuration passed or failed by luck of the last sample.
+    let mut health_samples = 0u64;
+    let mut health_healthy = 0u64;
 
     let mut otlp_client = TraceServiceClient::connect(format!("http://{otlp_address}"))
         .await
@@ -304,10 +310,17 @@ async fn main() {
             }
         }
 
-        if pushes.is_multiple_of(10)
-            && let Some(pid) = server_pid
-        {
-            rss_peak_bytes = rss_peak_bytes.max(server_rss_bytes(pid).unwrap_or(0));
+        if pushes.is_multiple_of(10) {
+            if let Some(pid) = server_pid {
+                rss_peak_bytes = rss_peak_bytes.max(server_rss_bytes(pid).unwrap_or(0));
+            }
+            if let Some(sample) = fetch_metrics(&http_address)
+                .get("loggytracy_remote_healthy")
+                .copied()
+            {
+                health_samples += 1;
+                health_healthy += (sample as u64).min(1);
+            }
         }
     }
 
@@ -381,6 +394,14 @@ async fn main() {
     // acknowledged data is never lost (no ingest errors) and both the remote and
     // the cache end healthy. Transient counters are reported for interpretation.
     let remote_healthy_end = gauge(&end_metrics, "loggytracy_remote_healthy");
+    // A store that is up should read healthy for essentially the whole run. The
+    // bar is deliberately not 100%: a real outage during a fault-injection run
+    // is expected to show, and should show, as time spent unhealthy.
+    let remote_healthy_fraction = if health_samples > 0 {
+        health_healthy as f64 / health_samples as f64
+    } else {
+        1.0
+    };
     let cache_healthy_end = gauge(&end_metrics, "loggytracy_cache_healthy");
     // Flush liveness. Transient injected errors are tolerated, but the flush
     // loop must keep draining the WAL: if the backlog is not bounded and no
@@ -399,6 +420,7 @@ async fn main() {
     let behavioral = serde_json::json!({
         "no_ingest_errors": ingest_errors_delta == 0,
         "remote_healthy_end": remote_healthy_end == 1,
+        "remote_healthy_fraction": remote_healthy_fraction,
         "cache_healthy_end": cache_healthy_end == 1,
         "flush_progressing": flush_progressing,
         "wal_backlog_bounded": wal_backlog_bounded,
@@ -410,7 +432,7 @@ async fn main() {
         "retention_observed": retention_success_delta > 0,
     });
     let behavioral_pass = ingest_errors_delta == 0
-        && remote_healthy_end == 1
+        && remote_healthy_fraction >= 0.95
         && cache_healthy_end == 1
         && flush_progressing;
 

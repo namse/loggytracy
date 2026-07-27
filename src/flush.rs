@@ -331,9 +331,8 @@ async fn flush_once(
                     trace_memtable.abort_flush(trace_spans);
                     return Err(format!("failed to record flush transaction: {error}"));
                 }
-                let epoch = cache.remote_operation_epoch();
                 if let Err(error) = cache.storage.publish(&new_parts, &[]).await {
-                    cache.mark_remote_unhealthy();
+                    cache.record_remote_failure();
                     let rollback_error = cache
                         .storage
                         .rollback_flush_transaction(&config.data_dir)
@@ -356,7 +355,7 @@ async fn flush_once(
                     });
                 }
                 if let Err(error) = cache.storage.publish_trace_parts(&new_trace_parts).await {
-                    cache.mark_remote_unhealthy();
+                    cache.record_remote_failure();
                     let rollback_error = cache
                         .storage
                         .rollback_flush_transaction(&config.data_dir)
@@ -378,7 +377,7 @@ async fn flush_once(
                         },
                     });
                 }
-                cache.mark_remote_healthy_since(epoch);
+                cache.record_remote_success();
             }
             // A query holds the operation read lock for its complete
             // memtable/part snapshot. Publish may happen under a read lock,

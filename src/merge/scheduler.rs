@@ -122,20 +122,19 @@ async fn merge_once(
                 let required: std::collections::HashSet<String> = old_ids.iter().cloned().collect();
                 let missing = registry.missing_data_ids(&required);
                 if !missing.is_empty() {
-                    let epoch = cache.remote_operation_epoch();
                     let restore = tokio::time::timeout(
                         config.max_restore_runtime,
                         cache.storage.restore_parts(&cache.parts_root, &missing),
                     )
                     .await;
                     match restore {
-                        Ok(Ok(())) => cache.mark_remote_healthy_since(epoch),
+                        Ok(Ok(())) => cache.record_remote_success(),
                         Ok(Err(error)) => {
-                            cache.mark_remote_unhealthy();
+                            cache.record_remote_failure();
                             return Err(error);
                         }
                         Err(_) => {
-                            cache.mark_remote_unhealthy();
+                            cache.record_remote_failure();
                             return Err("object store restore timed out".to_string());
                         }
                     }
@@ -262,7 +261,6 @@ async fn merge_once(
             }
             let mut manifest_committed = false;
             if let Some(cache) = remote_cache {
-                let epoch = cache.remote_operation_epoch();
                 if let Err(error) = cache.storage.publish(&new_parts, &old_ids).await {
                     if let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs) {
                         tracing::warn!(%cleanup_error, "failed to remove unpublished merged parts");
@@ -280,7 +278,7 @@ async fn merge_once(
                         );
                         continue;
                     }
-                    cache.mark_remote_unhealthy();
+                    cache.record_remote_failure();
                     tracing::error!(
                         %error,
                         partition = %partition,
@@ -291,7 +289,7 @@ async fn merge_once(
                     ));
                     continue;
                 }
-                cache.mark_remote_healthy_since(epoch);
+                cache.record_remote_success();
                 manifest_committed = true;
             }
             drop(part_guard);

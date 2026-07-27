@@ -358,6 +358,67 @@
         assert!(error.1.contains("OTLP gRPC server"));
     }
 
+    /// Readiness follows a sustained object-store outage, not a single failed
+    /// request.
+    ///
+    /// One failure used to mark the store unhealthy, and `/ready` reads that.
+    /// Measured under a 3% injected write-error rate — which the engine
+    /// survives with no ingest errors and no lost data — the flag flipped
+    /// 14-17 times a minute and read false 34-59% of the time. An orchestrator
+    /// watching it pulls the instance out of service over an error rate that
+    /// cost nothing.
+    #[tokio::test]
+    async fn readiness_ignores_an_isolated_object_store_failure() {
+        let data_dir = temp_dir();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+        let memtable = Arc::new(MemTable::new());
+        let remote = Arc::new(crate::object_storage::RemoteCache::new(
+            Arc::new(crate::object_storage::ObjectStorage::in_memory()),
+            data_dir.join("parts"),
+        ));
+        remote.mark_cache_healthy();
+        let state = crate::test_support::state(
+            config.clone(),
+            memtable.clone(),
+            Arc::new(Journal::spawn(&config, memtable).unwrap()),
+            Arc::new(PartRegistry::new()),
+            Arc::new(crate::trace_registry::TraceRegistry::standalone()),
+            Some(remote.clone()),
+        );
+
+        remote.record_remote_failure();
+        assert!(
+            remote.is_remote_healthy(),
+            "one failed request is not an outage"
+        );
+        assert!(ready(State(state.clone())).await.is_ok());
+
+        // A success between failures is what distinguishes a flaky request
+        // from a store that is gone, so it resets the count.
+        remote.record_remote_failure();
+        remote.record_remote_success();
+        remote.record_remote_failure();
+        remote.record_remote_failure();
+        assert!(remote.is_remote_healthy(), "{}", remote.consecutive_remote_failures());
+        assert!(ready(State(state.clone())).await.is_ok());
+
+        // Failing without a success in between does mean the store is gone.
+        remote.record_remote_failure();
+        assert!(!remote.is_remote_healthy());
+        assert_eq!(
+            ready(State(state.clone())).await.unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        // And one success is enough to come back, because the evidence that
+        // the store works is the store working.
+        remote.record_remote_success();
+        assert!(ready(State(state)).await.is_ok());
+    }
+
     #[tokio::test]
     async fn readiness_reflects_remote_storage_health() {
         let data_dir = temp_dir();
@@ -370,7 +431,7 @@
             Arc::new(crate::object_storage::ObjectStorage::in_memory()),
             data_dir.join("parts"),
         ));
-        remote.mark_remote_unhealthy();
+        remote.mark_unhealthy();
         remote.mark_cache_healthy();
         let state = crate::test_support::state(
             config.clone(),
@@ -385,7 +446,7 @@
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.contains("object store"));
 
-        remote.mark_remote_healthy();
+        remote.record_remote_success();
         remote.mark_cache_unhealthy();
         let memtable = Arc::new(MemTable::new());
         let state = crate::test_support::state(

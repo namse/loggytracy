@@ -54,7 +54,7 @@ pub async fn retention_loop(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             healthy.store(false, Ordering::Release);
             if let Some(cache) = remote_cache.as_deref() {
-                cache.mark_remote_unhealthy();
+                cache.record_remote_failure();
             }
             tracing::error!(%error, "retention iteration failed");
         } else {
@@ -279,20 +279,19 @@ async fn retention_once_at(
     if let Some(cache) = remote_cache {
         if !removed_log_ids.is_empty() {
             let ids = removed_log_ids.clone();
-            let epoch = cache.remote_operation_epoch();
             match tokio::time::timeout(
                 config.max_retention_runtime,
                 cache.storage.publish(&[], &ids),
             )
             .await
             {
-                Ok(Ok(_)) => cache.mark_remote_healthy_since(epoch),
+                Ok(Ok(_)) => cache.record_remote_success(),
                 Ok(Err(error)) => {
-                    cache.mark_remote_unhealthy();
+                    cache.record_remote_failure();
                     return Err(error);
                 }
                 Err(_) => {
-                    cache.mark_remote_unhealthy();
+                    cache.record_remote_failure();
                     return Err("object-store retention timed out".to_string());
                 }
             }
@@ -311,20 +310,19 @@ async fn retention_once_at(
                 .filter(|(part, _)| removed_trace_ids.iter().any(|id| id == &part.id))
                 .map(|(part, _)| part.clone())
                 .collect();
-            let epoch = cache.remote_operation_epoch();
             match tokio::time::timeout(
                 config.max_retention_runtime,
                 cache.storage.remove_trace_parts(&descriptors),
             )
             .await
             {
-                Ok(Ok(_)) => cache.mark_remote_healthy_since(epoch),
+                Ok(Ok(_)) => cache.record_remote_success(),
                 Ok(Err(error)) => {
-                    cache.mark_remote_unhealthy();
+                    cache.record_remote_failure();
                     return Err(error);
                 }
                 Err(_) => {
-                    cache.mark_remote_unhealthy();
+                    cache.record_remote_failure();
                     return Err("trace object-store retention timed out".to_string());
                 }
             }
@@ -334,7 +332,6 @@ async fn retention_once_at(
     }
 
     if let Some(cache) = remote_cache {
-        let epoch = cache.remote_operation_epoch();
         match tokio::time::timeout(
             config.max_retention_runtime,
             cache
@@ -343,13 +340,13 @@ async fn retention_once_at(
         )
         .await
         {
-            Ok(Ok(_)) => cache.mark_remote_healthy_since(epoch),
+            Ok(Ok(_)) => cache.record_remote_success(),
             Ok(Err(error)) => {
-                cache.mark_remote_unhealthy();
+                cache.record_remote_failure();
                 return Err(error);
             }
             Err(_) => {
-                cache.mark_remote_unhealthy();
+                cache.record_remote_failure();
                 return Err("remote retention garbage collection timed out".to_string());
             }
         }

@@ -29,7 +29,8 @@ This engine is **single-machine, single-writer**. Breaking that assumption corru
 | `loggytracy_ingest_throttled_total` | Increasing | Returning 429; flush cannot keep up with ingest |
 | `loggytracy_wal_backlog_bytes` | Upward trend | Same cause, earlier signal |
 | `loggytracy_flush_errors_total` | Increasing while `flush_success_total` is flat | **Flush stopped.** Most dangerous state |
-| `loggytracy_remote_healthy` | Stays 0 | Object store unreachable |
+| `loggytracy_remote_healthy` | Stays 0 | Object store unreachable. Set by three consecutive failures with no success between them, so an isolated failed request does not trip it |
+| `loggytracy_remote_consecutive_failures` | Rising but below 3 | The store is degrading without being declared down — the early signal the health flag deliberately hides |
 | `loggytracy_merge_debt_parts` | Upward trend | Merge cannot keep up; query-planning cost rises |
 | `loggytracy_retention_rewrite_skipped_total` | Increasing | A part is too large to rewrite. **Tenant deletion is not complete** |
 | `loggytracy_tenant_policy_unknown_tenants` | Greater than 0 | Unknown tenants are accumulating data from the control plane's perspective |

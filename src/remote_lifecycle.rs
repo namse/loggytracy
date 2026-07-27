@@ -48,7 +48,6 @@ where
     let missing = missing_parts(&required);
     if !missing.is_empty() {
         let started = std::time::Instant::now();
-        let epoch = remote.remote_operation_epoch();
         let result = match domain {
             RemoteDomain::Logs => {
                 tokio::time::timeout(
@@ -69,7 +68,7 @@ where
         };
         match result {
             Ok(Ok(())) => {
-                remote.mark_remote_healthy_since(epoch);
+                remote.record_remote_success();
                 if let Some(metrics) = &metrics {
                     metrics
                         .remote_restore_success
@@ -82,7 +81,7 @@ where
                 }
             }
             Ok(Err(error)) => {
-                remote.mark_remote_unhealthy();
+                remote.record_remote_failure();
                 if let Some(metrics) = &metrics {
                     metrics
                         .remote_restore_errors
@@ -96,7 +95,7 @@ where
                 return Err(RuntimeError::Remote(error));
             }
             Err(_) => {
-                remote.mark_remote_unhealthy();
+                remote.record_remote_failure();
                 if let Some(metrics) = &metrics {
                     metrics
                         .remote_restore_errors

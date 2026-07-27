@@ -34,20 +34,42 @@ pub struct ObjectStorage {
 pub struct RemoteCache {
     pub storage: Arc<ObjectStorage>,
     pub parts_root: PathBuf,
-    // The low bit is health; the remaining bits are a failure generation.
-    // A success may clear a failure only if the operation started in the
-    // current generation, preventing an older concurrent restore/publish from
-    // overwriting a newer failure.
-    remote_state: Arc<AtomicU64>,
+    /// Object-store failures since the last success.
+    ///
+    /// This was a health bit plus a failure generation, where a success cleared
+    /// the bit only if its operation had started in the current generation. The
+    /// guard was aimed at a real hazard — a slow success must not clear a newer
+    /// failure — but it made a *single* failed request mean "the store is
+    /// down", and that is what `/ready` reads.
+    ///
+    /// Measured at a 3% injected write-error rate, which the engine survives
+    /// with no ingest errors and no lost data: `remote_healthy` flipped 14-17
+    /// times a minute and read false 34-59% of the time. An orchestrator
+    /// watching that pulls the instance in and out of service over an error
+    /// rate that cost nothing.
+    remote_failures: Arc<AtomicU32>,
     cache_healthy: Arc<AtomicBool>,
 }
+
+/// Consecutive failures that constitute an outage rather than a bad request.
+///
+/// A store that is genuinely unreachable fails everything, so it crosses this
+/// in the time of a few operations. An isolated failure between successes never
+/// does.
+///
+/// What is given up is the old generation guard: a slow success that started
+/// before an outage now resets the count, delaying detection by one more round
+/// of failures. That is a bounded delay rather than the indefinite masking the
+/// guard was written to prevent, because during a real outage failures vastly
+/// outnumber stale successes.
+const REMOTE_FAILURE_THRESHOLD: u32 = 3;
 
 impl RemoteCache {
     pub fn new(storage: Arc<ObjectStorage>, parts_root: PathBuf) -> Self {
         Self {
             storage,
             parts_root,
-            remote_state: Arc::new(AtomicU64::new(1)),
+            remote_failures: Arc::new(AtomicU32::new(0)),
             cache_healthy: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -57,39 +79,32 @@ impl RemoteCache {
     }
 
     pub fn is_remote_healthy(&self) -> bool {
-        self.remote_state.load(Ordering::Acquire) & 1 == 1
+        self.consecutive_remote_failures() < REMOTE_FAILURE_THRESHOLD
+    }
+
+    /// Failure pressure below the threshold, which the health flag hides by
+    /// design. An operator watching this sees a store degrading before it is
+    /// declared down.
+    pub fn consecutive_remote_failures(&self) -> u32 {
+        self.remote_failures.load(Ordering::Acquire)
     }
 
     pub fn is_cache_healthy(&self) -> bool {
         self.cache_healthy.load(Ordering::Acquire)
     }
 
-    pub fn mark_remote_healthy(&self) {
-        let epoch = self.remote_operation_epoch();
-        self.mark_remote_healthy_since(epoch);
+    /// The store answered. Callers report the outcome of the operation they
+    /// just finished; nothing has to be captured beforehand.
+    pub fn record_remote_success(&self) {
+        self.remote_failures.store(0, Ordering::Release);
     }
 
-    pub fn mark_remote_unhealthy(&self) {
-        self.remote_state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                Some((((state >> 1).saturating_add(1)) << 1) & !1)
-            })
-            .ok();
-    }
-
-    pub fn remote_operation_epoch(&self) -> u64 {
-        self.remote_state.load(Ordering::Acquire) >> 1
-    }
-
-    pub fn mark_remote_healthy_since(&self, epoch: u64) {
-        let unhealthy = epoch << 1;
-        let healthy = unhealthy | 1;
-        let _ = self.remote_state.compare_exchange(
-            unhealthy,
-            healthy,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+    pub fn record_remote_failure(&self) {
+        let _ = self
+            .remote_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |failures| {
+                Some(failures.saturating_add(1))
+            });
     }
 
     pub fn mark_cache_healthy(&self) {
@@ -107,9 +122,13 @@ impl RemoteCache {
             .unwrap_or_else(|| PathBuf::from("traces"))
     }
 
+    /// Drive the remote to unhealthy in one call, for tests that need the
+    /// state rather than the path into it.
     #[cfg(test)]
     pub fn mark_unhealthy(&self) {
-        self.mark_remote_unhealthy();
+        for _ in 0..REMOTE_FAILURE_THRESHOLD {
+            self.record_remote_failure();
+        }
     }
 }
 
