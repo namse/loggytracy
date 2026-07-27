@@ -584,7 +584,7 @@ the code, the note says which.
 - [x] P1-10 retry transient object-store failures at startup (`LOGGYTRACY_STARTUP_RETRY_BUDGET`). The remaining `panic!` sites are the deliberate give-up past that budget, where the orchestrator's restart backoff is the better place to escalate
 - [x] P2-6 honor `RUST_LOG`, default `info`
 - [x] P2-7 latency histograms (p95/p99 derivable). Endpoint labels are still absent
-- [ ] P2-8 non-stdin abort path + document orchestrator deployment requirements
+- [x] P2-8 non-stdin abort (`SIGUSR1`) + the orchestrator requirement and the two ways out documented in [`RUNBOOK.md`](RUNBOOK.md)
 - [x] P2-9 warn on `file://` production misuse (opt-in enforcement remains)
 - [ ] P2-4 decide `retention_period` default (document rationale if infinite)
 - [x] P3 Dockerfile + configuration reference + runbook + alert rules

@@ -188,8 +188,9 @@ pub enum ShutdownOutcome {
 /// disk, so giving up would lose data. Transient object-store failures are
 /// retried with bounded backoff forever. If retries keep failing past
 /// `shutdown_flush_warn_after`, a prominent stdout message repeats and an
-/// operator must type `exit` on stdin to force termination; absent that input
-/// the process keeps retrying and exits on its own the moment a flush succeeds.
+/// operator can force termination with `SIGUSR1` (or `exit` on stdin when a
+/// terminal is attached); absent that the process keeps retrying and exits on
+/// its own the moment a flush succeeds.
 ///
 /// The operator abort is only reachable *between* attempts, while backing off
 /// after a failed pass. A hung (rather than erroring) object-store call would
@@ -311,8 +312,42 @@ so a restart on this same disk recovers without loss; do not discard the disk)."
 }
 
 /// Read stdin on a blocking thread and signal once the operator types `exit`.
+/// Two ways for an operator to abandon a force-flush that will not finish.
+///
+/// `SIGUSR1` is the one that matters. Under systemd or in a container stdin is
+/// not a TTY, so the typed command was unreachable exactly where this decision
+/// gets made — and the alternative there is the orchestrator's grace period
+/// expiring into a `SIGKILL`, which is the same abort with no exit code, no log
+/// line, and no chance to record that the data is still in the WAL on that
+/// disk. A signal reaches the process the same way `SIGTERM` already does:
+/// `kill -USR1 1`.
+///
+/// stdin is kept because it is the convenient one when a person is watching a
+/// terminal, and neither costs anything when unused.
 fn spawn_abort_watcher() -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel(1);
+
+    #[cfg(unix)]
+    {
+        let signal_tx = tx.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut abort = match signal(SignalKind::user_defined1()) {
+                Ok(abort) => abort,
+                Err(error) => {
+                    tracing::error!(%error, "failed to install the SIGUSR1 abort handler");
+                    return;
+                }
+            };
+            if abort.recv().await.is_some() {
+                tracing::warn!("SIGUSR1 received; abandoning the force-flush");
+                // The channel holds one slot and one abort ends the loop, so a
+                // full channel means an abort is already in flight.
+                let _ = signal_tx.try_send(());
+            }
+        });
+    }
+
     std::thread::spawn(move || {
         use std::io::BufRead;
         let stdin = std::io::stdin();
@@ -328,9 +363,51 @@ fn spawn_abort_watcher() -> mpsc::Receiver<()> {
                 Err(_) => return,
             }
         }
-        // stdin closed (for example, not a TTY): no operator abort is possible,
-        // so force-flush retries until storage recovers.
-        tracing::warn!("stdin is unavailable; operator-initiated shutdown abort is disabled");
+        // stdin closed, which is the normal case in a container. The signal
+        // path above is the one that works there.
+        tracing::info!("stdin is unavailable; abandon a stuck force-flush with SIGUSR1");
     });
     rx
+}
+
+#[cfg(all(test, unix))]
+mod abort_signal_tests {
+    use super::*;
+
+    /// The abort that works where the decision is actually made.
+    ///
+    /// Under systemd or in a container stdin is not a TTY, so the typed
+    /// command was unreachable exactly there, and the only remaining way out
+    /// was the orchestrator's grace period expiring into a `SIGKILL` — the
+    /// same abort with no exit code and no log line.
+    #[tokio::test]
+    async fn sigusr1_abandons_a_force_flush_that_cannot_finish() {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        // Installed here first so the process disposition is already a handler
+        // when the signal is raised. Without it a scheduling race between
+        // spawning the watcher and raising the signal would kill the test
+        // binary, since SIGUSR1 terminates by default.
+        let mut guard = signal(SignalKind::user_defined1()).expect("install SIGUSR1");
+
+        let mut abort = spawn_abort_watcher();
+        // Give the watcher's task a chance to register its own stream.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let status = std::process::Command::new("kill")
+            .args(["-USR1", &std::process::id().to_string()])
+            .status()
+            .expect("raise SIGUSR1");
+        assert!(status.success());
+
+        let received = tokio::time::timeout(Duration::from_secs(5), abort.recv())
+            .await
+            .expect("the abort must arrive rather than hang");
+        assert!(received.is_some(), "the watcher forwards the signal");
+
+        // Drain the test's own stream so the signal does not leak into a later
+        // test that installs one.
+        let _ = tokio::time::timeout(Duration::from_millis(50), guard.recv()).await;
+    }
 }

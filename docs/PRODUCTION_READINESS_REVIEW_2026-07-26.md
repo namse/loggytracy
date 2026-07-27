@@ -167,7 +167,7 @@ Only status is confirmed here; see the previous document for details.
 | P2-2 resource guards on metadata endpoints | **Fixed** — semaphore, timeout, `start`/`end`, and `match[]` count limits |
 | P2-5 duplicates after a crash unobservable | Open |
 | P2-7 `/metrics` has no histograms or labels | **Partly fixed** — latency histograms are there, so p95/p99 is derivable. Endpoint labels are still absent |
-| P2-8 stdin abort ineffective in containers | Open |
+| P2-8 stdin abort ineffective in containers | **Fixed** — `SIGUSR1` abandons a stuck force-flush and exits non-zero. stdin is kept for interactive use |
 | P3 deployment assets | **Fixed** — Dockerfile, [`CONFIGURATION.md`](CONFIGURATION.md), [`RUNBOOK.md`](RUNBOOK.md) |
 | P2 real S3 validation | **Confirmed out of scope** — local MinIO is the limit ([`LOAD_VALIDATION.md`](LOAD_VALIDATION.md)) |
 

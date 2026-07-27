@@ -15,6 +15,8 @@ This engine is **single-machine, single-writer**. Breaking that assumption corru
 2. **Set `terminationGracePeriodSeconds` high.** Force-flush retries without a hard timeout during shutdown.
    If the orchestrator sends SIGKILL after 30 seconds, unflushed data remains only in the WAL, and the disk
    may be discarded when the pod is scheduled on another node. **At least 10 minutes, preferably more.**
+   The point of the long grace period is that the decision to give up should be an operator's
+   (`kill -USR1`, which exits non-zero and says so) rather than a timer's (SIGKILL, which says nothing).
 3. **Use one replica.** Raising this to two or more lets the second instance claim the writer epoch and the
    first one is fenced and killed. This is intentional, but such a configuration must not be created.
 4. **Keep the listening address inside the trust boundary.** TLS and authentication are outside this process,
@@ -126,6 +128,21 @@ will not go unnoticed.
 
 The exit code in step 3 is the only basis for judgment. SIGKILL has no exit code, so if step 2 was skipped
 and the process was forced down, restart it on that disk to recover.
+
+### When the force-flush cannot finish
+
+If the object store is down, step 2 never completes. That is the design: giving up would lose data, so the
+retry has no timeout. Two ways out, and they are not equivalent.
+
+- **`kill -USR1 <pid>`** — abandon the force-flush deliberately. The process exits **non-zero**, logs that
+  it did so, and leaves the data in the WAL. Use this when the store will not recover soon and the pod has
+  to go. Then **keep the disk** and restart on it.
+- **Doing nothing until the grace period expires** — the orchestrator sends SIGKILL. The data is in the
+  same place, but there is no exit code and no log line saying why, so nothing distinguishes it from a
+  clean shutdown afterwards. This is the case `terminationGracePeriodSeconds` is set high to avoid.
+
+Inside a container stdin is not a TTY, so the `exit`/`quit` command on stdin is only useful when a person
+is attached to a terminal. `SIGUSR1` is the one that works in a deployment.
 
 ## Recovery after forced termination
 
