@@ -26,6 +26,13 @@ pub struct ObjectStorage {
     /// CAS stops a lost update but not two divergent local WALs, and not one
     /// instance's retention expiring a part the other has just registered.
     writer_epoch: AtomicU64,
+    /// Catalog files checksummed while restoring. The expensive part of a
+    /// startup at scale is this, not the store round trips: every part's bloom,
+    /// stream index and metadata are read and verified from local disk. Counted
+    /// so a test can catch a redundant pass without running at the scale where
+    /// the seconds show.
+    #[cfg(test)]
+    catalog_validations: AtomicU64,
 }
 
 /// Coordinates all mutations of the local object-store cache. Readers hold a
@@ -133,6 +140,21 @@ impl RemoteCache {
 }
 
 impl ObjectStorage {
+    /// See `catalog_validations`.
+    #[cfg(test)]
+    pub fn catalog_validations(&self) -> u64 {
+        self.catalog_validations.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn record_catalog_validation(&self) {
+        self.catalog_validations.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(not(test))]
+    fn record_catalog_validation(&self) {}
+
+
     pub fn from_url(url: &str) -> Result<Self, String> {
         let url =
             url::Url::parse(url).map_err(|error| format!("invalid object-store URL: {error}"))?;
@@ -162,6 +184,8 @@ production or on shared/network storage."
             local_manifest_overwrite,
             fence_sink: std::sync::OnceLock::new(),
             writer_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            catalog_validations: AtomicU64::new(0),
         })
     }
 
@@ -174,6 +198,8 @@ production or on shared/network storage."
             local_manifest_overwrite: false,
             fence_sink: std::sync::OnceLock::new(),
             writer_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            catalog_validations: AtomicU64::new(0),
         }
     }
 
@@ -188,6 +214,8 @@ production or on shared/network storage."
             local_manifest_overwrite: false,
             fence_sink: std::sync::OnceLock::new(),
             writer_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            catalog_validations: AtomicU64::new(0),
         })
     }
 
@@ -206,6 +234,8 @@ production or on shared/network storage."
             local_manifest_overwrite: false,
             fence_sink: std::sync::OnceLock::new(),
             writer_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            catalog_validations: AtomicU64::new(0),
         }
     }
 
@@ -221,6 +251,8 @@ production or on shared/network storage."
             local_manifest_overwrite: false,
             fence_sink: std::sync::OnceLock::new(),
             writer_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            catalog_validations: AtomicU64::new(0),
         }
     }
 

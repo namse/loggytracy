@@ -198,8 +198,18 @@ impl ObjectStorage {
         // local generations and their markers.
         let local_parts = part::discover_parts(parts_root)?;
         let manifest = self.load_manifest().await?;
-        self.publish_local_only_parts(&local_parts, &manifest)
+        let published = self
+            .publish_local_only_parts(&local_parts, &manifest)
             .await?;
+        // Only restore again if the manifest changed. The second pass exists to
+        // fetch catalog files for parts this reconcile just published, and on a
+        // clean restart it publishes nothing — so it was re-validating every
+        // part's checksums a second time for no result. At 10,000 parts that
+        // pass alone cost about eighteen seconds of a sixty-four second
+        // startup.
+        if published.generation == manifest.generation {
+            return Ok(published);
+        }
         self.restore_catalog(parts_root).await
     }
 
@@ -216,6 +226,7 @@ impl ObjectStorage {
         let mut missing = Vec::new();
         for descriptor in &manifest.parts {
             let final_dir = cache_part_dir(parts_root, descriptor)?;
+            self.record_catalog_validation();
             if open_manifest_part(&final_dir, descriptor, false).is_ok() {
                 continue;
             }

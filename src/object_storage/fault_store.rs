@@ -163,6 +163,9 @@ pub(crate) struct LatencyFaultStore {
     /// a pending blocking task is enough to make that untrue.
     reads_in_flight: AtomicU64,
     peak_reads_in_flight: AtomicU64,
+    /// Every read this store has served. Lets a test count the work a startup
+    /// phase does without running one at a scale where the cost is visible.
+    total_reads: AtomicU64,
 }
 
 impl LatencyFaultStore {
@@ -173,6 +176,7 @@ impl LatencyFaultStore {
             operation_counter: AtomicU64::new(0),
             reads_in_flight: AtomicU64::new(0),
             peak_reads_in_flight: AtomicU64::new(0),
+            total_reads: AtomicU64::new(0),
         }
     }
 
@@ -180,6 +184,11 @@ impl LatencyFaultStore {
     #[cfg(test)]
     pub(crate) fn peak_reads_in_flight(&self) -> u64 {
         self.peak_reads_in_flight.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total_reads(&self) -> u64 {
+        self.total_reads.load(Ordering::Relaxed)
     }
 
     /// One deterministic draw keyed by the seed and the operation index. The
@@ -231,6 +240,7 @@ impl LatencyFaultStore {
     }
 
     async fn shape_read(&self) {
+        self.total_reads.fetch_add(1, Ordering::Relaxed);
         let in_flight = self.reads_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         self.peak_reads_in_flight
             .fetch_max(in_flight, Ordering::Relaxed);

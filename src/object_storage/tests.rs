@@ -1509,3 +1509,46 @@ opens a connection per part"
             "and a directory nothing points at is not eviction's to remove"
         );
     }
+
+    /// Reconciling a clean cache reads the catalog once, not twice.
+    ///
+    /// `reconcile_local_cache` restored the catalog at the start and again at
+    /// the end. The second pass exists to fetch catalog files for parts the
+    /// reconcile itself published, and a clean restart publishes nothing — so
+    /// it re-validated every part's checksums for no result. Measured at 10,099
+    /// parts, that pass was about eighteen seconds of a sixty-four second
+    /// startup.
+    ///
+    /// Counted here rather than timed, so the regression is caught without a
+    /// run at the scale where it hurts.
+    #[tokio::test]
+    async fn reconciling_a_clean_cache_reads_the_catalog_once() {
+        let root = temp_dir("reconcile-passes");
+        let parts_root = root.join("parts");
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = super::fault_store::FaultConfig::for_test(0, 0, 0, 0.0, 3);
+        let faulty = Arc::new(super::fault_store::LatencyFaultStore::new(inner, config));
+        let store: Arc<dyn ObjectStore> = faulty.clone();
+        let storage = ObjectStorage::from_store(store, "reconcile-passes");
+
+        for index in 0..6 {
+            let mut sample = row(&format!("part-{index}"));
+            sample.timestamp_ns += index as i64;
+            let parts = crate::part::flush_rows(vec![sample], &parts_root, 16).unwrap();
+            storage.publish(&parts, &[]).await.unwrap();
+        }
+        // Local catalog intact and nothing unpublished: the case a restart of a
+        // cleanly stopped instance presents.
+        let before = storage.catalog_validations();
+        let manifest = storage.reconcile_local_cache(&parts_root).await.unwrap();
+        let validations = storage.catalog_validations() - before;
+
+        assert_eq!(manifest.parts.len(), 6);
+        assert_eq!(
+            validations, 6,
+            "reconcile checksummed {validations} catalogs for six parts; a second pass is back"
+        );
+        // The store itself is barely touched, which is the point of the
+        // catalog being local: the cost is checksums, not round trips.
+        assert!(faulty.total_reads() > 0);
+    }

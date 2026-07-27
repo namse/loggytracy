@@ -327,3 +327,45 @@ Incidentally this is the first evidence on the long-running-leak axis: memory
 returns fully to its starting value after sustained load. It is not a
 substitute for a long run, because what a soak looks for is drift over hours,
 but a leak large enough to matter over hours would likely be visible here.
+
+## 8. Startup at 10,000 parts (P1-11)
+
+Merge disabled, 500 tenants, small flushes, until the registry held **10,099
+parts** and 107,609 (tenant, part) pairs. Then a clean stop and a restart, timed
+from process start to `/ready`.
+
+**63.69 seconds.** The phases, from the startup log:
+
+| phase | seconds | share |
+|---|---|---|
+| Log catalog restore | 36.9 | 58% |
+| Trace catalog restore | 10.7 | 17% |
+| Part registry load | 11.3 | 18% |
+| Everything else | 4.8 | 7% |
+
+Journal recovery was instant — the WAL was empty after a clean stop, so this is
+the floor, not a bad case.
+
+**The cost is checksums, not round trips.** Every part's bloom, stream index and
+metadata are read from local disk and verified, and that happens three times: the
+catalog restore at the start of `reconcile_local_cache`, the one at its end, and
+again when the registry opens each part. The store is barely touched.
+
+One of the three was redundant. The final restore exists to fetch catalog files
+for parts the reconcile itself published, and a clean restart publishes nothing,
+so it re-validated 10,099 catalogs for no result — roughly 18 seconds. It is now
+skipped when the manifest did not change. The remaining two passes are real work
+and reducing them needs the manifest format change P1-11 describes.
+
+For scale, the other numbers at 10,099 parts: 18.7 MB of resident sidecars,
+25.0 MB of `meta.json`, 78 MB RSS, first query 0.76 s and 0.02 s thereafter.
+The sidecar figure is far below the 407 MB extrapolated in section 6, because
+these parts are tiny — 10.7 tenants per part against 87 — so the earlier
+extrapolation assumed a part shape this configuration does not produce.
+
+**Also learned: there is no way to switch merge off.** `tokio::time::interval`
+fires its first tick immediately, so `MERGE_INTERVAL=99999s` still merges once at
+startup. Accumulating this part set worked only because the load outran that
+single tick. A later tick during the measurement consolidated all 10,099 parts
+into 5 in under two minutes — correct behaviour, but it means every "merge
+disabled" run in this document had one merge in it.
