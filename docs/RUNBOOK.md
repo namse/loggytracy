@@ -167,6 +167,18 @@ will not go unnoticed.
 The exit code in step 3 is the only basis for judgment. SIGKILL has no exit code, so if step 2 was skipped
 and the process was forced down, restart it on that disk to recover.
 
+### Shutdown takes longer than expected
+
+The drain waits for the merge group that was running when the signal arrived.
+Merge stops taking *new* groups the moment it is told to drain, so the bound is
+one group, not a whole tick — but one group can be a minute at scale, and
+`MERGE_MAX_INPUT_BYTES` is what sets it.
+
+If SIGTERM to exit is much longer than that, read the log timeline rather than
+guessing: each stage announces itself (`flush task stopped`, `merge task
+stopped`, `servers drained; force-flushing before exit`). Measured on a
+two-hour run at 500 tenants, the force-flush itself was 47 ms.
+
 ### When the force-flush cannot finish
 
 If the object store is down, step 2 never completes. That is the design: giving up would lose data, so the
