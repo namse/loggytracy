@@ -81,12 +81,35 @@ fn parse_metric_expr(input: &str, depth: usize) -> Result<MetricExpr, String> {
         ("rate", RangeFunction::Rate),
         ("count_over_time", RangeFunction::CountOverTime),
         ("bytes_over_time", RangeFunction::BytesOverTime),
+        ("sum_over_time", RangeFunction::SumOverTime),
+        ("avg_over_time", RangeFunction::AvgOverTime),
+        ("min_over_time", RangeFunction::MinOverTime),
+        ("max_over_time", RangeFunction::MaxOverTime),
+        ("quantile_over_time", RangeFunction::QuantileOverTime),
     ] {
         if let Some(rest) = strip_word(input, name) {
             let (inside, tail) = take_parenthesized(rest.trim_start())?;
             if !tail.trim().is_empty() {
                 return Err(format!("unexpected input after {name}"));
             }
+            // `quantile_over_time(0.99, {…}[5m])` puts φ first. Split on the
+            // comma before the selector so a comma inside the selector or a
+            // pipeline does not confuse it.
+            let (quantile, inside) = if function == RangeFunction::QuantileOverTime {
+                let comma = inside
+                    .find(',')
+                    .ok_or("quantile_over_time expects a quantile followed by a log expression")?;
+                let raw = inside[..comma].trim();
+                let quantile: f64 = raw
+                    .parse()
+                    .map_err(|_| format!("invalid quantile '{raw}'"))?;
+                if !(0.0..=1.0).contains(&quantile) {
+                    return Err(format!("quantile {quantile} must be between 0 and 1"));
+                }
+                (Some(quantile), &inside[comma + 1..])
+            } else {
+                (None, inside)
+            };
             let close = inside
                 .trim_end()
                 .strip_suffix(']')
@@ -97,10 +120,22 @@ fn parse_metric_expr(input: &str, depth: usize) -> Result<MetricExpr, String> {
             if range_ns <= 0 {
                 return Err("metric range must be greater than zero".to_string());
             }
+            let (query, unwrap) = parse_log_query_with_unwrap(close[..open].trim())?;
+            // Refused rather than answered with nothing: a function over
+            // values with no values named is a query the user got wrong, and
+            // an empty result reads as "no data" instead of "no question".
+            if function.needs_unwrap() && unwrap.is_none() {
+                return Err(format!("{name} requires an '| unwrap <field>' stage"));
+            }
+            if !function.needs_unwrap() && unwrap.is_some() {
+                return Err(format!("{name} does not take an 'unwrap' stage"));
+            }
             return Ok(MetricExpr::Range {
                 function,
-                query: parse_log_query(close[..open].trim())?,
+                query,
                 range_ns,
+                unwrap,
+                quantile,
             });
         }
     }
@@ -296,6 +331,94 @@ fn parse_matchers(input: &str) -> Result<Vec<LabelMatcher>, String> {
         }
     }
     Ok(matchers)
+}
+
+/// Splits a trailing `| unwrap …` off a log expression before parsing the rest
+/// as a pipeline.
+///
+/// `unwrap` is not a pipeline stage: it selects the value a range function
+/// aggregates and belongs to that function, not to the filtering. Keeping it
+/// out of `PipelineStage` means a log query can never carry one, which is what
+/// makes "this function needs an unwrap" checkable at parse time.
+fn parse_log_query_with_unwrap(input: &str) -> Result<(LogQuery, Option<Unwrap>), String> {
+    let Some(position) = find_unwrap_stage(input) else {
+        return Ok((parse_log_query(input)?, None));
+    };
+    let argument = input[position..].trim_start();
+    let argument = argument
+        .strip_prefix('|')
+        .map(str::trim_start)
+        .and_then(|rest| strip_word(rest, "unwrap"))
+        .ok_or("malformed unwrap stage")?
+        .trim();
+    let unwrap = parse_unwrap(argument)?;
+    Ok((parse_log_query(input[..position].trim_end())?, Some(unwrap)))
+}
+
+/// The last `| unwrap` in the expression, since anything after it would be a
+/// stage the unwrap cannot see.
+fn find_unwrap_stage(input: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut position = None;
+    let mut index = 0usize;
+    let mut in_string = false;
+    let mut quote = b'"';
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if byte == b'\\' && quote == b'"' {
+                index += 2;
+                continue;
+            }
+            if byte == quote {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' || byte == b'`' {
+            in_string = true;
+            quote = byte;
+            index += 1;
+            continue;
+        }
+        if byte == b'|' {
+            let rest = input[index + 1..].trim_start();
+            if strip_word(rest, "unwrap").is_some() {
+                position = Some(index);
+            }
+        }
+        index += 1;
+    }
+    position
+}
+
+fn parse_unwrap(argument: &str) -> Result<Unwrap, String> {
+    if let Some(rest) = strip_word(argument, "duration") {
+        let rest = rest.trim_start();
+        let inner = rest
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+            .ok_or("unwrap duration expects a parenthesized field name")?;
+        let field = inner.trim().to_string();
+        validate_field_name(&field)?;
+        return Ok(Unwrap {
+            field,
+            conversion: UnwrapConversion::Duration,
+        });
+    }
+    if argument.contains('(') {
+        return Err(format!(
+            "unsupported unwrap conversion in '{argument}': only a bare field name and \
+duration(field) are supported"
+        ));
+    }
+    let field = argument.trim().to_string();
+    validate_field_name(&field)?;
+    Ok(Unwrap {
+        field,
+        conversion: UnwrapConversion::None,
+    })
 }
 
 fn parse_pipeline(input: &str) -> Result<Vec<PipelineStage>, String> {

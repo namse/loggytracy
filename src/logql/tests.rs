@@ -432,3 +432,85 @@
             "a synthesized name is not an index term"
         );
     }
+
+    #[test]
+    fn unwrap_and_the_value_functions_parse() {
+        for query in [
+            r#"sum_over_time({app="a"} | logfmt | unwrap latency [5m])"#,
+            r#"avg_over_time({app="a"} | logfmt | unwrap duration(took) [5m])"#,
+            r#"quantile_over_time(0.99, {app="a"} | logfmt | unwrap latency [5m])"#,
+            r#"max_over_time({app="a"} | logfmt | unwrap latency [1h])"#,
+        ] {
+            assert!(parse_expr(query).is_ok(), "{query}");
+        }
+    }
+
+    /// A function over values with no values named is a query the user got
+    /// wrong. Answering it with an empty result reads as "no data" rather than
+    /// "no question", so it is refused.
+    #[test]
+    fn a_value_function_without_unwrap_is_refused() {
+        assert!(parse_expr(r#"sum_over_time({app="a"}[5m])"#).is_err());
+        assert!(parse_expr(r#"quantile_over_time(0.9, {app="a"}[5m])"#).is_err());
+        // And the converse: counting functions take no unwrap.
+        assert!(parse_expr(r#"count_over_time({app="a"} | logfmt | unwrap x [5m])"#).is_err());
+    }
+
+    #[test]
+    fn quantiles_outside_zero_to_one_are_refused() {
+        assert!(parse_expr(r#"quantile_over_time(1.5, {a="b"} | unwrap x [5m])"#).is_err());
+        assert!(parse_expr(r#"quantile_over_time(-0.1, {a="b"} | unwrap x [5m])"#).is_err());
+        assert!(parse_expr(r#"quantile_over_time(nope, {a="b"} | unwrap x [5m])"#).is_err());
+    }
+
+    /// Only a bare field and `duration(field)` convert. Anything else errors
+    /// rather than silently yielding nothing for every entry.
+    #[test]
+    fn unsupported_unwrap_conversions_are_refused() {
+        assert!(parse_expr(r#"sum_over_time({a="b"} | unwrap bytes(size) [5m])"#).is_err());
+        assert!(parse_expr(r#"sum_over_time({a="b"} | unwrap foo(x) [5m])"#).is_err());
+    }
+
+    /// The unwrap belongs to the range function, not to the pipeline, so a log
+    /// query can never carry one — which is what makes the "needs an unwrap"
+    /// check possible at parse time.
+    #[test]
+    fn unwrap_is_not_a_log_pipeline_stage() {
+        assert!(parse(r#"{app="a"} | unwrap latency"#).is_err());
+    }
+
+    #[test]
+    fn a_duration_unwrap_yields_seconds() {
+        let unwrap = Unwrap {
+            field: "took".to_string(),
+            conversion: UnwrapConversion::Duration,
+        };
+        let fields: std::collections::BTreeMap<String, String> =
+            [("took".to_string(), "1500ms".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(unwrap.value(&fields), Some(1.5));
+    }
+
+    /// A field that is absent or does not convert drops the entry rather than
+    /// contributing zero. Zero is a value someone will plot, and a parse
+    /// failure is not a measurement of zero.
+    #[test]
+    fn an_unconvertible_unwrap_drops_the_entry() {
+        let unwrap = Unwrap {
+            field: "latency".to_string(),
+            conversion: UnwrapConversion::None,
+        };
+        let absent = std::collections::BTreeMap::new();
+        assert_eq!(unwrap.value(&absent), None);
+        let unparseable: std::collections::BTreeMap<String, String> =
+            [("latency".to_string(), "fast".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(unwrap.value(&unparseable), None);
+        let infinite: std::collections::BTreeMap<String, String> =
+            [("latency".to_string(), "inf".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(unwrap.value(&infinite), None, "infinity is not a sample");
+    }

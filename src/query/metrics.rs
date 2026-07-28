@@ -258,14 +258,12 @@ fn evaluate_metric_all(
     evaluation_times: &[i64],
 ) -> Result<Vec<Vec<(Labels, f64)>>, String> {
     let values = match expr {
-        logql::MetricExpr::Range {
-            function, range_ns, ..
-        } => {
+        logql::MetricExpr::Range { range_ns, .. } => {
+            let spec = metric_range_spec(expr);
             let mut by_labels: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
             for (labels, entry) in entries {
-                let increment = match function {
-                    logql::RangeFunction::BytesOverTime => entry.line.len() as f64,
-                    logql::RangeFunction::Rate | logql::RangeFunction::CountOverTime => 1.0,
+                let Some(increment) = sample_value(&spec, labels, entry) else {
+                    continue;
                 };
                 by_labels
                     .entry(labels.clone())
@@ -278,31 +276,27 @@ fn evaluate_metric_all(
 
             let mut output: Vec<Vec<(Labels, f64)>> =
                 (0..evaluation_times.len()).map(|_| Vec::new()).collect();
-            let seconds = *range_ns as f64 / 1_000_000_000.0;
             for (labels, events) in by_labels {
-                let mut left = 0usize;
-                let mut right = 0usize;
-                let mut active_count = 0usize;
-                let mut active_value = 0.0f64;
+                let mut prefix = Vec::with_capacity(events.len() + 1);
+                prefix.push(0.0);
+                for &(_, value) in &events {
+                    prefix.push(prefix.last().copied().unwrap_or_default() + value);
+                }
+                let series = MetricRangeSeries { events, prefix };
                 for (index, &evaluation_ns) in evaluation_times.iter().enumerate() {
-                    while right < events.len() && events[right].0 <= evaluation_ns {
-                        active_count += 1;
-                        active_value += events[right].1;
-                        right += 1;
-                    }
-                    if let Some(window_start) = evaluation_ns.checked_sub(*range_ns) {
-                        while left < right && events[left].0 <= window_start {
-                            active_count -= 1;
-                            active_value -= events[left].1;
-                            left += 1;
-                        }
-                    }
-                    if active_count > 0 {
-                        let value = if matches!(function, logql::RangeFunction::Rate) {
-                            active_value / seconds
-                        } else {
-                            active_value
-                        };
+                    let right = series
+                        .events
+                        .partition_point(|(timestamp_ns, _)| *timestamp_ns <= evaluation_ns);
+                    let left = evaluation_ns
+                        .checked_sub(*range_ns)
+                        .map(|start| {
+                            series
+                                .events
+                                .partition_point(|(timestamp_ns, _)| *timestamp_ns <= start)
+                        })
+                        .unwrap_or(0);
+                    if right > left {
+                        let value = window_value(&spec, &series, left, right);
                         output[index].push((labels.clone(), value));
                         if output[index].len() > MAX_METRIC_SERIES {
                             return Err(format!(
@@ -379,7 +373,6 @@ struct MetricRangeSeries {
 }
 
 struct MetricEvaluator {
-    function: logql::RangeFunction,
     range_ns: i64,
     max_series: usize,
     by_labels: BTreeMap<Labels, MetricRangeSeries>,
@@ -392,15 +385,15 @@ impl MetricEvaluator {
         cancellation: Option<&AtomicBool>,
         max_series: usize,
     ) -> Result<Self, String> {
-        let (function, range_ns) = metric_range_spec(expr);
+        let spec = metric_range_spec(expr);
+        let range_ns = spec.range_ns;
         let mut events_by_labels: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
         for (labels, entry) in entries {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Err("metric query timed out".to_string());
             }
-            let increment = match function {
-                logql::RangeFunction::BytesOverTime => entry.line.len() as f64,
-                logql::RangeFunction::Rate | logql::RangeFunction::CountOverTime => 1.0,
+            let Some(increment) = sample_value(&spec, labels, entry) else {
+                continue;
             };
             if !events_by_labels.contains_key(labels) && events_by_labels.len() == max_series {
                 return Err(format!(
@@ -430,7 +423,6 @@ impl MetricEvaluator {
             by_labels.insert(labels, MetricRangeSeries { events, prefix });
         }
         Ok(Self {
-            function,
             range_ns,
             max_series,
             by_labels,
@@ -445,7 +437,7 @@ impl MetricEvaluator {
     ) -> Result<Vec<(Labels, f64)>, String> {
         let mut values = match expr {
             logql::MetricExpr::Range { .. } => {
-                let seconds = self.range_ns as f64 / 1_000_000_000.0;
+                let spec = metric_range_spec(expr);
                 let window_start = evaluation_ns.checked_sub(self.range_ns);
                 let mut values = Vec::new();
                 for (labels, series) in &self.by_labels {
@@ -463,10 +455,7 @@ impl MetricEvaluator {
                         })
                         .unwrap_or(0);
                     if right > left {
-                        let mut value = series.prefix[right] - series.prefix[left];
-                        if matches!(self.function, logql::RangeFunction::Rate) {
-                            value /= seconds;
-                        }
+                        let value = window_value(&spec, series, left, right);
                         values.push((labels.clone(), value));
                         if values.len() > self.max_series {
                             return Err(format!(
@@ -535,15 +524,112 @@ impl MetricEvaluator {
     }
 }
 
-fn metric_range_spec(expr: &logql::MetricExpr) -> (logql::RangeFunction, i64) {
+/// The innermost range function and everything it needs to turn entries into
+/// samples.
+struct RangeSpec<'a> {
+    function: logql::RangeFunction,
+    range_ns: i64,
+    unwrap: Option<&'a logql::Unwrap>,
+    quantile: Option<f64>,
+}
+
+fn metric_range_spec(expr: &logql::MetricExpr) -> RangeSpec<'_> {
     match expr {
         logql::MetricExpr::Range {
-            function, range_ns, ..
-        } => (*function, *range_ns),
+            function,
+            range_ns,
+            unwrap,
+            quantile,
+            ..
+        } => RangeSpec {
+            function: *function,
+            range_ns: *range_ns,
+            unwrap: unwrap.as_ref(),
+            quantile: *quantile,
+        },
         logql::MetricExpr::Aggregate { expr, .. } | logql::MetricExpr::TopK { expr, .. } => {
             metric_range_spec(expr)
         }
     }
+}
+
+/// The value one entry contributes.
+///
+/// `None` drops the entry. For the counting functions that never happens; for
+/// an unwrapped one it means the field was absent or did not convert, and a
+/// failed conversion is not a measurement of zero.
+fn sample_value(
+    spec: &RangeSpec<'_>,
+    labels: &Labels,
+    entry: &crate::memtable::LogEntry,
+) -> Option<f64> {
+    match spec.unwrap {
+        None => Some(match spec.function {
+            logql::RangeFunction::BytesOverTime => entry.line.len() as f64,
+            _ => 1.0,
+        }),
+        Some(unwrap) => {
+            // The pipeline leaves its evaluated fields on the query-local
+            // entry, and stream labels are visible to it, so the unwrap reads
+            // the same set the field filters did.
+            let mut fields: BTreeMap<String, String> = labels.clone();
+            for (name, value) in &entry.structured_metadata {
+                fields.insert(name.clone(), value.clone());
+            }
+            unwrap.value(&fields)
+        }
+    }
+}
+
+/// The value of a range function over the samples in one window.
+fn window_value(spec: &RangeSpec<'_>, series: &MetricRangeSeries, left: usize, right: usize) -> f64 {
+    let count = (right - left) as f64;
+    match spec.function {
+        logql::RangeFunction::Rate => {
+            (series.prefix[right] - series.prefix[left]) / (spec.range_ns as f64 / 1e9)
+        }
+        logql::RangeFunction::CountOverTime => count,
+        logql::RangeFunction::BytesOverTime | logql::RangeFunction::SumOverTime => {
+            series.prefix[right] - series.prefix[left]
+        }
+        logql::RangeFunction::AvgOverTime => (series.prefix[right] - series.prefix[left]) / count,
+        logql::RangeFunction::MinOverTime => series.events[left..right]
+            .iter()
+            .map(|(_, value)| *value)
+            .fold(f64::INFINITY, f64::min),
+        logql::RangeFunction::MaxOverTime => series.events[left..right]
+            .iter()
+            .map(|(_, value)| *value)
+            .fold(f64::NEG_INFINITY, f64::max),
+        logql::RangeFunction::QuantileOverTime => {
+            let mut window: Vec<f64> = series.events[left..right]
+                .iter()
+                .map(|(_, value)| *value)
+                .collect();
+            // Sorted per evaluation point rather than kept sorted: the window
+            // slides by time, so an order maintained incrementally would have
+            // to support removal from the middle, and the windows here are
+            // bounded by the sample cap anyway.
+            window.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+            quantile_of(&window, spec.quantile.unwrap_or(0.0))
+        }
+    }
+}
+
+/// Linear interpolation between the two nearest ranks, which is what Prometheus
+/// and Loki report. Picking the nearest sample instead would make a p99 over
+/// three points meaningless in a different way for every window size.
+fn quantile_of(sorted: &[f64], quantile: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let rank = quantile * (sorted.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return sorted[lower];
+    }
+    sorted[lower] + (sorted[upper] - sorted[lower]) * (rank - lower as f64)
 }
 
 #[cfg(test)]

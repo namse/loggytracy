@@ -2185,3 +2185,122 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             "a refused query is not a failed one"
         );
     }
+
+    fn unwrapped_entries(values: &[(i64, &str)]) -> Vec<(Labels, LogEntry)> {
+        let labels: Labels = [("app".to_string(), "u".to_string())].into_iter().collect();
+        values
+            .iter()
+            .map(|(timestamp_ns, latency)| {
+                (
+                    labels.clone(),
+                    LogEntry {
+                        timestamp_ns: *timestamp_ns,
+                        line: format!("latency={latency}"),
+                        // The pipeline leaves its fields here, which is where
+                        // the unwrap reads them from.
+                        structured_metadata: vec![("latency".to_string(), latency.to_string())],
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_value_functions_aggregate_unwrapped_samples() {
+        let entries = unwrapped_entries(&[
+            (1_000_000_000, "10"),
+            (2_000_000_000, "20"),
+            (3_000_000_000, "60"),
+        ]);
+        for (query, expected) in [
+            (r#"sum_over_time({app="u"} | unwrap latency [10s])"#, 90.0),
+            (r#"avg_over_time({app="u"} | unwrap latency [10s])"#, 30.0),
+            (r#"min_over_time({app="u"} | unwrap latency [10s])"#, 10.0),
+            (r#"max_over_time({app="u"} | unwrap latency [10s])"#, 60.0),
+        ] {
+            let logql::QueryExpr::Metric(expr) = logql::parse_expr(query).unwrap() else {
+                panic!("expected metric")
+            };
+            let values = evaluate_metric_at(&expr, &entries, 5_000_000_000);
+            assert_eq!(values.len(), 1, "{query}");
+            assert!(
+                (values[0].1 - expected).abs() < 1e-9,
+                "{query}: {} != {expected}",
+                values[0].1
+            );
+        }
+    }
+
+    /// Interpolated between the two nearest ranks, as Prometheus and Loki
+    /// report it. Picking the nearest sample instead would make a p99 over a
+    /// handful of points wrong in a different way for every window size.
+    #[test]
+    fn quantile_over_time_interpolates_between_ranks() {
+        let entries = unwrapped_entries(&[
+            (1_000_000_000, "0"),
+            (2_000_000_000, "10"),
+            (3_000_000_000, "20"),
+            (4_000_000_000, "30"),
+        ]);
+        let logql::QueryExpr::Metric(expr) =
+            logql::parse_expr(r#"quantile_over_time(0.5, {app="u"} | unwrap latency [10s])"#)
+                .unwrap()
+        else {
+            panic!("expected metric")
+        };
+        let values = evaluate_metric_at(&expr, &entries, 5_000_000_000);
+        assert_eq!(values.len(), 1);
+        assert!(
+            (values[0].1 - 15.0).abs() < 1e-9,
+            "median of 0,10,20,30 is 15, got {}",
+            values[0].1
+        );
+
+        let logql::QueryExpr::Metric(p100) =
+            logql::parse_expr(r#"quantile_over_time(1, {app="u"} | unwrap latency [10s])"#).unwrap()
+        else {
+            panic!("expected metric")
+        };
+        assert_eq!(evaluate_metric_at(&p100, &entries, 5_000_000_000)[0].1, 30.0);
+    }
+
+    /// An entry whose unwrap field does not convert is dropped from the sample
+    /// set. Counting it as zero would drag an average toward a value nothing
+    /// measured.
+    #[test]
+    fn unconvertible_samples_are_dropped_not_zeroed() {
+        let mut entries = unwrapped_entries(&[(1_000_000_000, "10"), (2_000_000_000, "20")]);
+        let labels = entries[0].0.clone();
+        entries.push((
+            labels,
+            LogEntry {
+                timestamp_ns: 3_000_000_000,
+                line: "latency=slow".into(),
+                structured_metadata: vec![("latency".to_string(), "slow".to_string())],
+            },
+        ));
+        let logql::QueryExpr::Metric(expr) =
+            logql::parse_expr(r#"avg_over_time({app="u"} | unwrap latency [10s])"#).unwrap()
+        else {
+            panic!("expected metric")
+        };
+        let values = evaluate_metric_at(&expr, &entries, 5_000_000_000);
+        assert!(
+            (values[0].1 - 15.0).abs() < 1e-9,
+            "average of 10 and 20 is 15, not 10: {}",
+            values[0].1
+        );
+    }
+
+    /// The window still slides. A value function is not exempt from the range
+    /// bound just because it aggregates values rather than counts.
+    #[test]
+    fn a_value_function_respects_the_range_window() {
+        let entries = unwrapped_entries(&[(1_000_000_000, "10"), (9_000_000_000, "90")]);
+        let logql::QueryExpr::Metric(expr) =
+            logql::parse_expr(r#"sum_over_time({app="u"} | unwrap latency [5s])"#).unwrap()
+        else {
+            panic!("expected metric")
+        };
+        assert_eq!(evaluate_metric_at(&expr, &entries, 10_000_000_000)[0].1, 90.0);
+    }

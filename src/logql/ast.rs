@@ -330,6 +330,65 @@ pub enum RangeFunction {
     Rate,
     CountOverTime,
     BytesOverTime,
+    /// Functions over unwrapped sample values rather than over entry counts.
+    /// Each requires an `unwrap` stage, because there is no value to aggregate
+    /// without one.
+    SumOverTime,
+    AvgOverTime,
+    MinOverTime,
+    MaxOverTime,
+    QuantileOverTime,
+}
+
+impl RangeFunction {
+    /// Whether this function aggregates unwrapped values. The parser uses it to
+    /// reject a query that asks for one without an `unwrap`, rather than
+    /// silently returning nothing.
+    pub fn needs_unwrap(self) -> bool {
+        matches!(
+            self,
+            Self::SumOverTime
+                | Self::AvgOverTime
+                | Self::MinOverTime
+                | Self::MaxOverTime
+                | Self::QuantileOverTime
+        )
+    }
+}
+
+/// `| unwrap latency` or `| unwrap duration(latency)` — how a field becomes a
+/// number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unwrap {
+    pub field: String,
+    pub conversion: UnwrapConversion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwrapConversion {
+    /// The field is already a number.
+    None,
+    /// `duration(field)` — parsed as a duration and yielded in seconds, which
+    /// is the unit Loki reports.
+    Duration,
+}
+
+impl Unwrap {
+    /// The sample value for one entry, or `None` when the field is absent or
+    /// does not convert.
+    ///
+    /// A non-convertible entry is dropped from the sample set rather than
+    /// counted as zero. Zero is a value someone will plot, and a field that
+    /// failed to parse is not a measurement of zero.
+    pub fn value(&self, fields: &BTreeMap<String, String>) -> Option<f64> {
+        let raw = fields.get(&self.field)?;
+        match self.conversion {
+            UnwrapConversion::None => raw.parse::<f64>().ok().filter(|value| value.is_finite()),
+            UnwrapConversion::Duration => crate::logql::parse_duration_ns(raw)
+                .ok()
+                .map(|nanos| nanos as f64 / 1_000_000_000.0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +405,10 @@ pub enum MetricExpr {
         function: RangeFunction,
         query: LogQuery,
         range_ns: i64,
+        /// Present exactly when `function.needs_unwrap()`.
+        unwrap: Option<Unwrap>,
+        /// The φ of `quantile_over_time(φ, ...)`, in `[0, 1]`.
+        quantile: Option<f64>,
     },
     Aggregate {
         op: AggregateOp,
