@@ -189,6 +189,7 @@
                 &config,
                 &TenantPolicy::disabled(),
                 &DeleteMasks::default(),
+                None,
                 &RuntimeMetrics::new(),
             )
             .await
@@ -549,7 +550,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
             .await
             .unwrap();
 
@@ -634,7 +635,7 @@
             ("beta", crate::tenant_policy::TenantRetention::Infinite),
         ]);
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &RuntimeMetrics::new())
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &RuntimeMetrics::new())
             .await
             .unwrap();
 
@@ -682,7 +683,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
             .await
             .unwrap();
 
@@ -710,7 +711,7 @@
         // The rows are gone, so the next tick has nothing left to reclaim and
         // must not copy the part onto itself.
         let rewritten_id = reader.meta().id.clone();
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
             .await
             .unwrap();
         assert_eq!(registry.snapshot()[0].meta().id, rewritten_id);
@@ -748,7 +749,7 @@
             crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_nanos(1)),
         )]);
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &RuntimeMetrics::new())
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &RuntimeMetrics::new())
             .await
             .unwrap();
 
@@ -872,7 +873,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
             .await
             .unwrap();
 
@@ -962,7 +963,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
             .await
             .unwrap();
 
@@ -985,7 +986,7 @@
             registry.register(more).unwrap();
         }
         assert!(
-            merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &RuntimeMetrics::new())
+            merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &RuntimeMetrics::new())
                 .await
                 .is_err()
         );
@@ -1037,6 +1038,7 @@
             &config,
             &TenantPolicy::disabled(),
             &DeleteMasks::default(),
+            None,
             &metrics,
         )
         .await
@@ -1124,7 +1126,7 @@
         )]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
             .await
             .unwrap();
 
@@ -1230,6 +1232,7 @@
             &config,
             &TenantPolicy::disabled(),
             &requests.masks(),
+            None,
             &RuntimeMetrics::new(),
         )
         .await
@@ -1263,4 +1266,68 @@
             crate::delete_requests::DeleteStatus::Processed,
             "with no part left that could hold a covered row, the request is applied"
         );
+    }
+
+    /// Measured on the two-hour soak: SIGTERM to exit took 118 seconds, and 117
+    /// of them were merge groups that *started after* the signal. The loop's
+    /// own select only sees the drain between ticks, so a tick holding several
+    /// groups ran every one of them out.
+    #[tokio::test]
+    async fn a_draining_merge_does_not_start_another_group() {
+        let dir = tmp_dir("drain-mid-tick");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 2,
+            merge_max_groups_per_tick: 8,
+            retention_period: None,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        for timestamp_ns in 0..4i64 {
+            let parts = part::flush_rows(
+                vec![tenant_row("alpha", 1_000 + timestamp_ns)],
+                &parts_root,
+                config.row_group_size,
+            )
+            .unwrap();
+            registry.register(parts).unwrap();
+        }
+        let before = registry.part_count();
+        assert!(before > 1, "there is work for a merge to do");
+
+        let (_sender, draining) = tokio::sync::watch::channel(true);
+        merge_once(
+            &registry,
+            None,
+            &config,
+            &TenantPolicy::disabled(),
+            &DeleteMasks::default(),
+            Some(&draining),
+            &RuntimeMetrics::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            registry.part_count(),
+            before,
+            "a tick that begins while draining takes no group at all"
+        );
+
+        // And the same tick without the drain does the work, so the guard is
+        // what stopped it rather than the group selection.
+        let (_sender, running) = tokio::sync::watch::channel(false);
+        merge_once(
+            &registry,
+            None,
+            &config,
+            &TenantPolicy::disabled(),
+            &DeleteMasks::default(),
+            Some(&running),
+            &RuntimeMetrics::new(),
+        )
+        .await
+        .unwrap();
+        assert!(registry.part_count() < before);
     }

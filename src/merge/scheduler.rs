@@ -27,6 +27,7 @@ pub async fn merge_loop(
             &config,
             &tenant_policy,
             &masks,
+            Some(&drain_rx),
             &metrics,
         )
         .await
@@ -66,6 +67,7 @@ async fn merge_once_without_retention(
         config,
         &TenantPolicy::disabled(),
         &crate::delete_requests::DeleteMasks::default(),
+        None,
         &RuntimeMetrics::new(),
     )
     .await
@@ -77,6 +79,7 @@ async fn merge_once(
     config: &Config,
     tenant_policy: &TenantPolicy,
     deletes: &crate::delete_requests::DeleteMasks,
+    drain: Option<&watch::Receiver<bool>>,
     metrics: &RuntimeMetrics,
 ) -> Result<(), String> {
     let readers = registry.snapshot();
@@ -123,6 +126,17 @@ async fn merge_once(
         } in groups
         {
             if groups_processed >= config.merge_max_groups_per_tick {
+                break 'partitions;
+            }
+            // A tick may hold many groups and each one can take a minute. The
+            // loop's own select only sees the drain between ticks, so a
+            // shutdown that arrived mid-tick used to wait out every remaining
+            // group: measured at 118 seconds from SIGTERM to exit, of which
+            // 117 were merges started *after* the signal. The group already
+            // running still finishes — abandoning it would throw away the work
+            // and leave the inputs to be merged again — but no new one starts.
+            if drain.is_some_and(|receiver| *receiver.borrow()) {
+                tracing::info!(groups_processed, "merge stopping early to drain");
                 break 'partitions;
             }
             groups_processed += 1;
