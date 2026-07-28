@@ -401,11 +401,28 @@ manifest costs exactly what publishing the first into an empty one. The
 remaining 20 PUTs are the four merge ticks that actually rewrote something,
 at the same five each.
 
-**LIST and DELETE were zero, and that is not a measurement of them.** Remote
-objects are deleted by `garbage_collect_orphans`, which runs only after
-retention has retired a whole part and only past `retention_grace_period`
-(one hour by default). This run was sixty seconds. Their per-cycle cost is
-still unmeasured.
+**LIST and DELETE were zero in that run, because nothing had expired yet.**
+Remote objects are deleted by `garbage_collect_orphans`, which runs only after
+retention has retired a whole part and only past `retention_grace_period` —
+one hour by default, and the run was sixty seconds. Measured separately with
+the grace period at one second, merge off, and three parts expiring:
+
+| | delta while three parts were retired |
+|---|---|
+| DELETE | 12 |
+| LIST | 2 |
+| objects listed | 12 |
+| PUT | 1 |
+| GET | 3 |
+
+**Four DELETEs per part, one per immutable file, unbatched.** R2 does not
+charge for deletes, so this costs nothing there; on a backend that does,
+`DeleteObjects` would collapse it to one request per batch. That is a change
+worth making only against a backend that bills for it.
+
+The orphan sweep is two LISTs — one per immutable prefix — plus the two
+manifest GETs it compares against, and it runs only on a retention pass that
+actually retired something. Against the PUT traffic below, it is noise.
 
 ### What this says about the bill
 
