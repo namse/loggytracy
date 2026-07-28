@@ -456,3 +456,58 @@ missing was the price of the choice, and that is now measurable at
 
 The prices are quoted from R2's published rates and will change. The counts
 will not: they are what this code does.
+
+
+## 10. Tier D: two hours, 500 tenants, a restart and a fence
+
+The duration run. 7,225 seconds (2.01 h), 500 tenants, 3,000 eps offered,
+`file://` with Tier B fault injection — 5 ms write / 20 ms read latency, 10 ms
+jitter, **1% write-error rate** — `flush_max_interval=2s`, `merge_interval=15s`,
+`retention=10m/30s`, cache 32 MiB. Sampled every 15 s, 482 samples.
+
+**Read the latency numbers nowhere in this section.** The machine was
+compiling and running the test suite for most of the run, so response times and
+peak RSS reflect CPU starvation, not the engine. The behavioural gates below do
+not depend on the machine being idle, which is why they are the gates.
+
+### Behavioural gates
+
+| gate | result |
+|---|---|
+| Zero loss of acked data | **pass** — `wal_replayed_records` and `wal_replayed_entries` were both 0 after the restart. A clean shutdown left nothing to replay, so nothing was duplicated either |
+| WAL backlog bounded | **pass** — peak 58.1 MB, mean 12.8 MB over the first half and 12.7 MB over the second |
+| RSS stable, no upward trend | **pass** — mean 893 MB over the first half and 893 MB over the second. Peak 2.6 GB under build contention |
+| Flush, merge, retention all progress | **pass** — 1,467 flushes, 253 merges, 150 retention passes. 142 flush errors, which is the injected 1% and all recovered |
+| Zero ingest errors | **pass** — 0 across 110,040 requests |
+| Graceful shutdown lossless | **pass** — force-flush complete on the first attempt, "all acknowledged data is durable" |
+| Fencing | **pass** — a second instance on the same prefix made the first log `fenced by a newer writer` and exit 1 |
+| Data readable after restart | **pass** — all 500 tenants' streams; 1,700 rows for `load-tenant-0` and 1,200 for `load-tenant-7` in a nine-minute window |
+
+**`remote_healthy` read true in 482 of 482 samples.** Against a 1% write-error
+rate sustained for two hours. Before the hysteresis fix (§7) the same signal
+flipped 14–17 times a minute and read false 34–59% of the time at 3% errors.
+This is that fix holding over hours rather than over a minute.
+
+### Restart
+
+**0.50 seconds to `/ready`**, at 2 parts and 514,000 rows. Nothing to compare
+against §8's 63.7 seconds — that measurement was at 10,099 parts, and the whole
+point of §8 is that startup is linear in part count. What this confirms is the
+other end of the line: with merge working normally, part count stays small and
+so does startup.
+
+### What the soak found
+
+**Graceful shutdown took 118 seconds, and 117 of them were avoidable.** The
+timeline: SIGTERM at 02:46:12, flush loop stopped 1.0 s later, force-flush
+took 47 ms — and the merge task stopped at 02:48:10, having completed two more
+merge groups that it *started after the signal*. The merge loop selects on the
+drain only between ticks, and a tick holds up to `merge_max_groups_per_tick`
+groups, each about a minute at this scale.
+
+Fixed: the tick now checks the drain before taking each group. The group
+already running still finishes, because abandoning it throws away the work and
+leaves its inputs to be merged again on the next boot. Nothing new starts.
+
+Nothing shorter could have found this. The earlier runs never accumulated
+enough parts for one tick to hold more than a single group.

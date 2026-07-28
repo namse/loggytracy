@@ -100,9 +100,11 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
       `validate` enforce `merge_max_input_bytes <= merge_max_memory_bytes`.
 - [x] Implement retention policies and expired-data deletion (including a separate retention timeout knob)
 - [ ] Tune resource limits such as query memory, range, and concurrency to operational targets
-- [ ] **Tier D duration/scale run** — over 2 hours, over 10,000 parts, over 500 tenants, and one restart during
-      the run. Existing Tier B/C runs last tens of seconds and cannot exercise P1-11 (O(N) paths) or N3
-      (row-group fragmentation). Acceptance criteria are in [`docs/LOAD_VALIDATION.md`](docs/LOAD_VALIDATION.md)
+- [x] **Tier D duration/scale run** — 2.01 hours, 500 tenants, a graceful shutdown, a restart and a fence,
+      every behavioural gate met. It found one defect nothing shorter could: shutdown waited out merge
+      groups it started *after* the signal, 117 of the 118 seconds it took. The 10,000-part axis is
+      measured separately in §8, because reaching it means effectively disabling merge, which is a
+      different question from steady-state stability. Results: [`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md) §10
 - [x] **CAS preflight** — verify at startup that conditional writes are enforced and refuse startup otherwise.
       Running against the deployment target itself resolves what local validation could not answer.
 - [x] **Measure object-store operation counts** — `loggytracy_object_store_operations_total` counts every

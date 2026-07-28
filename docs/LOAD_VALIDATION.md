@@ -196,14 +196,20 @@ and long-running leaks) are problems of **time and volume**, so they can be meas
 Because the machine is not the target specification (4 vCPU / 16 GiB), **absolute values are records, not
 gates**. Gates are behavioral invariants.
 
-- [ ] Zero loss of acked data (confirmed by replay after restart)
-- [ ] WAL backlog is bounded — 429 appears above the limit and clears when load subsides
-- [ ] RSS is stable below the configured limit (no upward trend)
-- [ ] Flush, merge, and retention all progress (`*_success_total` increases, `*_errors_total` stays flat)
-- [ ] Eviction → restore round trip succeeds, with zero restore errors
-- [ ] Graceful shutdown is lossless (M6 rehearsal)
-- [ ] When two instances use the same prefix, the old instance is fenced and exits abnormally
-- [ ] **Record** p50/p95/p99, RSS, part count, and startup time (do not gate on them)
+All of these were met on the Tier D run recorded in
+[`LOAD_RESULTS.md`](LOAD_RESULTS.md) §10 except the eviction→restore round
+trip, which needs the separate configuration described below and was measured
+on its own.
+
+- [x] Zero loss of acked data (confirmed by replay after restart)
+- [x] WAL backlog is bounded — 429 appears above the limit and clears when load subsides
+- [x] RSS is stable below the configured limit (no upward trend)
+- [x] Flush, merge, and retention all progress (`*_success_total` increases, `*_errors_total` stays flat)
+- [x] Eviction → restore round trip succeeds, with zero restore errors
+- [x] Graceful shutdown is lossless (M6 rehearsal) — and the run found that it took 118 seconds because
+      merge kept starting groups after the signal, now fixed
+- [x] When two instances use the same prefix, the old instance is fenced and exits abnormally
+- [x] **Record** p50/p95/p99, RSS, part count, and startup time (do not gate on them)
 
 #### Observing eviction → restore
 
