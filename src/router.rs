@@ -30,6 +30,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/loki/api/v1/detected_labels", get(query::detected_labels))
         .route("/loki/api/v1/detected_fields", get(query::detected_fields))
         .route("/loki/api/v1/patterns", get(query::patterns))
+        .route(
+            "/loki/api/v1/delete",
+            post(query::submit_delete_request)
+                .get(query::list_delete_requests)
+                .delete(query::cancel_delete_request),
+        )
         .route("/metrics", get(query::metrics))
         .route("/api/traces/{trace_id}", get(tempo::trace_by_id))
         .route("/api/search", get(tempo::search))

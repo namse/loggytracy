@@ -44,6 +44,10 @@ pub struct AppState {
     /// `ingest_gate`, which asks whether *this instance* can take more; this
     /// one asks whether *this tenant* may send more.
     pub tenant_quota: Arc<TenantQuota>,
+    /// Outstanding deletion requests. Consulted by the one scan every read path
+    /// funnels through, so a deleted line stops being readable the moment the
+    /// request is accepted rather than when its part is next rewritten.
+    pub delete_requests: Arc<crate::delete_requests::DeleteRequests>,
     /// Wall clock. Injected so the boundaries that depend on it — which
     /// timestamps ingest accepts, what range a query defaults to — can be
     /// tested at the edge instead of relative to whatever `now` happened to be.
@@ -65,6 +69,9 @@ pub struct AppStateDependencies {
     pub metrics: Arc<RuntimeMetrics>,
     pub shutdown: Arc<ShutdownState>,
     pub clock: Arc<Clock>,
+    /// Supplied by startup, which has already loaded what previous runs
+    /// accepted. A test fixture leaves it out and gets an empty registry.
+    pub delete_requests: Option<Arc<crate::delete_requests::DeleteRequests>>,
 }
 
 impl AppState {
@@ -77,6 +84,14 @@ impl AppState {
             config.clone(),
             dependencies.metrics.clone(),
         ));
+        let delete_requests = dependencies.delete_requests.unwrap_or_else(|| {
+            Arc::new(crate::delete_requests::DeleteRequests::new(
+                dependencies
+                    .remote_cache
+                    .as_ref()
+                    .map(|cache| cache.storage.clone()),
+            ))
+        });
         let tenant_quota = Arc::new(TenantQuota::new(
             config.clone(),
             dependencies.clock.clone(),
@@ -86,6 +101,7 @@ impl AppState {
         Self {
             ingest_gate,
             tenant_quota,
+            delete_requests,
             clock: dependencies.clock,
             query_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_query_scans,

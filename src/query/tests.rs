@@ -2491,3 +2491,218 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         assert_eq!(status, StatusCode::OK);
         assert!(body["data"].as_array().unwrap().is_empty());
     }
+
+    async fn send(
+        state: &Arc<AppState>,
+        method: &str,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = crate::build_router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn delete_state() -> (Arc<AppState>, i64) {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
+        let base_ns = 1_700_000_000_000_000_000i64;
+        for (app, line) in [("keep", "kept line"), ("drop", "secret line")] {
+            memtable.insert(
+                test_tenant(),
+                [("app".to_string(), app.to_string())]
+                    .into_iter()
+                    .collect::<Labels>(),
+                vec![LogEntry {
+                    timestamp_ns: base_ns,
+                    line: line.to_string(),
+                    structured_metadata: vec![],
+                }],
+            );
+        }
+        (state, base_ns)
+    }
+
+    async fn lines_for(state: &Arc<AppState>, selector: &str) -> Vec<String> {
+        let (status, body) = get_json(
+            state,
+            &format!(
+                "/loki/api/v1/query_range?query={}&start=1699999999&end=1700000001&limit=100",
+                urlencoding(selector)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        body["data"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|stream| stream["values"].as_array().unwrap().clone())
+            .map(|value| value[1].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn urlencoding(raw: &str) -> String {
+        raw.bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (byte as char).to_string()
+                }
+                _ => format!("%{byte:02X}"),
+            })
+            .collect()
+    }
+
+    /// The promise of the endpoint: the lines stop being readable when the
+    /// request is accepted, not when a rewrite eventually runs. Only the
+    /// selected stream goes.
+    #[tokio::test]
+    async fn an_accepted_deletion_hides_its_lines_immediately() {
+        let (state, base_ns) = delete_state();
+        assert_eq!(lines_for(&state, r#"{app=~".+"}"#).await.len(), 2);
+
+        let (status, _) = send(
+            &state,
+            "POST",
+            &format!(
+                "/loki/api/v1/delete?query={}&start={}&end={}",
+                urlencoding(r#"{app="drop"}"#),
+                (base_ns - 1_000_000_000) / 1_000_000_000,
+                (base_ns + 1_000_000_000) / 1_000_000_000
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert_eq!(
+            lines_for(&state, r#"{app=~".+"}"#).await,
+            vec!["kept line".to_string()],
+            "the deleted stream is gone and the other one is untouched"
+        );
+    }
+
+    /// A request outside the window the lines fall in deletes nothing. Getting
+    /// this wrong deletes more than was asked for, which is unrecoverable.
+    #[tokio::test]
+    async fn a_deletion_outside_the_window_removes_nothing() {
+        let (state, base_ns) = delete_state();
+        let (status, _) = send(
+            &state,
+            "POST",
+            &format!(
+                "/loki/api/v1/delete?query={}&start={}&end={}",
+                urlencoding(r#"{app="drop"}"#),
+                (base_ns / 1_000_000_000) + 10,
+                (base_ns / 1_000_000_000) + 20
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(lines_for(&state, r#"{app=~".+"}"#).await.len(), 2);
+    }
+
+    /// Listing reports what was asked for, and cancelling puts the lines back —
+    /// which is only honest while the request has not been applied.
+    #[tokio::test]
+    async fn a_cancelled_request_makes_its_lines_readable_again() {
+        let (state, base_ns) = delete_state();
+        let window = format!(
+            "start={}&end={}",
+            (base_ns - 1_000_000_000) / 1_000_000_000,
+            (base_ns + 1_000_000_000) / 1_000_000_000
+        );
+        send(
+            &state,
+            "POST",
+            &format!(
+                "/loki/api/v1/delete?query={}&{window}",
+                urlencoding(r#"{app="drop"}"#)
+            ),
+        )
+        .await;
+
+        let (status, body) = send(&state, "GET", "/loki/api/v1/delete").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = body.as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["status"], "received");
+        assert_eq!(listed[0]["query"], r#"{app="drop"}"#);
+        let request_id = listed[0]["request_id"].as_str().unwrap().to_string();
+
+        let (status, _) = send(
+            &state,
+            "DELETE",
+            &format!("/loki/api/v1/delete?request_id={request_id}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(lines_for(&state, r#"{app=~".+"}"#).await.len(), 2);
+
+        let (_, body) = send(&state, "GET", "/loki/api/v1/delete").await;
+        assert!(body.as_array().unwrap().is_empty());
+
+        let (status, _) = send(
+            &state,
+            "DELETE",
+            "/loki/api/v1/delete?request_id=never-existed",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A selector this cannot honour consistently is refused rather than
+    /// accepted and half-applied. A pipeline stage names a value derived from
+    /// the line, so what it deletes would change whenever the parser does.
+    #[tokio::test]
+    async fn a_deletion_query_must_be_a_selector() {
+        let (state, base_ns) = delete_state();
+        let window = format!(
+            "start={}&end={}",
+            base_ns / 1_000_000_000,
+            base_ns / 1_000_000_000 + 1
+        );
+        for query in [
+            r#"{app="drop"} | json | status="500""#,
+            r#"rate({app="drop"}[1m])"#,
+            r#"{}"#,
+        ] {
+            let (status, _) = send(
+                &state,
+                "POST",
+                &format!(
+                    "/loki/api/v1/delete?query={}&{window}",
+                    urlencoding(query)
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        }
+
+        // A window that ends before it starts deletes an empty set, which is
+        // far more likely to be a mistake than an intent.
+        let (status, _) = send(
+            &state,
+            "POST",
+            &format!(
+                "/loki/api/v1/delete?query={}&start=1700000010&end=1700000000",
+                urlencoding(r#"{app="drop"}"#)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }

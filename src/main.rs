@@ -4,6 +4,7 @@ mod backpressure;
 mod bloom;
 mod clock;
 mod config;
+mod delete_requests;
 mod flush;
 mod ingest;
 mod journal;

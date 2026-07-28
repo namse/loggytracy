@@ -355,6 +355,7 @@ include!("metrics.rs");
 include!("handlers.rs");
 include!("loki_extra.rs");
 include!("patterns.rs");
+include!("delete_api.rs");
 include!("tail.rs");
 
 #[cfg(test)]

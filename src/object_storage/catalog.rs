@@ -825,6 +825,73 @@ single-process development store use a file:// URL, which opts out of CAS delibe
         Ok(policies)
     }
 
+    fn delete_request_path(&self, tenant: &str, request_id: &str) -> ObjectPath {
+        self.path(&format!("{DELETE_REQUEST_PREFIX}/{tenant}/{request_id}.json"))
+    }
+
+    /// One object per request, for the same reason as one object per policy: a
+    /// submission is a single unconditional write with nothing to contend on.
+    pub async fn put_delete_request(
+        &self,
+        tenant: &str,
+        request_id: &str,
+        body: Vec<u8>,
+    ) -> Result<(), String> {
+        self.store
+            .put(&self.delete_request_path(tenant, request_id), body.into())
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                format!("failed to store delete request {request_id} for tenant {tenant}: {error}")
+            })
+    }
+
+    pub async fn remove_delete_request(
+        &self,
+        tenant: &str,
+        request_id: &str,
+    ) -> Result<(), String> {
+        match self
+            .store
+            .delete(&self.delete_request_path(tenant, request_id))
+            .await
+        {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(format!(
+                "failed to remove delete request {request_id} for tenant {tenant}: {error}"
+            )),
+        }
+    }
+
+    /// Every stored request body. Read once at startup; a failure here is fatal,
+    /// because starting with a subset would serve data a tenant asked to have
+    /// deleted.
+    pub async fn load_delete_requests(&self) -> Result<Vec<Vec<u8>>, String> {
+        use futures_util::StreamExt;
+
+        let prefix = self.path(DELETE_REQUEST_PREFIX);
+        let mut locations = Vec::new();
+        let mut stream = self.store.list(Some(&prefix));
+        while let Some(item) = stream.next().await {
+            let meta =
+                item.map_err(|error| format!("failed to list the delete requests: {error}"))?;
+            locations.push(meta.location);
+        }
+        let mut requests = Vec::new();
+        for location in locations {
+            let bytes = self
+                .store
+                .get(&location)
+                .await
+                .map_err(|error| format!("failed to read delete request {location}: {error}"))?
+                .bytes()
+                .await
+                .map_err(|error| format!("failed to read delete request {location}: {error}"))?;
+            requests.push(bytes.to_vec());
+        }
+        Ok(requests)
+    }
+
     /// Deletes immutable objects that are absent from both manifests only
     /// after a grace period. Retention removes manifest visibility first; this
     /// pass is the crash-safe, delayed physical garbage collector.

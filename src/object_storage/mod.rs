@@ -32,6 +32,9 @@ const TRACE_MANIFEST_FILE: &str = "trace-manifest.json";
 /// Per-tenant retention policies, one object per tenant. Deliberately outside
 /// the `parts`/`trace_parts` prefixes that `garbage_collect_orphans` sweeps.
 pub const TENANT_POLICY_PREFIX: &str = "tenant_policies";
+/// Deletion requests, one object per request. Outside the `parts` prefixes for
+/// the same reason as the policies: `garbage_collect_orphans` sweeps those.
+pub const DELETE_REQUEST_PREFIX: &str = "delete_requests";
 const TRACE_PART_FILES: [&str; 3] = [TRACE_DATA_FILE, TRACE_BLOOM_FILE, TRACE_META_FILE];
 const TRACE_CATALOG_FILES: [&str; 2] = [TRACE_BLOOM_FILE, TRACE_META_FILE];
 const MAX_CAS_ATTEMPTS: usize = 16;

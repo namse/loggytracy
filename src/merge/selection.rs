@@ -172,6 +172,7 @@ pub struct GroupRewrite {
 pub fn rewrite_group(
     readers: &[Arc<PartReader>],
     cutoffs: Option<&Cutoffs>,
+    deletes: &crate::delete_requests::DeleteMasks,
     parts_root: &Path,
     row_group_size: usize,
     max_memory_bytes: u64,
@@ -186,6 +187,14 @@ pub fn rewrite_group(
         let before = rows.len();
         if let Some(cutoffs) = cutoffs {
             rows.retain(|row| !cutoffs.is_expired(&row.tenant, row.timestamp_ns));
+        }
+        // The same predicate the scan hides with, applied where the bytes
+        // actually leave. A part that no rewrite ever touches keeps them, which
+        // is why the request stays `received` until one has.
+        if !deletes.is_empty() {
+            rows.retain(|row| {
+                !deletes.hides_row(&row.tenant, &row.labels, row.timestamp_ns, &row.line)
+            });
         }
         rewrite.dropped_rows += before - rows.len();
         if rows.is_empty() {

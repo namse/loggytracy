@@ -1,8 +1,10 @@
+#[allow(clippy::too_many_arguments)]
 pub async fn merge_loop(
     registry: Arc<PartRegistry>,
     remote_cache: Option<Arc<RemoteCache>>,
     config: Arc<Config>,
     tenant_policy: Arc<TenantPolicy>,
+    delete_requests: Arc<crate::delete_requests::DeleteRequests>,
     healthy: Arc<AtomicBool>,
     metrics: Arc<RuntimeMetrics>,
     mut drain_rx: watch::Receiver<bool>,
@@ -15,16 +17,29 @@ pub async fn merge_loop(
             _ = ticker.tick() => {}
             _ = wait_for_drain(&mut drain_rx) => return,
         }
+        // Taken before the tick, and the status resolved after it, so a
+        // request accepted mid-tick is applied by the next one rather than
+        // being reported as processed by a rewrite that never saw it.
+        let masks = delete_requests.masks();
         match merge_once(
             &registry,
             remote_cache.as_deref(),
             &config,
             &tenant_policy,
+            &masks,
             &metrics,
         )
         .await
         {
             Ok(()) => {
+                if !masks.is_empty() {
+                    let metas: Vec<crate::part::PartMeta> = registry
+                        .snapshot()
+                        .into_iter()
+                        .map(|reader| reader.meta().clone())
+                        .collect();
+                    delete_requests.mark_processed(&metas);
+                }
                 metrics.merge_success.fetch_add(1, Ordering::Relaxed);
                 healthy.store(true, Ordering::Release)
             }
@@ -50,6 +65,7 @@ async fn merge_once_without_retention(
         remote_cache,
         config,
         &TenantPolicy::disabled(),
+        &crate::delete_requests::DeleteMasks::default(),
         &RuntimeMetrics::new(),
     )
     .await
@@ -60,6 +76,7 @@ async fn merge_once(
     remote_cache: Option<&RemoteCache>,
     config: &Config,
     tenant_policy: &TenantPolicy,
+    deletes: &crate::delete_requests::DeleteMasks,
     metrics: &RuntimeMetrics,
 ) -> Result<(), String> {
     let readers = registry.snapshot();
@@ -162,12 +179,14 @@ async fn merge_once(
                 let parts_root = parts_root.clone();
                 let old_dirs = old_dirs.clone();
                 let cutoffs = cutoffs.clone();
+                let deletes = deletes.clone();
                 let row_group_size = config.row_group_size;
                 let max_memory_bytes = config.merge_max_memory_bytes;
                 move || {
                     rewrite_group(
                         &group,
                         cutoffs.as_ref(),
+                        &deletes,
                         &parts_root,
                         row_group_size,
                         max_memory_bytes,

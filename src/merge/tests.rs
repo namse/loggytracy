@@ -1,4 +1,5 @@
     use super::*;
+    use crate::delete_requests::DeleteMasks;
     use crate::tenant::test_tenant;
     use crate::config::Config;
     use crate::memtable::Labels;
@@ -187,6 +188,7 @@
                 None,
                 &config,
                 &TenantPolicy::disabled(),
+                &DeleteMasks::default(),
                 &RuntimeMetrics::new(),
             )
             .await
@@ -547,7 +549,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
             .await
             .unwrap();
 
@@ -632,7 +634,7 @@
             ("beta", crate::tenant_policy::TenantRetention::Infinite),
         ]);
 
-        merge_once(&registry, None, &config, &policy, &RuntimeMetrics::new())
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &RuntimeMetrics::new())
             .await
             .unwrap();
 
@@ -680,7 +682,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
             .await
             .unwrap();
 
@@ -708,7 +710,7 @@
         // The rows are gone, so the next tick has nothing left to reclaim and
         // must not copy the part onto itself.
         let rewritten_id = reader.meta().id.clone();
-        merge_once(&registry, None, &config, &policy, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
             .await
             .unwrap();
         assert_eq!(registry.snapshot()[0].meta().id, rewritten_id);
@@ -746,7 +748,7 @@
             crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_nanos(1)),
         )]);
 
-        merge_once(&registry, None, &config, &policy, &RuntimeMetrics::new())
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &RuntimeMetrics::new())
             .await
             .unwrap();
 
@@ -870,7 +872,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
             .await
             .unwrap();
 
@@ -960,7 +962,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
             .await
             .unwrap();
 
@@ -983,7 +985,7 @@
             registry.register(more).unwrap();
         }
         assert!(
-            merge_once(&registry, None, &config, &policy, &RuntimeMetrics::new())
+            merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &RuntimeMetrics::new())
                 .await
                 .is_err()
         );
@@ -1034,6 +1036,7 @@
             Some(&cache),
             &config,
             &TenantPolicy::disabled(),
+            &DeleteMasks::default(),
             &metrics,
         )
         .await
@@ -1121,7 +1124,7 @@
         )]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), &metrics)
             .await
             .unwrap();
 
@@ -1184,5 +1187,80 @@
             merge_debt_part_count(&registry, &config, Some(&cutoffs)),
             1,
             "the part two thirds of which has expired is pending merge work"
+        );
+    }
+
+    /// Hiding a line is the promise; removing it is the obligation. A rewrite
+    /// must actually drop the covered rows, and must leave the rest of the
+    /// part — other tenants, other streams, other times — intact.
+    #[tokio::test]
+    async fn a_rewrite_removes_the_rows_a_deletion_covers() {
+        let dir = tmp_dir("delete-rewrite");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 2,
+            retention_period: None,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        for timestamp_ns in [1_000i64, 2_000] {
+            let parts = part::flush_rows(
+                vec![
+                    tenant_row("alpha", timestamp_ns),
+                    tenant_row("beta", timestamp_ns),
+                ],
+                &parts_root,
+                config.row_group_size,
+            )
+            .unwrap();
+            registry.register(parts).unwrap();
+        }
+
+        let requests = crate::delete_requests::DeleteRequests::new(None);
+        requests
+            .submit(&tenant_id("alpha"), r#"{app="alpha"}"#, 0, 1_500, 1_500)
+            .await
+            .expect("a valid request");
+
+        merge_once(
+            &registry,
+            None,
+            &config,
+            &TenantPolicy::disabled(),
+            &requests.masks(),
+            &RuntimeMetrics::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut survivors: Vec<String> = registry
+            .snapshot()
+            .iter()
+            .flat_map(|reader| reader.read_all_rows(None).unwrap())
+            .map(|row| row.line)
+            .collect();
+        survivors.sort();
+        assert_eq!(
+            survivors,
+            vec![
+                "alpha-2000".to_string(),
+                "beta-1000".to_string(),
+                "beta-2000".to_string()
+            ],
+            "only alpha's row inside the window is gone"
+        );
+
+        let metas: Vec<part::PartMeta> = registry
+            .snapshot()
+            .into_iter()
+            .map(|reader| reader.meta().clone())
+            .collect();
+        requests.mark_processed(&metas);
+        assert_eq!(
+            requests.list(&tenant_id("alpha"))[0].status,
+            crate::delete_requests::DeleteStatus::Processed,
+            "with no part left that could hold a covered row, the request is applied"
         );
     }

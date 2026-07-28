@@ -1610,3 +1610,29 @@ opens a connection per part"
             copies: after.copies - before.copies,
         }
     }
+
+    /// A request that hides rows but does not survive a restart is the one
+    /// failure this must not have: the instance would come back serving lines
+    /// a tenant was told were gone.
+    #[tokio::test]
+    async fn a_deletion_request_outlives_the_process_that_accepted_it() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let storage = ObjectStorage::sharing_store_for_test(store.clone());
+        let tenant = crate::tenant::test_tenant();
+
+        let accepted = crate::delete_requests::DeleteRequests::new(Some(storage));
+        let request = accepted
+            .submit(&tenant, r#"{app="drop"}"#, 0, 1_000, 500)
+            .await
+            .expect("a valid request");
+
+        let restarted = crate::delete_requests::DeleteRequests::new(Some(
+            ObjectStorage::sharing_store_for_test(store),
+        ));
+        assert_eq!(restarted.load().await.unwrap(), 1);
+        let restored = restarted.list(&tenant);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].request_id, request.request_id);
+        assert!(!restarted.mask_for(&tenant).is_empty());
+    }

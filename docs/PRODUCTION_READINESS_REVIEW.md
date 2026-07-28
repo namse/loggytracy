@@ -375,7 +375,7 @@ Endpoints called by the Grafana Loki data source but missing:
 | `/loki/api/v1/patterns` | **implemented as a read-time miner over a bounded sample.** The objection stands and shapes the answer: pattern mining is a heuristic with no compatibility contract, so this one is not claimed to match Loki's, and it does not earn a second index on the write path. The response reports the lines it sampled, so a reader knows the summary describes the sample rather than the window |
 | ~~`/loki/api/v1/detected_fields`, `detected_labels`~~ | **implemented.** Labels with cardinality from the same sources `labels` reads; fields from structured metadata over a bounded sample |
 | ~~`/loki/api/v1/format_query`~~ | **implemented as a validator.** It does not rewrite: a faithful renderer for the whole LogQL surface is a second grammar to keep in step with the parser, and a formatter that silently changes a query is worse than one that leaves it alone |
-| `/loki/api/v1/delete` (delete API) | **open.** Deletion exists per tenant (`retention: "0"`, applied through merge rewrite), but a Loki-shaped delete *request* needs durable request state and query-time masking. That belongs in `RETENTION_DESIGN.md` as a design, not improvised here |
+| `/loki/api/v1/delete` (delete API) | **implemented, on the two terms this review named.** Request state is durable — one object per request, loaded at startup, fatal on failure — and query-time masking sits at the single scan every read path funnels through. The bytes leave through the merge rewrite that already existed, using the same per-row predicate, and `status` reports which of the two has happened |
 
 Implemented but inaccurate:
 
@@ -615,7 +615,7 @@ the code, the note says which.
 - [x] P1-2 OTLP logs — `LogsService` on gRPC, `POST /v1/logs` and `/v1/traces` on HTTP, protobuf and JSON
 - [x] P2-1 `tail` (WebSocket live tail) and time ranges for `labels`/`series`
 - [x] P2-1 `index/volume`, `volume_range`, `detected_labels`, `detected_fields`, `format_query`
-- [ ] P2-1 remaining: `patterns` and the `delete` API — both deliberate, see the table above
+- [x] P2-1 remaining: `patterns` and the `delete` API — both now implemented, see the table above
 - [ ] P2-5 deduplication itself (`todo.md` P2)
 - [ ] LogQL improvements in P1 of `todo.md`
 

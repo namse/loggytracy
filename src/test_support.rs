@@ -105,6 +105,7 @@ fn state_inner(
             metrics: Arc::new(RuntimeMetrics::new()),
             shutdown: Arc::new(ShutdownState::new()),
             clock,
+            delete_requests: None,
         },
     ))
 }

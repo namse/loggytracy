@@ -267,6 +267,25 @@ pub async fn run(config: Arc<Config>) {
         .await,
     );
 
+    // Loaded on the same terms and for a stronger reason: booting without a
+    // request that was accepted would serve lines a tenant asked to have
+    // deleted.
+    let delete_requests = Arc::new(crate::delete_requests::DeleteRequests::new(
+        object_storage.clone(),
+    ));
+    let loaded_delete_requests =
+        with_object_store_retry("delete request load", startup_budget, || {
+            let delete_requests = delete_requests.clone();
+            async move { delete_requests.load().await }
+        })
+        .await;
+    if loaded_delete_requests > 0 {
+        tracing::info!(
+            requests = loaded_delete_requests,
+            "restored outstanding deletion requests"
+        );
+    }
+
     // Handles for every background worker. Shutdown signals them through the
     // drain watch and then joins them here before the final force-flush, so the
     // force-flush is the only writer touching the registry and object store.
@@ -327,12 +346,14 @@ pub async fn run(config: Arc<Config>) {
         let metrics = metrics.clone();
         let drain_rx = shutdown.subscribe();
         let policy = tenant_policy.clone();
+        let deletes = delete_requests.clone();
         let handle = tokio::spawn(async move {
             merge::merge_loop(
                 registry,
                 cache,
                 config,
                 policy,
+                deletes,
                 task_health,
                 metrics,
                 drain_rx,
@@ -467,6 +488,7 @@ pub async fn run(config: Arc<Config>) {
             metrics,
             shutdown: shutdown.clone(),
             clock: clock.clone(),
+            delete_requests: Some(delete_requests),
         },
     ));
 

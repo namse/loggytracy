@@ -88,6 +88,11 @@ fn unified_query_with_stats_cancellable_with_memory(
     max_scan_bytes: Option<u64>,
 ) -> Result<QueryExecution, String> {
     let mut all: Vec<(Labels, LogEntry)> = Vec::new();
+    // The one place every read path meets its rows, which is why the deletion
+    // mask is here and not at each handler. A second scan would be a second
+    // place to forget it, and forgetting it means serving a line a tenant asked
+    // to have deleted.
+    let deleted = state.delete_requests.mask_for(tenant);
     let mut scanned_rows = 0u64;
     let mut scanned_bytes = 0u64;
     let mut materialized_memory_bytes = 0u64;
@@ -117,6 +122,16 @@ fn unified_query_with_stats_cancellable_with_memory(
         for mut e in sr.entries {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Err("query timed out".to_string());
+            }
+            // Before the pipeline runs: a delete selector matches the line as
+            // it was written, and `line_format` would have rewritten it.
+            if deleted.hides(&sr.labels, &e) {
+                state
+                    .delete_requests
+                    .metrics
+                    .hidden_rows
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
             }
             if parsed.process_entry_with_labels_cancellable(&sr.labels, &mut e, cancellation)? {
                 materialized_memory_bytes = materialized_memory_bytes
@@ -165,6 +180,14 @@ fn unified_query_with_stats_cancellable_with_memory(
         for mut e in sr.entries {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Err("query timed out".to_string());
+            }
+            if deleted.hides(&sr.labels, &e) {
+                state
+                    .delete_requests
+                    .metrics
+                    .hidden_rows
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
             }
             if parsed.process_entry_with_labels_cancellable(&sr.labels, &mut e, cancellation)? {
                 materialized_memory_bytes = materialized_memory_bytes
