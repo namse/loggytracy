@@ -48,6 +48,8 @@ sized roughly fifty times too small.
 | `loggytracy_stream_limit_rejected_total` | Increasing | A tenant is creating streams past its limit. **Usually a client putting a request id or timestamp in a label**, not a plan being outgrown — check the label names before raising anything |
 | `loggytracy_query_quota_rejected_total` | Increasing | A tenant is over its read quota — scan rate or concurrency. Like the ingest one: a plan question, not a scaling one |
 | `loggytracy_ingest_quota_rejected_total` | Increasing | A tenant exceeded its rate. **Different from `ingest_throttled_total`** — the server is healthy and the tenant is sending more than its plan allows; this is a plan issue, not a scaling issue |
+| `loggytracy_delete_hidden_rows_total` | Rising steadily long after a request | The rows are hidden but not gone — no rewrite has reached the parts holding them. See below |
+| `loggytracy_delete_requests_rejected_total` | Increasing | A tenant is at the per-request limit. Each outstanding request is a predicate every one of that tenant's scans evaluates per row |
 | `loggytracy_pending_flush_bytes` | Does not reach 0 while draining | Shutdown has not reached durability |
 | `loggytracy_part_sidecar_resident_bytes` | Rising relative to RSS budget | Sidecars are not evicted; resident memory is linear in part count |
 | `loggytracy_part_tenant_segments` | Near `part_count × tenant count` | Each tenant is scattered across nearly every part, maximizing shared-part fixed cost |
@@ -116,6 +118,28 @@ If `retention_rewrite_skipped_total` increases, a part cannot be rewritten withi
 It is already invisible to queries, but **the bytes remain.**
 
 Increase `MERGE_MAX_MEMORY_BYTES` or reduce `ROW_GROUP_SIZE` (which makes windows smaller).
+
+### A deletion request stays at `received`
+
+`GET /loki/api/v1/delete` reports `received` until no part could still hold a
+row the request covers. The rows are already unreadable — the scan masks them
+from the moment the request was accepted — so this is not an availability
+problem. It means the bytes are still there.
+
+The removal happens inside the merge rewrite, so the request advances when
+merge next touches those parts. If it does not advance:
+
+- Check `loggytracy_merge_success_total` is increasing. Nothing is removed while
+  merge is failing.
+- Check `loggytracy_retention_rewrite_skipped_total`. A part too large to rewrite
+  within `MERGE_MAX_MEMORY_BYTES` blocks deletion for the same reason it blocks
+  tenant deletion, and the same fix applies.
+- A part that no merge group will ever select keeps its bytes until retention
+  removes the part. Lowering `MERGE_TARGET_PART_ROWS` brings it back into scope.
+
+The status is deliberately conservative: part metadata records `streams` for the
+whole part, so a part holding that stream for a *different* tenant keeps the
+request at `received`. It never claims a removal that has not happened.
 
 ### Two instances started with the same prefix
 

@@ -756,7 +756,32 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
             .render("loggytracy_remote_restore_latency_ms"),
     );
     body.push_str(&object_store_operation_metrics(&state));
+    body.push_str(&delete_request_metrics(&state));
     body
+}
+
+/// Deletion is the one operation here that destroys data on request, so how
+/// many were accepted, how many were refused, and how many rows are being
+/// hidden are all things an operator has to be able to see without asking a
+/// tenant.
+fn delete_request_metrics(state: &AppState) -> String {
+    let metrics = &state.delete_requests.metrics;
+    format!(
+        "# TYPE loggytracy_delete_requests_accepted_total counter\n\
+loggytracy_delete_requests_accepted_total {}\n\
+# HELP loggytracy_delete_requests_rejected_total Submissions refused for exceeding the per-tenant limit. Each outstanding request is a predicate every scan for that tenant evaluates per row.\n\
+# TYPE loggytracy_delete_requests_rejected_total counter\n\
+loggytracy_delete_requests_rejected_total {}\n\
+# TYPE loggytracy_delete_requests_cancelled_total counter\n\
+loggytracy_delete_requests_cancelled_total {}\n\
+# HELP loggytracy_delete_hidden_rows_total Rows a scan dropped because a deletion request covered them. Stops growing for a request once a rewrite has removed its bytes.\n\
+# TYPE loggytracy_delete_hidden_rows_total counter\n\
+loggytracy_delete_hidden_rows_total {}\n",
+        metrics.accepted.load(Ordering::Relaxed),
+        metrics.rejected.load(Ordering::Relaxed),
+        metrics.cancelled.load(Ordering::Relaxed),
+        metrics.hidden_rows.load(Ordering::Relaxed),
+    )
 }
 
 /// The cost model of this design is operation counts, not bytes. R2 bills per
