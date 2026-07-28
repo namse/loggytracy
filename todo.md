@@ -131,6 +131,24 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
       the bytes at the next rewrite. Design and the reasons for each refusal:
       [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
 
+## Deferred with a reason
+
+- [ ] **P1-11: manifest as generational deltas plus periodic snapshots.** The manifest is still rewritten in
+      full on every publish, so one object takes every commit. What that costs is now measured
+      ([`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md) §9): one PUT and one GET per flush, on one key,
+      whose rate is the flush interval. **Not the startup bottleneck** — §8 measured startup at 10,099
+      parts and found the cost is local checksum validation, not manifest I/O, so the O(N) half of P1-11
+      is already answered.
+      What remains is the hot key, and the fix that actually removes it is not "deltas" but making each
+      commit a `PutMode::Create` at its own generation key, so no key takes two writes. That replaces the
+      commit protocol every durability guarantee here rests on — lost-update protection, merge input
+      revalidation, writer fencing, the cross-domain flush transaction — and it cannot be validated by
+      anything short of another soak. It is listed in
+      [`docs/LOAD_VALIDATION.md`](docs/LOAD_VALIDATION.md) as the *response to* observed throttling on the
+      first real deployment, not as a precondition for it, and that is the right order: the mitigation
+      should be built when there is a measurement saying it is needed, against the backend that produced
+      the measurement.
+
 ## P4 — M6 hardware replacement
 
 Detailed plan: [`docs/M6_IMPLEMENTATION_PLAN.md`](docs/M6_IMPLEMENTATION_PLAN.md)
