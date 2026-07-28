@@ -2385,3 +2385,109 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             "steps with no entries produce no sample, so the minimum is over the steps that did"
         );
     }
+
+    /// Tokens carrying a digit are masked before anything is compared, so a
+    /// thousand distinct request ids are one pattern rather than a thousand.
+    #[test]
+    fn digits_are_variable_on_their_face() {
+        assert_eq!(
+            tokenize("GET /users/4821 took 13ms"),
+            vec!["GET", "<_>", "took", "<_>"]
+        );
+    }
+
+    /// A template that has degraded to wildcards must not absorb every line of
+    /// its length: with nothing pinned there is nothing to have matched.
+    #[test]
+    fn similarity_ignores_the_positions_a_template_gave_up_on() {
+        let template = vec!["<_>".to_string(), "<_>".to_string()];
+        let tokens = vec!["anything".to_string(), "at all".to_string()];
+        assert_eq!(similarity(&template, &tokens), 0.0);
+
+        let template = vec!["level".to_string(), "<_>".to_string(), "msg".to_string()];
+        let matching = vec!["level".to_string(), "x".to_string(), "msg".to_string()];
+        assert_eq!(similarity(&template, &matching), 1.0);
+        let half = vec!["level".to_string(), "x".to_string(), "other".to_string()];
+        assert_eq!(similarity(&template, &half), 0.5);
+        // Different lengths are different patterns, whatever they share.
+        assert_eq!(similarity(&template, &matching[..2]), 0.0);
+    }
+
+    /// The whole point of the endpoint: many lines, few templates, and the
+    /// varying field shown as a wildcard rather than as a hundred patterns.
+    #[tokio::test]
+    async fn patterns_collapse_varying_fields_and_keep_distinct_messages_apart() {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
+        let base_ns = 1_700_000_000_000_000_000i64;
+        let mut entries = Vec::new();
+        for user_index in 0..20i64 {
+            entries.push(LogEntry {
+                timestamp_ns: base_ns + user_index * 1_000_000_000,
+                line: format!("user {user_index} logged in from host alpha"),
+                structured_metadata: vec![],
+            });
+        }
+        for failure_index in 0..5i64 {
+            entries.push(LogEntry {
+                timestamp_ns: base_ns + failure_index * 1_000_000_000,
+                line: "could not reach the payment service".to_string(),
+                structured_metadata: vec![],
+            });
+        }
+        memtable.insert(
+            test_tenant(),
+            [("app".to_string(), "patterns".to_string())]
+                .into_iter()
+                .collect::<Labels>(),
+            entries,
+        );
+
+        let (status, body) = get_json(
+            &state,
+            "/loki/api/v1/patterns?query=%7Bapp%3D%22patterns%22%7D",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let found = body["data"].as_array().unwrap();
+        let templates: Vec<&str> = found
+            .iter()
+            .map(|pattern| pattern["pattern"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            templates,
+            vec![
+                "user <_> logged in from host alpha",
+                "could not reach the payment service"
+            ],
+            "twenty logins are one pattern, and the failures are not folded into it"
+        );
+        assert_eq!(body["sampledLines"], 25);
+
+        let login_samples = found[0]["samples"].as_array().unwrap();
+        let counted: u64 = login_samples
+            .iter()
+            .map(|sample| sample[1].as_u64().unwrap())
+            .sum();
+        assert_eq!(counted, 20, "every line it matched is in a bucket");
+    }
+
+    /// An unparseable selector is the caller's error, and a window that
+    /// retention has already emptied is an empty answer rather than one.
+    #[tokio::test]
+    async fn patterns_refuses_a_bad_query_and_answers_an_empty_window() {
+        let dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        let state = test_state(&dir, memtable, Arc::new(PartRegistry::new()), None);
+        let (status, _) = get_json(&state, "/loki/api/v1/patterns?query=%7Bnot+a+selector").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, body) = get_json(
+            &state,
+            "/loki/api/v1/patterns?query=%7Bapp%3D%22none%22%7D&start=1700000000&end=1700000060",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["data"].as_array().unwrap().is_empty());
+    }
