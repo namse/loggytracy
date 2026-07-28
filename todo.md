@@ -116,6 +116,14 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
 - [x] Improve the load probe to verify rows read — the probe counts the lines returned, so "restored and
       read" is distinguishable from "nothing matched"
 
+## P2 — Loki API surface
+
+- [x] `patterns` — a read-time miner over a bounded sample of the window, reporting the lines it
+      looked at. No index is added to the write path
+- [x] `delete` API — hides on acceptance at the single scan every read path funnels through, removes
+      the bytes at the next rewrite. Design and the reasons for each refusal:
+      [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
+
 ## P4 — M6 hardware replacement
 
 Detailed plan: [`docs/M6_IMPLEMENTATION_PLAN.md`](docs/M6_IMPLEMENTATION_PLAN.md)

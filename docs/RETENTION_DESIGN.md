@@ -672,3 +672,58 @@ requested window is older than the tenant's retention, the clamped start passes
 the end. The range is validated against the request the client actually made,
 then clamped, and an empty `streams`/`matrix`/`vector` result is returned — a
 downgrade must not turn previously valid queries into `400`s.
+
+## Deletion requests (`/loki/api/v1/delete`)
+
+Retention answers "how long may this tenant's data live." A deletion request
+answers a different question — "remove these lines, now" — and the two share
+one mechanism at the bottom and nothing above it.
+
+**Two obligations at two speeds.** The lines must stop being readable when the
+request is accepted, because a deletion request is usually somebody exercising
+a right and an hour's delay is not an answer. The bytes must also actually go,
+and that cannot happen at the same moment: parts are immutable, and rewriting
+one to drop a few rows is the most expensive operation this engine has.
+
+So a request does both, each at the speed it can go:
+
+| | when | how |
+|---|---|---|
+| Stops being readable | on acceptance | a per-row mask applied at the single scan every read path funnels through |
+| Bytes removed | at the next rewrite touching the part | the same per-row predicate, inside `rewrite_group` next to the retention cutoff |
+
+**The mask lives at one place on purpose.** `run_unified_query_with_stats` is
+where logs, metric queries, tail, volume, detected fields and the restore probe
+all meet their rows. A second place to apply the mask would be a second place to
+forget it, and forgetting it means serving a line somebody was told was gone.
+It is applied *before* the pipeline runs, because a delete selector matches the
+line as it was written and `line_format` would have rewritten it.
+
+**Durable before visible.** The request is written to the object store — one
+object per request, under `delete_requests/`, outside the prefixes
+`garbage_collect_orphans` sweeps — before it hides anything, and it is loaded at
+startup on the same fatal-on-failure terms as the tenant policies. A request
+that is masking rows but would not survive a restart is the one failure this
+must not have.
+
+**`status` is conservative.** A request is promoted from `received` to
+`processed` only when no part's metadata could still hold a row it covers. Part
+metadata records `streams` for the whole part rather than per tenant, so a part
+holding that stream for a *different* tenant keeps the request at `received`.
+The status lags; it never claims removal that has not happened.
+
+**Refused: pipeline stages in the selector.** Matchers and line filters name
+rows that exist. A stage names a value derived from them, and "the lines whose
+parsed `status` was 500" would mean something different whenever the parser
+changed. A deletion that cannot be honoured consistently is refused rather than
+accepted and half-applied.
+
+**Not offered: Loki's cancellation grace period.** There, a request sits
+unapplied for 24 hours so it can be withdrawn — during which the data is still
+being served. Here it is hidden immediately and can be withdrawn until the
+rewrite lands, which is the same affordance without that window.
+
+**The limit is a scan cost, not a storage cost.** Each outstanding request is a
+predicate every scan for that tenant evaluates per row, which is why a tenant
+holds at most `MAX_DELETE_REQUESTS_PER_TENANT` of them. When no request exists
+anywhere the scan pays a single atomic load, which is the normal case.
