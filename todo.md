@@ -2870,7 +2870,18 @@ Read path:
       one. **Splitting it is one counter** on the same meter (`src/restore_meter.rs` already knows which
       bodies went unread; it does not know why), so measure before building — the same order that turned
       the item above around.
-- [ ] Improve metric evaluation from bounded in-memory computation to streaming/pre-aggregation
+- [x] Improve metric evaluation from bounded in-memory computation to streaming — the scan takes a row
+      sink, and the metric path folds each row into per-series samples as it arrives instead of collecting
+      `Vec<(SharedLabels, LogEntry)>` for the evaluator to discard one step later. The log paths keep the
+      collecting sink and go through the same scan, because that is where the deletion mask lives. The
+      `sum(rate(...))`-shaped fast path that materializes nothing at all stays where it was, in front of
+      it. `LOGGYTRACY_MAX_METRIC_ROWS` is removed: it capped an intermediate, so a `rate()` over a busy
+      stream was refused for materializing something the client would never receive. Cost is still bounded
+      by `max_query_scan_bytes` (per part, not after the fact), `max_query_runtime`, `max_metric_series`
+      and `max_metric_samples`. Pinned by
+      `a_metric_query_folds_rows_a_log_query_could_not_materialize`; the run that motivated it is
+      [`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md) §12, whose magnitudes are struck with the rest of the
+      retired harness's
 - [x] ~~Validate a deployment environment using real S3~~ — **confirmed out of scope.** This is an indie project,
       so local MinIO is the upper bound for load validation. What is validated, what risks remain, and what to
       check on the first real deployment are in [`docs/LOAD_VALIDATION.md`](docs/LOAD_VALIDATION.md)
@@ -2887,12 +2898,13 @@ Read path:
       (`scripts/run_query_load_local.sh`) that fills all 8 scan slots with 2,403 scans queued behind them.
       It says the knob to change is **not** a memory cap: peak RSS at full saturation is 496 MB, 9.2% of the
       configured 5 GiB, so `MAX_QUERY_MEMORY_BYTES` is nowhere near binding. What it found instead is
-      head-of-line blocking — a 60-second dashboard query measures p95 6.46 s against a 2 s target because
-      the scheduler admits by arrival order and it waits behind eight 120-second scans, while those wide
-      scans themselves measure p95 392 ms. Raising `MAX_CONCURRENT_QUERY_SCANS` buys a shorter queue with
-      budget that is 90% unused; separating interactive scans from bulk ones fixes the latency for free.
-      **Deferred to the range-GET work on purpose**: that changes what a scan costs, and picking a
-      separation policy against the current cost would be tuning against a number about to move
+      head-of-line blocking: the scheduler admits by arrival order, so a 60-second dashboard query waited
+      behind eight 120-second scans at p95 6.46 s against a 2 s target. **Then the metric fold (§12) took
+      the same probe to 546 ms without touching the scheduler**, by making the queries ahead of it six
+      times cheaper. p99 barely moved (8.59 → 8.12 s), so the blocking is still the shape of the tail —
+      it is no longer the binding problem. **Deferred to the range-GET work on purpose**: that changes
+      what a scan costs again, and picking a separation policy against a cost about to move is tuning
+      with more steps
 - [x] **Tier D duration/scale run** — 2.01 hours, 500 tenants, a graceful shutdown, a restart and a fence,
       every behavioural gate met. It found one defect nothing shorter could: shutdown waited out merge
       groups it started *after* the signal, 117 of the 118 seconds it took. The 10,000-part axis is

@@ -198,7 +198,6 @@ pub struct Config {
     pub sidecar_cache_max_bytes: Option<u64>,
     pub max_log_limit: usize,
     pub max_metric_evaluation_points: usize,
-    pub max_metric_rows: usize,
     pub max_metric_series: usize,
     pub max_metric_samples: usize,
     /// How many `match[]` selectors one `series` request may carry. Each one
@@ -309,7 +308,6 @@ impl Default for Config {
             sidecar_cache_max_bytes: None,
             max_log_limit: 100_000,
             max_metric_evaluation_points: 10_000,
-            max_metric_rows: 1_000_000,
             max_metric_series: 100_000,
             max_metric_samples: 5_000_000,
             max_series_matchers: 32,
@@ -710,10 +708,6 @@ impl Config {
                 "LOGGYTRACY_MAX_METRIC_EVALUATION_POINTS",
                 defaults.max_metric_evaluation_points,
             )?,
-            max_metric_rows: env_positive_usize(
-                "LOGGYTRACY_MAX_METRIC_ROWS",
-                defaults.max_metric_rows,
-            )?,
             max_metric_series: env_positive_usize(
                 "LOGGYTRACY_MAX_METRIC_SERIES",
                 defaults.max_metric_series,
@@ -951,7 +945,6 @@ exclusive: per-tenant retention replaces the global period"
             "max_metric_evaluation_points",
             self.max_metric_evaluation_points,
         )?;
-        positive_usize("max_metric_rows", self.max_metric_rows)?;
         positive_usize("max_metric_series", self.max_metric_series)?;
         positive_usize("max_metric_samples", self.max_metric_samples)?;
         positive_usize(

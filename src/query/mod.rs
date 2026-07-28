@@ -16,7 +16,6 @@ use crate::part;
 use crate::tenant::TenantId;
 
 const MAX_METRIC_EVALUATION_POINTS: usize = 10_000;
-const MAX_METRIC_ROWS: usize = 1_000_000;
 const MAX_METRIC_SERIES: usize = 100_000;
 const MAX_METRIC_SAMPLES: usize = 5_000_000;
 const MAX_LOG_LIMIT: usize = 100_000;

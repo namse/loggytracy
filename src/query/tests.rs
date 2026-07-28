@@ -1680,6 +1680,78 @@
         }
     }
 
+    /// A metric query is no longer refused for materializing rows it never keeps.
+    ///
+    /// The scan used to hand the evaluator every matching line and the evaluator
+    /// reduced them to a `(timestamp, value)` per series one step later, so the
+    /// ceiling was on an intermediate. The same rows that make a *log* query
+    /// legitimately too large to materialize cost a metric query sixteen bytes
+    /// an event and none of the text.
+    #[tokio::test]
+    async fn a_metric_query_folds_rows_a_log_query_could_not_materialize() {
+        const ROWS: usize = 512;
+
+        let data_dir = temp_dir();
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            labels,
+            (0..ROWS)
+                .map(|index| LogEntry {
+                    timestamp_ns: 1_000_000_000 + index as i64 * 1_000_000,
+                    line: "x".repeat(1024),
+                    structured_metadata: vec![],
+                })
+                .collect(),
+        );
+
+        // Well under the half-megabyte of lines, and well over the eight
+        // kilobytes of samples they fold down to.
+        let state = state_with_config(
+            Config {
+                data_dir: data_dir.clone(),
+                max_query_memory_bytes: 64 * 1024,
+                ..Config::default()
+            },
+            memtable,
+            Arc::new(PartRegistry::new()),
+        );
+
+        let logql::QueryExpr::Metric(expr) =
+            logql::parse_expr(r#"count_over_time({app="api"}[1m])"#).unwrap()
+        else {
+            panic!("expected metric")
+        };
+        let series = run_metric_query(state.clone(), test_tenant(), expr, vec![2_000_000_000])
+            .await
+            .unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].samples[0].1, ROWS as f64);
+
+        // The same rows asked for as lines are still refused, and that refusal
+        // is the honest one: a client asking for them would receive every byte.
+        let error = run_unified_query_with_stats(
+            state,
+            test_tenant(),
+            logql::parse(r#"{app="api"}"#).unwrap(),
+            crate::part::QueryTimeRange::closed(0, 3_000_000_000),
+            ROWS,
+            true,
+            None,
+            crate::metrics::QueryEndpoint::Query,
+        )
+        .await
+        .err()
+        .expect("the log query must not fit in the same budget");
+        assert!(
+            error.contains("materialized bytes"),
+            "expected a memory refusal for the log query, got: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn metric_grouping_uses_extracted_fields_and_parser_errors() {
         let data_dir = temp_dir();

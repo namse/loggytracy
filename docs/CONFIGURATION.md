@@ -250,10 +250,20 @@ becomes disk usage that cannot be evicted**.
 | Variable | Default |
 |---|---|
 | `LOGGYTRACY_MAX_METRIC_EVALUATION_POINTS` | 10,000 |
-| `LOGGYTRACY_MAX_METRIC_ROWS` | 1,000,000 |
 | `LOGGYTRACY_MAX_METRIC_SERIES` | 100,000 |
 | `LOGGYTRACY_MAX_METRIC_SAMPLES` | (see `config.rs`) |
 | `LOGGYTRACY_MAX_CONCURRENT_METRIC_EVALUATIONS` | 4 |
+
+`LOGGYTRACY_MAX_METRIC_ROWS` **was removed and is now ignored.** It capped an
+intermediate rather than an answer: the scan handed the evaluator every matching
+line and the evaluator reduced them to `(timestamp, value)` per series one step
+later, discarding the text. So a `rate()` over a busy stream was refused for
+materializing something the client would never receive. The rows are now folded
+into per-series samples as they are scanned, and what a metric query costs is
+bounded by `LOGGYTRACY_MAX_QUERY_SCAN_BYTES` for the read, `MAX_QUERY_RUNTIME`
+for the wall clock, and `MAX_METRIC_SERIES` / `MAX_METRIC_SAMPLES` for the
+answer — all of which bound something real. An instance that still sets the
+variable starts normally and ignores it.
 
 ### Trace queries
 

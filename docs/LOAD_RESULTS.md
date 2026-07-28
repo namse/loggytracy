@@ -499,8 +499,9 @@ inferred from this run's percentiles, which is why it outlives them. **It is als
 the shape of the answer P3's "tune resource limits to operational targets" was
 waiting for, and it says the knob to turn is not a memory cap** — separating
 interactive scans from bulk ones shortens the queue without spending budget.
-Recorded as a finding, not acted on: the choice belongs with the range-GET work,
-which changes what a scan costs.
+Recorded as a finding, not acted on — and **superseded before either knob was
+turned, see §12**: making the expensive query cheaper moved the same probe back
+inside its target without touching the scheduler at all.
 
 **Survives — a concurrency defect nothing serial could find.** The first run
 failed most of its restores with fault injection *disabled*, on `File exists
@@ -531,6 +532,55 @@ needs.
 
 Raw output: [`query_heavy_result.json`](query_heavy_result.json), kept for the
 counters the server produced rather than for the rates the harness reported.
+
+---
+
+## 12. Folding metric rows instead of collecting them
+
+**Asked:** why a `rate()` over a busy stream came back refused rather than
+answered.
+
+**What it was:** `MetricEvaluator` never wanted the rows. Its first act was to
+reduce them to a `(timestamp, value)` per label set and drop every line, so the
+`Vec<(SharedLabels, LogEntry)>` the scan handed it existed only to be discarded
+one step later — and `max_metric_rows` bounded that intermediate. The ceiling was
+on something the client was never going to receive.
+
+**The fix is code, not a measurement, and survives on its own.** The scan takes a
+sink. The log paths get the one that collects rows, sorts and groups them, which
+is what they did before; the metric path gets one that folds each row into
+per-series samples as it arrives, keeping sixteen bytes an event and none of the
+text. Both go through the same scan rather than beside it, because that is where
+the deletion mask lives and a second scan would be a second place to forget it.
+**Pinned by `a_metric_query_folds_rows_a_log_query_could_not_materialize`**,
+which answers a metric query over half a megabyte of lines under a 64 KiB budget
+and shows the same rows still refused as a log query — a test, so it is citable
+where the run that motivated it is not.
+
+`LOGGYTRACY_MAX_METRIC_ROWS` is removed. What a metric query costs is still
+bounded, by things that bound something real: `max_query_scan_bytes` for the read
+— enforced per part rather than checked afterwards — `max_query_runtime` for the
+wall clock, and `max_metric_series` / `max_metric_samples` for the answer.
+
+**The tables are struck, as in §11.** The re-run used the same retired harness on
+the same shared-core client, so its ratios carry the caveat its absolute numbers
+do.
+
+**Survives — the ordering it settled.** Making the expensive query cheaper moved
+the dashboard probe back inside its target *without touching the scheduler*, so
+§11's "the knob to turn is not a memory cap" resolves one step further: at this
+workload it was not the scheduler either. Head-of-line blocking is still the
+shape of the tail — the p99 barely moved — but it stopped being the binding
+problem. That is a statement about which change to make first, and it does not
+depend on the magnitudes that showed it.
+
+**Unknown:** everything the ratios claim. Whether the fold is worth the
+evaluation-count multiple it reported, and what peak RSS does at a workload that
+is not sharing eight cores with its own load generator, are for the rewritten
+harness to answer.
+
+Raw output: [`query_heavy_fold_result.json`](query_heavy_fold_result.json),
+against §11's [`query_heavy_result.json`](query_heavy_result.json).
 
 ---
 

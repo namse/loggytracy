@@ -115,16 +115,14 @@ async fn run_metric_query_with_stats_cancellable(
     let scan_start =
         scan_start_override.unwrap_or_else(|| first.saturating_sub(expr.lookback_ns()));
     let query = expr.log_query().clone();
-    let max_metric_rows = state.config.max_metric_rows.min(MAX_METRIC_ROWS);
     let max_metric_series = state.config.max_metric_series.min(MAX_METRIC_SERIES);
     let max_metric_samples = state.config.max_metric_samples.min(MAX_METRIC_SAMPLES);
 
     // `sum()` of a count-shaped range function needs no rows at all: the
     // answer is how many rows (or line bytes) land in each evaluation window,
     // and the sink can accumulate that directly — two array updates per row
-    // where the general path materialized a `LogEntry` per row at
-    // `max_metric_rows` scale, grouped them, sorted them and prefix-summed
-    // them. The general path stays for everything the accumulation cannot
+    // where the general path grouped, sorted and prefix-summed a `LogEntry`
+    // per row. The general path stays for everything the accumulation cannot
     // express: unwraps, quantiles, per-series grouping, offsets, subqueries.
     if let logql::MetricExpr::Aggregate {
         op: logql::AggregateOp::Sum,
@@ -155,7 +153,7 @@ async fn run_metric_query_with_stats_cancellable(
             tenant,
             query,
             part::QueryTimeRange::closed(scan_start, end),
-            Some(max_metric_rows),
+            None,
             cancellation,
             Some(deadline.saturating_duration_since(tokio::time::Instant::now())),
             columns,
@@ -165,11 +163,6 @@ async fn run_metric_query_with_stats_cancellable(
         )
         .await?;
         drop(evaluation_permit);
-        if accepted as usize > max_metric_rows {
-            return Err(format!(
-                "metric query exceeds the maximum of {max_metric_rows} scanned rows"
-            ));
-        }
         let mut series = Vec::new();
         if accepted > 0 {
             let mut samples = Vec::with_capacity(evaluation_times.len());
@@ -195,7 +188,25 @@ async fn run_metric_query_with_stats_cancellable(
         });
     }
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let execution = run_unified_query_with_stats_cancellable_for_runtime(
+    // No row ceiling, and no log limit. Both used to be `max_metric_rows`,
+    // because the scan handed back every matching line and the evaluator threw
+    // them away one entry later — so a `rate()` over a busy stream was refused
+    // for materializing an intermediate the client was never going to receive.
+    // The fold below keeps sixteen bytes an event instead, and what a metric
+    // query costs is still bounded: `max_query_scan_bytes` for the read,
+    // `max_query_runtime` for the wall clock, `max_metric_series` and
+    // `max_metric_samples` for the answer.
+    let mask = state.delete_requests.mask_for(&tenant);
+    let max_query_memory_bytes = state.config.max_query_memory_bytes;
+    let sink = MetricEventSink::new(
+        &expr,
+        query.clone(),
+        mask,
+        Some(cancellation.clone()),
+        max_metric_series,
+        Some(max_query_memory_bytes),
+    );
+    let (sink, scanned_rows, scanned_bytes) = run_metric_event_scan(
         state.clone(),
         tenant,
         query,
@@ -204,9 +215,6 @@ async fn run_metric_query_with_stats_cancellable(
         // dropping the row at exactly that instant would change every final
         // sample rather than trim one row off a log response.
         part::QueryTimeRange::closed(scan_start, end),
-        max_metric_rows.saturating_add(1),
-        true,
-        Some(max_metric_rows),
         cancellation.clone(),
         Some(remaining),
         // The metric path decodes only what the expression can read: the
@@ -215,67 +223,21 @@ async fn run_metric_query_with_stats_cancellable(
         // stage forces everything. `sum(rate({app="x"}[5m]))` was decoding
         // every column of every row to add one to a counter per row.
         expr.required_columns(),
+        sink,
     )
     .await?;
-    let row_count: usize = execution
-        .results
-        .iter()
-        .map(|stream| stream.entries.len())
-        .sum();
-    if row_count > max_metric_rows {
-        return Err(format!(
-            "metric query exceeds the maximum of {max_metric_rows} scanned rows"
-        ));
-    }
-    let input_memory = estimated_query_memory_bytes(&execution.results);
-    let scanned_rows = execution.scanned_rows;
-    let scanned_bytes = execution.scanned_bytes;
-    let grouping_fields = expr.grouping_fields();
+    let input_memory = sink.retained_bytes();
 
     let task_cancellation = cancellation.clone();
     let mut task = tokio::task::spawn_blocking(move || {
         let _evaluation_permit = evaluation_permit;
         let _arena = crate::memprof::enter(crate::memprof::Arena::Query);
-        // The scan's pool reservation rides in `execution` and stays held
-        // through the evaluation: `entries` below moves the same rows the
-        // reservation paid for.
-        let streams = execution.results;
-        let _memory_reservation = execution.memory_reservation;
-        let mut entries = Vec::new();
-        for stream in streams {
-            for entry in stream.entries {
-                if task_cancellation.load(Ordering::Acquire) {
-                    return Err("metric query timed out".to_string());
-                }
-                // Shared with the stream unless a grouping field actually has
-                // to be promoted into it. This clone was the whole `BTreeMap`
-                // per row — and this whole loop used to run on an async
-                // worker thread, outside every arena, before the blocking
-                // task it now lives in (`docs/MEMORY_ATTRIBUTION.md`, "an
-                // eighth term nobody proposed": 203 MiB at its high-water).
-                let mut labels = stream.labels.clone();
-                // Pipeline-extracted fields are query-local structured
-                // metadata at this point. Promote them into the metric label
-                // set so range functions and aggregations can distinguish
-                // entries such as `level=info` and `level=error` from the
-                // same stream.
-                for (name, value) in &entry.structured_metadata {
-                    // Pipeline fields must not replace original stream
-                    // labels. A colliding extraction has already been renamed
-                    // by process_entry_with_labels.
-                    if grouping_fields.contains(name) && !labels.contains_key(name) {
-                        SharedLabels::make_mut(&mut labels).insert(name.clone(), value.clone());
-                    }
-                }
-                entries.push((labels, entry));
-            }
-        }
+        let evaluator = MetricEvaluator::from_sink(sink, Some(task_cancellation.as_ref()))?;
         evaluate_metric_stream_with_limits(
             &expr,
-            &entries,
+            &evaluator,
             &evaluation_times,
             Some(task_cancellation.as_ref()),
-            max_metric_series,
             max_metric_samples,
         )
     });
@@ -516,6 +478,208 @@ fn empty_labels() -> SharedLabels {
     EMPTY.get_or_init(|| SharedLabels::new(Labels::new())).clone()
 }
 
+/// The owned half of `RangeSpec`, which borrows from the expression.
+///
+/// A sink crosses into the scan's blocking task, so it cannot hold a borrow of
+/// the expression. It holds the same five fields and lends them back per row.
+struct OwnedRangeSpec {
+    function: logql::RangeFunction,
+    range_ns: i64,
+    unwrap: Option<logql::Unwrap>,
+    quantile: Option<f64>,
+    offset_ns: i64,
+}
+
+impl OwnedRangeSpec {
+    fn of(expr: &logql::MetricExpr) -> Self {
+        let spec = metric_range_spec(expr);
+        Self {
+            function: spec.function,
+            range_ns: spec.range_ns,
+            unwrap: spec.unwrap.cloned(),
+            quantile: spec.quantile,
+            offset_ns: spec.offset_ns,
+        }
+    }
+
+    fn borrow(&self) -> RangeSpec<'_> {
+        RangeSpec {
+            function: self.function,
+            range_ns: self.range_ns,
+            unwrap: self.unwrap.as_ref(),
+            quantile: self.quantile,
+            offset_ns: self.offset_ns,
+        }
+    }
+}
+
+/// Folds scanned rows into per-series samples as they arrive.
+///
+/// `MetricEvaluator` never wanted the rows. Its first act was to reduce them to
+/// a `(timestamp, value)` per label set and drop every line, so the
+/// `Vec<(SharedLabels, LogEntry)>` in between existed only to be discarded — and
+/// that intermediate is what `max_metric_rows` bounded. It is why a `rate()`
+/// over a busy stream came back refused rather than answered: the ceiling was on
+/// something the client was never going to receive.
+///
+/// What survives here is sixteen bytes an event plus one label set a series,
+/// which is what `max_metric_series` and `max_metric_samples` already bound.
+///
+/// Owns its context rather than borrowing it, unlike `CountingSink`: this sink
+/// is built before the blocking task and moves into it.
+struct MetricEventSink {
+    /// Stages still run per row — a field filter must reject before the fold.
+    query: logql::LogQuery,
+    mask: crate::delete_requests::DeleteMask,
+    cancellation: Option<Arc<AtomicBool>>,
+    spec: OwnedRangeSpec,
+    /// Names the aggregation groups by. Pipeline-extracted fields are
+    /// query-local structured metadata at this point, and the ones being
+    /// grouped on have to be promoted into the label set so range functions can
+    /// tell `level=info` from `level=error` within one stream.
+    grouping_fields: BTreeSet<String>,
+    max_series: usize,
+    max_memory_bytes: Option<u64>,
+    events: BTreeMap<SharedLabels, Vec<(i64, f64)>>,
+    retained_bytes: u64,
+    /// Counted here and published once, rather than through a borrowed counter.
+    hidden_rows: u64,
+}
+
+impl MetricEventSink {
+    fn new(
+        expr: &logql::MetricExpr,
+        query: logql::LogQuery,
+        mask: crate::delete_requests::DeleteMask,
+        cancellation: Option<Arc<AtomicBool>>,
+        max_series: usize,
+        max_memory_bytes: Option<u64>,
+    ) -> Self {
+        Self {
+            query,
+            mask,
+            cancellation,
+            spec: OwnedRangeSpec::of(expr),
+            grouping_fields: expr.grouping_fields(),
+            max_series,
+            max_memory_bytes,
+            events: BTreeMap::new(),
+            retained_bytes: 0,
+            hidden_rows: 0,
+        }
+    }
+
+    /// The fold on its own, for tests that hand it rows a scan already produced:
+    /// no mask, and no stages to re-run over entries the pipeline has passed.
+    #[cfg(test)]
+    fn for_tests(expr: &logql::MetricExpr, max_series: usize) -> Self {
+        let mut query = expr.log_query().clone();
+        query.stages.clear();
+        Self::new(
+            expr,
+            query,
+            crate::delete_requests::DeleteMask::default(),
+            None,
+            max_series,
+            None,
+        )
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
+    fn accept_inner(
+        &mut self,
+        labels: &SharedLabels,
+        mut entry: LogEntry,
+        extracted_json: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<(), String> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err("metric query timed out".to_string());
+        }
+        // Before the pipeline runs: a delete selector matches the line as it
+        // was written, and `line_format` would have rewritten it.
+        if !self.mask.is_empty() && self.mask.hides(labels, &entry) {
+            self.hidden_rows += 1;
+            return Ok(());
+        }
+        if !self.query.stages.is_empty()
+            && !self.query.process_entry_with_precomputed_json(
+                labels,
+                &mut entry,
+                self.cancellation.as_deref(),
+                extracted_json.as_ref(),
+            )?
+        {
+            return Ok(());
+        }
+        // Shared with the stream unless a grouping field actually has to be
+        // promoted into it. The `contains_key` guard is also the shadowing
+        // rule: a metadata pair whose key is a stream label never wins, and a
+        // colliding extraction has already been renamed by
+        // `process_entry_with_labels`.
+        let mut labels = labels.clone();
+        for (name, value) in &entry.structured_metadata {
+            if self.grouping_fields.contains(name) && !labels.contains_key(name) {
+                SharedLabels::make_mut(&mut labels).insert(name.clone(), value.clone());
+            }
+        }
+        let Some(increment) = sample_value(&self.spec.borrow(), &labels, &entry) else {
+            return Ok(());
+        };
+        let sample = (entry.timestamp_ns, increment);
+        match self.events.get_mut(&labels) {
+            Some(events) => events.push(sample),
+            None => {
+                if self.events.len() == self.max_series {
+                    return Err(format!(
+                        "metric query exceeds the maximum of {} series",
+                        self.max_series
+                    ));
+                }
+                self.retained_bytes = self.retained_bytes.saturating_add(
+                    labels
+                        .iter()
+                        .map(|(name, value)| name.len().saturating_add(value.len()))
+                        .sum::<usize>() as u64,
+                );
+                self.events.insert(labels, vec![sample]);
+            }
+        }
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(std::mem::size_of::<(i64, f64)>() as u64);
+        if let Some(max) = self.max_memory_bytes
+            && self.retained_bytes > max
+        {
+            return Err(format!(
+                "query exceeds the maximum of {max} materialized bytes"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl crate::part::RowSink for MetricEventSink {
+    fn accept_extracted(
+        &mut self,
+        labels: &SharedLabels,
+        entry: LogEntry,
+        extracted_json: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<(), String> {
+        self.accept_inner(labels, entry, extracted_json)
+    }
+
+    fn accept(&mut self, labels: &SharedLabels, entry: LogEntry) -> Result<(), String> {
+        self.accept_inner(labels, entry, None)
+    }
+}
+
 struct MetricEvaluator {
     range_ns: i64,
     max_series: usize,
@@ -523,32 +687,15 @@ struct MetricEvaluator {
 }
 
 impl MetricEvaluator {
-    fn new(
-        expr: &logql::MetricExpr,
-        entries: &[(SharedLabels, LogEntry)],
-        cancellation: Option<&AtomicBool>,
-        max_series: usize,
-    ) -> Result<Self, String> {
-        let spec = metric_range_spec(expr);
-        let range_ns = spec.range_ns;
-        let mut events_by_labels: BTreeMap<SharedLabels, Vec<(i64, f64)>> = BTreeMap::new();
-        for (labels, entry) in entries {
-            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-                return Err("metric query timed out".to_string());
-            }
-            let Some(increment) = sample_value(&spec, labels, entry) else {
-                continue;
-            };
-            if !events_by_labels.contains_key(labels) && events_by_labels.len() == max_series {
-                return Err(format!(
-                    "metric query exceeds the maximum of {max_series} series"
-                ));
-            }
-            events_by_labels
-                .entry(labels.clone())
-                .or_default()
-                .push((entry.timestamp_ns, increment));
-        }
+    /// Sorts each series and builds its prefix sums.
+    ///
+    /// Separate from the fold because the fold runs in the scan's blocking task
+    /// and this runs in the evaluation task, which is what holds the metric
+    /// permit.
+    fn from_sink(sink: MetricEventSink, cancellation: Option<&AtomicBool>) -> Result<Self, String> {
+        let range_ns = sink.spec.range_ns;
+        let max_series = sink.max_series;
+        let events_by_labels = sink.events;
 
         let mut by_labels = BTreeMap::new();
         for (labels, mut events) in events_by_labels {
@@ -885,25 +1032,30 @@ fn evaluate_metric_stream(
     evaluation_times: &[i64],
     cancellation: Option<&AtomicBool>,
 ) -> Result<BTreeMap<SharedLabels, Vec<(i64, f64)>>, String> {
+    // Feeds the sink the way a scan would, so the tests exercise the fold
+    // rather than a second way of reaching the evaluator.
+    let mut sink = MetricEventSink::for_tests(expr, MAX_METRIC_SERIES);
+    for (labels, entry) in entries {
+        crate::part::RowSink::accept(&mut sink, labels, entry.clone())?;
+    }
+    let evaluator = MetricEvaluator::from_sink(sink, cancellation)?;
     evaluate_metric_stream_with_limits(
         expr,
-        entries,
+        &evaluator,
         evaluation_times,
         cancellation,
-        MAX_METRIC_SERIES,
         MAX_METRIC_SAMPLES,
     )
 }
 
 fn evaluate_metric_stream_with_limits(
     expr: &logql::MetricExpr,
-    entries: &[(SharedLabels, LogEntry)],
+    evaluator: &MetricEvaluator,
     evaluation_times: &[i64],
     cancellation: Option<&AtomicBool>,
-    max_series: usize,
     max_samples: usize,
 ) -> Result<BTreeMap<SharedLabels, Vec<(i64, f64)>>, String> {
-    let evaluator = MetricEvaluator::new(expr, entries, cancellation, max_series)?;
+    let max_series = evaluator.max_series;
     let mut output: BTreeMap<SharedLabels, Vec<(i64, f64)>> = BTreeMap::new();
     let mut sample_count = 0usize;
     for &timestamp_ns in evaluation_times {
