@@ -116,7 +116,7 @@ assumes clients back off on 429 and rely on their own WAL, so disabling them bre
 | `LOGGYTRACY_MAX_BATCH_BYTES` | 1 MiB | Maximum bytes grouped into one write+fsync |
 | `LOGGYTRACY_MAX_BATCH_MS` | `0` (no wait) | **0 is the default and recommended.** Group commit forms behind writes: data arriving during write/fsync goes into the next batch. A nonzero value caps per-connection throughput at `1000/this value` pushes/s. Increase it only on disks where fsync costs more than waiting |
 | `LOGGYTRACY_FLUSH_MAX_BYTES` | 1 MiB | Flush when the memtable reaches this size |
-| `LOGGYTRACY_FLUSH_MAX_INTERVAL` | `5s` | Flush at this interval even when the size threshold is not reached. **This value is the RPO for unexpected disk loss** |
+| `LOGGYTRACY_FLUSH_MAX_INTERVAL` | `5s` | Flush at this interval even when the size threshold is not reached. **This value is the RPO for unexpected disk loss, and it is also the object-store bill** — see below |
 | `LOGGYTRACY_FLUSH_CHECK_INTERVAL` | `500ms` | Interval at which the flush loop checks conditions |
 | `LOGGYTRACY_ROW_GROUP_SIZE` | 8192 (maximum 65536) | Parquet row group row count. Groups also stop at tenant boundaries, so **the number of tenants in a part is a lower bound for the actual row group count** |
 
@@ -234,7 +234,8 @@ The process follows `RUST_LOG` directly. When unset, it uses `loggytracy=info,wa
 
 ## Tuning starting points
 
-- **Want a smaller RPO** → Lower `FLUSH_MAX_INTERVAL`. Object-store writes increase accordingly
+- **Want a smaller RPO** → Lower `FLUSH_MAX_INTERVAL`. Object-store writes increase accordingly, and on a
+  per-request backend that is money — see the table below before choosing
 - **High ack latency** → First check whether `MAX_BATCH_MS` is 0. If not, that value is the latency floor
 - **WAL backlog is growing** → Flush cannot keep up with ingest. Check for 429 responses
   (`loggytracy_ingest_throttled_total`); if none appear, the limit is too high
@@ -243,3 +244,37 @@ The process follows `RUST_LOG` directly. When unset, it uses `loggytracy=info,wa
 - **The disk is filling** → Reduce `CACHE_MAX_BYTES` or set `RETENTION_PERIOD`. Nothing is deleted when the latter is unset
 - **Want p95/p99** → Apply `histogram_quantile` to `loggytracy_query_latency_ms_bucket`.
   `*_latency_ns_total` provides only an average
+
+
+## The flush interval is the object-store bill
+
+A flush costs **five PUTs and one GET**: four PUTs for the part's immutable
+files, one for the manifest, and the GET is the manifest it replaced. Measured,
+not estimated ([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §9), and pinned by a test
+that also holds the property that matters — publishing the tenth part into a
+nine-part manifest costs what publishing the first into an empty one cost.
+
+A flush skips an empty memtable, so an idle instance costs nothing. An instance
+with continuous traffic flushes on every tick, which makes PUT volume a function
+of this one setting:
+
+| `FLUSH_MAX_INTERVAL` | Class A / day | / month | R2 cost |
+|---|---|---|---|
+| 2 s | 216,000 | 6.48 M | $24.66 |
+| 5 s (**default**) | 86,400 | 2.59 M | $7.16 |
+| 15 s | 28,800 | 0.86 M | free tier |
+| 30 s | 14,400 | 0.43 M | free tier |
+| 60 s | 7,200 | 0.22 M | free tier |
+
+**The default does not fit the budget this engine was designed around.** The
+shared-part layout exists because per-tenant objects broke a $1/month plan, and
+one busy instance at the default spends seven times that before any tenant
+multiplier.
+
+The default is 5 s anyway, because this setting is also the RPO — how much
+acknowledged data a disk loss can cost — and that is a deployment decision
+between money and durability, not one this repository should make on someone's
+behalf. What it can do is refuse to let the choice be made without the price.
+
+Watch `loggytracy_object_store_operations_total{kind="put"}` to see the real
+number for a real workload; the rates above will change and the counts will not.
