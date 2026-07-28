@@ -81,6 +81,11 @@ where
                 }
             }
             Ok(Err(error)) => {
+                // A restore that fails leaves nothing behind but a counter, and
+                // a counter cannot say whether the store refused or the part was
+                // retired while the query was planning. Those need opposite
+                // responses from an operator, so the reason is logged.
+                tracing::warn!(error = %error, "object-store restore failed");
                 remote.record_remote_failure();
                 if let Some(metrics) = &metrics {
                     metrics

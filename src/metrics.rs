@@ -76,6 +76,27 @@ pub struct RuntimeMetrics {
     /// One per endpoint. The single histogram this replaced could not say
     /// which endpoint was slow, and did not cover the metric path at all.
     pub query_latency: [LatencyHistogram; QueryEndpoint::ALL.len()],
+    /// Scans holding a scheduler permit right now.
+    pub query_scans_in_flight: AtomicU64,
+    /// High-water mark of that, since start.
+    ///
+    /// `peak_materialized_bytes` is dominated by
+    /// `max_concurrent_query_scans × max_query_memory_bytes` — four of the five
+    /// configured gigabytes at the defaults — and no load run has ever
+    /// exercised it, because every run so far has been ingest-dominated. A run
+    /// that claims to have reached the limit has to show it, and a gauge
+    /// scraped every few hundred milliseconds cannot: a burst that fills the
+    /// scheduler and drains again between two scrapes is invisible to sampling.
+    /// The mark is therefore recorded as it happens.
+    pub query_scans_in_flight_peak: AtomicU64,
+    /// Scans that found every slot taken and had to wait for one.
+    ///
+    /// This is the stronger claim of the two. A peak equal to the limit says
+    /// the scheduler was full at an instant; a nonzero queued count says it was
+    /// full and someone was behind it, which is the state the memory budget is
+    /// written against.
+    pub query_scans_queued: AtomicU64,
+    pub query_scan_queue_wait_ns: AtomicU64,
     pub remote_restore_success: AtomicU64,
     pub remote_restore_errors: AtomicU64,
     pub remote_restore_latency_ns: AtomicU64,
@@ -145,6 +166,10 @@ impl RuntimeMetrics {
             query_scanned_bytes: AtomicU64::new(0),
             query_latency_ns: AtomicU64::new(0),
             query_latency: std::array::from_fn(|_| LatencyHistogram::default()),
+            query_scans_in_flight: AtomicU64::new(0),
+            query_scans_in_flight_peak: AtomicU64::new(0),
+            query_scans_queued: AtomicU64::new(0),
+            query_scan_queue_wait_ns: AtomicU64::new(0),
             remote_restore_success: AtomicU64::new(0),
             remote_restore_errors: AtomicU64::new(0),
             remote_restore_latency_ns: AtomicU64::new(0),
@@ -178,6 +203,41 @@ impl RuntimeMetrics {
 
     pub fn load(target: &AtomicU64) -> u64 {
         target.load(Ordering::Relaxed)
+    }
+
+    /// Records that a scan queued behind a full scheduler, and for how long.
+    pub fn record_scan_queue_wait(&self, waited: Duration) {
+        self.query_scans_queued.fetch_add(1, Ordering::Relaxed);
+        Self::add_duration(&self.query_scan_queue_wait_ns, waited);
+    }
+}
+
+/// Holds the scan-occupancy gauges up for as long as a scan holds its permit.
+///
+/// A guard rather than a pair of calls because the permit outlives every early
+/// return on the query path — a cancelled request, a timeout, a scan that
+/// exceeds its memory budget — and an occupancy that only decrements on the
+/// success path would climb to the limit and stay there, reporting saturation
+/// that had long since drained.
+pub struct ScanOccupancy {
+    metrics: std::sync::Arc<RuntimeMetrics>,
+}
+
+impl ScanOccupancy {
+    pub fn enter(metrics: std::sync::Arc<RuntimeMetrics>) -> Self {
+        let in_flight = metrics.query_scans_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics
+            .query_scans_in_flight_peak
+            .fetch_max(in_flight, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for ScanOccupancy {
+    fn drop(&mut self) {
+        self.metrics
+            .query_scans_in_flight
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 

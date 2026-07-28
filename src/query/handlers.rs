@@ -285,6 +285,7 @@ fn duration_to_i64_ns(duration: std::time::Duration) -> i64 {
 /// because they compete for the same thing a log query does — the part readers.
 struct MetadataGuard {
     _permit: tokio::sync::OwnedSemaphorePermit,
+    _occupancy: crate::metrics::ScanOccupancy,
     window: crate::part::MetadataWindow,
     deadline: std::time::Instant,
 }
@@ -302,19 +303,34 @@ impl MetadataGuard {
         if window.is_empty() {
             return Ok(None);
         }
-        let permit = state
-            .query_scan_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| {
-                (
+        let permit = match state.query_scan_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
                     "query semaphore closed".to_string(),
-                )
-            })?;
+                ));
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                let queued_at = std::time::Instant::now();
+                let permit = state
+                    .query_scan_semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "query semaphore closed".to_string(),
+                        )
+                    })?;
+                state.metrics.record_scan_queue_wait(queued_at.elapsed());
+                permit
+            }
+        };
         Ok(Some(Self {
             _permit: permit,
+            _occupancy: crate::metrics::ScanOccupancy::enter(state.metrics.clone()),
             window,
             deadline: std::time::Instant::now() + state.config.max_query_runtime,
         }))
@@ -719,6 +735,17 @@ loggytracy_query_scanned_rows_total {}\n\
 loggytracy_query_scanned_bytes_total {}\n\
 # TYPE loggytracy_query_latency_ns_total counter\n\
 loggytracy_query_latency_ns_total {}\n\
+# HELP loggytracy_query_scans_in_flight Scans holding a scheduler permit right now, out of max_concurrent_query_scans.\n\
+# TYPE loggytracy_query_scans_in_flight gauge\n\
+loggytracy_query_scans_in_flight {}\n\
+# HELP loggytracy_query_scans_in_flight_peak High-water mark of that since start. The memory budget's largest term is max_concurrent_query_scans x max_query_memory_bytes, and this is how far into it a run actually reached — a sampled gauge cannot see a burst that fills the scheduler and drains between two scrapes.\n\
+# TYPE loggytracy_query_scans_in_flight_peak gauge\n\
+loggytracy_query_scans_in_flight_peak {}\n\
+# HELP loggytracy_query_scans_queued_total Scans that found every slot taken and waited. Nonzero is proof the concurrency limit bound, which the peak alone only suggests.\n\
+# TYPE loggytracy_query_scans_queued_total counter\n\
+loggytracy_query_scans_queued_total {}\n\
+# TYPE loggytracy_query_scan_queue_wait_ns_total counter\n\
+loggytracy_query_scan_queue_wait_ns_total {}\n\
 # TYPE loggytracy_remote_restore_success_total counter\n\
 loggytracy_remote_restore_success_total {}\n\
 # TYPE loggytracy_remote_restore_errors_total counter\n\
@@ -812,6 +839,10 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         m.query_scanned_rows.load(Ordering::Relaxed),
         m.query_scanned_bytes.load(Ordering::Relaxed),
         m.query_latency_ns.load(Ordering::Relaxed),
+        m.query_scans_in_flight.load(Ordering::Relaxed),
+        m.query_scans_in_flight_peak.load(Ordering::Relaxed),
+        m.query_scans_queued.load(Ordering::Relaxed),
+        m.query_scan_queue_wait_ns.load(Ordering::Relaxed),
         m.remote_restore_success.load(Ordering::Relaxed),
         m.remote_restore_errors.load(Ordering::Relaxed),
         m.remote_restore_latency_ns.load(Ordering::Relaxed),

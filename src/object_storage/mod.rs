@@ -36,6 +36,69 @@ pub const TENANT_POLICY_PREFIX: &str = "tenant_policies";
 pub const DELETE_REQUEST_PREFIX: &str = "delete_requests";
 const TRACE_PART_FILES: [&str; 3] = [TRACE_DATA_FILE, TRACE_BLOOM_FILE, TRACE_META_FILE];
 const TRACE_CATALOG_FILES: [&str; 2] = [TRACE_BLOOM_FILE, TRACE_META_FILE];
+/// Distinguishes one restore attempt's staging directory from another's.
+///
+/// The staging directory used to be named for the part alone, which is correct
+/// only while one restore runs at a time. Restores hold a *shared* lifecycle
+/// guard on purpose — network latency must not block writers exclusively — so
+/// concurrent readers that miss the same part each enter this path at once, and
+/// they were tearing down each other's staging area mid-download: `remove_dir_all`
+/// then `create_dir` on a name both of them owned. The losers failed with
+/// `File exists` or `No such file or directory`, which the restore path counts
+/// as an object-store failure, degrading `remote_healthy` and pushing `/ready`
+/// toward 503 over a race the store had no part in. Measured under 24 concurrent
+/// readers with fault injection *disabled*, 266 of 358 restores failed this way.
+///
+/// A process-local counter suffices: `cleanup_tmp` clears `.tmp` at startup, and
+/// two processes cannot share a cache root — the writer fence sees to that.
+static RESTORE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// A staging area that removes itself unless a rename carried its contents away.
+///
+/// The attempt number sits *above* the `<partition>/<id>` pair rather than
+/// inside either name: `load_part` validates a staged part against the directory
+/// it is read from, and it checks both — the leaf must be the part id and its
+/// parent must be the partition. Only a component above those is free.
+///
+/// Removing the whole attempt directory on drop also replaces what the shared
+/// name used to do for free — every failed download used to leave its partial
+/// bytes under `.tmp` until the next `cleanup_tmp` at startup.
+struct StagingDir {
+    /// The attempt-scoped parent, removed on drop.
+    root: PathBuf,
+    /// Where the downloaded files go.
+    dir: PathBuf,
+}
+
+impl StagingDir {
+    fn create(cache_root: &Path, partition: &str, id: &str) -> Result<Self, String> {
+        let attempt = RESTORE_STAGING_SEQUENCE
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        let dir =
+            ensure_safe_directory_chain(cache_root, &[".tmp", "remote", &attempt, partition, id])?;
+        let root = dir
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| format!("staging path has no attempt root: {}", dir.display()))?
+            .to_path_buf();
+        Ok(Self { root, dir })
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        // After a successful commit the part directory has already been renamed
+        // out and only the empty attempt directory is left, so nothing here is
+        // worth reporting a failure over.
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 const MAX_CAS_ATTEMPTS: usize = 16;
 const FLUSH_TRANSACTION_FILE: &str = "flush.txn";
 

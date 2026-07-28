@@ -173,12 +173,8 @@ impl ObjectStorage {
         include_data: bool,
     ) -> Result<(), String> {
         let final_dir = trace_cache_part_dir(traces_root, descriptor)?;
-        let temp_dir = ensure_safe_directory_chain(
-            traces_root,
-            &[".tmp", "remote", &descriptor.partition, &descriptor.id],
-        )?;
-        std::fs::remove_dir_all(&temp_dir).map_err(|error| error.to_string())?;
-        std::fs::create_dir(&temp_dir).map_err(|error| error.to_string())?;
+        let staging = StagingDir::create(traces_root, &descriptor.partition, &descriptor.id)?;
+        let temp_dir = staging.path();
         let files: &[&str] = if include_data {
             &TRACE_PART_FILES
         } else {
@@ -212,7 +208,7 @@ impl ObjectStorage {
                     )
                 })?;
         }
-        let downloaded = crate::trace_part::load_trace_part(&temp_dir)?;
+        let downloaded = crate::trace_part::load_trace_part(temp_dir)?;
         if downloaded.meta.id != descriptor.id || downloaded.meta.partition != descriptor.partition
         {
             return Err(format!(
@@ -222,15 +218,20 @@ impl ObjectStorage {
         }
         TracePartReader::open_cached(downloaded)?;
         if include_data {
-            TracePartReader::open(crate::trace_part::load_trace_part(&temp_dir)?)?;
+            TracePartReader::open(crate::trace_part::load_trace_part(temp_dir)?)?;
         }
-        if final_dir.exists() {
-            std::fs::remove_dir_all(&final_dir).map_err(|error| error.to_string())?;
+        match std::fs::remove_dir_all(&final_dir) {
+            Ok(()) => {}
+            // Either nothing was cached here yet, or a concurrent restore of the
+            // same immutable part committed first. Both are the state this line
+            // was trying to produce.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
         }
         if let Some(parent) = final_dir.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        std::fs::rename(&temp_dir, &final_dir).map_err(|error| error.to_string())?;
+        std::fs::rename(temp_dir, &final_dir).map_err(|error| error.to_string())?;
         Ok(())
     }
 

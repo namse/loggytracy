@@ -256,13 +256,31 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
     )
     .await
     .map_err(|_| "query timed out".to_string())??;
-    let scan_permit = tokio::time::timeout(
-        max_runtime,
-        state.query_scan_semaphore.clone().acquire_owned(),
-    )
-    .await
-    .map_err(|_| "query timed out".to_string())?
-    .map_err(|_| "query scan scheduler is closed".to_string())?;
+    let scan_permit = match state.query_scan_semaphore.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            return Err("query scan scheduler is closed".to_string());
+        }
+        // Every slot was taken. Separated from the fast path only so the wait
+        // can be counted: this branch is the evidence that
+        // `max_concurrent_query_scans` actually bound, and the memory budget is
+        // written against the state where it does. The pin above is deliberately
+        // outside it: a restore is network wait, and counting it here would
+        // report object-store latency as scheduler contention.
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            let queued_at = std::time::Instant::now();
+            let permit = tokio::time::timeout(
+                max_runtime,
+                state.query_scan_semaphore.clone().acquire_owned(),
+            )
+            .await
+            .map_err(|_| "query timed out".to_string())?
+            .map_err(|_| "query scan scheduler is closed".to_string())?;
+            state.metrics.record_scan_queue_wait(queued_at.elapsed());
+            permit
+        }
+    };
+    let scan_occupancy = crate::metrics::ScanOccupancy::enter(state.metrics.clone());
     // Admission to the shared byte pool, after the scan slot for the same
     // reason the slot comes after the pin: each stage of admission should
     // hold only what the previous stages granted while it waits.
@@ -280,6 +298,7 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
         // cancelling the request must not admit an unbounded second scan while
         // the first task is still consuming CPU and memory.
         let _scan_permit = scan_permit;
+        let _scan_occupancy = scan_occupancy;
         let _part_guard = part_guard;
         let _arena = crate::memprof::enter(crate::memprof::Arena::Query);
         let mut execution = unified_query_with_stats_cancellable_with_memory(

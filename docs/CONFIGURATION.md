@@ -333,6 +333,13 @@ plain `MALLOC_CONF` name is not consulted).
   read path is `sum by (le)` across them. There is no unlabeled series to read
   instead: one would double-count under `sum`.
   `*_latency_ns_total` provides only an average
+- **Queries are slow but nothing is failing** → Check `loggytracy_query_scans_queued_total`. Nonzero
+  means scans waited for a slot, and `loggytracy_query_scan_queue_wait_ns_total` divided by it is how
+  long they waited. The scheduler admits by arrival order and knows nothing about cost, so a cheap
+  dashboard query queues behind expensive ones: measured at 24 concurrent readers, a 60-second query
+  reached p95 6.46 s while the wide scans ahead of it measured 392 ms
+  ([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §11). `loggytracy_query_scans_in_flight_peak` is the high-water
+  mark since start — a sampled gauge cannot see a burst that fills and drains between two scrapes
 
 
 ## The flush interval is the object-store bill
@@ -408,6 +415,13 @@ arithmetic on the configured limits rather than a measurement. The multiple
 between idle and peak used to be quoted in this paragraph; it came from the
 retired harness ([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §7) and is struck. Size
 against the bound, and measure the peak on a real workload.
+
+**How far a real workload gets into the query term is now measured: 9.2%.** With
+all eight scan slots occupied and 2,403 scans queued behind them, peak RSS was
+496 MB ([§11](LOAD_RESULTS.md)). The per-scan cap is nowhere near binding at that
+shape of query, so the bound above stays an upper bound rather than becoming a
+sizing target — 850 MB with merge running is still the larger figure, and the
+read path is not where this engine's memory goes.
 
 Not in the number, and why:
 

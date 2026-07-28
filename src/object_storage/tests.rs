@@ -1443,6 +1443,61 @@ opens a connection per part"
         );
     }
 
+    /// Concurrent restores of the same part do not destroy each other.
+    ///
+    /// Restores run under a *shared* lifecycle guard on purpose — object-store
+    /// latency must not block writers exclusively — so several readers that miss
+    /// the same evicted part all enter `download_part` at once. They used to
+    /// stage into a directory named for the part alone and `remove_dir_all` it
+    /// on the way in, so each one tore down whatever the others had downloaded:
+    /// the losers failed with `File exists` or `No such file or directory`,
+    /// which the restore path counts as an object-store failure and which drags
+    /// `remote_healthy` down over a race the store had no part in. A
+    /// query-heavy load run with fault injection *disabled* failed 266 of 358
+    /// restores this way.
+    #[tokio::test]
+    async fn concurrent_restores_of_one_part_all_succeed() {
+        const RESTORERS: usize = 12;
+
+        let root = temp_dir("restore-same-part").join("parts");
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        // Enough read latency that the downloads overlap rather than finishing
+        // one before the next is polled. Zero injected errors: whatever fails
+        // here is this code, not the store.
+        let config = super::fault_store::FaultConfig::for_test(0, 20, 0, 0.0, 11);
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(super::fault_store::LatencyFaultStore::new(inner, config));
+        let storage = Arc::new(ObjectStorage::from_store(store, "restore-same-part"));
+
+        let parts = crate::part::flush_rows(vec![row("contended")], &root, 100).unwrap();
+        let manifest = storage.publish(&parts, &[]).await.unwrap();
+        // Take the whole directory, so every restorer runs the full three-file
+        // path — the one that replaces the part directory wholesale.
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let ids: HashSet<String> = manifest.parts.iter().map(|part| part.id.clone()).collect();
+        let restores = (0..RESTORERS).map(|_| {
+            let storage = storage.clone();
+            let root = root.clone();
+            let ids = ids.clone();
+            async move { storage.restore_parts(&root, &ids).await }
+        });
+        let outcomes = futures_util::future::join_all(restores).await;
+        let failures: Vec<_> = outcomes.iter().filter_map(|out| out.as_ref().err()).collect();
+        assert!(
+            failures.is_empty(),
+            "{} of {RESTORERS} concurrent restores failed: {failures:?}",
+            failures.len()
+        );
+
+        let registry =
+            crate::part_registry::PartRegistry::load_from_manifest(&root, &manifest).unwrap();
+        let result = registry
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+            .unwrap();
+        assert_eq!(result[0].entries[0].line, "contended");
+    }
+
     /// Eviction visits the registry's parts, not the tree. Directories on disk
     /// that no registered part points at are neither read nor removed — which
     /// is what the walk already did by skipping them, at the cost of walking
@@ -1666,7 +1721,7 @@ opens a connection per part"
         let registry =
             crate::part_registry::PartRegistry::load_from_manifest(&root, &manifest).unwrap();
         let result = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .unwrap();
         assert_eq!(result[0].entries[0].line, "evicted then restored");
     }
@@ -1700,7 +1755,7 @@ opens a connection per part"
         let registry =
             crate::part_registry::PartRegistry::load_from_manifest(&root, &manifest).unwrap();
         let result = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .unwrap();
         assert_eq!(result[0].entries[0].line, "damaged then restored");
     }

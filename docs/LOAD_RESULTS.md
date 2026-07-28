@@ -464,14 +464,88 @@ numbers.
 
 ---
 
+## 11. Query-heavy: the memory budget's largest term, exercised once
+
+**Asked:** what the read side of the memory budget actually costs. Every run
+above is ingest-dominated — `src/bin/load.rs` issued its queries from inside the
+push loop, one per `query_every` pushes, so query concurrency was one by
+construction, and `max_concurrent_query_scans × max_query_memory_bytes`, **four
+of the five gigabytes** `peak_materialized_bytes` reports at startup, had never
+been touched by a load run. Independent reader threads and a query-heavy profile
+were added to drive it: 24 readers, 24 tenants, 120-second scan windows at
+`limit=5000`, a 256 KiB cache so the readers miss, retention at 600 s, 2000 eps
+offered, 150 s with a 45 s warmup, Tier B faults on.
+
+**The tables are struck with the rest of this document.** This ran on
+`src/bin/load.rs`, and the retirement applies to its numbers as much as to §1–§10:
+it achieved a third of its offered rate, because 24 reader threads and the push
+loop shared the client's 8 cores. What follows is what never depended on a
+magnitude.
+
+**Survives — the scheduler can be filled, and the server can prove it was.**
+`loggytracy_query_scans_in_flight_peak` and `query_scans_queued` are high-water
+marks the server keeps rather than gauges the harness samples, because a burst
+that fills the scheduler and drains between two scrapes is invisible to sampling.
+A run that did not fill the scheduler has not measured the term it was launched
+to measure, so the harness refuses to call it a pass. That refusal is a property
+of the harness and survives its rewrite.
+
+**Survives — small queries queue behind large ones.** The scan scheduler admits
+by arrival order and knows nothing about cost, so a dashboard refresh waits
+behind up to `max_concurrent_query_scans` wide scans. This is head-of-line
+blocking rather than saturation: nothing is overloaded, and the queue is doing
+exactly what it was written to do. It is read off the admission path, not
+inferred from this run's percentiles, which is why it outlives them. **It is also
+the shape of the answer P3's "tune resource limits to operational targets" was
+waiting for, and it says the knob to turn is not a memory cap** — separating
+interactive scans from bulk ones shortens the queue without spending budget.
+Recorded as a finding, not acted on: the choice belongs with the range-GET work,
+which changes what a scan costs.
+
+**Survives — a concurrency defect nothing serial could find.** The first run
+failed most of its restores with fault injection *disabled*, on `File exists
+(os error 17)` and `failed to cache part … data.parquet: No such file or
+directory (os error 2)`. Restores hold a *shared* lifecycle guard on purpose, so
+object-store latency does not block writers exclusively; several readers missing
+the same evicted part therefore all enter `download_part` at once, and they
+staged into a directory named for the part alone, `remove_dir_all`-ing it on the
+way in — each tearing down what the others had downloaded. The losers were
+counted as object-store failures, and each called `record_remote_failure`, which
+is what drives `/ready` to 503. This is the same class of mistake the publish
+path documents and guards against for `INPUTS_CHANGED_ERROR` — "never as a store
+failure, reporting it as one takes `/ready` to 503 over a benign race" — left
+unguarded on the restore path, in both the log and the trace domain. Serially it
+is unreachable, which is why nine load runs never saw it. Fixed by staging each
+attempt under its own directory, and **pinned by
+`concurrent_restores_of_one_part_all_succeed`**, which fails 11 of 12 restores
+against the old scheme — a test, so it is citable where the run that found it is
+not.
+
+**Unknown, and left open by that fix:** two restores can still collide replacing
+the same part directory, one deleting it between the other's remove and rename.
+Renaming the three files individually into a directory that is never deleted
+would close it — parts are immutable, so concurrent restores write identical
+bytes and per-file renames cannot produce a wrong combination. Not done here: it
+changes a commit path, and it belongs with the format change that range GET
+needs.
+
+Raw output: [`query_heavy_result.json`](query_heavy_result.json), kept for the
+counters the server produced rather than for the rates the harness reported.
+
+---
+
 ## What is not measured at all
 
 - **Anything the rewritten harness has not produced yet.** That is every number
   formerly in this document.
 - **Long-running leaks.** §7 is suggestive and is not a soak.
-- **Concurrent read/write behaviour.** The harness issued queries inline on the
-  push thread, so no run in this document ever had a reader contending with a
-  writer. There is no such test in the suite either.
+- **Concurrent read/write behaviour, by a harness that can measure it.** Every
+  run before §11 issued queries inline on the push thread, so reads never
+  contended with writes. §11 did contend them and found a real defect doing it,
+  but on the retired harness and on a client whose cores its readers and its push
+  loop had to share, so it settles the direction and none of the magnitudes. What
+  the suite pins is narrower and does survive:
+  `concurrent_restores_of_one_part_all_succeed`.
 - **Any workload with realistic cardinality or entropy.** Every run used one
   label set and padded lines.
 - **Anything against Loki.** The claim in [`VISION.md`](VISION.md) has never been

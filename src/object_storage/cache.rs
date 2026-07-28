@@ -312,17 +312,18 @@ impl ObjectStorage {
                 .await;
         }
         let local_tombstone = std::fs::read(final_dir.join(part::MERGE_TOMBSTONE_FILE)).ok();
-        let tmp_dir = self.reset_part_tmp_dir(parts_root, descriptor)?;
+        let staging = StagingDir::create(parts_root, &descriptor.partition, &descriptor.id)?;
+        let tmp_dir = staging.path();
         let files: &[&str] = if include_data {
             &PART_FILES
         } else {
             &CATALOG_FILES
         };
         for &file in files {
-            self.fetch_part_file(descriptor, file, &tmp_dir).await?;
+            self.fetch_part_file(descriptor, file, tmp_dir).await?;
         }
         let downloaded =
-            open_manifest_part(&tmp_dir, descriptor, include_data).map_err(|error| {
+            open_manifest_part(tmp_dir, descriptor, include_data).map_err(|error| {
                 format!(
                     "downloaded part {} failed validation: {error}",
                     descriptor.id
@@ -336,11 +337,19 @@ impl ObjectStorage {
             std::fs::File::open(&marker)
                 .and_then(|file| file.sync_all())
                 .map_err(|error| error.to_string())?;
-            part::fsync_dir(&tmp_dir).map_err(|error| error.to_string())?;
+            part::fsync_dir(tmp_dir).map_err(|error| error.to_string())?;
         }
 
-        std::fs::remove_dir_all(&final_dir).map_err(|error| error.to_string())?;
-        std::fs::rename(&tmp_dir, &final_dir)
+        match std::fs::remove_dir_all(&final_dir) {
+            Ok(()) => {}
+            // Another restore of the same part reached the commit first. Gone is
+            // the state this line wanted, so it is not an error to find it that
+            // way — and a part is immutable, so the copy that beat us here holds
+            // the same bytes ours does.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        std::fs::rename(tmp_dir, &final_dir)
             .map_err(|error| format!("failed to commit cached part {}: {error}", descriptor.id))?;
         // A catalog-only download restores no body, so it buys no later scan
         // and is not what the reuse figure is about.
@@ -365,12 +374,12 @@ impl ObjectStorage {
         parts_root: &Path,
         final_dir: &Path,
     ) -> Result<(), String> {
-        let tmp_dir = self.reset_part_tmp_dir(parts_root, descriptor)?;
-        self.fetch_part_file(descriptor, DATA_FILE, &tmp_dir).await?;
+        let staging = StagingDir::create(parts_root, &descriptor.partition, &descriptor.id)?;
+        self.fetch_part_file(descriptor, DATA_FILE, staging.path())
+            .await?;
         let data_path = final_dir.join(DATA_FILE);
-        std::fs::rename(tmp_dir.join(DATA_FILE), &data_path)
+        std::fs::rename(staging.path().join(DATA_FILE), &data_path)
             .map_err(|error| format!("failed to commit cached part {}: {error}", descriptor.id))?;
-        std::fs::remove_dir_all(&tmp_dir).map_err(|error| error.to_string())?;
         match open_manifest_part(final_dir, descriptor, true) {
             Ok(downloaded) => {
                 drop(downloaded);
@@ -384,20 +393,6 @@ impl ObjectStorage {
                 ))
             }
         }
-    }
-
-    fn reset_part_tmp_dir(
-        &self,
-        parts_root: &Path,
-        descriptor: &ManifestPart,
-    ) -> Result<PathBuf, String> {
-        let tmp_dir = ensure_safe_directory_chain(
-            parts_root,
-            &[".tmp", "remote", &descriptor.partition, &descriptor.id],
-        )?;
-        std::fs::remove_dir_all(&tmp_dir).map_err(|error| error.to_string())?;
-        std::fs::create_dir(&tmp_dir).map_err(|error| error.to_string())?;
-        Ok(tmp_dir)
     }
 
     async fn fetch_part_file(

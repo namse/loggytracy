@@ -2883,11 +2883,16 @@ Read path:
       `validate` enforce `merge_max_input_bytes <= merge_max_memory_bytes`.
 - [x] Implement retention policies and expired-data deletion (including a separate retention timeout knob)
 - [ ] Tune resource limits such as query memory, range, and concurrency to operational targets. **The
-      arithmetic exists now**: `peak_materialized_bytes` is computed, logged at startup and documented in
-      [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — 5 GiB at the defaults, of which 4 is
-      `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES`. What is still missing is a *measurement* at
-      that concurrency: every load run so far has been ingest-dominated, so the largest term in the budget
-      has never been exercised. Choosing different numbers before then would be guessing with more steps
+      measurement exists now** — [`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md) §11, a query-heavy profile
+      (`scripts/run_query_load_local.sh`) that fills all 8 scan slots with 2,403 scans queued behind them.
+      It says the knob to change is **not** a memory cap: peak RSS at full saturation is 496 MB, 9.2% of the
+      configured 5 GiB, so `MAX_QUERY_MEMORY_BYTES` is nowhere near binding. What it found instead is
+      head-of-line blocking — a 60-second dashboard query measures p95 6.46 s against a 2 s target because
+      the scheduler admits by arrival order and it waits behind eight 120-second scans, while those wide
+      scans themselves measure p95 392 ms. Raising `MAX_CONCURRENT_QUERY_SCANS` buys a shorter queue with
+      budget that is 90% unused; separating interactive scans from bulk ones fixes the latency for free.
+      **Deferred to the range-GET work on purpose**: that changes what a scan costs, and picking a
+      separation policy against the current cost would be tuning against a number about to move
 - [x] **Tier D duration/scale run** — 2.01 hours, 500 tenants, a graceful shutdown, a restart and a fence,
       every behavioural gate met. It found one defect nothing shorter could: shutdown waited out merge
       groups it started *after* the signal, 117 of the 118 seconds it took. The 10,000-part axis is
