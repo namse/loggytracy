@@ -113,9 +113,13 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
       immutable file, unbatched) plus two LISTs per orphan sweep
 - [x] Document load-test results and bottlenecks — [`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md).
       Keep reproducible facts in tests and quote only numbers in the document.
-- [ ] **Mitigate N3**: With 500 tenants, the same 5,000 rows become 24.7x (28 KB → 691 KB). Row groups stop
-      at tenant boundaries, so tenant count is a lower bound for row-group count and Parquet column metadata
-      and bloom filters scale with it. The target workload has many small tenants, so this directly affects design.
+- [x] **Mitigate N3** — measured, and the mitigation already existed. The 24.7x is a function of
+      rows-per-tenant-per-part, not of tenant count: merge cuts (tenant, part) pairs 3.6x and
+      parts-per-tenant from 6.6 to 1.85, amortising the ratio to ~1.07x. At 10,099 parts the resident
+      sidecar cost is 18.7 MB, not the 407 MB first extrapolated, because parts that fragmented are also
+      small. The binding memory constraint at this scale is the merge budget, which is hundreds of
+      megabytes against the sidecars' single digits — the opposite of the working assumption. Numbers in
+      [`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md) §2, §6 and §8, with the two refuted hypotheses kept.
 - [x] Improve the load probe to verify rows read — the probe counts the lines returned, so "restored and
       read" is distinguishable from "nothing matched"
 
