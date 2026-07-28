@@ -1481,3 +1481,59 @@ resident {:.0} B",
             "an empty equality cannot be answered by the index"
         );
     }
+
+    /// At-least-once delivery makes a second, byte-identical copy of an entry a
+    /// normal event rather than a defect: a retried push whose first response
+    /// was lost, or a WAL suffix replayed after a crash. Two copies of one entry
+    /// must not become two log lines.
+    #[test]
+    fn identical_entries_are_written_once() {
+        let root = tempfile_dir();
+        let original = make_rows().remove(0);
+        let replayed = original.clone();
+        let parts = flush_rows(vec![original, replayed], &root, 100).unwrap();
+        let rows: u64 = parts.iter().map(|part| part.meta.row_count).sum();
+        assert_eq!(rows, 1);
+    }
+
+    /// Only a copy in every field is a copy. A shared timestamp is not enough,
+    /// and neither is a shared line — dropping either of these would be losing
+    /// data, not deduplicating it.
+    #[test]
+    fn entries_differing_in_any_field_are_all_kept() {
+        let root = tempfile_dir();
+        let base = make_rows().remove(0);
+
+        let mut different_line = base.clone();
+        different_line.line = "second".to_string();
+
+        let mut different_timestamp = base.clone();
+        different_timestamp.timestamp_ns += 1;
+
+        let mut different_stream = base.clone();
+        different_stream
+            .labels
+            .insert("pod".to_string(), "other".to_string());
+
+        let mut different_metadata = base.clone();
+        different_metadata.structured_metadata = vec![("trace".to_string(), "abc".to_string())];
+
+        let mut different_tenant = base.clone();
+        different_tenant.tenant = crate::tenant::TenantId::parse("other-tenant").unwrap();
+
+        let parts = flush_rows(
+            vec![
+                base,
+                different_line,
+                different_timestamp,
+                different_stream,
+                different_metadata,
+                different_tenant,
+            ],
+            &root,
+            100,
+        )
+        .unwrap();
+        let rows: u64 = parts.iter().map(|part| part.meta.row_count).sum();
+        assert_eq!(rows, 6);
+    }

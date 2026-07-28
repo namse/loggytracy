@@ -300,8 +300,20 @@ impl Row {
 
     /// The part sort key. Timestamp order is preserved *within* a tenant, so
     /// the reader's early termination and row-group time pruning keep working.
-    fn sort_key(&self) -> (&str, i64) {
-        (self.tenant.as_str(), self.timestamp_ns)
+    /// The full identity of a row, not just its placement.
+    ///
+    /// `(tenant, timestamp)` is what the layout needs — tenant-aligned row
+    /// groups and time order within a tenant. Everything after the timestamp is
+    /// a tie-break, which the ordering never cared about, and which makes two
+    /// copies of one entry sort adjacent so a duplicate can be recognised.
+    fn sort_key(&self) -> (&str, i64, &Labels, &str, &[(String, String)]) {
+        (
+            self.tenant.as_str(),
+            self.timestamp_ns,
+            &self.labels,
+            self.line.as_str(),
+            &self.structured_metadata,
+        )
     }
 }
 

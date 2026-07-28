@@ -13,10 +13,11 @@ pub fn replay(
 ///
 /// Delivery is at-least-once by design: the checkpoint advances after a flush,
 /// so a crash in between leaves records in the WAL that are already durable in
-/// parts, and replay writes them a second time. That trade is deliberate and
-/// documented, but until now nothing said it had happened — an operator could
-/// not tell a restart that duplicated nothing from one that duplicated a
-/// minute of logs, and neither could anyone reading a query result.
+/// parts, and replay writes them a second time. The copies are collapsed the
+/// first time the two parts are merged, but until then they are two log lines,
+/// and this is the only thing that says how many there could be — an operator
+/// could not otherwise tell a restart that duplicated nothing from one that
+/// duplicated a minute of logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReplayReport {
     pub checkpoint: u64,

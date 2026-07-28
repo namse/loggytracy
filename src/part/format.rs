@@ -23,8 +23,25 @@ pub fn rows_from_snapshot(snapshot: &MemTableSnapshot) -> Vec<Row> {
     rows
 }
 
-fn sort_rows(rows: &mut [Row]) {
+/// Sorts into layout order and drops entries that are copies of one another.
+///
+/// Delivery is at-least-once. A push that was durably written but whose
+/// response never reached the client is retried, and a crash between a flush
+/// and its checkpoint replays a WAL suffix that is already in a part — both
+/// produce a second copy of an entry that is identical in every field. Loki
+/// resolves this the same way: within a stream, one timestamp and one line is
+/// one entry.
+///
+/// What is given up is two genuinely distinct entries that share a stream, a
+/// nanosecond, a line and its metadata. At nanosecond resolution that is a
+/// collision of things already indistinguishable to a reader.
+///
+/// Every part is written through here — flush, merge and the retention rewrite
+/// — so a duplicate that a flush could not see (its twin is in an older part)
+/// is removed the first time the two are merged.
+fn sort_rows(rows: &mut Vec<Row>) {
     rows.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+    rows.dedup_by(|left, right| left.sort_key() == right.sort_key());
 }
 
 pub fn flush_rows(

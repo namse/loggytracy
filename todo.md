@@ -81,7 +81,10 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
 
 ## P2 — correctness and storage performance
 
-- [ ] Deduplicate duplicate logs that can result from crash replay
+- [x] Deduplicate duplicate logs that can result from crash replay — every part is written through one
+      sort, which now drops entries identical in tenant, stream, timestamp, line and metadata. A flush
+      cannot see a twin that is already in an older part, so the removal lands the first time the two
+      are merged; `loggytracy_wal_replayed_entries` still reports the upper bound a restart introduced
 - [ ] Add Parquet range reads (**multi-tenancy prerequisite** — shared parts must read only a tenant's byte range,
       so this is no longer an optional optimization)
 - [ ] Improve metric evaluation from bounded in-memory computation to streaming/pre-aggregation
