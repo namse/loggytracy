@@ -105,9 +105,12 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
       (row-group fragmentation). Acceptance criteria are in [`docs/LOAD_VALIDATION.md`](docs/LOAD_VALIDATION.md)
 - [x] **CAS preflight** — verify at startup that conditional writes are enforced and refuse startup otherwise.
       Running against the deployment target itself resolves what local validation could not answer.
-- [ ] **Measure object-store operation counts** — PUT/GET/LIST per flush/merge/retention cycle. Amounts cannot
-      be measured locally, but counts are backend-independent and measurable; because this design has been
-      dominated by R2 Class A costs, these counts are the cost estimate.
+- [x] **Measure object-store operation counts** — `loggytracy_object_store_operations_total` counts every
+      request by kind, and a test pins publication at four PUTs per part plus one GET and one PUT for the
+      manifest, independent of manifest size. Measured numbers and what they say about the bill (the flush
+      interval sets the Class A cost, and the current default does not fit the $1 budget) are in
+      [`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md) §9. **Still unmeasured:** LIST and DELETE, which only
+      occur past `retention_grace_period`
 - [x] Document load-test results and bottlenecks — [`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md).
       Keep reproducible facts in tests and quote only numbers in the document.
 - [ ] **Mitigate N3**: With 500 tenants, the same 5,000 rows become 24.7x (28 KB → 691 KB). Row groups stop

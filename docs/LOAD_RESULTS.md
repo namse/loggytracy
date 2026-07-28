@@ -369,3 +369,73 @@ startup. Accumulating this part set worked only because the load outran that
 single tick. A later tick during the measurement consolidated all 10,099 parts
 into 5 in under two minutes — correct behaviour, but it means every "merge
 disabled" run in this document had one merge in it.
+
+
+## 9. Object-store operation counts
+
+The cost unit of this whole design. Per-tenant objects were rejected on
+Cloudflare R2 Class A cost, and nothing since had checked that arithmetic
+against what the engine actually issues. Amounts cannot be measured locally —
+a local backend has no price — but counts are a property of this code rather
+than of the backend, so they measure the same here as against R2.
+
+Measured over a 60-second run (`file://` backend, one tenant, one line per
+second, `flush_max_interval=2s`, `merge_interval=5s`, `retention=30s/5s`):
+
+| | count | per cycle |
+|---|---|---|
+| Flushes | 17 | |
+| Merges (ticks) | 12 | |
+| Retention passes | 12 | |
+| PUT | 105 | |
+| GET | 38 | |
+| LIST | 0 | |
+| DELETE | 0 | |
+| COPY | 0 | |
+
+**A flush costs five PUTs and one GET.** Four PUTs are the part's immutable
+files (`data`, `bloom`, `stream index`, `meta`), one is the manifest, and the
+GET is the manifest it read to replace. That is pinned in a test, along with
+the property that matters more: publishing the tenth part into a nine-part
+manifest costs exactly what publishing the first into an empty one. The
+remaining 20 PUTs are the four merge ticks that actually rewrote something,
+at the same five each.
+
+**LIST and DELETE were zero, and that is not a measurement of them.** Remote
+objects are deleted by `garbage_collect_orphans`, which runs only after
+retention has retired a whole part and only past `retention_grace_period`
+(one hour by default). This run was sixty seconds. Their per-cycle cost is
+still unmeasured.
+
+### What this says about the bill
+
+R2 bills Class A per request with the first million free per month per
+account. Deletes are free there; GETs are Class B and an order of magnitude
+cheaper. So the number that matters is PUTs, and PUTs are a function of the
+flush interval and nothing else — a flush skips an empty memtable, so an idle
+instance costs nothing, but an instance with continuous traffic flushes on
+every tick.
+
+| `flush_max_interval` | Class A / day | / month | R2 cost |
+|---|---|---|---|
+| 2 s | 216,000 | 6.48 M | $24.66 |
+| 5 s (**current default**) | 86,400 | 2.59 M | $7.16 |
+| 15 s | 28,800 | 0.86 M | free tier |
+| 30 s | 14,400 | 0.43 M | free tier |
+| 60 s | 7,200 | 0.22 M | free tier |
+
+**The default does not fit the budget this design was built for.** The whole
+shared-part layout exists because per-tenant objects broke a $1/month plan, and
+a 5-second flush interval on one busy instance spends seven times that before
+any tenant multiplier. Fifteen seconds or slower fits inside the free tier with
+room for the merge and retention traffic on top.
+
+This is not an argument for changing the default here. The flush interval is
+also the RPO — it is how much acknowledged data a crash can lose from the
+object store's point of view — so it is a deployment decision between cost and
+durability, not a number this repository should pick for someone. What was
+missing was the price of the choice, and that is now measurable at
+`loggytracy_object_store_operations_total`.
+
+The prices are quoted from R2's published rates and will change. The counts
+will not: they are what this code does.
