@@ -231,10 +231,14 @@ cache space and couples tenants.
 
 ### Read-side improvements
 
-- Consolidating sidecars takes a cache miss from **4 GETs to 1**. Today a miss
-  re-downloads all of `PART_FILES` even though the three catalog files are
-  already local (`cache.rs:246` uses `&PART_FILES` when `include_data=true`,
-  and `remove_dir_all(&final_dir)` wipes the good local copies first).
+- Consolidating sidecars. **Done, partly.** The trigram blooms and the stream
+  index are one `index.bin`, so a part is three files rather than four: a
+  catalog restore is 2 GETs instead of 3 and a full restore is 3 instead of 4.
+  Folding `meta.json` in as well would make it 2, but `meta.json` is also the
+  self-describing version header that the registry and the recovery paths read
+  standalone, so that is a separate change with its own migration question.
+  A miss still re-downloads all of `PART_FILES` even when the catalog files are
+  already local, which is the remaining half of this item.
 - Merge concatenates each tenant's segments across parts, making a tenant's
   data **more contiguous** in merged parts. One range GET then retrieves more
   useful data. Merge helps more here than under per-tenant parts.
@@ -245,18 +249,53 @@ Tenant-aligned row groups mean a tenant with 50 rows still occupies its own row
 group. With 1,000 active tenants a part may contain 1,000+ row groups, and
 Parquet footer metadata (a few hundred bytes per column chunk) can reach 1-2 MB.
 
-Assessment:
+Assessment, now measured:
 
 - **Compression loss is negligible in absolute terms.** It lands only where
   byte counts are tiny; large tenants still get full-size row groups.
-- **Footer size needs measurement.** If it becomes significant, pool tenants
-  below a minimum row count (~512) into a shared row group and index them by
-  row range in `meta.json`. Pruning granularity coarsens and isolation weakens
-  from "cannot address" to "row-range filter" — acceptable but strictly worse,
-  so only do this if measurement demands it.
+- **Footer size: measured, and pooling is not needed.** 5,000 rows across 500
+  tenants come to 691 KB against 28 KB for one tenant — 24.7x, about 1.3 KB per
+  row group ([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §2). But the ratio is a
+  function of rows-per-tenant-per-part, not of tenant count, and merge is what
+  bounds that: it cuts (tenant, part) pairs 3.6x and parts-per-tenant from 6.6
+  to 1.85, taking the ratio to about **1.07x** (§6). At 10,099 parts the
+  resident sidecar cost is 18.7 MB, not the 407 MB first extrapolated, because
+  the parts that fragment that badly are also tiny (§8).
+- **The premise this was watching for turned out to be inverted.** At this scale
+  the sidecars are single-digit megabytes while one merge transiently holds
+  hundreds, so the binding memory constraint is the merge budget, not
+  fragmentation.
 
-**Open item: measure Parquet footer size at realistic tenant counts before
-finalizing the row-group policy.**
+So the fallback — pooling tenants below ~512 rows into a shared row group,
+weakening isolation from "cannot address" to "row-range filter" — is **not
+being built.** It was conditional on a measurement demanding it, and the
+measurement does not.
+
+### What is left of the read path
+
+Two of the four read-path items are done — tenant-aligned row groups with the
+segment index, and the sidecar consolidation above. The other two are one piece
+of work, not two:
+
+1. **Range GET on restore**, using a tenant's byte range instead of the whole
+   object.
+2. **`(part, tenant)` local cache keys**, so what lands on disk is the slice
+   rather than the shared object.
+
+They are one piece because a range of a Parquet file is not a Parquet file. The
+choice is between reconstructing a valid single-tenant file locally from the
+fetched byte range plus a rewritten footer, and reading ranges straight from the
+object store through an async Parquet reader with no local file at all. The
+second is what arrow-rs is built for and it is the smaller amount of code — but
+it adds a second way to reach a tenant's rows, and this engine has one scan
+precisely so that the retention clamp, the tenant scope and the deletion mask
+cannot be applied in one place and forgotten in the other.
+
+**Not decided here.** It needs the byte ranges recorded in `TenantSegment` at
+write time either way, and it should be decided against a measurement of how
+often a shared-part miss actually happens under a real workload — which is a
+number no run has produced yet, because every load run so far has been
+ingest-dominated.
 
 ## Supporting changes
 
