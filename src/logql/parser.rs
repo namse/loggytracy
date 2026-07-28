@@ -62,6 +62,13 @@ fn parse_metric_expr(input: &str, depth: usize) -> Result<MetricExpr, String> {
         });
     }
 
+    // A subquery is a range function whose operand is `(<expr>[<range>:<step>])`
+    // rather than a log selector, so it is recognised before the log-selector
+    // forms below try and fail to parse the inner expression as one.
+    if let Some(subquery) = parse_subquery(input, depth)? {
+        return Ok(subquery);
+    }
+
     for (name, function) in [
         ("rate", RangeFunction::Rate),
         ("count_over_time", RangeFunction::CountOverTime),
@@ -389,6 +396,84 @@ const BINARY_OPERATORS: [(&str, BinaryOp); 11] = [
 ];
 
 /// Splits a trailing `offset <duration>` off a range expression.
+/// `<function>(<inner>[<range>:<step>] offset <d>)`.
+fn parse_subquery(input: &str, depth: usize) -> Result<Option<MetricExpr>, String> {
+    for (name, function) in [
+        ("rate", RangeFunction::Rate),
+        ("count_over_time", RangeFunction::CountOverTime),
+        ("sum_over_time", RangeFunction::SumOverTime),
+        ("avg_over_time", RangeFunction::AvgOverTime),
+        ("min_over_time", RangeFunction::MinOverTime),
+        ("max_over_time", RangeFunction::MaxOverTime),
+        ("quantile_over_time", RangeFunction::QuantileOverTime),
+    ] {
+        let Some(rest) = strip_word(input, name) else {
+            continue;
+        };
+        let (inside, tail) = take_parenthesized(rest.trim_start())?;
+        if !tail.trim().is_empty() {
+            return Err(format!("unexpected input after {name}"));
+        }
+        let (quantile, inside) = if function == RangeFunction::QuantileOverTime {
+            let Some(comma) = inside.find(',') else {
+                return Ok(None);
+            };
+            let raw = inside[..comma].trim();
+            let Ok(quantile) = raw.parse::<f64>() else {
+                return Ok(None);
+            };
+            (Some(quantile), &inside[comma + 1..])
+        } else {
+            (None, inside)
+        };
+        let (inside, offset_ns) = match split_offset(inside)? {
+            Some((head, offset_ns)) => (head, offset_ns),
+            None => (inside, 0),
+        };
+        let Some(close) = inside.trim_end().strip_suffix(']') else {
+            return Ok(None);
+        };
+        let Some(open) = find_range_open(close) else {
+            return Ok(None);
+        };
+        // The colon is what distinguishes `[5m:1m]` from `[5m]`. Without one
+        // this is an ordinary range function over a log selector, which the
+        // caller handles.
+        let Some(colon) = close[open + 1..].find(':') else {
+            return Ok(None);
+        };
+        let range_ns = parse_duration_ns(close[open + 1..open + 1 + colon].trim())?;
+        let step = close[open + 2 + colon..].trim();
+        // `[5m:]` means "the default step", which this does not guess at: a
+        // step chosen for the user silently changes how many samples the outer
+        // window aggregates.
+        if step.is_empty() {
+            return Err(format!(
+                "{name} subquery requires an explicit step, as in [5m:1m]"
+            ));
+        }
+        let step_ns = parse_duration_ns(step)?;
+        if range_ns <= 0 || step_ns <= 0 {
+            return Err("subquery range and step must be greater than zero".to_string());
+        }
+        if let Some(quantile) = quantile
+            && !(0.0..=1.0).contains(&quantile)
+        {
+            return Err(format!("quantile {quantile} must be between 0 and 1"));
+        }
+        let inner = parse_metric_expr(close[..open].trim(), depth + 1)?;
+        return Ok(Some(MetricExpr::Subquery {
+            function,
+            quantile,
+            inner: Box::new(inner),
+            range_ns,
+            step_ns,
+            offset_ns,
+        }));
+    }
+    Ok(None)
+}
+
 fn split_offset(input: &str) -> Result<Option<(&str, i64)>, String> {
     let trimmed = input.trim_end();
     // Searched from the right: the keyword can only be the last thing, and a

@@ -2333,3 +2333,55 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             99.0
         );
     }
+
+    /// A subquery evaluates its inner expression on its own step grid inside
+    /// the outer window, and aggregates those samples. Evaluating the inner
+    /// expression once at the outer point instead would make
+    /// `max_over_time(rate(…)[1h:1m])` the rate at one instant rather than the
+    /// largest of sixty.
+    #[tokio::test]
+    async fn a_subquery_aggregates_the_inner_expression_over_its_own_steps() {
+        let labels: Labels = [("app".to_string(), "s".to_string())].into_iter().collect();
+        // Three entries inside the second step, one inside the tenth. A
+        // one-second count_over_time therefore peaks at 3.
+        let mut entries: Vec<(Labels, LogEntry)> = Vec::new();
+        for offset in [500_000_000, 600_000_000, 700_000_000] {
+            entries.push((
+                labels.clone(),
+                LogEntry {
+                    timestamp_ns: 1_000_000_000 + offset,
+                    line: "burst".into(),
+                    structured_metadata: vec![],
+                },
+            ));
+        }
+        entries.push((
+            labels.clone(),
+            LogEntry {
+                timestamp_ns: 9_500_000_000,
+                line: "tail".into(),
+                structured_metadata: vec![],
+            },
+        ));
+
+        let logql::QueryExpr::Metric(peak) =
+            logql::parse_expr(r#"max_over_time(count_over_time({app="s"}[1s])[12s:1s])"#).unwrap()
+        else {
+            panic!("expected metric")
+        };
+        let values = evaluate_metric_stream(&peak, &entries, &[12_000_000_000], None).unwrap();
+        let series = values.values().next().expect("one series");
+        assert_eq!(series[0].1, 3.0, "the busiest inner step is the maximum");
+
+        let logql::QueryExpr::Metric(minimum) =
+            logql::parse_expr(r#"min_over_time(count_over_time({app="s"}[1s])[12s:1s])"#).unwrap()
+        else {
+            panic!("expected metric")
+        };
+        let values = evaluate_metric_stream(&minimum, &entries, &[12_000_000_000], None).unwrap();
+        assert_eq!(
+            values.values().next().unwrap()[0].1,
+            1.0,
+            "steps with no entries produce no sample, so the minimum is over the steps that did"
+        );
+    }

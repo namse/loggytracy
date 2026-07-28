@@ -715,3 +715,47 @@
             entry.structured_metadata.iter().cloned().collect();
         assert_eq!(fields[crate::logql::PARSER_ERROR_FIELD], "JSONParserErr");
     }
+
+    #[test]
+    fn subqueries_parse_with_an_explicit_step() {
+        for query in [
+            r#"max_over_time(rate({app="a"}[1m])[1h:1m])"#,
+            r#"sum_over_time(sum by (app) (rate({app="a"}[1m]))[10m:30s])"#,
+            r#"quantile_over_time(0.9, rate({app="a"}[1m])[1h:1m])"#,
+            r#"max_over_time(rate({app="a"}[1m])[1h:1m] offset 30m)"#,
+        ] {
+            assert!(parse_expr(query).is_ok(), "{query}");
+        }
+    }
+
+    /// `[5m:]` means "the default step" in Prometheus. Guessing one here would
+    /// silently change how many samples the outer window aggregates, so it is
+    /// asked for instead.
+    #[test]
+    fn a_subquery_without_a_step_is_refused() {
+        assert!(parse_expr(r#"max_over_time(rate({a="b"}[1m])[5m:])"#).is_err());
+        assert!(parse_expr(r#"max_over_time(rate({a="b"}[1m])[5m:0s])"#).is_err());
+    }
+
+    /// The colon is the only thing separating a subquery from an ordinary range
+    /// function, so a plain range must still parse as one.
+    #[test]
+    fn a_range_without_a_colon_is_not_a_subquery() {
+        let QueryExpr::Metric(expr) = parse_expr(r#"rate({a="b"}[5m])"#).unwrap() else {
+            panic!("expected metric")
+        };
+        assert!(matches!(expr, MetricExpr::Range { .. }));
+    }
+
+    /// The scan range is cut from the lookback, so a subquery has to declare
+    /// its whole window plus whatever the inner expression looks back from the
+    /// oldest point inside it.
+    #[test]
+    fn a_subquery_lookback_covers_the_inner_range_too() {
+        let QueryExpr::Metric(expr) =
+            parse_expr(r#"max_over_time(rate({a="b"}[2m])[10m:1m])"#).unwrap()
+        else {
+            panic!("expected metric")
+        };
+        assert_eq!(expr.lookback_ns(), (10 + 2) * 60 * 1_000_000_000);
+    }

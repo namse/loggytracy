@@ -496,6 +496,20 @@ pub enum MetricExpr {
         grouping: Option<Grouping>,
         expr: Box<MetricExpr>,
     },
+    /// `<aggregation>(<inner>[<range>:<step>])` — an aggregation over the
+    /// values another metric expression produces at a fixed step.
+    ///
+    /// Held as its own node rather than desugared, because the inner
+    /// expression's evaluation points are not the outer query's: the inner one
+    /// is evaluated on the subquery's own step grid inside each outer window.
+    Subquery {
+        function: RangeFunction,
+        quantile: Option<f64>,
+        inner: Box<MetricExpr>,
+        range_ns: i64,
+        step_ns: i64,
+        offset_ns: i64,
+    },
     /// `expr op scalar` or `scalar op expr`.
     ///
     /// Vector-to-vector operations are not here. Both sides would be separate
@@ -524,6 +538,7 @@ impl MetricExpr {
             Self::Aggregate { expr, .. }
             | Self::TopK { expr, .. }
             | Self::Binary { expr, .. } => expr.log_query(),
+            Self::Subquery { inner, .. } => inner.log_query(),
         }
     }
 
@@ -540,6 +555,18 @@ impl MetricExpr {
             Self::Aggregate { expr, .. }
             | Self::TopK { expr, .. }
             | Self::Binary { expr, .. } => expr.lookback_ns(),
+            // The scan has to cover the subquery's whole window plus whatever
+            // the inner expression looks back from its earliest point inside
+            // it, or the oldest inner evaluations read from parts that were
+            // never selected.
+            Self::Subquery {
+                inner,
+                range_ns,
+                offset_ns,
+                ..
+            } => range_ns
+                .saturating_add(*offset_ns)
+                .saturating_add(inner.lookback_ns()),
         }
     }
 
@@ -560,6 +587,7 @@ impl MetricExpr {
                 fields
             }
             Self::TopK { expr, .. } | Self::Binary { expr, .. } => expr.grouping_fields(),
+            Self::Subquery { inner, .. } => inner.grouping_fields(),
         }
     }
 }

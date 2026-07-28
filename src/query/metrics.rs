@@ -366,6 +366,13 @@ fn evaluate_metric_all(
                     .collect()
             })
             .collect(),
+        // Subqueries are evaluated only by the streaming path, which is what
+        // production uses. This test-only evaluator exists to cross-check the
+        // simpler expression forms against it and gains nothing from a second
+        // implementation of the harder one.
+        logql::MetricExpr::Subquery { .. } => {
+            return Err("subqueries are evaluated by the streaming path".to_string());
+        }
         logql::MetricExpr::TopK { k, expr } => {
             let mut output = evaluate_metric_all(expr, entries, evaluation_times)?;
             for values in &mut output {
@@ -487,6 +494,75 @@ impl MetricEvaluator {
                 }
                 values
             }
+            logql::MetricExpr::Subquery {
+                function,
+                quantile,
+                inner,
+                range_ns,
+                step_ns,
+                offset_ns,
+            } => {
+                // The inner expression is evaluated on the subquery's own step
+                // grid inside the outer window, and those samples are what the
+                // outer function aggregates. Evaluating it once at the outer
+                // point instead would make `max_over_time(rate(…)[1h:1m])`
+                // return the rate at one instant rather than the largest of
+                // sixty.
+                let window_end = evaluation_ns.saturating_sub(*offset_ns);
+                let window_start = window_end.saturating_sub(*range_ns);
+                let mut samples: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
+                let mut point = window_start.saturating_add(*step_ns);
+                let mut steps = 0usize;
+                while point <= window_end {
+                    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                        return Err("metric query timed out".to_string());
+                    }
+                    steps += 1;
+                    if steps > MAX_METRIC_EVALUATION_POINTS {
+                        return Err(format!(
+                            "subquery exceeds the maximum of {MAX_METRIC_EVALUATION_POINTS} \
+inner evaluation points"
+                        ));
+                    }
+                    for (labels, value) in self.evaluate_at(inner, point, cancellation)? {
+                        samples.entry(labels).or_default().push(value);
+                    }
+                    point = point.saturating_add(*step_ns);
+                }
+                samples
+                    .into_iter()
+                    .filter_map(|(labels, mut values)| {
+                        if values.is_empty() {
+                            return None;
+                        }
+                        let count = values.len() as f64;
+                        let value = match function {
+                            logql::RangeFunction::Rate => {
+                                values.iter().sum::<f64>() / (*range_ns as f64 / 1e9)
+                            }
+                            logql::RangeFunction::CountOverTime => count,
+                            logql::RangeFunction::BytesOverTime
+                            | logql::RangeFunction::SumOverTime => values.iter().sum(),
+                            logql::RangeFunction::AvgOverTime => {
+                                values.iter().sum::<f64>() / count
+                            }
+                            logql::RangeFunction::MinOverTime => {
+                                values.iter().copied().fold(f64::INFINITY, f64::min)
+                            }
+                            logql::RangeFunction::MaxOverTime => {
+                                values.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+                            }
+                            logql::RangeFunction::QuantileOverTime => {
+                                values.sort_by(|left, right| {
+                                    left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                quantile_of(&values, quantile.unwrap_or(0.0))
+                            }
+                        };
+                        Some((labels, value))
+                    })
+                    .collect()
+            }
             logql::MetricExpr::Binary {
                 op,
                 expr,
@@ -590,6 +666,7 @@ fn metric_range_spec(expr: &logql::MetricExpr) -> RangeSpec<'_> {
         logql::MetricExpr::Aggregate { expr, .. }
         | logql::MetricExpr::TopK { expr, .. }
         | logql::MetricExpr::Binary { expr, .. } => metric_range_spec(expr),
+        logql::MetricExpr::Subquery { inner, .. } => metric_range_spec(inner),
     }
 }
 

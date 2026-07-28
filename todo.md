@@ -72,7 +72,7 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
       planner change rather than a parser one
 - [x] Support `without`
 - [x] Support `offset`
-- [ ] Support subqueries
+- [x] Support subqueries
 - [x] Loki-compatible JSON semantics for arrays, top-level arrays and `null`
 - [x] Exact-field pruning on stream-label fields, through the stream index
 - [ ] Exact-field pruning for empty-string equality and `_extracted` collisions —
