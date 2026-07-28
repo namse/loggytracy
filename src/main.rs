@@ -53,6 +53,7 @@ async fn main() {
     let config = Arc::new(
         Config::from_env().unwrap_or_else(|error| panic!("invalid configuration: {error}")),
     );
+    config.log_memory_budget();
     startup::run(config).await;
 }
 

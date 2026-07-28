@@ -281,3 +281,44 @@ behalf. What it can do is refuse to let the choice be made without the price.
 
 Watch `loggytracy_object_store_operations_total{kind="put"}` to see the real
 number for a real workload; the rates above will change and the counts will not.
+
+
+## Sizing an instance
+
+Every limit in this document is enforced on its own, and none of them is
+enforced against the machine. The largest term in the footprint is a product of
+two knobs that never appear next to each other:
+
+| term | default | worst case |
+|---|---|---|
+| `MAX_CONCURRENT_QUERY_SCANS` × `MAX_QUERY_MEMORY_BYTES` | 8 × 512 MiB | **4 GiB** |
+| `MERGE_MAX_MEMORY_BYTES` (one merge at a time) | 1 GiB | **1 GiB** |
+| **Peak materialized** | | **5 GiB** |
+
+The process logs this number once at startup (`peak_materialized_bytes`), because
+there is nowhere else to learn it.
+
+It is an upper bound, not an estimate: reaching it needs every scan slot full
+and each one at its cap. What matters is that nothing prevents it, and that an
+instance sized from its idle footprint is sized about **fifty times too small** —
+15 MB idle against 850 MB under load, measured in
+[`LOAD_RESULTS.md`](LOAD_RESULTS.md) §7.
+
+Not in the number, and why:
+
+- **Trace scans.** `MAX_TRACE_SPANS` is a count, not a byte budget, so there is
+  no honest term to add. `MAX_CONCURRENT_TRACE_SCANS` × the span size of the
+  workload is the missing product.
+- **The memtable.** Bounded by backpressure rather than by a constant: ingest is
+  refused before it grows without limit. Measured at tens of megabytes under
+  sustained load.
+- **Resident part sidecars.** 18.7 MB at 10,099 parts ([§8](LOAD_RESULTS.md)) —
+  real, and two orders of magnitude below the query term.
+- **Allocator retention.** Peak RSS tracks whether merge runs at all rather than
+  what it is allowed to materialize ([§6](LOAD_RESULTS.md)), so RSS lags the
+  budget downward after load subsides.
+- **`CACHE_MAX_BYTES`.** Disk, not memory.
+
+**To lower the peak, lower the concurrency first.** `MAX_CONCURRENT_QUERY_SCANS`
+is the multiplier; halving it takes a gigabyte and a half off the bound, and it
+degrades a burst of queries into a queue rather than degrading every query.

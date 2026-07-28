@@ -516,6 +516,38 @@ impl Config {
         Ok(config)
     }
 
+    /// The most this configuration can have materialized at once, in bytes.
+    ///
+    /// Every limit here is enforced on its own and none of them is enforced
+    /// against the machine. Eight concurrent scans at 512 MiB is four gigabytes
+    /// that no single knob mentions, and an operator sizing an instance from
+    /// its idle footprint — measured at fifty times below its peak — has no way
+    /// to arrive at that number by reading the configuration.
+    ///
+    /// Deliberately an upper bound rather than an estimate. Reaching it needs
+    /// every scan slot full and each one at its cap, which a real workload will
+    /// not do; the point is that nothing prevents it.
+    pub fn peak_materialized_bytes(&self) -> u64 {
+        let queries =
+            (self.max_concurrent_query_scans as u64).saturating_mul(self.max_query_memory_bytes);
+        // Trace scans have no byte budget of their own — `max_trace_spans` is a
+        // count — so this is the honest floor rather than the true term, and
+        // the log says so.
+        let merge = self.merge_max_memory_bytes;
+        queries.saturating_add(merge)
+    }
+
+    /// Logged once at startup. There is nowhere else an operator learns this.
+    pub fn log_memory_budget(&self) {
+        tracing::info!(
+            peak_materialized_bytes = self.peak_materialized_bytes(),
+            concurrent_query_scans = self.max_concurrent_query_scans,
+            max_query_memory_bytes = self.max_query_memory_bytes,
+            merge_max_memory_bytes = self.merge_max_memory_bytes,
+            "configured peak materialized memory, excluding trace scans, the memtable and allocator retention"
+        );
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.listen_addr.trim().is_empty() || self.otlp_grpc_addr.trim().is_empty() {
             return Err("listen and OTLP addresses must not be empty".to_string());
@@ -900,6 +932,33 @@ mod tests {
             undocumented.is_empty(),
             "these knobs exist in config.rs but not in docs/CONFIGURATION.md: {undocumented:#?}"
         );
+    }
+
+    /// The largest term in this engine's memory footprint is a product of two
+    /// knobs that never appear together, and an instance sized from its idle
+    /// footprint is sized about fifty times too small (LOAD_RESULTS.md §7). So
+    /// the product is computed and logged rather than left to be discovered.
+    #[test]
+    fn the_peak_memory_budget_is_the_product_nobody_reads() {
+        let config = Config {
+            max_concurrent_query_scans: 8,
+            max_query_memory_bytes: 512 * 1024 * 1024,
+            merge_max_memory_bytes: 1024 * 1024 * 1024,
+            ..Config::default()
+        };
+        assert_eq!(
+            config.peak_materialized_bytes(),
+            5 * 1024 * 1024 * 1024,
+            "eight scans at half a gigabyte plus one merge at a gigabyte"
+        );
+
+        // Halving the concurrency halves the term, which is the point: the
+        // knob an operator reaches for is the one that moves the number.
+        let halved = Config {
+            max_concurrent_query_scans: 4,
+            ..config
+        };
+        assert_eq!(halved.peak_materialized_bytes(), 3 * 1024 * 1024 * 1024);
     }
 
     #[test]

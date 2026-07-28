@@ -102,7 +102,12 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
       `materialized_bytes` in part metadata so group selection and read budgets use the same unit, and have
       `validate` enforce `merge_max_input_bytes <= merge_max_memory_bytes`.
 - [x] Implement retention policies and expired-data deletion (including a separate retention timeout knob)
-- [ ] Tune resource limits such as query memory, range, and concurrency to operational targets
+- [ ] Tune resource limits such as query memory, range, and concurrency to operational targets. **The
+      arithmetic exists now**: `peak_materialized_bytes` is computed, logged at startup and documented in
+      [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — 5 GiB at the defaults, of which 4 is
+      `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES`. What is still missing is a *measurement* at
+      that concurrency: every load run so far has been ingest-dominated, so the largest term in the budget
+      has never been exercised. Choosing different numbers before then would be guessing with more steps
 - [x] **Tier D duration/scale run** — 2.01 hours, 500 tenants, a graceful shutdown, a restart and a fence,
       every behavioural gate met. It found one defect nothing shorter could: shutdown waited out merge
       groups it started *after* the signal, 117 of the 118 seconds it took. The 10,000-part axis is
