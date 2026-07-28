@@ -97,7 +97,7 @@ async fn merge_once(
     // and the cutoffs, and it runs whether or not the previous one succeeded,
     // so a stalled merge still shows its backlog growing.
     metrics.merge_debt_parts.store(
-        merge_debt_part_count(registry, config, cutoffs.as_ref()) as u64,
+        merge_debt_part_count(registry, config, cutoffs.as_ref(), deletes) as u64,
         Ordering::Relaxed,
     );
 
@@ -119,7 +119,7 @@ async fn merge_once(
         // Exclude an oversized single part (it is already large enough).
         // Group small parts for merging. Simplification: within a partition, group from the smallest
         // parts until merge_target_part_rows is reached once there are at least merge_min_part_count.
-        let groups = select_groups(&parts, config, cutoffs.as_ref());
+        let groups = select_groups(&parts, config, cutoffs.as_ref(), deletes);
         for MergeGroup {
             parts: group,
             retention_only,

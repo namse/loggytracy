@@ -126,16 +126,18 @@ row the request covers. The rows are already unreadable — the scan masks them
 from the moment the request was accepted — so this is not an availability
 problem. It means the bytes are still there.
 
-The removal happens inside the merge rewrite, so the request advances when
-merge next touches those parts. If it does not advance:
+The removal happens inside the merge rewrite. A part that could hold a covered
+row is selected for rewrite on that basis alone, whatever its size, so the
+request advances on the next merge tick that reaches it. If it does not:
 
 - Check `loggytracy_merge_success_total` is increasing. Nothing is removed while
   merge is failing.
 - Check `loggytracy_retention_rewrite_skipped_total`. A part too large to rewrite
   within `MERGE_MAX_MEMORY_BYTES` blocks deletion for the same reason it blocks
   tenant deletion, and the same fix applies.
-- A part that no merge group will ever select keeps its bytes until retention
-  removes the part. Lowering `MERGE_TARGET_PART_ROWS` brings it back into scope.
+- `MERGE_MAX_GROUPS_PER_TICK` bounds how many parts one tick rewrites, so a
+  tenant spread across many parts advances a few per tick rather than all at
+  once.
 
 The status is deliberately conservative: part metadata records `streams` for the
 whole part, so a part holding that stream for a *different* tenant keeps the

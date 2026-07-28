@@ -417,6 +417,21 @@ impl DeleteMasks {
                 .any(|compiled| compiled.covers(labels, timestamp_ns, line))
         })
     }
+
+    /// Whether this part could still hold a row some request covers, decided
+    /// from `meta.json` alone.
+    ///
+    /// Merge asks this to decide whether a part is worth rewriting. It is the
+    /// same question `mark_processed` answers and it is conservative in the
+    /// same direction: a false positive costs one rewrite that drops nothing,
+    /// a false negative leaves deleted bytes on disk.
+    pub fn may_cover_part(&self, meta: &crate::part::PartMeta) -> bool {
+        self.by_tenant.iter().any(|(tenant, requests)| {
+            requests
+                .iter()
+                .any(|compiled| compiled.may_be_held_by(tenant, meta))
+        })
+    }
 }
 
 /// A delete selector is a log selector, not a pipeline.

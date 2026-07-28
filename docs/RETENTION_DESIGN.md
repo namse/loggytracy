@@ -706,6 +706,14 @@ startup on the same fatal-on-failure terms as the tenant policies. A request
 that is masking rows but would not survive a restart is the one failure this
 must not have.
 
+**A covered part is worth rewriting on its own.** Merge admits it the same way
+it admits a part holding rows for a tenant at zero retention, and for the same
+reason stated there: otherwise a part too large for any ordinary group keeps the
+rows until retention deletes the whole part, and "deleted" would be describing
+the mask rather than a removal. The test is made from `meta.json` — tenant
+segments overlapping the window, and a recorded stream matching the selector —
+so it costs a map lookup rather than a read.
+
 **`status` is conservative.** A request is promoted from `received` to
 `processed` only when no part's metadata could still hold a row it covers. Part
 metadata records `streams` for the whole part rather than per tenant, so a part

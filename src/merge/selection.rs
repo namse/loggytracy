@@ -9,6 +9,7 @@ pub fn merge_debt_part_count(
     registry: &PartRegistry,
     config: &Config,
     cutoffs: Option<&Cutoffs>,
+    deletes: &crate::delete_requests::DeleteMasks,
 ) -> usize {
     let readers = registry.snapshot();
     if readers.is_empty() {
@@ -24,7 +25,7 @@ pub fn merge_debt_part_count(
     let mut debt = 0usize;
     for (_partition, mut parts) in by_partition {
         parts.sort_by_key(|reader| reader.meta().row_count);
-        for group in select_groups(&parts, config, cutoffs) {
+        for group in select_groups(&parts, config, cutoffs, deletes) {
             debt += group.parts.len();
         }
     }
@@ -51,13 +52,23 @@ struct MergeGroup {
 /// A tenant at zero retention is a deleted tenant, and its rows are reclaimed
 /// regardless of the threshold: otherwise "deletion" would leave rows in a
 /// large part indefinitely, which is not a thing the word can mean.
+///
+/// A deletion request is the same sentence with a narrower subject, so it is
+/// admitted on the same terms. Without this, a part large enough that no
+/// ordinary group would take it keeps the rows somebody asked to have removed
+/// until retention happens to delete the whole part — the rows are already
+/// unreadable, but "deleted" would be describing a mask rather than a removal.
 fn select_groups(
     parts: &[Arc<PartReader>],
     config: &Config,
     cutoffs: Option<&Cutoffs>,
+    deletes: &crate::delete_requests::DeleteMasks,
 ) -> Vec<MergeGroup> {
     let min_part_count = config.merge_min_part_count.max(2);
     let needs_rewrite = |reader: &Arc<PartReader>| {
+        if deletes.may_cover_part(reader.meta()) {
+            return true;
+        }
         cutoffs.is_some_and(|cutoffs| {
             cutoffs.holds_zero_retention_rows(reader.meta())
                 || cutoffs.expired_log_row_fraction(reader.meta())

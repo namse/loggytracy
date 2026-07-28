@@ -1175,7 +1175,7 @@
         registry.register(parts).unwrap();
 
         assert_eq!(
-            merge_debt_part_count(&registry, &config, None),
+            merge_debt_part_count(&registry, &config, None, &DeleteMasks::default()),
             0,
             "with no policy there is no debt: the group is below the minimum"
         );
@@ -1186,7 +1186,7 @@
         )]);
         let cutoffs = policy.cutoffs_now().unwrap();
         assert_eq!(
-            merge_debt_part_count(&registry, &config, Some(&cutoffs)),
+            merge_debt_part_count(&registry, &config, Some(&cutoffs), &DeleteMasks::default()),
             1,
             "the part two thirds of which has expired is pending merge work"
         );
@@ -1330,4 +1330,75 @@
         .await
         .unwrap();
         assert!(registry.part_count() < before);
+    }
+
+    /// A part too large for any ordinary group used to keep the rows somebody
+    /// asked to have removed until retention deleted the whole part. The rows
+    /// were unreadable the whole time, but "deleted" was describing a mask
+    /// rather than a removal.
+    #[tokio::test]
+    async fn a_deletion_makes_a_part_worth_rewriting_on_its_own() {
+        let dir = tmp_dir("delete-selects");
+        let config = Config {
+            data_dir: dir.clone(),
+            // No group will ever form: one part, and the minimum is four.
+            merge_min_part_count: 4,
+            retention_period: None,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        let parts = part::flush_rows(
+            vec![tenant_row("alpha", 1_000), tenant_row("beta", 1_001)],
+            &parts_root,
+            config.row_group_size,
+        )
+        .unwrap();
+        registry.register(parts.clone()).unwrap();
+        let original_id = parts[0].meta.id.clone();
+
+        // Without a request the part stays: nothing makes it eligible.
+        merge_once(
+            &registry,
+            None,
+            &config,
+            &TenantPolicy::disabled(),
+            &DeleteMasks::default(),
+            None,
+            &RuntimeMetrics::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(registry.snapshot()[0].meta().id, original_id);
+
+        let requests = crate::delete_requests::DeleteRequests::new(None);
+        requests
+            .submit(&tenant_id("alpha"), r#"{app="alpha"}"#, 0, 2_000, 2_000)
+            .await
+            .expect("a valid request");
+
+        merge_once(
+            &registry,
+            None,
+            &config,
+            &TenantPolicy::disabled(),
+            &requests.masks(),
+            None,
+            &RuntimeMetrics::new(),
+        )
+        .await
+        .unwrap();
+
+        let survivors: Vec<String> = registry
+            .snapshot()
+            .iter()
+            .flat_map(|reader| reader.read_all_rows(None).unwrap())
+            .map(|row| row.line)
+            .collect();
+        assert_eq!(
+            survivors,
+            vec!["beta-1001".to_string()],
+            "the request alone made the part eligible, and only its rows went"
+        );
     }
