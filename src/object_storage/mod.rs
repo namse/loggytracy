@@ -168,7 +168,10 @@ struct LocalMergeGroup {
     added: Vec<Part>,
 }
 
+mod counting_store;
 mod fault_store;
+
+pub use counting_store::{CountingStore, ObjectStoreOpCounts, ObjectStoreOps};
 
 include!("paths.rs");
 include!("catalog.rs");

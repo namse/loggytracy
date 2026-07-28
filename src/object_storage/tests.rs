@@ -1552,3 +1552,61 @@ opens a connection per part"
         // catalog being local: the cost is checksums, not round trips.
         assert!(faulty.total_reads() > 0);
     }
+
+    /// The cost unit of this whole design is object-store requests, and the
+    /// number of them per publication is a property of this code rather than of
+    /// the backend, so it is pinned here rather than estimated in a document.
+    ///
+    /// A publication of one part costs, per part: four PUTs for the immutable
+    /// files, plus one GET and one PUT for the manifest it replaces. What must
+    /// not happen is a term that grows with the *manifest*: publishing the
+    /// tenth part into a nine-part manifest must cost the same as publishing
+    /// the first into an empty one.
+    #[tokio::test]
+    async fn publishing_a_part_costs_a_fixed_number_of_requests() {
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("op-counts").join("parts");
+
+        let mut first_row = row("first");
+        first_row.timestamp_ns += 1;
+        let first = part::flush_rows(vec![first_row], &root, 100).unwrap();
+        let before = storage.operation_counts();
+        storage.publish(&first, &[]).await.unwrap();
+        let first_publish = delta(before, storage.operation_counts());
+
+        assert_eq!(first_publish.puts, PART_FILES.len() as u64 + 1);
+        assert_eq!(first_publish.gets, 1);
+        assert_eq!(first_publish.lists, 0);
+        assert_eq!(first_publish.copies, 0);
+
+        for index in 2..=9u64 {
+            let mut filler = row("filler");
+            filler.timestamp_ns += index as i64;
+            let part = part::flush_rows(vec![filler], &root, 100).unwrap();
+            storage.publish(&part, &[]).await.unwrap();
+        }
+
+        let mut tenth_row = row("tenth");
+        tenth_row.timestamp_ns += 10;
+        let tenth = part::flush_rows(vec![tenth_row], &root, 100).unwrap();
+        let before = storage.operation_counts();
+        storage.publish(&tenth, &[]).await.unwrap();
+        let tenth_publish = delta(before, storage.operation_counts());
+
+        assert_eq!(
+            tenth_publish, first_publish,
+            "publication cost must not grow with the size of the manifest"
+        );
+    }
+
+    fn delta(before: ObjectStoreOpCounts, after: ObjectStoreOpCounts) -> ObjectStoreOpCounts {
+        ObjectStoreOpCounts {
+            puts: after.puts - before.puts,
+            multipart_puts: after.multipart_puts - before.multipart_puts,
+            gets: after.gets - before.gets,
+            deletes: after.deletes - before.deletes,
+            lists: after.lists - before.lists,
+            listed_objects: after.listed_objects - before.listed_objects,
+            copies: after.copies - before.copies,
+        }
+    }

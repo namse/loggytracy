@@ -515,6 +515,32 @@ async fn main() {
         "part_meta_bytes": gauge(&end_metrics, "loggytracy_part_meta_bytes"),
     });
 
+    // The design's cost unit. Divided by the cycles that ran, these are the
+    // per-flush/merge/retention request counts the R2 estimate was built on,
+    // and they are backend-independent even though the price is not.
+    let merge_success_delta = counter_delta(
+        &start_metrics,
+        &end_metrics,
+        "loggytracy_merge_success_total",
+    );
+    let object_store_operations = serde_json::json!({
+        "puts": object_store_op_delta(&start_metrics, &end_metrics, "put"),
+        "gets": object_store_op_delta(&start_metrics, &end_metrics, "get"),
+        "deletes": object_store_op_delta(&start_metrics, &end_metrics, "delete"),
+        "lists": object_store_op_delta(&start_metrics, &end_metrics, "list"),
+        "copies": object_store_op_delta(&start_metrics, &end_metrics, "copy"),
+        "listed_objects": counter_delta(
+            &start_metrics,
+            &end_metrics,
+            "loggytracy_object_store_listed_objects_total",
+        ),
+        "cycles": serde_json::json!({
+            "flush": flush_success_delta,
+            "merge": merge_success_delta,
+            "retention": retention_success_delta,
+        }),
+    });
+
     let mut report = serde_json::json!({
         "tier": tier,
         "seed": seed,
@@ -561,6 +587,7 @@ async fn main() {
 
     // Added after construction: the literal is already at `json!`'s recursion
     // limit, and one more key inside it stops the macro from expanding.
+    report["object_store_operations"] = object_store_operations;
     report["tenants"] = serde_json::json!(tenant_count);
     report["push_throttled"] = serde_json::json!(push_throttled);
     report["target_events"] = serde_json::json!(target_events);
@@ -735,6 +762,20 @@ fn counter_delta(start: &HashMap<String, f64>, end: &HashMap<String, f64>, name:
     let start_value = start.get(name).copied().unwrap_or(0.0);
     let end_value = end.get(name).copied().unwrap_or(0.0);
     (end_value - start_value).max(0.0) as u64
+}
+
+/// The operation counters carry a `kind` label, so their map key is the whole
+/// series name including it.
+fn object_store_op_delta(
+    start: &HashMap<String, f64>,
+    end: &HashMap<String, f64>,
+    kind: &str,
+) -> u64 {
+    counter_delta(
+        start,
+        end,
+        &format!("loggytracy_object_store_operations_total{{kind=\"{kind}\"}}"),
+    )
 }
 
 fn gauge(metrics: &HashMap<String, f64>, name: &str) -> u64 {

@@ -551,7 +551,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
     let layout = state.parts.layout_totals();
     let policy = tenant_policy_gauges(&state);
     let m = &state.metrics;
-    format!(
+    let mut body = format!(
         "# TYPE loggytracy_memtable_entries gauge\n\
 loggytracy_memtable_entries {}\n\
 # TYPE loggytracy_memtable_bytes gauge\n\
@@ -754,6 +754,43 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         m.query_latency.render("loggytracy_query_latency_ms"),
         m.remote_restore_latency
             .render("loggytracy_remote_restore_latency_ms"),
+    );
+    body.push_str(&object_store_operation_metrics(&state));
+    body
+}
+
+/// The cost model of this design is operation counts, not bytes. R2 bills per
+/// request, and the whole shared-part layout exists because per-tenant objects
+/// multiplied that count. These are the numbers to divide by flush, merge and
+/// retention cycles to get the per-cycle cost, and they measure the same
+/// locally as they do against a paid backend.
+fn object_store_operation_metrics(state: &AppState) -> String {
+    let Some(counts) = state
+        .remote_cache
+        .as_ref()
+        .map(|cache| cache.storage.operation_counts())
+    else {
+        return String::new();
+    };
+    format!(
+        "# HELP loggytracy_object_store_operations_total Object-store requests issued, by kind. Which kinds are billed how is the backend's policy; how many of each this engine issues is not.\n\
+# TYPE loggytracy_object_store_operations_total counter\n\
+loggytracy_object_store_operations_total{{kind=\"put\"}} {}\n\
+loggytracy_object_store_operations_total{{kind=\"put_multipart\"}} {}\n\
+loggytracy_object_store_operations_total{{kind=\"get\"}} {}\n\
+loggytracy_object_store_operations_total{{kind=\"delete\"}} {}\n\
+loggytracy_object_store_operations_total{{kind=\"list\"}} {}\n\
+loggytracy_object_store_operations_total{{kind=\"copy\"}} {}\n\
+# HELP loggytracy_object_store_listed_objects_total Objects the listings returned. A backend pages a listing, so its request count follows from this and the page size rather than from the list count.\n\
+# TYPE loggytracy_object_store_listed_objects_total counter\n\
+loggytracy_object_store_listed_objects_total {}\n",
+        counts.puts,
+        counts.multipart_puts,
+        counts.gets,
+        counts.deletes,
+        counts.lists,
+        counts.copies,
+        counts.listed_objects,
     )
 }
 

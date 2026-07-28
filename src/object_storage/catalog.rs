@@ -5,6 +5,9 @@
 /// environment (AWS_*, OBJECT_STORE_* and backend-specific keys).
 pub struct ObjectStorage {
     store: Arc<dyn ObjectStore>,
+    /// Requests issued through `store`, counted by kind. See
+    /// [`counting_store`] for why the count and not the amount.
+    ops: Arc<ObjectStoreOps>,
     prefix: ObjectPath,
     manifest_update: tokio::sync::Mutex<()>,
     /// The local filesystem backend does not implement conditional updates.
@@ -177,8 +180,20 @@ production or on shared/network storage."
             Some(config) => Arc::new(fault_store::LatencyFaultStore::new(Arc::from(store), config)),
             None => Arc::from(store),
         };
-        Ok(Self {
-            store,
+        Ok(Self::wrapping(store, prefix, local_manifest_overwrite))
+    }
+
+    /// The one place the store is installed, so the operation counter cannot be
+    /// left off a backend by adding a constructor that forgets it.
+    fn wrapping(
+        store: Arc<dyn ObjectStore>,
+        prefix: ObjectPath,
+        local_manifest_overwrite: bool,
+    ) -> Self {
+        let ops = Arc::new(ObjectStoreOps::default());
+        Self {
+            store: Arc::new(CountingStore::new(store, ops.clone())),
+            ops,
             prefix,
             manifest_update: tokio::sync::Mutex::new(()),
             local_manifest_overwrite,
@@ -186,37 +201,32 @@ production or on shared/network storage."
             writer_epoch: AtomicU64::new(0),
             #[cfg(test)]
             catalog_validations: AtomicU64::new(0),
-        })
+        }
+    }
+
+    /// Object-store requests this process has issued, by kind.
+    pub fn operation_counts(&self) -> ObjectStoreOpCounts {
+        self.ops.snapshot()
     }
 
     #[cfg(test)]
     pub fn in_memory() -> Self {
-        Self {
-            store: Arc::new(object_store::memory::InMemory::new()),
-            prefix: ObjectPath::from("loggytracy-test"),
-            manifest_update: tokio::sync::Mutex::new(()),
-            local_manifest_overwrite: false,
-            fence_sink: std::sync::OnceLock::new(),
-            writer_epoch: AtomicU64::new(0),
-            #[cfg(test)]
-            catalog_validations: AtomicU64::new(0),
-        }
+        Self::wrapping(
+            Arc::new(object_store::memory::InMemory::new()),
+            ObjectPath::from("loggytracy-test"),
+            false,
+        )
     }
 
     /// Two handles over one backing store: what two processes pointed at the
     /// same prefix actually look like.
     #[cfg(test)]
     pub fn sharing_store_for_test(store: Arc<dyn ObjectStore>) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::wrapping(
             store,
-            prefix: ObjectPath::from("loggytracy-test"),
-            manifest_update: tokio::sync::Mutex::new(()),
-            local_manifest_overwrite: false,
-            fence_sink: std::sync::OnceLock::new(),
-            writer_epoch: AtomicU64::new(0),
-            #[cfg(test)]
-            catalog_validations: AtomicU64::new(0),
-        })
+            ObjectPath::from("loggytracy-test"),
+            false,
+        ))
     }
 
     /// An in-memory store whose every write fails, for the paths that must
@@ -224,19 +234,14 @@ production or on shared/network storage."
     #[cfg(test)]
     pub fn in_memory_with_failing_writes() -> Self {
         let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        Self {
-            store: Arc::new(fault_store::LatencyFaultStore::new(
+        Self::wrapping(
+            Arc::new(fault_store::LatencyFaultStore::new(
                 inner,
                 fault_store::FaultConfig::for_test(0, 0, 0, 1.0, 1),
             )),
-            prefix: ObjectPath::from("loggytracy-test"),
-            manifest_update: tokio::sync::Mutex::new(()),
-            local_manifest_overwrite: false,
-            fence_sink: std::sync::OnceLock::new(),
-            writer_epoch: AtomicU64::new(0),
-            #[cfg(test)]
-            catalog_validations: AtomicU64::new(0),
-        }
+            ObjectPath::from("loggytracy-test"),
+            false,
+        )
     }
 
     /// Wrap an arbitrary object store, used by tests to inject fault-injecting
@@ -244,16 +249,7 @@ production or on shared/network storage."
     /// local overwrite shortcut), exercising the real CAS manifest path.
     #[cfg(test)]
     pub fn from_store(store: Arc<dyn ObjectStore>, prefix: &str) -> Self {
-        Self {
-            store,
-            prefix: ObjectPath::from(prefix),
-            manifest_update: tokio::sync::Mutex::new(()),
-            local_manifest_overwrite: false,
-            fence_sink: std::sync::OnceLock::new(),
-            writer_epoch: AtomicU64::new(0),
-            #[cfg(test)]
-            catalog_validations: AtomicU64::new(0),
-        }
+        Self::wrapping(store, ObjectPath::from(prefix), false)
     }
 
     fn path(&self, relative: &str) -> ObjectPath {
