@@ -289,7 +289,6 @@
 
     #[test]
     fn rejects_invalid_and_deferred_syntax() {
-        assert!(parse(r#"{app="x"} | line_format "{{.app}}""#).is_err());
         assert!(parse_expr(r#"quantile_over_time(0.9, {}[5m])"#).is_err());
         assert!(parse_expr(r#"rate({}[0s])"#).is_err());
     }
@@ -300,4 +299,136 @@
         assert!(parse("{} 文字文字文字文字文字文字文字").is_err());
         let query = parse(r#"{app="\文"}"#).unwrap();
         assert_eq!(query.matchers[0].value, r#"\文"#);
+    }
+
+    #[test]
+    fn line_format_rewrites_the_line_from_extracted_fields() {
+        let QueryExpr::Logs(query) =
+            parse_expr(r#"{app="a"} | logfmt | line_format "{{.status}} {{.path}}""#).unwrap()
+        else {
+            panic!("expected a log query")
+        };
+        let mut entry = LogEntry {
+            timestamp_ns: 1,
+            line: "status=500 path=/checkout user=alice".to_string(),
+            structured_metadata: vec![],
+        };
+        assert!(query.process_entry(&mut entry));
+        assert_eq!(entry.line, "500 /checkout");
+    }
+
+    /// A filter after a `line_format` sees the formatted line. That is what
+    /// makes the two composable in either order, and it is why the stage
+    /// rewrites the entry rather than only the output.
+    #[test]
+    fn a_filter_after_line_format_matches_the_formatted_line() {
+        let QueryExpr::Logs(query) =
+            parse_expr(r#"{app="a"} | logfmt | line_format "{{.status}}" |= "500""#).unwrap()
+        else {
+            panic!("expected a log query")
+        };
+        let mut matching = LogEntry {
+            timestamp_ns: 1,
+            line: "status=500 path=/a".to_string(),
+            structured_metadata: vec![],
+        };
+        assert!(query.process_entry(&mut matching));
+
+        let mut other = LogEntry {
+            timestamp_ns: 1,
+            // The original line contains "500", the formatted one does not.
+            line: "status=200 latency=500".to_string(),
+            structured_metadata: vec![],
+        };
+        assert!(!query.process_entry(&mut other));
+    }
+
+    /// A field the template names but the entry does not have renders empty,
+    /// which is what Go's template does with a missing map key.
+    #[test]
+    fn a_missing_template_field_renders_empty() {
+        let QueryExpr::Logs(query) =
+            parse_expr(r#"{app="a"} | logfmt | line_format "[{{.absent}}]""#).unwrap()
+        else {
+            panic!("expected a log query")
+        };
+        let mut entry = LogEntry {
+            timestamp_ns: 1,
+            line: "status=200".to_string(),
+            structured_metadata: vec![],
+        };
+        assert!(query.process_entry(&mut entry));
+        assert_eq!(entry.line, "[]");
+    }
+
+    /// Quoting is what separates a rename from a literal: `new=old` copies a
+    /// field, `new="old"` assigns the text.
+    #[test]
+    fn label_format_distinguishes_a_rename_from_a_template() {
+        let QueryExpr::Logs(query) =
+            parse_expr(r#"{app="a"} | logfmt | label_format code=status, kind="status""#).unwrap()
+        else {
+            panic!("expected a log query")
+        };
+        let mut entry = LogEntry {
+            timestamp_ns: 1,
+            line: "status=500".to_string(),
+            structured_metadata: vec![],
+        };
+        assert!(query.process_entry(&mut entry));
+        let fields: std::collections::BTreeMap<_, _> =
+            entry.structured_metadata.iter().cloned().collect();
+        assert_eq!(fields["code"], "500", "unquoted copies the field");
+        assert_eq!(fields["kind"], "status", "quoted assigns the text");
+    }
+
+    /// Assignments read the field set as it was before the stage, so a swap
+    /// swaps instead of collapsing. Evaluating them in sequence would make the
+    /// result depend on argument order.
+    #[test]
+    fn label_format_assignments_do_not_see_each_other() {
+        let QueryExpr::Logs(query) =
+            parse_expr(r#"{app="a"} | logfmt | label_format a=b, b=a"#).unwrap()
+        else {
+            panic!("expected a log query")
+        };
+        let mut entry = LogEntry {
+            timestamp_ns: 1,
+            line: "a=first b=second".to_string(),
+            structured_metadata: vec![],
+        };
+        assert!(query.process_entry(&mut entry));
+        let fields: std::collections::BTreeMap<_, _> =
+            entry.structured_metadata.iter().cloned().collect();
+        assert_eq!(fields["a"], "second");
+        assert_eq!(fields["b"], "first");
+    }
+
+    /// The template subset refuses what it cannot render rather than
+    /// approximating it. A half-supported template produces lines that look
+    /// right and are not, which the user cannot see; a parse error they can.
+    #[test]
+    fn unsupported_template_expressions_are_refused() {
+        for query in [
+            r#"{app="a"} | line_format "{{ if .x }}y{{ end }}""#,
+            r#"{app="a"} | line_format "{{.a""#,
+            r#"{app="a"} | line_format "{{ printf \"%s\" .a }}""#,
+        ] {
+            assert!(parse_expr(query).is_err(), "{query}");
+        }
+    }
+
+    /// A `label_format` can synthesize any name, so an equality after it says
+    /// nothing about what is stored and must not prune a row group.
+    #[test]
+    fn a_predicate_after_label_format_does_not_prune() {
+        let QueryExpr::Logs(query) =
+            parse_expr(r#"{app="a"} | logfmt | label_format code=status | code="500""#).unwrap()
+        else {
+            panic!("expected a log query")
+        };
+        assert!(
+            query.exact_field_predicates().is_empty(),
+            "a synthesized name is not an index term"
+        );
     }

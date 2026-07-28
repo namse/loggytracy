@@ -63,7 +63,8 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
 
 ## P1 — LogQL improvements
 
-- [ ] Support `line_format`, `label_format`
+- [x] Support `line_format`, `label_format` — a deliberate subset of Go templates
+      (literal text and `{{.field}}`), refusing what it cannot render rather than approximating
 - [ ] Support `unwrap` and `quantile_over_time`
 - [ ] Support binary/vector operators
 - [ ] Support `without`, offset, and subqueries

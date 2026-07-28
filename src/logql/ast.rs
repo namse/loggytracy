@@ -49,6 +49,98 @@ pub enum PipelineStage {
     Json,
     Logfmt,
     Field(FieldFilter),
+    /// `| line_format "{{.status}} {{.path}}"` — rewrite the line from fields.
+    LineFormat(Template),
+    /// `| label_format new=old, other="{{.field}}"` — rename or synthesize
+    /// fields. Loki calls them labels; at this point in the pipeline they are
+    /// the same map the field filters read.
+    LabelFormat(Vec<LabelFormat>),
+}
+
+#[derive(Debug, Clone)]
+pub struct LabelFormat {
+    pub name: String,
+    pub source: LabelFormatSource,
+}
+
+#[derive(Debug, Clone)]
+pub enum LabelFormatSource {
+    /// `new=old`, an unquoted identifier: a rename.
+    Rename(String),
+    /// `new="..."`, a quoted template.
+    Template(Template),
+}
+
+/// The subset of Go's text/template that Loki's format stages use in practice:
+/// literal text and `{{.field}}` substitutions.
+///
+/// Deliberately a subset, and one that refuses rather than approximates.
+/// Supporting a fragment of a template language while silently mis-rendering
+/// the rest would produce log lines that look right and are not, which is worse
+/// than a query that will not parse — the user can see the second one.
+#[derive(Debug, Clone)]
+pub struct Template {
+    parts: Vec<TemplatePart>,
+}
+
+#[derive(Debug, Clone)]
+enum TemplatePart {
+    Literal(String),
+    Field(String),
+}
+
+impl Template {
+    pub fn parse(source: &str) -> Result<Self, String> {
+        let mut parts = Vec::new();
+        let mut rest = source;
+        while let Some(open) = rest.find("{{") {
+            if open > 0 {
+                parts.push(TemplatePart::Literal(rest[..open].to_string()));
+            }
+            let after = &rest[open + 2..];
+            let close = after.find("}}").ok_or_else(|| {
+                "unterminated '{{' in a format template".to_string()
+            })?;
+            let expression = after[..close].trim();
+            let field = expression.strip_prefix('.').ok_or_else(|| {
+                format!(
+                    "unsupported template expression '{{{{{expression}}}}}': only field \
+substitutions like {{{{.name}}}} are supported"
+                )
+            })?;
+            if field.is_empty() || !field.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return Err(format!(
+                    "unsupported template field '.{field}': names may contain letters, digits \
+and underscores"
+                ));
+            }
+            parts.push(TemplatePart::Field(field.to_string()));
+            rest = &after[close + 2..];
+        }
+        if !rest.is_empty() {
+            parts.push(TemplatePart::Literal(rest.to_string()));
+        }
+        Ok(Self { parts })
+    }
+
+    /// Render against the pipeline's current fields. A field the template names
+    /// but the entry does not have renders empty, which is what Go's template
+    /// does with a missing map key and what Loki therefore does.
+    pub fn render(&self, fields: &BTreeMap<String, String>) -> String {
+        let mut out = String::new();
+        for part in &self.parts {
+            match part {
+                TemplatePart::Literal(text) => out.push_str(text),
+                TemplatePart::Field(name) => {
+                    if let Some(value) = fields.get(name) {
+                        out.push_str(value);
+                    }
+                }
+            }
+        }
+        out
+    }
+
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +181,15 @@ impl LogQuery {
                     });
                 }
                 PipelineStage::Line(_) | PipelineStage::Field(_) => {}
+                // A `label_format` can synthesize any name, so a later
+                // equality on that name is not a statement about what is stored
+                // and must not prune a row group. Everything already collected
+                // stays: those predicates were read before this stage could
+                // rewrite anything.
+                PipelineStage::LabelFormat(_) => return predicates,
+                // `line_format` rewrites the line, not the fields, so the
+                // exact-field index is unaffected by it.
+                PipelineStage::LineFormat(_) => {}
             }
         }
         predicates
@@ -167,6 +268,29 @@ impl LogQuery {
                 PipelineStage::Field(filter) => {
                     if !filter.matches(&fields) {
                         return Ok(false);
+                    }
+                }
+                // Rewrites the line the *later* stages see, not the stored one.
+                // A `|=` after a `line_format` matches the formatted text,
+                // which is what makes the two composable in either order.
+                PipelineStage::LineFormat(template) => {
+                    entry.line = template.render(&fields);
+                }
+                PipelineStage::LabelFormat(formats) => {
+                    // Every assignment reads the field set as it was before
+                    // this stage, so `a=b, b=a` swaps rather than collapsing.
+                    // Loki evaluates a label_format the same way, and the
+                    // alternative makes the result depend on argument order.
+                    let before = fields.clone();
+                    for format in formats {
+                        let value = match &format.source {
+                            LabelFormatSource::Rename(source) => {
+                                before.get(source).cloned().unwrap_or_default()
+                            }
+                            LabelFormatSource::Template(template) => template.render(&before),
+                        };
+                        observe_extracted_name(&mut next_extracted_suffix, &format.name);
+                        fields.insert(format.name.clone(), value);
                     }
                 }
             }

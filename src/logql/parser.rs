@@ -335,12 +335,67 @@ fn parse_pipeline(input: &str) -> Result<Vec<PipelineStage>, String> {
             stages.push(PipelineStage::Logfmt);
             continue;
         }
+        if consume_word(input, &mut pos, "line_format") {
+            skip_space(input, &mut pos);
+            let source = parse_string_literal(input, &mut pos)?;
+            stages.push(PipelineStage::LineFormat(Template::parse(&source)?));
+            continue;
+        }
+        if consume_word(input, &mut pos, "label_format") {
+            stages.push(PipelineStage::LabelFormat(parse_label_formats(
+                input, &mut pos,
+            )?));
+            continue;
+        }
         let preview = input_preview(input, pos);
         let filter = parse_field_filter(input, &mut pos)
             .map_err(|error| format!("unsupported LogQL stage '{preview}...': {error}"))?;
         stages.push(PipelineStage::Field(filter));
     }
     Ok(stages)
+}
+
+/// `label_format a=b, c="{{.d}}"` — one or more comma-separated assignments.
+///
+/// An unquoted right-hand side is a rename and a quoted one is a template,
+/// which is Loki's distinction. Getting it from the quoting rather than from
+/// the content matters: `new=old` and `new="old"` mean different things — the
+/// first copies a field, the second assigns the literal text `old`.
+fn parse_label_formats(input: &str, pos: &mut usize) -> Result<Vec<LabelFormat>, String> {
+    let mut formats = Vec::new();
+    loop {
+        skip_space(input, pos);
+        let name = parse_identifier(input, pos)?;
+        validate_field_name(&name)?;
+        skip_space(input, pos);
+        if input.as_bytes().get(*pos) != Some(&b'=') {
+            return Err(format!("expected '=' after label_format name '{name}'"));
+        }
+        *pos += 1;
+        skip_space(input, pos);
+        let source = if input
+            .as_bytes()
+            .get(*pos)
+            .is_some_and(|byte| *byte == b'"' || *byte == b'`')
+        {
+            LabelFormatSource::Template(Template::parse(&parse_string_literal(input, pos)?)?)
+        } else {
+            let source = parse_identifier(input, pos)?;
+            validate_field_name(&source)?;
+            LabelFormatSource::Rename(source)
+        };
+        formats.push(LabelFormat { name, source });
+        skip_space(input, pos);
+        if input.as_bytes().get(*pos) == Some(&b',') {
+            *pos += 1;
+            continue;
+        }
+        break;
+    }
+    if formats.is_empty() {
+        return Err("label_format expects at least one assignment".to_string());
+    }
+    Ok(formats)
 }
 
 fn parse_field_filter(input: &str, pos: &mut usize) -> Result<FieldFilter, String> {
