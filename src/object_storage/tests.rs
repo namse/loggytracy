@@ -1632,6 +1632,79 @@ opens a connection per part"
         }
     }
 
+    /// Restoring an evicted body fetches the body and nothing else.
+    ///
+    /// Eviction removes the Parquet body and deliberately leaves `index.bin`
+    /// and `meta.json` behind, so the catalog a restore needs is already local
+    /// and already checksummed against the manifest descriptor. Refetching it
+    /// cost two extra GETs on every cache miss, and deleted a healthy catalog
+    /// in order to replace it with an identical copy of itself.
+    #[tokio::test]
+    async fn restoring_an_evicted_body_costs_one_get() {
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("restore-op-counts").join("parts");
+        let parts = part::flush_rows(vec![row("evicted then restored")], &root, 100).unwrap();
+        let manifest = storage.publish(&parts, &[]).await.unwrap();
+        storage
+            .evict_cache(&root, 0, &[parts[0].dir.clone()])
+            .unwrap();
+        assert!(!parts[0].data_path().exists());
+        assert!(parts[0].index_path().exists() && parts[0].meta_path().exists());
+
+        let ids: HashSet<String> = manifest.parts.iter().map(|part| part.id.clone()).collect();
+        let before = storage.operation_counts();
+        storage.restore_parts(&root, &ids).await.unwrap();
+        let restore = delta(before, storage.operation_counts());
+
+        assert_eq!(
+            restore.gets, 2,
+            "one GET for the manifest and one for the body; the catalog is already local"
+        );
+        assert_eq!(restore.puts, 0);
+        assert_eq!(restore.lists, 0);
+
+        let registry =
+            crate::part_registry::PartRegistry::load_from_manifest(&root, &manifest).unwrap();
+        let result = registry
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .unwrap();
+        assert_eq!(result[0].entries[0].line, "evicted then restored");
+    }
+
+    /// The one-GET path is an optimisation of a *valid* local catalog, not an
+    /// assumption that one exists. A part whose sidecar no longer matches its
+    /// descriptor falls back to fetching every file, because that is the only
+    /// way to get a catalog that does match.
+    #[tokio::test]
+    async fn restoring_a_part_with_a_damaged_catalog_fetches_every_file() {
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("restore-damaged-catalog").join("parts");
+        let parts = part::flush_rows(vec![row("damaged then restored")], &root, 100).unwrap();
+        let manifest = storage.publish(&parts, &[]).await.unwrap();
+        storage
+            .evict_cache(&root, 0, &[parts[0].dir.clone()])
+            .unwrap();
+        std::fs::write(parts[0].index_path(), b"not the index that was published").unwrap();
+
+        let ids: HashSet<String> = manifest.parts.iter().map(|part| part.id.clone()).collect();
+        let before = storage.operation_counts();
+        storage.restore_parts(&root, &ids).await.unwrap();
+        let restore = delta(before, storage.operation_counts());
+
+        assert_eq!(
+            restore.gets,
+            PART_FILES.len() as u64 + 1,
+            "one GET for the manifest and one per part file"
+        );
+
+        let registry =
+            crate::part_registry::PartRegistry::load_from_manifest(&root, &manifest).unwrap();
+        let result = registry
+            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .unwrap();
+        assert_eq!(result[0].entries[0].line, "damaged then restored");
+    }
+
     fn delta(before: ObjectStoreOpCounts, after: ObjectStoreOpCounts) -> ObjectStoreOpCounts {
         ObjectStoreOpCounts {
             puts: after.puts - before.puts,

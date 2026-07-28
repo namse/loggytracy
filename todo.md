@@ -2694,9 +2694,9 @@ Read path:
 - [x] **Metadata endpoint guards**: Add semaphore, timeout, `start`/`end`, and `match[]` count limits to
       `labels`/`label_values`/`series`/`index_stats`.
 - [x] **Remove O(parts) from `/metrics`**: Workers publish merge-debt and unknown-tenant gauges.
-- [x] **Multi-tenancy** — **the instance's share is complete** (2026-08-18). Every sub-item below is done
-      except durable monthly usage accounting, which is the control plane's by the checklist's own reasoning,
-      and Parquet range reads, which is struck in P2 on measurement rather than deferred. The design, cost
+- [x] **Multi-tenancy** — **the instance's share is complete** (2026-08-18). Every sub-item below is done:
+      durable monthly usage accounting is the control plane's by the checklist's own reasoning, and Parquet
+      range reads are struck in P2 on measurement rather than deferred. The design, cost
       model, and implementation checklist are in
       [`docs/MULTI_TENANCY_DESIGN.md`](docs/MULTI_TENANCY_DESIGN.md).
       **The previous design using tenants as a storage-path axis (`docs/ARCHITECTURE.md`, "Multi-tenancy")
@@ -2733,8 +2733,9 @@ Read path:
   - [x] Per-tenant usage — `GET .../tenants/{tenant}/usage` on the admin API. **Not** labels on
         `/metrics`: that scrape is unauthenticated and process-wide by design, and a label per
         tenant is the cardinality problem this engine bounds everywhere else
-  - [ ] Durable monthly usage accounting — **this belongs to the control plane, not the instance.** A month spans
-        instances and outlives them. This side only exports per-tenant usage for the control plane to account for.
+  - [x] ~~Durable monthly usage accounting~~ — **the control plane's, not the instance's.** A month spans
+        instances and outlives them; this side only exports per-tenant usage for the control plane to
+        account for. Recorded under "Decided against — not pending work".
 - [x] Document TLS unsupported as an architecture decision
 - [x] Ingest input limits (body/decompressed length/line/label count and length/timestamp acceptance window)
 
@@ -2752,21 +2753,6 @@ Read path:
 - [x] Support subqueries
 - [x] Loki-compatible JSON semantics for arrays, top-level arrays and `null`
 - [x] Exact-field pruning on stream-label fields, through the stream index
-- [ ] Exact-field pruning for empty-string equality and `_extracted` collisions —
-      both stay conservative on purpose: an empty equality also matches an absent
-      field, and absence is not indexed anywhere. The *naming* half is settled and
-      no longer open: measured against `grafana/loki:3.3.2`, a `| json` field
-      colliding with a stream label becomes `<name>_extracted` (both survive, both
-      filter) and one colliding with a pushed structured-metadata key is discarded
-      outright, which loggytracy now matches — see the `| json` entry under "Open
-      correctness defects". What is left is one deliberate divergence: on a
-      *second* collision Loki appends `_extracted` once more and overwrites the
-      existing `foo_extracted` stream label, while loggytracy answers
-      `foo_extracted_2` and keeps it, because it will not drop a value it was
-      given. A name that could have been synthesized that way must therefore
-      never drive a row-group prune, which is what
-      `query::tests::synthesized_extracted_field_never_false_negative_prunes_parts`
-      and `..._restores_an_evicted_part_conservatively` hold
 
 ## P2 — correctness and storage performance
 
@@ -2939,6 +2925,31 @@ Read path:
 - [x] `delete` API — hides on acceptance at the single scan every read path funnels through, removes
       the bytes at the next rewrite. Design and the reasons for each refusal:
       [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
+
+## Decided against — not pending work
+
+These are settled decisions, not unfinished items. They are listed so the reason survives, and kept out
+of the checklists above so the open list means "not done yet" and nothing else.
+
+- **Durable monthly usage accounting** — belongs to the control plane, not the instance. A month spans
+  instances and outlives them. This side exports per-tenant usage (`GET .../tenants/{tenant}/usage`) and
+  the control plane accounts for it. Nothing further is owed here.
+- **Exact-field pruning for empty-string equality and `_extracted` collisions** — deliberately
+  conservative. An empty equality also matches an absent field, and absence is not indexed anywhere, so
+  pruning on it would drop matching rows. The conservatism is the correct behaviour, not a gap. The
+  *naming* half is settled too: measured against `grafana/loki:3.3.2`, a `| json` field colliding with a
+  stream label becomes `<name>_extracted` (both survive, both filter) and one colliding with a pushed
+  structured-metadata key is discarded outright, which loggytracy now matches — see the `| json` entry
+  under "Open correctness defects". One deliberate divergence remains: on a *second* collision Loki
+  appends `_extracted` once more and overwrites the existing `foo_extracted` stream label, while
+  loggytracy answers `foo_extracted_2` and keeps it, because it will not drop a value it was given. A
+  name that could have been synthesized that way must therefore never drive a row-group prune, which is
+  what `query::tests::synthesized_extracted_field_never_false_negative_prunes_parts` and
+  `..._restores_an_evicted_part_conservatively` hold.
+
+Decisions already recorded as closed items above, for cross-reference: `(tier, day)` partitioning
+(rejected, see Multi-tenancy), validation against real S3 (out of scope, P2), and TLS (unsupported by
+architecture decision, P0).
 
 ## Deferred with a reason
 

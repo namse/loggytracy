@@ -301,40 +301,25 @@ impl ObjectStorage {
         include_data: bool,
     ) -> Result<(), String> {
         let final_dir = cache_part_dir(parts_root, descriptor)?;
+        // Eviction takes the Parquet body and leaves the catalog beside it, so a
+        // body-only restore usually finds `index.bin` and `meta.json` already
+        // local and already checksummed against this descriptor. Rebuilding the
+        // whole directory would spend two more GETs to arrive at bytes that are
+        // on disk, and would delete a healthy catalog in order to do it.
+        if include_data && open_manifest_part(&final_dir, descriptor, false).is_ok() {
+            return self
+                .download_part_body(descriptor, parts_root, &final_dir)
+                .await;
+        }
         let local_tombstone = std::fs::read(final_dir.join(part::MERGE_TOMBSTONE_FILE)).ok();
-        let tmp_dir = ensure_safe_directory_chain(
-            parts_root,
-            &[".tmp", "remote", &descriptor.partition, &descriptor.id],
-        )?;
-        std::fs::remove_dir_all(&tmp_dir).map_err(|error| error.to_string())?;
-        std::fs::create_dir(&tmp_dir).map_err(|error| error.to_string())?;
+        let tmp_dir = self.reset_part_tmp_dir(parts_root, descriptor)?;
         let files: &[&str] = if include_data {
             &PART_FILES
         } else {
             &CATALOG_FILES
         };
         for &file in files {
-            let result = self
-                .store
-                .get(&self.part_path(descriptor, file))
-                .await
-                .map_err(|error| {
-                    format!(
-                        "failed to download part {} file {file}: {error}",
-                        descriptor.id
-                    )
-                })?;
-            let bytes = result.bytes().await.map_err(|error| {
-                format!("failed to read part {} file {file}: {error}", descriptor.id)
-            })?;
-            tokio::fs::write(tmp_dir.join(file), bytes)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "failed to cache part {} file {file}: {error}",
-                        descriptor.id
-                    )
-                })?;
+            self.fetch_part_file(descriptor, file, &tmp_dir).await?;
         }
         let downloaded =
             open_manifest_part(&tmp_dir, descriptor, include_data).map_err(|error| {
@@ -363,6 +348,85 @@ impl ObjectStorage {
             crate::restore_meter::global().note_restore(&final_dir);
         }
         Ok(())
+    }
+
+    /// Restores only the Parquet body into a part directory whose catalog is
+    /// already local and already valid for this descriptor.
+    ///
+    /// The body lands by renaming one file into place rather than by replacing
+    /// the directory, so the catalog and any merge tombstone beside it are never
+    /// deleted and never rewritten. A body that fails validation is removed
+    /// again: every reader checksums the body it opens, so nothing trusts the
+    /// file in the window before this check, and removing it keeps the retry on
+    /// the one-GET path instead of demoting it to the three-GET one.
+    async fn download_part_body(
+        &self,
+        descriptor: &ManifestPart,
+        parts_root: &Path,
+        final_dir: &Path,
+    ) -> Result<(), String> {
+        let tmp_dir = self.reset_part_tmp_dir(parts_root, descriptor)?;
+        self.fetch_part_file(descriptor, DATA_FILE, &tmp_dir).await?;
+        let data_path = final_dir.join(DATA_FILE);
+        std::fs::rename(tmp_dir.join(DATA_FILE), &data_path)
+            .map_err(|error| format!("failed to commit cached part {}: {error}", descriptor.id))?;
+        std::fs::remove_dir_all(&tmp_dir).map_err(|error| error.to_string())?;
+        match open_manifest_part(final_dir, descriptor, true) {
+            Ok(downloaded) => {
+                drop(downloaded);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&data_path);
+                Err(format!(
+                    "downloaded part {} failed validation: {error}",
+                    descriptor.id
+                ))
+            }
+        }
+    }
+
+    fn reset_part_tmp_dir(
+        &self,
+        parts_root: &Path,
+        descriptor: &ManifestPart,
+    ) -> Result<PathBuf, String> {
+        let tmp_dir = ensure_safe_directory_chain(
+            parts_root,
+            &[".tmp", "remote", &descriptor.partition, &descriptor.id],
+        )?;
+        std::fs::remove_dir_all(&tmp_dir).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&tmp_dir).map_err(|error| error.to_string())?;
+        Ok(tmp_dir)
+    }
+
+    async fn fetch_part_file(
+        &self,
+        descriptor: &ManifestPart,
+        file: &str,
+        dest_dir: &Path,
+    ) -> Result<(), String> {
+        let result = self
+            .store
+            .get(&self.part_path(descriptor, file))
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to download part {} file {file}: {error}",
+                    descriptor.id
+                )
+            })?;
+        let bytes = result.bytes().await.map_err(|error| {
+            format!("failed to read part {} file {file}: {error}", descriptor.id)
+        })?;
+        tokio::fs::write(dest_dir.join(file), bytes)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to cache part {} file {file}: {error}",
+                    descriptor.id
+                )
+            })
     }
 
     /// Evict Parquet bodies until the cache fits `max_bytes`, oldest first.

@@ -63,7 +63,7 @@ Per flush with an object store configured:
 
 | Operation | Code | Class |
 |---|---|---|
-| Upload 4 part files (`data.parquet`, `bloom.tri`, `stream.idx`, `meta.json`) | `object_storage/cache.rs:2` `upload_part` over `PART_FILES` (`object_storage/mod.rs:18`) | **A** × 4 |
+| Upload 3 part files (`data.parquet`, `index.bin`, `meta.json`) | `object_storage/cache.rs:2` `upload_part` over `PART_FILES` (`object_storage/mod.rs:19`) | **A** × 3 |
 | Manifest read for CAS | `object_storage/object_io.rs:304` `load_manifest_versioned` | B × 1 |
 | Manifest write | `object_storage/object_io.rs:298` `publish` | **A** × 1 |
 | Trace manifest read (**happens even with zero traces**) | `flush.rs:353` → `object_storage/catalog.rs:265` | B × 1 |
@@ -249,8 +249,18 @@ cache space and couples tenants.
   Folding `meta.json` in as well would make it 2, but `meta.json` is also the
   self-describing version header that the registry and the recovery paths read
   standalone, so that is a separate change with its own migration question.
-  A miss still re-downloads all of `PART_FILES` even when the catalog files are
-  already local, which is the remaining half of this item.
+- Fetching only what a miss is actually missing. **Done.** Eviction removes the
+  Parquet body and leaves `index.bin` and `meta.json` behind, so a body-only
+  restore has the catalog on disk already, checksummed against the manifest
+  descriptor it is restoring for. `download_part` used to refetch all three
+  files anyway and `remove_dir_all` the healthy catalog to make room for the
+  copy. It now GETs the body alone and renames that one file into place, so a
+  cache miss costs **one Class B instead of three** and the merge tombstone
+  beside the catalog is never rewritten. A part whose sidecar no longer matches
+  its descriptor still falls back to fetching everything, which is the only way
+  to obtain a catalog that does match. Pinned by
+  `restoring_an_evicted_body_costs_one_get` and
+  `restoring_a_part_with_a_damaged_catalog_fetches_every_file`.
 - Merge concatenates each tenant's segments across parts, making a tenant's
   data **more contiguous** in merged parts. One range GET then retrieves more
   useful data. Merge helps more here than under per-tenant parts.
@@ -319,12 +329,19 @@ split is what pays for the download.
 
 ## Supporting changes
 
-### Consolidate the four sidecars into one object
+### Consolidate the sidecars into one object
 
-`PART_FILES` (`object_storage/mod.rs:18`) is four files, so each part costs four
-PUTs. A single container — `[parquet][bloom][stream.idx][meta][offset footer]` —
-makes it one, a **4x Class A reduction**, and fixes the redundant-GET problem
-above.
+**Half done.** The trigram blooms and the stream index are one `index.bin`, so
+`PART_FILES` (`object_storage/mod.rs:19`) is three files rather than four: three
+PUTs per flush instead of four, one fewer round trip per catalog restore, and
+one fewer checksum pass per part at startup — which §8 of
+[`LOAD_RESULTS.md`](LOAD_RESULTS.md) measured as the actual startup cost.
+
+Folding `meta.json` in as well would make it two, but `meta.json` is the
+self-describing version header that the registry and the recovery paths read
+standalone, and `PART_META_VERSION` was just raised to 2. The next format change
+should therefore carry the `TenantSegment` byte ranges that range GET needs, in
+the same step — doing the two separately moves the on-disk format three times.
 
 Affected: `upload_part`, `download_part`, `restore_catalog`,
 `delete_part_objects`, `garbage_collect_orphans`. All iterate the `PART_FILES` /
@@ -475,11 +492,13 @@ This is the gap `PRODUCTION_READINESS_REVIEW.md:276` records as
 | Merge | **done** — reads rows through the tenant index and re-sorts by `(tenant, ts)`; no cross-tenant mixing beyond the shared object |
 | Per-tenant retention | **done** — the control plane pushes one tenant at a time to `PUT /loggytracy/api/v1/admin/tenants/{tenant}/retention`, loggytracy persists it before acknowledging, and it is applied at deletion time; partitions stay on `day`. See [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
 | Partition on `(tier, day)` | **rejected** — retention baked in at write time cannot honour a plan change; superseded by [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
-| Sidecar consolidation | **not done** — still four `PART_FILES` |
-| Range GET / per-`(part, tenant)` cache | **not done** |
+| Sidecar consolidation | **done for the sidecars** — the trigram blooms and the stream index are one `index.bin`, so `PART_FILES` is three. Folding `meta.json` in is deliberately left for the format change that adds `TenantSegment` byte ranges, so the on-disk format moves once rather than twice |
+| Cache-miss fetch cost | **done** — a body-only restore GETs the body alone and leaves the local catalog in place: one Class B per miss instead of three |
+| Range GET / per-`(part, tenant)` cache | **not done** — the last open multi-tenancy item |
 | Ingest rate quota | **done** — `ingest_rate` rides the same pushed policy as retention (`4MiB/s`, `0`, `unlimited`), enforced per tenant before the body is decompressed. `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` covers tenants the control plane has said nothing about |
-| Query-scan and stream-count quotas, per-tenant semaphores, tenant-labelled metrics | **not done** |
-| Durable usage accounting | **not done** — and deliberately so for the *monthly* budget: a month is spent across instances and outlives any of them, so the control plane holds it. What an instance can answer for is its own share, which is the rate above |
+| Query-scan and stream-count quotas | **done** — `query_rate` and `max_streams` ride the same pushed policy as `ingest_rate`; a scan is charged what it actually read, and `max_streams` is enforced against the union of parts and buffers |
+| Per-tenant usage | **done** — `GET /loggytracy/api/v1/admin/tenants/{tenant}/usage`. Deliberately *not* labels on `/metrics`: that scrape is unauthenticated and process-wide by design, and a label per tenant is the cardinality problem this engine bounds everywhere else |
+| Durable monthly usage accounting | **out of scope, decided** — a month is spent across instances and outlives any of them, so the control plane holds it. An instance answers only for its own share, which is the endpoint above |
 
 `/metrics` deliberately keeps process-wide gauges (`global_stats`): it is the
 operator scrape, not a tenant-facing endpoint.
@@ -515,16 +534,24 @@ Ordered by dependency.
 - [x] Add the per-tenant index to `meta.json` (`part/metadata.rs`).
 - [x] ~~Partition on `(tier, day)` instead of `day`~~ — rejected; per-tenant
       retention is applied at deletion time instead ([`RETENTION_DESIGN.md`](RETENTION_DESIGN.md)).
-- [ ] Consolidate `PART_FILES` into a single container object.
+- [x] Consolidate the sidecars — the trigram blooms and the stream index are one
+      `index.bin`, so `PART_FILES` is three. `meta.json` stays separate on
+      purpose: it is the self-describing version header the registry and the
+      recovery paths read standalone, and folding it in belongs with the format
+      change that adds `TenantSegment` byte ranges, so the on-disk format moves
+      once rather than twice.
 
 ### 3. Read path
 
 - [x] Per-tenant `min_ts`/`max_ts` pruning from the meta index.
+- [x] Fetch only what a miss is missing — a body-only restore GETs the body and
+      leaves the already-valid local catalog alone, one Class B instead of three.
 - [ ] Range GET using `byte_range` in `download_part`.
 - [ ] Key the local cache by `(part_id, tenant)`.
-- [ ] Parallelize `restore_parts` and `restore_catalog` (both are serial
-      `for … .await` loops today; 20 missed parts = 20+ sequential round trips,
-      bounded only by `max_restore_runtime` at 25s, `config.rs:116`).
+- [x] Parallelize `restore_parts` and `restore_catalog` — both fan out at
+      `RESTORE_CONCURRENCY` (16). The bound exists because unbounded fan-out
+      opens a connection per part and turns a restore into a self-inflicted
+      outage of the store it is reading.
 
 ### 4. Isolation surface
 
@@ -538,13 +565,23 @@ isolation boundary once files are no longer separate.
 
 ### 5. Quotas and limits
 
-- [ ] Per-tenant ingest rate and monthly volume, checked **before** journal
-      append.
-- [ ] Active stream count cap, keep-existing / drop-new.
-- [ ] Query scanned-bytes accounting per tenant, monthly + hourly.
-- [ ] Per-tenant semaphores replacing the global ones in `app_state.rs:16-18`.
+- [x] Per-tenant ingest rate, checked **before** the body is decompressed so an
+      over-limit tenant cannot consume CPU. Monthly volume is the control
+      plane's, not an instance's.
+- [x] Active stream count cap — `max_streams`, enforced against the union of
+      what the tenant holds in parts and in the buffers.
+- [x] Query scanned-bytes accounting per tenant — `query_rate`, charged after a
+      scan with what it actually read.
+- [x] Per-tenant query concurrency — `max_concurrent_queries_per_tenant`
+      (`tenant_quota.rs`). The global semaphores in `app_state.rs` stay: they
+      are the process-wide memory bound, which is a different question from a
+      tenant's share of it.
 - [ ] Per-tenant cache budget (see risks below).
-- [ ] Tenant labels on all quota and rejection counters in `metrics.rs`.
+- [x] ~~Tenant labels on all quota and rejection counters in `metrics.rs`~~ —
+      rejected. `/metrics` is an unauthenticated, process-wide scrape by design,
+      and a label per tenant is the cardinality problem this engine bounds
+      everywhere else. Per-tenant numbers are served from the admin usage
+      endpoint instead.
 
 ### 6. Durable usage accounting
 
