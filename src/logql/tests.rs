@@ -607,3 +607,33 @@
                 .collect();
         assert_eq!(unwrap.value(&infinite), None, "infinity is not a sample");
     }
+
+    /// The scan range is cut from the lookback, so an offset that did not
+    /// widen it would select parts that do not contain the window being asked
+    /// about — the query would read as empty rather than as wrong.
+    #[test]
+    fn an_offset_widens_the_lookback() {
+        let QueryExpr::Metric(plain) = parse_expr(r#"rate({a="b"}[5m])"#).unwrap() else {
+            panic!("expected metric")
+        };
+        let QueryExpr::Metric(offset) = parse_expr(r#"rate({a="b"}[5m] offset 1h)"#).unwrap()
+        else {
+            panic!("expected metric")
+        };
+        assert_eq!(plain.lookback_ns(), 5 * 60 * 1_000_000_000);
+        assert_eq!(
+            offset.lookback_ns(),
+            (5 * 60 + 60 * 60) * 1_000_000_000,
+            "the offset has to be inside the scan range"
+        );
+    }
+
+    /// `offset` is only the keyword when it follows the range bracket. A field
+    /// or label of that name is not a modifier.
+    #[test]
+    fn the_word_offset_elsewhere_is_not_a_modifier() {
+        assert!(parse_expr(r#"count_over_time({app="offset"}[5m])"#).is_ok());
+        assert!(parse_expr(r#"count_over_time({a="b"} | logfmt | offset="1" [5m])"#).is_ok());
+        assert!(parse_expr(r#"count_over_time({a="b"}[5m] offset)"#).is_err());
+        assert!(parse_expr(r#"count_over_time({a="b"}[5m] offset -1h)"#).is_err());
+    }

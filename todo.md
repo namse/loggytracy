@@ -71,7 +71,8 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
       Vector-to-vector is refused: both sides would need their own scan, which is a
       planner change rather than a parser one
 - [x] Support `without`
-- [ ] Support offset and subqueries
+- [x] Support `offset`
+- [ ] Support subqueries
 - [ ] Support Loki-compatible semantics for JSON top-level arrays and `null` values
 - [ ] Improve exact-field pruning for empty-string equality, stream-label fields, and `_extracted` name collisions
 

@@ -2304,3 +2304,32 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         };
         assert_eq!(evaluate_metric_at(&expr, &entries, 10_000_000_000)[0].1, 90.0);
     }
+
+    /// An offset shifts the window back without moving the point it is
+    /// reported at. That is what makes `rate(…[5m] offset 1h)` plottable
+    /// against an un-offset series on the same axis.
+    #[tokio::test]
+    async fn an_offset_shifts_the_window_not_the_evaluation_point() {
+        let entries = unwrapped_entries(&[(1_000_000_000, "10"), (61_000_000_000, "99")]);
+        let logql::QueryExpr::Metric(offset) =
+            logql::parse_expr(r#"sum_over_time({app="u"} | unwrap latency [5s] offset 60s)"#)
+                .unwrap()
+        else {
+            panic!("expected metric")
+        };
+        // At t=62s the un-offset window holds the second sample; offset by 60s
+        // it holds the first.
+        let values = evaluate_metric_at(&offset, &entries, 62_000_000_000);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].1, 10.0, "the offset window sees the older sample");
+
+        let logql::QueryExpr::Metric(plain) =
+            logql::parse_expr(r#"sum_over_time({app="u"} | unwrap latency [5s])"#).unwrap()
+        else {
+            panic!("expected metric")
+        };
+        assert_eq!(
+            evaluate_metric_at(&plain, &entries, 62_000_000_000)[0].1,
+            99.0
+        );
+    }

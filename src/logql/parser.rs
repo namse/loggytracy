@@ -95,6 +95,12 @@ fn parse_metric_expr(input: &str, depth: usize) -> Result<MetricExpr, String> {
             } else {
                 (None, inside)
             };
+            // `[5m] offset 1h` — peeled before the bracket, since the offset
+            // sits outside it.
+            let (inside, offset_ns) = match split_offset(inside)? {
+                Some((head, offset_ns)) => (head, offset_ns),
+                None => (inside, 0),
+            };
             let close = inside
                 .trim_end()
                 .strip_suffix(']')
@@ -121,6 +127,7 @@ fn parse_metric_expr(input: &str, depth: usize) -> Result<MetricExpr, String> {
                 range_ns,
                 unwrap,
                 quantile,
+                offset_ns,
             });
         }
     }
@@ -380,6 +387,31 @@ const BINARY_OPERATORS: [(&str, BinaryOp); 11] = [
     ("/", BinaryOp::Div),
     ("%", BinaryOp::Mod),
 ];
+
+/// Splits a trailing `offset <duration>` off a range expression.
+fn split_offset(input: &str) -> Result<Option<(&str, i64)>, String> {
+    let trimmed = input.trim_end();
+    // Searched from the right: the keyword can only be the last thing, and a
+    // label or line filter could contain the word anywhere else.
+    let Some(position) = trimmed.rfind("offset") else {
+        return Ok(None);
+    };
+    // Must follow the closing bracket of the range, or it is part of something
+    // else — a field named `offset`, for instance.
+    let head = &trimmed[..position];
+    if !head.trim_end().ends_with(']') {
+        return Ok(None);
+    }
+    let after = &trimmed[position + "offset".len()..];
+    if !after.starts_with(char::is_whitespace) {
+        return Ok(None);
+    }
+    let offset_ns = parse_duration_ns(after.trim())?;
+    if offset_ns < 0 {
+        return Err("offset must not be negative".to_string());
+    }
+    Ok(Some((head, offset_ns)))
+}
 
 fn parse_binary(input: &str, depth: usize) -> Result<Option<MetricExpr>, String> {
     let Some((position, token, op)) = find_top_level_binary(input) else {

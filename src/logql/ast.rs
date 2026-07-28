@@ -483,6 +483,13 @@ pub enum MetricExpr {
         unwrap: Option<Unwrap>,
         /// The φ of `quantile_over_time(φ, ...)`, in `[0, 1]`.
         quantile: Option<f64>,
+        /// `[5m] offset 1h` — shift the window back by this much.
+        ///
+        /// Held here rather than folded into the evaluation time because the
+        /// scan range has to cover the shifted window: a query offset by an
+        /// hour reads an hour further back, and the planner needs to know that
+        /// before it selects parts.
+        offset_ns: i64,
     },
     Aggregate {
         op: AggregateOp,
@@ -520,9 +527,16 @@ impl MetricExpr {
         }
     }
 
+    /// How far back a query reads, counting any offset. The scan range is cut
+    /// from this, so an offset that is not included here would select parts
+    /// that do not contain the window being asked about.
     pub fn lookback_ns(&self) -> i64 {
         match self {
-            Self::Range { range_ns, .. } => *range_ns,
+            Self::Range {
+                range_ns,
+                offset_ns,
+                ..
+            } => range_ns.saturating_add(*offset_ns),
             Self::Aggregate { expr, .. }
             | Self::TopK { expr, .. }
             | Self::Binary { expr, .. } => expr.lookback_ns(),

@@ -284,10 +284,11 @@ fn evaluate_metric_all(
                 }
                 let series = MetricRangeSeries { events, prefix };
                 for (index, &evaluation_ns) in evaluation_times.iter().enumerate() {
+                    let window_end = evaluation_ns.saturating_sub(spec.offset_ns);
                     let right = series
                         .events
-                        .partition_point(|(timestamp_ns, _)| *timestamp_ns <= evaluation_ns);
-                    let left = evaluation_ns
+                        .partition_point(|(timestamp_ns, _)| *timestamp_ns <= window_end);
+                    let left = window_end
                         .checked_sub(*range_ns)
                         .map(|start| {
                             series
@@ -454,7 +455,10 @@ impl MetricEvaluator {
         let mut values = match expr {
             logql::MetricExpr::Range { .. } => {
                 let spec = metric_range_spec(expr);
-                let window_start = evaluation_ns.checked_sub(self.range_ns);
+                // The offset shifts the window back; the evaluation point it is
+                // reported at does not move.
+                let window_end = evaluation_ns.saturating_sub(spec.offset_ns);
+                let window_start = window_end.checked_sub(self.range_ns);
                 let mut values = Vec::new();
                 for (labels, series) in &self.by_labels {
                     if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -564,6 +568,7 @@ struct RangeSpec<'a> {
     range_ns: i64,
     unwrap: Option<&'a logql::Unwrap>,
     quantile: Option<f64>,
+    offset_ns: i64,
 }
 
 fn metric_range_spec(expr: &logql::MetricExpr) -> RangeSpec<'_> {
@@ -573,12 +578,14 @@ fn metric_range_spec(expr: &logql::MetricExpr) -> RangeSpec<'_> {
             range_ns,
             unwrap,
             quantile,
+            offset_ns,
             ..
         } => RangeSpec {
             function: *function,
             range_ns: *range_ns,
             unwrap: unwrap.as_ref(),
             quantile: *quantile,
+            offset_ns: *offset_ns,
         },
         logql::MetricExpr::Aggregate { expr, .. }
         | logql::MetricExpr::TopK { expr, .. }
