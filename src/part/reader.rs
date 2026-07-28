@@ -807,16 +807,32 @@ impl PartReader {
             if predicate.canonical && !self.exact_field_bloom_canonical {
                 return true;
             }
-            // Stream labels are visible to pipeline field filters, but are
-            // intentionally not part of the exact-field bloom. The stream
-            // index handles label matchers; skipping this predicate here is
-            // required to avoid pruning a row group that contains the label.
+            // A stream label is not in the exact-field bloom, but it is in the
+            // stream index — so the predicate is answerable, just from the
+            // other side. This used to scan unconditionally, which made
+            // `| app="x"` on a stream label the one equality that could not
+            // prune, even though the index knows exactly which row groups hold
+            // it.
+            //
+            // The label is what the filter sees even when a parser extracted
+            // the same name, because the label is canonical and the extraction
+            // is renamed to `<name>_extracted`. So the index is authoritative
+            // here rather than merely a hint.
             if self
                 .stream_labels
                 .iter()
                 .any(|name| name == &predicate.name)
             {
-                return true;
+                // An empty value means "absent or empty", and absence is not
+                // an entry in the index.
+                if predicate.value.is_empty() {
+                    return true;
+                }
+                return self
+                    .stream_index
+                    .get(&predicate.name)
+                    .and_then(|values| values.get(&predicate.value))
+                    .is_some_and(|bitmap| bitmap.contains(rg as u32));
             }
             // Field-filter execution may treat an absent field as an empty
             // string. Absence is not represented in the bloom, so an empty

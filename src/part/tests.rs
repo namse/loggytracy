@@ -1421,3 +1421,63 @@ resident {:.0} B",
             assert_eq!(tenants.len(), 1);
         }
     }
+
+    /// A field filter on a stream label prunes through the stream index.
+    ///
+    /// It is not in the exact-field bloom and never will be, but the index
+    /// knows exactly which row groups hold each label value — so this used to
+    /// be the one equality that could not prune, for want of asking the other
+    /// side.
+    #[test]
+    fn a_field_filter_on_a_stream_label_prunes_through_the_index() {
+        let tmp = tempfile_dir();
+        let part = flush_rows(make_rows(), &tmp, 1).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let range = QueryTimeRange {
+            start_ns: i64::MIN,
+            end_ns: i64::MAX,
+            include_end: true,
+        };
+
+        // `app` is a stream label: two rows carry "test" and one "other".
+        let selected = reader.select_row_groups_with_exact_fields(
+            &test_tenant(),
+            &[],
+            &[],
+            &[ExactFieldPredicate::new("app", "other")],
+            range,
+        );
+        assert_eq!(
+            selected.len(),
+            1,
+            "only the row group holding app=other is selected: {selected:?}"
+        );
+
+        // A value no row group holds selects nothing at all.
+        assert!(
+            reader
+                .select_row_groups_with_exact_fields(
+                    &test_tenant(),
+                    &[],
+                    &[],
+                    &[ExactFieldPredicate::new("app", "absent")],
+                    range,
+                )
+                .is_empty()
+        );
+
+        // An empty value means "absent or empty", and absence is not an index
+        // entry, so it still scans.
+        assert!(
+            !reader
+                .select_row_groups_with_exact_fields(
+                    &test_tenant(),
+                    &[],
+                    &[],
+                    &[ExactFieldPredicate::new("app", "")],
+                    range,
+                )
+                .is_empty(),
+            "an empty equality cannot be answered by the index"
+        );
+    }

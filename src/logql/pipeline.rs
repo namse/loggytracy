@@ -168,13 +168,83 @@ fn extract_json_cancellable(
     if cancellation.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
         return Err(ExtractError::Cancelled);
     }
-    let serde_json::Value::Object(object) = value else {
-        return Err(ExtractError::Parse);
-    };
+    // A top-level array is valid JSON that Loki flattens by index, the same as
+    // a nested one. Rejecting it here would make `["a","b"]` a parser error
+    // while `{"x":["a","b"]}` extracted fine, which is a distinction the line
+    // format does not actually make.
     let mut fields = BTreeMap::new();
     let mut next_suffix: BTreeMap<String, usize> = BTreeMap::new();
-    flatten_json("", &object, &mut fields, &mut next_suffix, cancellation)?;
+    match value {
+        serde_json::Value::Object(object) => {
+            flatten_json("", &object, &mut fields, &mut next_suffix, cancellation)?;
+        }
+        serde_json::Value::Array(items) => {
+            flatten_array("", &items, &mut fields, &mut next_suffix, cancellation)?;
+        }
+        // A bare scalar line is not an object of fields. `json` on it is a
+        // parser error, which is what sets `__error__` and keeps the entry
+        // filterable rather than silently field-less.
+        _ => return Err(ExtractError::Parse),
+    }
     Ok(fields)
+}
+
+/// Arrays flatten by index: `{"a":["x","y"]}` yields `a_0` and `a_1`.
+///
+/// Dropping them silently was the previous behaviour, and it made a field
+/// present in the line unqueryable with no indication that it had been skipped.
+fn flatten_array(
+    prefix: &str,
+    items: &[serde_json::Value],
+    fields: &mut BTreeMap<String, String>,
+    next_suffix: &mut BTreeMap<String, usize>,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), ExtractError> {
+    for (index, value) in items.iter().enumerate() {
+        if cancellation.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
+            return Err(ExtractError::Cancelled);
+        }
+        let path = if prefix.is_empty() {
+            index.to_string()
+        } else {
+            format!("{prefix}_{index}")
+        };
+        flatten_value(&path, value, fields, next_suffix, cancellation)?;
+    }
+    Ok(())
+}
+
+fn flatten_value(
+    path: &str,
+    value: &serde_json::Value,
+    fields: &mut BTreeMap<String, String>,
+    next_suffix: &mut BTreeMap<String, usize>,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), ExtractError> {
+    match value {
+        serde_json::Value::String(value) => {
+            insert_extracted_with_counter(fields, next_suffix, path.to_string(), value.clone());
+        }
+        serde_json::Value::Bool(value) => {
+            insert_extracted_with_counter(fields, next_suffix, path.to_string(), value.to_string());
+        }
+        serde_json::Value::Number(value) => {
+            insert_extracted_with_counter(fields, next_suffix, path.to_string(), value.to_string());
+        }
+        serde_json::Value::Object(nested) => {
+            flatten_json(path, nested, fields, next_suffix, cancellation)?;
+        }
+        serde_json::Value::Array(items) => {
+            flatten_array(path, items, fields, next_suffix, cancellation)?;
+        }
+        // Extracted as empty rather than dropped, which is what Loki does. The
+        // difference is observable: `| field=""` matches a JSON null, and an
+        // absent field is a different question from a null one.
+        serde_json::Value::Null => {
+            insert_extracted_with_counter(fields, next_suffix, path.to_string(), String::new());
+        }
+    }
+    Ok(())
 }
 
 fn flatten_json(
@@ -196,21 +266,7 @@ fn flatten_json(
         } else {
             format!("{prefix}_{name}")
         };
-        match value {
-            serde_json::Value::String(value) => {
-                insert_extracted_with_counter(fields, next_suffix, path, value.clone());
-            }
-            serde_json::Value::Bool(value) => {
-                insert_extracted_with_counter(fields, next_suffix, path, value.to_string());
-            }
-            serde_json::Value::Number(value) => {
-                insert_extracted_with_counter(fields, next_suffix, path, value.to_string());
-            }
-            serde_json::Value::Object(nested) => {
-                flatten_json(&path, nested, fields, next_suffix, cancellation)?;
-            }
-            serde_json::Value::Null | serde_json::Value::Array(_) => {}
-        }
+        flatten_value(&path, value, fields, next_suffix, cancellation)?;
     }
     Ok(())
 }

@@ -637,3 +637,81 @@
         assert!(parse_expr(r#"count_over_time({a="b"}[5m] offset)"#).is_err());
         assert!(parse_expr(r#"count_over_time({a="b"}[5m] offset -1h)"#).is_err());
     }
+
+    /// Arrays flatten by index. Dropping them made a field that is present in
+    /// the line unqueryable, with nothing to say it had been skipped.
+    #[test]
+    fn json_arrays_flatten_by_index() {
+        let QueryExpr::Logs(query) = parse_expr(r#"{a="b"} | json"#).unwrap() else {
+            panic!("expected a log query")
+        };
+        let mut entry = LogEntry {
+            timestamp_ns: 1,
+            line: r#"{"tags":["red","green"],"nested":[{"id":7}]}"#.to_string(),
+            structured_metadata: vec![],
+        };
+        assert!(query.process_entry(&mut entry));
+        let fields: std::collections::BTreeMap<_, _> =
+            entry.structured_metadata.iter().cloned().collect();
+        assert_eq!(fields["tags_0"], "red");
+        assert_eq!(fields["tags_1"], "green");
+        assert_eq!(fields["nested_0_id"], "7");
+    }
+
+    /// A JSON null extracts as empty rather than vanishing. The difference is
+    /// observable: `| field=""` matches a null, and "absent" is a different
+    /// question from "null".
+    #[test]
+    fn json_null_extracts_as_an_empty_value() {
+        let QueryExpr::Logs(query) = parse_expr(r#"{a="b"} | json"#).unwrap() else {
+            panic!("expected a log query")
+        };
+        let mut entry = LogEntry {
+            timestamp_ns: 1,
+            line: r#"{"user":null,"id":1}"#.to_string(),
+            structured_metadata: vec![],
+        };
+        assert!(query.process_entry(&mut entry));
+        let fields: std::collections::BTreeMap<_, _> =
+            entry.structured_metadata.iter().cloned().collect();
+        assert_eq!(fields.get("user"), Some(&String::new()));
+    }
+
+    /// A top-level array is valid JSON and flattens the same as a nested one.
+    /// Refusing it would have made `["a"]` a parser error while
+    /// `{"x":["a"]}` extracted fine — a distinction the format does not make.
+    #[test]
+    fn a_top_level_json_array_extracts() {
+        let QueryExpr::Logs(query) = parse_expr(r#"{a="b"} | json"#).unwrap() else {
+            panic!("expected a log query")
+        };
+        let mut entry = LogEntry {
+            timestamp_ns: 1,
+            line: r#"[{"id":1},{"id":2}]"#.to_string(),
+            structured_metadata: vec![],
+        };
+        assert!(query.process_entry(&mut entry));
+        let fields: std::collections::BTreeMap<_, _> =
+            entry.structured_metadata.iter().cloned().collect();
+        assert_eq!(fields["0_id"], "1");
+        assert_eq!(fields["1_id"], "2");
+    }
+
+    /// A bare scalar is not a set of fields. It stays a parser error, which is
+    /// what sets `__error__` and keeps the entry filterable rather than
+    /// silently field-less.
+    #[test]
+    fn a_bare_scalar_line_is_still_a_json_parser_error() {
+        let QueryExpr::Logs(query) = parse_expr(r#"{a="b"} | json"#).unwrap() else {
+            panic!("expected a log query")
+        };
+        let mut entry = LogEntry {
+            timestamp_ns: 1,
+            line: "42".to_string(),
+            structured_metadata: vec![],
+        };
+        assert!(query.process_entry(&mut entry));
+        let fields: std::collections::BTreeMap<_, _> =
+            entry.structured_metadata.iter().cloned().collect();
+        assert_eq!(fields[crate::logql::PARSER_ERROR_FIELD], "JSONParserErr");
+    }

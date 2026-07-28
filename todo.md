@@ -73,8 +73,11 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
 - [x] Support `without`
 - [x] Support `offset`
 - [ ] Support subqueries
-- [ ] Support Loki-compatible semantics for JSON top-level arrays and `null` values
-- [ ] Improve exact-field pruning for empty-string equality, stream-label fields, and `_extracted` name collisions
+- [x] Loki-compatible JSON semantics for arrays, top-level arrays and `null`
+- [x] Exact-field pruning on stream-label fields, through the stream index
+- [ ] Exact-field pruning for empty-string equality and `_extracted` collisions —
+      both stay conservative on purpose: an empty equality also matches an absent
+      field, and absence is not indexed anywhere
 
 ## P2 — correctness and storage performance
 
