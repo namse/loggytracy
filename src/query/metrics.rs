@@ -308,19 +308,14 @@ fn evaluate_metric_all(
             }
             output
         }
-        logql::MetricExpr::Aggregate { op, by, expr } => {
+        logql::MetricExpr::Aggregate { op, grouping, expr } => {
             let inner = evaluate_metric_all(expr, entries, evaluation_times)?;
             let mut output = Vec::with_capacity(inner.len());
             for values in inner {
                 let mut grouped: BTreeMap<Labels, (f64, usize)> = BTreeMap::new();
                 for (labels, value) in values {
-                    let group = match by {
-                        Some(names) => names
-                            .iter()
-                            .filter_map(|name| {
-                                labels.get(name).map(|value| (name.clone(), value.clone()))
-                            })
-                            .collect(),
+                    let group = match grouping {
+                        Some(grouping) => grouping.key(&labels),
                         None => Labels::new(),
                     };
                     let aggregate = grouped.entry(group).or_insert((value, 0));
@@ -349,6 +344,27 @@ fn evaluate_metric_all(
             }
             output
         }
+        logql::MetricExpr::Binary {
+            op,
+            expr,
+            scalar,
+            scalar_on_left,
+        } => evaluate_metric_all(expr, entries, evaluation_times)?
+            .into_iter()
+            .map(|values| {
+                values
+                    .into_iter()
+                    .filter_map(|(labels, value)| {
+                        let (left, right) = if *scalar_on_left {
+                            (*scalar, value)
+                        } else {
+                            (value, *scalar)
+                        };
+                        op.apply(left, right).map(|value| (labels, value))
+                    })
+                    .collect()
+            })
+            .collect(),
         logql::MetricExpr::TopK { k, expr } => {
             let mut output = evaluate_metric_all(expr, entries, evaluation_times)?;
             for values in &mut output {
@@ -467,17 +483,34 @@ impl MetricEvaluator {
                 }
                 values
             }
-            logql::MetricExpr::Aggregate { op, by, expr } => {
+            logql::MetricExpr::Binary {
+                op,
+                expr,
+                scalar,
+                scalar_on_left,
+            } => {
+                let inner = self.evaluate_at(expr, evaluation_ns, cancellation)?;
+                inner
+                    .into_iter()
+                    .filter_map(|(labels, value)| {
+                        let (left, right) = if *scalar_on_left {
+                            (*scalar, value)
+                        } else {
+                            (value, *scalar)
+                        };
+                        // A comparison that does not hold drops the series
+                        // rather than yielding zero, which is what makes
+                        // `> 100` a filter and not an indicator.
+                        op.apply(left, right).map(|value| (labels, value))
+                    })
+                    .collect()
+            }
+            logql::MetricExpr::Aggregate { op, grouping, expr } => {
                 let inner = self.evaluate_at(expr, evaluation_ns, cancellation)?;
                 let mut grouped: BTreeMap<Labels, (f64, usize)> = BTreeMap::new();
                 for (labels, value) in inner {
-                    let group = match by {
-                        Some(names) => names
-                            .iter()
-                            .filter_map(|name| {
-                                labels.get(name).map(|value| (name.clone(), value.clone()))
-                            })
-                            .collect(),
+                    let group = match grouping {
+                        Some(grouping) => grouping.key(&labels),
                         None => Labels::new(),
                     };
                     let aggregate = grouped.entry(group).or_insert((value, 0));
@@ -547,9 +580,9 @@ fn metric_range_spec(expr: &logql::MetricExpr) -> RangeSpec<'_> {
             unwrap: unwrap.as_ref(),
             quantile: *quantile,
         },
-        logql::MetricExpr::Aggregate { expr, .. } | logql::MetricExpr::TopK { expr, .. } => {
-            metric_range_spec(expr)
-        }
+        logql::MetricExpr::Aggregate { expr, .. }
+        | logql::MetricExpr::TopK { expr, .. }
+        | logql::MetricExpr::Binary { expr, .. } => metric_range_spec(expr),
     }
 }
 

@@ -20,6 +20,12 @@ fn parse_metric_expr(input: &str, depth: usize) -> Result<MetricExpr, String> {
         ));
     }
     let input = input.trim();
+    // Split on a top-level binary operator before anything else, so the
+    // operands are parsed as complete expressions rather than the operator
+    // being mistaken for part of one.
+    if let Some(binary) = parse_binary(input, depth)? {
+        return Ok(binary);
+    }
     for (name, op) in [
         ("sum", AggregateOp::Sum),
         ("avg", AggregateOp::Avg),
@@ -28,31 +34,10 @@ fn parse_metric_expr(input: &str, depth: usize) -> Result<MetricExpr, String> {
     ] {
         if let Some(mut rest) = strip_word(input, name) {
             rest = rest.trim_start();
-            let (by, inside) = if let Some(after_by) = strip_word(rest, "by") {
-                let (grouping, tail) = take_parenthesized(after_by.trim_start())?;
-                let (inside, tail) = take_parenthesized(tail.trim_start())?;
-                if !tail.trim().is_empty() {
-                    return Err(format!("unexpected input after {name} aggregation"));
-                }
-                (Some(parse_grouping(grouping)?), inside)
-            } else {
-                let (inside, tail) = take_parenthesized(rest)?;
-                let tail = tail.trim_start();
-                if let Some(after_by) = strip_word(tail, "by") {
-                    let (grouping, tail) = take_parenthesized(after_by.trim_start())?;
-                    if !tail.trim().is_empty() {
-                        return Err(format!("unexpected input after {name} aggregation"));
-                    }
-                    (Some(parse_grouping(grouping)?), inside)
-                } else if !tail.is_empty() {
-                    return Err(format!("unexpected input after {name} aggregation"));
-                } else {
-                    (None, inside)
-                }
-            };
+            let (grouping, inside) = parse_aggregate_grouping(rest, name)?;
             return Ok(MetricExpr::Aggregate {
                 op,
-                by,
+                grouping,
                 expr: Box::new(parse_metric_expr(inside, depth + 1)?),
             });
         }
@@ -340,6 +325,151 @@ fn parse_matchers(input: &str) -> Result<Vec<LabelMatcher>, String> {
 /// aggregates and belongs to that function, not to the filtering. Keeping it
 /// out of `PipelineStage` means a log query can never carry one, which is what
 /// makes "this function needs an unwrap" checkable at parse time.
+/// `by (…)` or `without (…)`, before or after the aggregated expression.
+fn parse_aggregate_grouping<'a>(
+    rest: &'a str,
+    name: &str,
+) -> Result<(Option<Grouping>, &'a str), String> {
+    let rest = rest.trim_start();
+    for (keyword, build) in [
+        ("by", Grouping::By as fn(Vec<String>) -> Grouping),
+        ("without", Grouping::Without as fn(Vec<String>) -> Grouping),
+    ] {
+        if let Some(after) = strip_word(rest, keyword) {
+            let (names, tail) = take_parenthesized(after.trim_start())?;
+            let (inside, tail) = take_parenthesized(tail.trim_start())?;
+            if !tail.trim().is_empty() {
+                return Err(format!("unexpected input after {name} aggregation"));
+            }
+            return Ok((Some(build(parse_grouping(names)?)), inside));
+        }
+    }
+    let (inside, tail) = take_parenthesized(rest)?;
+    let tail = tail.trim_start();
+    for (keyword, build) in [
+        ("by", Grouping::By as fn(Vec<String>) -> Grouping),
+        ("without", Grouping::Without as fn(Vec<String>) -> Grouping),
+    ] {
+        if let Some(after) = strip_word(tail, keyword) {
+            let (names, tail) = take_parenthesized(after.trim_start())?;
+            if !tail.trim().is_empty() {
+                return Err(format!("unexpected input after {name} aggregation"));
+            }
+            return Ok((Some(build(parse_grouping(names)?)), inside));
+        }
+    }
+    if !tail.is_empty() {
+        return Err(format!("unexpected input after {name} aggregation"));
+    }
+    Ok((None, inside))
+}
+
+/// Binary operators, lowest precedence first so the split lands on the operator
+/// that binds least tightly — the same reason a recursive-descent parser peels
+/// `+` before `*`.
+const BINARY_OPERATORS: [(&str, BinaryOp); 11] = [
+    ("==", BinaryOp::Eq),
+    ("!=", BinaryOp::Neq),
+    (">=", BinaryOp::Gte),
+    ("<=", BinaryOp::Lte),
+    (">", BinaryOp::Gt),
+    ("<", BinaryOp::Lt),
+    ("+", BinaryOp::Add),
+    ("-", BinaryOp::Sub),
+    ("*", BinaryOp::Mul),
+    ("/", BinaryOp::Div),
+    ("%", BinaryOp::Mod),
+];
+
+fn parse_binary(input: &str, depth: usize) -> Result<Option<MetricExpr>, String> {
+    let Some((position, token, op)) = find_top_level_binary(input) else {
+        return Ok(None);
+    };
+    let left = input[..position].trim();
+    let right = input[position + token.len()..].trim();
+    if left.is_empty() || right.is_empty() {
+        return Err(format!("binary operator '{token}' is missing an operand"));
+    }
+    let left_scalar = left.parse::<f64>().ok();
+    let right_scalar = right.parse::<f64>().ok();
+    match (left_scalar, right_scalar) {
+        (None, Some(scalar)) => Ok(Some(MetricExpr::Binary {
+            op,
+            expr: Box::new(parse_metric_expr(left, depth + 1)?),
+            scalar,
+            scalar_on_left: false,
+        })),
+        (Some(scalar), None) => Ok(Some(MetricExpr::Binary {
+            op,
+            expr: Box::new(parse_metric_expr(right, depth + 1)?),
+            scalar,
+            scalar_on_left: true,
+        })),
+        (Some(_), Some(_)) => Err(
+            "a binary operation between two scalars is not a metric query".to_string(),
+        ),
+        (None, None) => Err(format!(
+            "binary operations between two metric expressions are not supported: '{token}' has a \
+selector on both sides, and each side would need its own scan"
+        )),
+    }
+}
+
+/// The rightmost lowest-precedence operator outside brackets, quotes and
+/// selectors.
+///
+/// Rightmost so that `a - b - c` associates left, which is what subtraction
+/// requires. Skipping bracketed regions is what keeps the `-` in `[5m]`, the
+/// `>` in a field filter and the `/` in a quoted path from being read as
+/// operators.
+fn find_top_level_binary(input: &str) -> Option<(usize, &'static str, BinaryOp)> {
+    let bytes = input.as_bytes();
+    let mut found: Option<(usize, &'static str, BinaryOp)> = None;
+    let mut depth = 0i32;
+    let mut index = 0usize;
+    let mut in_string = false;
+    let mut quote = b'"';
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if byte == b'\\' && quote == b'"' {
+                index += 2;
+                continue;
+            }
+            if byte == quote {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'`' => {
+                in_string = true;
+                quote = byte;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {
+                if depth == 0
+                    && let Some((token, op)) = BINARY_OPERATORS
+                        .iter()
+                        .find(|(token, _)| input[index..].starts_with(token))
+                {
+                    // `!=` and `=~` inside a bare selector never reach here
+                    // because a selector is braced, but a comparison operator
+                    // is two bytes and its first byte can also start another,
+                    // so the longest match wins by table order.
+                    found = Some((index, token, *op));
+                    index += token.len();
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    found
+}
+
 fn parse_log_query_with_unwrap(input: &str) -> Result<(LogQuery, Option<Unwrap>), String> {
     let Some(position) = find_unwrap_stage(input) else {
         return Ok((parse_log_query(input)?, None));

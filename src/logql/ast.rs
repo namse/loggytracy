@@ -391,6 +391,80 @@ impl Unwrap {
     }
 }
 
+/// `by (a, b)` keeps those labels; `without (a, b)` keeps everything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Grouping {
+    By(Vec<String>),
+    Without(Vec<String>),
+}
+
+impl Grouping {
+    /// The label set one series is grouped under.
+    pub fn key(&self, labels: &Labels) -> Labels {
+        match self {
+            Self::By(names) => names
+                .iter()
+                .filter_map(|name| labels.get(name).map(|value| (name.clone(), value.clone())))
+                .collect(),
+            Self::Without(names) => labels
+                .iter()
+                .filter(|(name, _)| !names.contains(name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        }
+    }
+
+    pub fn names(&self) -> &[String] {
+        match self {
+            Self::By(names) | Self::Without(names) => names,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Neq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+}
+
+impl BinaryOp {
+    /// Comparisons filter rather than compute: Prometheus and Loki keep the
+    /// left sample when the comparison holds and drop the series when it does
+    /// not, instead of yielding 1 or 0.
+    #[cfg(test)]
+    pub fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            Self::Eq | Self::Neq | Self::Gt | Self::Gte | Self::Lt | Self::Lte
+        )
+    }
+
+    pub fn apply(self, left: f64, right: f64) -> Option<f64> {
+        Some(match self {
+            Self::Add => left + right,
+            Self::Sub => left - right,
+            Self::Mul => left * right,
+            Self::Div => left / right,
+            Self::Mod => left % right,
+            Self::Eq => return (left == right).then_some(left),
+            Self::Neq => return (left != right).then_some(left),
+            Self::Gt => return (left > right).then_some(left),
+            Self::Gte => return (left >= right).then_some(left),
+            Self::Lt => return (left < right).then_some(left),
+            Self::Lte => return (left <= right).then_some(left),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateOp {
     Sum,
@@ -412,8 +486,23 @@ pub enum MetricExpr {
     },
     Aggregate {
         op: AggregateOp,
-        by: Option<Vec<String>>,
+        grouping: Option<Grouping>,
         expr: Box<MetricExpr>,
+    },
+    /// `expr op scalar` or `scalar op expr`.
+    ///
+    /// Vector-to-vector operations are not here. Both sides would be separate
+    /// selectors needing separate scans, and every read path in this engine is
+    /// built around one log query per metric expression — `log_query()` would
+    /// stop being answerable. That is a planner change, not a parser one, so
+    /// the parser refuses it rather than the evaluator half-doing it.
+    Binary {
+        op: BinaryOp,
+        expr: Box<MetricExpr>,
+        scalar: f64,
+        /// `2 - rate(…)` is not `rate(…) - 2`, so which side the scalar was on
+        /// has to survive parsing.
+        scalar_on_left: bool,
     },
     TopK {
         k: usize,
@@ -425,14 +514,18 @@ impl MetricExpr {
     pub fn log_query(&self) -> &LogQuery {
         match self {
             Self::Range { query, .. } => query,
-            Self::Aggregate { expr, .. } | Self::TopK { expr, .. } => expr.log_query(),
+            Self::Aggregate { expr, .. }
+            | Self::TopK { expr, .. }
+            | Self::Binary { expr, .. } => expr.log_query(),
         }
     }
 
     pub fn lookback_ns(&self) -> i64 {
         match self {
             Self::Range { range_ns, .. } => *range_ns,
-            Self::Aggregate { expr, .. } | Self::TopK { expr, .. } => expr.lookback_ns(),
+            Self::Aggregate { expr, .. }
+            | Self::TopK { expr, .. }
+            | Self::Binary { expr, .. } => expr.lookback_ns(),
         }
     }
 
@@ -442,14 +535,17 @@ impl MetricExpr {
     pub fn grouping_fields(&self) -> BTreeSet<String> {
         match self {
             Self::Range { .. } => BTreeSet::new(),
-            Self::Aggregate { by, expr, .. } => {
+            Self::Aggregate { grouping, expr, .. } => {
                 let mut fields = expr.grouping_fields();
-                if let Some(names) = by {
-                    fields.extend(names.iter().cloned());
+                if let Some(grouping) = grouping {
+                    // `without` names labels to drop, but the evaluator still
+                    // has to see them to drop them, so both forms pull their
+                    // names into the projected field set.
+                    fields.extend(grouping.names().iter().cloned());
                 }
                 fields
             }
-            Self::TopK { expr, .. } => expr.grouping_fields(),
+            Self::TopK { expr, .. } | Self::Binary { expr, .. } => expr.grouping_fields(),
         }
     }
 }

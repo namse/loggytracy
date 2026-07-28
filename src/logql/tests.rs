@@ -196,10 +196,103 @@
         else {
             panic!("expected metric")
         };
-        let MetricExpr::Aggregate { by, .. } = expr else {
+        let MetricExpr::Aggregate { grouping: by, .. } = expr else {
             panic!("expected aggregate")
         };
-        assert_eq!(by, Some(vec!["__error__".to_string(), "level".to_string()]));
+        assert_eq!(
+            by,
+            Some(Grouping::By(vec![
+                "__error__".to_string(),
+                "level".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn without_keeps_every_label_it_does_not_name() {
+        let QueryExpr::Metric(expr) =
+            parse_expr(r#"sum without (pod) (count_over_time({}[5m]))"#).unwrap()
+        else {
+            panic!("expected metric")
+        };
+        let MetricExpr::Aggregate { grouping, .. } = expr else {
+            panic!("expected aggregate")
+        };
+        let grouping = grouping.expect("a grouping clause");
+        let labels: std::collections::BTreeMap<String, String> = [
+            ("app".to_string(), "a".to_string()),
+            ("pod".to_string(), "p1".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let key = grouping.key(&labels);
+        assert_eq!(key.len(), 1);
+        assert_eq!(key["app"], "a");
+    }
+
+    #[test]
+    fn binary_operators_take_a_scalar_on_either_side() {
+        for query in [
+            r#"rate({app="a"}[5m]) / 1024"#,
+            r#"1024 * rate({app="a"}[5m])"#,
+            r#"sum(count_over_time({app="a"}[5m])) > 100"#,
+        ] {
+            assert!(parse_expr(query).is_ok(), "{query}");
+        }
+    }
+
+    /// The scalar's side is kept because subtraction and division are not
+    /// commutative: `2 - rate(…)` is a different query from `rate(…) - 2`.
+    #[test]
+    fn a_scalar_on_the_left_stays_on_the_left() {
+        let QueryExpr::Metric(MetricExpr::Binary {
+            op,
+            scalar,
+            scalar_on_left,
+            ..
+        }) = parse_expr(r#"2 - rate({app="a"}[5m])"#).unwrap()
+        else {
+            panic!("expected a binary metric")
+        };
+        assert_eq!(op, BinaryOp::Sub);
+        assert_eq!(scalar, 2.0);
+        assert!(scalar_on_left);
+    }
+
+    /// A comparison keeps the sample when it holds and drops the series when it
+    /// does not, rather than yielding 1 or 0. That is what makes `> 100` a
+    /// filter, and it is Prometheus's and Loki's behaviour.
+    #[test]
+    fn comparisons_filter_rather_than_indicate() {
+        assert!(BinaryOp::Gt.is_comparison());
+        assert_eq!(BinaryOp::Gt.apply(150.0, 100.0), Some(150.0));
+        assert_eq!(BinaryOp::Gt.apply(50.0, 100.0), None);
+        assert!(!BinaryOp::Add.is_comparison());
+        assert_eq!(BinaryOp::Add.apply(1.0, 2.0), Some(3.0));
+    }
+
+    /// Operators inside brackets, selectors and strings are not operators. The
+    /// `-` of `[5m]`, the `>` of a field filter and a `/` in a quoted path all
+    /// live inside something.
+    #[test]
+    fn operators_inside_brackets_and_strings_are_not_split_on() {
+        for query in [
+            r#"rate({app="a"}[5m])"#,
+            r#"count_over_time({app="a"} | logfmt | status > 400 [5m])"#,
+            r#"count_over_time({app="a"} |= "a/b" [5m])"#,
+            r#"sum by (a) (rate({app="a"}[5m]))"#,
+        ] {
+            assert!(parse_expr(query).is_ok(), "{query}");
+        }
+    }
+
+    /// Both sides being selectors would need a scan each, and every read path
+    /// here is built around one log query per metric expression. Refused in the
+    /// parser rather than half-done in the evaluator.
+    #[test]
+    fn vector_to_vector_operations_are_refused() {
+        let error = parse_expr(r#"rate({app="a"}[5m]) / rate({app="b"}[5m])"#).unwrap_err();
+        assert!(error.contains("own scan"), "{error}");
     }
 
     #[test]

@@ -67,8 +67,11 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
       (literal text and `{{.field}}`), refusing what it cannot render rather than approximating
 - [x] Support `unwrap` (bare field and `duration(field)`) plus `sum_over_time`,
       `avg_over_time`, `min_over_time`, `max_over_time` and `quantile_over_time`
-- [ ] Support binary/vector operators
-- [ ] Support `without`, offset, and subqueries
+- [x] Support binary operators with a scalar operand (`+ - * / %`, `== != > >= < <=`).
+      Vector-to-vector is refused: both sides would need their own scan, which is a
+      planner change rather than a parser one
+- [x] Support `without`
+- [ ] Support offset and subqueries
 - [ ] Support Loki-compatible semantics for JSON top-level arrays and `null` values
 - [ ] Improve exact-field pruning for empty-string equality, stream-label fields, and `_extracted` name collisions
 
