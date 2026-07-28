@@ -110,8 +110,8 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
 - [ ] **Mitigate N3**: With 500 tenants, the same 5,000 rows become 24.7x (28 KB → 691 KB). Row groups stop
       at tenant boundaries, so tenant count is a lower bound for row-group count and Parquet column metadata
       and bloom filters scale with it. The target workload has many small tenants, so this directly affects design.
-- [ ] Improve the load probe to verify rows read — it currently cannot distinguish "restored and read" from
-      "nothing matched."
+- [x] Improve the load probe to verify rows read — the probe counts the lines returned, so "restored and
+      read" is distinguishable from "nothing matched"
 
 ## P4 — M6 hardware replacement
 

@@ -151,6 +151,8 @@ async fn main() {
     let mut ack_warmup = Vec::new();
     let mut query_steady = Vec::new();
     let mut restore_probe_latency = Vec::new();
+    let mut restore_probe_rows = 0u64;
+    let mut restore_probes_with_rows = 0u64;
     let mut metric_steady = Vec::new();
     let mut tempo_steady = Vec::new();
     // Absent when the harness was not told which process to watch. Reporting
@@ -263,9 +265,17 @@ async fn main() {
                     "",
                     query_tenant.as_deref(),
                 ) {
-                    Ok((200, _)) => {
+                    Ok((200, response)) => {
                         restore_probe_latency.push(started.elapsed());
                         restore_probes += 1;
+                        // A 200 alone cannot tell a restored part that was read
+                        // from a window that held nothing. Count what came
+                        // back, so the difference is in the result.
+                        let rows = loki_result_rows(&response);
+                        restore_probe_rows += rows;
+                        if rows > 0 {
+                            restore_probes_with_rows += 1;
+                        }
                     }
                     Ok(_) | Err(_) => query_errors += 1,
                 }
@@ -465,6 +475,13 @@ async fn main() {
         "recovered_merge_errors": merge_errors_delta,
         "restore_errors": restore_errors_delta,
         "restore_observed": restore_success_delta > 0,
+        // Reported rather than gated: with retention on, the probe's window is
+        // legitimately empty, so zero rows is not by itself a failure. What it
+        // is, is the difference between a run that proved the round trip and
+        // one that only proved the endpoint answers.
+        "restore_probe_rows": restore_probe_rows,
+        "restore_probes_with_rows": restore_probes_with_rows,
+        "restore_read_rows": restore_probe_rows > 0,
         "retention_observed": retention_success_delta > 0,
     });
     let behavioral_pass = ingest_errors_delta == 0
@@ -778,6 +795,27 @@ fn object_store_op_delta(
     )
 }
 
+/// Log lines in a Loki `query_range` response, across every stream it returned.
+///
+/// Deliberately tolerant: a body this cannot parse counts as zero rows rather
+/// than failing the probe, because the probe's own gate is the status code and
+/// this number is a description of what came back.
+fn loki_result_rows(response: &str) -> u64 {
+    let Some(body_start) = response.find("\r\n\r\n") else {
+        return 0;
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&response[body_start + 4..]) else {
+        return 0;
+    };
+    let Some(streams) = body["data"]["result"].as_array() else {
+        return 0;
+    };
+    streams
+        .iter()
+        .map(|stream| stream["values"].as_array().map_or(0, Vec::len) as u64)
+        .sum()
+}
+
 fn gauge(metrics: &HashMap<String, f64>, name: &str) -> u64 {
     metrics.get(name).copied().unwrap_or(0.0) as u64
 }
@@ -858,4 +896,33 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_the_lines_a_loki_response_returned() {
+        let body = r#"{"status":"success","data":{"resultType":"streams","result":[
+            {"stream":{"app":"a"},"values":[["1","x"],["2","y"]]},
+            {"stream":{"app":"b"},"values":[["3","z"]]}]}}"#;
+        assert_eq!(
+            loki_result_rows(&format!("HTTP/1.1 200 OK\r\n\r\n{body}")),
+            3
+        );
+    }
+
+    /// A window that matched nothing answers 200 with an empty result, which is
+    /// exactly the case a status code cannot tell from a restored read.
+    #[test]
+    fn an_empty_result_counts_zero_rows() {
+        let body = r#"{"status":"success","data":{"resultType":"streams","result":[]}}"#;
+        assert_eq!(
+            loki_result_rows(&format!("HTTP/1.1 200 OK\r\n\r\n{body}")),
+            0
+        );
+        assert_eq!(loki_result_rows("HTTP/1.1 200 OK\r\n\r\nnot json"), 0);
+        assert_eq!(loki_result_rows("no headers at all"), 0);
+    }
 }

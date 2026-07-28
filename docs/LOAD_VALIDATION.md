@@ -223,9 +223,10 @@ LOGGYTRACY_LOAD_RESTORE_LOOKBACK_SECONDS=40
 With this configuration, 111 evictions, 66 parts, `restore_observed: true`, and zero restore errors were
 observed (restore latency p50 31 ms / p95 749 ms / p99 1.6 s).
 
-**One remaining limitation:** The probe cannot distinguish "restored and read" from "nothing matched" —
-both return 200. This run is valid because `restore_observed` is confirmed by a server-side counter, but it
-would be better for the probe itself to verify the number of rows read.
+The probe now counts the lines that came back (`restore_probe_rows`,
+`restore_probes_with_rows`), so "restored and read" is distinguishable from "nothing matched" without
+inferring it from a server-side counter. It is reported rather than gated: with retention on, the probe's
+window is legitimately empty, and a zero there describes the configuration rather than a failure.
 
 Record measurements in [`LOAD_RESULTS.md`](LOAD_RESULTS.md). Numbers kept only in chat or a terminal
 disappear and must be measured again. Always record the machine profile, build revision, and seed with the
