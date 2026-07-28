@@ -393,9 +393,12 @@ second, `flush_max_interval=2s`, `merge_interval=5s`, `retention=30s/5s`):
 | DELETE | 0 | |
 | COPY | 0 | |
 
-**A flush costs five PUTs and one GET.** Four PUTs are the part's immutable
-files (`data`, `bloom`, `stream index`, `meta`), one is the manifest, and the
-GET is the manifest it read to replace. That is pinned in a test, along with
+**A flush costs five PUTs and one GET** *as measured*. Four PUTs were the
+part's immutable files (`data`, `bloom`, `stream index`, `meta`), one was the
+manifest, and the GET was the manifest it read to replace. The blooms and the
+stream index have since been consolidated into one `index.bin`, making it
+**four PUTs and one GET** — the tables below are the measured five; divide the
+PUT column by 5 and multiply by 4 for the current shape. That is pinned in a test, along with
 the property that matters more: publishing the tenth part into a nine-part
 manifest costs exactly what publishing the first into an empty one. The
 remaining 20 PUTs are the four merge ticks that actually rewrote something,

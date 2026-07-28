@@ -69,8 +69,7 @@ fn cache_part_dir(parts_root: &Path, descriptor: &ManifestPart) -> Result<PathBu
     let dir = ensure_safe_directory_chain(parts_root, &[&descriptor.partition, &descriptor.id])?;
     for file in [
         DATA_FILE,
-        BLOOM_FILE,
-        STREAM_INDEX_FILE,
+        INDEX_FILE,
         META_FILE,
         part::MERGE_TOMBSTONE_FILE,
         UPLOAD_MARKER_FILE,

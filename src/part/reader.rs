@@ -87,31 +87,18 @@ struct DecodedBlooms {
 }
 
 fn validate_sidecar_files(part: &Part) -> Result<(), String> {
-    let files = [
-        (
-            BLOOM_FILE,
-            part.bloom_path(),
-            part.meta.integrity.bloom_crc32,
-        ),
-        (
-            STREAM_INDEX_FILE,
-            part.stream_index_path(),
-            part.meta.integrity.stream_index_crc32,
-        ),
-    ];
-    for (name, path, expected) in files {
-        let actual = file_crc32(&path).map_err(|error| {
-            format!(
-                "failed to checksum {name} for part {}: {error}",
-                part.meta.id
-            )
-        })?;
-        if actual != expected {
-            return Err(format!(
-                "{name} checksum mismatch for part {}: expected {expected}, got {actual}",
-                part.meta.id
-            ));
-        }
+    let expected = part.meta.integrity.index_crc32;
+    let actual = file_crc32(&part.index_path()).map_err(|error| {
+        format!(
+            "failed to checksum {INDEX_FILE} for part {}: {error}",
+            part.meta.id
+        )
+    })?;
+    if actual != expected {
+        return Err(format!(
+            "{INDEX_FILE} checksum mismatch for part {}: expected {expected}, got {actual}",
+            part.meta.id
+        ));
     }
     Ok(())
 }
@@ -222,10 +209,10 @@ impl PartReader {
                 part.meta.id
             ));
         }
-        let bloom_bytes = fs::read(part.bloom_path()).map_err(|e| e.to_string())?;
-        let decoded_blooms = decode_blooms(&bloom_bytes, part.meta.row_group_count as usize)?;
-        let stream_index =
-            decode_stream_index(&fs::read(part.stream_index_path()).map_err(|e| e.to_string())?)?;
+        let index_bytes = fs::read(part.index_path()).map_err(|e| e.to_string())?;
+        let (bloom_bytes, stream_bytes) = split_index(&index_bytes)?;
+        let decoded_blooms = decode_blooms(bloom_bytes, part.meta.row_group_count as usize)?;
+        let stream_index = decode_stream_index(stream_bytes)?;
         validate_stream_index(&part, &stream_index)?;
         let stream_labels = part.meta.stream_labels.clone();
         if require_data || part.data_path().exists() {

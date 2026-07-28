@@ -31,34 +31,44 @@
         bytes
     }
 
-    fn rewrite_part_bloom_as_v1(part: &Part) {
-        let bytes = fs::read(part.bloom_path()).unwrap();
-        let decoded = decode_blooms(&bytes, part.meta.row_group_count as usize).unwrap();
-        let legacy = encode_btf1(&decoded.line);
-        fs::write(part.bloom_path(), &legacy).unwrap();
+    /// Replaces the bloom section of a part's index container, leaving the
+    /// stream index alone, and repairs both checksums. Downgrade tests need to
+    /// put an older bloom encoding on disk without disturbing anything else.
+    fn replace_bloom_section(part: &Part, replacement: &[u8]) {
+        let bytes = fs::read(part.index_path()).unwrap();
+        let (_, streams) = split_index(&bytes).unwrap();
+        let mut rebuilt = Vec::new();
+        rebuilt.extend_from_slice(INDEX_MAGIC);
+        for section in [replacement, streams] {
+            rebuilt.extend_from_slice(&(section.len() as u32).to_le_bytes());
+            rebuilt.extend_from_slice(section);
+        }
+        fs::write(part.index_path(), &rebuilt).unwrap();
 
         let meta_path = part.meta_path();
         let mut meta: MetaFile =
             serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-        meta.integrity.bloom_crc32 = crc32fast::hash(&legacy);
+        meta.integrity.index_crc32 = crc32fast::hash(&rebuilt);
         meta.integrity.metadata_crc32 = 0;
         meta.integrity.metadata_crc32 = metadata_crc32(&meta).unwrap();
         fs::write(meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
     }
 
-    fn rewrite_part_bloom_as_v2(part: &Part) {
-        let bytes = fs::read(part.bloom_path()).unwrap();
-        let decoded = decode_blooms(&bytes, part.meta.row_group_count as usize).unwrap();
-        let legacy = encode_btf2(&decoded.line, decoded.exact_fields.as_ref().unwrap());
-        fs::write(part.bloom_path(), &legacy).unwrap();
+    fn part_blooms(part: &Part) -> DecodedBlooms {
+        let bytes = fs::read(part.index_path()).unwrap();
+        let (bloom, _) = split_index(&bytes).unwrap();
+        decode_blooms(bloom, part.meta.row_group_count as usize).unwrap()
+    }
 
-        let meta_path = part.meta_path();
-        let mut meta: MetaFile =
-            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-        meta.integrity.bloom_crc32 = crc32fast::hash(&legacy);
-        meta.integrity.metadata_crc32 = 0;
-        meta.integrity.metadata_crc32 = metadata_crc32(&meta).unwrap();
-        fs::write(meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    fn rewrite_part_bloom_as_v1(part: &Part) {
+        let decoded = part_blooms(part);
+        replace_bloom_section(part, &encode_btf1(&decoded.line));
+    }
+
+    fn rewrite_part_bloom_as_v2(part: &Part) {
+        let decoded = part_blooms(part);
+        let legacy = encode_btf2(&decoded.line, decoded.exact_fields.as_ref().unwrap());
+        replace_bloom_section(part, &legacy);
     }
 
     fn make_rows() -> Vec<Row> {
@@ -175,7 +185,9 @@
         rows[0].structured_metadata = vec![("trace_id".to_string(), "first".to_string())];
         rows[1].structured_metadata = vec![("trace_id".to_string(), "second".to_string())];
         let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
-        assert_eq!(&fs::read(part.bloom_path()).unwrap()[..4], BLOOM_MAGIC_V4);
+        let index_bytes = fs::read(part.index_path()).unwrap();
+        assert_eq!(&index_bytes[..INDEX_MAGIC.len()], INDEX_MAGIC);
+        assert_eq!(&split_index(&index_bytes).unwrap().0[..4], BLOOM_MAGIC_V4);
         let reader = PartReader::open(part).unwrap();
 
         let selected = reader.select_row_groups_with_exact_fields(&test_tenant(),
@@ -243,14 +255,14 @@
             row.structured_metadata = vec![];
         }
         let plain_part = flush_rows(plain.clone(), &tmp, 1).unwrap().remove(0);
-        let plain_bytes = fs::metadata(plain_part.bloom_path()).unwrap().len();
+        let plain_bytes = fs::metadata(plain_part.index_path()).unwrap().len();
 
         let mut indexed = plain;
         for row in &mut indexed {
             row.structured_metadata = vec![("trace_id".to_string(), "abc".to_string())];
         }
         let indexed_part = flush_rows(indexed, &tempfile_dir(), 1).unwrap().remove(0);
-        let indexed_bytes = fs::metadata(indexed_part.bloom_path()).unwrap().len();
+        let indexed_bytes = fs::metadata(indexed_part.index_path()).unwrap().len();
 
         let row_groups = plain_part.meta.row_group_count as u64;
         assert!(row_groups >= 2, "need more than one row group to see a floor");
@@ -908,7 +920,7 @@
                 .collect();
             let part = flush_rows(rows, &tmp, 8192).expect("flush").remove(0);
             let on_disk = fs::metadata(part.data_path()).unwrap().len();
-            let bloom = fs::metadata(part.bloom_path()).unwrap().len();
+            let bloom = fs::metadata(part.index_path()).unwrap().len();
             let reader = PartReader::open(part).expect("open");
             (
                 reader.meta().row_group_count,
@@ -1070,7 +1082,7 @@ resident {:.0} B",
         )
         .unwrap();
         let new_dir = &merged[0].dir;
-        std::fs::write(new_dir.join(BLOOM_FILE), b"corrupt").unwrap();
+        std::fs::write(new_dir.join(INDEX_FILE), b"corrupt").unwrap();
 
         let discovered = discover_parts(&parts_root).unwrap();
         assert_eq!(discovered.len(), 1);
@@ -1536,4 +1548,40 @@ resident {:.0} B",
         .unwrap();
         let rows: u64 = parts.iter().map(|part| part.meta.row_count).sum();
         assert_eq!(rows, 6);
+    }
+
+    /// The container is the first thing read, so a file from a build that laid
+    /// it out differently has to be refused rather than parsed as sections.
+    #[test]
+    fn an_index_file_without_the_container_header_is_refused() {
+        assert!(split_index(b"BTF4nonsense").is_err());
+        assert!(split_index(b"").is_err());
+        // Header present, first length prefix truncated.
+        let mut truncated = INDEX_MAGIC.to_vec();
+        truncated.extend_from_slice(&[0u8; 2]);
+        assert!(split_index(&truncated).is_err());
+        // Length prefix claims more than follows it.
+        let mut lying = INDEX_MAGIC.to_vec();
+        lying.extend_from_slice(&99u32.to_le_bytes());
+        lying.extend_from_slice(b"short");
+        assert!(split_index(&lying).is_err());
+    }
+
+    /// Both sections come back exactly as written, and a part opens from them.
+    /// Splitting one file into two payloads is the whole change; getting the
+    /// boundary wrong would mix the blooms into the stream index silently.
+    #[test]
+    fn the_index_container_round_trips_both_sections() {
+        let tmp = tempfile_dir();
+        let part = flush_rows(make_rows(), &tmp, 1).unwrap().remove(0);
+        let bytes = fs::read(part.index_path()).unwrap();
+        let (bloom, streams) = split_index(&bytes).unwrap();
+        assert_eq!(&bloom[..4], BLOOM_MAGIC_V4);
+        assert_eq!(&streams[..STREAM_MAGIC.len()], STREAM_MAGIC);
+        assert_eq!(
+            INDEX_MAGIC.len() + 4 + bloom.len() + 4 + streams.len(),
+            bytes.len(),
+            "the container holds the two sections and nothing else"
+        );
+        assert!(PartReader::open(part).is_ok());
     }

@@ -24,8 +24,18 @@ use crate::memtable::{Labels, LogEntry, MemTableSnapshot, QueryResult, StreamRes
 use crate::tenant::TenantId;
 
 pub const DATA_FILE: &str = "data.parquet";
-pub const BLOOM_FILE: &str = "bloom.tri";
-pub const STREAM_INDEX_FILE: &str = "stream.idx";
+/// Trigram blooms and the stream index in one file.
+///
+/// They were two, and a part therefore cost two objects, two round trips on
+/// restore and two checksum passes at startup. Startup at 10,099 parts is
+/// dominated by exactly that validation (LOAD_RESULTS.md §8), and every object
+/// per part is a Class A operation per flush (§9). Nothing ever read one of
+/// these without the other, so being two files bought nothing.
+pub const INDEX_FILE: &str = "index.bin";
+/// Container header: magic plus the version of the layout inside it. Checked
+/// before any section is read, so a file from another build is refused rather
+/// than parsed as garbage.
+pub const INDEX_MAGIC: &[u8; 5] = b"LTIX1";
 pub const META_FILE: &str = "meta.json";
 pub const MERGE_TOMBSTONE_FILE: &str = ".merge.tombstone";
 /// On-disk layout of `meta.json`.
@@ -35,7 +45,7 @@ pub const MERGE_TOMBSTONE_FILE: &str = ".merge.tombstone";
 /// agree on what the struct is. Without this a format change surfaces as a
 /// checksum mismatch, which reads as corruption rather than as a version the
 /// build cannot handle.
-pub const PART_META_VERSION: u32 = 1;
+pub const PART_META_VERSION: u32 = 2;
 
 const BLOOM_MAGIC_V1: &[u8; 4] = b"BTF1";
 const BLOOM_MAGIC_V2: &[u8; 4] = b"BTF2";
@@ -247,11 +257,8 @@ impl Part {
     pub fn data_path(&self) -> PathBuf {
         self.dir.join(DATA_FILE)
     }
-    pub fn bloom_path(&self) -> PathBuf {
-        self.dir.join(BLOOM_FILE)
-    }
-    pub fn stream_index_path(&self) -> PathBuf {
-        self.dir.join(STREAM_INDEX_FILE)
+    pub fn index_path(&self) -> PathBuf {
+        self.dir.join(INDEX_FILE)
     }
     pub fn meta_path(&self) -> PathBuf {
         self.dir.join(META_FILE)

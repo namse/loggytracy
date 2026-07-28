@@ -200,13 +200,7 @@ fn write_part_files(
     row_group_size: usize,
 ) -> io::Result<()> {
     write_parquet(&dir.join(DATA_FILE), rows, stream_labels, row_group_size)?;
-    write_bloom(&dir.join(BLOOM_FILE), rows, row_group_size)?;
-    write_stream_index(
-        &dir.join(STREAM_INDEX_FILE),
-        rows,
-        row_group_size,
-        stream_labels,
-    )?;
+    write_index(&dir.join(INDEX_FILE), rows, row_group_size, stream_labels)?;
     write_meta(
         &dir.join(META_FILE),
         id,
@@ -321,7 +315,7 @@ fn write_parquet(
     Ok(())
 }
 
-fn write_bloom(path: &Path, rows: &[Row], row_group_size: usize) -> io::Result<()> {
+fn encode_blooms(rows: &[Row], row_group_size: usize) -> io::Result<Vec<u8>> {
     let bounds = row_group_bounds(rows, row_group_size);
     let mut buf = Vec::new();
     buf.extend_from_slice(BLOOM_MAGIC_V4);
@@ -385,7 +379,5 @@ fn write_bloom(path: &Path, rows: &[Row], row_group_size: usize) -> io::Result<(
         buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&bytes);
     }
-    fs::write(path, &buf)?;
-    sync_file(path)?;
-    Ok(())
+    Ok(buf)
 }

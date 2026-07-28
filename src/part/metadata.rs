@@ -36,8 +36,7 @@ fn write_meta(
         .ok_or_else(|| io::Error::other("metadata path has no parent"))?;
     let integrity = PartIntegrity {
         data_crc32: file_crc32(&dir.join(DATA_FILE))?,
-        bloom_crc32: file_crc32(&dir.join(BLOOM_FILE))?,
-        stream_index_crc32: file_crc32(&dir.join(STREAM_INDEX_FILE))?,
+        index_crc32: file_crc32(&dir.join(INDEX_FILE))?,
         metadata_crc32: 0,
     };
     let mut meta = MetaFile {
@@ -100,8 +99,7 @@ fn tenant_segments(rows: &[Row], bounds: &[(usize, usize)]) -> Vec<TenantSegment
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PartIntegrity {
     data_crc32: u32,
-    bloom_crc32: u32,
-    stream_index_crc32: u32,
+    index_crc32: u32,
     metadata_crc32: u32,
 }
 

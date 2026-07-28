@@ -248,11 +248,13 @@ The process follows `RUST_LOG` directly. When unset, it uses `loggytracy=info,wa
 
 ## The flush interval is the object-store bill
 
-A flush costs **five PUTs and one GET**: four PUTs for the part's immutable
-files, one for the manifest, and the GET is the manifest it replaced. Measured,
-not estimated ([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §9), and pinned by a test
-that also holds the property that matters — publishing the tenth part into a
-nine-part manifest costs what publishing the first into an empty one cost.
+A flush costs **four PUTs and one GET**: three PUTs for the part's immutable
+files (`data.parquet`, `index.bin`, `meta.json`), one for the manifest, and the
+GET is the manifest it replaced. Measured, not estimated
+([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §9), and pinned by a test that also holds
+the two properties that matter — publishing the tenth part into a nine-part
+manifest costs what publishing the first into an empty one cost, and the file
+count per part is asserted rather than incidental.
 
 A flush skips an empty memtable, so an idle instance costs nothing. An instance
 with continuous traffic flushes on every tick, which makes PUT volume a function
@@ -260,16 +262,17 @@ of this one setting:
 
 | `FLUSH_MAX_INTERVAL` | Class A / day | / month | R2 cost |
 |---|---|---|---|
-| 2 s | 216,000 | 6.48 M | $24.66 |
-| 5 s (**default**) | 86,400 | 2.59 M | $7.16 |
-| 15 s | 28,800 | 0.86 M | free tier |
-| 30 s | 14,400 | 0.43 M | free tier |
-| 60 s | 7,200 | 0.22 M | free tier |
+| 2 s | 172,800 | 5.18 M | $18.83 |
+| 5 s (**default**) | 69,120 | 2.07 M | $4.83 |
+| 15 s | 23,040 | 0.69 M | free tier |
+| 30 s | 11,520 | 0.35 M | free tier |
+| 60 s | 5,760 | 0.17 M | free tier |
 
 **The default does not fit the budget this engine was designed around.** The
 shared-part layout exists because per-tenant objects broke a $1/month plan, and
-one busy instance at the default spends seven times that before any tenant
-multiplier.
+one busy instance at the default spends almost five times that before any
+tenant multiplier. Consolidating the two index sidecars into one file took a
+fifth off this table; the remaining term is the flush rate itself.
 
 The default is 5 s anyway, because this setting is also the RPO — how much
 acknowledged data a disk loss can cost — and that is a deployment decision

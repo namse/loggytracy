@@ -45,7 +45,10 @@ The complete production-readiness gate list is in [`docs/PRODUCTION_READINESS_RE
         Details: [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
   - [x] ~~`(tier, day)` partitioning~~ — rejected. Fixing retention at write time does not apply plan changes
         to existing data. Partitions remain by `day`.
-  - [ ] Consolidate four part sidecars into one, add Parquet range reads (P2), and use `(part, tenant)` local cache keys
+  - [ ] Add Parquet range reads (P2) and use `(part, tenant)` local cache keys. **Sidecar consolidation is
+        done**: the trigram blooms and the stream index are one `index.bin`, so a part is three files rather
+        than four — one fewer billed PUT per flush, one fewer round trip per catalog restore, and one fewer
+        checksum pass per part at startup, which §8 measured as the actual startup cost
   - [x] **Per-tenant ingest rate** — `ingest_rate` rides the same push as retention. The control plane sets the
         number; this side only owns the field and enforcement points. Check before decompression so an over-limit
         tenant cannot consume CPU.

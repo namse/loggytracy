@@ -758,7 +758,7 @@
         assert_eq!(storage.evict_cache(&root, 0, &eligible).unwrap(), 0);
         assert!(!parts[0].data_path().exists());
         assert!(parts[0].meta_path().exists());
-        assert!(parts[0].bloom_path().exists());
+        assert!(parts[0].index_path().exists());
     }
 
     #[test]
@@ -1575,6 +1575,12 @@ opens a connection per part"
         let first_publish = delta(before, storage.operation_counts());
 
         assert_eq!(first_publish.puts, PART_FILES.len() as u64 + 1);
+        assert_eq!(
+            PART_FILES.len(),
+            3,
+            "every file per part is a billed request per flush, so the count is \
+             load-bearing rather than incidental"
+        );
         assert_eq!(first_publish.gets, 1);
         assert_eq!(first_publish.lists, 0);
         assert_eq!(first_publish.copies, 0);

@@ -8,7 +8,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode, PutOptions, PutResult, UpdateVersion};
 use serde::{Deserialize, Serialize};
 
-use crate::part::{self, BLOOM_FILE, DATA_FILE, META_FILE, Part, STREAM_INDEX_FILE};
+use crate::part::{self, DATA_FILE, INDEX_FILE, META_FILE, Part};
 use crate::trace_part::{
     TRACE_BLOOM_FILE, TRACE_DATA_FILE, TRACE_META_FILE, TracePart, TracePartReader,
     discover_trace_parts,
@@ -16,8 +16,8 @@ use crate::trace_part::{
 
 const MANIFEST_FILE: &str = "manifest.json";
 const UPLOAD_MARKER_FILE: &str = ".object-store-uploading";
-const PART_FILES: [&str; 4] = [DATA_FILE, BLOOM_FILE, STREAM_INDEX_FILE, META_FILE];
-const CATALOG_FILES: [&str; 3] = [BLOOM_FILE, STREAM_INDEX_FILE, META_FILE];
+const PART_FILES: [&str; 3] = [DATA_FILE, INDEX_FILE, META_FILE];
+const CATALOG_FILES: [&str; 2] = [INDEX_FILE, META_FILE];
 /// Part downloads in flight while restoring a catalog or a set of bodies.
 ///
 /// Restore was sequential, so its cost was `parts × round trip` — a startup on

@@ -17,12 +17,57 @@ fn encode_exact_field_token(name: &str, value: &str) -> io::Result<Vec<u8>> {
     Ok(token)
 }
 
-fn write_stream_index(
+/// Writes the blooms and the stream index as two length-prefixed sections
+/// behind one header, so a reader takes one file open and one checksum.
+fn write_index(
     path: &Path,
     rows: &[Row],
     row_group_size: usize,
     stream_labels: &[String],
 ) -> io::Result<()> {
+    let bloom = encode_blooms(rows, row_group_size)?;
+    let streams = encode_stream_index(rows, row_group_size, stream_labels)?;
+    let mut buf = Vec::with_capacity(INDEX_MAGIC.len() + 8 + bloom.len() + streams.len());
+    buf.extend_from_slice(INDEX_MAGIC);
+    for section in [&bloom, &streams] {
+        let length = u32::try_from(section.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "index section is too large")
+        })?;
+        buf.extend_from_slice(&length.to_le_bytes());
+        buf.extend_from_slice(section);
+    }
+    fs::write(path, &buf)?;
+    sync_file(path)?;
+    Ok(())
+}
+
+/// Splits a container back into `(blooms, stream index)`.
+fn split_index(buf: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    if !buf.starts_with(INDEX_MAGIC) {
+        return Err("part index file has an unrecognized header".to_string());
+    }
+    let mut rest = &buf[INDEX_MAGIC.len()..];
+    let mut sections: [&[u8]; 2] = [&[], &[]];
+    for section in sections.iter_mut() {
+        if rest.len() < 4 {
+            return Err("part index file is truncated".to_string());
+        }
+        let length = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        rest = &rest[4..];
+        if rest.len() < length {
+            return Err("part index file is truncated".to_string());
+        }
+        *section = &rest[..length];
+        rest = &rest[length..];
+    }
+    Ok((sections[0], sections[1]))
+}
+
+fn encode_stream_index(
+    rows: &[Row],
+    row_group_size: usize,
+    stream_labels: &[String],
+) -> io::Result<Vec<u8>> {
     let bounds = row_group_bounds(rows, row_group_size);
     let mut index: StreamMap = BTreeMap::new();
     for (rg, (start, end)) in bounds.iter().enumerate() {
@@ -59,8 +104,6 @@ fn write_stream_index(
             buf.extend_from_slice(&bm_bytes);
         }
     }
-    fs::write(path, &buf)?;
-    sync_file(path)?;
-    Ok(())
+    Ok(buf)
 }
 

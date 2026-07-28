@@ -767,7 +767,7 @@ impl PartRegistry {
 mod tests {
     use super::*;
     use crate::memtable::Labels;
-    use crate::part::{self, BLOOM_FILE, Row};
+    use crate::part::{self, INDEX_FILE, Row};
     use crate::tenant::test_tenant;
     use std::collections::BTreeMap;
 
@@ -846,7 +846,7 @@ mod tests {
         )
         .unwrap()
         .remove(0);
-        std::fs::write(new.dir.join(BLOOM_FILE), b"corrupt").unwrap();
+        std::fs::write(new.dir.join(INDEX_FILE), b"corrupt").unwrap();
 
         let result = registry.replace(&[old_id], vec![part::load_part(&new.dir).unwrap()]);
         assert!(result.is_err());
@@ -879,7 +879,7 @@ mod tests {
         )
         .unwrap()
         .remove(0);
-        std::fs::write(corrupt.dir.join(BLOOM_FILE), b"corrupt").unwrap();
+        std::fs::write(corrupt.dir.join(INDEX_FILE), b"corrupt").unwrap();
 
         let result = registry.register(vec![valid, corrupt]);
 
@@ -899,7 +899,7 @@ mod tests {
         )
         .unwrap()
         .remove(0);
-        std::fs::write(part.dir.join(BLOOM_FILE), b"corrupt").unwrap();
+        std::fs::write(part.dir.join(INDEX_FILE), b"corrupt").unwrap();
 
         let result = PartRegistry::load_from_disk(&parts_root);
 
