@@ -249,9 +249,21 @@ disappear and must be measured again. Always record the machine profile, build r
 result, and never call values from a non-target machine a pass against the target.
 
 **That document is retired and holds no numbers today.** Recording the machine profile, the build and the
-seed was never enough: the run that produced them has to be capable of measuring what it reports. Until the
-harness rewrite in M8 lands, a load run can move a behavioural checkbox and nothing else, and new
+seed was never enough: the run that produced them has to be capable of measuring what it reports. New
 percentiles go into a new section of a document that begins after the ruler exists.
+
+The rewritten harness (`src/bin/load/`) is that ruler, and it records what a rerun needs without being
+asked: the build revision, the seed, every workload knob, every `LOGGYTRACY_*` the server was started with,
+the machine profile, and the corpus's measured Parquet compression ratio. Three of its outputs change how a
+result is read.
+
+- **Two latencies per request.** `service` starts at the actual send; `response` starts at the *intended*
+  send. Quote `response`; `service` is only interpretable next to it. Their gap, in
+  `coordinated_omission`, is how much of the offered rate the client could not issue.
+- **A percentile that the sample count cannot support is `null`,** with the count and the requirement
+  beside it. A gate on a `null` fails. Do not quote a percentile without its `count`.
+- **429 is not an error and not a pass.** It is `throttled_rate`, gated separately from `error_rate`. A run
+  that was refused most of what it offered did not measure the rate it names.
 
 **Keep reproducible facts in tests, not in prose.** Keep runs only for things that require load — whether
 backpressure engages and clears, timestamp boundaries, and fragmentation ratios are deterministic, so

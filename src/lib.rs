@@ -4,6 +4,9 @@ mod backpressure;
 pub mod bloom;
 pub mod clock;
 pub mod config;
+// Shared with `benches/` and `bin/load`. One generator, so a load result and a
+// bench result describe the same bytes; see the module doc.
+pub mod corpus;
 mod delete_requests;
 mod flush;
 mod ingest;

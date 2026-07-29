@@ -20,16 +20,18 @@ that never contend with writes. Optimizing against those numbers reproduces them
       citing it on both build revision and verdict
 - [ ] **`benches/` with criterion** — WAL append, memtable insert, `rows_from_snapshot`, bloom build and lookup,
       Parquet row-group scan, LogQL evaluation. These are the regression gate; there is currently none of any kind
-- [ ] **Rewrite `src/bin/load.rs`**: N connections with keep-alive (today one connection, one request in flight,
-      `Connection: close` per request — `bin/load.rs:715,732`); latency measured from *intended* send time, not
-      actual (`bin/load.rs:195` — uncorrected coordinated omission); a corpus with real log shapes and a
-      cardinality knob (today one hardcoded label set at `:693` and `"x".repeat(...)` padding at `:680`);
-      out-of-order arrival; reads concurrent with writes (today inline on the push thread at `:221`); RSS from
-      `VmHWM` rather than a coarse `ps` poll
-- [ ] **Delete `src/bin/m5_load.rs`** or fix it — it still measures `std::process::id()`, the harness's own RSS
-      (`bin/m5_load.rs:310-317`), which is the bug already post-mortemed at `bin/load.rs:842-849`
-- [ ] **Fix `scripts/run_load_local.sh`** — it `cd`s to a path that does not exist on this machine, so the only
-      reproduction script in the repository cannot run
+- [x] **Rewrite `src/bin/load.rs`** (now `src/bin/load/`): N keep-alive connections per workload over a
+      hand-rolled HTTP/1.1 client on tokio (no new dependency — the server binary keeps object storage as its
+      only outbound call); latency taken from the *intended* send, with service time and response time both
+      reported and their gap called out; the corpus is `loggytracy::corpus`, promoted out of `benches/` so
+      there is one generator; out-of-order and late arrival are workload knobs; queries are an independent
+      workload with their own rate and connections; percentiles carry their sample count and refuse to be
+      computed below it; RSS is `VmHWM` from `/proc/<server pid>/status` with a sampled `VmRSS` series, and a
+      run that cannot read it fails; the WAL gate is a trend, not `trough <= peak * 0.5`
+- [x] **Delete `src/bin/m5_load.rs`** — deleted. It measured `std::process::id()`, the harness's own RSS
+- [x] **Fix `scripts/run_load_local.sh`** — the repository root is derived from the script's own location, the
+      addresses and the result path are defaults rather than assignments, and the harness's non-zero verdict
+      exit no longer truncates the server log
 - [ ] **CI.** There is no `.github`. None of the above holds without it
 
 ## M9 — the comparison bed

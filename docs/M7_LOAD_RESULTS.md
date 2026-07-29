@@ -86,8 +86,8 @@ is the correct outcome: a regenerated artifact is not a retired one.
   as "far under the cap" as though that meant something. The full correction is
   in [`LOAD_RESULTS.md`](LOAD_RESULTS.md) §3, and the principle it produced is
   the one that matters here: **a gate that cannot measure must not pass.** The
-  harness now takes the server PID and reports `null` when it was not given one.
-  `src/bin/m5_load.rs` still has the original bug.
+  rewritten harness reads `VmHWM` from `/proc/<server pid>/status` and fails the
+  run when it cannot. `src/bin/m5_load.rs` had the original bug and is deleted.
 - **Achieved event rate.** It is bounded by the harness's own structure, not by
   the engine.
 - **The per-tier numeric target tables.** Both tiers "passed every numeric

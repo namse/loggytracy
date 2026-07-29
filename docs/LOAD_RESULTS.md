@@ -125,12 +125,16 @@ and peak RSS, for the reason immediately below.
 harness. So the figure was a few megabytes of request buffers, it was compared
 against a 4 GiB gate it could never have exceeded, and it was written down as an
 engine result. The tell was in the table itself: a peak of a few megabytes next
-to an 8 MiB memtable in the same run. The harness now takes the server PID and
-reports `null` when it was not given one — **a gate that cannot measure must not
-pass.**
+to an 8 MiB memtable in the same run. **A gate that cannot measure must not
+pass** — and it must not silently pass either, which the intermediate fix still
+allowed by reporting `null`.
 
-`src/bin/m5_load.rs` still has the bug, so every m5-era memory number in this
-repository is the harness's own RSS. Deleting or fixing that binary is M8.
+The rewritten harness reads `VmHWM` from `/proc/<server pid>/status`, so the
+peak is the kernel's own high-water mark rather than whatever a poll happened
+to catch, and a run that could not read it **fails**. `src/bin/m5_load.rs` had
+the same bug and has been deleted, so every m5-era memory number in this
+repository is the harness's own RSS and there is no longer a binary that can
+produce another one.
 
 ### Harness defect revealed by this run
 
