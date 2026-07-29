@@ -179,6 +179,12 @@ fn scan_memtable_stream(
     }
 }
 
+impl Default for MemTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemTable {
     pub fn new() -> Self {
         Self {

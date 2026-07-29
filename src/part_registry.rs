@@ -150,6 +150,12 @@ pub struct PartRegistry {
     operation_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
+impl Default for PartRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PartRegistry {
     pub fn new() -> Self {
         Self {

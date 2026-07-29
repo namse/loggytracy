@@ -1,48 +1,6 @@
-mod admin;
-mod app_state;
-mod backpressure;
-mod bloom;
-mod clock;
-mod config;
-mod delete_requests;
-mod flush;
-mod ingest;
-mod journal;
-mod log_ingest;
-mod logql;
-mod memtable;
-mod merge;
-mod metrics;
-mod object_storage;
-mod otlp_http;
-mod otlp_log;
-mod part;
-mod part_registry;
-mod proto;
-mod query;
-mod remote_lifecycle;
-mod retention;
-mod router;
-mod runtime_error;
-mod shutdown;
-mod startup;
-mod tempo;
-mod tenant;
-mod tenant_policy;
-mod tenant_quota;
-#[cfg(test)]
-mod test_support;
-mod trace;
-mod trace_ingest;
-mod trace_part;
-mod trace_registry;
-
 use std::sync::Arc;
 
-pub use app_state::{AppState, AppStateDependencies};
-use config::Config;
-pub use router::build_router;
-pub use startup::recover;
+use loggytracy::config::Config;
 
 #[tokio::main]
 async fn main() {
@@ -54,11 +12,5 @@ async fn main() {
         Config::from_env().unwrap_or_else(|error| panic!("invalid configuration: {error}")),
     );
     config.log_memory_budget();
-    startup::run(config).await;
-}
-
-#[cfg(test)]
-mod tests {
-    include!("tests/e2e.rs");
-    include!("tests/shutdown_rehearsal.rs");
+    loggytracy::run(config).await;
 }
