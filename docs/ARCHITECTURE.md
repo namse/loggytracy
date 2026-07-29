@@ -7,6 +7,13 @@ This document records what the engine *is*. [`VISION.md`](VISION.md) records wha
 invariants that are load-bearing, what is deliberately not built, and what would falsify the claim. Where
 the two disagree, `VISION.md` is the intent and this one is the implementation.
 
+[`COMPARISON.md`](COMPARISON.md) records how it currently measures against Loki on the same machine, at the
+same container memory limit, over the same corpus. **The claim in `VISION.md` does not survive that run**:
+loggytracy loses `| json | field="x"`, its own headline query, and is OOM-killed at a limit Loki survives.
+The bed is [`compare/`](../compare/), the raw artifacts are in [`artifacts/m9/`](artifacts/m9/), and the
+document is regenerated from them rather than written. Read it before trusting any performance statement
+elsewhere in these docs.
+
 ## Decided choices
 
 | Item | Decision |
