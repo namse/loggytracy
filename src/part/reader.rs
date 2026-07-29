@@ -199,6 +199,9 @@ impl PartReader {
     }
 
     fn open_internal(part: Part, require_data: bool) -> Result<Self, String> {
+        // Innermost wins, so the blooms a query faults in are charged here
+        // rather than to the query: they outlive it.
+        let _arena = crate::memprof::enter(crate::memprof::Arena::Sidecar);
         validate_sidecar_files(&part)?;
         if part.meta.row_group_count == 0
             || part.meta.row_group_min_ts.len() != part.meta.row_group_count as usize

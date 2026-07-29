@@ -28,6 +28,7 @@ async fn scan_trace_spans(
     let mut task = tokio::task::spawn_blocking(move || {
         let _scan_permit = scan_permit;
         let _guard = guard;
+        let _arena = crate::memprof::enter(crate::memprof::Arena::Query);
         let mut spans = match trace_id.as_deref() {
             Some(trace_id) => journal
                 .trace_memtable()

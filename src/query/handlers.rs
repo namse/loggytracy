@@ -757,6 +757,7 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
     );
     body.push_str(&object_store_operation_metrics(&state));
     body.push_str(&delete_request_metrics(&state));
+    body.push_str(&crate::memprof::render());
     body
 }
 

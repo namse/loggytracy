@@ -197,6 +197,7 @@ async fn merge_once(
                 let row_group_size = config.row_group_size;
                 let max_memory_bytes = config.merge_max_memory_bytes;
                 move || {
+                    let _arena = crate::memprof::enter(crate::memprof::Arena::Merge);
                     rewrite_group(
                         &group,
                         cutoffs.as_ref(),

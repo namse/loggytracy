@@ -152,6 +152,7 @@ struct MergeTombstone {
 }
 
 pub fn load_part(dir: &Path) -> Result<Part, String> {
+    let _arena = crate::memprof::enter(crate::memprof::Arena::PartMeta);
     let meta_str = fs::read_to_string(dir.join(META_FILE)).map_err(|e| e.to_string())?;
     let meta_file: MetaFile = serde_json::from_str(&meta_str).map_err(|e| e.to_string())?;
     if meta_file.version != PART_META_VERSION {

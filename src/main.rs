@@ -2,6 +2,10 @@ use std::sync::Arc;
 
 use loggytracy::config::Config;
 
+#[cfg(feature = "memprof")]
+#[global_allocator]
+static ALLOCATOR: loggytracy::memprof::ProfilingAllocator = loggytracy::memprof::ProfilingAllocator;
+
 #[tokio::main]
 async fn main() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

@@ -157,6 +157,7 @@ async fn run_metric_query_with_stats_cancellable(
     let task_cancellation = cancellation.clone();
     let mut task = tokio::task::spawn_blocking(move || {
         let _evaluation_permit = evaluation_permit;
+        let _arena = crate::memprof::enter(crate::memprof::Arena::Query);
         evaluate_metric_stream_with_limits(
             &expr,
             &entries,

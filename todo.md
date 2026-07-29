@@ -147,13 +147,14 @@ that never contend with writes. Optimizing against those numbers reproduces them
       labels. The second is the more useful finding, because the row-equality check **did not catch it** — the
       digest is over `(timestamp, line)` pairs, so `json_field` was reported as 24/24 agreed while the two
       responses carried 6 labels and 22
-- [ ] **loggytracy was OOM-killed at a 2 GiB container limit where Loki was not**, ingesting 1.2 M events at
+- [x] **loggytracy was OOM-killed at a 2 GiB container limit where Loki was not**, ingesting 1.2 M events at
       20 k eps with the harness's query workload on. `memory.peak` climbed monotonically from 2 MB to the limit
       in forty seconds while `loggytracy_memtable_bytes` reported 111 MB, so the accounted memtable is not
-      where it went. An ingest-only run at the same limit survived — at exactly the limit — so the query path
-      is at least part of it, which points straight at [`docs/VISION.md`](docs/VISION.md) invariant III's
-      `normal_scan_limit = usize::MAX`. **This is M10's headline number and it now exists.** The bed sweeps
-      limits and reports the sweep, so the published run is at 8 GiB and says so
+      where it went. **Answered by [`docs/MEMORY_ATTRIBUTION.md`](docs/MEMORY_ATTRIBUTION.md)**: 44% of the
+      anonymous peak is allocator-retained free memory, and the largest live terms are one merge group
+      (771 MiB) and the flush's whole-snapshot `Vec<Row>` (721 MiB). The query path is implicated through the
+      allocation traffic it generates rather than through what it holds. The bed sweeps limits and reports the
+      sweep, so the published run is at 8 GiB and says so
 - [ ] **In local-only mode the WAL is never compacted.** `flush.rs:219` passes `remote_cache.is_some()` as the
       `compact` flag, so without an object store the checkpoint offset advances and `journal.wal` keeps every
       byte ever ingested, uncompressed. It was 541 MiB against 143 MiB of parts — 79% of the disk footprint.
@@ -177,23 +178,66 @@ offered 20 k eps with a 5 qps read workload, loggytracy is OOM-killed and Loki i
 I failing against a competitor on the same machine, and it is the test this section's last item asks for,
 already written and already red.
 
-- [ ] **Honest metering first.** `entries_bytes` (`memtable.rs:69-81`) counts line and label lengths only —
-      not the 56-byte `LogEntry`, the 48-byte slot per metadata pair, malloc headers, or `Vec` slack. Measured
-      shapes are 1.4–2.8x under, so `MAX_MEMTABLE_BYTES=256 MiB` is really 400–700 MiB. A budget on a dishonest
-      meter is worse than no budget, because it will be believed
-- [ ] `LOGGYTRACY_MEMORY_BUDGET` divided into ingest/flush/merge/query/sidecar arenas with per-arena accounting
-      and per-arena refusal. Existing knobs become overrides; what is not overridable is that they sum
+### Phase A — diagnosis (done)
+
+[`docs/MEMORY_ATTRIBUTION.md`](docs/MEMORY_ATTRIBUTION.md) is the measurement, `src/memprof.rs` is the
+instrument (arena-tagging global allocator behind the default-off `memprof` feature), and
+`scripts/run_memprof_local.sh` is the one-command reproduction. What it changes about the plan below:
+
+- [x] **The dominant term is not any arena.** At the moment of the kill the engine's live heap was 669 MiB of
+      2 GiB and **44% of the anonymous footprint was memory the process had already freed** and glibc had not
+      returned — 61–69% in some variants, 67% in the surviving 8 GiB run. A budget denominated in live bytes
+      would have read a third full at the instant the kernel killed the process
+- [x] **It is a function of allocation rate, not of anything held.** 52 GB allocated in 33 s across 444 M
+      allocations, 217x the offered data rate; query is 57–77% of that traffic and flush 17–38%.
+      `MALLOC_ARENA_MAX=1` with trim thresholds takes `anon / live` from 2.5–4.1 to **1.34** and more than
+      doubles time-to-OOM without fixing anything
+- [x] **The query workload is not required and neither is merge.** Ingest alone is killed at 2 GiB on this bed
+      (which contradicts `docs/COMPARISON.md`'s ingest-only observation; both are recorded, the difference is
+      not explained). Merge disabled is killed sooner than ingest-only
+- [x] **Refuted: sidecars and `PartMeta`** — 0.2–1.2% of the anonymous peak, ~240 kB + ~140 kB per part, and
+      `loggytracy_part_sidecar_resident_bytes` is accurate to 4%. **Refuted: in-flight push bodies** — the
+      journal append awaits its own completion, so in-flight is bounded by HTTP concurrency and measures
+      ~0.3 MiB. **Refuted as a memory term: `rows_from_snapshot` outside `spawn_blocking`** — same bytes either
+      side of the hand-off; it remains a latency defect
+- [x] **Found, and not on anyone's list: a fourth per-row `Labels` clone.** `query/metrics.rs:134-155` walks
+      every scanned row on an async worker thread, before the `spawn_blocking` at `:158`, cloning
+      `stream.labels` per row — outside every arena, scanning to `max_metric_rows + 1` = 1 000 001 rows rather
+      than the API limit, and 203 MiB at its high-water. Folded into M11's read-path list
+
+### Phase B — the budget
+
+- [ ] **Make the anonymous footprint track live bytes first.** Measured precondition, not a tuning note: with
+      the default glibc configuration no live-byte budget can be honest. `mallopt` at startup, or an allocator
+      whose heap decays, or the arena-tagging allocator promoted into production. Whichever is chosen, the
+      `anon / live` ratio it achieves must be published beside the budget
+- [ ] **Honest metering.** `entries_bytes` (`memtable.rs:69-81`) counts line and label lengths only — not the
+      56-byte `LogEntry`, the 48-byte slot per metadata pair, malloc headers, or `Vec` slack. Measured
+      **1.70–1.79x under** in situ on the comparison corpus, so `MAX_MEMTABLE_BYTES=256 MiB` is really ~440 MiB
+- [ ] `LOGGYTRACY_MEMORY_BUDGET` divided into ingest 20% / flush 25% / merge 25% / query 25% / sidecar 5% —
+      the measured shares, not the guessed ones. Existing knobs become overrides; what is not overridable is
+      that they sum. **Flush and merge do not fit their shares today** (721 MiB and 771 MiB measured against
+      512 MiB each at a 2 GiB budget), which is the work, not a reason to raise the shares
+- [ ] **Flush cannot be sized independently of ingest.** `rows_from_snapshot` holds a copy of the memtable at
+      **3.3x its accounted size** and 1 326–1 345 bytes per row, and the two peak together. Either the flush
+      share is expressed as a multiple of the ingest share, or the flush streams the snapshot in bounded chunks
 - [ ] **Query admission by budget, not by slot.** Replace `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES`
       (8 × 512 MiB = 4 GiB, admitted in a comment at `config.rs:522`) with a shared arena. Same ceiling, and a
-      burst of cheap queries no longer queues behind a slot count
+      burst of cheap queries no longer queues behind a slot count. The arena must include the metric path's
+      materialization, which is outside it today
+- [ ] **`merge_max_memory_bytes` must come from the budget.** Its 1 GiB default is half a 2 GiB container and
+      is derived from nothing the operator set; one group reached 771 MiB live
 - [ ] **Sidecars inside the budget.** They are outside it on purpose today (`part/reader.rs:77-81`), so resident
-      memory grows with part count unbounded. Make them LRU-evictable — they are already durable in `index.bin`
+      memory grows with part count unbounded. Make them LRU-evictable — they are already durable in `index.bin`.
+      Sized from the measured ~240 kB per part, not from a share
 - [ ] **Stop materializing `PartMeta::streams`** (`part/mod.rs:231`, `part/metadata.rs:172-176`) — every distinct
-      label set in every open part, held as live `String`s. Stream identity needs a fingerprint, not the text
+      label set in every open part, held as live `String`s. Measured ~140 kB per part
 - [ ] **Bound in-flight push bodies.** The ingest gate is checked once at request entry and nothing limits
-      concurrency, so (in-flight requests x 64 MiB) sits outside the accounting
+      concurrency, so (in-flight requests x 64 MiB) sits outside the accounting. Measured at 0.3 MiB on the bed,
+      so this is closing a hole rather than recovering memory
 - [ ] **A test that runs at a declared budget and asserts peak RSS stays under it.** Not a sizing paragraph in
-      the runbook
+      the runbook — and it must assert against the cgroup's `anon`, not against the sum of the arenas, because
+      the sum of the arenas was a third of `anon` at the moment of the kill
 
 ## M11 — bounded copies and deep pruning ([`docs/VISION.md`](docs/VISION.md) II, III)
 

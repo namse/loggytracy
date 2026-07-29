@@ -187,6 +187,9 @@ async fn push_inner(
         )
             .into());
     }
+    // Dropped before the journal `.await` below: the label is thread-local, so
+    // holding it across a suspension point would tag another task's work.
+    let ingest_arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
     let decompressed = snap::raw::Decoder::new()
         .decompress_vec(&body)
         .map_err(|e| {
@@ -254,6 +257,7 @@ async fn push_inner(
         parsed.push((labels, entries));
     }
 
+    drop(ingest_arena);
     // The protobuf body is already the journal's encoding, so it is stored as
     // it arrived rather than re-encoded from `parsed`.
     state

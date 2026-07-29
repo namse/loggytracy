@@ -386,6 +386,7 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
         // the first task is still consuming CPU and memory.
         let _scan_permit = scan_permit;
         let _part_guard = part_guard;
+        let _arena = crate::memprof::enter(crate::memprof::Arena::Query);
         unified_query_with_stats_cancellable_with_memory(
             &state,
             &tenant,

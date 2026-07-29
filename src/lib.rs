@@ -13,6 +13,7 @@ mod ingest;
 pub mod journal;
 mod log_ingest;
 pub mod logql;
+pub mod memprof;
 pub mod memtable;
 mod merge;
 mod metrics;

@@ -31,18 +31,27 @@ LOGGYTRACY_MEMORY_BUDGET=1GiB
 
 That number is the same number they put in the container's memory limit, and the
 engine's job is to stay under it. The budget is divided into **arenas**, each
-with its own accounted allocation and its own refusal when full:
+with its own accounted allocation and its own refusal when full. The shares
+below are the ones [`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) measured;
+the earlier table here was a guess and every one of its numbers moved:
 
-| Arena | Share | Holds | On overflow |
-|---|---|---|---|
-| ingest | 25% | memtable, trace memtable, in-flight push bodies | `429` + `Retry-After` (already the mechanism) |
-| flush | 15% | materialized rows, Parquet writer buffers | defer the flush; ingest backs up into its own arena and refuses there |
-| merge | 20% | one merge group | split the group; skip the tick |
-| query | 30% | every concurrent scan, pipeline stage and metric evaluation | queue, then `429` |
-| sidecar | 10% | blooms, stream index, part metadata | evict least-recently-used sidecars; reload from `index.bin` |
+| Arena | Share | Measured high-water at 2 GiB | Holds | On overflow |
+|---|---|---|---|---|
+| ingest | 20% | 378 MiB | memtable, trace memtable, in-flight push bodies | `429` + `Retry-After` (already the mechanism) |
+| flush | 25% | **721 MiB** | materialized rows, Parquet writer buffers | defer the flush; ingest backs up into its own arena and refuses there |
+| merge | 25% | **771 MiB** | one merge group | split the group; skip the tick |
+| query | 25% | 242 MiB + 203 MiB untagged | every concurrent scan, pipeline stage and metric evaluation | queue, then `429` |
+| sidecar | 5% | 17 MiB | blooms, stream index, part metadata | evict least-recently-used sidecars; reload from `index.bin` |
 
 Shares are defaults, individually overridable. What is not overridable is that
 they sum to the budget.
+
+**Two of the five do not fit their share as the engine is written**, and that is
+the finding rather than a sizing problem: flush materializes a whole memtable
+snapshot at 3.3× its accounted size, and one merge group reached 771 MiB against
+a `merge_max_memory_bytes` default of 1 GiB — half the container. Their shares
+are targets the code must be made to meet (invariant II's `Arc<Labels>` and a
+chunked flush; a group split sized from the budget), not descriptions of it.
 
 **Two consequences that are architectural, not tuning.**
 
@@ -60,15 +69,32 @@ every distinct label set in every open part (`part/mod.rs:231`,
 `part/metadata.rs:172-176`), so its cost is stream cardinality × part count in
 live `String`s. Sidecars are already durable on local disk, so making them
 evictable costs a re-read of `index.bin`, and stream identity does not need the
-label text — a fingerprint is enough.
+label text — a fingerprint is enough. Measured: **~240 kB of sidecar and ~140 kB
+of `PartMeta` per part**, which is 0.2–1.2% of the anonymous peak at the part
+counts the comparison bed reaches. The concern is right and the 10% this
+document used to give it was wrong by an order of magnitude.
 
 **Accounting must be honest before any of this means anything.** `entries_bytes`
 (`memtable.rs:69-81`) counts `line.len()` plus label name and value lengths and
 nothing else — not the 56-byte `LogEntry`, not the 48-byte slot per metadata
 pair, not malloc headers, not `Vec` slack. Measured shapes come out **1.4× to
-2.8× under**, so `MAX_MEMTABLE_BYTES=256 MiB` is really 400–700 MiB. A budget
-computed from a dishonest meter is a worse guarantee than no budget, because it
-will be believed.
+2.8× under** in isolation and **1.70–1.79× under** in situ on the comparison
+corpus, so `MAX_MEMTABLE_BYTES=256 MiB` is really ~440 MiB. A budget computed
+from a dishonest meter is a worse guarantee than no budget, because it will be
+believed.
+
+**And a live-byte meter is not enough on its own.** At the moment the kernel
+killed the process at 2 GiB, the engine's live heap was **669 MiB** — every
+arena inside its share, the budget reporting a third full — while 44% of the
+anonymous footprint was memory the process had already freed and glibc had not
+returned. The engine asked for 52 GB across 444 million allocations in 33
+seconds; at that rate the allocator's steady state is a heap the size of the
+transient peak. So the budget has a precondition: the process must make its own
+anonymous footprint track its live bytes (measured: `MALLOC_ARENA_MAX=1` with
+trim thresholds takes `anon / live` from 2.5–4.1 to **1.34** and more than
+doubles time-to-OOM), and the budget must be verified against the cgroup's
+`anon` rather than against the sum of its own arenas.
+[`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) is the measurement.
 
 **How this is verified:** a test that runs the engine at a declared budget under
 sustained mixed load and asserts peak RSS stays under it. Not a sizing paragraph
@@ -105,7 +131,20 @@ correct, and its byte accounting reflects it (`memtable.rs:57-67`). Then
 
 The read path is the same mistake mirrored: reader → registry → execution
 materializes, clones per row, and sorts, **three times**
-(`reader.rs:1041`, `part_registry.rs:628`, `execution.rs:202`).
+(`reader.rs:1041`, `part_registry.rs:628`, `execution.rs:202`) — and a **fourth**
+on the metric path, which
+[`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) found by measuring: after the
+scan returns, `evaluate_metric_query` walks every row on an async worker thread
+and clones `stream.labels` per row again (`query/metrics.rs:134-155`), outside
+the `spawn_blocking` at `:158` and outside every budget. It is 203 MiB at its
+high-water, and it is the whole reason `rate()` is 7.1× slower than Loki.
+
+Measured, so the payoff has a number: `rows_from_snapshot` allocates **1 503
+bytes and 17 allocations per row** and holds **1 345 bytes per row live** at five
+labels, identically at 1, 256 and 8192 streams — the clone is per row, not per
+stream. In the running engine that is a `Vec<Row>` at **3.3× the accounted
+memtable it was built from**, and the flush path's whole cost is **26 kB and 356
+allocations per 368-byte line**.
 
 `Arc<Labels>` end to end — memtable, `Row`, part write, reader, query result —
 removes all of it. This is one type change with the largest single payoff in the
@@ -130,6 +169,18 @@ The fix is not a smaller ceiling. It is that execution **streams**: a merge of
 per-part sorted iterators feeding a bounded top-K heap, materializing exactly
 `limit` rows plus the heap. That also deletes the triple-materialize of
 invariant II, because there is nothing left to materialize.
+
+**Measured, and it is not the whole of the query cost.** Running the identical
+workload with only `| json | field=` queries against only label-only queries,
+`usize::MAX` costs **6.5× the live materialization** (111 MiB against 17 MiB) and
+3× the allocations. But the label-only shape — the one where the limit *does*
+apply — still allocates **270 MB and 1.19 million allocations per query to return
+a hundred rows**, and the query path is still 57% of all allocation traffic in
+that run. Bounding the scan removes the query arena's residency and about half
+its churn; the rest is the per-row work that happens before any limit can apply,
+which is the triple materialize and `reader.rs:727` allocating the line before
+the filter that rejects it. See
+[`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md).
 
 **Pruning we index for and then do not use:**
 

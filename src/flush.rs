@@ -230,7 +230,10 @@ async fn flush_once(
         }
         return Ok(());
     }
-    let rows = part::rows_from_snapshot(&ckpt.snapshot);
+    let rows = {
+        let _arena = crate::memprof::enter(crate::memprof::Arena::Flush);
+        part::rows_from_snapshot(&ckpt.snapshot)
+    };
     let trace_spans = ckpt.trace_snapshot;
     // An `Arc` clone: the flush reads the buffer the memtable still holds for
     // the abort path, rather than being handed a copy of it.
@@ -254,6 +257,7 @@ async fn flush_once(
         let parts_root = parts_root.clone();
         let traces_root = config.data_dir.join("traces");
         move || {
+            let _arena = crate::memprof::enter(crate::memprof::Arena::Flush);
             let log_parts = part::flush_rows(rows, &parts_root, row_group_size)?;
             let trace_parts = match trace_part::flush_trace_spans(
                 &trace_spans_for_flush,

@@ -86,7 +86,10 @@ impl Journal {
         data: Vec<u8>,
         streams: Vec<(Labels, Vec<LogEntry>)>,
     ) -> Result<(), IoError> {
-        let framed = frame_tenant_record(&tenant, TENANT_RECORD_KIND_LOGS, &data);
+        let framed = {
+            let _arena = crate::memprof::enter(crate::memprof::Arena::Wal);
+            frame_tenant_record(&tenant, TENANT_RECORD_KIND_LOGS, &data)
+        };
         self.send_append(framed, tenant, streams, Vec::new()).await
     }
 
@@ -96,7 +99,10 @@ impl Journal {
         data: Vec<u8>,
         spans: Vec<TraceSpan>,
     ) -> Result<(), IoError> {
-        let framed = frame_tenant_record(&tenant, TENANT_RECORD_KIND_TRACES, &data);
+        let framed = {
+            let _arena = crate::memprof::enter(crate::memprof::Arena::Wal);
+            frame_tenant_record(&tenant, TENANT_RECORD_KIND_TRACES, &data)
+        };
         self.send_append(framed, tenant, Vec::new(), spans).await
     }
 
@@ -301,6 +307,7 @@ async fn writer_loop(
         }
 
         if !batch.is_empty() {
+            let wal_arena = crate::memprof::enter(crate::memprof::Arena::Wal);
             let mut buf = Vec::with_capacity(batch_bytes + batch.len() * RECORD_HEADER_SIZE);
             for (data, _, _, _, _) in &batch {
                 let len = u32::try_from(data.len()).map_err(|_| {
@@ -315,6 +322,7 @@ async fn writer_loop(
                 buf.extend_from_slice(data);
             }
 
+            drop(wal_arena);
             let write_result = async {
                 file.write_all(&buf).await?;
                 file.flush().await?;
@@ -329,6 +337,10 @@ async fn writer_loop(
                     // 204 must already be counted against the next request's
                     // backpressure gate.
                     backlog.set_wal_bytes(good_len);
+                    // The entries were allocated under the ingest label and
+                    // are moved, not copied, so the memtable's own nodes are
+                    // charged to the same arena its contents already are.
+                    let _arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
                     for (_, tenant, streams, traces, done) in batch.drain(..) {
                         for (labels, entries) in streams {
                             memtable.insert(tenant.clone(), labels, entries);

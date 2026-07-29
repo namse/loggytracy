@@ -11,6 +11,14 @@ autobenches = false
 name = "loggytracy"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Arena-tagged global allocator plus its `/metrics` families, for measuring
+# where resident memory actually goes (`docs/MEMORY_ATTRIBUTION.md`). Off by
+# default and absent from a release build: with it off, `memprof::enter` is an
+# inlined no-op and the process keeps the system allocator.
+memprof = []
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
