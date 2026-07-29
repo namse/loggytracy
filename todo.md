@@ -12,14 +12,22 @@ No optimization starts before this. Every performance number currently in the re
 harness that cannot reach its own offered rate, on data with cardinality 1 and near-zero entropy, with reads
 that never contend with writes. Optimizing against those numbers reproduces them.
 
-- [ ] **Retire the numbers, keep the reasoning.** Strike the tables in [`docs/LOAD_RESULTS.md`](docs/LOAD_RESULTS.md)
-      and [`docs/M7_LOAD_RESULTS.md`](docs/M7_LOAD_RESULTS.md); keep the refuted hypotheses, the terminal-sample
-      lesson, and §8's finding that every "merge disabled" run in the document had one merge in it. Fix the
-      dangling references while there: a cited test that does not exist (`LOAD_RESULTS.md:90`), a cited artifact
-      that does not exist (`m7_tier_c_result.json`), and a surviving artifact that disagrees with the document
-      citing it on both build revision and verdict
-- [ ] **`benches/` with criterion** — WAL append, memtable insert, `rows_from_snapshot`, bloom build and lookup,
-      Parquet row-group scan, LogQL evaluation. These are the regression gate; there is currently none of any kind
+- [x] **Retire the numbers, keep the reasoning.** Both documents carry a retirement header and no number in
+      them may be cited until the rewritten harness regenerates it. What survives is what never depended on the
+      magnitudes: three refuted hypotheses kept rather than replaced, the terminal-sample lesson, §8's finding
+      that `tokio::time::interval` fires immediately — so every "merge disabled" run had one merge in it — now
+      written as explicit Invalidated markers on the sections it killed, and the structural object-store counts,
+      which are properties of the code rather than of the harness. Three citations were wrong and are now
+      recorded as wrong: a named test that never existed, an artifact that was never checked in, and a surviving
+      artifact that disagrees with the document citing it on both build and verdict. That artifact is kept, with
+      a header, because it is the only checked-in evidence *for* the retirement
+- [x] **`benches/` with criterion** — six targets over WAL append, memtable insert and query,
+      `rows_from_snapshot`, bloom build and lookup, part write and scan, and LogQL parse and evaluation. The
+      corpus is seeded and clock-free with a cardinality knob, and prints its measured compression ratio every
+      run so a drift back toward the retired harness's 31.5x is visible immediately. The row and part benches
+      carry a counting global allocator, because time is the wrong instrument for invariants I and II: it
+      already reads two allocations per label per row at `part/mod.rs:302`, which is the number `Arc<Labels>`
+      has to move
 - [x] **Rewrite `src/bin/load.rs`** (now `src/bin/load/`): N keep-alive connections per workload over a
       hand-rolled HTTP/1.1 client on tokio (no new dependency — the server binary keeps object storage as its
       only outbound call); latency taken from the *intended* send, with service time and response time both
@@ -29,6 +37,11 @@ that never contend with writes. Optimizing against those numbers reproduces them
       computed below it; RSS is `VmHWM` from `/proc/<server pid>/status` with a sampled `VmRSS` series, and a
       run that cannot read it fails; the WAL gate is a trend, not `trough <= peak * 0.5`
 - [x] **Delete `src/bin/m5_load.rs`** — deleted. It measured `std::process::id()`, the harness's own RSS
+- [ ] **The Dockerfile builds on a different compiler than CI gates.** `Dockerfile:1-3` claims a pinned
+      toolchain and uses `FROM rust:1-bookworm`, which is not one, and it copies only `Cargo.toml`,
+      `Cargo.lock` and `src`, so [`rust-toolchain.toml`](rust-toolchain.toml) never reaches the image build.
+      The shipped artifact is therefore compiled by a toolchain nothing verified. Adding the file to the `COPY`
+      costs a toolchain download inside the image build
 - [x] **Fix `scripts/run_load_local.sh`** — the repository root is derived from the script's own location, the
       addresses and the result path are defaults rather than assignments, and the harness's non-zero verdict
       exit no longer truncates the server log
