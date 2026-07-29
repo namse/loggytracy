@@ -364,6 +364,23 @@ impl<'a> ExactFieldPruning<'a> {
     }
 }
 
+/// A half-open `[start, end)` extent within `data.parquet`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByteRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl ByteRange {
+    pub fn len(&self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+}
+
 /// One tenant's contiguous slice of a shared part.
 ///
 /// Rows are sorted by `(tenant, timestamp_ns)` and row groups never straddle
@@ -380,6 +397,20 @@ pub struct TenantSegment {
     pub row_count: u64,
     pub min_ts_ns: i64,
     pub max_ts_ns: i64,
+    /// Where this tenant's row groups sit in `data.parquet`.
+    ///
+    /// Recorded so a reader can fetch one tenant's bytes instead of the whole
+    /// shared object. A part is up to `merge_target_part_rows` across every
+    /// tenant in it, so serving one tenant from the whole object is an
+    /// amplification proportional to tenant breadth.
+    pub bytes: ByteRange,
+    /// CRC32 of exactly that range.
+    ///
+    /// The part-wide `data_crc32` cannot verify a slice, and a slice fetched on
+    /// its own is the only thing a range read has. Recording it per segment
+    /// keeps a partial read as checkable as a whole one — which is the property
+    /// every other file here already has.
+    pub crc32: u32,
 }
 
 #[derive(Clone, Debug)]

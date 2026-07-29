@@ -542,7 +542,7 @@ fn write_part_files(
 ) -> io::Result<()> {
     let (ordinals, stream_table) = assign_stream_ordinals(rows)?;
     let parquet_started = std::time::Instant::now();
-    write_parquet(
+    let row_group_ranges = write_parquet(
         &dir.join(DATA_FILE),
         rows,
         &ordinals,
@@ -576,6 +576,7 @@ fn write_part_files(
         stream_labels,
         metadata_columns,
         parsed_columns,
+        &row_group_ranges,
     );
     if measured {
         FLUSH_BUILD.meta.observe(meta_started.elapsed());
@@ -817,6 +818,31 @@ fn part_writer_properties(row_group_size: usize) -> WriterProperties {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Where each row group landed in the body, off the metadata the writer just
+/// wrote.
+///
+/// Shared by the batch and the streaming writer so the two cannot disagree
+/// about what a row group's extent is.
+fn row_group_byte_ranges(metadata: &parquet::file::metadata::ParquetMetaData) -> Vec<ByteRange> {
+    metadata
+        .row_groups()
+        .iter()
+        .map(|row_group| {
+            // A row group's column chunks are contiguous, but the order they
+            // are reported in is the schema's, not the file's, so the extent is
+            // taken as the span rather than as first-to-last.
+            let mut start = u64::MAX;
+            let mut end = 0u64;
+            for column in row_group.columns() {
+                let (offset, length) = column.byte_range();
+                start = start.min(offset);
+                end = end.max(offset.saturating_add(length));
+            }
+            ByteRange { start, end }
+        })
+        .collect()
+}
+
 fn write_parquet(
     path: &Path,
     rows: &[Row],
@@ -825,7 +851,7 @@ fn write_parquet(
     metadata_columns: &[(String, u64)],
     parsed_columns: &[(String, u64)],
     row_group_size: usize,
-) -> io::Result<()> {
+) -> io::Result<Vec<ByteRange>> {
     let metadata_keys: Vec<String> = metadata_columns
         .iter()
         .map(|(key, _)| key.clone())
@@ -853,10 +879,19 @@ fn write_parquet(
         writer.write(&batch).map_err(io::Error::other)?;
         writer.flush().map_err(io::Error::other)?;
     }
-    writer.close().map_err(io::Error::other)?;
+    let metadata = writer.close().map_err(io::Error::other)?;
     sync_file(path)?;
     crate::page_cache::drop_cache(path);
-    Ok(())
+
+    let ranges = row_group_byte_ranges(&metadata);
+    if ranges.len() != bounds.len() {
+        return Err(io::Error::other(format!(
+            "parquet wrote {} row groups for {} planned boundaries",
+            ranges.len(),
+            bounds.len()
+        )));
+    }
+    Ok(ranges)
 }
 
 fn encode_blooms(

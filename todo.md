@@ -2691,6 +2691,12 @@ Read path:
       replay could produce, the compaction state's version byte and its phase-2 acceptance, and the `BTF1`,
       `BTF2` and `BTF3` bloom readers. `PartReader` is simpler for it — three format flags that were constant
       became nothing, and `exact_field_bloom` stopped being an `Option`
+  - [ ] **Reintroducing format versioning is an open decision, not pending work.** The other line of
+        development raised `PART_META_VERSION` to 3 and wrote a migration design for crossing a format
+        on a running deployment. Neither was taken: this trunk's recorded choice is that nothing on
+        disk or on the wire is versioned (`docs/ARCHITECTURE.md`, decided choices). The design exists
+        and can be recovered from `backup/pre-rebase-origin` if the choice is ever reversed — reversing
+        it is a decision to make deliberately, not a thing to let arrive with a merge
 - [x] **Metadata endpoint guards**: Add semaphore, timeout, `start`/`end`, and `match[]` count limits to
       `labels`/`label_values`/`series`/`index_stats`.
 - [x] **Remove O(parts) from `/metrics`**: Workers publish merge-debt and unknown-tenant gauges.

@@ -97,6 +97,17 @@ exist are `merge::tests::layout_totals_count_tenant_part_pairs_and_survive_a_sil
 and `merge::tests::merging_parts_removes_their_pairs_from_the_totals`, cited
 correctly at the end of §6.
 
+**The fixed per-pair cost has grown since, and the increment is struck too.**
+`TenantSegment` now carries the tenant's byte range in `data.parquet` and a
+CRC32 of exactly that range, so the `meta.json` segment gained two fields per
+(tenant, part) pair. The byte figure for that increment came from the same
+synthetic corpus as everything else in this section, so it is struck with them;
+the shape is not struck, and it is worth naming plainly: it is a fixed cost paid
+on every part written, for a read path §6's own measurement decided against.
+Fixed location: `part::tests::each_tenant_segment_records_the_byte_range_of_its_own_row_groups`,
+which checks the recorded range against the Parquet footer that actually decides
+the layout, against its own checksum, and against its neighbours.
+
 ## 3. Backpressure holds at the limit
 
 **Asked:** what the engine does when ingest greatly exceeds flush capacity. The

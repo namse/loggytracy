@@ -9,6 +9,7 @@ fn write_meta(
     stream_labels: &[String],
     metadata_columns: &[(String, u64)],
     parsed_columns: &[(String, u64)],
+    row_group_ranges: &[ByteRange],
 ) -> io::Result<()> {
     let n = rows.len();
     let bounds = row_group_bounds(rows, row_group_size);
@@ -55,7 +56,7 @@ fn write_meta(
                 .all(|pair| pair[0].timestamp_ns <= pair[1].timestamp_ns)
         })
         .collect();
-    let tenants = tenant_segments(rows, &bounds);
+    let mut tenants = tenant_segments(rows, &bounds, row_group_ranges);
 
     // The ordinal table, in assignment order: `meta.streams` is what the
     // `_stream` column indexes into, so its order is load-bearing now and
@@ -72,8 +73,13 @@ fn write_meta(
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("metadata path has no parent"))?;
+    // One pass over the body for both checksums. The segments are contiguous,
+    // ordered and non-overlapping — rows are sorted by tenant and row groups
+    // never straddle a boundary — so the per-segment digests fall out of the
+    // same read the part-wide one already needed.
+    let data_crc32 = checksum_data_and_segments(&dir.join(DATA_FILE), &mut tenants)?;
     let integrity = PartIntegrity {
-        data_crc32: file_crc32(&dir.join(DATA_FILE))?,
+        data_crc32,
         index_crc32: file_crc32(&dir.join(INDEX_FILE))?,
         metadata_crc32: 0,
     };
@@ -110,19 +116,28 @@ fn write_meta(
 
 /// Build the per-tenant index from `(tenant, timestamp)`-sorted rows whose
 /// row-group boundaries already respect tenant boundaries.
-fn tenant_segments(rows: &[Row], bounds: &[(usize, usize)]) -> Vec<TenantSegment> {
+///
+/// `crc32` is left zero here and filled in by `checksum_data_and_segments`,
+/// which is the only place that reads the body.
+fn tenant_segments(
+    rows: &[Row],
+    bounds: &[(usize, usize)],
+    row_group_ranges: &[ByteRange],
+) -> Vec<TenantSegment> {
     let mut segments: Vec<TenantSegment> = Vec::new();
     for (row_group, (start, end)) in bounds.iter().enumerate() {
         let group = &rows[*start..*end];
         let tenant = &group[0].tenant;
         let min_ts_ns = group.iter().map(|r| r.timestamp_ns).min().unwrap_or_default();
         let max_ts_ns = group.iter().map(|r| r.timestamp_ns).max().unwrap_or_default();
+        let range = row_group_ranges.get(row_group).copied().unwrap_or_default();
         match segments.last_mut() {
             Some(segment) if segment.tenant == *tenant => {
                 segment.row_group_end = row_group as u32 + 1;
                 segment.row_count += group.len() as u64;
                 segment.min_ts_ns = segment.min_ts_ns.min(min_ts_ns);
                 segment.max_ts_ns = segment.max_ts_ns.max(max_ts_ns);
+                segment.bytes.end = segment.bytes.end.max(range.end);
             }
             _ => segments.push(TenantSegment {
                 tenant: tenant.clone(),
@@ -131,10 +146,46 @@ fn tenant_segments(rows: &[Row], bounds: &[(usize, usize)]) -> Vec<TenantSegment
                 row_count: group.len() as u64,
                 min_ts_ns,
                 max_ts_ns,
+                bytes: range,
+                crc32: 0,
             }),
         }
     }
     segments
+}
+
+/// Checksums the body once, filling in each segment's digest on the way past.
+///
+/// Segments are contiguous, ordered and non-overlapping, so a single forward
+/// read covers all of them. Reading the file once per segment instead would
+/// make flush cost O(tenants) reads of the whole part.
+fn checksum_data_and_segments(path: &Path, segments: &mut [TenantSegment]) -> io::Result<u32> {
+    let mut file = fs::File::open(path)?;
+    let mut whole = crc32fast::Hasher::new();
+    let mut digests = vec![crc32fast::Hasher::new(); segments.len()];
+    let mut buffer = [0u8; 64 * 1024];
+    let mut offset = 0u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        whole.update(chunk);
+        let chunk_end = offset.saturating_add(read as u64);
+        for (segment, digest) in segments.iter().zip(digests.iter_mut()) {
+            let start = segment.bytes.start.max(offset);
+            let end = segment.bytes.end.min(chunk_end);
+            if start < end {
+                digest.update(&chunk[(start - offset) as usize..(end - offset) as usize]);
+            }
+        }
+        offset = chunk_end;
+    }
+    for (segment, digest) in segments.iter_mut().zip(digests) {
+        segment.crc32 = digest.finalize();
+    }
+    Ok(whole.finalize())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

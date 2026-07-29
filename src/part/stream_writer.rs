@@ -223,6 +223,8 @@ impl StreamingPartWriter {
                 segment.min_ts_ns = segment.min_ts_ns.min(min_ts_ns);
                 segment.max_ts_ns = segment.max_ts_ns.max(max_ts_ns);
             }
+            // `bytes` and `crc32` are filled in by `finish`: the writer only
+            // knows where a row group landed once it has closed the file.
             _ => self.tenants.push(TenantSegment {
                 tenant: first.tenant.clone(),
                 row_group_start: ordinal,
@@ -230,6 +232,8 @@ impl StreamingPartWriter {
                 row_count: self.group.len() as u64,
                 min_ts_ns,
                 max_ts_ns,
+                bytes: ByteRange::default(),
+                crc32: 0,
             }),
         }
 
@@ -250,7 +254,7 @@ impl StreamingPartWriter {
 
     pub fn finish(mut self, dir: &Path, id: &str, partition: &str) -> io::Result<()> {
         self.flush_group()?;
-        self.writer.close().map_err(io::Error::other)?;
+        let parquet_metadata = self.writer.close().map_err(io::Error::other)?;
         sync_file(&self.data_path)?;
         // Synced, therefore clean — and dropped from the page cache on
         // purpose, so the write stream cannot ride `memory.current` into
@@ -293,8 +297,35 @@ impl StreamingPartWriter {
             names.into_iter().map(str::to_string).collect()
         };
 
+        // A tenant's extent is the span of its row groups, which the writer
+        // only learns from the metadata it just wrote. The segments were
+        // accumulated as the groups were cut, so filling the ranges in is a
+        // walk over them rather than a second pass over the rows.
+        let row_group_ranges = row_group_byte_ranges(&parquet_metadata);
+        if row_group_ranges.len() != self.row_group_rows.len() {
+            return Err(io::Error::other(format!(
+                "parquet wrote {} row groups for {} cut groups",
+                row_group_ranges.len(),
+                self.row_group_rows.len()
+            )));
+        }
+        let mut tenants = self.tenants;
+        for segment in &mut tenants {
+            let mut start = u64::MAX;
+            let mut end = 0u64;
+            for range in &row_group_ranges
+                [segment.row_group_start as usize..segment.row_group_end as usize]
+            {
+                start = start.min(range.start);
+                end = end.max(range.end);
+            }
+            segment.bytes = ByteRange { start, end };
+        }
+        // One pass over the body for both checksums, the same as the batch
+        // path: the segments are contiguous, ordered and non-overlapping.
+        let data_crc32 = checksum_data_and_segments(&self.data_path, &mut tenants)?;
         let integrity = PartIntegrity {
-            data_crc32: file_crc32(&self.data_path)?,
+            data_crc32,
             index_crc32: file_crc32(&dir.join(INDEX_FILE))?,
             metadata_crc32: 0,
         };
@@ -317,7 +348,7 @@ impl StreamingPartWriter {
             row_group_max_ts: self.row_group_max_ts,
             row_group_rows: self.row_group_rows,
             row_group_ts_monotonic: self.row_group_ts_monotonic,
-            tenants: self.tenants,
+            tenants,
             materialized_bytes: self.materialized_bytes,
             // Every declared key stays listed, even at a count of zero:
             // the Parquet file carries its (all-null) column either way, and

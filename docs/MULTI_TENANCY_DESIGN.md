@@ -327,6 +327,44 @@ Condition 1 and the struck entry in `todo.md`. Per-tenant cache keys go with
 it: they need the range read to have a slice to key, and the sharing they would
 split is what pays for the download.
 
+### What is recorded at write time anyway
+
+The write half landed from the other line of work before that decision was
+taken, so each `TenantSegment` now carries:
+
+- `bytes: ByteRange` — the half-open extent of that tenant's row groups in
+  `data.parquet`, taken from the metadata `ArrowWriter::close` returns, because
+  the writer is the only thing that knows the layout. Both writers record it,
+  and `part::tests::the_streaming_writer_produces_the_same_part_as_the_batch_one`
+  is what keeps them from disagreeing about where a row group is.
+- `crc32` — of exactly that range, computed in the same single pass over the
+  body that already produced `data_crc32`. Without it a fetched slice would be
+  the one thing in this design that could not be checked.
+
+Pinned by `part::tests::each_tenant_segment_records_the_byte_range_of_its_own_row_groups`,
+which checks the recorded range against the Parquet footer that actually decides
+the layout, against its own checksum, and against its neighbours.
+
+**It is recorded and unused, and that is a cost, not a hedge.** Two fields per
+(tenant, part) pair, paid on every part written, for a read path this document
+decided against on measurement. Keeping it is a bet that the decision gets
+revisited under a workload with a different miss rate; if that bet is not one
+worth holding, the fields come out and the writers get simpler. Nothing reads
+them today.
+
+The reading half, if it is ever built, is decided and is pure code:
+`parquet::arrow::push_decoder::ParquetPushDecoder` answers
+`DecodeResult::NeedsData(Vec<Range<u64>>)` and the caller supplies the bytes, so
+the scan stays synchronous inside `spawn_blocking` and the bytes can come from a
+cached slice, a range GET, or a mix. Reconstructing a local single-tenant
+Parquet file was rejected: a rewritten footer can be compared against nothing,
+and an offset that is subtly wrong yields *wrong rows* rather than an error, in
+an engine that checksums every file at every open.
+
+**No format version came with any of this.** loggytracy versions nothing on disk
+— see the decided-choices table in [`ARCHITECTURE.md`](ARCHITECTURE.md). The
+format changed; a stale data directory is deleted.
+
 ## Supporting changes
 
 ### Consolidate the sidecars into one object
@@ -338,10 +376,10 @@ one fewer checksum pass per part at startup — which §8 of
 [`LOAD_RESULTS.md`](LOAD_RESULTS.md) measured as the actual startup cost.
 
 Folding `meta.json` in as well would make it two, but `meta.json` is the
-self-describing version header that the registry and the recovery paths read
-standalone, and `PART_META_VERSION` was just raised to 2. The next format change
-should therefore carry the `TenantSegment` byte ranges that range GET needs, in
-the same step — doing the two separately moves the on-disk format three times.
+self-describing header the registry and the recovery paths read standalone. It
+is not versioned and nothing on disk is, so a format change is not an event to
+be batched around: the `TenantSegment` byte ranges landed on their own, and
+folding `meta.json` in can land on its own too.
 
 Affected: `upload_part`, `download_part`, `restore_catalog`,
 `delete_part_objects`, `garbage_collect_orphans`. All iterate the `PART_FILES` /
@@ -494,7 +532,8 @@ This is the gap `PRODUCTION_READINESS_REVIEW.md:276` records as
 | Partition on `(tier, day)` | **rejected** — retention baked in at write time cannot honour a plan change; superseded by [`RETENTION_DESIGN.md`](RETENTION_DESIGN.md) |
 | Sidecar consolidation | **done for the sidecars** — the trigram blooms and the stream index are one `index.bin`, so `PART_FILES` is three. Folding `meta.json` in is deliberately left for the format change that adds `TenantSegment` byte ranges, so the on-disk format moves once rather than twice |
 | Cache-miss fetch cost | **done** — a body-only restore GETs the body alone and leaves the local catalog in place: one Class B per miss instead of three |
-| Range GET / per-`(part, tenant)` cache | **not done** — the last open multi-tenancy item |
+| Range GET: recorded byte ranges | **done, and currently unused** — every `TenantSegment` carries its `ByteRange` in `data.parquet` and a CRC32 of exactly that range. The read half is decided against on measurement, so these two fields are a cost with no reader |
+| Range GET: reading through them / per-`(part, tenant)` cache | **decided against, on measurement** — a restored body is read by several tenants before eviction, so serving them selectively trades Class A requests to save bytes R2 gives away. Design if ever revisited: the push decoder |
 | Ingest rate quota | **done** — `ingest_rate` rides the same pushed policy as retention (`4MiB/s`, `0`, `unlimited`), enforced per tenant before the body is decompressed. `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` covers tenants the control plane has said nothing about |
 | Query-scan and stream-count quotas | **done** — `query_rate` and `max_streams` ride the same pushed policy as `ingest_rate`; a scan is charged what it actually read, and `max_streams` is enforced against the union of parts and buffers |
 | Per-tenant usage | **done** — `GET /loggytracy/api/v1/admin/tenants/{tenant}/usage`. Deliberately *not* labels on `/metrics`: that scrape is unauthenticated and process-wide by design, and a label per tenant is the cardinality problem this engine bounds everywhere else |
@@ -546,8 +585,13 @@ Ordered by dependency.
 - [x] Per-tenant `min_ts`/`max_ts` pruning from the meta index.
 - [x] Fetch only what a miss is missing — a body-only restore GETs the body and
       leaves the already-valid local catalog alone, one Class B instead of three.
-- [ ] Range GET using `byte_range` in `download_part`.
-- [ ] Key the local cache by `(part_id, tenant)`.
+- [x] Record each tenant's byte range and a CRC of it at write time. No format
+      version came with it; loggytracy versions nothing on disk.
+- [x] ~~Range GET using those ranges in `download_part`, decoded through
+      `ParquetPushDecoder`~~ — decided against on measurement.
+- [x] ~~Key the local cache by `(part_id, tenant)`~~ — goes with the range read:
+      it needs a slice to key, and the sharing it would split is what pays for
+      the download.
 - [x] Parallelize `restore_parts` and `restore_catalog` — both fan out at
       `RESTORE_CONCURRENCY` (16). The bound exists because unbounded fan-out
       opens a connection per part and turns a restore into a self-inflicted

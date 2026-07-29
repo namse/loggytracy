@@ -1783,6 +1783,82 @@ resident {:.0} B",
         }
     }
 
+    /// A tenant's recorded byte range really is that tenant's row groups.
+    ///
+    /// This is the fact a range read rests on, and nothing else in the part can
+    /// check it: `data_crc32` covers the whole body, so it says nothing about a
+    /// slice. The range is therefore verified three ways — against the Parquet
+    /// footer that actually decides the layout, against its own recorded
+    /// checksum, and against the other tenants' ranges, because a range that
+    /// overlapped a neighbour would fetch rows the tenant may not address.
+    #[test]
+    fn each_tenant_segment_records_the_byte_range_of_its_own_row_groups() {
+        let tmp = tempfile_dir();
+        let rows: Vec<Row> = (0..600)
+            .map(|index| {
+                tenant_row(
+                    &format!("tenant{}", index % 3),
+                    &format!("line {index} with enough text to compress like a log line"),
+                    1_000 + index as i64,
+                )
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 64).unwrap().remove(0);
+
+        let body = fs::read(part.data_path()).unwrap();
+        let reader_metadata = {
+            let file = fs::File::open(part.data_path()).unwrap();
+            ArrowReaderMetadata::load(&file, Default::default()).unwrap()
+        };
+        let row_groups = reader_metadata.metadata().row_groups();
+
+        let mut previous_end = None;
+        for segment in &part.meta.tenants {
+            let range = segment.bytes;
+            assert!(!range.is_empty(), "{} recorded an empty range", segment.tenant);
+
+            // Ground truth: every column chunk of every row group the segment
+            // claims must fall inside the range, and no other row group may.
+            for (ordinal, row_group) in row_groups.iter().enumerate() {
+                let ordinal = ordinal as u32;
+                let claimed =
+                    ordinal >= segment.row_group_start && ordinal < segment.row_group_end;
+                for column in row_group.columns() {
+                    let (start, length) = column.byte_range();
+                    let inside = start >= range.start && start + length <= range.end;
+                    assert_eq!(
+                        inside, claimed,
+                        "row group {ordinal} column chunk at {start}..{} vs {}'s range {}..{}",
+                        start + length,
+                        segment.tenant,
+                        range.start,
+                        range.end
+                    );
+                }
+            }
+
+            assert_eq!(
+                segment.crc32,
+                crc32fast::hash(&body[range.start as usize..range.end as usize]),
+                "{} recorded a checksum its own bytes do not produce",
+                segment.tenant
+            );
+
+            // Segments are written in file order, so a later one starting
+            // before the previous ended would mean two tenants share bytes.
+            if let Some(end) = previous_end {
+                assert!(
+                    range.start >= end,
+                    "{} starts at {} inside the previous segment ending at {end}",
+                    segment.tenant,
+                    range.start
+                );
+            }
+            previous_end = Some(range.end);
+        }
+        assert_eq!(part.meta.tenants.len(), 3);
+    }
+
     #[test]
     fn a_shared_part_confines_every_read_to_the_querying_tenant() {
         let tmp = tempfile_dir();
