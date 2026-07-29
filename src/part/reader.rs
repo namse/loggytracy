@@ -284,11 +284,25 @@ fn window_row_selection(mask: u64, group_rows: usize) -> RowSelection {
     )
 }
 
+// Counts what a scan spends on opening the body, so the cost can be asserted
+// rather than assumed. Every call here is a `File::open` plus a full Parquet
+// footer parse.
+//
+// Per thread rather than global: a scan is synchronous and runs on its caller's
+// thread, and the test harness runs tests in parallel in one process, so a
+// shared counter would report other tests' scans.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PART_DATA_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn open_part_data(
     part: &Part,
     validate_checksum: bool,
     page_index: bool,
 ) -> Result<(PreadReader, ArrowReaderMetadata), String> {
+    #[cfg(test)]
+    PART_DATA_OPENS.with(|opens| opens.set(opens.get() + 1));
     if validate_checksum {
         let actual = file_crc32(&part.data_path()).map_err(|error| {
             format!(

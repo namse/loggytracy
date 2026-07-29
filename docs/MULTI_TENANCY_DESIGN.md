@@ -352,6 +352,34 @@ revisited under a workload with a different miss rate; if that bet is not one
 worth holding, the fields come out and the writers get simpler. Nothing reads
 them today.
 
+### The decode mechanism is proven; the cache lifecycle is not built
+
+`part::tests::a_tenant_decodes_from_its_own_byte_range_and_asks_for_nothing_else`
+decodes one tenant's rows from the footer plus that tenant's byte range alone,
+and asserts that **every range the decoder asks for falls inside the segment**.
+That second assertion is the load-bearing one: it is what makes fetching a
+tenant's slice *sufficient*, and it is the same fail-closed property a
+per-tenant file would have had. The rows match an ordinary whole-file read of
+the same tenant.
+
+What remains is not the decoder, it is the cache lifecycle around it, and it is
+larger than it looks because **merge and retention still need whole parts**
+(`merge/selection.rs` reads every tenant segment). So the cache has to hold two
+kinds of entry — whole bodies for the writers, per-tenant slices for the readers
+— and every part of the lifecycle has to know which it is looking at:
+
+- `PartRegistry::missing_data_ids` becomes a question about `(part, tenant)`
+  rather than about a part.
+- `PartReader` needs a second backing: push buffers over a cached slice, beside
+  today's `PreadReader` over a whole file.
+- `restore_parts` becomes a range GET of the segment plus the footer, and
+  `evict_cache` has to reclaim slices as well as bodies.
+- `pin_remote_parts` has to carry the tenant, which it does not today.
+
+Until all of that lands together, whole-part restore stays the only path.
+Half-migrating it would leave the engine worse than it is now.
+
+
 The reading half, if it is ever built, is decided and is pure code:
 `parquet::arrow::push_decoder::ParquetPushDecoder` answers
 `DecodeResult::NeedsData(Vec<Range<u64>>)` and the caller supplies the bytes, so

@@ -2704,7 +2704,11 @@ Read path:
       durable monthly usage accounting is the control plane's by the checklist's own reasoning, and Parquet
       range reads are struck in P2 on measurement rather than deferred. The design, cost
       model, and implementation checklist are in
-      [`docs/MULTI_TENANCY_DESIGN.md`](docs/MULTI_TENANCY_DESIGN.md).
+      [`docs/MULTI_TENANCY_DESIGN.md`](docs/MULTI_TENANCY_DESIGN.md). The recorded byte ranges outlived
+      the read path they were for: `a_tenant_decodes_from_its_own_byte_range_and_asks_for_nothing_else`
+      proves a tenant's rows decode from the footer plus its own range and that the decoder reaches
+      outside it for nothing — so if the range-read decision is ever revisited, the mechanism is already
+      proven and what is left is the cache lifecycle, sized in the design doc.
       **The previous design using tenants as a storage-path axis (`docs/ARCHITECTURE.md`, "Multi-tenancy")
       was discarded because of R2 Class A costs** — writing objects per tenant does not fit the $1 plan
       budget at any RPO.

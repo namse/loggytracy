@@ -1783,6 +1783,139 @@ resident {:.0} B",
         }
     }
 
+    /// A scan parses the Parquet footer once, not once per row group.
+    ///
+    /// Opening the body sat inside the row-group loop, so the cost scaled with
+    /// the number of groups a query touched — and a part holds at least one row
+    /// group per tenant in it, at about 1.3 KB of metadata each (LOAD_RESULTS.md
+    /// §2). Nothing about it was per group: both handles are a file descriptor
+    /// and an `Arc` over metadata that describes the whole file.
+    #[test]
+    fn a_scan_opens_the_body_once_however_many_row_groups_it_reads() {
+        let tmp = tempfile_dir();
+        let rows: Vec<Row> = (0..512)
+            .map(|index| tenant_row("solo", &format!("line {index}"), 1_000 + index as i64))
+            .collect();
+        // One row per group, so a full scan touches every one of them.
+        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
+        assert_eq!(part.meta.row_group_count, 512);
+        let reader = PartReader::open(part).unwrap();
+        let tenant = TenantId::parse("solo").unwrap();
+
+        let before = PART_DATA_OPENS.with(|opens| opens.get());
+        let found = reader
+            .query(&tenant, &[], &[], QueryTimeRange::closed(i64::MIN, i64::MAX), usize::MAX, true)
+            .unwrap();
+        let opens = PART_DATA_OPENS.with(|opens| opens.get()) - before;
+
+        assert_eq!(
+            found.iter().map(|stream| stream.entries.len()).sum::<usize>(),
+            512,
+            "the scan must actually have read every row group"
+        );
+        assert_eq!(
+            opens, 1,
+            "a scan over 512 row groups opened the body {opens} times"
+        );
+    }
+
+    /// A tenant's rows decode from that tenant's bytes and nothing else.
+    ///
+    /// This is the mechanism range reads rest on, and the reason the decoder is
+    /// the push one rather than the async object-store reader: the caller
+    /// supplies the bytes, so the scan stays synchronous and the bytes can come
+    /// from a cached slice, a range GET, or a mix.
+    ///
+    /// The assertion that matters is not that the rows come out — it is that
+    /// every range the decoder asks for falls inside the segment. That is what
+    /// makes fetching one tenant's slice *sufficient*, and it is the same
+    /// fail-closed property a per-tenant file would have had.
+    #[test]
+    fn a_tenant_decodes_from_its_own_byte_range_and_asks_for_nothing_else() {
+        use parquet::DecodeResult;
+        use parquet::arrow::push_decoder::ParquetPushDecoderBuilder;
+
+        let tmp = tempfile_dir();
+        let rows: Vec<Row> = (0..600)
+            .map(|index| {
+                tenant_row(
+                    &format!("tenant{}", index % 3),
+                    &format!("line {index} with enough text to compress like a log line"),
+                    1_000 + index as i64,
+                )
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 64).unwrap().remove(0);
+
+        let wanted = TenantId::parse("tenant1").unwrap();
+        let segment = part.meta.tenant_segment(&wanted).unwrap().clone();
+        let body = fs::read(part.data_path()).unwrap();
+
+        // What a restore would have fetched: the footer, and this tenant's
+        // range. Nothing else of the body is available below.
+        let metadata = {
+            let file = fs::File::open(part.data_path()).unwrap();
+            ArrowReaderMetadata::load(&file, Default::default()).unwrap()
+        };
+        let slice = &body[segment.bytes.start as usize..segment.bytes.end as usize];
+        assert_eq!(crc32fast::hash(slice), segment.crc32);
+
+        let mut decoder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
+            .with_row_groups(
+                (segment.row_group_start..segment.row_group_end)
+                    .map(|group| group as usize)
+                    .collect(),
+            )
+            .build()
+            .unwrap();
+
+        let mut lines = Vec::new();
+        loop {
+            match decoder.try_decode().unwrap() {
+                DecodeResult::NeedsData(ranges) => {
+                    let data = ranges
+                        .iter()
+                        .map(|range| {
+                            assert!(
+                                range.start >= segment.bytes.start
+                                    && range.end <= segment.bytes.end,
+                                "decoder asked for {}..{} outside {}'s range {}..{}",
+                                range.start,
+                                range.end,
+                                wanted,
+                                segment.bytes.start,
+                                segment.bytes.end
+                            );
+                            let from = (range.start - segment.bytes.start) as usize;
+                            let to = (range.end - segment.bytes.start) as usize;
+                            bytes::Bytes::copy_from_slice(&slice[from..to])
+                        })
+                        .collect();
+                    decoder.push_ranges(ranges, data).unwrap();
+                }
+                DecodeResult::Data(batch) => {
+                    let column = batch.column(2).as_string::<i32>();
+                    for index in 0..batch.num_rows() {
+                        lines.push(column.value(index).to_string());
+                    }
+                }
+                DecodeResult::Finished => break,
+            }
+        }
+
+        // The same rows an ordinary whole-file read of this tenant returns.
+        let reader = PartReader::open(part).unwrap();
+        let expected: Vec<String> = reader
+            .query(&wanted, &[], &[], QueryTimeRange::closed(i64::MIN, i64::MAX), usize::MAX, true)
+            .unwrap()
+            .into_iter()
+            .flat_map(|stream| stream.entries)
+            .map(|entry| entry.line)
+            .collect();
+        assert_eq!(lines.len(), segment.row_count as usize);
+        assert_eq!(lines, expected);
+    }
+
     /// A tenant's recorded byte range really is that tenant's row groups.
     ///
     /// This is the fact a range read rests on, and nothing else in the part can
