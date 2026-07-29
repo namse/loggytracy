@@ -468,11 +468,12 @@ breaks the table's shape.** The flush arena holds a *copy* of the ingest arena's
 contents — `rows_from_snapshot` materializes the whole snapshot — so the flush
 share is not a free parameter: it is measured at 3.3× the accounted memtable and
 1.9× the ingest arena's live bytes, and the two peak together (375 MiB ingest and
-721 MiB flush in the same sample). A budget that gives ingest 20 % and flush 30 %
+721 MiB flush in the same sample). A budget that gives ingest 20 % and flush 25 %
 is therefore only satisfiable if the memtable cap is set so that
 `3.3 × cap ≤ flush share`, which at a 2 GiB budget means a memtable cap of about
-**185 MiB accounted** — smaller than today's 256 MiB default, which is really
-440 MiB. Either the flush share is expressed as a multiple of the ingest share,
+**155 MiB accounted** — well under today's 256 MiB default, which is really
+440 MiB, so the ingest share is the one the flush share actually constrains.
+Either the flush share is expressed as a multiple of the ingest share,
 or `flush_rows` streams the snapshot in bounded chunks so the multiple stops
 mattering. The second is the real answer and it is `VISION.md` invariant II's
 `Arc<Labels>` plus a chunked flush, not an arena boundary.
