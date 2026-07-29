@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# The answer to a commit that has already been superseded is not worth a runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Format, lint and the test suite. All three share one debug build of the
+  # dependency tree, which is the expensive part.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # `rust-toolchain.toml` is the single source of truth for the version;
+        # the components are repeated because `rustup toolchain install <ver>`
+        # does not read them from the file. Installing explicitly means a failed
+        # toolchain download reports itself as one, instead of surfacing as an
+        # unexplained failure in whichever step happened to compile first.
+        run: |
+          rustup toolchain install --profile minimal \
+            --component rustfmt --component clippy \
+            "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustc --version && cargo --version
+
+      # The tree pulls in arrow, parquet, tonic and object_store; uncached, a
+      # run spends most of its time compiling code that did not change.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        # `--all-targets` so benches and tests are linted too, and `-D warnings`
+        # because the tree is at zero warnings and that is a maintained property.
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: Load-harness smoke run
+        # NOT A MEASUREMENT. Debug profile, twenty seconds, on a shared runner
+        # whose neighbours are invisible to us: every latency and throughput
+        # number this produces is noise. This repository has already published
+        # numbers from a machine that was busy doing something else
+        # (docs/LOAD_RESULTS.md), so the gate below reads the verdict field and
+        # deliberately ignores its value.
+        #
+        # What it does catch: the run script or the harness failing to run at
+        # all. Exit 1 is "the server never became ready" and exit 101 is a
+        # panic; both are real breakage. Exit 2 is the harness reporting a
+        # verdict other than PASS, which is the expected outcome here -- a
+        # twenty-second run cannot even collect the 101 samples a p99 requires.
+        timeout-minutes: 10
+        env:
+          # `debug` reuses the artifacts `cargo test` just built. A debug harness
+          # measures the harness, which is fine when nothing is being measured.
+          LOGGYTRACY_LOAD_PROFILE: debug
+          LOGGYTRACY_LOAD_SECONDS: '20'
+          LOGGYTRACY_LOAD_WARMUP_SECONDS: '2'
+          LOGGYTRACY_LOAD_CORPUS_ROWS: '2000'
+          LOGGYTRACY_LOAD_STREAMS: '32'
+          LOGGYTRACY_LOAD_TARGET_EPS: '200'
+        run: |
+          set -uo pipefail
+          status=0
+          ./scripts/run_load_local.sh || status=$?
+          case "$status" in
+            0|2) ;;
+            *) echo "::error::the load harness did not complete (exit $status)"; exit 1 ;;
+          esac
+          verdict=$(jq -r '.verdict // empty' target/load_result.json)
+          if [ -z "$verdict" ]; then
+            echo "::error::the harness produced no verdict"
+            exit 1
+          fi
+          echo "harness verdict: $verdict (recorded, not gated -- see above)"
+
+  # Separate job: the benches build under the `bench` profile, so they share no
+  # compiled artifacts with `check` and there is nothing to gain by serializing
+  # them behind it.
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install --profile minimal \
+            --component rustfmt --component clippy \
+            "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo bench --no-run
+        # `benches/` is a separate crate against the `[lib]` target, so nothing
+        # else in CI compiles it. Without this it rots silently.
+        run: cargo bench --locked --no-run
+
+      - name: Bench smoke run
+        # NOT A MEASUREMENT either. `--test` runs each benchmark body exactly
+        # once with no timing loop and no statistics, which is the whole point:
+        # it proves the bench code executes, on hardware whose timings nobody
+        # should quote. `--benches` restricts this to the `[[bench]]` targets --
+        # without it, `cargo bench -- --test` would also re-run the unit tests
+        # under the bench profile.
+        run: cargo bench --locked --benches -- --test

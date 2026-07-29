@@ -32,7 +32,21 @@ that never contend with writes. Optimizing against those numbers reproduces them
 - [x] **Fix `scripts/run_load_local.sh`** — the repository root is derived from the script's own location, the
       addresses and the result path are defaults rather than assignments, and the harness's non-zero verdict
       exit no longer truncates the server log
-- [ ] **CI.** There is no `.github`. None of the above holds without it
+- [x] **CI.** [`.github/workflows/ci.yml`](.github/workflows/ci.yml), on every push and every pull request:
+      `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (the tree is at zero warnings and that is
+      a maintained property), `cargo test`, `cargo bench --no-run` so `benches/` — a separate crate nothing else
+      compiles — cannot rot, a criterion `--test` pass that executes every bench body once, and a twenty-second
+      debug run of [`scripts/run_load_local.sh`](scripts/run_load_local.sh). Neither the bench pass nor the load
+      run is a measurement: a shared runner's timings are noise, and this repository has already published
+      numbers from a machine that was busy doing something else. The load run is gated on the *presence* of a
+      verdict, not its value. The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml) rather than
+      in the workflow, so the version that gates a pull request is the one `cargo` picks locally
+- [ ] **Bench regression *detection*, not just bench execution.** CI proves the bench bodies run; it compares
+      nothing. Criterion baselines live in `target/criterion/` and do not survive a fresh runner, so an honest
+      gate needs a stored baseline — publish the estimates as an artifact, restore the previous one, and compare
+      against a threshold wide enough to survive shared hardware, or run the comparison on a machine that is not
+      shared. Half of this is worse than none: "regression check: passed" computed over noise is a claim nobody
+      will re-examine
 
 ## M9 — the comparison bed
 
