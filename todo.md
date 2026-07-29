@@ -109,6 +109,15 @@ that never contend with writes. Optimizing against those numbers reproduces them
       invisible unless a boundary lands on a row, which is why nothing before the comparison's step-aligned
       windows surfaced it. Not fixed here on purpose: a ruler that edits what it is measuring in the same
       change measures nothing
+- [ ] **`| json` does not promote extracted fields into a log response's stream labels; Loki's does.** Over the
+      same window loggytracy returned the six stream labels and Loki returned twenty-two, the difference being
+      every field the parser extracted. The row-equality check **did not catch this** — its digest is over
+      `(timestamp, line)` pairs, so a label-set difference is invisible to it, and the two label sets are in
+      [`docs/COMPARISON.md`](docs/COMPARISON.md) only because they were captured alongside. Metric grouping is
+      not affected: `sum(count_over_time({app="api"} | json [5s])) by (level)` is covered at
+      `query/tests.rs:960` and works. What differs is the log-query response shape, which is what Grafana's
+      Logs panel renders as a line's detected fields. **Extend the digest to cover labels** before the next
+      comparison run, or the next compatibility gap of this shape is invisible too
 - [ ] **loggytracy was OOM-killed at a 2 GiB container limit where Loki was not**, ingesting 1.2 M events at
       20 k eps with the harness's query workload on. `memory.peak` climbed monotonically from 2 MB to the limit
       in forty seconds while `loggytracy_memtable_bytes` reported 111 MB, so the accounted memtable is not
