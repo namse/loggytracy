@@ -4,9 +4,20 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 
 # Dependencies first, so editing our own sources does not re-resolve or
-# re-download the tree.
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
+# re-download the tree. `rust-toolchain.toml` is copied here rather than beside
+# `src` so the toolchain download happens once, in the cached layer: without it
+# in the image at all, `FROM rust:1-bookworm` decides the compiler and the
+# shipped binary is built by a toolchain no check in CI ever ran.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# `Cargo.toml` declares six `[[bench]]` targets. Cargo refuses to *parse* a
+# manifest whose declared targets are missing, so without this the image build
+# fails before it compiles anything — which it has done since the benches
+# landed. Nothing here builds them; they only have to exist.
+COPY benches ./benches
+# The stub needs a `src/lib.rs` as well as a `src/main.rs`: `Cargo.toml`
+# declares a `[lib]` target and the binary depends on it, so a stub with only
+# `main.rs` fails this layer outright rather than merely skipping the cache.
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && : > src/lib.rs \
     && cargo build --release --bin loggytracy \
     && rm -rf src
 
@@ -19,7 +30,10 @@ ARG LOGGYTRACY_BUILD_BRANCH=unknown
 ENV LOGGYTRACY_BUILD_REVISION=${LOGGYTRACY_BUILD_REVISION}
 ENV LOGGYTRACY_BUILD_BRANCH=${LOGGYTRACY_BUILD_BRANCH}
 # Touch so the dependency-cache layer above does not make cargo skip our code.
-RUN touch src/main.rs && cargo build --release --bin loggytracy
+# Both targets, not just the binary: the cache layer compiled an empty
+# `src/lib.rs`, and touching only `main.rs` leaves that fingerprint valid, so
+# the build fails on a library that appears to have no contents.
+RUN touch src/lib.rs src/main.rs && cargo build --release --bin loggytracy
 
 FROM debian:bookworm-slim
 RUN apt-get update \

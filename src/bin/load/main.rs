@@ -26,6 +26,7 @@
 
 mod config;
 mod http;
+mod matrix;
 mod probe;
 mod stats;
 mod workload;
@@ -43,7 +44,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::Instant;
 
-use config::Config;
+use config::{Config, Phase, Target};
 use http::{Client, Request};
 use stats::{GaugeSeries, LatencyPair, target_row, wal_backlog_drains};
 use workload::{ArrivalOrder, PushGenerator, QUERY_SHAPES, QueryGenerator, loki_result_rows};
@@ -176,7 +177,121 @@ struct OtlpOutcome {
 
 #[tokio::main]
 async fn main() {
-    let cfg = Config::from_env();
+    let cfg = match Config::from_env() {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    match cfg.phase {
+        Phase::Load => run_load(cfg).await,
+        Phase::Seed | Phase::Matrix => run_verify(cfg).await,
+    }
+}
+
+/// The seed and matrix phases, which drive the fixed dataset the comparison's
+/// query numbers and its row-equality check are both taken over.
+async fn run_verify(cfg: Config) {
+    if let Err(error) = matrix::require_anchor(&cfg.verify) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
+    if let Err(error) = wait_for_ready(&cfg).await {
+        eprintln!("server at {} is not ready: {error}", cfg.http_address);
+        std::process::exit(1);
+    }
+    let memory_source = cfg.memory_source();
+    let memory_before = memory_source
+        .as_ref()
+        .ok()
+        .and_then(|source| source.read().ok());
+
+    eprintln!(
+        "{} phase {:?}: generating verification corpus of {} rows",
+        cfg.target.name(),
+        cfg.phase,
+        cfg.verify.rows
+    );
+    let corpus = matrix::verify_corpus(&cfg);
+
+    let mut report = json!({
+        "phase": if cfg.phase == Phase::Seed { "seed" } else { "matrix" },
+        "target": cfg.target.name(),
+        "run": {
+            "build_revision": config::build_revision(),
+            "machine_profile": config::machine_profile(),
+            "seed": cfg.seed,
+        },
+        "verify": {
+            "tenant": corpus.tenant_ids[0].as_str(),
+            "anchor_ns": cfg.verify.anchor_ns,
+            "span_ns": cfg.verify_span_ns(),
+            "rows": corpus.entry_count(),
+            "streams": corpus.streams.len(),
+            "line_bytes": corpus.line_bytes(),
+        },
+    });
+
+    let ok;
+    match cfg.phase {
+        Phase::Seed => {
+            let outcome = matrix::run_seed(&cfg, &corpus).await;
+            ok = outcome.errors == 0 && outcome.rows == corpus.entry_count() as u64;
+            report["seed"] = json!({
+                "pushes": outcome.pushes,
+                "rows": outcome.rows,
+                "line_bytes": outcome.line_bytes,
+                "wire_bytes": outcome.wire_bytes,
+                "retries": outcome.retries,
+                "errors": outcome.errors,
+                "statuses": outcome
+                    .statuses
+                    .iter()
+                    .map(|(status, count)| (status.to_string(), *count))
+                    .collect::<BTreeMap<_, _>>(),
+                "first_error": outcome.first_error,
+                "elapsed_seconds": outcome.elapsed_seconds,
+                "complete": ok,
+            });
+        }
+        Phase::Matrix => {
+            let outcome = matrix::run_matrix(&cfg, &corpus).await;
+            ok = outcome["shapes"]
+                .as_object()
+                .is_some_and(|shapes| shapes.values().all(|shape| shape["errors"] == json!(0)));
+            report["matrix"] = outcome;
+        }
+        Phase::Load => unreachable!("run_verify is only reached for the seed and matrix phases"),
+    }
+
+    let memory_after = memory_source
+        .as_ref()
+        .ok()
+        .and_then(|source| source.read().ok());
+    report["memory"] = json!({
+        "source": memory_source.as_ref().map(|source| source.describe()).ok(),
+        "error": memory_source.as_ref().err(),
+        "peak_bytes_before": memory_before.as_ref().map(|memory| memory.vm_hwm_bytes),
+        "peak_bytes": memory_after.as_ref().map(|memory| memory.vm_hwm_bytes),
+        "current_bytes": memory_after.as_ref().map(|memory| memory.vm_rss_bytes),
+    });
+    report["config"] = serde_json::to_value(&cfg).expect("config serialization");
+    report["verdict"] = json!(if ok { "PASS" } else { "FAIL" });
+
+    let rendered = serde_json::to_string_pretty(&report).expect("report serialization");
+    if let Some(path) = cfg.result_path.as_ref()
+        && let Err(error) = std::fs::write(path, format!("{rendered}\n"))
+    {
+        eprintln!("warning: failed to write result file {path}: {error}");
+    }
+    println!("{rendered}");
+    if !ok {
+        std::process::exit(2);
+    }
+}
+
+async fn run_load(cfg: Config) {
     let revision = config::build_revision();
     let machine_profile = config::machine_profile();
 
@@ -277,10 +392,11 @@ async fn main() {
     let mut samples = sampler.await.unwrap_or_default();
     let otlp = otlp.await.unwrap_or_default();
     // Read once more after the workload stopped: the sampler exits before the
-    // last in-flight requests land, and `VmHWM` is a high-water mark, so the
-    // final read is the only one that covers the whole run.
-    if let Some(pid) = cfg.server_pid {
-        match probe::read_memory(pid) {
+    // last in-flight requests land, and both `VmHWM` and cgroup `memory.peak`
+    // are high-water marks, so the final read is the only one that covers the
+    // whole run.
+    match cfg.memory_source() {
+        Ok(source) => match source.read() {
             Ok(memory) => {
                 samples.vm_hwm_bytes =
                     Some(samples.vm_hwm_bytes.unwrap_or(0).max(memory.vm_hwm_bytes));
@@ -288,6 +404,9 @@ async fn main() {
             Err(error) => {
                 samples.rss_error.get_or_insert(error);
             }
+        },
+        Err(error) => {
+            samples.rss_error.get_or_insert(error);
         }
     }
 
@@ -620,10 +739,11 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
     let mut outcome = SampleOutcome::default();
     let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
     let interval = Duration::from_millis(cfg.sample_interval_ms);
+    let memory_source = cfg.memory_source();
     while !stop.load(Ordering::Relaxed) {
         let elapsed = run_start.elapsed().as_secs_f64();
-        match cfg.server_pid {
-            Some(pid) => match probe::read_memory(pid) {
+        match &memory_source {
+            Ok(source) => match source.read() {
                 Ok(memory) => {
                     outcome.rss.push(elapsed, memory.vm_rss_bytes);
                     outcome.vm_hwm_bytes =
@@ -633,30 +753,42 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
                     outcome.rss_error.get_or_insert(error);
                 }
             },
-            None => {
-                outcome.rss_error.get_or_insert_with(|| {
-                    "LOGGYTRACY_LOAD_SERVER_PID was not set, so no process could be watched"
-                        .to_string()
-                });
+            Err(error) => {
+                outcome.rss_error.get_or_insert_with(|| error.clone());
             }
         }
         match scrape(&mut client).await {
-            Some(metrics) => {
-                outcome.wal_backlog.push(
-                    elapsed,
-                    probe::gauge(&metrics, "loggytracy_wal_backlog_bytes"),
-                );
-                outcome
-                    .memtable_bytes
-                    .push(elapsed, probe::gauge(&metrics, "loggytracy_memtable_bytes"));
-                outcome
-                    .part_count
-                    .push(elapsed, probe::gauge(&metrics, "loggytracy_part_count"));
-                if let Some(healthy) = metrics.get("loggytracy_remote_healthy") {
-                    outcome.health_samples += 1;
-                    outcome.health_healthy += u64::from(*healthy >= 1.0);
+            Some(metrics) => match cfg.target {
+                Target::Loggytracy => {
+                    outcome.wal_backlog.push(
+                        elapsed,
+                        probe::gauge(&metrics, "loggytracy_wal_backlog_bytes"),
+                    );
+                    outcome
+                        .memtable_bytes
+                        .push(elapsed, probe::gauge(&metrics, "loggytracy_memtable_bytes"));
+                    outcome
+                        .part_count
+                        .push(elapsed, probe::gauge(&metrics, "loggytracy_part_count"));
+                    if let Some(healthy) = metrics.get("loggytracy_remote_healthy") {
+                        outcome.health_samples += 1;
+                        outcome.health_healthy += u64::from(*healthy >= 1.0);
+                    }
                 }
-            }
+                // Loki's analogues, so the two runs report the same shape of
+                // series: what is buffered in the ingester and how many
+                // chunks it holds are its memtable and its part count.
+                Target::Loki => {
+                    outcome.memtable_bytes.push(
+                        elapsed,
+                        probe::sum_by_prefix(&metrics, "loki_ingester_memory_streams") as u64,
+                    );
+                    outcome.part_count.push(
+                        elapsed,
+                        probe::sum_by_prefix(&metrics, "loki_ingester_memory_chunks") as u64,
+                    );
+                }
+            },
             None => outcome.scrape_errors += 1,
         }
         tokio::time::sleep(interval).await;
@@ -670,6 +802,11 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
 /// taken from the intended send, so a stall shows.
 async fn otlp_workload(cfg: Config, stop: Arc<AtomicBool>, deadline: Instant) -> OtlpOutcome {
     let mut outcome = OtlpOutcome::default();
+    // Loki has no trace ingest, so a trace workload would be load one side
+    // carries and the other does not.
+    if cfg.target == Target::Loki {
+        return outcome;
+    }
     let Some(interval) = cfg.otlp_interval() else {
         return outcome;
     };
@@ -895,29 +1032,70 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         .values()
         .all(|row| row["pass"] == json!(true));
 
-    let behavioral = json!({
-        "no_ingest_errors": ingest_errors == 0,
-        "remote_healthy_fraction": remote_healthy_fraction,
-        "cache_healthy_end": cache_healthy_end,
-        "flush_progressing": flush_progressing,
-        "wal_backlog_drains": drain.drained,
-        "wal_backlog_verdict_decided": drain.decided,
-        "wal_backlog_reason": drain.reason,
-        "wal_backlog": samples.wal_backlog.summary(),
-        "flush_success_delta": flush_success,
-        "recovered_flush_errors": flush_errors,
-        "recovered_merge_errors": merge_errors,
-        "merge_success_delta": merge_success,
-        "restore_observed": restore_success > 0,
-        "restore_errors": restore_errors,
-        "restore_probe_rows": query.restore_rows,
-        "restore_probes_with_rows": query.restore_probes_with_rows,
-        "retention_observed": retention_success > 0,
-    });
-    let behavioral_pass = ingest_errors == 0
-        && remote_healthy_fraction >= 0.95
-        && cache_healthy_end
-        && flush_progressing;
+    // Loki publishes none of the series the loggytracy gates are written
+    // against, and a gate over a series that does not exist reads zero and
+    // passes. So the Loki run is gated on Loki's own evidence instead — chiefly
+    // `loki_discarded_samples_total`, which is where a rate limit, a rejected
+    // old sample or an unordered write would show up. Every deviation this bed
+    // makes from Loki's defaults exists to keep that counter at zero, and a
+    // run where it is not zero is a misconfiguration on our side, not a result.
+    let (behavioral, behavioral_pass) = match cfg.target {
+        Target::Loggytracy => (
+            json!({
+                "no_ingest_errors": ingest_errors == 0,
+                "remote_healthy_fraction": remote_healthy_fraction,
+                "cache_healthy_end": cache_healthy_end,
+                "flush_progressing": flush_progressing,
+                "wal_backlog_drains": drain.drained,
+                "wal_backlog_verdict_decided": drain.decided,
+                "wal_backlog_reason": drain.reason,
+                "wal_backlog": samples.wal_backlog.summary(),
+                "flush_success_delta": flush_success,
+                "recovered_flush_errors": flush_errors,
+                "recovered_merge_errors": merge_errors,
+                "merge_success_delta": merge_success,
+                "restore_observed": restore_success > 0,
+                "restore_errors": restore_errors,
+                "restore_probe_rows": query.restore_rows,
+                "restore_probes_with_rows": query.restore_probes_with_rows,
+                "retention_observed": retention_success > 0,
+            }),
+            ingest_errors == 0
+                && remote_healthy_fraction >= 0.95
+                && cache_healthy_end
+                && flush_progressing,
+        ),
+        Target::Loki => {
+            let lines_received = probe::sum_delta(
+                &start_metrics,
+                &end_metrics,
+                "loki_distributor_lines_received_total",
+            );
+            let discarded =
+                probe::sum_delta(&start_metrics, &end_metrics, "loki_discarded_samples_total");
+            (
+                json!({
+                    "lines_received": lines_received,
+                    "discarded_samples": discarded,
+                    "discarded_by_reason": probe::breakdown(
+                        &end_metrics,
+                        "loki_discarded_samples_total",
+                        "reason",
+                    ),
+                    "chunks_flushed": probe::sum_delta(
+                        &start_metrics,
+                        &end_metrics,
+                        "loki_ingester_chunks_flushed_total",
+                    ),
+                    "memory_chunks_end": probe::sum_by_prefix(&end_metrics, "loki_ingester_memory_chunks"),
+                    "memory_streams_end": probe::sum_by_prefix(&end_metrics, "loki_ingester_memory_streams"),
+                    "note": "a non-zero discard count is this bed misconfiguring Loki, not a Loki \
+                result; the reason label says which limit did it",
+                }),
+                lines_received > 0 && discarded == 0,
+            )
+        }
+    };
 
     let mut per_shape = serde_json::Map::new();
     for shape in QUERY_SHAPES {
@@ -945,6 +1123,8 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         "targets": targets,
         "behavioral": behavioral,
         "run": {
+            "target": cfg.target.name(),
+            "phase": "load",
             "tier": cfg.tier,
             "build_revision": revision,
             "machine_profile": machine_profile,

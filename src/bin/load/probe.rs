@@ -16,6 +16,56 @@ pub struct Memory {
     pub vm_hwm_bytes: u64,
 }
 
+/// Where a run reads the server's resident memory from.
+///
+/// `/proc` is the M8 path and still the right one when the server is a process
+/// beside the harness. A containerised server needs the other: the comparison
+/// bed gives both systems the same cgroup memory limit, and `memory.peak` is
+/// the kernel's high-water mark for that cgroup — the exact analogue of
+/// `VmHWM`, and the only number that is comparable between a Rust process and
+/// a Go one, since Go's heap makes RSS a property of when the GC last ran.
+pub enum MemorySource {
+    Proc(u32),
+    Cgroup(String),
+}
+
+impl MemorySource {
+    pub fn read(&self) -> Result<Memory, String> {
+        match self {
+            MemorySource::Proc(pid) => read_memory(*pid),
+            MemorySource::Cgroup(dir) => read_cgroup_memory(dir),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            MemorySource::Proc(pid) => format!("/proc/{pid}/status VmHWM"),
+            MemorySource::Cgroup(dir) => format!("{dir}/memory.peak"),
+        }
+    }
+}
+
+/// cgroup v2 `memory.current` and `memory.peak` for one cgroup directory.
+///
+/// `memory.peak` needs kernel 5.19 or newer. A kernel without it is an error
+/// rather than a fallback to the sampled maximum, for the same reason the
+/// `/proc` reader refuses to return zero: a peak that was never measured must
+/// not be reported as a peak that was low.
+pub fn read_cgroup_memory(dir: &str) -> Result<Memory, String> {
+    let read = |name: &str| -> Result<u64, String> {
+        let path = format!("{dir}/{name}");
+        std::fs::read_to_string(&path)
+            .map_err(|error| format!("{path}: {error}"))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("{path}: {error}"))
+    };
+    Ok(Memory {
+        vm_rss_bytes: read("memory.current")?,
+        vm_hwm_bytes: read("memory.peak")?,
+    })
+}
+
 pub fn read_memory(pid: u32) -> Result<Memory, String> {
     let path = format!("/proc/{pid}/status");
     let text = std::fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))?;
@@ -82,6 +132,48 @@ pub fn gauge(metrics: &Metrics, name: &str) -> u64 {
     metrics.get(name).copied().unwrap_or(0.0) as u64
 }
 
+/// Every series whose name starts with `prefix`, summed.
+///
+/// Loki labels its counters by tenant and by reason, so
+/// `loki_discarded_samples_total` is a family rather than a series and the
+/// number a comparison needs is the family's total. loggytracy's own metrics
+/// are deliberately label-free (`todo.md`, "Per-tenant usage"), so this is only
+/// used on the Loki side.
+pub fn sum_by_prefix(metrics: &Metrics, prefix: &str) -> f64 {
+    metrics
+        .iter()
+        .filter(|(name, _)| name.as_str() == prefix || name.starts_with(&format!("{prefix}{{")))
+        .map(|(_, value)| *value)
+        .sum()
+}
+
+pub fn sum_delta(start: &Metrics, end: &Metrics, prefix: &str) -> u64 {
+    (sum_by_prefix(end, prefix) - sum_by_prefix(start, prefix)).max(0.0) as u64
+}
+
+/// `name{label="value",...}` split into its label pairs, for reporting a
+/// counter family broken down by one of its labels.
+pub fn breakdown(
+    metrics: &Metrics,
+    prefix: &str,
+    label: &str,
+) -> std::collections::BTreeMap<String, u64> {
+    let mut out = std::collections::BTreeMap::new();
+    let needle = format!("{label}=\"");
+    for (name, value) in metrics {
+        if !name.starts_with(&format!("{prefix}{{")) {
+            continue;
+        }
+        let key = name
+            .split_once(&needle)
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(found, _)| found.to_string())
+            .unwrap_or_else(|| "unlabelled".to_string());
+        *out.entry(key).or_default() += *value as u64;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +189,30 @@ mod tests {
     #[test]
     fn a_process_that_does_not_exist_is_an_error_not_a_zero() {
         assert!(read_memory(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn a_counter_family_sums_and_breaks_down_by_label() {
+        let metrics = parse_metrics(
+            b"loki_discarded_samples_total{reason=\"rate_limited\",tenant=\"a\"} 3\n\
+loki_discarded_samples_total{reason=\"rate_limited\",tenant=\"b\"} 4\n\
+loki_discarded_samples_total{reason=\"too_old\",tenant=\"a\"} 5\n\
+loki_discarded_samples_total_other 99\n",
+        );
+        assert_eq!(
+            sum_by_prefix(&metrics, "loki_discarded_samples_total"),
+            12.0
+        );
+        let by_reason = breakdown(&metrics, "loki_discarded_samples_total", "reason");
+        assert_eq!(by_reason.get("rate_limited"), Some(&7));
+        assert_eq!(by_reason.get("too_old"), Some(&5));
+    }
+
+    /// A cgroup that is not there must not read as a container that used no
+    /// memory — the same rule the `/proc` reader is built on.
+    #[test]
+    fn a_missing_cgroup_is_an_error_not_a_zero() {
+        assert!(read_cgroup_memory("/sys/fs/cgroup/loggytracy-does-not-exist").is_err());
     }
 
     #[test]

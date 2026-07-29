@@ -27,8 +27,74 @@ pub struct Targets {
     pub min_backlog_samples: usize,
 }
 
+/// Which system this run is driving.
+///
+/// The point of the comparison bed is that this is the *only* variable: the
+/// corpus, the seed, the offered rate, the queries and the wire format are the
+/// same on both sides, because loggytracy's HTTP surface is Loki-compatible by
+/// design. What differs is a readiness check that means the same thing in two
+/// vocabularies, two sets of `/metrics` names, and which behavioural gates can
+/// be asked at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Target {
+    Loggytracy,
+    Loki,
+}
+
+impl Target {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "loggytracy" => Ok(Target::Loggytracy),
+            "loki" => Ok(Target::Loki),
+            other => Err(format!(
+                "LOGGYTRACY_LOAD_TARGET must be loggytracy or loki, got {other:?}"
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Target::Loggytracy => "loggytracy",
+            Target::Loki => "loki",
+        }
+    }
+}
+
+/// What this invocation does.
+///
+/// `load` is M8's run and is unchanged. `seed` and `matrix` exist because the
+/// query comparison has to run on data both systems provably hold: a paced
+/// ingest run sends whatever it managed to send, at wall-clock timestamps, so
+/// two runs of it produce two different datasets and any row-level comparison
+/// between them would be meaningless. `seed` pushes a fixed corpus at fixed
+/// timestamps, so both systems end up holding byte-identical entries, and
+/// `matrix` then times and compares queries over that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    Load,
+    Seed,
+    Matrix,
+}
+
+impl Phase {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "load" => Ok(Phase::Load),
+            "seed" => Ok(Phase::Seed),
+            "matrix" => Ok(Phase::Matrix),
+            other => Err(format!(
+                "LOGGYTRACY_LOAD_PHASE must be load, seed or matrix, got {other:?}"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Config {
+    pub target: Target,
+    pub phase: Phase,
     pub http_address: String,
     pub otlp_address: String,
     pub tier: String,
@@ -39,6 +105,9 @@ pub struct Config {
     pub request_timeout_seconds: u64,
     pub sample_interval_ms: u64,
     pub server_pid: Option<u32>,
+    /// cgroup v2 directory of the server's container, when the server is not a
+    /// sibling process. Takes precedence over `server_pid`.
+    pub cgroup_path: Option<String>,
     pub result_path: Option<String>,
 
     pub ingest_connections: usize,
@@ -68,13 +137,45 @@ pub struct Config {
 
     pub otlp_eps: f64,
 
+    pub verify: Verify,
     pub targets: Targets,
 }
 
+/// The fixed dataset the query comparison runs on, and the query matrix over
+/// it.
+#[derive(Clone, Debug, Serialize)]
+pub struct Verify {
+    pub tenant_prefix: String,
+    pub rows: usize,
+    pub streams: usize,
+    pub labels_per_stream: usize,
+    /// Nanoseconds between consecutive rows in *log* time. The dataset spans
+    /// `rows * step_ns`, which is what the query windows are cut out of.
+    pub step_ns: i64,
+    /// Unix nanoseconds the dataset starts at. Zero means "derive it from the
+    /// clock", which is only correct for a single-system run: the two runs of
+    /// a comparison must be given the same anchor explicitly, or they are not
+    /// holding the same rows.
+    pub anchor_ns: i64,
+    pub entries_per_push: usize,
+    pub push_connections: usize,
+    /// Sub-windows the dataset is cut into. Queries are (app x sub-window), so
+    /// this is what makes a cold query cold: a window nothing has asked for
+    /// before cannot be answered from either system's result cache.
+    pub windows: usize,
+    /// Warm repeats of each query after its cold issue.
+    pub repeats: usize,
+    pub limit: usize,
+    pub range: String,
+    pub step_seconds: i64,
+}
+
 impl Config {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, String> {
         let duration_seconds = env_u64("LOGGYTRACY_LOAD_SECONDS", 60).max(1);
-        Self {
+        Ok(Self {
+            target: Target::parse(&env_string("LOGGYTRACY_LOAD_TARGET", "loggytracy"))?,
+            phase: Phase::parse(&env_string("LOGGYTRACY_LOAD_PHASE", "load"))?,
             http_address: env_string("LOGGYTRACY_LOAD_ADDR", "127.0.0.1:3100"),
             otlp_address: env_string("LOGGYTRACY_LOAD_OTLP_ADDR", "127.0.0.1:4317"),
             tier: env_string("LOGGYTRACY_LOAD_TIER", "B"),
@@ -88,6 +189,9 @@ impl Config {
             server_pid: std::env::var("LOGGYTRACY_LOAD_SERVER_PID")
                 .ok()
                 .and_then(|raw| raw.trim().parse::<u32>().ok()),
+            cgroup_path: std::env::var("LOGGYTRACY_LOAD_CGROUP")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             result_path: std::env::var("LOGGYTRACY_LOAD_RESULT_PATH").ok(),
 
             ingest_connections: env_usize("LOGGYTRACY_LOAD_CONNECTIONS", 8).max(1),
@@ -124,6 +228,22 @@ impl Config {
 
             otlp_eps: env_f64("LOGGYTRACY_LOAD_OTLP_EPS", 5.0).max(0.0),
 
+            verify: Verify {
+                tenant_prefix: env_string("LOGGYTRACY_LOAD_VERIFY_TENANT_PREFIX", "verify-tenant"),
+                rows: env_usize("LOGGYTRACY_LOAD_VERIFY_ROWS", 120_000).max(1),
+                streams: env_usize("LOGGYTRACY_LOAD_VERIFY_STREAMS", 32).max(1),
+                labels_per_stream: env_usize("LOGGYTRACY_LOAD_VERIFY_LABELS", 6).clamp(1, 10),
+                step_ns: env_u64("LOGGYTRACY_LOAD_VERIFY_STEP_NS", 1_000_000).max(1) as i64,
+                anchor_ns: env_u64("LOGGYTRACY_LOAD_VERIFY_ANCHOR_NS", 0) as i64,
+                entries_per_push: env_usize("LOGGYTRACY_LOAD_VERIFY_ENTRIES_PER_PUSH", 100).max(1),
+                push_connections: env_usize("LOGGYTRACY_LOAD_VERIFY_CONNECTIONS", 4).max(1),
+                windows: env_usize("LOGGYTRACY_LOAD_MATRIX_WINDOWS", 3).max(1),
+                repeats: env_usize("LOGGYTRACY_LOAD_MATRIX_REPEATS", 5).max(1),
+                limit: env_usize("LOGGYTRACY_LOAD_MATRIX_LIMIT", 20_000).max(1),
+                range: env_string("LOGGYTRACY_LOAD_MATRIX_RANGE", "1m"),
+                step_seconds: env_u64("LOGGYTRACY_LOAD_MATRIX_STEP_SECONDS", 10).max(1) as i64,
+            },
+
             targets: Targets {
                 push_response_p95_ms: env_f64("LOGGYTRACY_TARGET_PUSH_RESPONSE_P95_MS", 250.0),
                 push_response_p99_ms: env_f64("LOGGYTRACY_TARGET_PUSH_RESPONSE_P99_MS", 1000.0),
@@ -140,7 +260,27 @@ impl Config {
                 ),
                 min_backlog_samples: env_usize("LOGGYTRACY_TARGET_MIN_BACKLOG_SAMPLES", 8).max(2),
             },
+        })
+    }
+
+    /// Where the server's resident memory is read from, or the reason no
+    /// reading is possible. An unmeasurable peak is an error the run carries,
+    /// never a zero.
+    pub fn memory_source(&self) -> Result<crate::probe::MemorySource, String> {
+        match (self.cgroup_path.as_ref(), self.server_pid) {
+            (Some(dir), _) => Ok(crate::probe::MemorySource::Cgroup(dir.clone())),
+            (None, Some(pid)) => Ok(crate::probe::MemorySource::Proc(pid)),
+            (None, None) => Err(
+                "neither LOGGYTRACY_LOAD_CGROUP nor LOGGYTRACY_LOAD_SERVER_PID was set, so no \
+server memory could be watched"
+                    .to_string(),
+            ),
         }
+    }
+
+    /// Log-time span the verification dataset covers, in nanoseconds.
+    pub fn verify_span_ns(&self) -> i64 {
+        self.verify.rows as i64 * self.verify.step_ns
     }
 
     pub fn request_timeout(&self) -> Duration {

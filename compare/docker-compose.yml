@@ -1,0 +1,63 @@
+# The comparison bed: loggytracy and Loki side by side, same machine, same
+# container memory limit, each on local filesystem storage, each with its own
+# volume so disk usage is separately measurable.
+#
+# What is deliberately identical: the memory limit, the storage medium, the
+# absence of a CPU limit, and the fact that both are single-process. What is
+# deliberately *not* identical is the configuration inside each process — each
+# runs at its own defaults, and every deviation from those is documented in
+# `loki-config.yaml` and reproduced into `docs/COMPARISON.md`.
+#
+# Driven by `run.sh`, which is the one-command reproduction.
+
+name: loggytracy-compare
+
+x-memory: &memory
+  # The same number for both, and the number `docs/VISION.md` invariant I says
+  # an operator would also give the engine. Override with COMPARE_MEMORY.
+  mem_limit: ${COMPARE_MEMORY:-2g}
+  # Swap capped at the memory limit means zero swap on cgroup v2, so a process
+  # that wants more than the limit is refused or killed rather than quietly
+  # paging. A comparison in which one system swapped is not a comparison.
+  memswap_limit: ${COMPARE_MEMORY:-2g}
+
+services:
+  loggytracy:
+    <<: *memory
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        LOGGYTRACY_BUILD_REVISION: ${LOGGYTRACY_BUILD_REVISION:-unknown}
+        LOGGYTRACY_BUILD_BRANCH: ${LOGGYTRACY_BUILD_BRANCH:-unknown}
+    image: loggytracy-compare:${LOGGYTRACY_BUILD_REVISION:-dev}
+    ports:
+      - "${LOGGYTRACY_PORT:-3110}:3100"
+    volumes:
+      - loggytracy-data:/var/lib/loggytracy
+    environment:
+      # Local-only, i.e. no object store. Loki's filesystem backend keeps one
+      # durable copy on local disk; pointing loggytracy at a `file://` object
+      # store would keep a local part *and* a remote copy of it, and the
+      # bytes-on-disk axis would be measuring the bed rather than the engine.
+      # Everything else is the engine's own default on purpose — see the
+      # fairness rules in `docs/COMPARISON.md`.
+      LOGGYTRACY_LISTEN_ADDR: 0.0.0.0:3100
+      LOGGYTRACY_OTLP_GRPC_ADDR: 0.0.0.0:4317
+      LOGGYTRACY_DATA_DIR: /var/lib/loggytracy
+    stop_grace_period: 120s
+
+  loki:
+    <<: *memory
+    image: grafana/loki:3.3.2
+    command: -config.file=/etc/loki/config.yaml
+    ports:
+      - "${LOKI_PORT:-3120}:3100"
+    volumes:
+      - ./loki-config.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+    stop_grace_period: 120s
+
+volumes:
+  loggytracy-data:
+  loki-data:
