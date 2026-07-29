@@ -3,6 +3,10 @@
 A single-machine log and trace engine written in Rust. It combines VictoriaLogs' logical design with
 the Parquet physical format and S3 tiering.
 
+This document records what the engine *is*. [`VISION.md`](VISION.md) records what it is *for* — the three
+invariants that are load-bearing, what is deliberately not built, and what would falsify the claim. Where
+the two disagree, `VISION.md` is the intent and this one is the implementation.
+
 ## Decided choices
 
 | Item | Decision |
@@ -10,6 +14,8 @@ the Parquet physical format and S3 tiering.
 | Deployment | Single machine, single writer |
 | Source of truth | S3-compatible object storage |
 | Local disk | Cache (LRU eviction) |
+| Memory | **One declared budget** (`LOGGYTRACY_MEMORY_BUDGET`) divided into ingest/flush/merge/query/sidecar arenas, each with its own accounting and its own refusal. Not a set of independent limits whose product is discovered afterwards — see [`VISION.md`](VISION.md) invariant I |
+| Execution engine | **Hand-written.** DataFusion is rejected: its memory is not accountable at arena granularity, and the LogQL surface is small enough that a planner for it is smaller than the integration |
 | Durability | Journal (append-only) + group commit + ack after fsync. Alloy WAL is assumed as a safety net |
 | Replication | No replicas. For unexpected server or disk loss, the accepted loss window (RPO) is determined by the flush interval (`flush_max_bytes`/`flush_max_interval`, whichever comes first: 1 MiB/5 s by default), and this is intentionally accepted |
 
@@ -173,8 +179,13 @@ LogQL parsing (chumsky) → plan → pruning in this order:
 
 - This engine's differentiator is accelerating Loki's slow `| json | field="x"` pattern by push-down
   bloom pruning when the field was columnized at ingest. Push-down is part of the planner design from the start.
-- Consider DataFusion as the execution engine, supplying pruning results through a custom TableProvider.
-  LogQL-specific range aggregations are custom operators.
+  **This is built and has never been measured against Loki.** The claim and what would falsify it are stated in
+  [`VISION.md`](VISION.md).
+- DataFusion was considered as the execution engine and is **rejected** — see "Decided choices" above.
+  Execution is a merge of per-part sorted iterators feeding a bounded top-K heap, so that a query's memory
+  is `limit` rows plus the heap rather than everything the window matched. Today it is neither: with any
+  pipeline stage the scan limit becomes `usize::MAX` (`query/execution.rs:102`), which is
+  [`VISION.md`](VISION.md) invariant III's worst violation.
 
 ## S3 and manifest
 
@@ -251,6 +262,10 @@ Unsupported syntax is rejected during parsing with a clear error message.
 | M5 | Merge/compaction tuning, retention, resource limits (query memory/range limits), load tests | Target throughput is achieved |
 | M6 | Graceful-shutdown hardware replacement (SIGTERM handler + force-flush + drain-status readiness) | Hardware replacement rehearsal succeeds with traffic moved to new hardware without loss |
 | M7 | Local S3 load validation (Tier B: in-process latency/fault-injection store / Tier C: local MinIO real S3 protocol) + stronger load-analysis gauge observability | Throughput, latency, memory, retention, and error rate are validated against targets; bottlenecks are documented; manifest CAS, remote restore, and retention GC are verified on MinIO |
+| M8 | **The ruler.** Retire the untrustworthy numbers, add criterion microbenchmarks for the hot paths, rewrite the load harness (N connections, intended-send-time latency, realistic corpus, concurrent reads), add CI | A performance regression is detected by a test rather than by reading prose |
+| M9 | **The comparison bed.** Loki beside loggytracy at an equal container memory limit, same corpus, four query shapes plus ingest, disk-per-GB and object-store operation counts | The claim in [`VISION.md`](VISION.md) is either supported by a published table or abandoned |
+| M10 | **Declared memory budget** ([`VISION.md`](VISION.md) I). One budget knob, arena accounting, honest memtable metering, sidecars inside the budget, admission by budget rather than by slot | The engine runs a sustained mixed load under a declared budget and a test asserts peak RSS stays under it |
+| M11 | **Bounded copies and deep pruning** ([`VISION.md`](VISION.md) II, III). `Arc<Labels>` end to end, the two free memcpys removed, single sort and single parse; streaming top-K execution, projection pushdown, cached Parquet footers, regex literal extraction | The M8 benchmarks move, and M9's table is regenerated against the same Loki build |
 
 ## References
 
