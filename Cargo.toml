@@ -3,6 +3,9 @@ name = "loggytracy"
 version = "0.1.0"
 edition = "2024"
 default-run = "loggytracy"
+# `benches/corpus/` is a shared module, not a bench. Auto-discovery would have
+# to be told that anyway, and every target here is declared below.
+autobenches = false
 
 [lib]
 name = "loggytracy"
@@ -42,3 +45,31 @@ tower = { version = "0.5", features = ["util"] }
 # backoff, the startup retry budget — are logic, and testing logic by waiting
 # out a real clock is how they ended up untested.
 tokio = { version = "1", features = ["test-util"] }
+# The regression gate. `docs/VISION.md` — "the ruler comes before the work".
+# Plotters and rayon are off: these run in CI to detect a regression, not to
+# draw a distribution.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+
+[[bench]]
+name = "wal"
+harness = false
+
+[[bench]]
+name = "memtable"
+harness = false
+
+[[bench]]
+name = "rows"
+harness = false
+
+[[bench]]
+name = "bloom"
+harness = false
+
+[[bench]]
+name = "part"
+harness = false
+
+[[bench]]
+name = "logql"
+harness = false
