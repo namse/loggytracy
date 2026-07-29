@@ -269,6 +269,23 @@ pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
     total
 }
 
+/// Query window boundaries are snapped down to a whole `step`.
+///
+/// Measured, not assumed: Loki puts a metric query's samples on a grid aligned
+/// to absolute multiples of `step` and will emit a point past the requested
+/// `end` to stay on it, while loggytracy steps from `start`. Over an unaligned
+/// window the two therefore report the same rates at different instants, and a
+/// row-equality check would fail on the *bed's* choice of window rather than on
+/// anything either engine got wrong. Aligning the window makes Loki's alignment
+/// a no-op and leaves the two grids identical, so what remains for the check to
+/// find is a genuine difference in the values.
+fn align_to_step(ns: i64, step_ns: i64) -> i64 {
+    if step_ns <= 0 {
+        return ns;
+    }
+    ns - ns.rem_euclid(step_ns)
+}
+
 pub struct Query {
     pub id: String,
     pub shape: Shape,
@@ -299,12 +316,19 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
     };
     let span = cfg.verify_span_ns();
     let windows = cfg.verify.windows as i64;
+    let step_ns = cfg.verify.step_seconds * 1_000_000_000;
     let mut queries = Vec::new();
     for shape in SHAPES {
         for (app_index, app) in apps.iter().enumerate() {
             for window in 0..cfg.verify.windows {
-                let start_ns = cfg.verify.anchor_ns + span * window as i64 / windows;
-                let end_ns = cfg.verify.anchor_ns + span * (window as i64 + 1) / windows;
+                let start_ns = align_to_step(
+                    cfg.verify.anchor_ns + span * window as i64 / windows,
+                    step_ns,
+                );
+                let end_ns = align_to_step(
+                    cfg.verify.anchor_ns + span * (window as i64 + 1) / windows,
+                    step_ns,
+                );
                 let selector = format!("{{app=\"{app}\"}}");
                 let variant = app_index * cfg.verify.windows + window;
                 let expression = match shape {
@@ -724,6 +748,24 @@ mod tests {
     fn a_body_that_is_not_a_loki_result_is_an_error_not_an_empty_answer() {
         assert!(digest_response(b"not json").is_err());
         assert!(digest_response(br#"{"status":"error"}"#).is_err());
+    }
+
+    #[test]
+    fn window_boundaries_snap_down_to_a_whole_step() {
+        let step = 10_000_000_000i64;
+        assert_eq!(
+            align_to_step(1_785_307_465_000_000_000, step),
+            1_785_307_460_000_000_000
+        );
+        assert_eq!(
+            align_to_step(1_785_307_460_000_000_000, step),
+            1_785_307_460_000_000_000
+        );
+        assert_eq!(
+            align_to_step(12_345, 0),
+            12_345,
+            "a zero step aligns nothing"
+        );
     }
 
     #[test]
