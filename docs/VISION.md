@@ -167,8 +167,8 @@ The differentiator is invariant III applied to one query shape.
 `| json | field="value"` is a full scan in Loki: Loki indexes labels, not
 structured fields, so the parser stage runs over every line in the window.
 loggytracy columnizes and blooms those fields at ingest, so the same query prunes
-at row-group granularity. **This is built and has never been measured against
-anything.**
+at row-group granularity. ~~**This is built and has never been measured against
+anything.**~~ **It has now been measured, and it lost.**
 
 The claim is therefore stated as a falsifiable one:
 
@@ -176,10 +176,26 @@ The claim is therefore stated as a falsifiable one:
 > loggytracy answers `{...} | json | field="value"` over a window Loki must scan
 > in materially less time, without giving up ingest throughput or disk footprint.
 
-It is abandoned if the comparison in [`LOAD_VALIDATION.md`](LOAD_VALIDATION.md)
-shows Loki within noise on that shape, or shows loggytracy losing on ingest or
+It is abandoned if the comparison in [`COMPARISON.md`](COMPARISON.md) shows Loki
+within noise on that shape, or shows loggytracy losing on ingest or
 bytes-per-GB by enough that the query win does not pay for it. Publishing the
 comparison means publishing it when it loses.
+
+**The M9 result, and this section is subordinate to it — "if a measurement
+contradicts this document, the measurement wins".** On the same corpus, the same
+machine and the same container limit, loggytracy is **1.49x slower cold and
+1.44x slower warm** on `| json | field=`; it is 1.69x slower on `|=` and 7.1x
+slower on `sum(rate())`; it wins only the label-only shape, at 0.36x. It
+achieves 16.8 k eps against Loki's 19.9 k and holds 323 MiB per GB of settled
+data against 267. And the limits were not equal by choice: at 2 GiB loggytracy
+was OOM-killed and Loki was not, so the published run is at 8 GiB.
+
+The claim is not abandoned, because none of that is a property of the *format* —
+it is invariant III unbuilt. `normal_scan_limit` is still `usize::MAX` for
+exactly this shape, there is still no projection pushdown, and the bloom the
+claim rests on is still behind a full materialize. What the measurement removes
+is the option of asserting the claim before that work is done. The number to
+beat is now written down.
 
 ---
 

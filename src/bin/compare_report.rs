@@ -56,7 +56,7 @@ fn main() {
     memory_table(&mut page, &bed, &load);
     disk_table(&mut page, &bed, &load, &seed);
     object_store(&mut page, &bed);
-    verdict(&mut page, &matrix, &load);
+    verdict(&mut page, &bed, &matrix, &load);
     distrust(&mut page, &bed, &load, &matrix);
     configuration(&mut page, dir);
 
@@ -161,10 +161,17 @@ That builds the loggytracy image, brings both systems up under
 rewrites this file. It takes minutes rather than hours; the run this document
 was generated from settled for {} seconds between ingest and query.
 
-The knobs are defaults, not assignments — `COMPARE_MEMORY`, `COMPARE_LOAD_EPS`,
-`COMPARE_LOAD_EVENTS`, `COMPARE_VERIFY_ROWS`, `COMPARE_MATRIX_REPEATS`,
-`COMPARE_SETTLE_SECONDS`, `COMPARE_SEED` — so a reader can vary one without
-editing the script.
+The knobs are defaults, not assignments — `COMPARE_MEMORY`,
+`COMPARE_MEMORY_LIMITS`, `COMPARE_LOAD_EPS`, `COMPARE_LOAD_EVENTS`,
+`COMPARE_VERIFY_ROWS`, `COMPARE_MATRIX_REPEATS`, `COMPARE_SETTLE_SECONDS`,
+`COMPARE_SEED` — so a reader can vary one without editing the script.
+
+Every number below comes from the JSON in
+[`artifacts/m9/`](artifacts/m9/), which the same run copied out of
+`target/compare/` — so the artifacts and the document cannot disagree about
+which run they describe. That is not a formality: of the numbers this
+repository retired, one cited artifact did not exist and another disagreed with
+the document citing it on both build revision and verdict.
 
 "#,
         bed["memory_limit"].as_str().unwrap_or("?"),
@@ -604,6 +611,25 @@ kill is actually decided on.
     ));
 }
 
+/// The write-ahead log's share of a system's volume.
+///
+/// Taken from the `du -sb <dir>/*` breakdown that `run.sh` recorded, which is
+/// the raw measurement, rather than from a second reading: a component is
+/// write-ahead log when its name says so, and everything else is settled data.
+fn wal_bytes(bed: &Value, target: &str) -> f64 {
+    bed["disk_bytes"][target]["breakdown"]
+        .as_str()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|entry| entry.rsplit_once(':'))
+        .filter(|(path, _)| {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            name.starts_with("wal") || name.starts_with("journal")
+        })
+        .filter_map(|(_, bytes)| bytes.parse::<f64>().ok())
+        .sum()
+}
+
 fn disk_table(
     page: &mut String,
     bed: &Value,
@@ -615,9 +641,8 @@ fn disk_table(
         f64_of(&load[target]["ingest"]["line_bytes"]).unwrap_or(0.0)
             + f64_of(&seed[target]["seed"]["line_bytes"]).unwrap_or(0.0)
     };
-    let per_gb = |target: &str| -> String {
-        let bytes = f64_of(&disk[target]["settled"]).unwrap_or(0.0);
-        let source = ingested(target);
+    let wal_of = |target: &str| wal_bytes(bed, target);
+    let per_gb = |bytes: f64, source: f64| -> String {
         if source <= 0.0 {
             return "null".to_string();
         }
@@ -626,26 +651,46 @@ fn disk_table(
             (bytes / source) * (1_000_000_000.0 / (1024.0 * 1024.0))
         )
     };
+    let settled = |target: &str| f64_of(&disk[target]["settled"]).unwrap_or(0.0);
+    let bytes = |value: f64| mib(&Value::from(value));
+
     page.push_str(&format!(
         r#"## Bytes on disk
 
 Measured per volume with `du -sb` inside each container, after the settle and
 before the query phase, so both had the same chance to flush, cut chunks and
-compact. Both totals **include each system's write-ahead log**, because both
-keep one and excluding it from either would be choosing which system's
-durability to charge for.
+compact.
 
 | | loggytracy | Loki |
 |---|---|---|
 | line bytes ingested | {:.0} | {:.0} |
-| bytes on disk, settled | {} | {} |
-| **per GB ingested** | {} | {} |
-| after the query phase | {} | {} |
+| total on disk, settled | {} | {} |
+| of which write-ahead log | {} | {} |
+| settled data (total minus WAL) | {} | {} |
+| **total per GB ingested** | {} | {} |
+| **settled data per GB ingested** | {} | {} |
+| total after the query phase | {} | {} |
 
 Breakdown:
 
 * loggytracy — `{}`
 * Loki — `{}`
+
+**The two rows say different things and the second is the fairer one.**
+loggytracy compacts its write-ahead log only when an object store is
+configured — `flush.rs:219` passes `remote_cache.is_some()` as the `compact`
+flag, so in the local-only mode this bed runs it in, the checkpoint offset
+advances and the file never shrinks. Everything ever ingested is still in it,
+uncompressed, because the WAL stores the decompressed protobuf rather than the
+client's snappy (`todo.md`, M11). Loki truncates its ingester WAL on flush, so
+its WAL row is kilobytes.
+
+That difference is a **property of the configuration this bed chose**, not of
+the engine as it is meant to be deployed, and reporting only the total would be
+charging loggytracy for the bed's decision — the same defect as a rigged win,
+pointed the other way. The settled-data row is the like-for-like number: parts
+and sidecars against chunks and TSDB index. The total row is what an operator
+running local-only actually gets, and it is not small.
 
 The settle was {} seconds. Loki's chunks were flushed explicitly first, because
 Loki holds a chunk in its ingester until it has been idle for `chunk_idle_period`
@@ -659,8 +704,17 @@ default and needed no equivalent.
         ingested("loki"),
         mib(&disk["loggytracy"]["settled"]),
         mib(&disk["loki"]["settled"]),
-        per_gb("loggytracy"),
-        per_gb("loki"),
+        bytes(wal_of("loggytracy")),
+        bytes(wal_of("loki")),
+        bytes(settled("loggytracy") - wal_of("loggytracy")),
+        bytes(settled("loki") - wal_of("loki")),
+        per_gb(settled("loggytracy"), ingested("loggytracy")),
+        per_gb(settled("loki"), ingested("loki")),
+        per_gb(
+            settled("loggytracy") - wal_of("loggytracy"),
+            ingested("loggytracy")
+        ),
+        per_gb(settled("loki") - wal_of("loki"), ingested("loki")),
         mib(&disk["loggytracy"]["after_queries"]),
         mib(&disk["loki"]["after_queries"]),
         disk["loggytracy"]["breakdown"].as_str().unwrap_or(""),
@@ -702,7 +756,12 @@ arithmetic, and it stays missing until both run on the same object store.
     );
 }
 
-fn verdict(page: &mut String, matrix: &BTreeMap<&str, Value>, load: &BTreeMap<&str, Value>) {
+fn verdict(
+    page: &mut String,
+    bed: &Value,
+    matrix: &BTreeMap<&str, Value>,
+    load: &BTreeMap<&str, Value>,
+) {
     let shape = |name: &str, pass: &str, target: &str| -> Option<f64> {
         f64_of(&matrix[target]["matrix"]["shapes"][name][pass]["p50_ms"])
     };
@@ -726,6 +785,22 @@ fn verdict(page: &mut String, matrix: &BTreeMap<&str, Value>, load: &BTreeMap<&s
     };
     let ingest_lt = f64_of(&load["loggytracy"]["ingest"]["achieved_eps"]).unwrap_or(0.0);
     let ingest_lk = f64_of(&load["loki"]["ingest"]["achieved_eps"]).unwrap_or(0.0);
+    let disk_line = {
+        let lt = f64_of(&bed["disk_bytes"]["loggytracy"]["settled"]).unwrap_or(0.0);
+        let lk = f64_of(&bed["disk_bytes"]["loki"]["settled"]).unwrap_or(0.0);
+        let lt_data = lt - wal_bytes(bed, "loggytracy");
+        let lk_data = lk - wal_bytes(bed, "loki");
+        if lk > 0.0 && lk_data > 0.0 {
+            format!(
+                "loggytracy holds {:.2}x Loki's total on disk, and {:.2}x once each \
+system's write-ahead log is taken out",
+                lt / lk,
+                lt_data / lk_data,
+            )
+        } else {
+            "not measured".to_string()
+        }
+    };
     let claim_cold = shape("json_field", "cold_ms", "loggytracy")
         .zip(shape("json_field", "cold_ms", "loki"))
         .map(|(lt, lk)| lt < lk * 0.9);
@@ -746,6 +821,7 @@ and bloomed those fields at ingest.
 * `label_only`, cold: {}
 * `rate`, cold: {}
 * ingest: loggytracy achieved {ingest_lt:.0} eps against Loki's {ingest_lk:.0}
+* disk: {}
 
 **{}**
 
@@ -757,6 +833,7 @@ and bloomed those fields at ingest.
         describe("line_filter", "cold_ms"),
         describe("label_only", "cold_ms"),
         describe("rate", "cold_ms"),
+        disk_line,
         match (claim_cold, claim_warm) {
             (Some(true), Some(true)) =>
                 "The claim survives this run on both the cold and the warm pass.",
@@ -810,6 +887,44 @@ Loki's ingester retention would answer this, and it needs a run measured in \
 hours rather than minutes."
             .to_string(),
     );
+
+    if let Some(attempts) = bed["memory_limit_attempts"].as_array()
+        && attempts.len() > 1
+    {
+        items.push(format!(
+            "**The published run is at {}, not at the {} the bed asks for first.** \
+loggytracy was OOM-killed at the lower limit and Loki was not, so the query, \
+disk and memory columns are all taken at a limit loggytracy needed and Loki \
+did not. That is the single largest thing this comparison found, it is not a \
+caveat about the measurement but a result, and it means the claim's phrase \
+'at an equal container memory limit' is satisfied here only by raising the \
+limit until the losing side fits.",
+            num(&bed["memory_limit"]),
+            num(&attempts[0]["limit"]),
+        ));
+    }
+
+    let wal_share = {
+        let total = f64_of(&bed["disk_bytes"]["loggytracy"]["settled"]).unwrap_or(0.0);
+        if total > 0.0 {
+            wal_bytes(bed, "loggytracy") / total
+        } else {
+            0.0
+        }
+    };
+    if wal_share > 0.25 {
+        items.push(format!(
+            "**{:.0}% of loggytracy's disk number is a write-ahead log the bed's own \
+configuration stops it from compacting.** `flush.rs:219` compacts the WAL only \
+when an object store is configured, and this bed runs loggytracy local-only so \
+that it keeps one durable copy of a part rather than two. The two choices are \
+in tension and I did not find a configuration that avoids both; the table \
+reports the total and the WAL-excluded figure separately rather than picking \
+one. The WAL-excluded row is the one to compare engines on, and the total is \
+the one an operator running local-only actually gets.",
+            wal_share * 100.0
+        ));
+    }
 
     items.push(format!(
         "**The two ingest runs are sequential, and loggytracy went first.** Loki's \

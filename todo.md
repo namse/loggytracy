@@ -37,11 +37,15 @@ that never contend with writes. Optimizing against those numbers reproduces them
       computed below it; RSS is `VmHWM` from `/proc/<server pid>/status` with a sampled `VmRSS` series, and a
       run that cannot read it fails; the WAL gate is a trend, not `trough <= peak * 0.5`
 - [x] **Delete `src/bin/m5_load.rs`** — deleted. It measured `std::process::id()`, the harness's own RSS
-- [ ] **The Dockerfile builds on a different compiler than CI gates.** `Dockerfile:1-3` claims a pinned
-      toolchain and uses `FROM rust:1-bookworm`, which is not one, and it copies only `Cargo.toml`,
-      `Cargo.lock` and `src`, so [`rust-toolchain.toml`](rust-toolchain.toml) never reaches the image build.
-      The shipped artifact is therefore compiled by a toolchain nothing verified. Adding the file to the `COPY`
-      costs a toolchain download inside the image build
+- [x] **The Dockerfile builds on a different compiler than CI gates** — fixed in M9, because the comparison
+      bed needs an image. `rust-toolchain.toml` is now in the dependency-cache `COPY`, so the toolchain
+      download happens once in the cached layer and the shipped binary is built by the compiler CI gates.
+      Building it for the first time found two further defects that meant **the image had not been buildable
+      at all** since the benches landed: `Cargo.toml` declares six `[[bench]]` targets and cargo refuses to
+      *parse* a manifest whose declared targets are missing, so `benches/` is now copied too (nothing builds
+      them; they only have to exist); and the dependency-cache stub wrote only `src/main.rs` while
+      `Cargo.toml` declares a `[lib]`, so the layer failed outright — and once it is stubbed, `touch
+      src/main.rs` alone leaves the empty library's fingerprint valid, so both targets are touched
 - [x] **Fix `scripts/run_load_local.sh`** — the repository root is derived from the script's own location, the
       addresses and the result path are defaults rather than assignments, and the harness's non-zero verdict
       exit no longer truncates the server log
@@ -63,14 +67,77 @@ that never contend with writes. Optimizing against those numbers reproduces them
 
 ## M9 — the comparison bed
 
-- [ ] Loki single-binary beside loggytracy under docker-compose: **same corpus, same machine, same container
-      memory limit**
-- [ ] Four query shapes — label-only, `|=` substring, `| json | field="x"`, `rate()` aggregation — plus ingest
-      throughput, bytes on disk per GB ingested, and object-store request counts
-- [ ] Publish the table, including when it loses. The claim and its falsification condition are in
-      [`docs/VISION.md`](docs/VISION.md)
+**Done, and the claim lost.** The bed is [`compare/`](compare/); the published table is
+[`docs/COMPARISON.md`](docs/COMPARISON.md), regenerated from `target/compare/*.json` by
+`compare/run.sh` rather than written. A full run is about twenty-five minutes.
+
+- [x] **Loki single-binary beside loggytracy under docker-compose** — `compare/docker-compose.yml`, identical
+      `mem_limit` and `memswap_limit`, both on local filesystem storage, one isolated volume each. loggytracy
+      runs **local-only** so that, like Loki's filesystem backend, it keeps one durable copy of a part rather
+      than a local one and a remote one. `compare/loki-config.yaml` documents every deviation from Loki's
+      defaults beside the reason, and the run captures Loki's own `GET /config` diffed against
+      `GET /config?mode=defaults` so the published deviations are Loki's report and not this repository's claim
+- [x] **Harness target support** — `LOGGYTRACY_LOAD_TARGET=loggytracy|loki` and no new dependency. The same
+      corpus, seed, offered rate, connections and wire bytes go to both, because the push endpoint is the same
+      endpoint. What differs is the metric vocabulary, the behavioural gates (Loki is gated on
+      `loki_discarded_samples_total` being zero — a discard is this bed misconfiguring Loki, not a Loki result)
+      and the memory source, which is now cgroup v2 `memory.peak` when `LOGGYTRACY_LOAD_CGROUP` is set
+- [x] **A dataset both systems provably hold.** A paced load run sends what it managed to send at wall-clock
+      timestamps, so two runs of it are two different datasets and nothing row-level can be compared between
+      them. `LOGGYTRACY_LOAD_PHASE=seed` pushes a fixed corpus at fixed log timestamps from an anchor both runs
+      are given; `matrix` then times the four shapes over it cold and warm and digests every answer
+- [x] **Four query shapes plus ingest throughput and bytes on disk per GB ingested** — the table is in
+      [`docs/COMPARISON.md`](docs/COMPARISON.md). At 8 GiB per container, 1.2 M events at an offered 20 k eps
+      and zero errors on both sides: loggytracy wins `label_only` (0.36x), loses `|=` (1.69x), loses
+      `| json | field=` (1.49x cold, 1.44x warm) and loses `sum(rate())` (7.1x); ingest 16.8 k eps against
+      19.9 k; settled data 323 MiB/GB against 267 MiB/GB
+- [x] **Row equality: 94 of 96 queries returned identical rows.** The two that did not are the finding below
+- [ ] **Object-store request counts — deferred, with the reason published.** On a filesystem backend the two
+      counters do not count the same thing: loggytracy's `loggytracy_object_store_operations_total` counts
+      calls into the `object_store` crate and reads zero with no store configured, and Loki's filesystem chunk
+      client emits no request counter at all. Making the axis real means putting **both** on MinIO, which
+      changes both storage paths end to end and needs its own settling and validation — a different experiment,
+      not an extra column
+- [x] **Publish the table, including when it loses** — it loses
+
+### What the bed found
+
+- [ ] **`query_range` treats `end` as inclusive; Loki treats it as exclusive.** Confirmed against both
+      endpoints over the same window: for a window whose `end` falls exactly on an entry's timestamp,
+      loggytracy returns that entry and Loki does not. `parse_time_ns` and the range clamp own this. It is a
+      Loki-compatibility defect rather than a preference — the endpoint claims Loki's contract — and it is
+      invisible unless a boundary lands on a row, which is why nothing before the comparison's step-aligned
+      windows surfaced it. Not fixed here on purpose: a ruler that edits what it is measuring in the same
+      change measures nothing
+- [ ] **loggytracy was OOM-killed at a 2 GiB container limit where Loki was not**, ingesting 1.2 M events at
+      20 k eps with the harness's query workload on. `memory.peak` climbed monotonically from 2 MB to the limit
+      in forty seconds while `loggytracy_memtable_bytes` reported 111 MB, so the accounted memtable is not
+      where it went. An ingest-only run at the same limit survived — at exactly the limit — so the query path
+      is at least part of it, which points straight at [`docs/VISION.md`](docs/VISION.md) invariant III's
+      `normal_scan_limit = usize::MAX`. **This is M10's headline number and it now exists.** The bed sweeps
+      limits and reports the sweep, so the published run is at 8 GiB and says so
+- [ ] **In local-only mode the WAL is never compacted.** `flush.rs:219` passes `remote_cache.is_some()` as the
+      `compact` flag, so without an object store the checkpoint offset advances and `journal.wal` keeps every
+      byte ever ingested, uncompressed. It was 541 MiB against 143 MiB of parts — 79% of the disk footprint.
+      Either local-only should compact too, or the mode should be documented as not for retention
+- [x] **cgroup `memory.peak` includes the cgroup's own page cache**, so it is not a footprint on its own; both
+      systems write a WAL and then large data files. The harness now samples `anon` out of `memory.stat` and
+      reports the anonymous high-water mark beside the cgroup peak, because the anonymous figure is what an OOM
+      kill is decided on
+- [x] **Loki promotes structured metadata into metric identity.** A bare `rate({app="x"}[1m])` returns one
+      series per `trace_id` on Loki and one per stream on loggytracy, so the matrix uses `sum(rate(...))`:
+      otherwise the two are neither doing the same work nor producing comparable answers
+- [x] **Loki puts metric samples on a grid aligned to absolute multiples of `step`** and will emit a point past
+      the requested `end` to stay on it; loggytracy steps from `start`. The matrix aligns its window boundaries
+      so this is a no-op, because otherwise a row-equality failure would be about the bed's choice of window
 
 ## M10 — declared memory budget ([`docs/VISION.md`](docs/VISION.md) I)
+
+M9 supplied the number this milestone was missing: **at a 2 GiB container limit, ingesting 1.2 M events at an
+offered 20 k eps with a 5 qps read workload, loggytracy is OOM-killed and Loki is not**
+([`docs/COMPARISON.md`](docs/COMPARISON.md)). The accounted memtable was 111 MB at the time. That is invariant
+I failing against a competitor on the same machine, and it is the test this section's last item asks for,
+already written and already red.
 
 - [ ] **Honest metering first.** `entries_bytes` (`memtable.rs:69-81`) counts line and label lengths only —
       not the 56-byte `LogEntry`, the 48-byte slot per metadata pair, malloc headers, or `Vec` slack. Measured
@@ -283,6 +350,10 @@ Read path:
       read" is distinguishable from "nothing matched"
 
 ## P2 — Loki API surface
+
+- [ ] **`query_range`'s `end` is inclusive and Loki's is exclusive** — found by M9's row-equality check, see
+      "What the bed found" above. Two of ninety-six otherwise identical answers differed by exactly the row
+      sitting on the boundary
 
 - [x] `patterns` — a read-time miner over a bounded sample of the window, reporting the lines it
       looked at. No index is added to the write path
