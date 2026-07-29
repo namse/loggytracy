@@ -53,7 +53,7 @@ fn main() {
     ingest_table(&mut page, &load);
     query_table(&mut page, &matrix);
     row_equality(&mut page, &matrix);
-    memory_table(&mut page, &bed);
+    memory_table(&mut page, &bed, &load);
     disk_table(&mut page, &bed, &load, &seed);
     object_store(&mut page, &bed);
     verdict(&mut page, &matrix, &load);
@@ -518,8 +518,49 @@ never surfaced it.
     page.push('\n');
 }
 
-fn memory_table(page: &mut String, bed: &Value) {
+fn memory_table(page: &mut String, bed: &Value, load: &BTreeMap<&str, Value>) {
     let peak = &bed["peak_bytes"];
+    let attempts = bed["memory_limit_attempts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if attempts.len() > 1 {
+        page.push_str(
+            r#"## The memory limit the comparison could actually run at
+
+The bed sweeps container memory limits and runs the rest of the pipeline at the
+first one **both** systems survive. A limit where one of them is killed is not
+a failed setup to be retried past quietly; it is an ingest result at that
+limit, and it is the first row of this comparison.
+
+| limit | loggytracy survived | OOM-killed | Loki survived | OOM-killed |
+|---|---|---|---|---|
+"#,
+        );
+        for attempt in &attempts {
+            page.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                num(&attempt["limit"]),
+                num(&attempt["loggytracy_survived"]),
+                num(&attempt["loggytracy_oom_killed"]),
+                num(&attempt["loki_survived"]),
+                num(&attempt["loki_oom_killed"]),
+            ));
+        }
+        page.push_str(&format!(
+            r#"
+The per-limit ingest results are kept as `load_<system>_<limit>.json` in
+`target/compare/`. Everything after this section ran at **{}**.
+
+"#,
+            bed["memory_limit"].as_str().unwrap_or("?"),
+        ));
+    }
+    let anon = |target: &str| -> String {
+        mib(load[target]
+            .pointer("/memory/anon_peak_bytes")
+            .unwrap_or(&Value::Null))
+    };
     page.push_str(&format!(
         r#"## Peak memory
 
@@ -531,11 +572,22 @@ whose RSS is a statement about when its garbage collector last ran.
 The containers are restarted between the two phases, so each phase's peak is
 measured against a fresh cgroup.
 
+**`memory.peak` is not the process's footprint on its own.** A cgroup's memory
+accounting includes the page cache its own file I/O created, and both systems
+write a write-ahead log and then large data files, so both carry hundreds of
+megabytes of reclaimable cache inside their limit. That was measured here, not
+assumed: an ingest-only run drove `memory.peak` to exactly the 2 GiB limit
+without being killed, while the same run with the query workload on was killed.
+So the anonymous high-water mark is reported beside it — sampled from the
+cgroup's `memory.stat` during the ingest phase — and it is the number an OOM
+kill is actually decided on.
+
 | | loggytracy | Loki |
 |---|---|---|
 | limit | {} | {} |
-| peak during ingest | {} | {} |
-| peak during queries | {} | {} |
+| `memory.peak` during ingest | {} | {} |
+| **anonymous peak during ingest** | {} | {} |
+| `memory.peak` during queries | {} | {} |
 | OOM-killed | {} | {} |
 
 "#,
@@ -543,6 +595,8 @@ measured against a fresh cgroup.
         mib(&bed["memory_limit_bytes"]),
         mib(&peak["loggytracy"]["ingest"]),
         mib(&peak["loki"]["ingest"]),
+        anon("loggytracy"),
+        anon("loki"),
         mib(&peak["loggytracy"]["query"]),
         mib(&peak["loki"]["query"]),
         num(&peak["loggytracy"]["oom_killed"]),

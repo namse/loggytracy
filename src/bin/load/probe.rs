@@ -14,6 +14,18 @@ use std::collections::HashMap;
 pub struct Memory {
     pub vm_rss_bytes: u64,
     pub vm_hwm_bytes: u64,
+    /// Anonymous memory, when the source can separate it.
+    ///
+    /// A cgroup's `memory.current` and `memory.peak` include the **page cache**
+    /// the cgroup's own file I/O created, which is reclaimable and is not the
+    /// process's footprint. Both of these systems write a write-ahead log and
+    /// then large data files, so both accumulate hundreds of megabytes of it,
+    /// and a peak reported without this split reads as memory pressure that
+    /// the kernel would simply have reclaimed. Measured: an ingest-only run
+    /// took `memory.peak` to exactly the 2 GiB limit and was *not* killed,
+    /// while the same run with the query workload on was.
+    pub anon_bytes: Option<u64>,
+    pub file_bytes: Option<u64>,
 }
 
 /// Where a run reads the server's resident memory from.
@@ -60,9 +72,17 @@ pub fn read_cgroup_memory(dir: &str) -> Result<Memory, String> {
             .parse::<u64>()
             .map_err(|error| format!("{path}: {error}"))
     };
+    let stat = std::fs::read_to_string(format!("{dir}/memory.stat")).unwrap_or_default();
+    let field = |name: &str| -> Option<u64> {
+        stat.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .and_then(|value| value.trim().parse().ok())
+    };
     Ok(Memory {
         vm_rss_bytes: read("memory.current")?,
         vm_hwm_bytes: read("memory.peak")?,
+        anon_bytes: field("anon"),
+        file_bytes: field("file"),
     })
 }
 
@@ -87,6 +107,8 @@ pub fn read_memory(pid: u32) -> Result<Memory, String> {
     Ok(Memory {
         vm_rss_bytes,
         vm_hwm_bytes,
+        anon_bytes: None,
+        file_bytes: None,
     })
 }
 

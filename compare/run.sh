@@ -94,15 +94,23 @@ wait_ready() {
   done
 }
 
-say "building and starting the bed at ${COMPARE_MEMORY} per container"
-docker compose down -v --remove-orphans >/dev/null 2>&1 || true
-docker compose build
-docker compose up -d
-wait_ready "$LOGGYTRACY_PORT" loggytracy
-wait_ready "$LOKI_PORT" loki
+bring_up() {
+  say "starting the bed at ${COMPARE_MEMORY} per container"
+  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+  docker compose up -d
+  wait_ready "$LOGGYTRACY_PORT" loggytracy
+  wait_ready "$LOKI_PORT" loki
+  LT_CGROUP=$(cgroup_of loggytracy-compare-loggytracy-1)
+  LK_CGROUP=$(cgroup_of loggytracy-compare-loki-1)
+}
 
-LT_CGROUP=$(cgroup_of loggytracy-compare-loggytracy-1)
-LK_CGROUP=$(cgroup_of loggytracy-compare-loki-1)
+alive() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$1")" = "true" ]
+}
+
+say "building the images"
+docker compose build
+bring_up
 
 # Loki's own report of what it is running with, captured from the process
 # rather than from the file this repository wrote. `?mode=diff` is broken in
@@ -166,8 +174,46 @@ say "building the harness"
 cargo build --manifest-path "$ROOT/Cargo.toml" --release --bin load
 LOAD_BIN="$ROOT/target/release/load"
 
-run_load loggytracy "$LOGGYTRACY_PORT" "$LT_CGROUP"
-run_load loki "$LOKI_PORT" "$LK_CGROUP"
+# The ingest phase is run at each limit in COMPARE_MEMORY_LIMITS, in order, and
+# the first limit at which **both** systems survive carries the rest of the
+# pipeline. A limit at which one of them is OOM-killed is not an error to
+# retry past silently: it is an ingest result at that limit, it is recorded in
+# `attempts` below, and the published document reports it. The list is a
+# default like everything else here, and a single-entry list turns the sweep
+# off.
+ATTEMPTS=""
+SURVIVED=""
+for LIMIT in ${COMPARE_MEMORY_LIMITS:-2g 8g}; do
+  export COMPARE_MEMORY="$LIMIT"
+  bring_up
+  run_load loggytracy "$LOGGYTRACY_PORT" "$LT_CGROUP"
+  LT_ALIVE=$(alive loggytracy-compare-loggytracy-1 && echo true || echo false)
+  LT_OOM_AT=$(docker inspect -f '{{.State.OOMKilled}}' loggytracy-compare-loggytracy-1)
+  if [ "$LT_ALIVE" = "true" ]; then
+    run_load loki "$LOKI_PORT" "$LK_CGROUP"
+  fi
+  LK_ALIVE=$(alive loggytracy-compare-loki-1 && echo true || echo false)
+  LK_OOM_AT=$(docker inspect -f '{{.State.OOMKilled}}' loggytracy-compare-loki-1)
+
+  ATTEMPTS="$ATTEMPTS${ATTEMPTS:+,}{\"limit\":\"$LIMIT\",\"loggytracy_survived\":$LT_ALIVE,\
+\"loggytracy_oom_killed\":$LT_OOM_AT,\"loki_survived\":$LK_ALIVE,\"loki_oom_killed\":$LK_OOM_AT}"
+
+  if [ "$LT_ALIVE" = "true" ] && [ "$LK_ALIVE" = "true" ]; then
+    SURVIVED="$LIMIT"
+    cp "$OUT/load_loggytracy.json" "$OUT/load_loggytracy_$LIMIT.json"
+    cp "$OUT/load_loki.json" "$OUT/load_loki_$LIMIT.json"
+    break
+  fi
+  say "a container did not survive ${LIMIT}; keeping the result and trying the next limit"
+  cp "$OUT/load_loggytracy.json" "$OUT/load_loggytracy_$LIMIT.json" 2>/dev/null || true
+  cp "$OUT/load_loki.json" "$OUT/load_loki_$LIMIT.json" 2>/dev/null || true
+done
+
+if [ -z "$SURVIVED" ]; then
+  echo "no limit in '${COMPARE_MEMORY_LIMITS:-2g 8g}' let both systems finish the ingest phase;" >&2
+  echo "the per-limit results are in $OUT and no query comparison was run." >&2
+  exit 1
+fi
 
 run_verify seed loggytracy "$LOGGYTRACY_PORT" "$LT_CGROUP"
 run_verify seed loki "$LOKI_PORT" "$LK_CGROUP"
@@ -227,6 +273,7 @@ cat >"$OUT/bed.json" <<JSON
   "compose": "$(docker compose version --short)",
   "loki_image": "grafana/loki:3.3.2",
   "memory_limit": "$COMPARE_MEMORY",
+  "memory_limit_attempts": [$ATTEMPTS],
   "memory_limit_bytes": $(docker exec loggytracy-compare-loggytracy-1 cat /sys/fs/cgroup/memory.max),
   "settle_seconds": $SETTLE_SECONDS,
   "verify_anchor_ns": $ANCHOR_NS,

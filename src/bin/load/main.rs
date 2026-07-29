@@ -160,10 +160,13 @@ struct SampleOutcome {
     memtable_bytes: GaugeSeries,
     part_count: GaugeSeries,
     rss: GaugeSeries,
+    anon: GaugeSeries,
     health_samples: u64,
     health_healthy: u64,
     scrape_errors: u64,
     vm_hwm_bytes: Option<u64>,
+    anon_peak_bytes: Option<u64>,
+    file_bytes_end: Option<u64>,
     rss_error: Option<String>,
 }
 
@@ -215,6 +218,29 @@ async fn run_verify(cfg: Config) {
     );
     let corpus = matrix::verify_corpus(&cfg);
 
+    // Anonymous memory has to be *sampled*, not read at the ends: the cgroup's
+    // own `memory.peak` is a high-water mark but includes reclaimable page
+    // cache, and this phase reads large data files, so the page cache alone
+    // would carry the peak to the limit and say nothing.
+    let stop = Arc::new(AtomicBool::new(false));
+    let anon_peak = Arc::new(AtomicU64::new(0));
+    let anon_watch = tokio::spawn({
+        let stop = stop.clone();
+        let anon_peak = anon_peak.clone();
+        let source = cfg.memory_source();
+        async move {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(source) = source.as_ref()
+                    && let Ok(memory) = source.read()
+                    && let Some(anon) = memory.anon_bytes
+                {
+                    anon_peak.fetch_max(anon, Ordering::Relaxed);
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    });
+
     let mut report = json!({
         "phase": if cfg.phase == Phase::Seed { "seed" } else { "matrix" },
         "target": cfg.target.name(),
@@ -265,6 +291,8 @@ async fn run_verify(cfg: Config) {
         Phase::Load => unreachable!("run_verify is only reached for the seed and matrix phases"),
     }
 
+    stop.store(true, Ordering::Relaxed);
+    let _ = anon_watch.await;
     let memory_after = memory_source
         .as_ref()
         .ok()
@@ -275,6 +303,12 @@ async fn run_verify(cfg: Config) {
         "peak_bytes_before": memory_before.as_ref().map(|memory| memory.vm_hwm_bytes),
         "peak_bytes": memory_after.as_ref().map(|memory| memory.vm_hwm_bytes),
         "current_bytes": memory_after.as_ref().map(|memory| memory.vm_rss_bytes),
+        "anon_peak_bytes": match anon_peak.load(Ordering::Relaxed) {
+            0 => Value::Null,
+            peak => json!(peak),
+        },
+        "anon_bytes_end": memory_after.as_ref().and_then(|memory| memory.anon_bytes),
+        "file_bytes_end": memory_after.as_ref().and_then(|memory| memory.file_bytes),
     });
     report["config"] = serde_json::to_value(&cfg).expect("config serialization");
     report["verdict"] = json!(if ok { "PASS" } else { "FAIL" });
@@ -400,6 +434,10 @@ async fn run_load(cfg: Config) {
             Ok(memory) => {
                 samples.vm_hwm_bytes =
                     Some(samples.vm_hwm_bytes.unwrap_or(0).max(memory.vm_hwm_bytes));
+                if let Some(anon) = memory.anon_bytes {
+                    samples.anon_peak_bytes = Some(samples.anon_peak_bytes.unwrap_or(0).max(anon));
+                }
+                samples.file_bytes_end = memory.file_bytes.or(samples.file_bytes_end);
             }
             Err(error) => {
                 samples.rss_error.get_or_insert(error);
@@ -748,6 +786,12 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
                     outcome.rss.push(elapsed, memory.vm_rss_bytes);
                     outcome.vm_hwm_bytes =
                         Some(outcome.vm_hwm_bytes.unwrap_or(0).max(memory.vm_hwm_bytes));
+                    if let Some(anon) = memory.anon_bytes {
+                        outcome.anon.push(elapsed, anon);
+                        outcome.anon_peak_bytes =
+                            Some(outcome.anon_peak_bytes.unwrap_or(0).max(anon));
+                    }
+                    outcome.file_bytes_end = memory.file_bytes;
                 }
                 Err(error) => {
                     outcome.rss_error.get_or_insert(error);
@@ -1183,6 +1227,14 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         "error": samples.rss_error,
         "vm_rss": samples.rss.summary(),
         "vm_rss_samples": samples.rss.points(),
+        // A cgroup peak includes the page cache the cgroup's own writes
+        // created, which is reclaimable and is not the process's footprint.
+        // Both systems write a WAL and then large data files, so both carry
+        // hundreds of megabytes of it. The anonymous series is the part that
+        // cannot be reclaimed and is what an OOM kill is decided on.
+        "anon_peak_bytes": samples.anon_peak_bytes,
+        "anon": samples.anon.summary(),
+        "file_bytes_end": samples.file_bytes_end,
     });
     report["gauges"] = json!({
         "memtable_bytes": samples.memtable_bytes.summary(),
