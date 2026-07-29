@@ -1,4 +1,12 @@
 {
+  "_retired": {
+    "status": "RETIRED 2026-07-29 — do not cite any value in this file as an engine result.",
+    "why": "Produced by the original src/bin/load.rs: one connection, one request in flight, Connection: close per request, latency timed from the actual send rather than the intended one (uncorrected coordinated omission), one hardcoded label set over padded lines, queries issued inline on the push thread, and rss_peak_bytes read from the harness's own process ID rather than the server's.",
+    "kept_because": "It is the only checked-in evidence of those defects — see offered_eps against achieved_eps, the sample counts in the *_latency_ms blocks, and rss_peak_bytes passed against a 4 GiB target. docs/VISION.md cites it as exactly that.",
+    "disagrees_with": "docs/M7_LOAD_RESULTS.md describes a FAIL at build 782e7ff. This file is a later run: build d2f2c4f, verdict PASS. Neither describes the other.",
+    "note": "scripts/run_load_local.sh writes this path by default, so a rerun replaces this header along with the data. That is correct: a regenerated artifact is not a retired one.",
+    "see": ["docs/VISION.md", "docs/M7_LOAD_RESULTS.md", "todo.md M8"]
+  },
   "achieved_eps": 478.0021100678179,
   "ack_latency_ms": {
     "count": 167,

@@ -201,6 +201,15 @@ All of these were met on the Tier D run recorded in
 trip, which needs the separate configuration described below and was measured
 on its own.
 
+**The gates held; the records beside them are retired.** Every number that run
+produced was struck when the harness it came from was retired
+([`VISION.md`](VISION.md) "The ruler comes before the work", M8 in
+[`todo.md`](../todo.md)). The behavioural gates survive because they are
+booleans that do not depend on the machine being idle or on the corpus being
+realistic — which is why they are the gates. The last item below, "record the
+percentiles", is the item that has to be redone, and it cannot be redone until
+the harness can measure.
+
 - [x] Zero loss of acked data (confirmed by replay after restart)
 - [x] WAL backlog is bounded — 429 appears above the limit and clears when load subsides
 - [x] RSS is stable below the configured limit (no upward trend)
@@ -226,8 +235,9 @@ LOGGYTRACY_CACHE_MAX_BYTES=524288   # make the working set exceed the cache
 LOGGYTRACY_LOAD_RESTORE_LOOKBACK_SECONDS=40
 ```
 
-With this configuration, 111 evictions, 66 parts, `restore_observed: true`, and zero restore errors were
-observed (restore latency p50 31 ms / p95 749 ms / p99 1.6 s).
+With this configuration, `restore_observed: true` and zero restore errors were observed. The counts and
+restore-latency percentiles that used to be quoted here are struck with the rest of the harness's output
+([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §5); the percentiles in particular were over a handful of samples.
 
 The probe now counts the lines that came back (`restore_probe_rows`,
 `restore_probes_with_rows`), so "restored and read" is distinguishable from "nothing matched" without
@@ -237,6 +247,11 @@ window is legitimately empty, and a zero there describes the configuration rathe
 Record measurements in [`LOAD_RESULTS.md`](LOAD_RESULTS.md). Numbers kept only in chat or a terminal
 disappear and must be measured again. Always record the machine profile, build revision, and seed with the
 result, and never call values from a non-target machine a pass against the target.
+
+**That document is retired and holds no numbers today.** Recording the machine profile, the build and the
+seed was never enough: the run that produced them has to be capable of measuring what it reports. Until the
+harness rewrite in M8 lands, a load run can move a behavioural checkbox and nothing else, and new
+percentiles go into a new section of a document that begins after the ruler exists.
 
 **Keep reproducible facts in tests, not in prose.** Keep runs only for things that require load — whether
 backpressure engages and clears, timestamp boundaries, and fragmentation ratios are deterministic, so

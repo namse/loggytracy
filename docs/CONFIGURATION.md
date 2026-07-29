@@ -250,15 +250,19 @@ The process follows `RUST_LOG` directly. When unset, it uses `loggytracy=info,wa
 
 A flush costs **four PUTs and one GET**: three PUTs for the part's immutable
 files (`data.parquet`, `index.bin`, `meta.json`), one for the manifest, and the
-GET is the manifest it replaced. Measured, not estimated
-([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §9), and pinned by a test that also holds
-the two properties that matter — publishing the tenth part into a nine-part
-manifest costs what publishing the first into an empty one cost, and the file
-count per part is asserted rather than incidental.
+GET is the manifest it replaced. **Pinned by a test rather than by a load run**
+— `object_storage::tests::publishing_a_part_costs_a_fixed_number_of_requests` —
+which also holds the two properties that matter: publishing the tenth part into
+a nine-part manifest costs what publishing the first into an empty one cost, and
+the file count per part is asserted rather than incidental. The load run that
+first counted these requests is retired ([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §9)
+and the count outlived it, because a request count is a property of this code
+rather than of a machine or a corpus.
 
 A flush skips an empty memtable, so an idle instance costs nothing. An instance
 with continuous traffic flushes on every tick, which makes PUT volume a function
-of this one setting:
+of this one setting. The table below is arithmetic on the pinned count and
+nothing else:
 
 | `FLUSH_MAX_INTERVAL` | Class A / day | / month | R2 cost |
 |---|---|---|---|
@@ -278,6 +282,11 @@ The default is 5 s anyway, because this setting is also the RPO — how much
 acknowledged data a disk loss can cost — and that is a deployment decision
 between money and durability, not one this repository should make on someone's
 behalf. What it can do is refuse to let the choice be made without the price.
+
+**What is not in the table, and is unverified:** merge and retention PUTs ride
+on top of it, and their rate is a function of the workload. Every figure this
+repository has for that rate came from the retired harness, so treat the table
+as the floor for a busy instance rather than as its bill.
 
 Watch `loggytracy_object_store_operations_total{kind="put"}` to see the real
 number for a real workload; the rates above will change and the counts will not.
@@ -300,9 +309,15 @@ there is nowhere else to learn it.
 
 It is an upper bound, not an estimate: reaching it needs every scan slot full
 and each one at its cap. What matters is that nothing prevents it, and that an
-instance sized from its idle footprint is sized about **fifty times too small** —
-15 MB idle against 850 MB under load, measured in
-[`LOAD_RESULTS.md`](LOAD_RESULTS.md) §7.
+instance sized from its idle footprint is sized **far** too small: peak RSS is
+reached within about a minute of load starting and returns to idle when load
+stops, so a quiet screenshot describes nothing.
+
+**This bound is the only sizing figure here that is not retired**, because it is
+arithmetic on the configured limits rather than a measurement. The multiple
+between idle and peak used to be quoted in this paragraph; it came from the
+retired harness ([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §7) and is struck. Size
+against the bound, and measure the peak on a real workload.
 
 Not in the number, and why:
 
@@ -310,13 +325,19 @@ Not in the number, and why:
   no honest term to add. `MAX_CONCURRENT_TRACE_SCANS` × the span size of the
   workload is the missing product.
 - **The memtable.** Bounded by backpressure rather than by a constant: ingest is
-  refused before it grows without limit. Measured at tens of megabytes under
-  sustained load.
-- **Resident part sidecars.** 18.7 MB at 10,099 parts ([§8](LOAD_RESULTS.md)) —
-  real, and two orders of magnitude below the query term.
-- **Allocator retention.** Peak RSS tracks whether merge runs at all rather than
-  what it is allowed to materialize ([§6](LOAD_RESULTS.md)), so RSS lags the
-  budget downward after load subsides.
+  refused before it grows without limit. Note that `MAX_MEMTABLE_BYTES` is
+  enforced against an accounting that undercounts what a line actually occupies,
+  so the real ceiling is above the setting — see [`VISION.md`](VISION.md) I.
+- **Resident part sidecars.** Linear in (tenant, part) pairs, and small relative
+  to the query term at every part count this engine has been run at. The
+  absolute figures are retired; the shape is not, and
+  `loggytracy_part_sidecar_resident_bytes` reports it live.
+- **Peak RSS above the sum of these.** It is live memory held while ingest,
+  flush and merge overlap. Two explanations were proposed for it and both were
+  refuted: it is not the merge memory budget, which barely moved it, and it is
+  not allocator high-water retention, because RSS returns to its starting value
+  after load stops ([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §6 and §7 keep both
+  refutations).
 - **`CACHE_MAX_BYTES`.** Disk, not memory.
 
 **To lower the peak, lower the concurrency first.** `MAX_CONCURRENT_QUERY_SCANS`

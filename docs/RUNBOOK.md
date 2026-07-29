@@ -24,13 +24,22 @@ This engine is **single-machine, single-writer**. Breaking that assumption corru
 
 ## Sizing
 
-**Size on peak, not on idle.** Measured at 8000 eps with 500 tenants: RSS idles
-around 15 MB and peaks around 850 MB, reached within a minute of load starting,
-and returns to idle when load stops. That is live memory held while ingest,
-flush and merge overlap — not a leak, and not something a smaller
-`merge_max_memory_bytes` reduces, because the groups being merged are usually
-far below that budget already. An instance sized from a quiet screenshot is
-sized roughly fifty times too small.
+**Size on peak, not on idle.** RSS idles low and peaks far higher, reaches that
+peak within about a minute of load starting, and returns to idle when load
+stops. That is live memory held while ingest, flush and merge overlap — not a
+leak, and not something a smaller `merge_max_memory_bytes` reduces, because the
+groups being merged are usually far below that budget already. An instance sized
+from a quiet screenshot is sized far too small.
+
+**The multiple is unverified.** This paragraph used to quote an idle figure, a
+peak figure and the ratio between them. They came from the retired harness
+([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §7) — cardinality 1, no reader contending
+with the writer, and an achieved rate far below the offered one — so the peak is
+the peak of a workload nobody runs. The direction of the advice survives; how
+much headroom to leave is not a question this repository can answer today. Size
+against the bound in [`CONFIGURATION.md`](CONFIGURATION.md) "Sizing an
+instance", which is arithmetic on the configured limits rather than a
+measurement, and watch the instance's own peak once it is carrying traffic.
 
 ## What to alert on
 
