@@ -75,7 +75,7 @@ pub async fn query_range(
             .map_err(|e| (metric_error_status(&e), e))?;
             (
                 "streams",
-                serde_json::to_value(build_stream_data(execution.results)).unwrap(),
+                serde_json::to_value(build_stream_data(execution.results, forward)).unwrap(),
                 execution.scanned_rows,
             )
         }
@@ -183,7 +183,7 @@ pub async fn query(
             .map_err(|e| (metric_error_status(&e), e))?;
             (
                 "streams",
-                serde_json::to_value(build_stream_data(execution.results)).unwrap(),
+                serde_json::to_value(build_stream_data(execution.results, forward)).unwrap(),
                 execution.scanned_rows,
             )
         }

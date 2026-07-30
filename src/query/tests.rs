@@ -852,13 +852,18 @@
     #[tokio::test]
     async fn synthesized_extracted_field_never_false_negative_prunes_parts() {
         let data_dir = temp_dir();
-        let labels: Labels = [("app".to_string(), "api".to_string())]
-            .into_iter()
-            .collect();
-        let metadata = vec![
+        // `foo` and `foo_extracted` are *stream labels* rather than pushed
+        // metadata, because a collision with metadata drops the extraction
+        // (Loki's rule, see `merge_extracted`) and there would be no
+        // synthesized name left to prune on.
+        let labels: Labels = [
+            ("app".to_string(), "api".to_string()),
             ("foo".to_string(), "x".to_string()),
             ("foo_extracted".to_string(), "y".to_string()),
-        ];
+        ]
+        .into_iter()
+        .collect();
+        let metadata = vec![];
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
             test_tenant(),
@@ -1244,19 +1249,22 @@
         let data_dir = temp_dir();
         let parts_root = data_dir.join("parts");
         let storage = Arc::new(crate::object_storage::ObjectStorage::in_memory());
-        let labels: Labels = [("app".to_string(), "api".to_string())]
-            .into_iter()
-            .collect();
+        // Stream labels rather than pushed metadata, for the reason in
+        // `synthesized_extracted_field_never_false_negative_prunes_parts`.
+        let labels: Labels = [
+            ("app".to_string(), "api".to_string()),
+            ("foo".to_string(), "x".to_string()),
+            ("foo_extracted".to_string(), "y".to_string()),
+        ]
+        .into_iter()
+        .collect();
         let flushed = part::flush_rows(
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 10,
                 labels,
                 line: r#"{"foo":"z"}"#.to_string(),
-                structured_metadata: vec![
-                    ("foo".to_string(), "x".to_string()),
-                    ("foo_extracted".to_string(), "y".to_string()),
-                ],
+                structured_metadata: vec![],
             }],
             &parts_root,
             1,
@@ -2874,4 +2882,233 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    fn stream_result(labels: &[(&str, &str)], entries: Vec<LogEntry>) -> StreamResult {
+        StreamResult {
+            labels: labels
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            entries,
+        }
+    }
+
+    fn log_entry(timestamp_ns: i64, line: &str, metadata: &[(&str, &str)]) -> LogEntry {
+        LogEntry {
+            timestamp_ns,
+            line: line.to_string(),
+            structured_metadata: metadata
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Loki's log response has no structured-metadata slot in the `values`
+    /// tuple: measured against `grafana/loki:3.3.2`, a stream pushed with
+    /// `trace_id` metadata answers `{app="probe"}` with `trace_id` among the
+    /// `stream` labels and a two-element tuple. The three-element form is its
+    /// opt-in `categorize-labels` encoding. loggytracy returned the triple
+    /// unconditionally (`todo.md`, "Open correctness defects").
+    #[test]
+    fn a_log_response_promotes_pushed_metadata_into_the_stream_labels() {
+        let data = build_stream_data(
+            vec![stream_result(
+                &[("app", "api")],
+                vec![log_entry(
+                    20,
+                    "alpha",
+                    &[("trace_id", "t1"), ("pod_ip", "10.0.0.1")],
+                )],
+            )],
+            false,
+        );
+        assert_eq!(data.len(), 1);
+        assert_eq!(
+            data[0].stream,
+            [
+                ("app", "api"),
+                ("trace_id", "t1"),
+                ("pod_ip", "10.0.0.1"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect::<HashMap<_, _>>()
+        );
+        assert_eq!(
+            data[0].values,
+            vec![serde_json::json!(["20", "alpha"])],
+            "a values tuple carries the timestamp and the line and nothing else"
+        );
+    }
+
+    /// The same slot, so the same fix: the fields `| json` extracted are stream
+    /// labels on Loki. Driven through the pipeline rather than by handing
+    /// `build_stream_data` a synthetic entry, because the extraction landing in
+    /// the query-local `structured_metadata` is the internal representation the
+    /// fix had to keep working.
+    #[tokio::test]
+    async fn a_log_response_promotes_json_extracted_fields_into_the_stream_labels() {
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            labels,
+            vec![log_entry(
+                10,
+                r#"{"level":"error","status":"500"}"#,
+                &[("trace_id", "t1")],
+            )],
+        );
+        let data_dir = temp_dir();
+        let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+        let parsed = logql::parse(r#"{app="api"} | json"#).unwrap();
+        let results = run_unified_query(
+            state,
+            test_tenant(),
+            parsed,
+            crate::part::QueryTimeRange::closed(0, 20),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let data = build_stream_data(results, false);
+        assert_eq!(data.len(), 1);
+        let mut names: Vec<&str> = data[0].stream.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["app", "level", "status", "trace_id"]);
+        assert_eq!(data[0].stream["level"], "error");
+        assert_eq!(data[0].values[0].as_array().unwrap().len(), 2);
+    }
+
+    /// An extraction whose name is a pushed metadata key is dropped rather than
+    /// renamed, so `trace_id_extracted` — a name Loki's response never contained
+    /// — must not appear. Loki 3.3.2 answers `| json | trace_id="<the JSON
+    /// value>"` with nothing and renders `{{.trace_id}}` as the metadata value.
+    #[tokio::test]
+    async fn an_extraction_shadowed_by_pushed_metadata_never_reaches_the_response() {
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            labels,
+            vec![log_entry(
+                10,
+                r#"{"trace_id":"from-the-line","level":"error"}"#,
+                &[("trace_id", "from-the-push")],
+            )],
+        );
+        let data_dir = temp_dir();
+        let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+        let results = run_unified_query(
+            state,
+            test_tenant(),
+            logql::parse(r#"{app="api"} | json"#).unwrap(),
+            crate::part::QueryTimeRange::closed(0, 20),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let data = build_stream_data(results, false);
+        assert_eq!(data[0].stream["trace_id"], "from-the-push");
+        assert!(!data[0].stream.contains_key("trace_id_extracted"));
+    }
+
+    /// Rows whose promoted label sets differ are different streams, which is how
+    /// Loki answers a stream with per-entry metadata, and rows whose label sets
+    /// agree are one stream even when the scan produced them separately — with
+    /// the requested direction preserved across the merge.
+    #[test]
+    fn promotion_regroups_rows_by_their_whole_label_set_and_keeps_the_direction() {
+        let data = build_stream_data(
+            vec![
+                stream_result(
+                    &[("app", "api")],
+                    vec![
+                        log_entry(30, "c", &[("trace_id", "t1")]),
+                        log_entry(10, "a", &[("trace_id", "t2")]),
+                    ],
+                ),
+                stream_result(
+                    &[("app", "api")],
+                    vec![log_entry(20, "b", &[("trace_id", "t1")])],
+                ),
+            ],
+            false,
+        );
+        assert_eq!(data.len(), 2, "one stream per distinct promoted label set");
+        let t1 = data
+            .iter()
+            .find(|stream| stream.stream["trace_id"] == "t1")
+            .expect("t1 stream");
+        assert_eq!(
+            t1.values,
+            vec![
+                serde_json::json!(["30", "c"]),
+                serde_json::json!(["20", "b"])
+            ],
+            "backward: descending time even though the two rows came from two inputs"
+        );
+        let forward = build_stream_data(
+            vec![stream_result(
+                &[("app", "api")],
+                vec![log_entry(30, "c", &[]), log_entry(10, "a", &[])],
+            )],
+            true,
+        );
+        assert_eq!(
+            forward[0].values,
+            vec![
+                serde_json::json!(["10", "a"]),
+                serde_json::json!(["30", "c"])
+            ]
+        );
+    }
+
+    /// `label_format` over a stream label has to reach the response, because the
+    /// row's label set genuinely changed: Loki 3.3.2 answers
+    /// `{app="probe"} | label_format level="rewritten"` with `level="rewritten"`
+    /// rather than with the stored value. `line_format` rewrites the line and
+    /// leaves the label set alone.
+    #[tokio::test]
+    async fn label_format_over_a_stream_label_reaches_the_response() {
+        let labels: Labels = [
+            ("app".to_string(), "api".to_string()),
+            ("level".to_string(), "stored".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            labels,
+            vec![log_entry(10, r#"{"status":"500"}"#, &[])],
+        );
+        let data_dir = temp_dir();
+        let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+        let results = run_unified_query(
+            state,
+            test_tenant(),
+            logql::parse(r#"{app="api"} | json | label_format level="rewritten" | line_format "{{.status}}""#)
+                .unwrap(),
+            crate::part::QueryTimeRange::closed(0, 20),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let data = build_stream_data(results, false);
+        assert_eq!(data[0].stream["level"], "rewritten");
+        assert_eq!(data[0].stream["status"], "500");
+        assert_eq!(data[0].values, vec![serde_json::json!(["10", "500"])]);
     }

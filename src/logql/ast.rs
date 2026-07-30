@@ -211,7 +211,8 @@ impl LogQuery {
     /// Evaluates the pipeline with stream labels available as its initial
     /// field set. Labels are canonical for colliding names, so a parser
     /// extraction with the same name is retained as `<name>_extracted`.
-    /// Labels themselves are not retained as query-local structured metadata.
+    /// An unchanged label is not retained as query-local structured metadata;
+    /// one a `label_format` rewrote is.
     #[cfg(test)]
     pub fn process_entry_with_labels(&self, labels: &Labels, entry: &mut LogEntry) -> bool {
         self.process_entry_with_labels_cancellable(labels, entry, None)
@@ -229,9 +230,17 @@ impl LogQuery {
         for name in fields.keys() {
             observe_extracted_name(&mut next_extracted_suffix, name);
         }
+        // The names a parser stage may not extract under, because structured
+        // metadata outranks an extraction of the same name on Loki. See
+        // `merge_extracted`. A name that is *also* a stream label is not in
+        // here: there the extraction survives as `<name>_extracted`.
+        let mut shadowed_by_metadata: BTreeSet<String> = BTreeSet::new();
         for (name, value) in &entry.structured_metadata {
             // A stream label is the stable value visible to the pipeline.
             // Structured metadata with another name remains queryable.
+            if !labels.contains_key(name) {
+                shadowed_by_metadata.insert(name.clone());
+            }
             fields.entry(name.clone()).or_insert_with(|| value.clone());
             observe_extracted_name(&mut next_extracted_suffix, name);
         }
@@ -247,7 +256,12 @@ impl LogQuery {
                 }
                 PipelineStage::Json => match extract_json_cancellable(&entry.line, cancellation) {
                     Ok(extracted) => {
-                        merge_extracted(&mut fields, &mut next_extracted_suffix, extracted)
+                        merge_extracted(
+                            &mut fields,
+                            &mut next_extracted_suffix,
+                            &shadowed_by_metadata,
+                            extracted,
+                        )
                     }
                     Err(ExtractError::Parse) => {
                         set_parser_error(entry, &mut fields, "JSONParserErr");
@@ -257,7 +271,12 @@ impl LogQuery {
                 PipelineStage::Logfmt => {
                     match extract_logfmt_cancellable(&entry.line, cancellation) {
                         Ok(extracted) => {
-                            merge_extracted(&mut fields, &mut next_extracted_suffix, extracted)
+                            merge_extracted(
+                            &mut fields,
+                            &mut next_extracted_suffix,
+                            &shadowed_by_metadata,
+                            extracted,
+                        )
                         }
                         Err(ExtractError::Parse) => {
                             set_parser_error(entry, &mut fields, "LogfmtParserErr");
@@ -298,9 +317,16 @@ impl LogQuery {
         // `entry` is a query-local clone, so retaining the evaluated fields
         // here lets metric evaluation use the same label set that filtering
         // used without changing the persisted log entry.
+        //
+        // A stream label is dropped only while it still *equals* the stream
+        // label — carrying an identical copy would say nothing. A
+        // `label_format` that rewrote one is kept, because the row's label set
+        // genuinely changed and the response has to show the new value: Loki
+        // 3.3.2 answers `{app="probe"} | label_format level="rewritten"` with
+        // `level="rewritten"`, not with the stored value.
         entry.structured_metadata = fields
             .into_iter()
-            .filter(|(name, _)| !labels.contains_key(name))
+            .filter(|(name, value)| labels.get(name) != Some(value))
             .collect();
         Ok(true)
     }

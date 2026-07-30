@@ -89,12 +89,29 @@ fn decimal_duration_component_ns(
     i64::try_from(truncated).map_err(|_| format!("duration '{full_input}' is out of range"))
 }
 
+/// Merges one parser stage's output into the live field set.
+///
+/// `shadowed_by_metadata` holds the names the push sent as structured metadata
+/// and that are not also stream labels. An extraction under one of those names
+/// is **discarded**, because that is what Loki does: measured against
+/// `grafana/loki:3.3.2` with a stream pushed with `trace_id` metadata and a
+/// line whose JSON also carries `trace_id`, `| json | trace_id="<the JSON
+/// value>"` matches nothing, `| json | trace_id="<the metadata value>"`
+/// matches, `trace_id_extracted` does not exist, and `line_format
+/// "{{.trace_id}}"` renders the metadata value. Loki's `_extracted` suffix
+/// applies to a collision with a **stream label** only — there both names
+/// survive and both are filterable — which is the case the code below still
+/// renames.
 fn merge_extracted(
     fields: &mut BTreeMap<String, String>,
     next_suffix: &mut BTreeMap<String, usize>,
+    shadowed_by_metadata: &BTreeSet<String>,
     extracted: BTreeMap<String, String>,
 ) {
     for (name, value) in extracted {
+        if shadowed_by_metadata.contains(&name) {
+            continue;
+        }
         insert_extracted_with_counter(fields, next_suffix, name, value);
     }
 }

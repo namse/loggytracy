@@ -142,29 +142,63 @@ pub(crate) fn parse_time_ns(s: &str) -> Result<i64, String> {
     }
 }
 
-fn build_stream_data(results: Vec<StreamResult>) -> Vec<StreamData> {
-    results
+/// A log response's rows, grouped the way Loki groups them.
+///
+/// Everything a row carries — its stream labels, the structured metadata the
+/// push sent, and whatever the pipeline extracted — goes into the stream's
+/// label set, and each `values` tuple is `[timestamp, line]`. This is measured
+/// against `grafana/loki:3.3.2` rather than inferred: for a stream pushed with
+/// `trace_id` metadata, `{app="probe"}` answers with `trace_id` among the
+/// `stream` labels and a two-element tuple, and `{app="probe"} | json` adds the
+/// extracted fields to the same set. The three-element tuple is Loki's
+/// *opt-in* shape, requested with `X-Loki-Response-Encoding-Flags:
+/// categorize-labels`, and there it is an object of categories
+/// (`{"structuredMetadata": {...}, "parsed": {...}}`) rather than a flat map.
+/// loggytracy returned the flat map unconditionally, so pushed metadata and
+/// extracted fields both landed in a slot Loki's default response does not use
+/// (`todo.md`, "Open correctness defects").
+///
+/// One output stream per distinct label set, which is why the grouping is
+/// global rather than per input stream: two input streams whose labels a
+/// `label_format` collapsed onto each other are one stream to Loki. The
+/// direction has to be passed in because merging two inputs into one group
+/// interleaves their rows, and the response order is part of the contract.
+fn build_stream_data(results: Vec<StreamResult>, forward: bool) -> Vec<StreamData> {
+    let mut grouped: BTreeMap<Labels, Vec<(i64, String)>> = BTreeMap::new();
+    for result in results {
+        for entry in result.entries {
+            let mut labels = result.labels.clone();
+            for (name, value) in entry.structured_metadata {
+                labels.insert(name, value);
+            }
+            grouped
+                .entry(labels)
+                .or_default()
+                .push((entry.timestamp_ns, entry.line));
+        }
+    }
+    grouped
         .into_iter()
-        .map(|r| StreamData {
-            stream: r.labels.into_iter().collect(),
-            values: r
-                .entries
-                .iter()
-                .map(|e| {
-                    let mut arr = vec![
-                        serde_json::Value::String(e.timestamp_ns.to_string()),
-                        serde_json::Value::String(e.line.clone()),
-                    ];
-                    if !e.structured_metadata.is_empty() {
-                        let mut map = serde_json::Map::new();
-                        for (k, v) in &e.structured_metadata {
-                            map.insert(k.clone(), serde_json::Value::String(v.clone()));
-                        }
-                        arr.push(serde_json::Value::Object(map));
-                    }
-                    serde_json::Value::Array(arr)
-                })
-                .collect(),
+        .map(|(labels, mut rows)| {
+            // Stable, so rows sharing a timestamp keep the order the scan
+            // produced them in rather than being reshuffled by the grouping.
+            if forward {
+                rows.sort_by_key(|(timestamp_ns, _)| *timestamp_ns);
+            } else {
+                rows.sort_by_key(|(timestamp_ns, _)| std::cmp::Reverse(*timestamp_ns));
+            }
+            StreamData {
+                stream: labels.into_iter().collect(),
+                values: rows
+                    .into_iter()
+                    .map(|(timestamp_ns, line)| {
+                        serde_json::Value::Array(vec![
+                            serde_json::Value::String(timestamp_ns.to_string()),
+                            serde_json::Value::String(line),
+                        ])
+                    })
+                    .collect(),
+            }
         })
         .collect()
 }

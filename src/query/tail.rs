@@ -259,7 +259,9 @@ async fn tail_poll(
     // up falls behind — visibly, in the timestamps it delivers — instead of
     // losing lines, which is the failure an operator can actually act on.
     Some(serde_json::json!({
-        "streams": build_stream_data(fresh),
+        // `forward`: the scan above asked for the oldest entries after the
+        // cursor, so a tail delivers in ascending time.
+        "streams": build_stream_data(fresh, true),
         "dropped_entries": [],
     }))
 }

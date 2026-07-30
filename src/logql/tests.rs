@@ -46,13 +46,43 @@
             &[("trace_id", "metadata")],
         )));
 
-        let synthesized =
-            parse(r#"{} | json | foo_extracted_2="z""#).expect("synthesized field query");
-        assert!(synthesized.exact_field_predicates().is_empty());
-        assert!(synthesized.matches_entry(&entry(
+        // An extraction whose name is a pushed structured-metadata key is
+        // dropped rather than renamed, which is Loki's rule as measured against
+        // 3.3.2: with `foo` and `foo_extracted` both pushed as metadata and a
+        // line of `{"foo":"z"}`, `| json` returns the metadata values and none
+        // of `foo="z"`, `foo_extracted="z"`, `foo_extracted_2="z"` matches.
+        let shadowed = parse(r#"{} | json | foo_extracted_2="z""#).expect("synthesized field query");
+        assert!(shadowed.exact_field_predicates().is_empty());
+        assert!(!shadowed.matches_entry(&entry(
             r#"{"foo":"z"}"#,
             &[("foo", "x"), ("foo_extracted", "y")],
         )));
+        assert!(
+            !parse(r#"{} | json | foo="z""#)
+                .unwrap()
+                .matches_entry(&entry(r#"{"foo":"z"}"#, &[("foo", "x")]))
+        );
+
+        // A collision with a *stream label* still renames, because there Loki
+        // keeps both names and both are filterable. loggytracy carries the
+        // counter one step further than Loki does: Loki's second collision
+        // overwrites the `foo_extracted` stream label, this keeps its value.
+        let mut renamed = entry(r#"{"foo":"z"}"#, &[]);
+        let labels: Labels = [
+            ("foo".to_string(), "x".to_string()),
+            ("foo_extracted".to_string(), "y".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            parse(r#"{} | json"#)
+                .unwrap()
+                .process_entry_with_labels(&labels, &mut renamed)
+        );
+        assert_eq!(
+            renamed.structured_metadata,
+            vec![("foo_extracted_2".to_string(), "z".to_string())]
+        );
 
         let sanitized = parse(r#"{} | json | namespace_key="value" | _9code=200"#).unwrap();
         assert!(sanitized.matches_entry(&entry(r#"{"namespace:key":"value","9code":200}"#, &[],)));

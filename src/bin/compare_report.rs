@@ -483,31 +483,28 @@ hide — plus one per sample, compared at six decimals.
 
 The digest was over `(timestamp, line)` pairs alone until this run, which is how
 a `| json` label difference was once reported as 24 of 24 agreed (`todo.md`,
-"Open correctness defects"). Two differences between the two response shapes are
-declared rather than discovered, and the digest normalizes those two by name
-instead of looking away from labels altogether:
+"Open correctness defects"). **No placement is exempt from it.** One was, for one
+run: labels the seed pushed as structured metadata were digested without their
+placement, because Loki promoted them into a log response's stream labels while
+loggytracy returned them in the third element of each `values` tuple. That was
+the same defect the `| json` shape was open as — the same slot — and it is fixed
+rather than declared, so both sides now answer with one flat stream label set and
+a two-element tuple, and a regression back into that slot is a disagreement here.
 
-* Labels the seed pushed as **structured metadata** are digested without their
-  placement. Loki promotes them into the identity of whatever it returns — into
-  a log response's stream labels, and into metric identity, which is why the
-  matrix asks for `sum(rate(...))` — while loggytracy returns them in the third
-  element of each `values` tuple. Same information, different place, so both
-  digest to one `metadata:` record. Their **values are still compared per
-  entry**, so a row carrying the wrong `trace_id` is still a disagreement.
-* `detected_level` and `service_name` are **dropped**, because Loki derives them
-  at ingest from the line and the stream and nothing in this bed pushes either.
-  Every answer records which of them it carried, and that is reported below
-  rather than left implicit.
+One exemption remains, and it is by name rather than by placement:
+`detected_level` and `service_name` are **dropped**, because Loki derives them at
+ingest from the line and the stream and nothing in this bed pushes either. Every
+answer records which of them it carried, and that is reported below rather than
+left implicit.
 
-Every other label keeps its placement. That is what makes the `| json` shape a
-disagreement rather than a normalization: the extracted fields are stream labels
-on Loki and entry metadata on loggytracy, and Grafana's Logs panel renders the
-two differently.
-
-The metric step grid is the third known difference and it is handled by the
-query rather than by the digest: `align_to_step` snaps every window boundary to
-a whole `step`, so Loki's absolute-multiple alignment and loggytracy's
-step-from-`start` produce the same instants.
+Two known differences are left, and neither is normalized away by the digest.
+The metric step grid is handled by the query: `align_to_step` snaps every window
+boundary to a whole `step`, so Loki's absolute-multiple alignment and
+loggytracy's step-from-`start` produce the same instants. And an *unaggregated*
+metric query still differs in series identity — Loki promotes a row's structured
+metadata and extracted fields into it, loggytracy groups by stream labels and by
+whatever the query names in `by`/`without` — which is why the matrix asks for
+`sum(rate(...))`, and which is reported as a difference rather than hidden.
 
 **{agreed} of {total} queries agreed.**
 
@@ -557,8 +554,7 @@ window never surfaced it.
             page.push_str(
                 "Which labels differed, grouped by the difference. `stream:` is a label \
 the response put in the stream's label set, `entry:` one it put in the entry's \
-structured-metadata object, `metric:` one in a series' identity, and \
-`metadata:` a pushed metadata key whose placement is normalized above:\n\n",
+structured-metadata object, and `metric:` one in a series' identity:\n\n",
             );
             for ((only_left, only_right), ids) in &label_groups {
                 page.push_str(&format!(

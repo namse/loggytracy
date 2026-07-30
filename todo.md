@@ -42,7 +42,7 @@ reason expires now — the bed is built and its baseline is published.
       [`docs/COMPARISON.md`](docs/COMPARISON.md) records as a separate still-open difference — Loki aligns
       samples to absolute multiples of `step` and loggytracy steps from `start`.
 
-- [ ] **`| json` does not promote extracted fields into a log response's stream labels; Loki's does.**
+- [x] **`| json` does not promote extracted fields into a log response's stream labels; Loki's does.**
       *Found by:* the same run, but **not** by the equality check — its digest is over `(timestamp, line)`
       pairs, so a label-set difference is structurally invisible to it. `json_field` was reported as 24/24
       agreed. The two label sets appear in [`docs/COMPARISON.md`](docs/COMPARISON.md) only because they were
@@ -51,7 +51,7 @@ reason expires now — the bed is built and its baseline is published.
       parser extracted.
       *Severity:* the log-query response shape, which is what Grafana's Logs panel renders as a line's
       detected fields. Metric grouping is **not** affected — `sum(count_over_time({app="api"} | json [5s])) by
-      (level)` is covered at `query/tests.rs:960` and works.
+      (level)` is covered by `query::tests::metric_grouping_uses_extracted_fields_and_parser_errors` and works.
       *Blocked on:* nothing. The checker is fixed first (next item) and is now **red on this defect**:
       `json_field` reports 0 of 24 agreed, and the fix is what has to turn it green.
       *Also measured while extending the checker:* loggytracy does not drop the extracted fields, it returns
@@ -59,6 +59,53 @@ reason expires now — the bed is built and its baseline is published.
       them as stream labels. So the response carries the same names in the wrong place, plus one name Loki does
       not have at all (`trace_id_extracted`, loggytracy's collision rename for a field that is also pushed
       metadata). The fix is about placement, not about extraction.
+      *This and the "accepted" pushed-metadata difference were one defect, and that was settled against Loki
+      rather than by argument.* `grafana/loki:3.3.2`, one stream with `level` as a stream label, `trace_id` and
+      `pod_ip` pushed as structured metadata, and a line whose JSON carries `level` and `trace_id`:
+      `{app="probe"}` answers with `trace_id` and `pod_ip` **among the `stream` labels** and a **two-element**
+      `values` tuple, and `{app="probe"} | json` adds the extracted fields to that same set. Loki's default JSON
+      encoding never uses the third element; the three-element tuple is its *opt-in*
+      `X-Loki-Response-Encoding-Flags: categorize-labels` shape, and there it is an object of categories
+      (`{"structuredMetadata": {…}, "parsed": {…}}`) rather than the flat map loggytracy was returning. So the
+      digest's declared exemption described the same slot as this defect, and both are fixed.
+      *Loki's collision rule, measured the same way:* a `| json` field colliding with a **stream label** becomes
+      `<name>_extracted` and both survive and both filter. A field colliding with a **pushed metadata key** is
+      **discarded** — `| json | trace_id="<the JSON value>"` matches nothing, `| json | trace_id="<the metadata
+      value>"` matches, `trace_id_extracted` does not exist, and `line_format "{{.trace_id}}"` renders the
+      metadata value. That is why Loki's response had no `trace_id_extracted` and loggytracy's did.
+      *Fixed by:* `query::build_stream_data`, which now merges each row's stream labels with its post-pipeline
+      field set, emits one stream per distinct merged label set and a `[timestamp, line]` tuple. It takes the
+      requested `direction`, because merging two input streams into one group interleaves their rows.
+      `logql::merge_extracted` implements the collision rule above; `LogQuery::process_entry_with_labels_*` now
+      also passes a stream label that a `label_format` **rewrote** through to the response (Loki answers
+      `| label_format level="rewritten"` with the new value), while an unchanged one is still not duplicated
+      into the query-local metadata. The internal representation is unchanged — extracted fields still live on
+      the query-local entry's `structured_metadata`, which is what filtering and `sum(...) by (extracted_field)`
+      read (`query/tests.rs`, `sum(count_over_time(… | json [5s])) by (level)`).
+      *Deliberately different:* a second collision on the same name. loggytracy answers `foo_extracted_2` and
+      keeps the `foo_extracted` stream label; Loki appends `_extracted` once and **overwrites** the
+      `foo_extracted` stream label with the extracted value, losing it. loggytracy does not lose a value it was
+      given. This is the `_extracted` pruning item under "P1 — LogQL improvements", now with the measurement.
+      Also unchanged: an *unaggregated* metric query's series identity. Loki promotes a row's metadata and
+      extracted fields into it and loggytracy groups by stream labels plus whatever `by`/`without` names, so
+      `rate({app="api"})` answers one series per `trace_id` on Loki and one per stream here. That is an
+      identity/cardinality difference rather than a misplaced field, it is why the matrix asks for
+      `sum(rate(...))`, and it stays reported as a difference.
+      *Verified with:* the digest, not by assertion — the same short comparison the item below documents.
+      `json_field` **0 of 24 before, 24 of 24 after**, with `label_only`, `line_filter` and `rate` unchanged at
+      24/24. Then the digest's placement exemption was removed, because after the fix it could only hide a
+      regression back into the `values` triple, and the same comparison re-run against a fresh Loki volume:
+      **96 of 96**, with `label_only` now reading `stream:trace_id`/`stream:pod_ip` on both sides where it used
+      to read the placement-blind `metadata:` tag. At unit level, five tests at the response-builder level pin
+      this without Loki running: `query::tests::a_log_response_promotes_pushed_metadata_into_the_stream_labels`,
+      `a_log_response_promotes_json_extracted_fields_into_the_stream_labels`,
+      `an_extraction_shadowed_by_pushed_metadata_never_reaches_the_response`,
+      `promotion_regroups_rows_by_their_whole_label_set_and_keeps_the_direction` and
+      `label_format_over_a_stream_label_reaches_the_response`, plus
+      `logql::tests::json_scalar_extraction_is_ordered_and_metadata_wins_collisions` for the collision rule and
+      `matrix::tests::structured_metadata_in_the_values_triple_is_a_disagreement` for the ruler.
+      *Not regenerated:* [`docs/COMPARISON.md`](docs/COMPARISON.md), which is the M9 run's document. Its
+      generator's prose is updated with the exemption it no longer has; the next `compare/run.sh` publishes it.
 
 - [x] **Extend the row-equality digest to cover labels.** The finding above matters less than the blind spot
       that hid it: a checker that proves two engines agree while silently not looking at half the response is
@@ -71,14 +118,16 @@ reason expires now — the bed is built and its baseline is published.
       cannot hide, and the result type and `status` are hashed in as an envelope. A malformed `values` tuple is
       now an error rather than a silently skipped row — the old digest read what it could and ignored the rest,
       so a response it could not parse compared equal to an empty one.
-      *The two accepted differences are declared, not loosened away:* pushed structured-metadata keys are read
-      off the corpus the bed actually sent and digested **without** their placement, because Loki promotes them
-      into result identity and loggytracy returns them in the `values` triple — their *values* are still
-      compared per entry, so `label_only` now checks per-row `trace_id`/`pod_ip` that nothing checked before.
-      Loki's derived `detected_level` and `service_name` are dropped by name, and every answer records which
-      dropped names it carried so the document states the exemption with its counts instead of the digest
-      being quietly narrower than it claims. The metric step grid stays handled by `align_to_step`, i.e. by the
-      query rather than by the digest.
+      *One accepted difference turned out to be the same defect and was withdrawn:* pushed structured-metadata
+      keys were digested **without** their placement, on the grounds that Loki promotes them into result
+      identity while loggytracy returned them in the `values` triple. That is the same slot and the same
+      sentence as the `| json` defect above, so it was fixed instead, and the exemption is gone — nothing is
+      exempt from placement now, because after the fix the exemption could only hide a regression. Their
+      *values* were and are still compared per entry, so `label_only` checks per-row `trace_id`/`pod_ip` that
+      nothing checked before. What remains exempt is by name, not by placement: Loki's derived `detected_level`
+      and `service_name` are dropped, and every answer records which dropped names it carried so the document
+      states the exemption with its counts instead of the digest being quietly narrower than it claims. The
+      metric step grid stays handled by `align_to_step`, i.e. by the query rather than by the digest.
       *Reported as:* the disagreement table gains a labels-differ column, and the label difference itself is
       printed grouped by difference — "24 queries: only loggytracy `entry:level`…, only Loki `stream:level`…"
       — instead of reaching the document by accident.
@@ -86,15 +135,22 @@ reason expires now — the bed is built and its baseline is published.
       stay order-independent, and reported as its own fact plus a distrust item). *Deliberately not digested:*
       `data.stats`, which reports how much each engine had to read (16,384 lines against Loki's 1,251 for the
       same answer) and is the thing they are supposed to differ on; a log response's grouping into streams,
-      because Loki returns one stream per metadata combination and loggytracy one per stream; and `limit`
-      truncation, which no window in the matrix reaches (`limit` 20,000 against ~6,250 rows).
+      because both now return one stream per metadata combination but neither promises the same partition of
+      the same rows; and `limit` truncation, which no window in the matrix reaches (`limit` 20,000 against
+      ~6,250 rows).
       *Verified by:* seed + matrix phases only, against Loki 3.3.2 in `compare/docker-compose.yml` and a local
       loggytracy, 30,000 rows over 8 streams and 3 windows — the shortest configuration that surfaces
       `json_field`, about two seconds per phase instead of `compare/run.sh`'s 25 minutes.
-      `label_only` 24/24, `line_filter` 24/24, `rate` 24/24, **`json_field` 0/24**. The unit tests that pin
-      each rule are `matrix::tests::the_same_lines_under_different_labels_are_not_the_same_answer`,
-      `promoted_structured_metadata_digests_the_same_wherever_the_response_put_it` and
-      `json_extracted_fields_in_the_wrong_place_are_a_disagreement`.
+      `label_only` 24/24, `line_filter` 24/24, `rate` 24/24, **`json_field` 0/24** at the point the checker was
+      fixed; 96/96 once the defect above was. The unit tests that pin each rule are
+      `matrix::tests::the_same_lines_under_different_labels_are_not_the_same_answer`,
+      `structured_metadata_in_the_values_triple_is_a_disagreement`,
+      `json_extracted_fields_in_the_wrong_place_are_a_disagreement` and
+      `every_label_is_digested_where_the_response_put_it`.
+      *Re-seeding Loki is not idempotent, and a comparison rerun has to start from a fresh volume.* Loki drops
+      an exactly duplicate entry from a **log** answer but still counts it in `rate`, so a second `seed` against
+      the same volume leaves `label_only`/`line_filter`/`json_field` agreeing and doubles every `rate` sample.
+      That was hit while verifying the fix above and is a property of the bed, not of either engine.
       *Not regenerated:* [`docs/COMPARISON.md`](docs/COMPARISON.md), which is the M9 run's document and
       describes the digest that run used. The next `compare/run.sh` publishes the extended one; regenerating it
       from the old artifacts would print the new prose over old digests.
@@ -456,7 +512,19 @@ Read path:
 - [x] Exact-field pruning on stream-label fields, through the stream index
 - [ ] Exact-field pruning for empty-string equality and `_extracted` collisions —
       both stay conservative on purpose: an empty equality also matches an absent
-      field, and absence is not indexed anywhere
+      field, and absence is not indexed anywhere. The *naming* half is settled and
+      no longer open: measured against `grafana/loki:3.3.2`, a `| json` field
+      colliding with a stream label becomes `<name>_extracted` (both survive, both
+      filter) and one colliding with a pushed structured-metadata key is discarded
+      outright, which loggytracy now matches — see the `| json` entry under "Open
+      correctness defects". What is left is one deliberate divergence: on a
+      *second* collision Loki appends `_extracted` once more and overwrites the
+      existing `foo_extracted` stream label, while loggytracy answers
+      `foo_extracted_2` and keeps it, because it will not drop a value it was
+      given. A name that could have been synthesized that way must therefore
+      never drive a row-group prune, which is what
+      `query::tests::synthesized_extracted_field_never_false_negative_prunes_parts`
+      and `..._restores_an_evicted_part_conservatively` hold
 
 ## P2 — correctness and storage performance
 
