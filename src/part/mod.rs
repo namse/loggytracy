@@ -403,6 +403,7 @@ include!("metadata.rs");
 include!("tombstone.rs");
 include!("reader.rs");
 include!("row_stream.rs");
+include!("stream_writer.rs");
 
 #[cfg(test)]
 mod tests {

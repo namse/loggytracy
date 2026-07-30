@@ -27,9 +27,17 @@ fn write_index(
 ) -> io::Result<()> {
     let bloom = encode_blooms(rows, row_group_size)?;
     let streams = encode_stream_index(rows, row_group_size, stream_labels)?;
+    write_index_sections(path, &bloom, &streams)
+}
+
+/// The container both writers emit: magic, then each section length-prefixed.
+///
+/// Shared so a streaming writer cannot lay the file out differently from the
+/// batch one.
+fn write_index_sections(path: &Path, bloom: &[u8], streams: &[u8]) -> io::Result<()> {
     let mut buf = Vec::with_capacity(INDEX_MAGIC.len() + 8 + bloom.len() + streams.len());
     buf.extend_from_slice(INDEX_MAGIC);
-    for section in [&bloom, &streams] {
+    for section in [bloom, streams] {
         let length = u32::try_from(section.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "index section is too large")
         })?;
@@ -88,25 +96,40 @@ fn encode_stream_index(
             }
         }
     }
+    let entry_count: usize = index.values().map(|m| m.len()).sum();
+    let entries = index.iter().flat_map(|(name, values)| {
+        values
+            .iter()
+            .map(move |(value, bitmap)| (*name, *value, bitmap))
+    });
+    serialize_stream_index(entry_count, entries)
+}
+
+/// `SIX1` from `(label, value, postings)` in the order the reader expects.
+///
+/// Takes an iterator rather than the map so the streaming writer, whose keys
+/// must be owned because its rows are gone, produces the same bytes as the
+/// batch path, whose keys borrow the rows.
+fn serialize_stream_index<'a>(
+    entry_count: usize,
+    entries: impl IntoIterator<Item = (&'a str, &'a str, &'a RoaringBitmap)>,
+) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     buf.extend_from_slice(STREAM_MAGIC);
-    let entry_count: usize = index.values().map(|m| m.len()).sum();
     buf.extend_from_slice(&(entry_count as u32).to_le_bytes());
-    for (name, values) in &index {
-        for (value, bitmap) in values {
-            let name_bytes = name.as_bytes();
-            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(name_bytes);
-            let value_bytes = value.as_bytes();
-            buf.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(value_bytes);
-            let mut bm_bytes = Vec::new();
-            bitmap
-                .serialize_into(&mut bm_bytes)
-                .map_err(io::Error::other)?;
-            buf.extend_from_slice(&(bm_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&bm_bytes);
-        }
+    for (name, value, bitmap) in entries {
+        let name_bytes = name.as_bytes();
+        buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+        let value_bytes = value.as_bytes();
+        buf.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(value_bytes);
+        let mut bm_bytes = Vec::new();
+        bitmap
+            .serialize_into(&mut bm_bytes)
+            .map_err(io::Error::other)?;
+        buf.extend_from_slice(&(bm_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&bm_bytes);
     }
     Ok(buf)
 }

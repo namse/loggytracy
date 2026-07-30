@@ -193,6 +193,102 @@
     }
 
     #[test]
+    fn the_streaming_writer_produces_the_same_part_as_the_batch_one() {
+        // The whole argument for streaming a merge is that the format never
+        // needed the rows held. This is what says so: identical inputs through
+        // both writers must leave identical sidecars, or the two have drifted
+        // and a merged part is not what a flushed one would have been.
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let mut rows: Vec<Row> = Vec::new();
+        for tenant in ["tenant-a", "tenant-b"] {
+            for i in 0..40i64 {
+                let mut labels: Labels = BTreeMap::new();
+                labels.insert("app".to_string(), format!("app-{}", i % 3));
+                labels.insert("host".to_string(), tenant.to_string());
+                rows.push(Row {
+                    tenant: TenantId::parse(tenant).expect("valid"),
+                    timestamp_ns: base + i,
+                    line: format!("{{\"status\":\"{}\",\"msg\":\"row {i}\"}}", 200 + i % 5),
+                    labels: std::sync::Arc::new(labels),
+                    structured_metadata: vec![("trace_id".to_string(), format!("t{i}"))],
+                });
+            }
+        }
+
+        let batch = flush_rows(rows.clone(), &tmp, 7).expect("flush").remove(0);
+
+        // `load_part` checks both the directory name against the id and its
+        // parent against the partition, so the streamed copy mirrors the layout
+        // rather than sitting in a directory of its own choosing.
+        let streamed_dir = tmp
+            .join("streamed")
+            .join(&batch.meta.partition)
+            .join(&batch.meta.id);
+        std::fs::create_dir_all(&streamed_dir).expect("mkdir");
+        let stream_labels = collect_stream_labels(&rows);
+        let mut writer =
+            StreamingPartWriter::create(&streamed_dir, stream_labels, 7).expect("create");
+        // The batch path sorts; the streaming path is promised sorted input,
+        // which is MergedRows' job. Sorting here is standing in for it.
+        let mut sorted = rows.clone();
+        sort_rows(&mut sorted);
+        for row in sorted {
+            writer.push(row).expect("push");
+        }
+        writer
+            .finish(&streamed_dir, &batch.meta.id, &batch.meta.partition)
+            .expect("finish");
+
+        let batch_index = std::fs::read(batch.dir.join(INDEX_FILE)).expect("batch index");
+        let streamed_index = std::fs::read(streamed_dir.join(INDEX_FILE)).expect("streamed index");
+        assert_eq!(
+            batch_index, streamed_index,
+            "the blooms and the stream index must be byte-identical"
+        );
+
+        let batch_meta = load_part(&batch.dir).expect("batch meta").meta;
+        let streamed_part = load_part(&streamed_dir).expect("streamed meta");
+        let streamed_meta = streamed_part.meta.clone();
+        let segments = |meta: &PartMeta| -> Vec<(String, u32, u32, u64, i64, i64)> {
+            meta.tenants
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.tenant.to_string(),
+                        segment.row_group_start,
+                        segment.row_group_end,
+                        segment.row_count,
+                        segment.min_ts_ns,
+                        segment.max_ts_ns,
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(segments(&batch_meta), segments(&streamed_meta));
+        assert_eq!(batch_meta.row_count, streamed_meta.row_count);
+        assert_eq!(batch_meta.row_group_count, streamed_meta.row_group_count);
+        assert_eq!(batch_meta.min_ts_ns, streamed_meta.min_ts_ns);
+        assert_eq!(batch_meta.max_ts_ns, streamed_meta.max_ts_ns);
+        assert_eq!(batch_meta.row_group_min_ts, streamed_meta.row_group_min_ts);
+        assert_eq!(batch_meta.row_group_max_ts, streamed_meta.row_group_max_ts);
+        assert_eq!(batch_meta.stream_labels, streamed_meta.stream_labels);
+        assert_eq!(batch_meta.streams, streamed_meta.streams);
+        assert_eq!(
+            batch_meta.materialized_bytes,
+            streamed_meta.materialized_bytes
+        );
+
+        // And it must be readable, not merely equal on paper.
+        let reader = PartReader::open(streamed_part).expect("open streamed part");
+        let read = reader
+            .read_all_rows(None)
+            .expect("read back")
+            .len();
+        assert_eq!(read, 80);
+    }
+
+    #[test]
     fn flush_then_query_roundtrip() {
         let tmp = tempfile_dir();
         let rows = make_rows();
