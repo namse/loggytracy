@@ -704,12 +704,21 @@ fn sample_value(
         Some(unwrap) => {
             // The pipeline leaves its evaluated fields on the query-local
             // entry, and stream labels are visible to it, so the unwrap reads
-            // the same set the field filters did.
-            let mut fields: BTreeMap<String, String> = labels.clone();
-            for (name, value) in &entry.structured_metadata {
-                fields.insert(name.clone(), value.clone());
-            }
-            unwrap.value(&fields)
+            // the same set the field filters did — but it names one field, so
+            // only that field is resolved. Building the whole set was a
+            // `Labels` clone plus a `BTreeMap` per row.
+            //
+            // Resolution order is the one the map's inserts produced: the last
+            // structured-metadata pair with the name wins over an earlier one,
+            // and any of them wins over the stream label.
+            let raw = entry
+                .structured_metadata
+                .iter()
+                .rev()
+                .find(|(name, _)| *name == unwrap.field)
+                .map(|(_, value)| value.as_str())
+                .or_else(|| labels.get(&unwrap.field).map(String::as_str))?;
+            unwrap.convert(raw)
         }
     }
 }

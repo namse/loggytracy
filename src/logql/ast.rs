@@ -407,7 +407,14 @@ impl Unwrap {
     /// counted as zero. Zero is a value someone will plot, and a field that
     /// failed to parse is not a measurement of zero.
     pub fn value(&self, fields: &BTreeMap<String, String>) -> Option<f64> {
-        let raw = fields.get(&self.field)?;
+        self.convert(fields.get(&self.field)?)
+    }
+
+    /// The same conversion applied to a value the caller already resolved.
+    ///
+    /// The metric path names exactly one field, so it resolves that field
+    /// directly rather than materializing the whole field set per row.
+    pub fn convert(&self, raw: &str) -> Option<f64> {
         match self.conversion {
             UnwrapConversion::None => raw.parse::<f64>().ok().filter(|value| value.is_finite()),
             UnwrapConversion::Duration => crate::logql::parse_duration_ns(raw)
