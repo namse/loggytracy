@@ -94,7 +94,7 @@
             .await
             .expect("the export is accepted");
 
-        let results = memtable.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true);
+        let results = memtable.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true);
         let entries: Vec<&str> = results
             .iter()
             .flat_map(|stream| stream.entries.iter())
@@ -136,7 +136,7 @@
         for table in [&memtable, &memtable_window] {
             assert!(
                 table
-                    .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+                    .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                     .is_empty(),
                 "a refused export must not have been written"
             );
@@ -195,7 +195,7 @@
 
         assert!(
             memtable
-                .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                 .is_empty(),
             "a refused export must not have been written"
         );
@@ -224,7 +224,7 @@
             &config.default_tenant,
         )
         .expect("the WAL replays");
-        let results = replayed.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true);
+        let results = replayed.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true);
         let lines: Vec<&str> = results
             .iter()
             .flat_map(|stream| stream.entries.iter())

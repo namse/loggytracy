@@ -75,6 +75,12 @@ pub const TENANT_COLUMN: &str = "_tenant";
 /// every part to do it. The retention floor folds into `start_ns`, so one
 /// bound expresses both "what the client asked for" and "what the tenant is
 /// still entitled to".
+///
+/// Deliberately not a `QueryTimeRange`, and its `end` is deliberately still
+/// inclusive. These endpoints answer "did this label exist in the window", not
+/// "which rows are in the window", and no measurement establishes what Loki's
+/// own bound is here. Closing an existence question one nanosecond wide is the
+/// conservative error; a row set is what `query_range` promises exactly.
 #[derive(Clone, Copy, Debug)]
 pub struct MetadataWindow {
     pub start_ns: i64,
@@ -114,11 +120,71 @@ impl MetadataWindow {
 
 pub type StreamMap = BTreeMap<String, BTreeMap<String, RoaringBitmap>>;
 
-#[derive(Clone, Copy)]
-struct QueryTimeRange {
+/// The time window a log scan is allowed to return rows from.
+///
+/// Every level of the read path — the memtable scan, the part-level and
+/// row-group-level pruning, and the row-level reject inside a part — used to
+/// spell its own comparison out, and four independent comparisons that have to
+/// agree is how `end` came to be inclusive on the log path while Loki's
+/// `query_range` is `[start, end)`. So the boundary lives here and nothing below
+/// the query layer decides it: a site that prunes asks `overlaps`, a site that
+/// rejects a row asks `contains`, and the two cannot drift apart. A pruning
+/// bound tighter than the row bound silently drops rows, which is the failure
+/// mode this type exists to make unrepresentable.
+/// The fields are private so no caller can spell the comparison out again from
+/// the bounds: the only way to ask whether a timestamp is in the window is to
+/// ask this type.
+#[derive(Clone, Copy, Debug)]
+pub struct QueryTimeRange {
     start_ns: i64,
     end_ns: i64,
     include_end: bool,
+}
+
+impl QueryTimeRange {
+    /// `[start_ns, end_ns)` — what a Loki log query asks for. Both `query` and
+    /// `query_range` include `start` and exclude `end`.
+    pub fn half_open(start_ns: i64, end_ns: i64) -> Self {
+        Self {
+            start_ns,
+            end_ns,
+            include_end: false,
+        }
+    }
+
+    /// `[start_ns, end_ns]`.
+    ///
+    /// Not a log-query window. This is for the scans whose `end` is not a
+    /// client-supplied exclusive bound: a metric scan's `end` is its last
+    /// evaluation point, and the range evaluator's own window closes on it
+    /// (`timestamp_ns <= evaluation_ns`), so a half-open scan would starve the
+    /// final point of the row that lands exactly on it.
+    pub fn closed(start_ns: i64, end_ns: i64) -> Self {
+        Self {
+            start_ns,
+            end_ns,
+            include_end: true,
+        }
+    }
+
+    /// Every row there is, for the callers that mean "all of them".
+    pub fn unbounded() -> Self {
+        Self::closed(i64::MIN, i64::MAX)
+    }
+
+    /// Whether a row at `timestamp_ns` belongs to the answer.
+    pub fn contains(&self, timestamp_ns: i64) -> bool {
+        timestamp_ns >= self.start_ns
+            && (timestamp_ns < self.end_ns || (self.include_end && timestamp_ns == self.end_ns))
+    }
+
+    /// Whether a span `[min_ts_ns, max_ts_ns]` can hold a row this range
+    /// contains. Exactly `contains` lifted to a span, so pruning never rejects
+    /// a span holding a row the row-level test would have kept.
+    pub fn overlaps(&self, min_ts_ns: i64, max_ts_ns: i64) -> bool {
+        max_ts_ns >= self.start_ns
+            && (min_ts_ns < self.end_ns || (self.include_end && min_ts_ns == self.end_ns))
+    }
 }
 
 /// A positive exact equality over an entry's structured or parser-visible

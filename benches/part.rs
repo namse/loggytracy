@@ -115,8 +115,7 @@ fn bench_scan_label_columns(c: &mut Criterion) {
                             &tenant,
                             std::slice::from_ref(&matcher),
                             &[],
-                            start,
-                            end,
+                            loggytracy::part::QueryTimeRange::closed(start, end),
                             usize::MAX,
                             true,
                         )
@@ -156,7 +155,14 @@ fn bench_scan_tenants(c: &mut Criterion) {
             b.iter(|| {
                 written
                     .reader
-                    .query(&tenant, &[], &[], start, end, 100, false)
+                    .query(
+                        &tenant,
+                        &[],
+                        &[],
+                        loggytracy::part::QueryTimeRange::closed(start, end),
+                        100,
+                        false,
+                    )
                     .expect("scan succeeds")
             });
         });
@@ -188,7 +194,14 @@ fn bench_scan_filters(c: &mut Criterion) {
         b.iter(|| {
             written
                 .reader
-                .query(&tenant, &[], &[], start, end, 100, false)
+                .query(
+                    &tenant,
+                    &[],
+                    &[],
+                    loggytracy::part::QueryTimeRange::closed(start, end),
+                    100,
+                    false,
+                )
                 .expect("scan succeeds")
         });
     });
@@ -201,7 +214,14 @@ fn bench_scan_filters(c: &mut Criterion) {
         b.iter(|| {
             written
                 .reader
-                .query(&tenant, &[], &hit, start, end, 100, false)
+                .query(
+                    &tenant,
+                    &[],
+                    &hit,
+                    loggytracy::part::QueryTimeRange::closed(start, end),
+                    100,
+                    false,
+                )
                 .expect("scan succeeds")
         });
     });
@@ -214,7 +234,14 @@ fn bench_scan_filters(c: &mut Criterion) {
         b.iter(|| {
             written
                 .reader
-                .query(&tenant, &[], &miss, start, end, 100, false)
+                .query(
+                    &tenant,
+                    &[],
+                    &miss,
+                    loggytracy::part::QueryTimeRange::closed(start, end),
+                    100,
+                    false,
+                )
                 .expect("scan succeeds")
         });
     });
@@ -244,8 +271,7 @@ fn bench_scan_filters(c: &mut Criterion) {
                         &tenant,
                         &[],
                         ExactFieldPruning::new(&[], &predicates),
-                        start,
-                        end,
+                        loggytracy::part::QueryTimeRange::closed(start, end),
                         100,
                         false,
                     )
@@ -277,7 +303,14 @@ fn report_allocations() {
         let (result, stats) = corpus::alloc::measure(|| {
             written
                 .reader
-                .query(&tenant, &[], &[], start, end, usize::MAX, true)
+                .query(
+                    &tenant,
+                    &[],
+                    &[],
+                    loggytracy::part::QueryTimeRange::closed(start, end),
+                    usize::MAX,
+                    true,
+                )
                 .expect("scan succeeds")
         });
         let returned: usize = result.iter().map(|stream| stream.entries.len()).sum();

@@ -112,7 +112,7 @@
 
         // all
         let r = reader
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 3);
@@ -120,7 +120,7 @@
         // label matcher app="test"
         let m = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "test".to_string()).unwrap();
         let r = reader
-            .query(&test_tenant(), std::slice::from_ref(&m), &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), std::slice::from_ref(&m), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 2);
@@ -128,7 +128,7 @@
         // line filter "error"
         let f = LineFilter::Contains("error".to_string());
         let r = reader
-            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
@@ -138,9 +138,7 @@
             .query(&test_tenant(),
 
                 &[],
-                &[],
-                1_700_000_001_000_000_000,
-                1_700_000_003_000_000_000,
+                &[], crate::part::QueryTimeRange::closed(1_700_000_001_000_000_000, 1_700_000_003_000_000_000),
                 100,
                 true,
             )
@@ -162,17 +160,13 @@
 
                     &[],
                     std::slice::from_ref(&f),
-                    QueryTimeRange {
-                        start_ns: i64::MIN,
-                        end_ns: i64::MAX,
-                        include_end: true,
-                    },
+                    QueryTimeRange::closed(i64::MIN, i64::MAX),
                 )
                 .is_empty(),
             "bloom miss must avoid selecting the parquet row group"
         );
         let r = reader
-            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -195,11 +189,7 @@
             &[],
             &[],
             &[ExactFieldPredicate::new("trace_id", "second")],
-            QueryTimeRange {
-                start_ns: i64::MIN,
-                end_ns: i64::MAX,
-                include_end: true,
-            },
+            QueryTimeRange::closed(i64::MIN, i64::MAX),
         );
         assert_eq!(selected, vec![1]);
 
@@ -212,11 +202,7 @@
                 std::slice::from_ref(&app),
                 &[],
                 &[ExactFieldPredicate::new("app", "test")],
-                QueryTimeRange {
-                    start_ns: i64::MIN,
-                    end_ns: i64::MAX,
-                    include_end: true,
-                },
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
             ),
             vec![0, 1]
         );
@@ -225,17 +211,13 @@
 
             &[],
             &[],
-            &[ExactFieldPredicate::new("trace_id", "not-present")],
-            i64::MIN,
-            i64::MAX,
+            &[ExactFieldPredicate::new("trace_id", "not-present")], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
         ));
         assert!(reader.may_match_exact_fields(&test_tenant(),
 
             &[],
             &[],
-            &[ExactFieldPredicate::new("missing", "")],
-            i64::MIN,
-            i64::MAX,
+            &[ExactFieldPredicate::new("missing", "")], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
         ));
     }
 
@@ -282,11 +264,7 @@
                     &[],
                     &[],
                     &[ExactFieldPredicate::new("trace_id", "abc")],
-                    QueryTimeRange {
-                        start_ns: i64::MIN,
-                        end_ns: i64::MAX,
-                        include_end: true,
-                    },
+                    QueryTimeRange::closed(i64::MIN, i64::MAX),
                 )
                 .is_empty(),
             "no token indexed means no exact-field predicate can match"
@@ -300,20 +278,14 @@
                 std::slice::from_ref(&app),
                 &[],
                 &[ExactFieldPredicate::new("app", "test")],
-                QueryTimeRange {
-                    start_ns: i64::MIN,
-                    end_ns: i64::MAX,
-                    include_end: true,
-                },
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
             )
             .is_empty());
         assert!(reader.may_match_exact_fields(
             &test_tenant(),
             &[],
             &[],
-            &[ExactFieldPredicate::new("trace_id", "")],
-            i64::MIN,
-            i64::MAX,
+            &[ExactFieldPredicate::new("trace_id", "")], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
         ));
     }
 
@@ -325,11 +297,7 @@
         rows[1].line = r#"user=bob elapsed=250ms"#.to_string();
         let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
         let reader = PartReader::open(part).unwrap();
-        let time_range = QueryTimeRange {
-            start_ns: i64::MIN,
-            end_ns: i64::MAX,
-            include_end: true,
-        };
+        let time_range = QueryTimeRange::closed(i64::MIN, i64::MAX);
 
         assert_eq!(
             reader.select_row_groups_with_exact_fields(&test_tenant(),
@@ -392,11 +360,7 @@
         ];
         let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
         let reader = PartReader::open(part).unwrap();
-        let range = QueryTimeRange {
-            start_ns: i64::MIN,
-            end_ns: i64::MAX,
-            include_end: true,
-        };
+        let range = QueryTimeRange::closed(i64::MIN, i64::MAX);
 
         let numeric = crate::logql::parse("{} | json | value=9007199254740993").unwrap();
         assert_eq!(
@@ -451,11 +415,7 @@
             &[],
             &[],
             &query.exact_field_predicates(),
-            QueryTimeRange {
-                start_ns: i64::MIN,
-                end_ns: i64::MAX,
-                include_end: true,
-            },
+            QueryTimeRange::closed(i64::MIN, i64::MAX),
         );
         assert_eq!(selected, vec![0, 1]);
     }
@@ -473,9 +433,7 @@
 
             &[],
             &[],
-            &[ExactFieldPredicate::new("trace_id", "not-present")],
-            i64::MIN,
-            i64::MAX,
+            &[ExactFieldPredicate::new("trace_id", "not-present")], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
         ));
     }
 
@@ -541,9 +499,7 @@
             .query_with_exact_field_pruning_and_scan_limit(&test_tenant(),
 
                 &[],
-                ExactFieldPruning::new(&[], &[]),
-                0,
-                19,
+                ExactFieldPruning::new(&[], &[]), crate::part::QueryTimeRange::closed(0, 19),
                 1,
                 true,
                 Some(100),
@@ -572,9 +528,7 @@
             .query_with_exact_field_pruning_and_scan_limit(&test_tenant(),
 
                 &[],
-                ExactFieldPruning::new(&[], &[]),
-                0,
-                19,
+                ExactFieldPruning::new(&[], &[]), crate::part::QueryTimeRange::closed(0, 19),
                 usize::MAX,
                 true,
                 Some(3),
@@ -583,6 +537,86 @@
             .unwrap();
         assert_eq!(result.scanned_rows, 3);
         assert_eq!(result.results[0].entries.len(), 3);
+    }
+
+    /// One row per row group, so the row-group bound and the row bound are both
+    /// exercised on the same boundary. A pruning bound tighter than the row
+    /// bound drops rows silently, so the two are asserted against each other
+    /// rather than each on its own.
+    #[test]
+    fn a_row_on_end_belongs_to_a_closed_window_and_not_to_a_half_open_one() {
+        let tmp = tempfile_dir();
+        let rows: Vec<Row> = [100, 200, 300]
+            .into_iter()
+            .map(|timestamp_ns| Row {
+                tenant: test_tenant(),
+                timestamp_ns,
+                labels: BTreeMap::new(),
+                line: format!("line-{timestamp_ns}"),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let reader = PartReader::open(flush_rows(rows, &tmp, 1).unwrap().remove(0)).unwrap();
+
+        let timestamps = |range| {
+            let mut seen: Vec<i64> = reader
+                .query(&test_tenant(), &[], &[], range, 100, true)
+                .expect("query")
+                .iter()
+                .flat_map(|stream| stream.entries.iter().map(|entry| entry.timestamp_ns))
+                .collect();
+            seen.sort_unstable();
+            seen
+        };
+        let selected = |range| reader.select_row_groups(&test_tenant(), &[], &[], range);
+
+        assert_eq!(timestamps(QueryTimeRange::closed(100, 200)), vec![100, 200]);
+        assert_eq!(timestamps(QueryTimeRange::half_open(100, 200)), vec![100]);
+        assert_eq!(timestamps(QueryTimeRange::half_open(100, 201)), vec![
+            100, 200
+        ]);
+        assert_eq!(
+            timestamps(QueryTimeRange::half_open(200, 200)),
+            Vec::<i64>::new(),
+            "an empty window returns nothing, not the row on its boundary"
+        );
+
+        // Row groups here are one row each, so the group a boundary row lives in
+        // must be selected exactly when that row is returned.
+        assert_eq!(selected(QueryTimeRange::closed(100, 200)).len(), 2);
+        assert_eq!(selected(QueryTimeRange::half_open(100, 200)).len(), 1);
+        for range in [
+            QueryTimeRange::closed(100, 200),
+            QueryTimeRange::half_open(100, 200),
+            QueryTimeRange::half_open(100, 201),
+            QueryTimeRange::half_open(200, 200),
+        ] {
+            assert_eq!(
+                selected(range).len(),
+                timestamps(range).len(),
+                "row-group pruning and the row-level test must agree"
+            );
+        }
+
+        assert!(
+            reader.may_match_exact_fields(
+                &test_tenant(),
+                &[],
+                &[],
+                &[],
+                QueryTimeRange::closed(200, 200)
+            )
+        );
+        assert!(
+            !reader.may_match_exact_fields(
+                &test_tenant(),
+                &[],
+                &[],
+                &[],
+                QueryTimeRange::half_open(200, 200)
+            ),
+            "an empty window cannot need a part restored for it"
+        );
     }
 
     #[test]
@@ -598,17 +632,13 @@
 
                     std::slice::from_ref(&m),
                     &[],
-                    QueryTimeRange {
-                        start_ns: i64::MIN,
-                        end_ns: i64::MAX,
-                        include_end: true,
-                    },
+                    QueryTimeRange::closed(i64::MIN, i64::MAX),
                 )
                 .is_empty(),
             "stream-index miss must avoid selecting the parquet row group"
         );
         let r = reader
-            .query(&test_tenant(), &[m], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[m], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -641,7 +671,7 @@
         let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
 
         let r = reader
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 3, false)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 3, false)
             .expect("q");
         let lines: Vec<&str> = r
             .iter()
@@ -650,7 +680,7 @@
         assert_eq!(lines, vec!["line-2999", "line-2998", "line-2997"]);
 
         let r = reader
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 3, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 3, true)
             .expect("q");
         let lines: Vec<&str> = r
             .iter()
@@ -718,9 +748,7 @@
                         .query(&test_tenant(),
 
                             std::slice::from_ref(&matcher),
-                            &[],
-                            i64::MIN,
-                            i64::MAX,
+                            &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                             limit,
                             forward,
                         )
@@ -837,7 +865,7 @@
         let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
         let m = LabelMatcher::new("app".to_string(), MatcherOp::Eq, "".to_string()).unwrap();
         let r = reader
-            .query(&test_tenant(), &[m], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[m], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
@@ -1001,7 +1029,7 @@ resident {:.0} B",
         let reader = PartReader::open(parts.into_iter().next().unwrap()).expect("open");
         let f = LineFilter::Contains("zzzzzz-not-present-substr".to_string());
         let r = reader
-            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("q");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
@@ -1381,7 +1409,7 @@ resident {:.0} B",
         let reader = PartReader::open(part).unwrap();
         let lines = |tenant: &TenantId| -> Vec<String> {
             reader
-                .query(tenant, &[], &[], i64::MIN, i64::MAX, 100, true)
+                .query(tenant, &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
                 .unwrap()
                 .into_iter()
                 .flat_map(|stream| stream.entries)
@@ -1410,7 +1438,7 @@ resident {:.0} B",
         .unwrap();
         assert!(
             reader
-                .query(&acme, &[globex_matcher], &[], i64::MIN, i64::MAX, 100, true)
+                .query(&acme, &[globex_matcher], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
                 .unwrap()
                 .is_empty()
         );
@@ -1445,11 +1473,7 @@ resident {:.0} B",
         let tmp = tempfile_dir();
         let part = flush_rows(make_rows(), &tmp, 1).unwrap().remove(0);
         let reader = PartReader::open(part).unwrap();
-        let range = QueryTimeRange {
-            start_ns: i64::MIN,
-            end_ns: i64::MAX,
-            include_end: true,
-        };
+        let range = QueryTimeRange::closed(i64::MIN, i64::MAX);
 
         // `app` is a stream label: two rows carry "test" and one "other".
         let selected = reader.select_row_groups_with_exact_fields(

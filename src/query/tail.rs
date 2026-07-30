@@ -219,8 +219,10 @@ async fn tail_poll(
         state.clone(),
         tenant.clone(),
         query.clone(),
-        scan_start,
-        end_ns,
+        // Closed: `end_ns` is this poll's "now minus delay", not a bound the
+        // client asked to exclude. Excluding it would hold the newest line back
+        // a poll, and forever if the clock does not move.
+        crate::part::QueryTimeRange::closed(scan_start, end_ns),
         scan_limit,
         true,
         Some(state.config.max_query_scan_rows.min(MAX_LOG_SCAN_ROWS)),

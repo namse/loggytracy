@@ -575,7 +575,14 @@ mod tests {
         );
         assert!(pending_checkpoint.is_none());
         let results = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(
+                &test_tenant(),
+                &[],
+                &[],
+                crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                100,
+                true,
+            )
             .unwrap();
         assert_eq!(results.iter().map(|r| r.entries.len()).sum::<usize>(), 1);
     }

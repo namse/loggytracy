@@ -61,7 +61,7 @@
         assert_eq!(registry.part_count(), 1);
 
         let results = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 1000, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 1000, true)
             .expect("part query");
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 50);
@@ -345,7 +345,7 @@
 
         assert_eq!(registry.part_count(), 1);
         let results = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 2000, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 2000, true)
             .expect("part query");
         assert_eq!(
             results
@@ -417,7 +417,7 @@
         // bloom prune after merge
         let f = crate::logql::LineFilter::Contains("zzzzz".to_string());
         let r = registry
-            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -430,7 +430,7 @@
         )
         .unwrap();
         let r = registry
-            .query(&test_tenant(), &[m], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[m], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -443,7 +443,7 @@
         )
         .unwrap();
         let r = registry
-            .query(&test_tenant(), &[m], &[], i64::MIN, i64::MAX, 1000, true)
+            .query(&test_tenant(), &[m], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 1000, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 60);
@@ -573,7 +573,7 @@
         );
 
         let surviving = registry
-            .query(&tenant_id("beta"), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&tenant_id("beta"), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .unwrap();
         assert_eq!(
             surviving
@@ -585,7 +585,7 @@
         );
         assert!(
             registry
-                .query(&tenant_id("alpha"), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .query(&tenant_id("alpha"), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                 .unwrap()
                 .is_empty()
         );
@@ -697,7 +697,7 @@
         assert_eq!(reader.meta().row_count, 3);
         assert!(
             registry
-                .query(&tenant_id("alpha"), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .query(&tenant_id("alpha"), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                 .unwrap()
                 .is_empty()
         );
@@ -758,9 +758,7 @@
             .query(
                 &tenant_id("unmentioned"),
                 &[],
-                &[],
-                i64::MIN,
-                i64::MAX,
+                &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                 10,
                 true,
             )
@@ -905,9 +903,7 @@
                     .query(
                         &tenant_id("kept"),
                         &[],
-                        Default::default(),
-                        i64::MIN,
-                        i64::MAX,
+                        Default::default(), crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                         100,
                         true,
                     )

@@ -572,8 +572,7 @@ mod tests {
             &tenant("unmentioned"),
             &[],
             &[],
-            i64::MIN,
-            i64::MAX,
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             10,
             true,
         );

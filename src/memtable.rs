@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::logql::{LabelMatcher, LineFilter};
-use crate::part::MetadataWindow;
+use crate::part::{MetadataWindow, QueryTimeRange};
 use crate::tenant::TenantId;
 
 pub type Labels = BTreeMap<String, String>;
@@ -132,8 +132,7 @@ fn scan_memtable_stream(
     labels: &Labels,
     entries: &[LogEntry],
     line_filters: &[LineFilter],
-    start_ns: i64,
-    end_ns: i64,
+    range: QueryTimeRange,
     limit: usize,
     forward: bool,
     scan_limit: Option<usize>,
@@ -154,8 +153,7 @@ fn scan_memtable_stream(
             break;
         }
         *scanned_rows = scanned_rows.saturating_add(1);
-        if entry.timestamp_ns >= start_ns
-            && entry.timestamp_ns <= end_ns
+        if range.contains(entry.timestamp_ns)
             && line_filters
                 .iter()
                 .all(|filter| filter.matches(&entry.line))
@@ -332,14 +330,12 @@ impl MemTable {
             .saturating_add(self.flushing_bytes.load(Ordering::Relaxed)) as usize
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn query(
         &self,
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
         limit: usize,
         forward: bool,
     ) -> Vec<StreamResult> {
@@ -347,8 +343,7 @@ impl MemTable {
             tenant,
             matchers,
             line_filters,
-            start_ns,
-            end_ns,
+            range,
             limit,
             forward,
             None,
@@ -363,8 +358,7 @@ impl MemTable {
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
         limit: usize,
         forward: bool,
         scan_limit: Option<usize>,
@@ -394,8 +388,7 @@ impl MemTable {
                     labels,
                     entries,
                     line_filters,
-                    start_ns,
-                    end_ns,
+                    range,
                     limit,
                     forward,
                     scan_limit,
@@ -419,8 +412,7 @@ impl MemTable {
                     labels,
                     entries,
                     line_filters,
-                    start_ns,
-                    end_ns,
+                    range,
                     limit,
                     forward,
                     scan_limit,
@@ -688,7 +680,14 @@ mod tests {
             vec![sample_entry("globex line", 100)],
         );
 
-        let acme = memtable.query(&tenant("acme"), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let acme = memtable.query(
+            &tenant("acme"),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            100,
+            true,
+        );
         let lines: Vec<_> = acme
             .iter()
             .flat_map(|stream| stream.entries.iter().map(|entry| entry.line.as_str()))
@@ -709,7 +708,14 @@ mod tests {
         );
         assert!(
             memtable
-                .query(&tenant("initech"), &[], &[], i64::MIN, i64::MAX, 100, true)
+                .query(
+                    &tenant("initech"),
+                    &[],
+                    &[],
+                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    100,
+                    true
+                )
                 .is_empty(),
             "an unknown tenant must see nothing"
         );
@@ -739,7 +745,14 @@ mod tests {
         let snapshot = mt.begin_flush();
         assert_eq!(snapshot.len(), 1);
 
-        let results = mt.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = mt.query(
+            &sample_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            100,
+            true,
+        );
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
             total, 1,
@@ -747,7 +760,14 @@ mod tests {
         );
 
         mt.commit_flush();
-        let results2 = mt.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results2 = mt.query(
+            &sample_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            100,
+            true,
+        );
         let total2: usize = results2.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
             total2, 0,
@@ -767,7 +787,14 @@ mod tests {
         let snapshot = mt.begin_flush();
         mt.abort_flush(snapshot);
 
-        let results = mt.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = mt.query(
+            &sample_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            100,
+            true,
+        );
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1, "abort_flush should restore data to inner");
         assert!(!mt.is_empty());
@@ -814,13 +841,27 @@ mod tests {
         let snapshot = memtable.begin_flush();
         assert!(
             memtable
-                .query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .query(
+                    &sample_tenant(),
+                    &[],
+                    &[],
+                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    10,
+                    true
+                )
                 .len()
                 == 1
         );
         memtable.abort_flush(snapshot);
 
-        let results = memtable.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true);
+        let results = memtable.query(
+            &sample_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            10,
+            true,
+        );
         let total: usize = results.iter().map(|stream| stream.entries.len()).sum();
         assert_eq!(total, 1, "the aborted entries are back in the live buffer");
         assert_eq!(
@@ -848,7 +889,14 @@ mod tests {
             vec![sample_entry("second", 200)],
         );
 
-        let results = mt.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = mt.query(
+            &sample_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            100,
+            true,
+        );
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
             total, 2,
@@ -901,22 +949,57 @@ mod tests {
         assert_eq!(snapshot_entries, 2);
 
         memtable.abort_flush(second_snapshot);
-        let results = memtable.query(&sample_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = memtable.query(
+            &sample_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            100,
+            true,
+        );
         let total_entries: usize = results.iter().map(|stream| stream.entries.len()).sum();
         assert_eq!(total_entries, 2);
     }
 
     #[test]
-    fn query_includes_the_end_timestamp() {
+    fn the_range_decides_whether_a_row_on_end_is_returned() {
         let memtable = MemTable::new();
         memtable.insert(
             sample_tenant(),
             sample_labels(),
-            vec![sample_entry("at the inclusive end", i64::MAX)],
+            vec![sample_entry("on the boundary", 200)],
         );
+        let rows = |range| {
+            memtable
+                .query(&sample_tenant(), &[], &[], range, 100, true)
+                .iter()
+                .map(|stream| stream.entries.len())
+                .sum::<usize>()
+        };
 
-        let results = memtable.query(&sample_tenant(), &[], &[], i64::MAX, i64::MAX, 100, true);
-        let total_entries: usize = results.iter().map(|stream| stream.entries.len()).sum();
-        assert_eq!(total_entries, 1);
+        // This assertion used to be the whole test, under a name that made the
+        // scan's inclusive `end` sound like the contract. It is not: it is what
+        // a closed window means, and a log query does not ask for one.
+        assert_eq!(rows(QueryTimeRange::closed(100, 200)), 1);
+        assert_eq!(
+            rows(QueryTimeRange::half_open(100, 200)),
+            0,
+            "a row at exactly `end` is outside a Loki log window"
+        );
+        assert_eq!(
+            rows(QueryTimeRange::half_open(200, 300)),
+            1,
+            "`start` is included on both contracts"
+        );
+        assert_eq!(
+            rows(QueryTimeRange::half_open(200, 200)),
+            0,
+            "an empty window returns nothing, not the row on its boundary"
+        );
+        assert_eq!(
+            rows(QueryTimeRange::half_open(300, 100)),
+            0,
+            "an inverted window is empty rather than inverted"
+        );
     }
 }

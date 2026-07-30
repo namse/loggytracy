@@ -465,7 +465,14 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         // Verify that the writer has inserted the data when push returns 204 (#2 atomicity).
-        let results = memtable.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = memtable.query(
+            &test_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            100,
+            true,
+        );
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
     }
@@ -895,8 +902,7 @@ mod tests {
                     &crate::tenant::TenantId::parse("stranger").unwrap(),
                     &[],
                     &[],
-                    i64::MIN,
-                    i64::MAX,
+                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                     10,
                     true
                 )
@@ -995,9 +1001,14 @@ mod tests {
             .await
             .expect("a JSON push is accepted");
 
-        let results = state
-            .memtable
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true);
+        let results = state.memtable.query(
+            &test_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            10,
+            true,
+        );
         assert_eq!(results[0].labels["app"], "json");
         let lines: Vec<&str> = results
             .iter()
@@ -1022,7 +1033,14 @@ mod tests {
         )
         .expect("the WAL replays");
         let replayed_lines: Vec<String> = replayed
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(
+                &test_tenant(),
+                &[],
+                &[],
+                crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                10,
+                true,
+            )
             .iter()
             .flat_map(|stream| stream.entries.iter())
             .map(|entry| entry.line.clone())
@@ -1074,7 +1092,14 @@ mod tests {
         assert!(
             state
                 .memtable
-                .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .query(
+                    &test_tenant(),
+                    &[],
+                    &[],
+                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    10,
+                    true
+                )
                 .is_empty(),
             "no refused push may have been written"
         );
@@ -1185,8 +1210,7 @@ mod tests {
                     &test_tenant(),
                     std::slice::from_ref(&matcher),
                     &[],
-                    i64::MIN,
-                    i64::MAX,
+                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                     100,
                     true,
                 )
@@ -1235,8 +1259,7 @@ mod tests {
                 &test_tenant(),
                 &[matcher],
                 &[],
-                i64::MIN,
-                i64::MAX,
+                crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                 100,
                 true,
             )

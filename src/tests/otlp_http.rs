@@ -90,7 +90,7 @@
 
     fn lines(memtable: &MemTable) -> Vec<String> {
         memtable
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .iter()
             .flat_map(|stream| stream.entries.iter())
             .map(|entry| entry.line.clone())

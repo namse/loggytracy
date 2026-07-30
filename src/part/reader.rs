@@ -325,14 +325,12 @@ impl PartReader {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn query(
         &self,
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
         limit: usize,
         forward: bool,
     ) -> Result<Vec<StreamResult>, String> {
@@ -341,8 +339,7 @@ impl PartReader {
                 tenant,
                 matchers,
                 ExactFieldPruning::new(line_filters, &[]),
-                start_ns,
-                end_ns,
+                range,
                 limit,
                 forward,
                 None,
@@ -354,20 +351,18 @@ impl PartReader {
     /// Uses exact-field predicates only for row-group pruning. Bloom filters
     /// can return false positives, so the caller remains responsible for
     /// evaluating the predicates against each returned entry.
-    #[allow(clippy::too_many_arguments)]
     pub fn query_with_exact_field_pruning(
         &self,
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
         limit: usize,
         forward: bool,
     ) -> Result<Vec<StreamResult>, String> {
         Ok(self
             .query_with_exact_field_pruning_and_scan_limit(
-                tenant, matchers, pruning, start_ns, end_ns, limit, forward, None, None,
+                tenant, matchers, pruning, range, limit, forward, None, None,
             )?
             .results)
     }
@@ -378,8 +373,7 @@ impl PartReader {
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
         limit: usize,
         forward: bool,
         scan_limit: Option<usize>,
@@ -389,8 +383,7 @@ impl PartReader {
             tenant,
             matchers,
             pruning,
-            start_ns,
-            end_ns,
+            range,
             limit,
             forward,
             scan_limit,
@@ -405,8 +398,7 @@ impl PartReader {
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
         limit: usize,
         forward: bool,
         scan_limit: Option<usize>,
@@ -418,11 +410,7 @@ impl PartReader {
             matchers,
             pruning.line_filters,
             pruning.exact_fields,
-            QueryTimeRange {
-                start_ns,
-                end_ns,
-                include_end: true,
-            },
+            range,
             limit,
             forward,
             scan_limit,
@@ -461,11 +449,7 @@ impl PartReader {
                 &[],
                 &[],
                 &[],
-                QueryTimeRange {
-                    start_ns: i64::MIN,
-                    end_ns: i64::MAX,
-                    include_end: true,
-                },
+                QueryTimeRange::unbounded(),
                 usize::MAX,
                 true,
                 None,
@@ -510,11 +494,10 @@ impl PartReader {
         let mut selected = Vec::with_capacity(groups.len());
         for rg in groups {
             let rgu = rg as usize;
-            if !(self.part.meta.row_group_max_ts[rgu] >= time_range.start_ns
-                && (self.part.meta.row_group_min_ts[rgu] < time_range.end_ns
-                    || (time_range.include_end
-                        && self.part.meta.row_group_min_ts[rgu] == time_range.end_ns)))
-            {
+            if !time_range.overlaps(
+                self.part.meta.row_group_min_ts[rgu],
+                self.part.meta.row_group_max_ts[rgu],
+            ) {
                 continue;
             }
             if !row_group_matches_index(rg, matchers, &self.stream_index) {
@@ -540,8 +523,7 @@ impl PartReader {
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
     ) -> bool {
         !self
             .select_row_groups_with_exact_fields(
@@ -549,11 +531,7 @@ impl PartReader {
                 matchers,
                 line_filters,
                 exact_fields,
-                QueryTimeRange {
-                    start_ns,
-                    end_ns,
-                    include_end: true,
-                },
+                range,
             )
             .is_empty()
     }
@@ -712,10 +690,7 @@ impl PartReader {
                         ));
                     }
                     let ts_val = ts.value(i);
-                    if ts_val < time_range.start_ns
-                        || ts_val > time_range.end_ns
-                        || (!time_range.include_end && ts_val == time_range.end_ns)
-                    {
+                    if !time_range.contains(ts_val) {
                         continue;
                     }
                     let mut labels: Labels = BTreeMap::new();

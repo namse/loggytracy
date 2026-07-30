@@ -278,7 +278,7 @@
         let registry =
             crate::part_registry::PartRegistry::load_from_manifest(&source, &manifest).unwrap();
         let result = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .unwrap();
         assert_eq!(result[0].entries[0].line, "from object store");
     }

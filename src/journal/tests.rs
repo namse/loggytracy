@@ -138,7 +138,7 @@
             &restored,
             &test_tenant(),
         ).unwrap();
-        let results = restored.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true);
+        let results = restored.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true);
         let lines: Vec<_> = results
             .iter()
             .flat_map(|stream| stream.entries.iter().map(|entry| entry.line.as_str()))
@@ -176,7 +176,7 @@
             &test_tenant(),
         ).unwrap();
         let lines: Vec<_> = restored
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .into_iter()
             .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
             .collect();
@@ -214,7 +214,7 @@
             &test_tenant(),
         ).unwrap();
         let lines: Vec<_> = restored
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .into_iter()
             .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
             .collect();
@@ -250,7 +250,7 @@
         ).unwrap();
         assert!(
             restored
-                .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                 .is_empty()
         );
         assert_eq!(
@@ -345,7 +345,7 @@
         // still replays: retiring stale bookkeeping is not a data decision.
         assert!(!state_path.exists());
         let lines: Vec<_> = restored
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .into_iter()
             .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
             .collect();
@@ -386,7 +386,7 @@
         .unwrap();
         assert!(
             restored
-                .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 10, true)
+                .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                 .is_empty(),
             "both batches were flushed, so replay must yield nothing"
         );
@@ -500,7 +500,7 @@
         let (start, end) = replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt, &test_tenant()).unwrap();
         assert_eq!(start, 0);
         assert!(end > 0);
-        let results = mt.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = mt.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 2);
     }
@@ -629,7 +629,7 @@
 
         let mt = MemTable::new();
         replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt, &test_tenant()).unwrap();
-        let results = mt.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = mt.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
     }
@@ -669,7 +669,7 @@
 
         let lines = |tenant: &TenantId| -> Vec<String> {
             restored
-                .query(tenant, &[], &[], i64::MIN, i64::MAX, 100, true)
+                .query(tenant, &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
                 .into_iter()
                 .flat_map(|stream| stream.entries)
                 .map(|entry| entry.line)
@@ -697,7 +697,7 @@
         let restored = MemTable::new();
         replay(&wal_path, &ckpt_path, &restored, &test_tenant()).unwrap();
 
-        let entries = restored.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let entries = restored.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         assert_eq!(
             entries
                 .into_iter()

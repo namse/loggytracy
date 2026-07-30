@@ -130,7 +130,7 @@
         assert_eq!(registry.part_count(), 1);
 
         let results = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("part query");
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 3);
@@ -143,7 +143,7 @@
         )
         .unwrap();
         let results = registry
-            .query(&test_tenant(), &[m], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[m], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("part query");
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 3);
@@ -155,7 +155,7 @@
         )
         .unwrap();
         let results = registry
-            .query(&test_tenant(), &[m_miss], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[m_miss], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("part query");
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -187,7 +187,7 @@
         let registry = PartRegistry::load_from_disk(&config.data_dir.join("parts")).unwrap();
         assert_eq!(registry.part_count(), 0);
 
-        let results = memtable2.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = memtable2.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 3);
     }
@@ -220,7 +220,7 @@
             std::fs::metadata(&wal_path).unwrap().len(),
             valid_len as u64
         );
-        let results = recovered.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = recovered.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         assert_eq!(
             results
                 .iter()
@@ -269,12 +269,12 @@
 
         // disk: 3, memtable: 3
         let disk_results = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("part query");
         let disk_total: usize = disk_results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(disk_total, 3);
 
-        let mem_results = memtable2.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let mem_results = memtable2.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         let mem_total: usize = mem_results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(mem_total, 3);
     }
@@ -307,7 +307,7 @@
         // An existing substring.
         let f = crate::logql::LineFilter::Contains("database".to_string());
         let r = registry
-            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
@@ -315,7 +315,7 @@
         // A nonexistent substring — bloom pruning.
         let f = crate::logql::LineFilter::Contains("zzzzzz-no-such-substr".to_string());
         let r = registry
-            .query(&test_tenant(), &[], &[f], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[f], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
@@ -341,7 +341,7 @@
         // First restart.
         let memtable1 = MemTable::new();
         recover(&config, &memtable1).expect("recover 1");
-        let r1 = memtable1.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let r1 = memtable1.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         let t1: usize = r1.iter().map(|s| s.entries.len()).sum();
         assert_eq!(t1, 3, "first restart should restore in-flight data");
         drop(memtable1);
@@ -349,7 +349,7 @@
         // Second restart — the same data must be recovered because checkpoint did not advance.
         let memtable2 = MemTable::new();
         recover(&config, &memtable2).expect("recover 2");
-        let r2 = memtable2.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let r2 = memtable2.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         let t2: usize = r2.iter().map(|s| s.entries.len()).sum();
         assert_eq!(t2, 3, "second restart must NOT lose in-flight data");
     }
@@ -466,7 +466,7 @@
 
         recover(&config, &recovered).expect("recover acknowledged WAL");
 
-        let results = recovered.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let results = recovered.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         assert_eq!(
             results
                 .iter()
@@ -489,12 +489,12 @@
         let registry = PartRegistry::load_from_disk(&config.data_dir.join("parts")).unwrap();
 
         let memory_rows: usize = recovered
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .iter()
             .map(|stream| stream.entries.len())
             .sum();
         let part_rows: usize = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .unwrap()
             .iter()
             .map(|stream| stream.entries.len())
@@ -509,7 +509,7 @@
 
         assert_eq!(registry.part_count(), 1);
         let rows: usize = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .unwrap()
             .iter()
             .map(|stream| stream.entries.len())

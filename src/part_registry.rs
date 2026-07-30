@@ -7,7 +7,8 @@ use crate::logql::{LabelMatcher, LineFilter};
 use crate::memtable::{IndexStats, Labels, QueryResult, StreamResult};
 use crate::object_storage::Manifest;
 use crate::part::{
-    ExactFieldPredicate, ExactFieldPruning, MetadataWindow, Part, PartReader, discover_parts,
+    ExactFieldPredicate, ExactFieldPruning, MetadataWindow, Part, PartReader, QueryTimeRange,
+    discover_parts,
 };
 use crate::tenant::TenantId;
 
@@ -254,10 +255,9 @@ impl PartRegistry {
         &self,
         tenant: &TenantId,
         matchers: &[LabelMatcher],
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
     ) -> std::collections::HashSet<String> {
-        self.candidate_part_ids_with_exact_fields(tenant, matchers, &[], &[], start_ns, end_ns)
+        self.candidate_part_ids_with_exact_fields(tenant, matchers, &[], &[], range)
     }
 
     /// Plans against catalog-resident indexes only, including the optional
@@ -269,22 +269,14 @@ impl PartRegistry {
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
     ) -> std::collections::HashSet<String> {
         self.inner
             .read()
             .unwrap()
             .iter()
             .filter(|(_, reader)| {
-                reader.may_match_exact_fields(
-                    tenant,
-                    matchers,
-                    line_filters,
-                    exact_fields,
-                    start_ns,
-                    end_ns,
-                )
+                reader.may_match_exact_fields(tenant, matchers, line_filters, exact_fields, range)
             })
             .map(|(id, _)| id.clone())
             .collect()
@@ -457,14 +449,12 @@ impl PartRegistry {
         self.inner.read().unwrap().keys().cloned().collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn query(
         &self,
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
         limit: usize,
         forward: bool,
     ) -> Result<Vec<StreamResult>, String> {
@@ -473,8 +463,7 @@ impl PartRegistry {
                 tenant,
                 matchers,
                 ExactFieldPruning::new(line_filters, &[]),
-                start_ns,
-                end_ns,
+                range,
                 limit,
                 forward,
                 None,
@@ -483,20 +472,18 @@ impl PartRegistry {
             .results)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn query_with_exact_field_pruning(
         &self,
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
         limit: usize,
         forward: bool,
     ) -> Result<Vec<StreamResult>, String> {
         Ok(self
             .query_with_exact_field_pruning_and_scan_limit(
-                tenant, matchers, pruning, start_ns, end_ns, limit, forward, None, None,
+                tenant, matchers, pruning, range, limit, forward, None, None,
             )?
             .results)
     }
@@ -507,8 +494,7 @@ impl PartRegistry {
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
         limit: usize,
         forward: bool,
         scan_limit: Option<usize>,
@@ -518,8 +504,7 @@ impl PartRegistry {
             tenant,
             matchers,
             pruning,
-            start_ns,
-            end_ns,
+            range,
             limit,
             forward,
             scan_limit,
@@ -534,8 +519,7 @@ impl PartRegistry {
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
-        start_ns: i64,
-        end_ns: i64,
+        range: QueryTimeRange,
         limit: usize,
         forward: bool,
         scan_limit: Option<usize>,
@@ -560,8 +544,7 @@ impl PartRegistry {
                 let Some(segment) = r.meta().tenant_segment(tenant) else {
                     return false;
                 };
-                segment.max_ts_ns >= start_ns
-                    && segment.min_ts_ns <= end_ns
+                range.overlaps(segment.min_ts_ns, segment.max_ts_ns)
                     && (matchers.is_empty()
                         || r.meta()
                             .streams
@@ -616,8 +599,7 @@ impl PartRegistry {
                     tenant,
                     matchers,
                     pruning,
-                    start_ns,
-                    end_ns,
+                    range,
                     part_limit,
                     forward,
                     part_scan_limit,
@@ -816,7 +798,14 @@ mod tests {
         registry.register(second).unwrap();
 
         let result = registry
-            .query(&test_tenant(), &[], &[], 0, 1_000, 2, true)
+            .query(
+                &test_tenant(),
+                &[],
+                &[],
+                crate::part::QueryTimeRange::closed(0, 1_000),
+                2,
+                true,
+            )
             .unwrap();
         let entries: Vec<_> = result
             .into_iter()
@@ -858,7 +847,14 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(registry.part_count(), 1);
         let results = registry
-            .query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true)
+            .query(
+                &test_tenant(),
+                &[],
+                &[],
+                crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                100,
+                true,
+            )
             .expect("part query");
         assert_eq!(results.iter().map(|r| r.entries.len()).sum::<usize>(), 1);
         assert!(old.dir.exists());
@@ -930,7 +926,14 @@ mod tests {
 
         std::fs::write(data_path, b"corrupt").unwrap();
 
-        let result = registry.query(&test_tenant(), &[], &[], i64::MIN, i64::MAX, 100, true);
+        let result = registry.query(
+            &test_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            100,
+            true,
+        );
         assert!(result.is_err());
     }
 
@@ -945,7 +948,14 @@ mod tests {
         registry.register(parts).unwrap();
 
         let results = registry
-            .query(&test_tenant(), &[], &[], i64::MAX, i64::MAX, 100, true)
+            .query(
+                &test_tenant(),
+                &[],
+                &[],
+                crate::part::QueryTimeRange::closed(i64::MAX, i64::MAX),
+                100,
+                true,
+            )
             .expect("part query");
         assert_eq!(results.iter().map(|r| r.entries.len()).sum::<usize>(), 1);
     }
@@ -974,8 +984,7 @@ mod tests {
                     &[],
                     &[],
                     std::slice::from_ref(&predicate),
-                    i64::MIN,
-                    i64::MAX,
+                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                 )
                 .contains(&part_id)
         );
@@ -986,8 +995,7 @@ mod tests {
                     &[],
                     &[],
                     &[predicate],
-                    first_ts,
-                    first_ts,
+                    crate::part::QueryTimeRange::closed(first_ts, first_ts),
                 )
                 .is_empty(),
             "a field value in a later row group must not force restoration"

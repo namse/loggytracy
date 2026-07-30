@@ -16,15 +16,31 @@ Neither is fixed at the point of discovery, on purpose: both were found by [`com
 being built, and a ruler that edits the thing it is measuring in the same change measures nothing. That
 reason expires now — the bed is built and its baseline is published.
 
-- [ ] **`query_range` treats `end` as inclusive; Loki treats it as exclusive.**
+- [x] **`query_range` treats `end` as inclusive; Loki treats it as exclusive.**
       *Found by:* M9's row-equality check — 2 of 96 otherwise identical answers differed, always by exactly
       the row whose timestamp equals the window's `end`.
       *Confirmed:* directly against both endpoints over the same window. Both include `start`.
       *Severity:* a Loki-compatibility defect rather than a preference, because the endpoint claims Loki's
       contract. Invisible unless a boundary lands exactly on a row, which is why nothing before the
       comparison's step-aligned windows surfaced it.
-      *Owner:* `parse_time_ns` and the range clamp.
-      *Verify with:* `compare/run.sh`, matrix phase — the check that found it is the regression test.
+      *Fixed by:* `part::QueryTimeRange`, which now owns the question "does this timestamp fall in the
+      window" for the whole read path. The owner was not `parse_time_ns` — the timestamps parsed correctly;
+      the boundary was spelled out four separate times below the query layer (the memtable scan, the
+      part-level prune, the row-group prune and the row-level reject) and each one closed `end`. Log queries
+      construct `half_open`, so `[start, end)` is decided once, by the handler. The scans whose `end` is not
+      a client-supplied exclusive bound say `closed` explicitly: a metric scan's `end` is its last evaluation
+      point, tail's is "now minus delay", and a merge's is "every row".
+      *Verify with:* `compare/run.sh`, matrix phase — the check that found it is the end-to-end regression
+      test. At unit level, three tests put a row exactly on the boundary and each fails if a single site
+      drifts back: `memtable::tests::the_range_decides_whether_a_row_on_end_is_returned`,
+      `part::tests::a_row_on_end_belongs_to_a_closed_window_and_not_to_a_half_open_one` (which also asserts
+      row-group pruning agrees with the row-level test, since a tighter prune drops rows silently) and
+      `query::tests::query_range_includes_start_and_excludes_end_in_the_memtable_and_in_parts`.
+      `memtable::tests::query_includes_the_end_timestamp` had encoded the defect as the contract and is the
+      first of those three now.
+      *Not changed:* the metric step grid, which
+      [`docs/COMPARISON.md`](docs/COMPARISON.md) records as a separate still-open difference — Loki aligns
+      samples to absolute multiples of `step` and loggytracy steps from `start`.
 
 - [ ] **`| json` does not promote extracted fields into a log response's stream labels; Loki's does.**
       *Found by:* the same run, but **not** by the equality check — its digest is over `(timestamp, line)`

@@ -88,7 +88,16 @@ fn bench_query_stream_depth(c: &mut Criterion) {
             BenchmarkId::from_parameter(rows_per_stream),
             &rows_per_stream,
             |b, _| {
-                b.iter(|| memtable.query(&tenant, &[], &[], start, end, 100, false));
+                b.iter(|| {
+                    memtable.query(
+                        &tenant,
+                        &[],
+                        &[],
+                        loggytracy::part::QueryTimeRange::closed(start, end),
+                        100,
+                        false,
+                    )
+                });
             },
         );
     }
@@ -126,8 +135,7 @@ fn bench_query_cardinality(c: &mut Criterion) {
                     &tenant,
                     std::slice::from_ref(&matcher),
                     &[],
-                    start,
-                    end,
+                    loggytracy::part::QueryTimeRange::closed(start, end),
                     100,
                     false,
                 )
@@ -158,7 +166,16 @@ fn bench_query_line_filter(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(2))
         .throughput(Throughput::Elements(corpus.entry_count() as u64));
     group.bench_function("contains", |b| {
-        b.iter(|| memtable.query(&tenant, &[], &filters, start, end, 100, false));
+        b.iter(|| {
+            memtable.query(
+                &tenant,
+                &[],
+                &filters,
+                loggytracy::part::QueryTimeRange::closed(start, end),
+                100,
+                false,
+            )
+        });
     });
     group.finish();
 }

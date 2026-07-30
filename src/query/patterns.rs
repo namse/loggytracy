@@ -59,8 +59,11 @@ pub async fn patterns(
         state.clone(),
         tenant,
         query,
-        guard.window.start_ns,
-        guard.window.end_ns,
+        // The same window a `query_range` over the same picker range would
+        // scan: this samples the rows in the window, so a second row window for
+        // one Grafana time range is exactly the inconsistency that hid the
+        // inclusive-`end` defect.
+        crate::part::QueryTimeRange::half_open(guard.window.start_ns, guard.window.end_ns),
         PATTERN_SAMPLE,
         false,
         Some(PATTERN_SAMPLE),

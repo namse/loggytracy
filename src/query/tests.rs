@@ -97,6 +97,179 @@
         assert_eq!(json["data"]["stats"]["summary"]["totalLinesProcessed"], 1);
     }
 
+    /// The window boundary at every level at once: a row on `start` and a row
+    /// on `end` in the memtable, the same pair in a part, and one `query_range`
+    /// over exactly that window.
+    ///
+    /// This is the test that was missing. The memtable scan, the part-level
+    /// prune, the row-group prune and the row-level reject each spelled the
+    /// comparison out for itself, so `end` could be — and was — inclusive on the
+    /// log path while Loki's `query_range` is `[start, end)`; nothing caught it
+    /// because no test put a row exactly on a boundary. Asserting the two
+    /// sources together is what makes a single site drifting back a failure.
+    #[tokio::test]
+    async fn query_range_includes_start_and_excludes_end_in_the_memtable_and_in_parts() {
+        const START_NS: i64 = 1_700_000_000_000_000_000;
+        const END_NS: i64 = 1_700_000_001_000_000_000;
+
+        let data_dir = temp_dir();
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            labels.clone(),
+            vec![
+                LogEntry {
+                    timestamp_ns: START_NS,
+                    line: "memtable on start".to_string(),
+                    structured_metadata: Vec::new(),
+                },
+                LogEntry {
+                    timestamp_ns: END_NS,
+                    line: "memtable on end".to_string(),
+                    structured_metadata: Vec::new(),
+                },
+            ],
+        );
+        let parts = Arc::new(PartRegistry::new());
+        parts
+            .register(
+                part::flush_rows(
+                    [(START_NS, "part on start"), (END_NS, "part on end")]
+                        .into_iter()
+                        .map(|(timestamp_ns, line)| Row {
+                            tenant: test_tenant(),
+                            timestamp_ns,
+                            labels: labels.clone(),
+                            line: line.to_string(),
+                            structured_metadata: Vec::new(),
+                        })
+                        .collect(),
+                    &data_dir.join("parts"),
+                    // One row per row group, so the row-group prune has to make
+                    // the same call the row-level test does.
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let state = test_state(&data_dir, memtable, parts, None);
+
+        let response = query_range(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Query(QueryRangeParams {
+                query: r#"{app="api"}"#.to_string(),
+                start: Some(START_NS.to_string()),
+                end: Some(END_NS.to_string()),
+                limit: Some(100),
+                direction: Some("forward".to_string()),
+                step: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let mut lines: Vec<String> = response
+            .data
+            .result
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|stream| stream["values"].as_array().unwrap().clone())
+            .map(|value| value[1].as_str().unwrap().to_string())
+            .collect();
+        lines.sort();
+        assert_eq!(lines, vec!["memtable on start", "part on start"]);
+
+        // The same window one nanosecond wider does return the rows on `end`,
+        // so what is being asserted above is the boundary and not a lost row.
+        let response = query_range(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Query(QueryRangeParams {
+                query: r#"{app="api"}"#.to_string(),
+                start: Some(START_NS.to_string()),
+                end: Some((END_NS + 1).to_string()),
+                limit: Some(100),
+                direction: Some("forward".to_string()),
+                step: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let lines: usize = response
+            .data
+            .result
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stream| stream["values"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(lines, 4);
+
+        // The unified scan decides nothing itself: it answers whatever range it
+        // is handed, which is what lets one caller own the contract.
+        let parsed = logql::parse(r#"{app="api"}"#).unwrap();
+        let rows = |range| {
+            unified_query(&state, &test_tenant(), &parsed, range, 100, true)
+                .unwrap()
+                .iter()
+                .map(|stream| stream.entries.len())
+                .sum::<usize>()
+        };
+        assert_eq!(rows(part::QueryTimeRange::half_open(START_NS, END_NS)), 2);
+        assert_eq!(rows(part::QueryTimeRange::closed(START_NS, END_NS)), 4);
+        assert_eq!(rows(part::QueryTimeRange::half_open(END_NS, END_NS)), 0);
+    }
+
+    /// A metric scan's `end` is its last evaluation point, not a bound the
+    /// client asked to exclude, and the range evaluator's own window closes on
+    /// it. So the row that lands exactly there is still counted — the log
+    /// window's exclusive `end` must not reach this path.
+    #[tokio::test]
+    async fn a_metric_query_still_counts_the_row_on_its_last_evaluation_point() {
+        const AT_NS: i64 = 1_700_000_001_000_000_000;
+
+        let data_dir = temp_dir();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            [("app".to_string(), "api".to_string())]
+                .into_iter()
+                .collect(),
+            vec![LogEntry {
+                timestamp_ns: AT_NS,
+                line: "on the last evaluation point".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+        let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+
+        let response = query_range(
+            State(state),
+            crate::tenant::test_tenant_headers(),
+            Query(QueryRangeParams {
+                query: r#"count_over_time({app="api"}[1s])"#.to_string(),
+                start: Some((AT_NS - 1_000_000_000).to_string()),
+                end: Some(AT_NS.to_string()),
+                limit: None,
+                direction: None,
+                step: Some("1".to_string()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let samples = response.data.result[0]["values"].as_array().unwrap();
+        let last = samples.last().unwrap();
+        assert_eq!(last[0], AT_NS / 1_000_000_000);
+        assert_eq!(last[1], "1");
+    }
+
     #[tokio::test]
     async fn omitted_metric_start_scans_the_first_lookback_window() {
         let data_dir = temp_dir();
@@ -159,9 +332,7 @@
             run_unified_query_with_stats(
                 state.clone(),
                 test_tenant(),
-                parsed.clone(),
-                0,
-                2,
+                parsed.clone(), crate::part::QueryTimeRange::closed(0, 2),
                 1,
                 true,
                 None,
@@ -174,9 +345,7 @@
         let error = match unified_query_with_stats_cancellable(
             &state,
             &test_tenant(),
-            &parsed,
-            0,
-            2,
+            &parsed, crate::part::QueryTimeRange::closed(0, 2),
             1,
             true,
             Some(2),
@@ -525,7 +694,7 @@
             ))),
         );
         let parsed = logql::parse(r#"{app="remote"}"#).unwrap();
-        let result = run_unified_query(state, test_tenant(), parsed, i64::MIN, i64::MAX, 10, true)
+        let result = run_unified_query(state, test_tenant(), parsed, crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .await
             .unwrap();
 
@@ -599,12 +768,12 @@
             ))),
         );
         let parsed = logql::parse(r#"{app="remote"}"#).unwrap();
-        let guard = pin_query_parts_with_gap_hook(&state, &test_tenant(), &parsed, i64::MIN, i64::MAX, || {
+        let guard = pin_query_parts_with_gap_hook(&state, &test_tenant(), &parsed, crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), || {
             parts.reload_from_manifest(&parts_root, &manifest)
         })
         .await
         .unwrap();
-        let result = unified_query(&state, &test_tenant(), &parsed, i64::MIN, i64::MAX, 10, true).unwrap();
+        let result = unified_query(&state, &test_tenant(), &parsed, crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true).unwrap();
         drop(guard);
 
         assert_eq!(result.len(), 1);
@@ -656,7 +825,7 @@
         )
         .unwrap();
 
-        let result = run_unified_query(state.clone(), test_tenant(), parsed, 0, 30, 10, true)
+        let result = run_unified_query(state.clone(), test_tenant(), parsed, crate::part::QueryTimeRange::closed(0, 30), 10, true)
             .await
             .unwrap();
         let timestamps: Vec<_> = result[0]
@@ -668,7 +837,7 @@
 
         for query in [r#"{} | json | json="ok""#, r#"{} | logfmt="value""#] {
             let result =
-                run_unified_query(state.clone(), test_tenant(), logql::parse(query).unwrap(), 0, 30, 10, true)
+                run_unified_query(state.clone(), test_tenant(), logql::parse(query).unwrap(), crate::part::QueryTimeRange::closed(0, 30), 10, true)
                     .await
                     .unwrap();
             let timestamps: Vec<_> = result[0]
@@ -720,7 +889,7 @@
         let state = test_state(&data_dir, memtable, parts, None);
         let parsed = logql::parse(r#"{} | json | foo_extracted_2="z""#).unwrap();
 
-        let result = run_unified_query(state, test_tenant(), parsed, 0, 30, 10, true)
+        let result = run_unified_query(state, test_tenant(), parsed, crate::part::QueryTimeRange::closed(0, 30), 10, true)
             .await
             .unwrap();
         let timestamps: Vec<_> = result[0]
@@ -1109,7 +1278,7 @@
         );
         let parsed = logql::parse(r#"{} | json | foo_extracted_2="z""#).unwrap();
 
-        let result = run_unified_query(state, test_tenant(), parsed, 0, 20, 10, true)
+        let result = run_unified_query(state, test_tenant(), parsed, crate::part::QueryTimeRange::closed(0, 20), 10, true)
             .await
             .unwrap();
         assert_eq!(result[0].entries[0].line, r#"{"foo":"z"}"#);

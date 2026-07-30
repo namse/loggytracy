@@ -322,8 +322,9 @@ pub async fn detected_fields(
         state.clone(),
         tenant,
         query,
-        guard.window.start_ns,
-        guard.window.end_ns,
+        // As `patterns`: a sample of the rows in the log window, so it uses the
+        // log window's boundary.
+        crate::part::QueryTimeRange::half_open(guard.window.start_ns, guard.window.end_ns),
         sample_limit,
         false,
         Some(sample_limit),

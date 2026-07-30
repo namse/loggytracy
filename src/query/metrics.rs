@@ -107,8 +107,11 @@ async fn run_metric_query_with_stats_cancellable(
         state.clone(),
         tenant,
         query,
-        scan_start,
-        end,
+        // Closed, unlike a log query's window: `end` here is the last
+        // evaluation point, and the range evaluator's window closes on it, so
+        // dropping the row at exactly that instant would change every final
+        // sample rather than trim one row off a log response.
+        part::QueryTimeRange::closed(scan_start, end),
         max_metric_rows.saturating_add(1),
         true,
         Some(max_metric_rows),
