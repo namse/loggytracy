@@ -158,9 +158,22 @@ fn estimated_part_bytes(reader: &PartReader) -> u64 {
     reader.meta().materialized_bytes
 }
 
+/// Bytes of one part's rows a stream holds while paging.
+///
+/// This is now the only thing that bounds a rewrite's liveness. It used to be
+/// `merge_max_memory_bytes` against the whole group, which is what
+/// `docs/MEMORY_ATTRIBUTION.md` measured at 829 MiB; a page is per stream and
+/// independent of how large the parts are.
+const STREAM_PAGE_BYTES: u64 = 8 * 1024 * 1024;
+
 #[cfg(test)]
 fn read_all_rows(readers: &[Arc<PartReader>]) -> Result<Vec<part::Row>, String> {
-    read_all_rows_with_limit(readers, u64::MAX)
+    let mut merged = part::MergedRows::new(readers, STREAM_PAGE_BYTES);
+    let mut rows = Vec::new();
+    while let Some(row) = merged.next_row()? {
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// What one group's rewrite produced.
@@ -186,149 +199,69 @@ pub fn rewrite_group(
     deletes: &crate::delete_requests::DeleteMasks,
     parts_root: &Path,
     row_group_size: usize,
-    max_memory_bytes: u64,
     old_dirs: &[PathBuf],
 ) -> Result<GroupRewrite, String> {
-    let mut rewrite = GroupRewrite {
-        new_parts: Vec::new(),
-        dropped_rows: 0,
-        kept_rows: 0,
-    };
-    let result = read_in_batches(readers, max_memory_bytes, &mut |mut rows| {
-        let before = rows.len();
-        if let Some(cutoffs) = cutoffs {
-            rows.retain(|row| !cutoffs.is_expired(&row.tenant, row.timestamp_ns));
+    if readers.is_empty() {
+        return Ok(GroupRewrite {
+            new_parts: Vec::new(),
+            dropped_rows: 0,
+            kept_rows: 0,
+        });
+    }
+    // Both come from the inputs' `meta.json` rather than from their rows,
+    // because the output schema names a column per stream label and has to
+    // exist before the first row group is written. Reading them here is what
+    // makes streaming the rewrite possible at all.
+    let partition = readers[0].meta().partition.clone();
+    if let Some(other) = readers
+        .iter()
+        .find(|reader| reader.meta().partition != partition)
+    {
+        // Selection groups within one partition. If that ever stops being true
+        // the rows would be filed under the wrong day, which no read path could
+        // detect, so it is checked rather than assumed.
+        return Err(format!(
+            "merge group spans partitions {} and {}",
+            partition,
+            other.meta().partition
+        ));
+    }
+    let mut stream_labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for reader in readers {
+        stream_labels.extend(reader.meta().stream_labels.iter().cloned());
+    }
+
+    let mut merged = part::MergedRows::new(readers, STREAM_PAGE_BYTES);
+    let mut keep = |row: &part::Row| {
+        if let Some(cutoffs) = cutoffs
+            && cutoffs.is_expired(&row.tenant, row.timestamp_ns)
+        {
+            return false;
         }
         // The same predicate the scan hides with, applied where the bytes
         // actually leave. A part that no rewrite ever touches keeps them, which
         // is why the request stays `received` until one has.
-        if !deletes.is_empty() {
-            rows.retain(|row| {
-                !deletes.hides_row(&row.tenant, &row.labels, row.timestamp_ns, &row.line)
-            });
+        if !deletes.is_empty()
+            && deletes.hides_row(&row.tenant, &row.labels, row.timestamp_ns, &row.line)
+        {
+            return false;
         }
-        rewrite.dropped_rows += before - rows.len();
-        if rows.is_empty() {
-            return Ok(());
-        }
-        rewrite.kept_rows += rows.len();
-        let written =
-            part::flush_rows_with_merge_tombstone(rows, parts_root, row_group_size, old_dirs)
-                .map_err(|error| error.to_string())?;
-        rewrite.new_parts.extend(written);
-        Ok(())
-    });
-    if let Err(error) = result {
-        // A later batch failed after earlier ones were already on disk. They
-        // are unreferenced by any manifest, so removing them here keeps the
-        // failure from leaving parts that only tombstone recovery would clean.
-        let written: Vec<PathBuf> = rewrite.new_parts.iter().map(|new| new.dir.clone()).collect();
-        if let Err(cleanup_error) = part::remove_part_dirs(&written) {
-            tracing::warn!(%cleanup_error, "failed to remove partial merge output");
-        }
-        return Err(error);
-    }
-    Ok(rewrite)
-}
-
-/// Hand the group's rows to `sink` in pieces that each fit the budget.
-///
-/// A group of several parts halves until its pieces fit; a single part that
-/// still does not fit is read a row-group window at a time. Without this a
-/// part larger than `merge_max_memory_bytes` could never be rewritten, and for
-/// a tenant at zero retention that means its rows are never actually deleted —
-/// only hidden by the query clamp, which is not what deletion means.
-fn read_in_batches(
-    readers: &[Arc<PartReader>],
-    max_memory_bytes: u64,
-    sink: &mut impl FnMut(Vec<part::Row>) -> Result<(), String>,
-) -> Result<(), String> {
-    let error = match read_all_rows_with_limit(readers, max_memory_bytes) {
-        Ok(rows) => return sink(rows),
-        Err(error) => error,
+        true
     };
-    if readers.len() > 1 {
-        let (left, right) = readers.split_at(readers.len() / 2);
-        read_in_batches(left, max_memory_bytes, sink)?;
-        return read_in_batches(right, max_memory_bytes, sink);
-    }
-    let reader = &readers[0];
-    if reader.row_group_count() <= 1 {
-        // One row group is the part's indivisible unit. `row_group_size` caps
-        // how many rows it holds, so reaching here means a single row group
-        // exceeds the whole merge budget — a configuration problem the split
-        // cannot solve, and the error says so rather than looping.
-        return Err(error);
-    }
-    for window in row_group_windows(reader, max_memory_bytes) {
-        sink(reader.read_rows_in_row_groups(window, Some(max_memory_bytes))?)?;
-    }
-    Ok(())
+    let (new_parts, dropped_rows, kept_rows) = part::flush_row_stream_with_merge_tombstone(
+        &mut merged,
+        &mut keep,
+        parts_root,
+        &partition,
+        stream_labels.into_iter().collect(),
+        row_group_size,
+        old_dirs,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(GroupRewrite {
+        new_parts,
+        dropped_rows: dropped_rows as usize,
+        kept_rows: kept_rows as usize,
+    })
 }
 
-/// Row-group windows sized so each one is expected to fit the memory budget.
-///
-/// Sized from the part's own average row width rather than a fixed count: a
-/// part of wide rows needs smaller windows than one of narrow rows for the same
-/// budget. Always at least one row group, so the walk terminates.
-fn row_group_windows(reader: &PartReader, max_memory_bytes: u64) -> Vec<std::ops::Range<u32>> {
-    let row_group_count = reader.row_group_count();
-    let meta = reader.meta();
-    let rows_per_group = (meta.row_count / row_group_count.max(1) as u64).max(1);
-    let bytes_per_row = meta
-        .materialized_bytes
-        .checked_div(meta.row_count.max(1))
-        .unwrap_or(0)
-        .max(1);
-    let bytes_per_group = rows_per_group.saturating_mul(bytes_per_row).max(1);
-    let groups_per_window = (max_memory_bytes / bytes_per_group).clamp(1, row_group_count as u64);
-
-    let mut windows = Vec::new();
-    let mut start = 0u32;
-    while start < row_group_count {
-        let end = start
-            .saturating_add(groups_per_window as u32)
-            .min(row_group_count);
-        windows.push(start..end);
-        start = end;
-    }
-    windows
-}
-
-/// Bytes of one part's rows a stream may hold while paging.
-///
-/// A page is what bounds a reader's own liveness; the group's accumulated rows
-/// are bounded separately by `max_memory_bytes`. Small enough that k streams of
-/// it are noise against the budget, large enough that a page is many row groups
-/// rather than a syscall each.
-const STREAM_PAGE_BYTES: u64 = 8 * 1024 * 1024;
-
-fn read_all_rows_with_limit(
-    readers: &[Arc<PartReader>],
-    max_memory_bytes: u64,
-) -> Result<Vec<part::Row>, String> {
-    let mut rows: Vec<part::Row> = Vec::new();
-    let mut estimated_memory = 0u64;
-    // A k-way merge rather than reader-after-reader. Each part is already
-    // sorted on the key `sort_rows` uses, so this arrives sorted and
-    // deduplicated, and no reader's rows are ever held whole: the peak is the
-    // accumulated group plus one page per stream, not the group plus one part.
-    //
-    // The accumulated `Vec` is the remaining term and is what
-    // `docs/MEMORY_ATTRIBUTION.md` measured at 829 MiB; removing it needs the
-    // writer to consume this stream, which is the next step.
-    let mut merged = part::MergedRows::new(readers, STREAM_PAGE_BYTES);
-    while let Some(row) = merged.next_row()? {
-        let row_memory = row.materialized_bytes();
-        estimated_memory = estimated_memory
-            .checked_add(row_memory)
-            .ok_or_else(|| "merge memory accounting overflowed".to_string())?;
-        if estimated_memory > max_memory_bytes {
-            return Err(format!(
-                "merge exceeds the maximum of {max_memory_bytes} materialized bytes"
-            ));
-        }
-        rows.push(row);
-    }
-    Ok(rows)
-}

@@ -67,6 +67,100 @@ pub fn flush_rows_with_merge_tombstone(
     flush_rows_internal(rows, parts_root, row_group_size, Some(old_dirs))
 }
 
+/// Write one part from a sorted, deduplicated row stream.
+///
+/// The merge counterpart of [`flush_rows_with_merge_tombstone`], and the reason
+/// [`StreamingPartWriter`] exists: the batch form holds the whole group as a
+/// `Vec<Row>` first, which `docs/MEMORY_ATTRIBUTION.md` measured at 829 of 847
+/// live megabytes at the settle peak.
+///
+/// `stream_labels` and `partition` come from the inputs' `meta.json`, not from
+/// the rows, because the schema names a column per stream label and has to
+/// exist before the first row group. That makes the label set a **superset**:
+/// a label whose only rows were dropped by retention or a delete request still
+/// gets a column, all null. It costs a compressed empty column rather than a
+/// second pass over the rows to find out, and no read path can see the
+/// difference — an absent value prunes exactly as a missing column does.
+///
+/// A stream that turns out to be empty leaves no part and no tombstone, the
+/// same as flushing an empty `Vec`.
+pub fn flush_row_stream_with_merge_tombstone(
+    rows: &mut MergedRows,
+    keep: &mut dyn FnMut(&Row) -> bool,
+    parts_root: &Path,
+    partition: &str,
+    stream_labels: Vec<String>,
+    row_group_size: usize,
+    old_dirs: &[PathBuf],
+) -> io::Result<(Vec<Part>, u64, u64)> {
+    let tmp_root = parts_root.join(".tmp");
+    fs::create_dir_all(&tmp_root)?;
+    let staging = tmp_root.join(format!("merge-{}", uuid::Uuid::new_v4()));
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    fs::create_dir_all(&staging)?;
+
+    let mut writer = StreamingPartWriter::create(&staging, stream_labels, row_group_size)?;
+    let mut dropped = 0u64;
+    let mut kept = 0u64;
+    loop {
+        let row = match rows.next_row() {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(io::Error::other(error));
+            }
+        };
+        if !keep(&row) {
+            dropped += 1;
+            continue;
+        }
+        kept += 1;
+        if let Err(error) = writer.push(row) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    }
+    if writer.is_empty() {
+        let _ = fs::remove_dir_all(&staging);
+        return Ok((Vec::new(), dropped, kept));
+    }
+
+    let part_id = gen_part_id(writer.min_ts_ns());
+    if let Err(error) = writer.finish(&staging, &part_id, partition) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if let Err(error) = write_merge_tombstone(&staging, parts_root, old_dirs) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
+    let final_dir = parts_root.join(partition).join(&part_id);
+    if let Some(parent) = final_dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if final_dir.exists() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("part dir already exists: {}", final_dir.display()),
+        ));
+    }
+    fs::rename(&staging, &final_dir)?;
+    if let Some(parent) = final_dir.parent() {
+        fsync_dir(parent)?;
+    }
+    fsync_dir(parts_root)?;
+    let part = load_part(&final_dir).map_err(|error| {
+        rollback_committed(std::slice::from_ref(&final_dir));
+        io::Error::other(error)
+    })?;
+    Ok((vec![part], dropped, kept))
+}
+
 fn flush_rows_internal(
     rows: Vec<Row>,
     parts_root: &Path,

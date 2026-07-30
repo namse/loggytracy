@@ -923,19 +923,22 @@
         );
     }
 
-    /// A part that does not fit in `merge_max_memory_bytes` fails to read on
-    /// every tick. When retention is the only reason it was selected, that has
-    /// to stay a counted skip: reporting it would hold `merge_healthy` low
-    /// forever — and `/ready` at 503 — over reclamation that was never
-    /// required for correctness. Expired rows are already invisible to queries.
+    /// A rewrite streams, so a part no longer has to fit a memory budget to be
+    /// rewritten — and this is the guarantee that depends on it. Zero-retention
+    /// and expiry only actually *delete* when a rewrite happens; before
+    /// streaming, a group larger than `merge_max_memory_bytes` was counted as a
+    /// skip and its bytes stayed on disk forever (`N1(a)` in
+    /// `docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md`). The budget is set
+    /// below one row here, which used to make the read fail on every tick.
     #[tokio::test]
-    async fn an_unreadable_retention_only_group_is_skipped_instead_of_failing_the_tick() {
+    async fn a_retention_group_is_rewritten_however_little_memory_the_budget_names() {
         let dir = tmp_dir("retention-group-too-large");
         let config = Config {
             data_dir: dir.clone(),
             merge_min_part_count: 4,
             retention_period: None,
-            // Below one row, so reading the part always exceeds the budget.
+            // Below one row. Reading the group used to exceed this before the
+            // first row was produced; a stream never accumulates against it.
             merge_max_memory_bytes: 1,
             ..Config::default()
         };
@@ -966,29 +969,25 @@
             .await
             .unwrap();
 
+        // Rewritten, not skipped: one part still, but a *new* one, with
+        // alpha's expired rows gone and beta's kept.
         assert_eq!(registry.part_count(), 1);
-        assert_eq!(registry.snapshot()[0].meta().id, parts[0].meta.id);
+        assert_ne!(
+            registry.snapshot()[0].meta().id,
+            parts[0].meta.id,
+            "the group was skipped rather than rewritten"
+        );
         assert_eq!(
             metrics.retention_rewrite_skipped.load(Ordering::Relaxed),
-            1
+            0,
+            "nothing should be skipped for want of memory any more"
         );
-
-        // An ordinary merge group is a different matter: it is work that has
-        // to happen, so a read failure there still fails the tick.
-        for timestamp_ns in [2_000i64, 2_001, 2_002] {
-            let more = part::flush_rows(
-                vec![tenant_row("beta", timestamp_ns)],
-                &parts_root,
-                config.row_group_size,
-            )
-            .unwrap();
-            registry.register(more).unwrap();
-        }
-        assert!(
-            merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &RuntimeMetrics::new())
-                .await
-                .is_err()
+        assert_eq!(
+            metrics.retention_expired_rows_dropped.load(Ordering::Relaxed),
+            2,
+            "alpha's two expired rows must actually be gone"
         );
+        assert_eq!(registry.snapshot()[0].meta().row_count, 1);
     }
 
     /// Retention retiring a part while merge is publishing is not a failure of

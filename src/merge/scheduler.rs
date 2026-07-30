@@ -195,7 +195,6 @@ async fn merge_once(
                 let cutoffs = cutoffs.clone();
                 let deletes = deletes.clone();
                 let row_group_size = config.row_group_size;
-                let max_memory_bytes = config.merge_max_memory_bytes;
                 move || {
                     let _arena = crate::memprof::enter(crate::memprof::Arena::Merge);
                     rewrite_group(
@@ -204,7 +203,6 @@ async fn merge_once(
                         &deletes,
                         &parts_root,
                         row_group_size,
-                        max_memory_bytes,
                         &old_dirs,
                     )
                 }
@@ -218,11 +216,11 @@ async fn merge_once(
                 Err(error) => {
                     tracing::warn!(%error, partition = %partition, "merge rewrite failed, skipping group");
                     if retention_only {
-                        // Splitting has already been tried, so the inputs do
-                        // not fit at any granularity this code can produce.
-                        // Counted rather than reported: pinning merge_healthy
-                        // low would hide every other merge failure behind one
-                        // group that needs a configuration change.
+                        // A rewrite streams now, so it cannot fail for want
+                        // of memory at any part size; reaching here means I/O
+                        // or a corrupt input. Counted rather than reported:
+                        // pinning merge_healthy low would hide every other
+                        // merge failure behind one group.
                         metrics
                             .retention_rewrite_skipped
                             .fetch_add(1, Ordering::Relaxed);
