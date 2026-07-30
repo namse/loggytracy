@@ -402,6 +402,7 @@ include!("indexes.rs");
 include!("metadata.rs");
 include!("tombstone.rs");
 include!("reader.rs");
+include!("row_stream.rs");
 
 #[cfg(test)]
 mod tests {

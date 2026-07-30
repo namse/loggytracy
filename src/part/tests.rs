@@ -102,6 +102,96 @@
         ]
     }
 
+    fn row_at(ts: i64, line: &str) -> Row {
+        let mut labels: Labels = BTreeMap::new();
+        labels.insert("app".to_string(), "stream".to_string());
+        Row {
+            tenant: test_tenant(),
+            timestamp_ns: ts,
+            labels: std::sync::Arc::new(labels),
+            line: line.to_string(),
+            structured_metadata: vec![],
+        }
+    }
+
+    fn reader_for(rows: Vec<Row>, tmp: &std::path::Path, row_group_size: usize) -> Arc<PartReader> {
+        let part = flush_rows(rows, tmp, row_group_size)
+            .expect("flush")
+            .remove(0);
+        Arc::new(PartReader::open(part).expect("open"))
+    }
+
+    fn drain(merged: &mut MergedRows) -> Vec<Row> {
+        let mut out = Vec::new();
+        while let Some(row) = merged.next_row().expect("stream") {
+            out.push(row);
+        }
+        out
+    }
+
+    #[test]
+    fn a_paged_stream_yields_every_row_of_a_part_in_order() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let rows: Vec<Row> = (0..50).map(|i| row_at(base + i, &format!("line {i}"))).collect();
+        // Row groups of two, and a page budget of one byte, so the stream is
+        // forced to page rather than reading the part in one go: what is being
+        // tested is that paging does not lose or reorder a row.
+        let reader = reader_for(rows.clone(), &tmp, 2);
+        assert!(reader.row_group_count() > 1, "the part must actually be paged");
+
+        let mut merged = MergedRows::new(&[reader], 1);
+        let read = drain(&mut merged);
+        assert_eq!(read.len(), rows.len());
+        for (got, want) in read.iter().zip(&rows) {
+            assert_eq!(got.timestamp_ns, want.timestamp_ns);
+            assert_eq!(got.line, want.line);
+        }
+    }
+
+    #[test]
+    fn merging_parts_yields_one_sorted_run() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        // Interleaved on purpose: each part is sorted, the two together are not,
+        // and the merge has to produce the order a sort would have.
+        let evens: Vec<Row> = (0..20).map(|i| row_at(base + i * 2, &format!("even {i}"))).collect();
+        let odds: Vec<Row> = (0..20).map(|i| row_at(base + i * 2 + 1, &format!("odd {i}"))).collect();
+        let a = reader_for(evens, &tmp, 3);
+        let b = reader_for(odds, &tmp, 3);
+
+        let read = drain(&mut MergedRows::new(&[a, b], 1));
+        assert_eq!(read.len(), 40);
+        let timestamps: Vec<i64> = read.iter().map(|row| row.timestamp_ns).collect();
+        let mut sorted = timestamps.clone();
+        sorted.sort_unstable();
+        assert_eq!(timestamps, sorted, "a merge must arrive sorted, not merely complete");
+    }
+
+    #[test]
+    fn a_row_in_two_parts_is_yielded_once() {
+        // At-least-once recovery is what puts the same record in two parts, and
+        // the first merge that sees both is where the pair is supposed to
+        // collapse. `sort_rows` did this; a stream that skipped it would
+        // resurrect every duplicate a crash introduced.
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let shared: Vec<Row> = (0..5).map(|i| row_at(base + i, &format!("dup {i}"))).collect();
+        let a = reader_for(shared.clone(), &tmp, 2);
+        let b = reader_for(shared.clone(), &tmp, 2);
+
+        let read = drain(&mut MergedRows::new(&[a, b], 1));
+        assert_eq!(read.len(), shared.len(), "duplicates survived the merge");
+
+        // A row differing only in its line is not a duplicate: the key is the
+        // whole row, not its timestamp.
+        let tmp2 = tempfile_dir();
+        let c = reader_for(shared.clone(), &tmp2, 2);
+        let different: Vec<Row> = (0..5).map(|i| row_at(base + i, &format!("other {i}"))).collect();
+        let d = reader_for(different, &tmp2, 2);
+        assert_eq!(drain(&mut MergedRows::new(&[c, d], 1)).len(), 10);
+    }
+
     #[test]
     fn flush_then_query_roundtrip() {
         let tmp = tempfile_dir();

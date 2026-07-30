@@ -295,29 +295,40 @@ fn row_group_windows(reader: &PartReader, max_memory_bytes: u64) -> Vec<std::ops
     windows
 }
 
+/// Bytes of one part's rows a stream may hold while paging.
+///
+/// A page is what bounds a reader's own liveness; the group's accumulated rows
+/// are bounded separately by `max_memory_bytes`. Small enough that k streams of
+/// it are noise against the budget, large enough that a page is many row groups
+/// rather than a syscall each.
+const STREAM_PAGE_BYTES: u64 = 8 * 1024 * 1024;
+
 fn read_all_rows_with_limit(
     readers: &[Arc<PartReader>],
     max_memory_bytes: u64,
 ) -> Result<Vec<part::Row>, String> {
     let mut rows: Vec<part::Row> = Vec::new();
     let mut estimated_memory = 0u64;
-    for reader in readers {
-        let remaining_memory = max_memory_bytes.saturating_sub(estimated_memory);
-        // Merge rewrites the whole shared part, so it reads every tenant's
-        // rows. `read_all_rows` walks the tenant index rather than bypassing
-        // it, so each row still arrives tagged with its own tenant.
-        for row in reader.read_all_rows(Some(remaining_memory))? {
-            let row_memory = row.materialized_bytes();
-            estimated_memory = estimated_memory
-                .checked_add(row_memory)
-                .ok_or_else(|| "merge memory accounting overflowed".to_string())?;
-            if estimated_memory > max_memory_bytes {
-                return Err(format!(
-                    "merge exceeds the maximum of {max_memory_bytes} materialized bytes"
-                ));
-            }
-            rows.push(row);
+    // A k-way merge rather than reader-after-reader. Each part is already
+    // sorted on the key `sort_rows` uses, so this arrives sorted and
+    // deduplicated, and no reader's rows are ever held whole: the peak is the
+    // accumulated group plus one page per stream, not the group plus one part.
+    //
+    // The accumulated `Vec` is the remaining term and is what
+    // `docs/MEMORY_ATTRIBUTION.md` measured at 829 MiB; removing it needs the
+    // writer to consume this stream, which is the next step.
+    let mut merged = part::MergedRows::new(readers, STREAM_PAGE_BYTES);
+    while let Some(row) = merged.next_row()? {
+        let row_memory = row.materialized_bytes();
+        estimated_memory = estimated_memory
+            .checked_add(row_memory)
+            .ok_or_else(|| "merge memory accounting overflowed".to_string())?;
+        if estimated_memory > max_memory_bytes {
+            return Err(format!(
+                "merge exceeds the maximum of {max_memory_bytes} materialized bytes"
+            ));
         }
+        rows.push(row);
     }
     Ok(rows)
 }
