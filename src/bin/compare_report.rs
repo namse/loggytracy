@@ -1097,16 +1097,21 @@ query.",
         },
         match (claim_cold, claim_warm) {
             (Some(false), Some(false)) => {
-                r#"That is a valid and valuable result and it is not tuned around. It is
-also the result M8's own benchmarks predicted: loggytracy has no projection
-pushdown, parses every line twice when writing JSON parts, and sets its scan
-limit to `usize::MAX` for exactly this shape (`query/execution.rs:102-106`),
-because a limit cannot be applied before the pipeline runs. So
-`| json | field=` materializes every matching row in the window and then throws
-almost all of it away. `docs/VISION.md` invariant III names that as the worst
-violation of the three and the fix as a streaming executor with a bounded
-top-K heap. This document is the measurement that says how much it is worth,
-and nothing about the engine was changed to make the number smaller."#
+                r#"That is a valid and valuable result and it is not tuned around. No
+loggytracy setting was changed from its default to produce it.
+
+The two things `docs/VISION.md` invariant III named as the cause of the first
+loss are now built, and the per-limit table above shows they work: the scan limit
+reaches the scan, so at a limit of 100 this engine reads a fraction of what it
+reads at 20000. It is still not enough. What remains is that loggytracy reads
+several times the lines Loki does for the same answer, and the row groups it
+decodes carry every label column and the structured-metadata blob whether the
+query names them or not. That is projection and predicate pushdown, which is
+unbuilt, and it is where the residue lives.
+
+The `rate` row is the clearest statement of the limit: its lines-read figure is
+identical at both query limits, because a metric query has no `limit` to push
+down at all. Nothing in the executor can help it; only reading less per row can."#
             }
             _ => {
                 r#"The numbers above are the whole argument; the sections below say what is

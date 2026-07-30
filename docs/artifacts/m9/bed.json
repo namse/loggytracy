@@ -1,23 +1,25 @@
 {
-  "generated_at": "2026-07-29T07:24:36Z",
-  "revision": "143c28e",
+  "generated_at": "2026-07-30T08:14:36Z",
+  "revision": "35def6c",
   "branch": "master",
   "machine": "Linux 6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
   "docker": "29.1.3",
   "compose": "5.0.1",
   "loki_image": "grafana/loki:3.3.2",
-  "memory_limit": "8g",
-  "memory_limit_attempts": [{"limit":"2g","loggytracy_survived":false,"loggytracy_oom_killed":true,"loki_survived":true,"loki_oom_killed":false},{"limit":"8g","loggytracy_survived":true,"loggytracy_oom_killed":false,"loki_survived":true,"loki_oom_killed":false}],
-  "memory_limit_bytes": 8589934592,
+  "memory_limit": "2g",
+  "memory_limit_attempts": [{"limit":"2g","loggytracy_survived":true,"loggytracy_oom_killed":false,"loki_survived":true,"loki_oom_killed":false}],
+  "memory_limit_bytes": 2147483648,
   "settle_seconds": 150,
-  "verify_anchor_ns": 1785308680000000000,
+  "verify_anchor_ns": 1785398290000000000,
+  "matrix_primary_limit": 20000,
+  "matrix_runs": [{"limit":20000,"suffix":"_l20000"},{"limit":100,"suffix":"_l100"}],
   "object_store": "none: both systems are on their local filesystem",
   "peak_bytes": {
-    "loggytracy": { "ingest": 6250303488, "query": 125075456, "oom_killed": false },
-    "loki": { "ingest": 1998839808, "query": 297017344, "oom_killed": false }
+    "loggytracy": { "ingest": 2147483648, "query": 114864128, "oom_killed": false },
+    "loki": { "ingest": 2016555008, "query": 285237248, "oom_killed": false }
   },
   "disk_bytes": {
-    "loggytracy": { "settled": 717304654, "after_queries": 717300558, "breakdown": "/var/lib/loggytracy/journal.ckpt:8,/var/lib/loggytracy/journal.wal:567568484,/var/lib/loggytracy/parts:149727970,/var/lib/loggytracy/traces:4096" },
-    "loki": { "settled": 123438062, "after_queries": 123501039, "breakdown": "/loki/chunks:123292867,/loki/compactor:4096,/loki/rules:4096,/loki/rules-temp:4096,/loki/tsdb-shipper-active:96043,/loki/tsdb-shipper-cache:24576,/loki/wal:8192" }
+    "loggytracy": { "settled": 717195420, "after_queries": 717191324, "breakdown": "/var/lib/loggytracy/journal.ckpt:8,/var/lib/loggytracy/journal.wal:567568303,/var/lib/loggytracy/parts:149618917,/var/lib/loggytracy/traces:4096" },
+    "loki": { "settled": 123414313, "after_queries": 123479974, "breakdown": "/loki/chunks:123268994,/loki/compactor:4096,/loki/rules:4096,/loki/rules-temp:4096,/loki/tsdb-shipper-active:96167,/loki/tsdb-shipper-cache:24576,/loki/wal:8192" }
   }
 }
