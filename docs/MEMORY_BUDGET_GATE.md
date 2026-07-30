@@ -423,6 +423,28 @@ what the process is inside. That is observability with no behavioural change.
 the settle, is not yet known and is above 2 GiB.** The figure this document
 previously reported — 2 GiB at 81% — is the ingest phase alone.
 
+## A bench run on a busy machine invented a 41 % regression
+
+Worth recording because it nearly went into a document. `part/write/json` was
+measured while the 40-minute comparison bed was running in Docker on the same
+host, and criterion reported **+41 %, p < 0.05, "Performance has regressed"** —
+with a confidence interval spanning +23 % to +60 %, which is the tell.
+
+Re-measured on an idle machine against the same code: `part/write/plain`
+134.51 ms and `part/write/json` 321.28 ms, against 134.34 and 328.20 before
+streaming the merge. The batch write path is **unchanged within noise**, which is
+what a pure extraction of `encode_group_blooms` should cost.
+
+Criterion then said "Performance has improved by 30 %", which is equally wrong:
+its saved baseline was the contaminated run. A stored baseline is only as good as
+the machine that produced it.
+
+This is the same failure as `LOAD_RESULTS.md` §10, where a two-hour soak ran on a
+machine that was compiling for most of it. The rule that follows is narrow and
+worth keeping: **a timing taken while something else is running is not a
+measurement**, and a wide confidence interval is the signal to throw it away
+rather than to report it with a caveat.
+
 ## What this does not establish
 
 Stated in the discipline [`COMPARISON.md`](COMPARISON.md) sets.
