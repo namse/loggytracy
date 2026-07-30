@@ -69,15 +69,19 @@ fn encode_stream_index(
     stream_labels: &[String],
 ) -> io::Result<Vec<u8>> {
     let bounds = row_group_bounds(rows, row_group_size);
-    let mut index: StreamMap = BTreeMap::new();
+    // Keyed by borrows of the rows rather than by copies of them.
+    // `BTreeMap::entry` needs an owned key, so this used to clone every label
+    // name and every label value once **per row per label** to look up a
+    // posting list that already existed.
+    let mut index: BTreeMap<&str, BTreeMap<&str, RoaringBitmap>> = BTreeMap::new();
     for (rg, (start, end)) in bounds.iter().enumerate() {
         for row in &rows[*start..*end] {
             for label in stream_labels {
                 if let Some(v) = row.labels.get(label) {
                     index
-                        .entry(label.clone())
+                        .entry(label.as_str())
                         .or_default()
-                        .entry(v.clone())
+                        .entry(v.as_str())
                         .or_default()
                         .insert(rg as u32);
                 }

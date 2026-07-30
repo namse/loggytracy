@@ -80,7 +80,7 @@ fn unified_query_with_stats_cancellable_with_memory(
     max_memory_bytes: Option<u64>,
     max_scan_bytes: Option<u64>,
 ) -> Result<QueryExecution, String> {
-    let mut all: Vec<(Labels, LogEntry)> = Vec::new();
+    let mut all: Vec<(SharedLabels, LogEntry)> = Vec::new();
     // The one place every read path meets its rows, which is why the deletion
     // mask is here and not at each handler. A second scan would be a second
     // place to forget it, and forgetting it means serving a line a tenant asked

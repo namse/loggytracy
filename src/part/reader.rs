@@ -86,6 +86,77 @@ struct DecodedBlooms {
     exact_fields_canonical: bool,
 }
 
+/// The distinct label sets one scan has already decoded, so a part holding a
+/// hundred streams materializes a hundred label sets and not one per row.
+///
+/// The rows of a part are sorted by `(tenant, timestamp)`, so consecutive rows
+/// belong to different streams and comparing against the previous row would
+/// almost always miss. Keyed instead on a hash of the row's label column
+/// values, with every candidate in the bucket verified against the columns —
+/// a hash collision therefore costs a comparison and cannot return the wrong
+/// label set.
+struct LabelSetCache {
+    buckets: HashMap<u64, Vec<SharedLabels>>,
+}
+
+impl LabelSetCache {
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+        }
+    }
+
+    fn labels_for(
+        &mut self,
+        names: &[String],
+        columns: &[&StringArray],
+        row: usize,
+    ) -> SharedLabels {
+        let mut hasher = std::hash::DefaultHasher::new();
+        for (index, name) in names.iter().enumerate() {
+            if !columns[index].is_null(row) {
+                name.hash(&mut hasher);
+                columns[index].value(row).hash(&mut hasher);
+            }
+        }
+        let bucket = self.buckets.entry(hasher.finish()).or_default();
+        if let Some(hit) = bucket
+            .iter()
+            .find(|labels| label_set_matches_row(labels, names, columns, row))
+        {
+            return hit.clone();
+        }
+        let mut labels = Labels::new();
+        for (index, name) in names.iter().enumerate() {
+            if !columns[index].is_null(row) {
+                labels.insert(name.clone(), columns[index].value(row).to_string());
+            }
+        }
+        let labels: SharedLabels = Arc::new(labels);
+        bucket.push(labels.clone());
+        labels
+    }
+}
+
+fn label_set_matches_row(
+    labels: &Labels,
+    names: &[String],
+    columns: &[&StringArray],
+    row: usize,
+) -> bool {
+    let mut present = 0usize;
+    for (index, name) in names.iter().enumerate() {
+        if columns[index].is_null(row) {
+            continue;
+        }
+        present += 1;
+        if labels.get(name).map(String::as_str) != Some(columns[index].value(row)) {
+            return false;
+        }
+    }
+    present == labels.len()
+}
+
 fn validate_sidecar_files(part: &Part) -> Result<(), String> {
     let expected = part.meta.integrity.index_crc32;
     let actual = file_crc32(&part.index_path()).map_err(|error| {
@@ -601,9 +672,12 @@ impl PartReader {
             sorted_selected.reverse();
         }
 
-        let mut collected: Vec<(Labels, LogEntry)> = Vec::new();
+        let mut collected: Vec<(SharedLabels, LogEntry)> = Vec::new();
         let mut scanned_rows = 0usize;
         let mut scanned_bytes = 0u64;
+        // Outside the row-group loop: a stream spans row groups, so a cache per
+        // group would rebuild every label set once per group.
+        let mut label_sets = LabelSetCache::new();
 
         let batch_size = scan_limit
             .into_iter()
@@ -693,12 +767,7 @@ impl PartReader {
                     if !time_range.contains(ts_val) {
                         continue;
                     }
-                    let mut labels: Labels = BTreeMap::new();
-                    for (j, label_name) in self.stream_labels.iter().enumerate() {
-                        if !label_cols[j].is_null(i) {
-                            labels.insert(label_name.clone(), label_cols[j].value(i).to_string());
-                        }
-                    }
+                    let labels = label_sets.labels_for(&self.stream_labels, &label_cols, i);
                     if !matchers.iter().all(|m| m.matches(&labels)) {
                         continue;
                     }
@@ -1016,8 +1085,8 @@ fn decode_stream_index(buf: &[u8]) -> Result<StreamMap, String> {
     Ok(map)
 }
 
-pub fn group_by_labels(collected: Vec<(Labels, LogEntry)>) -> Vec<StreamResult> {
-    let mut grouped: BTreeMap<Labels, Vec<LogEntry>> = BTreeMap::new();
+pub fn group_by_labels(collected: Vec<(SharedLabels, LogEntry)>) -> Vec<StreamResult> {
+    let mut grouped: BTreeMap<SharedLabels, Vec<LogEntry>> = BTreeMap::new();
     for (labels, entry) in collected {
         grouped.entry(labels).or_default().push(entry);
     }

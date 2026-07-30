@@ -401,7 +401,7 @@
                     vec![crate::part::Row {
                         tenant: acme.clone(),
                         timestamp_ns: 1,
-                        labels: stream.clone(),
+                        labels: std::sync::Arc::new(stream.clone()),
                         line: "on disk".to_string(),
                         structured_metadata: vec![],
                     }],

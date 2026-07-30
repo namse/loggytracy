@@ -25,7 +25,7 @@ fn fill(memtable: &MemTable, corpus: &corpus::Corpus) {
     for stream in &corpus.streams {
         memtable.insert(
             stream.tenant.clone(),
-            stream.labels.clone(),
+            (*stream.labels).clone(),
             stream.entries.clone(),
         );
     }

@@ -562,7 +562,7 @@ impl PartRegistry {
             candidates.reverse();
         }
 
-        let mut all: Vec<(Labels, crate::memtable::LogEntry)> = Vec::new();
+        let mut all: Vec<(crate::memtable::SharedLabels, crate::memtable::LogEntry)> = Vec::new();
         let mut scanned_rows = 0usize;
         let mut scanned_bytes = 0u64;
         for reader in &candidates {
@@ -779,7 +779,7 @@ mod tests {
         Row {
             tenant: test_tenant(),
             timestamp_ns,
-            labels,
+            labels: std::sync::Arc::new(labels),
             line: line.to_string(),
             structured_metadata: vec![],
         }

@@ -24,7 +24,7 @@
         Row {
             tenant: test_tenant(),
             timestamp_ns: 1_700_000_000_000_000_000,
-            labels,
+            labels: std::sync::Arc::new(labels),
             line: line.to_string(),
             structured_metadata: Vec::new(),
         }

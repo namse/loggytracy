@@ -417,14 +417,14 @@
                     part::Row {
                         tenant: test_tenant(),
                         timestamp_ns: 1_700_000_000_000_000_000,
-                        labels: labels.clone(),
+                        labels: std::sync::Arc::new(labels.clone()),
                         line: "old-one".to_string(),
                         structured_metadata: Vec::new(),
                     },
                     part::Row {
                         tenant: test_tenant(),
                         timestamp_ns: 1_700_000_001_000_000_000,
-                        labels,
+                        labels: std::sync::Arc::new(labels),
                         line: "old-two".to_string(),
                         structured_metadata: Vec::new(),
                     },

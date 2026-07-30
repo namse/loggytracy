@@ -140,7 +140,7 @@ fn seed_bodies(corpus: &Corpus, entries_per_push: usize) -> Vec<SeedBody> {
         for chunk in stream.entries.chunks(entries_per_push) {
             let line_bytes: usize = chunk.iter().map(|entry| entry.line.len()).sum();
             let batch: Vec<(loggytracy::memtable::Labels, Vec<LogEntry>)> =
-                vec![(stream.labels.clone(), chunk.to_vec())];
+                vec![((*stream.labels).clone(), chunk.to_vec())];
             let encoded = loggytracy::proto::encode_push_request(&batch);
             bodies.push(SeedBody {
                 bytes: snap::raw::Encoder::new()

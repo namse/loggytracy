@@ -15,7 +15,7 @@
 //! and adds the bench-only counting allocator and scratch directory, which
 //! have no business in a library that a server binary links.
 
-use crate::memtable::{Labels, LogEntry, MemTableSnapshot, TenantStreams};
+use crate::memtable::{Labels, LogEntry, MemTableSnapshot, SharedLabels, TenantStreams};
 use crate::part::Row;
 use crate::tenant::TenantId;
 
@@ -176,7 +176,7 @@ impl CorpusSpec {
 
 pub struct Stream {
     pub tenant: TenantId,
-    pub labels: Labels,
+    pub labels: SharedLabels,
     pub entries: Vec<LogEntry>,
 }
 
@@ -527,7 +527,7 @@ pub fn generate(spec: &CorpusSpec) -> Corpus {
     let mut streams: Vec<Stream> = (0..stream_count)
         .map(|index| Stream {
             tenant: tenant_ids[index % tenant_count].clone(),
-            labels: labels_for_stream(index, spec.labels_per_stream),
+            labels: SharedLabels::new(labels_for_stream(index, spec.labels_per_stream)),
             entries: Vec::new(),
         })
         .collect();
@@ -623,7 +623,7 @@ impl Corpus {
 
     /// A `(labels, entry)` pairing for the pipeline benches, which take the
     /// stream labels as the pipeline's initial field set.
-    pub fn labelled_entries(&self) -> Vec<(&Labels, &LogEntry)> {
+    pub fn labelled_entries(&self) -> Vec<(&SharedLabels, &LogEntry)> {
         self.streams
             .iter()
             .flat_map(|stream| {
@@ -688,6 +688,6 @@ pub fn push_batches(corpus: &Corpus) -> Vec<(Labels, Vec<LogEntry>)> {
     corpus
         .streams
         .iter()
-        .map(|stream| (stream.labels.clone(), stream.entries.clone()))
+        .map(|stream| ((*stream.labels).clone(), stream.entries.clone()))
         .collect()
 }

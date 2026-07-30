@@ -28,7 +28,7 @@
             .map(|i| part::Row {
                 tenant: test_tenant(),
                 timestamp_ns: start_ts + i as i64,
-                labels: labels.clone(),
+                labels: std::sync::Arc::new(labels.clone()),
                 line: format!("{}-line-{}", suffix, i),
                 structured_metadata: vec![],
             })
@@ -173,7 +173,7 @@
                         ))
                         .unwrap(),
                         timestamp_ns: (batch * 1000) as i64 + row_index as i64,
-                        labels: labels.clone(),
+                        labels: std::sync::Arc::new(labels.clone()),
                         line: format!("batch {batch} row {row_index} of a log line"),
                         structured_metadata: vec![],
                     })
@@ -250,7 +250,7 @@
                     tenant: crate::tenant::TenantId::parse(&format!("t{:02}", row_index % 5))
                         .unwrap(),
                     timestamp_ns: (batch * 1000) as i64 + row_index as i64,
-                    labels: labels.clone(),
+                    labels: std::sync::Arc::new(labels.clone()),
                     line: format!("batch {batch} row {row_index}"),
                     structured_metadata: vec![],
                 })
@@ -492,7 +492,8 @@
             timestamp_ns,
             labels: [("app".to_string(), owner.to_string())]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into(),
             line: format!("{owner}-{timestamp_ns}"),
             structured_metadata: vec![],
         }
@@ -788,7 +789,8 @@
                 timestamp_ns: 1_700_000_000_000_000_000 + index,
                 labels: [("app".to_string(), "compressible".to_string())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::BTreeMap<_, _>>()
+                    .into(),
                 line: "a".repeat(512),
                 structured_metadata: vec![],
             })
@@ -822,7 +824,8 @@
             timestamp_ns,
             labels: [("app".to_string(), owner.to_string())]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into(),
             line: format!("{owner}-{timestamp_ns}-{}", "x".repeat(1024)),
             structured_metadata: vec![],
         }

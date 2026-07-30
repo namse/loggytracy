@@ -140,6 +140,11 @@ async fn run_metric_query_with_stats_cancellable(
             if cancellation.load(Ordering::Acquire) {
                 return Err("metric query timed out".to_string());
             }
+            // Shared with the stream unless a grouping field actually has to be
+            // promoted into it. This clone was the whole `BTreeMap` per row, on
+            // an async worker thread and outside every arena — 203 MiB at its
+            // high-water (`docs/MEMORY_ATTRIBUTION.md`, "an eighth term nobody
+            // proposed").
             let mut labels = stream.labels.clone();
             // Pipeline-extracted fields are query-local structured metadata
             // at this point. Promote them into the metric label set so range
@@ -149,8 +154,8 @@ async fn run_metric_query_with_stats_cancellable(
                 // Pipeline fields must not replace original stream labels.
                 // A colliding extraction has already been renamed by
                 // process_entry_with_labels.
-                if grouping_fields.contains(name) {
-                    labels.entry(name.clone()).or_insert_with(|| value.clone());
+                if grouping_fields.contains(name) && !labels.contains_key(name) {
+                    SharedLabels::make_mut(&mut labels).insert(name.clone(), value.clone());
                 }
             }
             entries.push((labels, entry));
@@ -221,9 +226,9 @@ async fn run_metric_query_with_stats_cancellable(
 #[cfg(test)]
 fn evaluate_metric_at(
     expr: &logql::MetricExpr,
-    entries: &[(Labels, LogEntry)],
+    entries: &[(SharedLabels, LogEntry)],
     timestamp_ns: i64,
-) -> Vec<(Labels, f64)> {
+) -> Vec<(SharedLabels, f64)> {
     evaluate_metric_all(expr, entries, &[timestamp_ns])
         .expect("test metric evaluation must remain within resource limits")
         .into_iter()
@@ -232,7 +237,7 @@ fn evaluate_metric_at(
 }
 
 #[cfg(test)]
-fn ensure_metric_series_limit(values: &[Vec<(Labels, f64)>]) -> Result<(), String> {
+fn ensure_metric_series_limit(values: &[Vec<(SharedLabels, f64)>]) -> Result<(), String> {
     if values
         .iter()
         .any(|at_time| at_time.len() > MAX_METRIC_SERIES)
@@ -258,13 +263,13 @@ fn ensure_metric_series_limit(values: &[Vec<(Labels, f64)>]) -> Result<(), Strin
 #[cfg(test)]
 fn evaluate_metric_all(
     expr: &logql::MetricExpr,
-    entries: &[(Labels, LogEntry)],
+    entries: &[(SharedLabels, LogEntry)],
     evaluation_times: &[i64],
-) -> Result<Vec<Vec<(Labels, f64)>>, String> {
+) -> Result<Vec<Vec<(SharedLabels, f64)>>, String> {
     let values = match expr {
         logql::MetricExpr::Range { range_ns, .. } => {
             let spec = metric_range_spec(expr);
-            let mut by_labels: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
+            let mut by_labels: BTreeMap<SharedLabels, Vec<(i64, f64)>> = BTreeMap::new();
             for (labels, entry) in entries {
                 let Some(increment) = sample_value(&spec, labels, entry) else {
                     continue;
@@ -278,7 +283,7 @@ fn evaluate_metric_all(
                 events.sort_unstable_by_key(|(timestamp_ns, _)| *timestamp_ns);
             }
 
-            let mut output: Vec<Vec<(Labels, f64)>> =
+            let mut output: Vec<Vec<(SharedLabels, f64)>> =
                 (0..evaluation_times.len()).map(|_| Vec::new()).collect();
             for (labels, events) in by_labels {
                 let mut prefix = Vec::with_capacity(events.len() + 1);
@@ -317,11 +322,11 @@ fn evaluate_metric_all(
             let inner = evaluate_metric_all(expr, entries, evaluation_times)?;
             let mut output = Vec::with_capacity(inner.len());
             for values in inner {
-                let mut grouped: BTreeMap<Labels, (f64, usize)> = BTreeMap::new();
+                let mut grouped: BTreeMap<SharedLabels, (f64, usize)> = BTreeMap::new();
                 for (labels, value) in values {
                     let group = match grouping {
-                        Some(grouping) => grouping.key(&labels),
-                        None => Labels::new(),
+                        Some(grouping) => SharedLabels::new(grouping.key(&labels)),
+                        None => empty_labels(),
                     };
                     let aggregate = grouped.entry(group).or_insert((value, 0));
                     if aggregate.1 > 0 {
@@ -400,22 +405,29 @@ struct MetricRangeSeries {
     prefix: Vec<f64>,
 }
 
+/// The label set an ungrouped aggregation reports under, allocated once for the
+/// process rather than once per series per evaluation point.
+fn empty_labels() -> SharedLabels {
+    static EMPTY: std::sync::OnceLock<SharedLabels> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| SharedLabels::new(Labels::new())).clone()
+}
+
 struct MetricEvaluator {
     range_ns: i64,
     max_series: usize,
-    by_labels: BTreeMap<Labels, MetricRangeSeries>,
+    by_labels: BTreeMap<SharedLabels, MetricRangeSeries>,
 }
 
 impl MetricEvaluator {
     fn new(
         expr: &logql::MetricExpr,
-        entries: &[(Labels, LogEntry)],
+        entries: &[(SharedLabels, LogEntry)],
         cancellation: Option<&AtomicBool>,
         max_series: usize,
     ) -> Result<Self, String> {
         let spec = metric_range_spec(expr);
         let range_ns = spec.range_ns;
-        let mut events_by_labels: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
+        let mut events_by_labels: BTreeMap<SharedLabels, Vec<(i64, f64)>> = BTreeMap::new();
         for (labels, entry) in entries {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Err("metric query timed out".to_string());
@@ -462,7 +474,7 @@ impl MetricEvaluator {
         expr: &logql::MetricExpr,
         evaluation_ns: i64,
         cancellation: Option<&AtomicBool>,
-    ) -> Result<Vec<(Labels, f64)>, String> {
+    ) -> Result<Vec<(SharedLabels, f64)>, String> {
         let mut values = match expr {
             logql::MetricExpr::Range { .. } => {
                 let spec = metric_range_spec(expr);
@@ -514,7 +526,7 @@ impl MetricEvaluator {
                 // sixty.
                 let window_end = evaluation_ns.saturating_sub(*offset_ns);
                 let window_start = window_end.saturating_sub(*range_ns);
-                let mut samples: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
+                let mut samples: BTreeMap<SharedLabels, Vec<f64>> = BTreeMap::new();
                 let mut point = window_start.saturating_add(*step_ns);
                 let mut steps = 0usize;
                 while point <= window_end {
@@ -591,11 +603,11 @@ inner evaluation points"
             }
             logql::MetricExpr::Aggregate { op, grouping, expr } => {
                 let inner = self.evaluate_at(expr, evaluation_ns, cancellation)?;
-                let mut grouped: BTreeMap<Labels, (f64, usize)> = BTreeMap::new();
+                let mut grouped: BTreeMap<SharedLabels, (f64, usize)> = BTreeMap::new();
                 for (labels, value) in inner {
                     let group = match grouping {
-                        Some(grouping) => grouping.key(&labels),
-                        None => Labels::new(),
+                        Some(grouping) => SharedLabels::new(grouping.key(&labels)),
+                        None => empty_labels(),
                     };
                     let aggregate = grouped.entry(group).or_insert((value, 0));
                     if aggregate.1 > 0 {
@@ -756,10 +768,10 @@ fn quantile_of(sorted: &[f64], quantile: f64) -> f64 {
 #[cfg(test)]
 fn evaluate_metric_stream(
     expr: &logql::MetricExpr,
-    entries: &[(Labels, LogEntry)],
+    entries: &[(SharedLabels, LogEntry)],
     evaluation_times: &[i64],
     cancellation: Option<&AtomicBool>,
-) -> Result<BTreeMap<Labels, Vec<(i64, f64)>>, String> {
+) -> Result<BTreeMap<SharedLabels, Vec<(i64, f64)>>, String> {
     evaluate_metric_stream_with_limits(
         expr,
         entries,
@@ -772,14 +784,14 @@ fn evaluate_metric_stream(
 
 fn evaluate_metric_stream_with_limits(
     expr: &logql::MetricExpr,
-    entries: &[(Labels, LogEntry)],
+    entries: &[(SharedLabels, LogEntry)],
     evaluation_times: &[i64],
     cancellation: Option<&AtomicBool>,
     max_series: usize,
     max_samples: usize,
-) -> Result<BTreeMap<Labels, Vec<(i64, f64)>>, String> {
+) -> Result<BTreeMap<SharedLabels, Vec<(i64, f64)>>, String> {
     let evaluator = MetricEvaluator::new(expr, entries, cancellation, max_series)?;
-    let mut output: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
+    let mut output: BTreeMap<SharedLabels, Vec<(i64, f64)>> = BTreeMap::new();
     let mut sample_count = 0usize;
     for &timestamp_ns in evaluation_times {
         if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {

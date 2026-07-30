@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::logql::{self};
-use crate::memtable::{Labels, LogEntry, StreamResult};
+use crate::memtable::{Labels, LogEntry, SharedLabels, StreamResult};
 use crate::part;
 use crate::tenant::TenantId;
 
@@ -164,12 +164,17 @@ pub(crate) fn parse_time_ns(s: &str) -> Result<i64, String> {
 /// direction has to be passed in because merging two inputs into one group
 /// interleaves their rows, and the response order is part of the contract.
 fn build_stream_data(results: Vec<StreamResult>, forward: bool) -> Vec<StreamData> {
-    let mut grouped: BTreeMap<Labels, Vec<(i64, String)>> = BTreeMap::new();
+    let mut grouped: BTreeMap<SharedLabels, Vec<(i64, String)>> = BTreeMap::new();
     for result in results {
         for entry in result.entries {
+            // A row that carries nothing to merge in shares the stream's label
+            // set; only one that does pays for a copy of it.
             let mut labels = result.labels.clone();
-            for (name, value) in entry.structured_metadata {
-                labels.insert(name, value);
+            if !entry.structured_metadata.is_empty() {
+                let fields = SharedLabels::make_mut(&mut labels);
+                for (name, value) in entry.structured_metadata {
+                    fields.insert(name, value);
+                }
             }
             grouped
                 .entry(labels)
@@ -188,7 +193,10 @@ fn build_stream_data(results: Vec<StreamResult>, forward: bool) -> Vec<StreamDat
                 rows.sort_by_key(|(timestamp_ns, _)| std::cmp::Reverse(*timestamp_ns));
             }
             StreamData {
-                stream: labels.into_iter().collect(),
+                stream: SharedLabels::try_unwrap(labels)
+                    .unwrap_or_else(|shared| (*shared).clone())
+                    .into_iter()
+                    .collect(),
                 values: rows
                     .into_iter()
                     .map(|(timestamp_ns, line)| {
@@ -205,7 +213,7 @@ fn build_stream_data(results: Vec<StreamResult>, forward: bool) -> Vec<StreamDat
 
 #[derive(Clone, Debug, PartialEq)]
 struct MetricSeries {
-    labels: Labels,
+    labels: SharedLabels,
     samples: Vec<(i64, f64)>,
 }
 
@@ -216,8 +224,8 @@ fn metric_series_json(series: Vec<MetricSeries>, instant: bool) -> serde_json::V
             .map(|series| {
                 let metric: serde_json::Map<String, serde_json::Value> = series
                     .labels
-                    .into_iter()
-                    .map(|(name, value)| (name, serde_json::Value::String(value)))
+                    .iter()
+                    .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
                     .collect();
                 let mut object = serde_json::Map::new();
                 object.insert("metric".to_string(), serde_json::Value::Object(metric));

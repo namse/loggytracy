@@ -122,7 +122,7 @@ impl PushGenerator {
                     structured_metadata: source.structured_metadata.clone(),
                 });
             }
-            batch.push((stream.labels.clone(), entries));
+            batch.push(((*stream.labels).clone(), entries));
         }
 
         // The library's own encoder, so the bytes on the wire are the bytes

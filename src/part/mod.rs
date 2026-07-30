@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::bloom::BloomFilter;
 use crate::logql::{LabelMatcher, LineFilter, MatcherOp};
-use crate::memtable::{Labels, LogEntry, MemTableSnapshot, QueryResult, StreamResult};
+use crate::memtable::{
+    Labels, LogEntry, MemTableSnapshot, QueryResult, SharedLabels, StreamResult,
+};
 use crate::tenant::TenantId;
 
 pub const DATA_FILE: &str = "data.parquet";
@@ -335,7 +338,7 @@ impl Part {
 pub struct Row {
     pub tenant: TenantId,
     pub timestamp_ns: i64,
-    pub labels: Labels,
+    pub labels: SharedLabels,
     pub line: String,
     pub structured_metadata: Vec<(String, String)>,
 }
@@ -361,7 +364,10 @@ impl Row {
         (labels_bytes + self.line.len() + metadata_bytes + std::mem::size_of::<Row>()) as u64
     }
 
-    pub fn from_entry(tenant: &TenantId, labels: &Labels, e: &LogEntry) -> Self {
+    /// The label set is shared with the stream it came from rather than copied.
+    /// This clone used to be the whole `BTreeMap` and it is why a flush held
+    /// 3.3x the memtable it was materializing.
+    pub fn from_entry(tenant: &TenantId, labels: &SharedLabels, e: &LogEntry) -> Self {
         Self {
             tenant: tenant.clone(),
             timestamp_ns: e.timestamp_ns,
@@ -383,7 +389,7 @@ impl Row {
         (
             self.tenant.as_str(),
             self.timestamp_ns,
-            &self.labels,
+            self.labels.as_ref(),
             self.line.as_str(),
             &self.structured_metadata,
         )

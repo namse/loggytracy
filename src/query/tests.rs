@@ -142,7 +142,7 @@
                         .map(|(timestamp_ns, line)| Row {
                             tenant: test_tenant(),
                             timestamp_ns,
-                            labels: labels.clone(),
+                            labels: std::sync::Arc::new(labels.clone()),
                             line: line.to_string(),
                             structured_metadata: Vec::new(),
                         })
@@ -472,7 +472,7 @@
                     vec![Row {
                         tenant: test_tenant(),
                         timestamp_ns: 1,
-                        labels,
+                        labels: std::sync::Arc::new(labels),
                         line: "on disk".to_string(),
                         structured_metadata: Vec::new(),
                     }],
@@ -646,7 +646,7 @@
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels,
+                labels: std::sync::Arc::new(labels),
                 line: "restored after eviction".to_string(),
                 structured_metadata: Vec::new(),
             }],
@@ -661,7 +661,7 @@
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_001,
-                labels: other_labels,
+                labels: std::sync::Arc::new(other_labels),
                 line: "must remain remote".to_string(),
                 structured_metadata: Vec::new(),
             }],
@@ -722,7 +722,7 @@
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1,
-                labels: labels.clone(),
+                labels: std::sync::Arc::new(labels.clone()),
                 line: "old generation".to_string(),
                 structured_metadata: Vec::new(),
             }],
@@ -737,7 +737,7 @@
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 2,
-                labels,
+                labels: std::sync::Arc::new(labels),
                 line: "new generation".to_string(),
                 structured_metadata: Vec::new(),
             }],
@@ -809,7 +809,7 @@
                     vec![Row {
                         tenant: test_tenant(),
                         timestamp_ns: 20,
-                        labels,
+                        labels: std::sync::Arc::new(labels),
                         line: line.to_string(),
                         structured_metadata: metadata,
                     }],
@@ -881,7 +881,7 @@
                     vec![Row {
                         tenant: test_tenant(),
                         timestamp_ns: 20,
-                        labels,
+                        labels: std::sync::Arc::new(labels),
                         line: r#"{"foo":"z"}"#.to_string(),
                         structured_metadata: metadata,
                     }],
@@ -907,8 +907,8 @@
 
     #[test]
     fn metric_windows_are_left_open_and_aggregations_recompute_each_step() {
-        let a: Labels = [("app".to_string(), "a".to_string())].into_iter().collect();
-        let b: Labels = [("app".to_string(), "b".to_string())].into_iter().collect();
+        let a: SharedLabels = SharedLabels::new([("app".to_string(), "a".to_string())].into_iter().collect());
+        let b: SharedLabels = SharedLabels::new([("app".to_string(), "b".to_string())].into_iter().collect());
         let entries = vec![
             (
                 a.clone(),
@@ -982,7 +982,7 @@
             };
             assert_eq!(
                 evaluate_metric_at(&aggregate, &entries, 10_000_000_000),
-                vec![(Labels::new(), expected)]
+                vec![(SharedLabels::new(Labels::new()), expected)]
             );
         }
     }
@@ -993,9 +993,8 @@
             Ok(logql::QueryExpr::Metric(expr)) => expr,
             _ => panic!("expected metric expression"),
         };
-        let labels: Labels = [("app".to_string(), "api".to_string())]
-            .into_iter()
-            .collect();
+        let labels: SharedLabels =
+            SharedLabels::new([("app".to_string(), "api".to_string())].into_iter().collect());
         let entries = vec![(
             labels,
             LogEntry {
@@ -1022,7 +1021,7 @@
                     vec![Row {
                         tenant: test_tenant(),
                         timestamp_ns: i64::MIN,
-                        labels: labels.clone(),
+                        labels: std::sync::Arc::new(labels.clone()),
                         line: "oldest".to_string(),
                         structured_metadata: vec![],
                     }],
@@ -1041,7 +1040,7 @@
         let result = run_metric_query(state, test_tenant(), expr, vec![i64::MIN + 1])
             .await
             .unwrap();
-        assert_eq!(result[0].labels, labels);
+        assert_eq!(*result[0].labels, labels);
         assert_eq!(result[0].samples, vec![(i64::MIN + 1, 1.0)]);
     }
 
@@ -1188,7 +1187,7 @@
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 6_000_000_000,
-                labels: labels.clone(),
+                labels: std::sync::Arc::new(labels.clone()),
                 line: "wanted".to_string(),
                 structured_metadata: vec![("tenant".to_string(), "one".to_string())],
             }],
@@ -1200,7 +1199,7 @@
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 7_000_000_000,
-                labels,
+                labels: std::sync::Arc::new(labels),
                 line: "unwanted".to_string(),
                 structured_metadata: vec![("tenant".to_string(), "two".to_string())],
             }],
@@ -1262,7 +1261,7 @@
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 10,
-                labels,
+                labels: std::sync::Arc::new(labels),
                 line: r#"{"foo":"z"}"#.to_string(),
                 structured_metadata: vec![],
             }],
@@ -2313,9 +2312,11 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
                     vec![Row {
                         tenant: test_tenant(),
                         timestamp_ns: 1_700_000_000_000_000_000,
-                        labels: [("app".to_string(), "quota".to_string())]
-                            .into_iter()
-                            .collect::<Labels>(),
+                        labels: SharedLabels::new(
+                            [("app".to_string(), "quota".to_string())]
+                                .into_iter()
+                                .collect(),
+                        ),
                         line: "a line long enough to cost some scan budget".to_string(),
                         structured_metadata: Vec::new(),
                     }],
@@ -2363,8 +2364,9 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         );
     }
 
-    fn unwrapped_entries(values: &[(i64, &str)]) -> Vec<(Labels, LogEntry)> {
-        let labels: Labels = [("app".to_string(), "u".to_string())].into_iter().collect();
+    fn unwrapped_entries(values: &[(i64, &str)]) -> Vec<(SharedLabels, LogEntry)> {
+        let labels: SharedLabels =
+            SharedLabels::new([("app".to_string(), "u".to_string())].into_iter().collect());
         values
             .iter()
             .map(|(timestamp_ns, latency)| {
@@ -2518,10 +2520,11 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
     /// largest of sixty.
     #[tokio::test]
     async fn a_subquery_aggregates_the_inner_expression_over_its_own_steps() {
-        let labels: Labels = [("app".to_string(), "s".to_string())].into_iter().collect();
+        let labels: SharedLabels =
+            SharedLabels::new([("app".to_string(), "s".to_string())].into_iter().collect());
         // Three entries inside the second step, one inside the tenth. A
         // one-second count_over_time therefore peaks at 3.
-        let mut entries: Vec<(Labels, LogEntry)> = Vec::new();
+        let mut entries: Vec<(SharedLabels, LogEntry)> = Vec::new();
         for offset in [500_000_000, 600_000_000, 700_000_000] {
             entries.push((
                 labels.clone(),
@@ -2889,7 +2892,8 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             labels: labels
                 .iter()
                 .map(|(name, value)| (name.to_string(), value.to_string()))
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into(),
             entries,
         }
     }

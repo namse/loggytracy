@@ -81,21 +81,21 @@
             Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels: labels1.clone(),
+                labels: std::sync::Arc::new(labels1.clone()),
                 line: "error connecting to database".to_string(),
                 structured_metadata: vec![],
             },
             Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_001_000_000_000,
-                labels: labels1,
+                labels: std::sync::Arc::new(labels1),
                 line: "all good now".to_string(),
                 structured_metadata: vec![("trace_id".to_string(), "abc".to_string())],
             },
             Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_002_000_000_000,
-                labels: labels2,
+                labels: std::sync::Arc::new(labels2),
                 line: "other app log line".to_string(),
                 structured_metadata: vec![],
             },
@@ -346,14 +346,14 @@
             Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: r#"{"value":9007199254740992,"elapsed":"1s"}"#.to_string(),
                 structured_metadata: vec![],
             },
             Row {
                 tenant: test_tenant(),
                 timestamp_ns: 2,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: r#"{"value":9007199254740993,"elapsed":"1000ms"}"#.to_string(),
                 structured_metadata: vec![],
             },
@@ -394,14 +394,14 @@
             Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: r#"{"value":500.0}"#.to_string(),
                 structured_metadata: vec![],
             },
             Row {
                 tenant: test_tenant(),
                 timestamp_ns: 2,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: r#"{"value":999}"#.to_string(),
                 structured_metadata: vec![],
             },
@@ -488,7 +488,7 @@
             .map(|timestamp_ns| Row {
                 tenant: test_tenant(),
                 timestamp_ns,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: format!("line-{timestamp_ns}"),
                 structured_metadata: vec![],
             })
@@ -517,7 +517,7 @@
             .map(|timestamp_ns| Row {
                 tenant: test_tenant(),
                 timestamp_ns,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: format!("line-{timestamp_ns}"),
                 structured_metadata: vec![],
             })
@@ -551,7 +551,7 @@
             .map(|timestamp_ns| Row {
                 tenant: test_tenant(),
                 timestamp_ns,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: format!("line-{timestamp_ns}"),
                 structured_metadata: vec![],
             })
@@ -662,7 +662,7 @@
             .map(|i| Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000 + i * 1_000_000_000,
-                labels: labels.clone(),
+                labels: std::sync::Arc::new(labels.clone()),
                 line: format!("line-{i:04}"),
                 structured_metadata: vec![],
             })
@@ -721,7 +721,7 @@
             .map(|i| Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000 + i * 1_000_000_000,
-                labels: labels.clone(),
+                labels: std::sync::Arc::new(labels.clone()),
                 line: format!("concurrent-line-{:02}", i),
                 structured_metadata: vec![],
             })
@@ -857,7 +857,7 @@
         let rows: Vec<Row> = vec![Row {
             tenant: test_tenant(),
             timestamp_ns: 1_700_000_000_000_000_000,
-            labels,
+            labels: std::sync::Arc::new(labels),
             line: "no app label here".to_string(),
             structured_metadata: vec![],
         }];
@@ -941,7 +941,8 @@
                     timestamp_ns: 1_700_000_000_000_000_000 + index as i64,
                     labels: [("app".to_string(), "fragmentation".to_string())]
                         .into_iter()
-                        .collect(),
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                        .into(),
                     line: format!("row {index} with enough text to compress like a log line"),
                     structured_metadata: vec![],
                 })
@@ -1017,7 +1018,7 @@ resident {:.0} B",
             .map(|i| Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000 + (i as i64) * 1_000_000,
-                labels: labels.clone(),
+                labels: std::sync::Arc::new(labels.clone()),
                 line: format!(
                     "log line index {} some random words here for trigrams unique fragment {}",
                     i, i
@@ -1047,7 +1048,7 @@ resident {:.0} B",
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: "old".to_string(),
                 structured_metadata: vec![],
             }],
@@ -1061,7 +1062,7 @@ resident {:.0} B",
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: "merged".to_string(),
                 structured_metadata: vec![],
             }],
@@ -1087,7 +1088,7 @@ resident {:.0} B",
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: "old".to_string(),
                 structured_metadata: vec![],
             }],
@@ -1100,7 +1101,7 @@ resident {:.0} B",
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: "merged".to_string(),
                 structured_metadata: vec![],
             }],
@@ -1137,7 +1138,7 @@ resident {:.0} B",
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels: l1,
+                labels: std::sync::Arc::new(l1),
                 line: "old1 line".to_string(),
                 structured_metadata: vec![],
             }],
@@ -1149,7 +1150,7 @@ resident {:.0} B",
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_002_000_000_000,
-                labels: l2,
+                labels: std::sync::Arc::new(l2),
                 line: "old2 line".to_string(),
                 structured_metadata: vec![],
             }],
@@ -1173,14 +1174,14 @@ resident {:.0} B",
             Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels: l3,
+                labels: std::sync::Arc::new(l3),
                 line: "old1 line".to_string(),
                 structured_metadata: vec![],
             },
             Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_002_000_000_000,
-                labels: l4,
+                labels: std::sync::Arc::new(l4),
                 line: "old2 line".to_string(),
                 structured_metadata: vec![],
             },
@@ -1227,7 +1228,7 @@ resident {:.0} B",
         let row = |line: &str| Row {
             tenant: test_tenant(),
             timestamp_ns: 1_700_000_000_000_000_000,
-            labels: BTreeMap::new(),
+            labels: std::sync::Arc::new(BTreeMap::new()),
             line: line.to_string(),
             structured_metadata: vec![],
         };
@@ -1274,7 +1275,7 @@ resident {:.0} B",
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: "replacement".to_string(),
                 structured_metadata: vec![],
             }],
@@ -1335,7 +1336,7 @@ resident {:.0} B",
             vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels: BTreeMap::new(),
+                labels: std::sync::Arc::new(BTreeMap::new()),
                 line: "replacement".to_string(),
                 structured_metadata: vec![],
             }],
@@ -1370,7 +1371,7 @@ resident {:.0} B",
         Row {
             tenant: TenantId::parse(tenant).unwrap(),
             timestamp_ns,
-            labels,
+            labels: std::sync::Arc::new(labels),
             line: line.to_string(),
             structured_metadata: vec![],
         }
@@ -1547,8 +1548,7 @@ resident {:.0} B",
         different_timestamp.timestamp_ns += 1;
 
         let mut different_stream = base.clone();
-        different_stream
-            .labels
+        crate::memtable::SharedLabels::make_mut(&mut different_stream.labels)
             .insert("pod".to_string(), "other".to_string());
 
         let mut different_metadata = base.clone();

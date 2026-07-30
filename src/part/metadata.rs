@@ -22,13 +22,20 @@ fn write_meta(
         .collect();
     let tenants = tenant_segments(rows, &bounds);
 
-    let mut stream_set: BTreeSet<Labels> = BTreeSet::new();
+    // Borrowed, so the distinct label sets are found without copying one per
+    // row. The copy into `Vec<(String, String)>` below is per *stream* and is
+    // what `meta.json` serializes.
+    let mut stream_set: BTreeSet<&Labels> = BTreeSet::new();
     for r in rows {
-        stream_set.insert(r.labels.clone());
+        stream_set.insert(r.labels.as_ref());
     }
     let streams: Vec<Vec<(String, String)>> = stream_set
         .into_iter()
-        .map(|m| m.into_iter().collect())
+        .map(|m| {
+            m.iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        })
         .collect();
 
     let dir = path

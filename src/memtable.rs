@@ -8,10 +8,28 @@ use crate::tenant::TenantId;
 
 pub type Labels = BTreeMap<String, String>;
 
+/// One stream's label set, shared by every row that belongs to the stream
+/// instead of copied into each of them.
+///
+/// The memtable already held one `Labels` per stream, and every hop after it
+/// held one per *row*: `Row::from_entry`, the part writer's stream index and
+/// stream set, the reader, the registry, the executor and the metric path. That
+/// was measured at 1 326-1 345 bytes and 11-27 allocations per row
+/// ([`docs/MEMORY_ATTRIBUTION.md`](../docs/MEMORY_ATTRIBUTION.md) hypothesis 2)
+/// and 721 MiB live in the flush arena — the largest live term in the process.
+///
+/// `Arc` rather than an interned handle: an intern table needs a global map, a
+/// lock on the ingest path and a policy for when an entry may be dropped, and
+/// buys 4 bytes per row over a pointer. Sharing is already scoped by the
+/// structures that hold it — a memtable stream, a `Vec<Row>` for one flush, one
+/// query's result — so a refcount expresses exactly the lifetime that is
+/// wanted and nothing has to decide when to evict.
+pub type SharedLabels = Arc<Labels>;
+
 /// One tenant's streams. The MemTable keeps a map of these rather than one
 /// flat `(tenant, labels)` map so that every read path has to name a tenant
 /// before it can reach any entry.
-pub type TenantStreams = HashMap<Labels, Vec<LogEntry>>;
+pub type TenantStreams = HashMap<SharedLabels, Vec<LogEntry>>;
 pub type MemTableSnapshot = HashMap<TenantId, TenantStreams>;
 
 #[derive(Clone)]
@@ -22,7 +40,7 @@ pub struct LogEntry {
 }
 
 pub struct StreamResult {
-    pub labels: Labels,
+    pub labels: SharedLabels,
     pub entries: Vec<LogEntry>,
 }
 
@@ -129,7 +147,7 @@ fn merge_snapshot(target: &mut MemTableSnapshot, source: MemTableSnapshot) -> u6
 
 #[allow(clippy::too_many_arguments)]
 fn scan_memtable_stream(
-    labels: &Labels,
+    labels: &SharedLabels,
     entries: &[LogEntry],
     line_filters: &[LineFilter],
     range: QueryTimeRange,
@@ -138,7 +156,7 @@ fn scan_memtable_stream(
     scan_limit: Option<usize>,
     cancellation: Option<&AtomicBool>,
     scanned_rows: &mut usize,
-    grouped: &mut BTreeMap<Labels, Vec<LogEntry>>,
+    grouped: &mut BTreeMap<SharedLabels, Vec<LogEntry>>,
     scan_stopped: &mut bool,
 ) {
     let mut ordered: Vec<&LogEntry> = entries.iter().collect();
@@ -197,7 +215,15 @@ impl MemTable {
         let mut delta = entries_bytes(&entries);
         let mut inner = self.inner.write().unwrap();
         let overhead = stream_overhead_bytes(&tenant, &labels);
-        let stream = inner.entry(tenant).or_default().entry(labels).or_default();
+        let streams = inner.entry(tenant).or_default();
+        // The `Arc` is allocated only for a stream this buffer has not seen.
+        // `entry` would need an owned key and so would allocate one per push
+        // batch and immediately drop it again.
+        let key = match streams.get_key_value(&labels) {
+            Some((existing, _)) => existing.clone(),
+            None => Arc::new(labels),
+        };
+        let stream = streams.entry(key).or_default();
         if stream.is_empty() {
             delta += overhead;
         }
@@ -278,8 +304,8 @@ impl MemTable {
     /// Every stream the tenant has buffered. Small by construction — it is
     /// bounded by what a flush interval accumulates — and only walked when a
     /// genuinely new stream appears.
-    pub fn tenant_streams(&self, tenant: &TenantId) -> Vec<Labels> {
-        let mut streams: BTreeSet<Labels> = BTreeSet::new();
+    pub fn tenant_streams(&self, tenant: &TenantId) -> Vec<SharedLabels> {
+        let mut streams: BTreeSet<SharedLabels> = BTreeSet::new();
         if let Some(buffered) = self.inner.read().unwrap().get(tenant) {
             streams.extend(buffered.keys().cloned());
         }
@@ -371,7 +397,7 @@ impl MemTable {
                 scanned_bytes: 0,
             };
         }
-        let mut grouped: BTreeMap<Labels, Vec<LogEntry>> = BTreeMap::new();
+        let mut grouped: BTreeMap<SharedLabels, Vec<LogEntry>> = BTreeMap::new();
         let mut scanned_rows = 0usize;
         let mut scan_stopped = false;
 
@@ -429,7 +455,7 @@ impl MemTable {
         drop(flushing);
         drop(inner);
 
-        let mut all_entries: Vec<(Labels, LogEntry)> = grouped
+        let mut all_entries: Vec<(SharedLabels, LogEntry)> = grouped
             .into_iter()
             .flat_map(|(labels, entries)| {
                 entries
@@ -443,7 +469,7 @@ impl MemTable {
             all_entries.sort_by_key(|e| std::cmp::Reverse(e.1.timestamp_ns));
         }
         all_entries.truncate(limit);
-        let mut result_groups: BTreeMap<Labels, Vec<LogEntry>> = BTreeMap::new();
+        let mut result_groups: BTreeMap<SharedLabels, Vec<LogEntry>> = BTreeMap::new();
         for (labels, entry) in all_entries {
             result_groups.entry(labels).or_default().push(entry);
         }
@@ -491,12 +517,12 @@ impl MemTable {
         };
         if let Some(streams) = inner.get(tenant) {
             for (labels, entries) in streams {
-                visit_retained(labels, entries);
+                visit_retained(labels.as_ref(), entries);
             }
         }
         if let Some(streams) = flushing.as_ref().and_then(|f| f.get(tenant)) {
             for (labels, entries) in streams {
-                visit_retained(labels, entries);
+                visit_retained(labels.as_ref(), entries);
             }
         }
     }

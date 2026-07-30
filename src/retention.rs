@@ -379,7 +379,8 @@ mod tests {
             timestamp_ns,
             labels: [("app".to_string(), owner.to_string())]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into(),
             line: format!("{owner} line"),
             structured_metadata: vec![],
         }
@@ -804,7 +805,7 @@ mod tests {
             vec![Row {
                 tenant: crate::tenant::test_tenant(),
                 timestamp_ns: 1_000,
-                labels,
+                labels: std::sync::Arc::new(labels),
                 line: "expired".to_string(),
                 structured_metadata: vec![],
             }],
@@ -845,7 +846,7 @@ mod tests {
             vec![Row {
                 tenant: crate::tenant::test_tenant(),
                 timestamp_ns: 1_000,
-                labels,
+                labels: std::sync::Arc::new(labels),
                 line: "expired remotely".to_string(),
                 structured_metadata: vec![],
             }],
@@ -893,7 +894,8 @@ mod tests {
                 timestamp_ns: 90,
                 labels: [("app".to_string(), "boundary".to_string())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::BTreeMap<_, _>>()
+                    .into(),
                 line: "boundary".to_string(),
                 structured_metadata: vec![],
             }],
