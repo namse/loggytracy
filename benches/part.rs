@@ -284,9 +284,10 @@ fn bench_scan_filters(c: &mut Criterion) {
 
 /// Read-path allocation, the mirror of the write-path table in `rows.rs`.
 ///
-/// The reader materializes a fresh `Labels` per row (`reader.rs:718-723`) and
-/// the registry and executor each clone it again. This measures the first of
-/// those three, per row returned.
+/// The reader used to materialize a fresh `Labels` per row and the registry and
+/// executor each cloned it again; it now interns one per distinct stream for the
+/// duration of the scan. This measures the first of those three hops, per row
+/// returned, so `peak live` is what has to stay flat across the label sweep.
 fn report_allocations() {
     corpus::alloc::header("part scan (row-group read, one part)");
     for label_columns in LABEL_COLUMN_SWEEP {
@@ -318,7 +319,7 @@ fn report_allocations() {
             &format!("label_columns={label_columns}"),
             returned,
             &stats,
-            "labels rebuilt per row at reader.rs:718-723",
+            "one interned label set per stream, shared by its rows",
         );
     }
 

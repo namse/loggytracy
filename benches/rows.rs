@@ -1,11 +1,16 @@
 //! Flush-path row materialization: `rows_from_snapshot` and `Row::from_entry`.
 //!
-//! `Row::from_entry` (`src/part/mod.rs:302`) clones the whole label `BTreeMap`
-//! per row, which `docs/VISION.md` II names as the largest single term in the
-//! repository. The cost is labels-per-stream x rows, so both are swept, and
-//! the number that has to move when `Arc<Labels>` lands is bytes-allocated per
-//! row rather than nanoseconds — so this binary carries the counting
-//! allocator and prints that table before the timings.
+//! `Row::from_entry` cloned the whole label `BTreeMap` per row, which
+//! `docs/VISION.md` II named as the largest single term in the repository. The
+//! cost was labels-per-stream x rows, so both are swept, and the number that had
+//! to move was bytes-allocated per row rather than nanoseconds — so this binary
+//! carries the counting allocator and prints that table before the timings.
+//!
+//! `Row::labels` is now `Arc<Labels>`, so the table's job changes from watching
+//! the amplification to holding it down: `bytes/row`, `allocs/row` and
+//! `peak live` must stay flat across the label sweep, and the `label sets` note
+//! must stay equal to the stream count. A per-row clone reappearing anywhere
+//! makes all four move together.
 
 #[path = "corpus/mod.rs"]
 #[allow(dead_code)]
@@ -93,9 +98,10 @@ fn bench_row_from_entry(c: &mut Criterion) {
 
 /// The memory half of the same sweep.
 ///
-/// `peak live` is the whole `Vec<Row>` plus the sort's scratch, and
-/// `bytes/row` is what a shared label set is supposed to remove: at ten labels
-/// the per-row clone is most of it, and at two labels it is not.
+/// `peak live` is the whole `Vec<Row>` plus the sort's scratch. `label sets`
+/// counts the distinct label-set allocations the rows point at, which is the
+/// direct measurement of sharing: one per stream is what `Arc<Labels>` buys,
+/// and one per row is what it replaced.
 fn report_allocations() {
     corpus::alloc::header("rows_from_snapshot (flush-path materialization)");
     for labels_per_stream in LABEL_SWEEP {
@@ -111,16 +117,14 @@ fn report_allocations() {
             let entries = corpus.entry_count();
             let distinct_label_bytes = corpus.distinct_label_bytes();
             let (rows, stats) = corpus::alloc::measure(|| rows_from_snapshot(&snapshot));
-            let cloned_label_bytes = label_bytes_in_rows(&rows);
             corpus::alloc::row(
                 &format!("labels={labels_per_stream} streams={streams}"),
                 entries,
                 &stats,
                 &format!(
-                    "label bytes {}x ({} held once, {} in rows)",
-                    cloned_label_bytes / distinct_label_bytes.max(1),
+                    "label sets {} for {entries} rows ({} label bytes held once)",
+                    distinct_label_sets(&rows),
                     distinct_label_bytes,
-                    cloned_label_bytes,
                 ),
             );
         }
@@ -128,15 +132,16 @@ fn report_allocations() {
     corpus::alloc::footer();
 }
 
-fn label_bytes_in_rows(rows: &[Row]) -> u64 {
+/// How many label-set allocations the whole `Vec<Row>` points at.
+///
+/// Counted by address rather than by value: two equal label sets that are two
+/// allocations are two live copies, which is exactly the thing being measured,
+/// and comparing by value would report them as one.
+fn distinct_label_sets(rows: &[Row]) -> usize {
     rows.iter()
-        .map(|row| {
-            row.labels
-                .iter()
-                .map(|(name, value)| (name.len() + value.len()) as u64)
-                .sum::<u64>()
-        })
-        .sum()
+        .map(|row| std::sync::Arc::as_ptr(&row.labels))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
 
 fn benches(c: &mut Criterion) {
