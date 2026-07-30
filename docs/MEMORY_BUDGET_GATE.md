@@ -6,16 +6,21 @@ the comparison bed's mixed load and asserts that the **cgroup's anonymous
 footprint** stays under the number that was declared.
 
 **The current, honest answer to "at what declared budget does this engine survive
-its own load?" is 5 GiB** — two and a half times the 2 GiB
-[`COMPARISON.md`](COMPARISON.md) asked for and Loki met. At the 2 GiB the
-comparison bed used, the gate is **red**: the process is OOM-killed at t≈49 s.
-Nothing here is fixed; this is the ruler for the fixes.
+its own load?" is 2 GiB** — the number [`COMPARISON.md`](COMPARISON.md) asked for
+and Loki met, and the number this gate was red at when it was built. It was
+5 GiB. Sharing label sets instead of copying them per row
+([`VISION.md`](VISION.md) invariant II, step 1) moved it, and the gate is
+**green at 2 GiB** at 90–96 % of it across three runs. It is red at 1792 MiB.
 
-It exists before them on purpose.
-[`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) established that the engine's
-own accounting reported 669 MiB live and 111 MB of memtable at the instant the
-kernel killed it, so **every other M10 item is a fix and this is the only thing
-that can say whether a fix worked.**
+That is one fix of invariant II's list, so the two baselines are both recorded
+below and neither is retracted: the 5 GiB one is what build `50190cf` did, and
+the 2 GiB one is what build `9199e07` does.
+
+This gate landed before the fixes on purpose, and that is why the move can be
+stated as a number at all. [`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md)
+established that the engine's own accounting reported 669 MiB live and 111 MB of
+memtable at the instant the kernel killed it, so **every other M10 item is a fix
+and this is the only thing that can say whether a fix worked.**
 
 ---
 
@@ -62,13 +67,24 @@ the page cache this engine's own Parquet and WAL writes create, which is
 reclaimable and is not what an OOM kill is decided on. Both are recorded beside
 the verdict; neither is gated.
 
-One row of one passing run, at a 5 GiB budget, is the whole argument:
+One row of one passing run, at a 5 GiB budget on build `50190cf`, is the whole
+argument:
 
 | in the same run | MiB |
 |---|---|
 | peak cgroup `anon` — what the kernel decides on | **4675** |
 | peak cgroup `memory.peak` — includes page cache | 5120 (the limit) |
 | peak `loggytracy_memtable_bytes` — what M9 had to reason with | **193** |
+
+The same three, from the `shared-labels-2g` run on build `9199e07`, say it again
+at a quarter of the budget and with the spread between the three unchanged in
+shape:
+
+| in the same run | MiB |
+|---|---|
+| peak cgroup `anon` | **1916** |
+| peak cgroup `memory.peak` | 2048 (the limit) |
+| peak `loggytracy_memtable_bytes` | **182** |
 
 ---
 
@@ -79,9 +95,9 @@ rather than asserted:
 
 | exit | verdict | means | seen in |
 |---|---|---|---|
-| 0 | `UNDER_BUDGET` | survived, delivered the offered workload, peak `anon` ≤ budget | the 5 and 6 GiB runs |
-| 2 | `OVER_BUDGET` | survived, peak `anon` exceeded the declared budget | `--budget 2GiB --limit 8GiB` |
-| 3 | `OOM_KILLED` | the kernel killed it inside its own declared budget | the 2 and 4 GiB runs |
+| 0 | `UNDER_BUDGET` | survived, delivered the offered workload, peak `anon` ≤ budget | the 5 and 6 GiB runs on `50190cf`; the 2 GiB runs on `9199e07` |
+| 2 | `OVER_BUDGET` | survived, peak `anon` exceeded the declared budget | `--budget 2GiB --limit 8GiB` on `50190cf`; the same command is `UNDER_BUDGET` on `9199e07` |
+| 3 | `OOM_KILLED` | the kernel killed it inside its own declared budget | the 2 and 4 GiB runs on `50190cf`; 1 GiB, 1536 MiB and 1792 MiB on `9199e07` |
 | 4 | `NOT_MEASURED` | the measurement did not happen | `--seconds 8`, which delivers 13 % of the offered events |
 
 **`NOT_MEASURED` is a failure, not a skip.** [`LOAD_RESULTS.md`](LOAD_RESULTS.md)
@@ -102,12 +118,18 @@ cannot hold is `OOM_KILLED`.
 
 An OOM kill is established by two independent sources, recorded separately:
 `oom_kill` in the cgroup's `memory.events`, and systemd's own `Result=oom-kill`
-on the scope. In the 2 GiB run both fired, and the process also exited on
-`SIGKILL`.
+on the scope. In build `50190cf`'s 2 GiB run both fired, and the process also
+exited on `SIGKILL`.
+
+**The two sources do not always agree, and both are kept for that reason.** In
+build `9199e07`'s 1 GiB run the cgroup's `oom_kill` counter read **0** while
+systemd reported `Result=oom-kill` and the process exited on `SIGKILL`; the
+1536 MiB and 1792 MiB runs had all three. A verdict resting on the cgroup counter
+alone would have called that run a crash rather than a budget failure.
 
 ---
 
-## The baseline
+## The baseline, before invariant II
 
 Build `50190cf`, default features (**not** `memprof` — its 16-byte tag per live
 allocation was 66–268 MiB in the attribution's runs). Default glibc, no
@@ -143,7 +165,57 @@ instrument, and 4586 MiB here is the same number without it.
 **5 GiB is not a recommendation.** It is the smallest whole GiB that survives,
 and it survives at 86–91 % of itself with a 283 MiB spread across three
 identical runs. Nobody should deploy on 9 % headroom. It is where invariant I
-stands today, and the number M10 and M11 have to move.
+stood at build `50190cf`, and the number M10 and M11 had to move.
+
+---
+
+## After sharing label sets
+
+Build `9199e07`, same features, same glibc, same machine, same workload, same
+seed. The one change between the two tables is
+[`VISION.md`](VISION.md) invariant II's first step: `Labels` is reached through
+`Arc<Labels>` from the memtable to the query result, so a label set is shared by
+a stream's rows instead of copied into each of them. Nothing else on the M10 or
+M11 lists is built — `normal_scan_limit` is still `usize::MAX`, there is still no
+projection pushdown, `entries_bytes` still under-reports, no arena exists, and no
+`MALLOC_*` variable is set.
+
+| declared budget | cgroup limit | verdict | `anon` peak (MiB) | share of budget | at | achieved eps | queries |
+|---|---|---|---|---|---|---|---|
+| 1 GiB | 1 GiB | **`OOM_KILLED`** | 941 | 92 % | 48.8 s | — | — |
+| 1536 MiB | 1536 MiB | **`OOM_KILLED`** | 1530 | 99.6 % | 52.5 s | — | — |
+| 1792 MiB | 1792 MiB | **`OOM_KILLED`** | 1734 | 96.7 % | 59.8 s | — | — |
+| **2 GiB** | 2 GiB | `UNDER_BUDGET` | **1916** | **93.5 %** | 62.3 s | 19 724 | 302 |
+| 2 GiB (repeat) | 2 GiB | `UNDER_BUDGET` | 1842 | 90.0 % | 62.3 s | 19 720 | 302 |
+| 2 GiB (repeat) | 2 GiB | `UNDER_BUDGET` | 1965 | 95.9 % | 62.3 s | 19 723 | 302 |
+| 2 GiB | 8 GiB | `UNDER_BUDGET` | 1913 | **93.4 %** | 62.3 s | 19 729 | 302 |
+
+**The overshoot is gone rather than smaller.** The row that measures it is the
+last one: given 8 GiB of room and asked to stay inside 2 GiB, the anonymous peak
+was **4586 MiB — 2.24×** before, and is **1913 MiB — 0.93×** now. That is the
+same experiment, not a different one, and it is the honest form of the claim
+because the kernel is not enforcing the ceiling in it. The workload's own
+anonymous high-water fell from about **4.5 GiB to about 1.9 GiB, 2.4×**.
+
+**The delivered load went up, not down.** 19 720–19 729 eps against 18 711–18 875
+before, and 302 queries answered against 271–273, so this is not a budget met by
+refusing work — which is the failure mode the 90 % delivery floor exists to
+catch. `delivered_fraction` is 1.001 in every passing run.
+
+**The floor is between 1792 MiB and 2 GiB, and it is not sharp.** The three
+killed runs die at 92–99.6 % of their limits, and 1792 MiB dies at t≈60 s having
+reached only 96.7 % of itself — the last reading before death, which is a lower
+bound. A budget this close to the workload's own high-water is decided by where
+the allocator happens to be when the merge tick lands, not by a threshold.
+
+**2 GiB is still not a recommendation.** It survives at 90–96 % of itself with a
+123 MiB spread across three identical runs, which is less headroom than the 5 GiB
+runs had and the same objection applies: nobody should deploy on 6 %. The rest of
+invariant II — the streaming top-K executor, `normal_scan_limit`, the free
+memcpys, projection pushdown — is what would buy the headroom, and the
+attribution says where: at build `50190cf` **44 % of the anonymous peak was
+memory the process had already freed**, and that fraction is a function of
+allocation traffic, which those items are about.
 
 ---
 
@@ -153,7 +225,7 @@ Stated in the discipline [`COMPARISON.md`](COMPARISON.md) sets.
 
 * **It is not the Docker bed.** A native cgroup v2 scope with the same
   `memory.max`, the same zero swap and the same `anon` — a container of the same
-  kind, not the same container. It also achieves 18.7–18.9 k eps where the
+  kind, not the same container. It also achieves 18.7–19.7 k eps where the
   published Docker run achieved 16.8 k, so the two beds are not
   interchangeable and this one is the easier of them.
 * **Sampling is 4 Hz**, so a spike shorter than 250 ms between samples is not in
@@ -169,11 +241,18 @@ Stated in the discipline [`COMPARISON.md`](COMPARISON.md) sets.
   surviving ones.
 * **One workload, one corpus, one machine, one duration.** The run ends at 1.2 M
   events, i.e. about 65 s and a few dozen parts. A longer run reaches more parts,
-  more merges and more sidecars, and nothing here says the 4.5 GiB high-water is
-  the ceiling of a run that lasts an hour. `LOAD_RESULTS.md` §10's soak is the
-  shape that would answer that.
+  more merges and more sidecars, and nothing here says the 4.5 GiB high-water of
+  `50190cf` or the 1.9 GiB of `9199e07` is the ceiling of a run that lasts an
+  hour. `LOAD_RESULTS.md` §10's soak is the shape that would answer that.
 * **It measures a peak, not a distribution.** Three runs at 5 GiB is enough to
-  see a 283 MiB spread and not enough to put a bound on it.
+  see a 283 MiB spread and not enough to put a bound on it; three at 2 GiB see
+  123 MiB and say no more.
+* **Two builds, one variable, and no proof it was the only one.** Everything
+  between `50190cf` and `9199e07` is in the second table, not just the label
+  sharing: the `end`-exclusive fix, the extracted-field placement, the index
+  sidecar merge. None of them is a memory change and the bench tables attribute
+  the drop to the label sets, but this document measured the pair of builds and
+  not the pair of diffs.
 * **The 90 % delivery floor is a judgement.** A run that delivered 89 % of its
   offered events would be reported as unmeasured; the number is chosen to reject
   a budget met by refusal, not calibrated against anything.

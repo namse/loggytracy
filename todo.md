@@ -176,7 +176,8 @@ that never contend with writes. Optimizing against those numbers reproduces them
       run so a drift back toward the retired harness's 31.5x is visible immediately. The row and part benches
       carry a counting global allocator, because time is the wrong instrument for invariants I and II: it
       already reads two allocations per label per row at `part/mod.rs:302`, which is the number `Arc<Labels>`
-      has to move
+      has to move — and did: 11/17/27 allocations per row at 2/5/10 labels became 6.00 at all three, so the
+      table's job is now to keep it flat rather than to watch it grow
 - [x] **Rewrite `src/bin/load.rs`** (now `src/bin/load/`): N keep-alive connections per workload over a
       hand-rolled HTTP/1.1 client on tokio (no new dependency — the server binary keeps object storage as its
       only outbound call); latency taken from the *intended* send, with service time and response time both
@@ -331,7 +332,9 @@ only thing that can say whether a fix worked, so it landed before them and it la
       (`docs/LOAD_RESULTS.md` §3: a gate that cannot measure must not pass; a budget met by
       refusing 90% of the offered load counts as unmeasured). **Measured: OOM-killed at t≈49 s at
       2 GiB; survives at 5 GiB at 86–91% of it; 4586 MiB of `anon` — 2.24× — when given 8 GiB of
-      room and asked to stay inside 2 GiB.** Not in CI: it needs a cgroup scope and minutes per run,
+      room and asked to stay inside 2 GiB — all on build `50190cf`. On `9199e07`, with M11's shared
+      label sets, the same commands read: **`UNDER_BUDGET` at 2 GiB at 90–96% across three runs, and
+      0.93x rather than 2.24x when given 8 GiB of room.** Not in CI: it needs a cgroup scope and minutes per run,
       and a peak-memory number off a shared runner is the kind this repository has already retired.
       CI compiles it, so it cannot rot the way a script and a document did
 - [ ] **The gate should read the budget from the server once the knob exists**, rather than being
@@ -350,11 +353,17 @@ only thing that can say whether a fix worked, so it landed before them and it la
       **1.70–1.79x under** in situ on the comparison corpus, so `MAX_MEMTABLE_BYTES=256 MiB` is really ~440 MiB
 - [ ] `LOGGYTRACY_MEMORY_BUDGET` divided into ingest 20% / flush 25% / merge 25% / query 25% / sidecar 5% —
       the measured shares, not the guessed ones. Existing knobs become overrides; what is not overridable is
-      that they sum. **Flush and merge do not fit their shares today** (721 MiB and 771 MiB measured against
-      512 MiB each at a 2 GiB budget), which is the work, not a reason to raise the shares
-- [ ] **Flush cannot be sized independently of ingest.** `rows_from_snapshot` holds a copy of the memtable at
-      **3.3x its accounted size** and 1 326–1 345 bytes per row, and the two peak together. Either the flush
-      share is expressed as a multiple of the ingest share, or the flush streams the snapshot in bounded chunks
+      that they sum. **Flush and merge did not fit their shares** (721 MiB and 771 MiB measured against
+      512 MiB each at a 2 GiB budget), which is the work, not a reason to raise the shares. Flush's share is
+      no longer the same problem — M11's shared label sets took `rows_from_snapshot` from 1 345 to 823 bytes
+      per row and its peak live from 26–28 MB to 13.85 MB on the bench — but the arena was never
+      re-measured in situ, so **721 MiB is a figure for a build that no longer exists and the number for
+      this one is not known.** Re-run the attribution before sizing anything from it
+- [ ] **Flush cannot be sized independently of ingest.** `rows_from_snapshot` held a copy of the memtable at
+      **3.3x its accounted size** and 1 326–1 345 bytes per row, and the two peaked together. The label sets
+      are now shared with the memtable rather than copied out of it, so the copy is the lines and the
+      metadata; the multiple is no longer 3.3 and has not been measured in situ. Either the flush share is
+      expressed as a multiple of the ingest share, or the flush streams the snapshot in bounded chunks
 - [ ] **Query admission by budget, not by slot.** Replace `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES`
       (8 × 512 MiB = 4 GiB, admitted in a comment at `config.rs:522`) with a shared arena. Same ceiling, and a
       burst of cheap queries no longer queues behind a slot count. The arena must include the metric path's
@@ -377,10 +386,36 @@ only thing that can say whether a fix worked, so it landed before them and it la
 
 Write path:
 
-- [ ] **`Arc<Labels>` end to end** — memtable, `Row`, part write, reader, query result. `Row::from_entry`
-      (`part/mod.rs:302`) currently clones the whole `BTreeMap` per row, `encode_stream_index`
-      (`part/indexes.rs:77-82`) clones every name and value again per row per label, and `write_meta`
-      (`part/metadata.rs:25-28`) clones the set a third time. Largest single payoff in the repository
+- [x] **`Arc<Labels>` end to end** — memtable, `Row`, part write, reader, registry, executor, query
+      result and the metric path, as `SharedLabels = Arc<Labels>`. **The "largest single payoff" claim
+      held.** `cargo bench --bench rows`: `rows_from_snapshot` goes from **1 457/1 505/1 569 bytes per
+      row** at 2/5/10 labels to **823.4 at all three**, from **11/17/27 allocations per row** to
+      **6.00**, and peak live from 26.0/27.0/28.3 MB to **13.85 MB flat** — the label term is not
+      smaller, it is gone, and the table is now flat in the label sweep. `--bench part`: the scan goes
+      from 3796/3955/4078 bytes per row to **3167/3263/3337** and from 11.2/19.3/27.4 allocations per
+      row to **6.19/6.32/6.45**, with peak live 54.0/56.5/58.4 MB to **31.0 MB flat**. Timings improved
+      everywhere and nothing regressed: `rows/from_snapshot` 1.80–4.31x, `rows/from_entry` 1.82x at two
+      labels and **4.40x at ten**, `part/scan_tenants/1` 1.36x, `part/scan_label_columns/10` 1.27x,
+      `memtable/query_cardinality/8192` 1.83x. **The gate moved from 5 GiB to 2 GiB**
+      ([`docs/MEMORY_BUDGET_GATE.md`](docs/MEMORY_BUDGET_GATE.md)): `--budget 2GiB` was `OOM_KILLED` at
+      t≈49 s and is now `UNDER_BUDGET` at 90–96% across three runs, and the 2.24x overshoot measured by
+      `--budget 2GiB --limit 8GiB` is **0.93x** — the workload's own anonymous high-water fell from
+      ~4.5 GiB to ~1.9 GiB while achieved eps rose from 18.7 k to 19.7 k. `encode_stream_index` is now
+      keyed by borrows of the rows and `write_meta` collects distinct borrows, so both clone per stream
+      rather than per row; the reader interns one label set per distinct stream per scan, keyed on a
+      hash of the row's label columns with every candidate verified against them
+  - [x] **A fifth site, on the metric path and not on this list:** `sample_value`
+        (`query/metrics.rs`) built a `BTreeMap` of every label and every metadata pair per row to read
+        the one field an `unwrap` names. It resolves that field directly now
+  - [ ] **A sixth, still there:** `process_entry_with_labels_cancellable` (`logql/ast.rs:228`) clones
+        `labels` into a mutable `fields` map **per row**, for every query including one with no pipeline
+        stages at all. Removing it needs a copy-on-write field view across the whole pipeline, not a
+        type change, and it sits directly on the just-fixed extracted-field placement
+  - [ ] **Two meters now over-count, both conservatively.** `Row::materialized_bytes`
+        (`part/mod.rs`) and `estimated_log_entry_memory_bytes` (`query/mod.rs`) charge every row for the
+        label bytes it shares, so merge group sizing and `max_query_memory_bytes` are stricter than the
+        memory that is really held. Neither was loosened here: that changes a limit and belongs with
+        M10's honest metering
 - [ ] Remove the two free memcpys: the line clone at `ingest.rs:247` (the source is separately owned and could
       be consumed), and the whole-payload copy in `frame_tenant_record` (`journal/mod.rs:90-101`) whose 7-byte
       prefix belongs in `writer_loop`'s batch buffer
@@ -399,8 +434,10 @@ Read path:
 - [ ] **Kill `normal_scan_limit = usize::MAX`** (`query/execution.rs:102-106`). Any pipeline stage today means
       the whole window is materialized before the pipeline reduces it — the most common Grafana query shape.
       Replace with a merge of per-part sorted iterators feeding a bounded top-K heap
-- [ ] That also deletes the triple materialize-and-sort with a per-row `Labels` clone at each hop
-      (`reader.rs:1041`, `part_registry.rs:628`, `execution.rs:202`)
+- [ ] That also deletes the triple materialize-and-sort at `reader.rs`, `part_registry.rs` and
+      `execution.rs`. **The per-row `Labels` clone at each of the three hops is already gone** — all
+      three now clone an `Arc` — but the three materializations and the three sorts are still there,
+      and they are what the streaming executor removes
 - [ ] **Projection pushdown.** `ProjectionMask` appears nowhere; `count_over_time({app="x"}[5m])` decodes every
       label column and the `structured_metadata` JSON blob
 - [ ] **Cache Parquet footer metadata on the reader.** `open_part_data` re-opens the file and re-runs

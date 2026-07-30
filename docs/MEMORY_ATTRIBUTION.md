@@ -6,9 +6,13 @@ OOM-killed and Loki is not** ([`COMPARISON.md`](COMPARISON.md)), while
 `loggytracy_memtable_bytes` reported 111 MB. This document is the measurement
 that says what the rest of it was.
 
-It is a diagnosis. Nothing here is fixed, and the budget of
-[`VISION.md`](VISION.md) invariant I is not built — but the *gate* for it now is,
-because a fix needs something that can tell whether it worked:
+It is a diagnosis, and every number in it is build `50190cf`'s. One of the things
+it diagnosed has since been fixed — hypothesis 2, the per-row `Labels` clone —
+and **nothing here was re-measured afterwards**, so this document describes an
+engine that no longer exists and its tables should be read that way. The budget of
+[`VISION.md`](VISION.md) invariant I is still not built — but the *gate* for it is,
+because a fix needs something that can tell whether it worked, and it is what said
+this one did:
 [`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md) runs the engine at a declared
 budget and compares peak cgroup `anon` against it. The reason for measuring
 first is written into that invariant: its arena split — ingest 25 %, flush 15 %,
@@ -280,6 +284,20 @@ churn, because most of that churn happens in the scan, before any limit applies
 rejects it).
 
 ### 2. `Row::from_entry` cloning `Labels` per row — **confirmed, and it is the largest *live* term once the allocator is honest**
+
+**Fixed, and the fix is the strongest evidence this hypothesis was right.** Build
+`9199e07` shares one label set per stream through `Arc<Labels>` from the memtable
+to the query result. On the controlled side `rows_from_snapshot` went from 1 345 to
+**823 bytes per row live** and from 17 to **6 allocations per row**, flat across
+2, 5 and 10 labels where it used to grow. On the gate — the only instrument that
+answers invariant I — `--budget 2GiB` went from `OOM_KILLED` at t≈49 s to
+`UNDER_BUDGET`, and the measured overshoot from **2.24× to 0.93×**
+([`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md)). **Everything below in this
+document is still build `50190cf`'s and has not been re-measured**, including the
+721 MiB flush figure this hypothesis rests on, the 44% retained-free share, and
+the 203 MiB of hypothesis 8. A second run of this document is what would say where
+the memory goes now; scaling its tables by the bench's factor would be the error
+it exists to prevent.
 
 Two independent measurements agree.
 

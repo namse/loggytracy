@@ -32,11 +32,17 @@ back is to stop asking for it — the engine requested 52 GB across 444 million
 allocations in 33 seconds, 217× the rate data arrived at.
 
 So invariant I's arena machinery is the *last* step, not the first. Ahead of it,
-in order: ~~the verification test~~ — **built, and red**
-([`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md): OOM-killed at 2 GiB, survives
-at 5 GiB, 2.24× over the budget when given room to overshoot); then II, because
-that is where the churn is; then whatever the allocator still retains, measured
-and published as a multiplier; and only then the arenas, sized from what remains.
+in order: ~~the verification test~~ — **built** ([`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md));
+then II, because that is where the churn is; then whatever the allocator still
+retains, measured and published as a multiplier; and only then the arenas, sized
+from what remains.
+
+**The order was right, and the first step of II is what proved it.** The gate was
+red at 2 GiB and green at 5, with a 2.24× overshoot when given room. Sharing label
+sets rather than copying them per row — nothing else on either list — made it
+green at 2 GiB and took the overshoot to 0.93×, at a higher delivered rate than
+before. That is one item of II's list moving invariant I's number by 2.4×, which
+is the argument for doing II before I rather than a claim about it.
 
 ### I. Memory is a budget you declare, not a number that emerges
 
@@ -55,7 +61,7 @@ the earlier table here was a guess and every one of its numbers moved:
 | Arena | Share | Measured high-water at 2 GiB | Holds | On overflow |
 |---|---|---|---|---|
 | ingest | 20% | 378 MiB | memtable, trace memtable, in-flight push bodies | `429` + `Retry-After` (already the mechanism) |
-| flush | 25% | **721 MiB** | materialized rows, Parquet writer buffers | defer the flush; ingest backs up into its own arena and refuses there |
+| flush | 25% | **721 MiB** (build `50190cf`; not re-measured since the label sets were shared) | materialized rows, Parquet writer buffers | defer the flush; ingest backs up into its own arena and refuses there |
 | merge | 25% | **771 MiB** | one merge group | split the group; skip the tick |
 | query | 25% | 242 MiB + 203 MiB untagged | every concurrent scan, pipeline stage and metric evaluation | queue, then `429` |
 | sidecar | 5% | 17 MiB | blooms, stream index, part metadata | evict least-recently-used sidecars; reload from `index.bin` |
@@ -63,12 +69,21 @@ the earlier table here was a guess and every one of its numbers moved:
 Shares are defaults, individually overridable. What is not overridable is that
 they sum to the budget.
 
-**Two of the five do not fit their share as the engine is written**, and that is
-the finding rather than a sizing problem: flush materializes a whole memtable
+**Two of the five did not fit their share when this was measured**, and that is
+the finding rather than a sizing problem: flush materialized a whole memtable
 snapshot at 3.3× its accounted size, and one merge group reached 771 MiB against
 a `merge_max_memory_bytes` default of 1 GiB — half the container. Their shares
 are targets the code must be made to meet (invariant II's `Arc<Labels>` and a
 chunked flush; a group split sized from the budget), not descriptions of it.
+
+**`Arc<Labels>` has landed and the table has not been re-measured, so every
+figure in it is build `50190cf`'s.** The flush arena's 721 MiB was a *copy* of the
+memtable — that copy is now a refcount — and the bench that agreed with it to
+1.4% has moved from 1 345 to 823 bytes per row and from 26–28 MB of peak live to
+13.85 MB. The right response is to re-run
+[`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) rather than to scale these
+numbers by the bench's factor, because the whole point of that document is that
+the in-situ composition was not what anyone predicted.
 
 **Two consequences that are architectural, not tuning.**
 
@@ -120,18 +135,24 @@ times" ([`RUNBOOK.md`](RUNBOOK.md):27), which is the honest description of an
 engine that does not have this invariant.
 
 **That test is built, it is the first of these steps rather than the last, and it
-is red.** `src/bin/memory_gate.rs` runs the comparison bed's workload — ingest
+was red.** `src/bin/memory_gate.rs` runs the comparison bed's workload — ingest
 with reads concurrent with writes — in a cgroup v2 scope at a declared budget and
 compares the peak of the cgroup's `anon` against it, because the engine's own
 accounting is the thing being audited and cannot be the auditor. It distinguishes
 four outcomes by exit code, and *could not be measured* is one of them and is a
-failure. Measured: at the 2 GiB the comparison bed used, **OOM-killed at
-t≈49 s**; the smallest declared budget this engine survives its own load at is
-**5 GiB**, and given 8 GiB of room while asked to stay inside 2 GiB its anonymous
-peak is 4586 MiB — **2.24× the budget it was given.** That factor is what the
-rest of this invariant and invariant II have to close.
-[`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md) is the baseline and its
-limitations.
+failure. Measured on build `50190cf`: at the 2 GiB the comparison bed used,
+**OOM-killed at t≈49 s**; the smallest declared budget it survived its own load at
+was **5 GiB**, and given 8 GiB of room while asked to stay inside 2 GiB its
+anonymous peak was 4586 MiB — **2.24× the budget it was given.**
+
+**Invariant II's first step closed most of that gap.** On build `9199e07`, with
+label sets shared instead of copied per row and nothing else on either list built,
+the gate is `UNDER_BUDGET` at **2 GiB** at 90–96% of it across three runs, red at
+1792 MiB, and the same `--limit 8GiB` experiment reads **1913 MiB — 0.93×** rather
+than 2.24×, at 19.7 k eps against 18.7 k. What is left is 6% of headroom at 2 GiB,
+which is not a budget anyone should deploy on, and the rest of the invariant is
+what buys it. [`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md) is both baselines
+and their limitations.
 
 ### II. A line's bytes are copied a bounded number of times, and label sets are never de-shared
 
@@ -162,34 +183,49 @@ WAL so replay has one decoder (`proto.rs:99-127`). The single-decoder property i
 right and worth keeping; materializing a whole second message with per-line and
 per-label clones to get it is not.
 
-**Label sets are the bigger term.** The memtable holds one `Labels` per stream —
-correct, and its byte accounting reflects it (`memtable.rs:57-67`). Then
-`Row::from_entry` clones the whole `BTreeMap` **per row** (`part/mod.rs:302`),
-`encode_stream_index` clones every name and value again per row per label
-(`part/indexes.rs:77-82`), and `write_meta` clones the set a third time
-(`part/metadata.rs:25-28`). A ten-label stream with ten thousand entries turns
-200 bytes of labels into roughly 150 MB of `Vec<Row>`, and nothing gates it.
+**Label sets were the bigger term, and this part is done.** The memtable holds one
+`Labels` per stream — correct, and its byte accounting reflects it
+(`memtable.rs:57-67`). Then `Row::from_entry` cloned the whole `BTreeMap` **per
+row**, `encode_stream_index` cloned every name and value again per row per label
+because `BTreeMap::entry` wants an owned key, and `write_meta` cloned the set a
+third time. The read path mirrored it: reader → registry → execution materializes,
+cloned per row, and sorts, **three times** — and a **fourth** on the metric path,
+which [`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) found by measuring, on an
+async worker thread outside the `spawn_blocking` and outside every budget, 203 MiB
+at its high-water. A **fifth** turned up while removing them: `sample_value` built
+the whole field set per row to read the one field an `unwrap` names.
 
-The read path is the same mistake mirrored: reader → registry → execution
-materializes, clones per row, and sorts, **three times**
-(`reader.rs:1041`, `part_registry.rs:628`, `execution.rs:202`) — and a **fourth**
-on the metric path, which
-[`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) found by measuring: after the
-scan returns, `evaluate_metric_query` walks every row on an async worker thread
-and clones `stream.labels` per row again (`query/metrics.rs:134-155`), outside
-the `spawn_blocking` at `:158` and outside every budget. It is 203 MiB at its
-high-water, and it is the whole reason `rate()` is 7.1× slower than Loki.
+`Labels` is now reached through `SharedLabels = Arc<Labels>` from the memtable to
+the query result, so a stream's label set is allocated once and every row points
+at it. The two writer sites that needed owned keys are keyed by borrows instead,
+and the reader interns one label set per distinct stream per scan. **The claim
+that this was the largest single payoff in the repository held, and it is the one
+number that says so:** the gate went from `OOM_KILLED` at 2 GiB to `UNDER_BUDGET`
+at 2 GiB, and the measured overshoot from 2.24× to 0.93×
+([`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md)).
 
-Measured, so the payoff has a number: `rows_from_snapshot` allocates **1 503
-bytes and 17 allocations per row** and holds **1 345 bytes per row live** at five
-labels, identically at 1, 256 and 8192 streams — the clone is per row, not per
-stream. In the running engine that is a `Vec<Row>` at **3.3× the accounted
-memtable it was built from**, and the flush path's whole cost is **26 kB and 356
-allocations per 368-byte line**.
+On the benches, where the number that had to move was bytes per row:
+`rows_from_snapshot` allocated **1 457 / 1 505 / 1 569 bytes and 11 / 17 / 27
+allocations per row** at 2 / 5 / 10 labels, identically at 1, 256 and 8192 streams
+— the clone was per row, not per stream — and now allocates **823.4 bytes and 6.00
+allocations per row at every point of that sweep**, with peak live flat at
+13.85 MB instead of 26.0–28.3 MB. The part scan went from **3796 / 3955 / 4078
+bytes and 11.2 / 19.3 / 27.4 allocations per row** to **3167 / 3263 / 3337 and
+6.19 / 6.32 / 6.45**, with peak live flat at 31.0 MB instead of 54.0–58.4 MB.
+Nothing in either bench got slower, including the two-label case where an atomic
+increment replaces a small bulk allocation and a regression was the expectation:
+`rows/from_entry` is 1.82× faster at two labels and 4.40× at ten.
 
-`Arc<Labels>` end to end — memtable, `Row`, part write, reader, query result —
-removes all of it. This is one type change with the largest single payoff in the
-repository.
+**Three things this did not remove.** `process_entry_with_labels_cancellable`
+still clones the label set into a mutable field map **per row**, for every query
+including one with no pipeline stages, and undoing that is a copy-on-write field
+view across the whole pipeline rather than a type change. The three
+materialize-and-sort hops on the read path are still three, because only the clone
+at each hop went away. And `Row::materialized_bytes` and
+`estimated_log_entry_memory_bytes` still charge every row for label bytes it now
+shares, so merge sizing and the query memory ceiling are conservative by the
+rows-per-stream factor — a meter to fix with the rest of the metering, not a limit
+to loosen on the way past.
 
 Also in this invariant: **one decode, one sort, one parse.** `sort_rows` runs
 globally and then again per partition (`part/format.rs:22`, `:91`), and
@@ -222,6 +258,12 @@ its churn; the rest is the per-row work that happens before any limit can apply,
 which is the triple materialize and `reader.rs:727` allocating the line before
 the filter that rejects it. See
 [`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md).
+
+Those figures are build `50190cf`'s, and every one of them included a `Labels`
+clone per row at each of the three hops and a fourth on the metric path, which no
+longer happen. They are an upper bound on what this shape costs now; nothing here
+re-measured them, and the ratio between the two shapes is the part of the finding
+that does not depend on it.
 
 **Pruning we index for and then do not use:**
 
