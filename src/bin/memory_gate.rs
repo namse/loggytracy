@@ -145,6 +145,14 @@ struct Args {
     query_connections: usize,
     seed: u64,
     port: u16,
+    /// Seconds to keep the server running after the workload stops.
+    ///
+    /// Without this the gate measures the peak of *accepting* load and calls it
+    /// the peak. It is not: the comparison bed was OOM-killed fifteen seconds
+    /// after its last row was accepted, in the idle settle, while merge
+    /// consolidated the parts ingest had left behind. The default matches that
+    /// bed's `COMPARE_SETTLE_SECONDS` so the two ask the same question.
+    settle: u64,
     server_env: Vec<(String, String)>,
     skip_build: bool,
     keep_data: bool,
@@ -167,6 +175,11 @@ usage: memory_gate --budget <size> [options]
   --connections <n>      ingest connections (default: 8)
   --query-eps <n>        query rate; must be > 0 (default: 5)
   --query-connections <n> query connections, separate from ingest (default: 4)
+  --settle <n>           seconds to keep sampling after the workload stops, so
+                         the merge backlog load leaves behind is inside the peak
+                         (default: 150, the comparison bed's settle). 0 measures
+                         only the peak of accepting load, which is what this
+                         gate did before it was found to miss a kill.
   --seed <n>             corpus seed (default: 1592598566, the comparison bed's)
   --port <n>             server HTTP port (default: 3251)
   --server-env K=V       extra environment for the server, repeatable
@@ -193,6 +206,7 @@ impl Args {
         // docs/COMPARISON.md and docs/MEMORY_ATTRIBUTION.md were measured on.
         let mut seed = 1_592_598_566;
         let mut port = 3251;
+        let mut settle = 150;
         let mut server_env = Vec::new();
         let mut skip_build = false;
         let mut keep_data = false;
@@ -217,6 +231,7 @@ impl Args {
                 "--query-connections" => query_connections = parse_number(&value()?)?,
                 "--seed" => seed = parse_number(&value()?)?,
                 "--port" => port = parse_number(&value()?)?,
+                "--settle" => settle = parse_number(&value()?)?,
                 "--server-env" => {
                     let raw = value()?;
                     let (key, val) = raw
@@ -270,6 +285,7 @@ writes is not the workload this gate exists to measure"
             query_connections,
             seed,
             port,
+            settle,
             server_env,
             skip_build,
             keep_data,
@@ -452,6 +468,30 @@ fn measure(args: &Args, facts: &mut Map<String, Value>) -> Result<Outcome, Strin
         thread::sleep(Duration::from_millis(200));
     }
 
+    // The workload has stopped. Everything above measured the peak of
+    // *accepting* load; the settle measures the peak of still holding it.
+    //
+    // This phase exists because the comparison bed was OOM-killed fifteen
+    // seconds after its last row was accepted, while merge consolidated the
+    // parts ingest had left behind — and this gate passed the same budget,
+    // because it stopped here. `docs/MEMORY_ATTRIBUTION.md` had already
+    // measured one merge group's rewrite as the largest single live term.
+    let ingest_ended_at = sampler.elapsed_seconds();
+    if server_exit.is_none() && args.settle > 0 {
+        let settle_until = Instant::now() + Duration::from_secs(args.settle);
+        while Instant::now() < settle_until {
+            if let Ok(Some(status)) = scope.child.try_wait() {
+                server_exit = Some(status);
+                // Same reason as above: systemd tears the cgroup down with the
+                // last process in it, taking the counter and its own verdict.
+                sampler.sample_now();
+                scope_result = scope.result();
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+
     let samples = sampler.stop();
     if server_exit.is_none()
         && let Ok(Some(status)) = scope.child.try_wait()
@@ -501,6 +541,14 @@ fn measure(args: &Args, facts: &mut Map<String, Value>) -> Result<Outcome, Strin
                 .unwrap_or(0) as f64
                 / MIB,
             "cgroup_memory_peak_note": "includes reclaimable page cache; recorded, not gated",
+            // Which phase the peak came from is the finding, not a detail. A
+            // gate that reports one number cannot say that the engine survived
+            // the load and then died cleaning up after it.
+            "peak_phase": if peak.at_seconds <= ingest_ended_at { "ingest" } else { "settle" },
+            "ingest_ended_at_seconds": ingest_ended_at,
+            "settle_seconds_requested": args.settle,
+            "ingest_phase_anon_peak_mib": phase_peak_mib(&samples, |at| at <= ingest_ended_at),
+            "settle_phase_anon_peak_mib": phase_peak_mib(&samples, |at| at > ingest_ended_at),
             "samples": samples.len(),
             "sample_interval_ms": SAMPLE_INTERVAL.as_millis(),
             "series_csv": series.display().to_string(),
@@ -603,6 +651,19 @@ struct Sample {
     oom_kill: u64,
 }
 
+/// Peak `anon` over the samples a phase covers, in MiB, or null when the phase
+/// produced none — a settle of zero seconds has no samples, and reporting 0.0
+/// for that would read as "it held nothing".
+fn phase_peak_mib(samples: &[Sample], in_phase: impl Fn(f64) -> bool) -> Value {
+    samples
+        .iter()
+        .filter(|sample| in_phase(sample.at_seconds))
+        .map(|sample| sample.anon)
+        .max()
+        .map(|anon| json!(anon as f64 / MIB))
+        .unwrap_or(Value::Null)
+}
+
 struct Sampler {
     stop: Arc<AtomicBool>,
     samples: Arc<Mutex<Vec<Sample>>>,
@@ -636,6 +697,12 @@ impl Sampler {
             cgroup: cgroup.to_path_buf(),
             started,
         }
+    }
+
+    /// Seconds since sampling began, so a phase boundary can be expressed in
+    /// the same clock the samples carry.
+    fn elapsed_seconds(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
     }
 
     /// An extra reading taken off the sampler's schedule, for the moment a
