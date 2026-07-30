@@ -283,6 +283,56 @@ not the place to read the size of that effect. `benches/query.rs` is
 
 ---
 
+## The gate stops one phase too early — found by the comparison bed, 2026-07-30
+
+**The gate passes at 2 GiB and the engine still dies at 2 GiB.** Both are true,
+and the difference is the gate's blind spot rather than a disagreement between
+two measurements.
+
+An attempt to regenerate [`COMPARISON.md`](COMPARISON.md) at revision `5f1e9a2`
+was OOM-killed in its 2 GiB container (`OOMKilled: true`, exit 137). The
+sequence, from the container's own log and the harness's result files:
+
+| time (KST) | what |
+|---|---|
+| 14:44–14:45 | ingest phase, 1.2 M events — completed |
+| 14:45:19 | seed phase, 150,000 verification rows — **`PASS`**, 1,504 pushes, 0 errors, all `204` |
+| 14:45:30 | **merge completed: 6 parts into 1** |
+| 14:45:32 | flush, 78,808 rows |
+| 14:45:47 | **OOM-killed** |
+
+It died **fifteen seconds after the last row was accepted**, in the idle settle,
+while merge consolidated the parts that ingest and the seed had left behind. Not
+during ingest. Not during the push. During the catch-up.
+
+The gate never sees this, because the gate's workload ends when ingest ends. It
+measures the peak of *accepting* load and then stops, so the merge backlog that
+load leaves behind is outside every number in this document. That is the same
+shape of defect as every other one this project has found: an instrument that
+reports a pass over the half of the problem it happens to look at. The
+[`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) figure that predicted it is
+already recorded — one merge group's rewrite was the **largest single live term
+at 771 MiB**, against a `merge_max_memory_bytes` default of **1 GiB, half of a
+2 GiB container**, derived from no number the operator gave.
+
+So the honest reading of this document's "smallest surviving budget" is **the
+smallest budget that survives ingest**, and it is not the same question as
+whether the engine fits a container. Fixing the gate is a precondition for the
+arena work, exactly as building the gate was a precondition for the fixes:
+
+- The gate must run through a settle with merge active, and gate on the peak
+  across it.
+- `merge_max_memory_bytes` must derive from the declared budget instead of
+  defaulting to half a small container.
+
+A second axis surfaced in the same run and is **not** what killed it, but was
+never published either: in the load phase — queries concurrent with 20 k eps of
+ingest — query response p95 was **22.9 s** today at 2 GiB, and was **5.7 s at
+2 GiB and 27.2 s at 8 GiB** in the M9 artifacts (`docs/artifacts/m9/`). The
+published comparison table never showed this, because its query columns come
+from the matrix phase: one connection, a small dataset, no ingest running. Query
+latency *under* ingest is a third measured axis with no gate on it.
+
 ## What this does not establish
 
 Stated in the discipline [`COMPARISON.md`](COMPARISON.md) sets.

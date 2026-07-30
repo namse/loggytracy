@@ -281,6 +281,31 @@ that never contend with writes. Optimizing against those numbers reproduces them
       the requested `end` to stay on it; loggytracy steps from `start`. The matrix aligns its window boundaries
       so this is a no-op, because otherwise a row-equality failure would be about the bed's choice of window
 
+## Next — the gate stops one phase too early
+
+Found 2026-07-30 by trying to regenerate [`docs/COMPARISON.md`](docs/COMPARISON.md) at `5f1e9a2`. **The
+comparison did not complete and no new verdict exists**; the published document is still the M9 run's.
+Details and the timeline are in [`docs/MEMORY_BUDGET_GATE.md`](docs/MEMORY_BUDGET_GATE.md).
+
+The engine was OOM-killed in its 2 GiB container **fifteen seconds after the last row was accepted**, in the
+idle settle, while merge consolidated what ingest and the seed had left behind. The memory gate passes at
+2 GiB because its workload *ends when ingest ends* — so the merge backlog load leaves behind is outside every
+number that document reports. This blocks the arena work the same way building the gate blocked the fixes:
+there is no point sizing arenas against a measurement that stops before the largest term runs.
+
+- [ ] **Extend the memory gate through a settle with merge active**, and gate on the peak across it, not on
+      the peak of accepting load. The current pass means "survives ingest", which is not "fits a container"
+- [ ] **`merge_max_memory_bytes` must derive from the declared budget.** It defaults to 1 GiB — *half* of a
+      2 GiB container — from no number the operator gave, and
+      [`docs/MEMORY_ATTRIBUTION.md`](docs/MEMORY_ATTRIBUTION.md) already measured one merge group's rewrite as
+      the **largest single live term at 771 MiB**. That measurement predicted this kill and nothing acted on it
+- [ ] **Query latency under ingest has no gate.** In the load phase — queries concurrent with 20 k eps — p95
+      was 22.9 s today at 2 GiB, and 5.7 s at 2 GiB / 27.2 s at 8 GiB in the M9 artifacts. The published
+      comparison never showed it: its query columns come from the matrix phase, which is one connection over a
+      small dataset with no ingest running. Three axes are now measured and two of them are ungated
+- [ ] Re-run `compare/run.sh` once the above lands. The matrix limit sweep is already in place (`5f1e9a2`), so
+      the run will report both the published limit of 20000 and Grafana's default of 100
+
 ## M10 — declared memory budget ([`docs/VISION.md`](docs/VISION.md) I)
 
 M9 supplied the number this milestone was missing: **at a 2 GiB container limit, ingesting 1.2 M events at an
