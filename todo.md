@@ -306,6 +306,42 @@ there is no point sizing arenas against a measurement that stops before the larg
 - [ ] Re-run `compare/run.sh` once the above lands. The matrix limit sweep is already in place (`5f1e9a2`), so
       the run will report both the published limit of 20000 and Grafana's default of 100
 
+## Next — stream the merge instead of materializing it
+
+[`docs/MEMORY_ATTRIBUTION.md`](docs/MEMORY_ATTRIBUTION.md)'s settle section measured where the budget gate's
+kill comes from: at the settle peak, **merge holds 829 of 847 live megabytes** across **7.2 million live
+allocations**, and ingest and flush have released everything. Its budget is not the lever — deriving it from
+the container was tried and measured worse. The lever is that `read_all_rows_with_limit`
+(`merge/selection.rs`) materializes the whole group as a `Vec<Row>` before a byte is written, so a part's
+worth of rows is live at once.
+
+**The design is validated, not guessed.** The one structural obstacle was that `part_schema` needs every
+stream label in the part *before* the first row group is written, which a stream cannot know. It does not
+have to: `PartMeta` already carries `stream_labels` and `min_ts_ns` (`part/mod.rs:284-300`), so the output
+schema and the part id come from the inputs' metadata without reading a row.
+
+- [ ] **A paged row iterator per `PartReader`**, over `read_rows_in_row_groups`, so one row group is live
+      rather than a part
+- [ ] **A k-way merge across the group's iterators**, with the dedup `sort_rows` does today on adjacent equal
+      sort keys. Inputs are each already sorted by `(tenant, timestamp_ns, …)`, which is what makes the merge
+      output sorted without a sort
+- [ ] **A streaming `write_part_files`.** Every accumulator it needs is incremental: `write_parquet` already
+      flushes per row group to pin ordinals; blooms and the stream index are per row group; `write_meta`'s
+      row count, min/max, tenant segments and `materialized_bytes` all accumulate; and `row_group_bounds` cuts
+      on a tenant change, which a sorted stream reaches in order
+- [ ] Keep `read_in_batches`'s split fallback meaningful, or retire it deliberately. It exists so a part
+      larger than the budget can still be rewritten — **which is what makes zero-retention deletion actually
+      delete** (`docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md` N1a). Streaming should make it unreachable
+      rather than wrong, and that must be argued rather than assumed
+- [ ] Re-run the extended memory gate and report the smallest surviving budget. Current: `OOM_KILLED` at
+      2 GiB with the settle peak at 1991/1954 MiB, ingest peak 1683-1703
+
+**Not started deliberately.** This touches `part/format.rs`, which owns the checksums, the tenant segments,
+the row-group bounds and the atomic publication every durability guarantee here rests on. It is a change of
+the same size as the streaming top-K executor and wants a session with room to iterate and test, not the tail
+of one. The measurement that justifies it and the design that unblocks it are both recorded above, so the
+next session starts from a validated plan rather than a hypothesis.
+
 ## M10 — declared memory budget ([`docs/VISION.md`](docs/VISION.md) I)
 
 M9 supplied the number this milestone was missing: **at a 2 GiB container limit, ingesting 1.2 M events at an
