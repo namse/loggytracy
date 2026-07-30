@@ -32,10 +32,11 @@ back is to stop asking for it — the engine requested 52 GB across 444 million
 allocations in 33 seconds, 217× the rate data arrived at.
 
 So invariant I's arena machinery is the *last* step, not the first. Ahead of it,
-in order: the verification test, because it is the only thing in this document
-that would have caught the above; then II, because that is where the churn is;
-then whatever the allocator still retains, measured and published as a
-multiplier; and only then the arenas, sized from what remains.
+in order: ~~the verification test~~ — **built, and red**
+([`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md): OOM-killed at 2 GiB, survives
+at 5 GiB, 2.24× over the budget when given room to overshoot); then II, because
+that is where the churn is; then whatever the allocator still retains, measured
+and published as a multiplier; and only then the arenas, sized from what remains.
 
 ### I. Memory is a budget you declare, not a number that emerges
 
@@ -117,6 +118,20 @@ sustained mixed load and asserts peak RSS stays under it. Not a sizing paragraph
 in the runbook. Today the runbook says "size on peak, not idle — roughly fifty
 times" ([`RUNBOOK.md`](RUNBOOK.md):27), which is the honest description of an
 engine that does not have this invariant.
+
+**That test is built, it is the first of these steps rather than the last, and it
+is red.** `src/bin/memory_gate.rs` runs the comparison bed's workload — ingest
+with reads concurrent with writes — in a cgroup v2 scope at a declared budget and
+compares the peak of the cgroup's `anon` against it, because the engine's own
+accounting is the thing being audited and cannot be the auditor. It distinguishes
+four outcomes by exit code, and *could not be measured* is one of them and is a
+failure. Measured: at the 2 GiB the comparison bed used, **OOM-killed at
+t≈49 s**; the smallest declared budget this engine survives its own load at is
+**5 GiB**, and given 8 GiB of room while asked to stay inside 2 GiB its anonymous
+peak is 4586 MiB — **2.24× the budget it was given.** That factor is what the
+rest of this invariant and invariant II have to close.
+[`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md) is the baseline and its
+limitations.
 
 ### II. A line's bytes are copied a bounded number of times, and label sets are never de-shared
 

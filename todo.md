@@ -207,6 +207,30 @@ instrument (arena-tagging global allocator behind the default-off `memprof` feat
 
 ### Phase B — the budget
 
+**The gate comes first and it is built.** [`docs/MEMORY_BUDGET_GATE.md`](docs/MEMORY_BUDGET_GATE.md)
+is the baseline; `src/bin/memory_gate.rs` is the gate. Every item below is a fix, and this is the
+only thing that can say whether a fix worked, so it landed before them and it landed red.
+
+- [x] **A test that runs at a declared budget and asserts peak memory stays under it** — and it
+      asserts against the cgroup's `anon`, not against the sum of the arenas, because the sum of the
+      arenas was a third of `anon` at the moment of the kill. One command,
+      `cargo run --release --bin memory_gate -- --budget 2GiB`, in a `systemd-run --user --scope`
+      cgroup with swap off, driven by the M8 harness with reads concurrent with writes at the
+      comparison bed's parameters and seed. Four outcomes by exit code — 0 under budget, 2 over
+      budget, 3 OOM-killed, **4 could not be measured, which is a failure and not a skip**
+      (`docs/LOAD_RESULTS.md` §3: a gate that cannot measure must not pass; a budget met by
+      refusing 90% of the offered load counts as unmeasured). **Measured: OOM-killed at t≈49 s at
+      2 GiB; survives at 5 GiB at 86–91% of it; 4586 MiB of `anon` — 2.24× — when given 8 GiB of
+      room and asked to stay inside 2 GiB.** Not in CI: it needs a cgroup scope and minutes per run,
+      and a peak-memory number off a shared runner is the kind this repository has already retired.
+      CI compiles it, so it cannot rot the way a script and a document did
+- [ ] **The gate should read the budget from the server once the knob exists**, rather than being
+      told the same number twice. Until then `--server-env LOGGYTRACY_MEMORY_BUDGET=...` reaches the
+      server without touching the gate
+- [ ] **A killed run loses the harness's own numbers.** The harness is killed three seconds after
+      the server dies and writes its report only at the end, so the ingest and query columns of
+      every OOM row in `docs/MEMORY_BUDGET_GATE.md` are empty. A periodic partial write, or a
+      result written on signal, would make a failing run as informative as a passing one
 - [ ] **Make the anonymous footprint track live bytes first.** Measured precondition, not a tuning note: with
       the default glibc configuration no live-byte budget can be honest. `mallopt` at startup, or an allocator
       whose heap decays, or the arena-tagging allocator promoted into production. Whichever is chosen, the
@@ -235,9 +259,9 @@ instrument (arena-tagging global allocator behind the default-off `memprof` feat
 - [ ] **Bound in-flight push bodies.** The ingest gate is checked once at request entry and nothing limits
       concurrency, so (in-flight requests x 64 MiB) sits outside the accounting. Measured at 0.3 MiB on the bed,
       so this is closing a hole rather than recovering memory
-- [ ] **A test that runs at a declared budget and asserts peak RSS stays under it.** Not a sizing paragraph in
-      the runbook — and it must assert against the cgroup's `anon`, not against the sum of the arenas, because
-      the sum of the arenas was a third of `anon` at the moment of the kill
+- [x] ~~**A test that runs at a declared budget and asserts peak RSS stays under it.**~~ Moved to the top of
+      this phase and built there, because it is the gate the rest of these items are measured by rather than
+      one of them: [`docs/MEMORY_BUDGET_GATE.md`](docs/MEMORY_BUDGET_GATE.md)
 
 ## M11 — bounded copies and deep pruning ([`docs/VISION.md`](docs/VISION.md) II, III)
 

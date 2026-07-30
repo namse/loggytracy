@@ -7,7 +7,10 @@ OOM-killed and Loki is not** ([`COMPARISON.md`](COMPARISON.md)), while
 that says what the rest of it was.
 
 It is a diagnosis. Nothing here is fixed, and the budget of
-[`VISION.md`](VISION.md) invariant I is not built. The reason for measuring
+[`VISION.md`](VISION.md) invariant I is not built — but the *gate* for it now is,
+because a fix needs something that can tell whether it worked:
+[`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md) runs the engine at a declared
+budget and compares peak cgroup `anon` against it. The reason for measuring
 first is written into that invariant: its arena split — ingest 25 %, flush 15 %,
 merge 20 %, query 30 %, sidecar 10 % — was a guess, and an accounting scheme
 built on a guess produces a number that is believed and wrong, which is the
@@ -434,7 +437,11 @@ Two things follow, in order:
    the sum of its own arenas. `VISION.md`'s verification — "a test that runs the
    engine at a declared budget and asserts peak RSS stays under it" — is the
    right test, and it is the *only* thing in the invariant that would have
-   caught this.
+   caught this. **It exists now**, and it is the first thing built after this
+   measurement rather than the last: `src/bin/memory_gate.rs`, with its baseline
+   and its four outcomes in [`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md). At
+   the 2 GiB this document is about it is red, and the smallest declared budget
+   the engine currently survives its own load at is **5 GiB**.
 
 ### Second, the shares
 
