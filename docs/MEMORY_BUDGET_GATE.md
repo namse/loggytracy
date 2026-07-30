@@ -10,22 +10,27 @@ its own load, settle included?" is 1792 MiB.**
 
 Every "2 GiB" figure below it was measured with a gate that stopped when the
 workload stopped, so what it answered was **"survives ingest"** — a narrower
-question than it reads as. Extended through a settle, the engine is
-`OOM_KILLED` at 2 GiB: it peaks at 1702.9 MiB during ingest, comfortably inside,
-and then reaches 1991.5 MiB **28.6 seconds after the last row was accepted**,
-while merge consolidates what ingest left behind. The comparison bed found this
-first and the gate now reproduces it in ninety seconds.
+question than it reads as. Extended through a settle, build `df6d65b` was
+`OOM_KILLED` at 2 GiB: it peaked at 1702.9 MiB during ingest, comfortably
+inside, and then reached 1991.5 MiB **28.6 seconds after the last row was
+accepted**, while merge consolidated what ingest had left behind. The comparison
+bed found that first and the gate now reproduces it in ninety seconds.
 
-The progression below is still real and none of it is retracted — it is simply
-measuring the ingest phase. Against that phase: 5 GiB on build `50190cf`,
-2 GiB at 90–96 % on `9199e07` after sharing label sets, 2 GiB at 78–83 % on
-`df6d65b` after the streaming top-K executor. What has not been measured until
-now is the phase after.
+The term was merge, holding **829 of 847 live megabytes** at the settle peak
+because a rewrite materialized its whole group first
+([`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md)). Streaming the rewrite is what
+moved the number: on `3ca3bb8`, 2 GiB is green at 89 % and 1792 MiB — red even on
+ingest alone before any of this — is green at 95 %, with the ingest and settle
+phase peaks now equal in every passing run.
 
-The obvious response — deriving `merge_max_memory_bytes` from the container
-rather than leaving it a constant 1 GiB — was tried, measured **worse**, and
-reverted; see below. So the term that holds the settle peak is currently
-unidentified.
+Shrinking the merge *budget* instead was tried first, measured **worse**, and
+reverted; that is recorded below, because a direction that ought to have worked
+and did not is worth more than the diff would have been.
+
+The progression below is real and none of it is retracted; it is simply measuring
+the ingest phase, and it says so. Against that phase: 5 GiB on `50190cf`, 2 GiB
+at 90–96 % on `9199e07` after sharing label sets, 2 GiB at 78–83 % on `df6d65b`
+after the streaming top-K executor.
 
 This gate landed before the fixes on purpose, and that is why the move can be
 stated as a number at all. [`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md)
