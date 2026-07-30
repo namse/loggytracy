@@ -21,6 +21,22 @@ features. It is that this engine does not yet keep the promise its shape implies
 Everything below is a target. The current state violates all three, and each
 section says where.
 
+**They are not independent, and the order was wrong when this document was
+written.** It listed them as three parallel goals. [`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md)
+established that **II is a precondition for I**: at the moment the kernel killed
+the process at a 2 GiB limit, 44% of its anonymous footprint was memory it had
+already freed, and its live heap was 669 MiB. An arena budget denominated in live
+bytes would have reported a third full while the process was dying. You cannot
+budget memory the allocator will not give back, and the way to make it give it
+back is to stop asking for it — the engine requested 52 GB across 444 million
+allocations in 33 seconds, 217× the rate data arrived at.
+
+So invariant I's arena machinery is the *last* step, not the first. Ahead of it,
+in order: the verification test, because it is the only thing in this document
+that would have caught the above; then II, because that is where the churn is;
+then whatever the allocator still retains, measured and published as a
+multiplier; and only then the arenas, sized from what remains.
+
 ### I. Memory is a budget you declare, not a number that emerges
 
 An operator gives one number:
@@ -103,6 +119,16 @@ times" ([`RUNBOOK.md`](RUNBOOK.md):27), which is the honest description of an
 engine that does not have this invariant.
 
 ### II. A line's bytes are copied a bounded number of times, and label sets are never de-shared
+
+**This is the load-bearing one.** It was written as the middle of three and
+[`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) moved it to the front: the
+churn it describes is what makes invariant I unachievable, because an allocator
+asked for 52 GB in 33 seconds keeps most of it. 72% of that traffic is the read
+path returning a hundred rows, and 20% is a flush path spending 26 kB and 356
+allocations on a 368-byte line. The measurement also confirmed the label clone
+in situ at 1,326 bytes per row against the microbenchmark's 1,345 — the two agree
+to 1.4%, which is why this invariant can be worked on with a bench rather than a
+container.
 
 Target: **three copies** from socket to disk — the request body, the WAL write
 buffer, the Arrow column buffer. Today it is six before the `204` and twelve
