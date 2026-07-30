@@ -6,16 +6,26 @@ the comparison bed's mixed load and asserts that the **cgroup's anonymous
 footprint** stays under the number that was declared.
 
 **The current, honest answer to "at what declared budget does this engine survive
-its own load?" is 2 GiB** — the number [`COMPARISON.md`](COMPARISON.md) asked for
-and Loki met, and the number this gate was red at when it was built. It was
-5 GiB. Sharing label sets instead of copying them per row
-([`VISION.md`](VISION.md) invariant II, step 1) moved it there, and the streaming
-top-K executor (step 2) did **not** move it further: it is still red at 1792 MiB.
-What it moved is the headroom at 2 GiB, from 6 % to **17–22 %**.
+its own load?" is: not known, and above 2 GiB.**
 
-That is two fixes of invariant II's list, so all three baselines are recorded
-below and none is retracted: the 5 GiB one is what build `50190cf` did, the
-2 GiB-at-90–96 % one is `9199e07`, and the 2 GiB-at-78–83 % one is `df6d65b`.
+Every "2 GiB" figure below it was measured with a gate that stopped when the
+workload stopped, so what it answered was **"survives ingest"** — a narrower
+question than it reads as. Extended through a settle, the engine is
+`OOM_KILLED` at 2 GiB: it peaks at 1702.9 MiB during ingest, comfortably inside,
+and then reaches 1991.5 MiB **28.6 seconds after the last row was accepted**,
+while merge consolidates what ingest left behind. The comparison bed found this
+first and the gate now reproduces it in ninety seconds.
+
+The progression below is still real and none of it is retracted — it is simply
+measuring the ingest phase. Against that phase: 5 GiB on build `50190cf`,
+2 GiB at 90–96 % on `9199e07` after sharing label sets, 2 GiB at 78–83 % on
+`df6d65b` after the streaming top-K executor. What has not been measured until
+now is the phase after.
+
+The obvious response — deriving `merge_max_memory_bytes` from the container
+rather than leaving it a constant 1 GiB — was tried, measured **worse**, and
+reverted; see below. So the term that holds the settle peak is currently
+unidentified.
 
 This gate landed before the fixes on purpose, and that is why the move can be
 stated as a number at all. [`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md)
