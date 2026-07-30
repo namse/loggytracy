@@ -44,6 +44,14 @@ green at 2 GiB and took the overshoot to 0.93×, at a higher delivered rate than
 before. That is one item of II's list moving invariant I's number by 2.4×, which
 is the argument for doing II before I rather than a claim about it.
 
+**The second step bought headroom rather than another whole step down.** The
+streaming top-K executor took the 2 GiB pass from 90–96% of the budget to
+**78–83%** and the workload's own anonymous high-water from 1913 to 1659 MiB, at a
+slightly higher delivered rate again — and 1792 MiB is still `OOM_KILLED`. Two
+items of II's list, and the second one moved the margin and not the floor;
+[`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md) says why the two need not move
+together.
+
 ### I. Memory is a budget you declare, not a number that emerges
 
 An operator gives one number:
@@ -216,16 +224,18 @@ Nothing in either bench got slower, including the two-label case where an atomic
 increment replaces a small bulk allocation and a regression was the expectation:
 `rows/from_entry` is 1.82× faster at two labels and 4.40× at ten.
 
-**Three things this did not remove.** `process_entry_with_labels_cancellable`
-still clones the label set into a mutable field map **per row**, for every query
-including one with no pipeline stages, and undoing that is a copy-on-write field
-view across the whole pipeline rather than a type change. The three
-materialize-and-sort hops on the read path are still three, because only the clone
-at each hop went away. And `Row::materialized_bytes` and
-`estimated_log_entry_memory_bytes` still charge every row for label bytes it now
-shares, so merge sizing and the query memory ceiling are conservative by the
-rows-per-stream factor — a meter to fix with the rest of the metering, not a limit
-to loosen on the way past.
+**Three things that did not remove, and one of them is now gone too.** The three
+materialize-and-sort hops on the read path **are one materialization of `limit`
+rows and one sort over them**, which is invariant III's streaming executor below
+and the step that closed it. What is still there:
+`process_entry_with_labels_cancellable` clones the label set into a mutable field
+map **per row**, for every query including one with no pipeline stages, and
+undoing that is a copy-on-write field view across the whole pipeline rather than a
+type change — the bound reduced how many times it is called, not what a call
+costs. And `Row::materialized_bytes` and `estimated_log_entry_memory_bytes` still
+charge every row for label bytes it now shares, so merge sizing and the query
+memory ceiling are conservative by the rows-per-stream factor — a meter to fix
+with the rest of the metering, not a limit to loosen on the way past.
 
 Also in this invariant: **one decode, one sort, one parse.** `sort_rows` runs
 globally and then again per partition (`part/format.rs:22`, `:91`), and
@@ -234,36 +244,49 @@ size the filter, once to fill it (`format.rs:335-341`, `:360-366`).
 
 ### III. Query cost is bounded before the scan starts, and pruning goes as deep as the format allows
 
-**The worst violation is the most common query.** When a query has any stage
-beyond a line filter — `| json`, `| logfmt`, a field filter — the scan limit is
-set to `usize::MAX` (`query/execution.rs:102-106`), because the limit cannot be
-applied before the pipeline runs. So `{app="x"} | json | status="500"` with
-`limit=100` materializes every matching row in the window, up to the 512 MiB
-ceiling, and then throws almost all of it away. That is the shape Grafana sends
-most, and it is the shape this engine claims to be good at.
+**The worst violation was the most common query, and it is fixed.** When a query
+had any stage beyond a line filter — `| json`, `| logfmt`, a field filter — the
+scan limit was set to `usize::MAX`, because the limit could not be applied before
+the pipeline ran. So `{app="x"} | json | status="500"` with `limit=100`
+materialized every matching row in the window, up to the 512 MiB ceiling, and then
+threw almost all of it away. That was the shape Grafana sends most, and the shape
+this engine claims to be good at.
 
-The fix is not a smaller ceiling. It is that execution **streams**: a merge of
-per-part sorted iterators feeding a bounded top-K heap, materializing exactly
-`limit` rows plus the heap. That also deletes the triple-materialize of
-invariant II, because there is nothing left to materialize.
+Execution now **streams**. `PartReader`, `PartRegistry` and `MemTable` offer rows
+one at a time to a `RowSink` (`part/sink.rs`), and the executor's sink
+(`log_scan.rs`) is a bounded top-K collector that runs the pipeline as each row
+arrives. So a pipeline stage no longer defeats the limit: the scan reads until it
+holds `limit` rows that *survived* the pipeline. From the sink's frontier — the
+timestamp a row must beat once the sink is full — the scan skips a whole part on
+its tenant segment's span without opening it, a whole row group on
+`row_group_min_ts`/`max_ts` without touching the Parquet body, and the rest of a
+part on the first row past the frontier, which is sound because a tenant's rows
+are ordered inside a part. Ties go to whichever row arrived first, so the answer
+is exactly what a stable sort plus `truncate(limit)` gave. That also deleted the
+triple-materialize of invariant II: there is nothing left to materialize but the
+`limit` rows, and one sort over those.
 
-**Measured, and it is not the whole of the query cost.** Running the identical
-workload with only `| json | field=` queries against only label-only queries,
-`usize::MAX` costs **6.5× the live materialization** (111 MiB against 17 MiB) and
-3× the allocations. But the label-only shape — the one where the limit *does*
-apply — still allocates **270 MB and 1.19 million allocations per query to return
-a hundred rows**, and the query path is still 57% of all allocation traffic in
-that run. Bounding the scan removes the query arena's residency and about half
-its churn; the rest is the per-row work that happens before any limit can apply,
-which is the triple materialize and `reader.rs:727` allocating the line before
-the filter that rejects it. See
-[`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md).
+**Measured on `benches/query.rs`, limit 100 over 202 000 rows in the window.**
+`| json | field=` went from processing every row in the window — 200 250 lines,
+703 MB of allocation traffic, 26.8 MB of peak live, 308.78 ms — to **3 130 lines,
+43.9 MB, 5.81 MB and 13.067 ms**, and label-only from 69 178 lines and 178 MB to
+**187 lines and 0.37 MB**. On the gate the margin at 2 GiB widened from 6% to
+17–22% and the workload's own anonymous high-water fell from 1913 to 1659 MiB, but
+the smallest surviving budget is still 2 GiB
+([`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md)). Two figures the old text
+quoted from [`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) — 111 MiB of live
+materialization against 17 MiB for the two shapes, and 270 MB per label-only query
+— were build `50190cf`'s and are not comparable to these; the attribution has not
+been re-run and its tables still describe an engine that no longer exists.
 
-Those figures are build `50190cf`'s, and every one of them included a `Labels`
-clone per row at each of the three hops and a fourth on the metric path, which no
-longer happen. They are an upper bound on what this shape costs now; nothing here
-re-measured them, and the ratio between the two shapes is the part of the finding
-that does not depend on it.
+**And a limit only helps where a limit binds.** On the comparison bed's own
+dataset the `json_field` figure at `limit=20 000` is unchanged at 16 384 lines,
+because 20 000 over ~1 250 matching rows never fills the sink. At Grafana's
+default 100 it is 5 528–11 072, against Loki's 1 251 for the same answer. The
+residue is not the limit: Loki's index takes it to one stream's chunks, while a
+row group here interleaves every stream in it and each of their rows is decoded
+and filtered. That is the pruning below, and it is now the largest remaining term
+on the shape the claim rests on.
 
 **Pruning we index for and then do not use:**
 
@@ -271,18 +294,17 @@ that does not depend on it.
   label column and the `structured_metadata` JSON blob is decoded even for
   `count_over_time({app="x"}[5m])`, which needs one column.
 - **No predicate pushdown, no Parquet statistics, no Parquet blooms.** Filtering
-  is a row loop (`reader.rs:697-752`) that allocates the line with `to_string()`
-  *before* testing the filter that will reject it (`:727`).
-- **Footer re-parsed per row group.** `open_part_data` re-opens the file, re-runs
-  `ArrowReaderMetadata::load` and rebuilds the schema for every selected row
-  group (`reader.rs:640`). Two hundred row groups is two hundred footer parses.
-- **`|~` never prunes.** `bloom_prune` matches only `LineFilter::Contains`
-  (`reader.rs:778-787`), so `|~ "error.*timeout"` gets no trigram pruning even
-  though both literals are indexable. Extracting required literals from the
-  regex closes this.
-- **Sequential parts.** Within one query, parts are scanned one at a time
-  (`part_registry.rs:579`), and an object-store restore holds a scan permit while
-  doing pure network I/O (`execution.rs:367` vs `:374`).
+  is a row loop (`reader.rs`, `scan_batch`) that allocates the line with
+  `to_string()` before testing the filter that will reject it.
+- **`|~` never prunes.** `bloom_prune` matches only `LineFilter::Contains`, so
+  `|~ "error.*timeout"` gets no trigram pruning even though both literals are
+  indexable. Extracting required literals from the regex closes this.
+- **Sequential parts.** Within one query, parts are scanned one at a time, and an
+  object-store restore holds a scan permit while doing pure network I/O
+  (`execution.rs`).
+- ~~**Footer re-parsed per row group.**~~ Closed by the streaming rewrite: the
+  footer is parsed once per part scan, and the reader clones an `Arc` of it per
+  row group and per backward window. Caching it across *scans* is still open.
 
 What is already right and must not regress: row groups aligned to tenant
 boundaries (`format.rs:221-238`), which is what makes every row-group-granular
@@ -325,11 +347,21 @@ data against 267. And the limits were not equal by choice: at 2 GiB loggytracy
 was OOM-killed and Loki was not, so the published run is at 8 GiB.
 
 The claim is not abandoned, because none of that is a property of the *format* —
-it is invariant III unbuilt. `normal_scan_limit` is still `usize::MAX` for
-exactly this shape, there is still no projection pushdown, and the bloom the
-claim rests on is still behind a full materialize. What the measurement removes
-is the option of asserting the claim before that work is done. The number to
-beat is now written down.
+it is invariant III unbuilt. What the measurement removes is the option of
+asserting the claim before that work is done. The number to beat is now written
+down.
+
+**Half of that work is now done and the comparison has not been re-run.**
+`normal_scan_limit = usize::MAX` is gone and the scan is bounded and streaming; a
+`| json | field=` with `limit=100` over a window of 202 000 rows costs 23.6× less
+time and 16× less allocation traffic on `benches/query.rs`, and the 2 GiB limit the
+published run could not use is now met with 17–22% of headroom rather than 6%. But
+the bed itself queried with `limit=20 000` over ~1 250 matching rows, where a limit
+binds nothing, and its `data.stats` figure is unchanged at 16 384 lines against
+Loki's 1 251. So nothing here licenses a claim about the 1.49× either way: the
+shape that got faster is not the shape the bed timed, and re-running
+[`COMPARISON.md`](COMPARISON.md) — with a limit an operator would actually send —
+is what would say.
 
 ---
 

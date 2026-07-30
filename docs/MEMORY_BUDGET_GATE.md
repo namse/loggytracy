@@ -9,12 +9,13 @@ footprint** stays under the number that was declared.
 its own load?" is 2 GiB** — the number [`COMPARISON.md`](COMPARISON.md) asked for
 and Loki met, and the number this gate was red at when it was built. It was
 5 GiB. Sharing label sets instead of copying them per row
-([`VISION.md`](VISION.md) invariant II, step 1) moved it, and the gate is
-**green at 2 GiB** at 90–96 % of it across three runs. It is red at 1792 MiB.
+([`VISION.md`](VISION.md) invariant II, step 1) moved it there, and the streaming
+top-K executor (step 2) did **not** move it further: it is still red at 1792 MiB.
+What it moved is the headroom at 2 GiB, from 6 % to **17–22 %**.
 
-That is one fix of invariant II's list, so the two baselines are both recorded
-below and neither is retracted: the 5 GiB one is what build `50190cf` did, and
-the 2 GiB one is what build `9199e07` does.
+That is two fixes of invariant II's list, so all three baselines are recorded
+below and none is retracted: the 5 GiB one is what build `50190cf` did, the
+2 GiB-at-90–96 % one is `9199e07`, and the 2 GiB-at-78–83 % one is `df6d65b`.
 
 This gate landed before the fixes on purpose, and that is why the move can be
 stated as a number at all. [`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md)
@@ -86,6 +87,16 @@ shape:
 | peak cgroup `memory.peak` | 2048 (the limit) |
 | peak `loggytracy_memtable_bytes` | **182** |
 
+And once more from `streaming-topk-2g` on build `df6d65b`, where the anonymous
+peak has come off the ceiling and `memory.peak` therefore no longer reads as the
+limit:
+
+| in the same run | MiB |
+|---|---|
+| peak cgroup `anon` | **1631** |
+| peak cgroup `memory.peak` | 1991 |
+| peak `loggytracy_memtable_bytes` | **168** |
+
 ---
 
 ## The four outcomes
@@ -95,9 +106,9 @@ rather than asserted:
 
 | exit | verdict | means | seen in |
 |---|---|---|---|
-| 0 | `UNDER_BUDGET` | survived, delivered the offered workload, peak `anon` ≤ budget | the 5 and 6 GiB runs on `50190cf`; the 2 GiB runs on `9199e07` |
-| 2 | `OVER_BUDGET` | survived, peak `anon` exceeded the declared budget | `--budget 2GiB --limit 8GiB` on `50190cf`; the same command is `UNDER_BUDGET` on `9199e07` |
-| 3 | `OOM_KILLED` | the kernel killed it inside its own declared budget | the 2 and 4 GiB runs on `50190cf`; 1 GiB, 1536 MiB and 1792 MiB on `9199e07` |
+| 0 | `UNDER_BUDGET` | survived, delivered the offered workload, peak `anon` ≤ budget | the 5 and 6 GiB runs on `50190cf`; the 2 GiB runs on `9199e07` and `df6d65b` |
+| 2 | `OVER_BUDGET` | survived, peak `anon` exceeded the declared budget | `--budget 2GiB --limit 8GiB` on `50190cf`; the same command is `UNDER_BUDGET` on `9199e07` and `df6d65b` |
+| 3 | `OOM_KILLED` | the kernel killed it inside its own declared budget | the 2 and 4 GiB runs on `50190cf`; 1 GiB, 1536 MiB and 1792 MiB on `9199e07`; 1792 MiB on `df6d65b` |
 | 4 | `NOT_MEASURED` | the measurement did not happen | `--seconds 8`, which delivers 13 % of the offered events |
 
 **`NOT_MEASURED` is a failure, not a skip.** [`LOAD_RESULTS.md`](LOAD_RESULTS.md)
@@ -216,6 +227,59 @@ memcpys, projection pushdown — is what would buy the headroom, and the
 attribution says where: at build `50190cf` **44 % of the anonymous peak was
 memory the process had already freed**, and that fraction is a function of
 allocation traffic, which those items are about.
+
+---
+
+## After the streaming top-K executor
+
+Build `df6d65b`, same features, same glibc, same machine, same workload, same
+seed, no `MALLOC_*` variable set. The one change between this table and the last
+is [`VISION.md`](VISION.md) invariant II's second step: `normal_scan_limit =
+usize::MAX` is gone, the reader, the registry and the memtable stream rows into a
+bounded top-K sink instead of each materializing and sorting the whole match set,
+and a scan stops once it holds `limit` rows that survived the pipeline. Nothing
+else on the M10 or M11 lists is built — there is still no projection pushdown,
+`entries_bytes` still under-reports, no arena exists, and the two free memcpys
+are still there.
+
+| declared budget | cgroup limit | verdict | `anon` peak (MiB) | share of budget | at | achieved eps | queries |
+|---|---|---|---|---|---|---|---|
+| 1792 MiB | 1792 MiB | **`OOM_KILLED`** | 1691 | 94.4 % | 57.5 s | — | — |
+| **2 GiB** | 2 GiB | `UNDER_BUDGET` | **1631** | **79.6 %** | 61.8 s | 19 871 | 302 |
+| 2 GiB (repeat) | 2 GiB | `UNDER_BUDGET` | 1596 | 77.9 % | 60.5 s | 19 878 | 302 |
+| 2 GiB (repeat) | 2 GiB | `UNDER_BUDGET` | 1706 | 83.3 % | 61.8 s | 19 876 | 302 |
+| 2 GiB | 8 GiB | `UNDER_BUDGET` | 1659 | **81.0 %** | 61.8 s | 19 889 | 302 |
+
+**The margin widened; the surviving budget did not fall.** 78–83 % of 2 GiB
+against 90–96 %, and the workload's own anonymous high-water — the `--limit 8GiB`
+row, where the kernel is not enforcing anything — is **1659 MiB against
+1913 MiB**, 0.81× the declared budget against 0.93×. But 1792 MiB is still
+`OOM_KILLED`, at 94.4 % of itself and 62 s in, so the smallest whole step this
+engine survives its own load at is unchanged. Both facts are the answer to "does
+the gate margin widen or does the surviving budget fall": the first, not the
+second.
+
+**Why the two do not move together.** The three killed and passing runs put this
+workload's high-water at about 1.6–1.7 GiB, and 1792 MiB is inside that band
+rather than above it — the 1792 MiB run reached 1691 MiB before it died, which is
+*more* than the 1631 MiB the 2 GiB run peaked at. A budget within one merge
+tick's worth of the high-water is decided by where the allocator happens to be,
+which is the same thing the previous table's floor paragraph says. The next whole
+step down, 1536 MiB, was not run: it was already killed at 99.6 % of itself on
+`9199e07` and nothing here predicts a 200 MiB drop.
+
+**The delivered load went up again, slightly.** 19 871–19 889 eps against
+19 720–19 729, and 302 queries answered in every run. `delivered_fraction` is
+1.0007–1.0009, so this is again not a budget met by refusing work.
+
+**What this table does not say.** It is a peak over four runs of one workload,
+and the query mix is the bed's — three parts label-only, three `|=`, three
+`| json | field=`, two `rate()`, one restore probe, at 5 qps. The streaming
+executor's effect on allocation traffic is largest on the shapes with a small
+limit over a large window, and this workload's queries use a 60 s window and a
+limit of 100 against a dataset that grows past it during the run, so the gate is
+not the place to read the size of that effect. `benches/query.rs` is
+([`../todo.md`](../todo.md), M11 read path).
 
 ---
 

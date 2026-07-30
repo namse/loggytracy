@@ -407,10 +407,16 @@ Write path:
   - [x] **A fifth site, on the metric path and not on this list:** `sample_value`
         (`query/metrics.rs`) built a `BTreeMap` of every label and every metadata pair per row to read
         the one field an `unwrap` names. It resolves that field directly now
-  - [ ] **A sixth, still there:** `process_entry_with_labels_cancellable` (`logql/ast.rs:228`) clones
+  - [ ] **A sixth, still there:** `process_entry_with_labels_cancellable` (`logql/ast.rs`) clones
         `labels` into a mutable `fields` map **per row**, for every query including one with no pipeline
         stages at all. Removing it needs a copy-on-write field view across the whole pipeline, not a
-        type change, and it sits directly on the just-fixed extracted-field placement
+        type change, and it sits directly on the just-fixed extracted-field placement.
+        **It did not fall out of the streaming rewrite and was not taken there.** The sink calls it on
+        every row the storage scan produces, so what the bound removed was the number of calls and not
+        their cost — `benches/query.rs`'s `json_field` case now makes 3 130 of them instead of 200 250,
+        which is the same 4.4x-per-row it always was. The one thing that changed is the shape of the
+        fix: the pipeline now runs inside the sink with the row's own labels in hand, so a
+        copy-on-write field view has exactly one caller to satisfy
   - [ ] **Two meters now over-count, both conservatively.** `Row::materialized_bytes`
         (`part/mod.rs`) and `estimated_log_entry_memory_bytes` (`query/mod.rs`) charge every row for the
         label bytes it shares, so merge group sizing and `max_query_memory_bytes` are stricter than the
@@ -431,28 +437,87 @@ Write path:
 
 Read path:
 
-- [ ] **Kill `normal_scan_limit = usize::MAX`** (`query/execution.rs:102-106`). Any pipeline stage today means
-      the whole window is materialized before the pipeline reduces it — the most common Grafana query shape.
-      Replace with a merge of per-part sorted iterators feeding a bounded top-K heap
-- [ ] That also deletes the triple materialize-and-sort at `reader.rs`, `part_registry.rs` and
-      `execution.rs`. **The per-row `Labels` clone at each of the three hops is already gone** — all
-      three now clone an `Arc` — but the three materializations and the three sorts are still there,
-      and they are what the streaming executor removes
+- [x] **`normal_scan_limit = usize::MAX` is gone**, and the read path is a bounded top-K sink the
+      reader, the registry and the memtable stream into (`src/part/sink.rs`, `src/log_scan.rs`). The
+      scan reads until it holds `limit` rows that **survived** the pipeline, and skips a whole part
+      from its tenant segment's span, a whole row group from `row_group_min_ts`/`max_ts`, and the
+      rest of a part on the first row past the sink's frontier — ties go to whichever row arrived
+      first, so the answer is what a stable sort plus `truncate(limit)` gave. **`benches/query.rs`
+      is the new bench and the evidence**, limit 100 over 202 000 rows in the window:
+
+      | shape | dir | lines | bytes allocated | peak live | time |
+      |---|---|---|---|---|---|
+      | `label_only` | backward | 69 178 → **187** | 178 416 315 → **367 655** | 10.5 → **0.08** MB | 49.000 ms → **243.43 µs** |
+      | `label_only` | forward | 6 750 → **1 003** | 165 841 034 → **8 031 426** | 10.2 → **2.89** MB | 31.377 ms → **2.0404 ms** |
+      | `line_filter` | backward | 142 906 → **9 517** | 355 132 227 → **76 060 366** | 10.7 → **6.42** MB | 92.237 ms → **17.189 ms** |
+      | `line_filter` | forward | 112 478 → **15 183** | 355 744 979 → **39 117 415** | 11.0 → **5.03** MB | 89.450 ms → **10.316 ms** |
+      | `json_field` | backward | 200 250 → **3 130** | 703 107 130 → **43 949 524** | 26.8 → **5.81** MB | 308.78 ms → **13.067 ms** |
+      | `json_field` | forward | 200 250 → **4 783** | 703 106 682 → **21 343 859** | 26.9 → **5.05** MB | 308.00 ms → **9.2568 ms** |
+
+      `--bench part`: `scan_tenants/1` **−66.5 %**, `/16` −57.5 %, `/128` −12.5 %;
+      `scan_filters/no_filter` **−75.3 %**, `line_filter_hit` −75.8 %, `exact_field_hit` −75.4 %. The
+      unbounded full-part scan is flat — `scan_label_columns` −1.5 % / +0.4 % / +0.7 % and
+      3163.5/3258.2/3330.4 bytes and 6.17/6.29/6.41 allocations per row against
+      3166.7/3263.4/3337.4 and 6.19/6.32/6.45, peak live 30.96 MB against 30.97 — because a sink
+      that has not filled holds a plain `Vec` and ranks nothing. `--bench memtable`:
+      `query_cardinality/256` **−92.2 %**, `/8192` −82.2 %, `query_line_filter/contains` −93.3 %,
+      `query_stream_depth/100` −61.0 %, `/2000` −41.0 %, `/50000` −2.6 % (the last is the
+      whole-stream sort two items below, which this does not touch).
+      **The gate margin widened and the surviving budget did not fall**
+      ([`docs/MEMORY_BUDGET_GATE.md`](docs/MEMORY_BUDGET_GATE.md)): 2 GiB is `UNDER_BUDGET` at
+      **78–83 %** across three runs against 90–96 %, the `--limit 8GiB` high-water is
+      **1659 MiB / 0.81x** against 1913 / 0.93x, and 19 871–19 889 eps against 19 720–19 729 — but
+      1792 MiB is still `OOM_KILLED`, at 94.4 %.
+      **Regressed:** `part/write` +2.6 % with a byte-identical allocation table and +0.4 % on the
+      same bench without this change, i.e. ~2 % of code layout in a crate that grew a module;
+      `scan_filters/line_filter_pruned` +1.9 % at 583 ns, where every row group is pruned and
+      constructing the sink is the only new work
+  - [x] **The triple materialize-and-sort is gone with it.** `PartReader` and `PartRegistry` now push
+        rows into the caller's sink instead of returning `Vec<StreamResult>`, so the only rows held
+        anywhere are the `limit` in the executor's sink and the only sort is over those. The old
+        `query_*` entry points remain as wrappers over a `TopKRows` sink, so tests, merge and the
+        object-store restore probe kept their signatures. Merge reads `Row`s straight out of a
+        `RowCollector` rather than through `StreamResult`s it immediately flattened
+  - [ ] **The bed's own `data.stats` number moved less than the bench, and the reason is not the
+        limit.** Reproducing the 30 000-row, 8-stream, 3-window seed dataset the 16 384-against-Loki's-1 251
+        figure came from: at the matrix's own `limit` of **20 000** the figure is **unchanged** at
+        16 384/16 384/13 616, because 20 000 over ~1 250 matching rows is a limit that never binds
+        and therefore never bounds anything. At Grafana's default `limit=100` it is
+        **16 384 → 11 072, 16 384 → 9 272, 13 616 → 5 528** for `json_field` and
+        8 192 → 7 184, 8 192 → 5 376, 5 424 → 800 for `label_only`. Still 4.4–8.8x Loki's 1 251, and
+        the residue is not the limit: Loki's index takes it to one stream's chunks, while a row group
+        here interleaves all eight streams and every row of them is decoded and filtered. That is
+        projection and predicate pushdown, the next two items, not this one
 - [ ] **Projection pushdown.** `ProjectionMask` appears nowhere; `count_over_time({app="x"}[5m])` decodes every
-      label column and the `structured_metadata` JSON blob
-- [ ] **Cache Parquet footer metadata on the reader.** `open_part_data` re-opens the file and re-runs
-      `ArrowReaderMetadata::load` per selected row group (`reader.rs:640`)
+      label column and the `structured_metadata` JSON blob. **This is now the largest remaining term on the
+      shape the claim rests on**, measured: see the `data.stats` item above
+- [x] **The Parquet footer is parsed once per part scan** instead of once per selected row group, which
+      fell out of the streaming rewrite: the scan needs one handle it can clone per row group and per
+      backward window, so hoisting `open_part_data` out of the loop was the way to get one.
+      `PreadReader` is a `File` behind an `Arc` and `ArrowReaderMetadata` is an `Arc<ParquetMetaData>`,
+      so the clones are refcounts. Caching it across *scans* on the reader is still open and is a
+      different lifetime question
+  - [x] **A backward scan no longer decodes a whole row group to reverse it.** Parquet reads forwards
+        only, so a backward scan used to `collect()` every batch of the group and reverse the list —
+        8192 rows of Arrow string arrays built to answer a `limit=100`, in the direction Grafana
+        defaults to. It now reads the group in windows from its end with `with_offset`, doubling the
+        window each time so a scan that does read the whole group pays O(group rows) in skipped
+        records rather than one skip over the whole prefix per window
 - [ ] Do not allocate the line before the filter that rejects it (`reader.rs:727` precedes `:728`)
 - [ ] **Extract required literals from `|~` regexes** so trigram blooms apply. `bloom_prune` matches only
       `LineFilter::Contains` (`reader.rs:778-787`)
 - [ ] Parallelize part scans within a query (`part_registry.rs:579` is sequential), and stop holding a scan
       permit across an object-store restore (`execution.rs:367` vs `:374`)
 - [ ] Memtable query: binary-search the sorted stream instead of counting every entry against the scan budget,
-      and stop sorting the whole stream on every query (`memtable.rs:145-156`)
+      and stop sorting the whole stream on every query (`memtable.rs`, `scan_memtable_stream`). **The
+      scan half is done** — the sink's frontier ends a stream at the first entry past it, which is
+      `query_stream_depth/100` −61 % and `/2000` −41 % — and the sort is the whole of what is left,
+      which is why `/50000` only moved 2.6 %
 - [ ] Verify the trigram bloom's `to_lowercase()` on both sides (`bloom.rs:139-148`, `:57`) cannot produce a
       false negative for non-ASCII substring filters — a dropped result is a correctness bug, not a pruning miss
 - [ ] Do not write an `.access` marker file per candidate part per query on the scan thread
-      (`part_registry.rs:596-607`)
+      (`part_registry.rs`). Narrower than it was: a part the sink's frontier rejects is skipped before
+      the marker is written, so a limited query now writes one per part it actually opens
 
 ## Test-suite repairs (fold into M8)
 
