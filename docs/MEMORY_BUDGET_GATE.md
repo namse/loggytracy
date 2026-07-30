@@ -333,6 +333,48 @@ published comparison table never showed this, because its query columns come
 from the matrix phase: one connection, a small dataset, no ingest running. Query
 latency *under* ingest is a third measured axis with no gate on it.
 
+## Shrinking the merge budget was tried, and it made things worse
+
+The obvious fix from the section above — derive `merge_max_memory_bytes` from
+the container instead of leaving it a constant 1 GiB — was implemented and
+measured with the extended gate at 2 GiB. **It failed, and it moved the failure
+earlier.** Two runs of each, build `d59706f`:
+
+| merge budget | verdict | peak phase | ingest peak | settle peak |
+|---|---|---|---|---|
+| derived, 512 MiB (`settle_merge_fix`, `derived_2`) | `OOM_KILLED` | **ingest** | 2008.8 / 1970 MiB | never reached |
+| built-in, 1 GiB (`settle_red`, `old1g_2`) | `OOM_KILLED` | settle | 1702.9 / 1682 MiB | 1991.5 / 1954 MiB |
+
+Derivation worked exactly as intended — the server logged
+`detected_memory_limit_bytes=2147483648`, `detected_memory_source="cgroup v2
+memory.max"`, `merge_max_memory_bytes=536870912`. The engine still died, sooner,
+with an ingest-phase peak about **290 MiB higher**.
+
+The reading: smaller groups mean more merges, and more merges overlap ingest.
+`docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md` recorded that contention as N8
+and measured it as costing backlog depth; here it costs resident memory during
+the phase that was previously the safe one. **The merge budget is not the
+binding term at 2 GiB.** The attribution's 771 MiB merge high-water is real and
+was measured in a different configuration; it is not what this workload dies of.
+
+Two caveats on the experiment. It changed two values at once —
+`merge_max_input_bytes` is derived from the memory budget, so the 512 MiB arm
+also halved the selection limit to 256 MiB, and the two are not separated here.
+And run-to-run spread at this budget is wide: earlier 2 GiB runs read
+1842–1965 MiB. Two runs per arm is enough to see a 290 MiB shift in *which
+phase* peaks, and not enough to put a number on it.
+
+**The change was reverted.** Keeping a default that a measurement says is worse,
+because it is the direction that ought to help, is the mistake this repository
+keeps declining to make. What was kept is the detection and the startup log —
+`detected_memory_limit_bytes` and `detected_memory_source` now appear beside
+`peak_materialized_bytes`, because an operator otherwise has no way to learn
+what the process is inside. That is observability with no behavioural change.
+
+**So the smallest budget this engine survives its own load at, measured through
+the settle, is not yet known and is above 2 GiB.** The figure this document
+previously reported — 2 GiB at 81% — is the ingest phase alone.
+
 ## What this does not establish
 
 Stated in the discipline [`COMPARISON.md`](COMPARISON.md) sets.

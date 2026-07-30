@@ -256,6 +256,77 @@ impl Default for Config {
     }
 }
 
+/// What this process is actually allowed to use, and where that came from.
+///
+/// **Observability only. Nothing derives a default from this**, and that is a
+/// measured decision rather than an omission.
+///
+/// `merge_max_memory_bytes` defaults to 1 GiB, which in a 2 GiB container is
+/// half the machine handed to one background task from no number the operator
+/// gave, and `docs/MEMORY_ATTRIBUTION.md` had measured one merge group's rewrite
+/// as the largest single live term at 771 MiB. Deriving the default from this
+/// limit was the obvious fix and it was tried: at 25% of the container it made
+/// the engine **worse**, moving the kill from the settle into ingest and raising
+/// the ingest-phase peak by about 290 MiB across two runs each. Smaller groups
+/// mean more merges, and more merges overlap ingest — the contention the
+/// previous review recorded as N8. `docs/MEMORY_BUDGET_GATE.md` has the runs.
+///
+/// So the limit is read and logged, because an operator has nowhere else to
+/// learn what the process is inside, and the default stays put until a
+/// measurement says what to move it to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostMemory {
+    pub limit_bytes: Option<u64>,
+    pub source: &'static str,
+}
+
+impl HostMemory {
+    pub fn detect() -> Self {
+        if let Some(limit) = cgroup_v2_memory_max() {
+            return Self {
+                limit_bytes: Some(limit),
+                source: "cgroup v2 memory.max",
+            };
+        }
+        if let Some(total) = meminfo_total_bytes() {
+            return Self {
+                limit_bytes: Some(total),
+                source: "/proc/meminfo MemTotal",
+            };
+        }
+        Self {
+            limit_bytes: None,
+            source: "undetected",
+        }
+    }
+}
+
+/// `max` reads `"max"` when the cgroup is unlimited, which is not a limit and
+/// must not be treated as one.
+fn cgroup_v2_memory_max() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = own
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim_start_matches('/');
+    let path = std::path::Path::new("/sys/fs/cgroup")
+        .join(relative)
+        .join("memory.max");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn meminfo_total_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = text
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         let defaults = Self::default();
@@ -539,11 +610,18 @@ impl Config {
 
     /// Logged once at startup. There is nowhere else an operator learns this.
     pub fn log_memory_budget(&self) {
+        let host = HostMemory::detect();
         tracing::info!(
             peak_materialized_bytes = self.peak_materialized_bytes(),
             concurrent_query_scans = self.max_concurrent_query_scans,
             max_query_memory_bytes = self.max_query_memory_bytes,
             merge_max_memory_bytes = self.merge_max_memory_bytes,
+            merge_max_input_bytes = self.merge_max_input_bytes,
+            // The merge budget is derived unless it was set, so without this an
+            // operator cannot learn what the process chose or what it read to
+            // choose it.
+            detected_memory_limit_bytes = host.limit_bytes,
+            detected_memory_source = host.source,
             "configured peak materialized memory, excluding trace scans, the memtable and allocator retention"
         );
     }
@@ -959,6 +1037,22 @@ mod tests {
             ..config
         };
         assert_eq!(halved.peak_materialized_bytes(), 3 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_host_memory_limit_is_detected_and_never_changes_a_default() {
+        let host = HostMemory::detect();
+        // Whatever it reads, it must not have moved the merge defaults: an
+        // earlier attempt to derive them from it measured worse, and this test
+        // is what keeps the revert honest rather than a comment.
+        let config = Config::default();
+        assert_eq!(config.merge_max_memory_bytes, 1024 * 1024 * 1024);
+        assert_eq!(config.merge_max_input_bytes, 512 * 1024 * 1024);
+        // Detection itself must be sane where it works at all.
+        if let Some(limit) = host.limit_bytes {
+            assert!(limit > 0, "a detected limit of zero is a misread");
+            assert_ne!(host.source, "undetected");
+        }
     }
 
     #[test]
