@@ -11,7 +11,8 @@
 //!   timestamps — the two systems provably hold the same entries.
 //! * **`matrix`** times the four query shapes over that dataset, cold and
 //!   warm, and records a digest of every answer so the two runs can be checked
-//!   for returning the same rows. A fast wrong answer is not a win, so the
+//!   for returning the same response — every row, the labels each row carried,
+//!   and where the response put them. A fast wrong answer is not a win, so the
 //!   digest is the part of this file that matters most.
 //!
 //! Neither phase paces, and neither reports a throughput. They are latency and
@@ -389,16 +390,90 @@ pub struct Answer {
     pub kind: String,
     pub rows: u64,
     pub series: u64,
-    /// Order-independent digest of the rows. Two systems that returned the
-    /// same rows in a different order agree here; two that returned different
-    /// rows do not, however similar their counts.
+    /// Order-independent digest of the **whole** response: every row, the
+    /// labels that row carried, and where the response put each of them. Two
+    /// systems that returned the same rows in a different order agree here;
+    /// two that returned the same lines under different labels do not, which
+    /// is the half of the response the `(timestamp, line)` digest this
+    /// replaces did not look at (`todo.md`, "Open correctness defects").
     pub digest: String,
-    /// Label names the result carried. Recorded separately from the digest
-    /// because Loki's `| json` stage promotes extracted fields to stream
-    /// labels and a difference there is a presentation difference, not a
-    /// wrong answer.
+    /// The placement-tagged label names inside the digest, as
+    /// `stream:`/`entry:`/`metric:`/`metadata:` names. Recorded so that a
+    /// disagreement can be reported as *which* labels each side had rather
+    /// than only as two digests that differ.
     pub label_keys: Vec<String>,
+    /// Label names this response carried that the comparison declares out of
+    /// scope by name (`DERIVED_LABELS`). Recorded per answer so the exemption
+    /// is visible in the document instead of being a silently narrower digest.
+    pub dropped_label_keys: Vec<String>,
+    /// Whether every series' values follow the direction the query asked for:
+    /// `direction=backward` for logs, ascending time for a metric. The digest
+    /// is deliberately order-independent, so without this the response order
+    /// would be unchecked.
+    pub ordered: bool,
+    /// `data.stats.summary.totalLinesProcessed`, recorded but **not** digested:
+    /// it is a statement about how much each engine had to read, which is the
+    /// thing they are supposed to differ on.
+    pub lines_processed: Option<u64>,
     pub sample: Vec<String>,
+}
+
+/// Labels a system derives for itself rather than being given.
+///
+/// Loki computes `detected_level` from the line and `service_name` from the
+/// stream at ingest. Nothing in this bed pushes either — `corpus::json_line`
+/// emits no `service_name` field — so neither can be a row an engine got wrong,
+/// and both are dropped from the digest. Dropped rather than ignored: every
+/// answer records which of them it carried, and the document states the
+/// exemption beside the result.
+const DERIVED_LABELS: [&str; 2] = ["detected_level", "service_name"];
+
+/// The one difference between the two response shapes that is declared instead
+/// of discovered.
+///
+/// Loki promotes the structured metadata a push carried into the identity of
+/// what it returns: as stream labels in a log response, as series identity in a
+/// metric one (`docs/COMPARISON.md`, which is why the matrix asks for
+/// `sum(rate(...))`). loggytracy returns the same pairs in the third element of
+/// each `values` tuple. Both placements digest to the same `metadata:` record,
+/// because the promotion is the accepted difference — but the *values* are
+/// still compared per entry, so a wrong `trace_id` on a row is still a
+/// disagreement.
+///
+/// Every other name keeps its placement, and that is what makes `| json`'s
+/// extracted fields a disagreement rather than a normalization: Loki returns
+/// them as stream labels, loggytracy returns them as entry metadata, and
+/// Grafana's Logs panel shows the two differently.
+pub struct Comparability {
+    pushed_metadata: BTreeSet<String>,
+}
+
+impl Comparability {
+    /// The metadata key set is read off the corpus the bed actually pushed
+    /// rather than hard-coded, so a run with a different `metadata_pairs` does
+    /// not silently normalize a key it never sent.
+    pub fn of(corpus: &Corpus) -> Self {
+        let mut pushed_metadata = BTreeSet::new();
+        for stream in &corpus.streams {
+            for entry in &stream.entries {
+                for (name, _) in &entry.structured_metadata {
+                    pushed_metadata.insert(name.clone());
+                }
+            }
+        }
+        Self { pushed_metadata }
+    }
+
+    /// The digest tag for a label, or `None` when it is declared out of scope.
+    fn tag(&self, name: &str, found_in: &'static str) -> Option<&'static str> {
+        if DERIVED_LABELS.contains(&name) {
+            return None;
+        }
+        if self.pushed_metadata.contains(name) {
+            return Some("metadata");
+        }
+        Some(found_in)
+    }
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -410,12 +485,42 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn canonical_labels(value: &Value) -> String {
-    let Some(map) = value.as_object() else {
-        return String::new();
-    };
-    map.iter()
-        .map(|(name, value)| format!("{name}={}", value.as_str().unwrap_or_default()))
+/// Folds a label object into the digested set, tagged by where it was found.
+///
+/// A non-string label value is an error rather than an empty string: the
+/// previous digest read label values with `unwrap_or_default`, so a response
+/// that answered `{"level": null}` compared equal to one that answered
+/// `{"level": ""}`.
+fn collect_labels(
+    value: &Value,
+    found_in: &'static str,
+    comparability: &Comparability,
+    digested: &mut BTreeMap<String, String>,
+    dropped: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let map = value
+        .as_object()
+        .ok_or_else(|| format!("a result's {found_in} labels are not an object"))?;
+    for (name, value) in map {
+        let text = value
+            .as_str()
+            .ok_or_else(|| format!("{found_in} label '{name}' is not a string: {value}"))?;
+        match comparability.tag(name, found_in) {
+            Some(tag) => {
+                digested.insert(format!("{tag}:{name}"), text.to_string());
+            }
+            None => {
+                dropped.insert(format!("{found_in}:{name}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonical_labels(digested: &BTreeMap<String, String>) -> String {
+    digested
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -440,74 +545,202 @@ fn canonical_sample(value: &Value) -> String {
     }
 }
 
-pub fn digest_response(body: &[u8]) -> Result<Answer, String> {
+/// One digest record per row, plus one per series identity for a metric result.
+///
+/// A log response's grouping into streams is *not* a record: Loki returns one
+/// stream per distinct structured-metadata combination, so it answers with 6250
+/// streams where loggytracy answers with 4, and that is the accepted promotion
+/// difference rather than a different answer. What must agree is which labels
+/// each entry carried, which is why the labels are digested per row. A metric
+/// response's grouping *is* its identity, so there each series contributes a
+/// record of its own and an extra empty series cannot hide.
+fn stream_records(
+    entries: &[Value],
+    comparability: &Comparability,
+    state: &mut DigestState,
+) -> Result<(), String> {
+    for entry in entries {
+        let mut stream_labels = BTreeMap::new();
+        collect_labels(
+            &entry["stream"],
+            "stream",
+            comparability,
+            &mut stream_labels,
+            &mut state.dropped,
+        )?;
+        let mut previous: Option<i64> = None;
+        for value in values_of(entry)? {
+            let pair = value
+                .as_array()
+                .ok_or_else(|| "a values element is not an array".to_string())?;
+            if !(pair.len() == 2 || pair.len() == 3) {
+                return Err(format!(
+                    "a log values element has {} elements, expected [timestamp, line] or \
+[timestamp, line, metadata]",
+                    pair.len()
+                ));
+            }
+            let timestamp = pair[0]
+                .as_str()
+                .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+                .ok_or_else(|| {
+                    format!("a log timestamp is not a nanosecond string: {}", pair[0])
+                })?;
+            let line = pair[1]
+                .as_str()
+                .ok_or_else(|| format!("a log line is not a string: {}", pair[1]))?;
+            let mut attributes = stream_labels.clone();
+            if let Some(metadata) = pair.get(2) {
+                collect_labels(
+                    metadata,
+                    "entry",
+                    comparability,
+                    &mut attributes,
+                    &mut state.dropped,
+                )?;
+            }
+            let parsed: i64 = timestamp
+                .parse()
+                .map_err(|_| format!("log timestamp '{timestamp}' does not fit in i64"))?;
+            // `direction=backward`, so within a stream time must not increase.
+            if previous.is_some_and(|previous| parsed > previous) {
+                state.ordered = false;
+            }
+            previous = Some(parsed);
+            state.label_keys.extend(attributes.keys().cloned());
+            state.records.push(format!(
+                "{}\u{1}{timestamp}\u{1}{line}",
+                canonical_labels(&attributes)
+            ));
+            state.rows += 1;
+        }
+    }
+    Ok(())
+}
+
+fn metric_records(
+    entries: &[Value],
+    comparability: &Comparability,
+    state: &mut DigestState,
+) -> Result<(), String> {
+    for entry in entries {
+        let mut labels = BTreeMap::new();
+        collect_labels(
+            &entry["metric"],
+            "metric",
+            comparability,
+            &mut labels,
+            &mut state.dropped,
+        )?;
+        let identity = canonical_labels(&labels);
+        state.label_keys.extend(labels.keys().cloned());
+        state.records.push(format!("series\u{1}{identity}"));
+        let mut previous: Option<f64> = None;
+        for value in values_of(entry)? {
+            let pair = value
+                .as_array()
+                .ok_or_else(|| "a values element is not an array".to_string())?;
+            if pair.len() != 2 {
+                return Err(format!(
+                    "a metric values element has {} elements, expected [timestamp, value]",
+                    pair.len()
+                ));
+            }
+            let at = pair[0]
+                .as_f64()
+                .or_else(|| pair[0].as_str().and_then(|text| text.parse().ok()))
+                .ok_or_else(|| format!("a metric timestamp is not a number: {}", pair[0]))?;
+            let numeric = pair[1].as_f64().is_some()
+                || pair[1]
+                    .as_str()
+                    .is_some_and(|text| text.parse::<f64>().is_ok());
+            if !numeric {
+                return Err(format!("a metric sample is not a number: {}", pair[1]));
+            }
+            // A metric range answers in ascending time on both systems.
+            if previous.is_some_and(|previous| at < previous) {
+                state.ordered = false;
+            }
+            previous = Some(at);
+            state.records.push(format!(
+                "{identity}\u{1}{}\u{1}{}",
+                canonical_sample(&pair[0]),
+                canonical_sample(&pair[1]),
+            ));
+            state.rows += 1;
+        }
+    }
+    Ok(())
+}
+
+/// `query_range` answers with `values`; the instant form answers with a single
+/// `value`. Neither is allowed to be absent — the previous digest skipped a
+/// result whose values it could not read, so a response that carried none at
+/// all digested as an empty agreement.
+fn values_of(entry: &Value) -> Result<Vec<Value>, String> {
+    if let Some(values) = entry["values"].as_array() {
+        return Ok(values.clone());
+    }
+    if entry["value"].is_array() {
+        return Ok(vec![entry["value"].clone()]);
+    }
+    Err("a result carries neither a values array nor a value pair".to_string())
+}
+
+#[derive(Default)]
+struct DigestState {
+    records: Vec<String>,
+    label_keys: BTreeSet<String>,
+    dropped: BTreeSet<String>,
+    rows: u64,
+    ordered: bool,
+}
+
+pub fn digest_response(body: &[u8], comparability: &Comparability) -> Result<Answer, String> {
     let parsed: Value =
         serde_json::from_slice(body).map_err(|error| format!("response is not JSON: {error}"))?;
     let kind = parsed["data"]["resultType"]
         .as_str()
         .unwrap_or("unknown")
         .to_string();
+    let status = parsed["status"].as_str().unwrap_or("missing").to_string();
     let entries = parsed["data"]["result"]
         .as_array()
         .ok_or_else(|| "response has no data.result array".to_string())?;
 
-    let mut lines: Vec<String> = Vec::new();
-    let mut label_keys: BTreeSet<String> = BTreeSet::new();
-    for entry in entries {
-        let labels = if kind == "matrix" || kind == "vector" {
-            &entry["metric"]
-        } else {
-            &entry["stream"]
-        };
-        if let Some(map) = labels.as_object() {
-            label_keys.extend(map.keys().cloned());
-        }
-        let Some(values) = entry["values"].as_array() else {
-            continue;
-        };
-        for value in values {
-            let Some(pair) = value.as_array() else {
-                continue;
-            };
-            let (first, second) = (
-                pair.first().unwrap_or(&Value::Null),
-                pair.get(1).unwrap_or(&Value::Null),
-            );
-            if kind == "matrix" || kind == "vector" {
-                lines.push(format!(
-                    "{}\u{1}{}\u{1}{}",
-                    canonical_labels(labels),
-                    canonical_sample(first),
-                    canonical_sample(second),
-                ));
-            } else {
-                // Stream labels are deliberately out of the row digest: see
-                // `Answer::label_keys`.
-                lines.push(format!(
-                    "{}\u{1}{}",
-                    first.as_str().unwrap_or_default(),
-                    second.as_str().unwrap_or_default(),
-                ));
-            }
-        }
+    let mut state = DigestState {
+        ordered: true,
+        ..DigestState::default()
+    };
+    if kind == "matrix" || kind == "vector" {
+        metric_records(entries, comparability, &mut state)?;
+    } else {
+        stream_records(entries, comparability, &mut state)?;
     }
-    lines.sort();
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for line in &lines {
-        hash ^= fnv1a64(line.as_bytes());
+    state.records.sort();
+    // The envelope goes in before the rows and outside the sort: a `streams`
+    // answer and a `matrix` answer are not the same answer even if their
+    // records happened to coincide.
+    let mut hash = fnv1a64(format!("{status}\u{1}{kind}").as_bytes());
+    for record in &state.records {
+        hash ^= fnv1a64(record.as_bytes());
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let sample = lines
+    let sample = state
+        .records
         .iter()
         .take(3)
-        .map(|line| line.chars().take(140).collect::<String>())
+        .map(|record| record.chars().take(140).collect::<String>())
         .collect();
     Ok(Answer {
         kind,
-        rows: lines.len() as u64,
+        rows: state.rows,
         series: entries.len() as u64,
         digest: format!("{hash:016x}"),
-        label_keys: label_keys.into_iter().collect(),
+        label_keys: state.label_keys.into_iter().collect(),
+        dropped_label_keys: state.dropped.into_iter().collect(),
+        ordered: state.ordered,
+        lines_processed: parsed["data"]["stats"]["summary"]["totalLinesProcessed"].as_u64(),
         sample,
     })
 }
@@ -559,13 +792,14 @@ async fn issue(
 pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
     let tenant = corpus.tenant_ids[0].as_str().to_string();
     let queries = build_queries(cfg, corpus);
+    let comparability = Comparability::of(corpus);
     let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
     let mut timings: Vec<Timing> = Vec::with_capacity(queries.len());
 
     for query in &queries {
         let (elapsed, status, body, error) = issue(&mut client, query, &tenant).await;
         let answer = if status == 200 {
-            match digest_response(&body) {
+            match digest_response(&body, &comparability) {
                 Ok(answer) => Some(answer),
                 Err(reason) => {
                     timings.push(Timing {
@@ -608,7 +842,10 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
             // window returns a different answer has a cache or a scan bound
             // that is not deterministic, and the cold/warm split would be
             // measuring that rather than caching.
-            match (digest_response(&body), timing.answer.as_ref()) {
+            match (
+                digest_response(&body, &comparability),
+                timing.answer.as_ref(),
+            ) {
                 (Ok(repeat), Some(first)) if repeat.digest != first.digest => {
                     timing.warm_digests_agree = false;
                 }
@@ -628,6 +865,7 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
         let mut rows = 0u64;
         let mut errors = 0u64;
         let mut unstable = 0u64;
+        let mut out_of_order = 0u64;
         let mut example = String::new();
         for (query, timing) in queries.iter().zip(&timings) {
             if query.shape != shape {
@@ -646,6 +884,7 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
             }
             rows += timing.answer.as_ref().map_or(0, |answer| answer.rows);
             unstable += u64::from(!timing.warm_digests_agree);
+            out_of_order += u64::from(timing.answer.as_ref().is_some_and(|answer| !answer.ordered));
         }
         per_shape.insert(
             shape.name().to_string(),
@@ -655,6 +894,7 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
                 "errors": errors,
                 "rows_returned_cold": rows,
                 "warm_answers_differed": unstable,
+                "answers_out_of_requested_order": out_of_order,
                 "cold_ms": cold.summary(),
                 "warm_ms": warm.summary(),
             }),
@@ -681,6 +921,12 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
                 "series": timing.answer.as_ref().map(|answer| answer.series),
                 "digest": timing.answer.as_ref().map(|answer| answer.digest.clone()),
                 "label_keys": timing.answer.as_ref().map(|answer| answer.label_keys.clone()),
+                "dropped_label_keys": timing
+                    .answer
+                    .as_ref()
+                    .map(|answer| answer.dropped_label_keys.clone()),
+                "ordered": timing.answer.as_ref().map(|answer| answer.ordered),
+                "lines_processed": timing.answer.as_ref().and_then(|answer| answer.lines_processed),
                 "sample": timing.answer.as_ref().map(|answer| answer.sample.clone()),
             })
         })
@@ -697,32 +943,150 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
 mod tests {
     use super::*;
 
+    /// No pushed metadata, so every label keeps the placement it arrived in.
+    fn plain() -> Comparability {
+        Comparability {
+            pushed_metadata: BTreeSet::new(),
+        }
+    }
+
+    /// What the bed actually pushes: `trace_id` and `pod_ip` as structured
+    /// metadata (`corpus::metadata`, `metadata_pairs: 2`).
+    fn as_seeded() -> Comparability {
+        Comparability {
+            pushed_metadata: ["trace_id", "pod_ip"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+
     #[test]
-    fn the_row_digest_ignores_order_and_stream_labels_but_not_content() {
+    fn the_row_digest_ignores_stream_grouping_and_order_but_not_content() {
         let first = br#"{"data":{"resultType":"streams","result":[
             {"stream":{"app":"a"},"values":[["2","beta"],["1","alpha"]]}]}}"#;
-        let second = br#"{"data":{"resultType":"streams","result":[
-            {"stream":{"app":"a","level":"info"},"values":[["1","alpha"]]},
-            {"stream":{"app":"a","level":"warn"},"values":[["2","beta"]]}]}}"#;
-        let third = br#"{"data":{"resultType":"streams","result":[
+        let regrouped = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a"},"values":[["1","alpha"]]},
+            {"stream":{"app":"a"},"values":[["2","beta"]]}]}}"#;
+        let changed_line = br#"{"data":{"resultType":"streams","result":[
             {"stream":{"app":"a"},"values":[["1","alpha"],["2","BETA"]]}]}}"#;
 
-        let first = digest_response(first).expect("valid");
-        let second = digest_response(second).expect("valid");
-        let third = digest_response(third).expect("valid");
+        let first = digest_response(first, &plain()).expect("valid");
+        let regrouped = digest_response(regrouped, &plain()).expect("valid");
+        let changed_line = digest_response(changed_line, &plain()).expect("valid");
         assert_eq!(
-            first.digest, second.digest,
-            "the same rows split across streams in a different order are the same answer"
+            first.digest, regrouped.digest,
+            "the same rows under the same labels, split into more streams, are the same answer"
         );
         assert_ne!(
-            first.digest, third.digest,
+            first.digest, changed_line.digest,
             "a changed line is a changed row"
         );
         assert_eq!(first.rows, 2);
-        assert_eq!(first.label_keys, vec!["app".to_string()]);
+        assert_eq!(first.label_keys, vec!["stream:app".to_string()]);
+    }
+
+    /// The blind spot this digest was extended to close: the finding in
+    /// `todo.md` was reported as 24/24 agreed because the labels were outside
+    /// the digest.
+    #[test]
+    fn the_same_lines_under_different_labels_are_not_the_same_answer() {
+        let one_stream = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a"},"values":[["1","alpha"],["2","beta"]]}]}}"#;
+        let mislabelled = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a"},"values":[["1","alpha"]]},
+            {"stream":{"app":"b"},"values":[["2","beta"]]}]}}"#;
+        let extra_label = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a","level":"info"},"values":[["1","alpha"],["2","beta"]]}]}}"#;
+        let other_value = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"b"},"values":[["1","alpha"],["2","beta"]]}]}}"#;
+
+        let one_stream = digest_response(one_stream, &plain()).expect("valid");
+        for (name, body) in [
+            ("a line under the wrong stream", mislabelled.as_slice()),
+            ("an extra label on every row", extra_label.as_slice()),
+            ("a different label value", other_value.as_slice()),
+        ] {
+            assert_ne!(
+                one_stream.digest,
+                digest_response(body, &plain()).expect("valid").digest,
+                "{name} must not digest equal"
+            );
+        }
+    }
+
+    /// The declared difference: Loki promotes pushed structured metadata into
+    /// the stream labels of a log response and loggytracy returns it in the
+    /// entry's metadata object. Same information, so the same digest — but the
+    /// values are still compared.
+    #[test]
+    fn promoted_structured_metadata_digests_the_same_wherever_the_response_put_it() {
+        let loki = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a","trace_id":"t1","pod_ip":"10.0.0.1","detected_level":"info",
+              "service_name":"a"},"values":[["1","alpha"]]}]}}"#;
+        let loggytracy = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a"},
+             "values":[["1","alpha",{"trace_id":"t1","pod_ip":"10.0.0.1"}]]}]}}"#;
+        let wrong_trace = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a"},
+             "values":[["1","alpha",{"trace_id":"t2","pod_ip":"10.0.0.1"}]]}]}}"#;
+
+        let loki = digest_response(loki, &as_seeded()).expect("valid");
+        let loggytracy = digest_response(loggytracy, &as_seeded()).expect("valid");
+        assert_eq!(loki.digest, loggytracy.digest);
+        assert_ne!(
+            loki.digest,
+            digest_response(wrong_trace, &as_seeded())
+                .expect("valid")
+                .digest,
+            "the metadata values are still part of the row"
+        );
         assert_eq!(
-            second.label_keys,
-            vec!["app".to_string(), "level".to_string()]
+            loki.dropped_label_keys,
+            vec![
+                "stream:detected_level".to_string(),
+                "stream:service_name".to_string()
+            ],
+            "an exempted label is recorded as dropped, not silently ignored"
+        );
+        assert!(loggytracy.dropped_label_keys.is_empty());
+    }
+
+    /// The defect this digest has to be red on: `| json`'s extracted fields
+    /// reach the stream labels on Loki and the entry's metadata object on
+    /// loggytracy. Not the same response, and a Logs panel renders the two
+    /// differently.
+    #[test]
+    fn json_extracted_fields_in_the_wrong_place_are_a_disagreement() {
+        let loki = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a","level":"info","status":"200","trace_id":"t1"},
+             "values":[["1","{\"level\":\"info\"}"]]}]}}"#;
+        let loggytracy = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a"},
+             "values":[["1","{\"level\":\"info\"}",
+                        {"level":"info","status":"200","trace_id":"t1"}]]}]}}"#;
+
+        let loki = digest_response(loki, &as_seeded()).expect("valid");
+        let loggytracy = digest_response(loggytracy, &as_seeded()).expect("valid");
+        assert_ne!(loki.digest, loggytracy.digest);
+        assert_eq!(
+            loki.label_keys,
+            vec![
+                "metadata:trace_id".to_string(),
+                "stream:app".to_string(),
+                "stream:level".to_string(),
+                "stream:status".to_string()
+            ]
+        );
+        assert_eq!(
+            loggytracy.label_keys,
+            vec![
+                "entry:level".to_string(),
+                "entry:status".to_string(),
+                "metadata:trace_id".to_string(),
+                "stream:app".to_string()
+            ],
+            "the report can name which labels each side had, and where"
         );
     }
 
@@ -735,19 +1099,115 @@ mod tests {
         let different = br#"{"data":{"resultType":"matrix","result":[
             {"metric":{"app":"a"},"values":[[1772000000,"0.07"]]}]}}"#;
         assert_eq!(
-            digest_response(loki).expect("valid").digest,
-            digest_response(other).expect("valid").digest
+            digest_response(loki, &plain()).expect("valid").digest,
+            digest_response(other, &plain()).expect("valid").digest
         );
         assert_ne!(
-            digest_response(loki).expect("valid").digest,
-            digest_response(different).expect("valid").digest
+            digest_response(loki, &plain()).expect("valid").digest,
+            digest_response(different, &plain()).expect("valid").digest
+        );
+    }
+
+    /// A metric result's grouping *is* its identity, so an extra series has to
+    /// show even when it carries no samples.
+    #[test]
+    fn metric_series_identity_is_digested_even_when_a_series_is_empty() {
+        let one = br#"{"data":{"resultType":"matrix","result":[
+            {"metric":{},"values":[[1772000000,"1"]]}]}}"#;
+        let plus_empty = br#"{"data":{"resultType":"matrix","result":[
+            {"metric":{},"values":[[1772000000,"1"]]},
+            {"metric":{"app":"a"},"values":[]}]}}"#;
+        let regrouped = br#"{"data":{"resultType":"matrix","result":[
+            {"metric":{"app":"a"},"values":[[1772000000,"1"]]}]}}"#;
+        assert_ne!(
+            digest_response(one, &plain()).expect("valid").digest,
+            digest_response(plus_empty, &plain()).expect("valid").digest
+        );
+        assert_ne!(
+            digest_response(one, &plain()).expect("valid").digest,
+            digest_response(regrouped, &plain()).expect("valid").digest,
+            "a sample under a different series identity is a different answer"
+        );
+    }
+
+    #[test]
+    fn a_streams_answer_and_a_matrix_answer_are_never_the_same_answer() {
+        let streams = br#"{"status":"success","data":{"resultType":"streams","result":[]}}"#;
+        let matrix = br#"{"status":"success","data":{"resultType":"matrix","result":[]}}"#;
+        assert_ne!(
+            digest_response(streams, &plain()).expect("valid").digest,
+            digest_response(matrix, &plain()).expect("valid").digest
+        );
+    }
+
+    #[test]
+    fn the_direction_the_query_asked_for_is_checked_separately_from_the_digest() {
+        let backward = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a"},"values":[["2","beta"],["1","alpha"]]}]}}"#;
+        let forward = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a"},"values":[["1","alpha"],["2","beta"]]}]}}"#;
+        let backward = digest_response(backward, &plain()).expect("valid");
+        let forward = digest_response(forward, &plain()).expect("valid");
+        assert!(backward.ordered);
+        assert!(
+            !forward.ordered,
+            "the matrix asks for direction=backward, so ascending entries are a finding"
+        );
+        assert_eq!(
+            backward.digest, forward.digest,
+            "the digest itself stays order-independent, or a reordered answer would read as a \
+different one"
         );
     }
 
     #[test]
     fn a_body_that_is_not_a_loki_result_is_an_error_not_an_empty_answer() {
-        assert!(digest_response(b"not json").is_err());
-        assert!(digest_response(br#"{"status":"error"}"#).is_err());
+        assert!(digest_response(b"not json", &plain()).is_err());
+        assert!(digest_response(br#"{"status":"error"}"#, &plain()).is_err());
+    }
+
+    /// A malformed response used to digest as an empty agreement: the old
+    /// digest skipped whatever it could not read.
+    #[test]
+    fn a_response_whose_shape_is_wrong_is_an_error_rather_than_a_silent_skip() {
+        for body in [
+            br#"{"data":{"resultType":"streams","result":[{"stream":{"app":"a"}}]}}"#.as_slice(),
+            br#"{"data":{"resultType":"streams","result":[{"values":[["1","a"]]}]}}"#.as_slice(),
+            br#"{"data":{"resultType":"streams","result":[
+                {"stream":{"app":"a"},"values":[["1"]]}]}}"#
+                .as_slice(),
+            br#"{"data":{"resultType":"streams","result":[
+                {"stream":{"app":"a"},"values":[[1,"a"]]}]}}"#
+                .as_slice(),
+            br#"{"data":{"resultType":"streams","result":[
+                {"stream":{"app":null},"values":[["1","a"]]}]}}"#
+                .as_slice(),
+            br#"{"data":{"resultType":"matrix","result":[
+                {"metric":{},"values":[[1772000000,"nope"]]}]}}"#
+                .as_slice(),
+        ] {
+            assert!(
+                digest_response(body, &plain()).is_err(),
+                "{} digested instead of erroring",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn the_metadata_key_set_is_read_off_the_corpus_the_bed_pushed() {
+        let corpus = loggytracy::corpus::generate(&CorpusSpec {
+            rows: 64,
+            streams: 4,
+            metadata_pairs: 2,
+            ..CorpusSpec::default()
+        });
+        let comparability = Comparability::of(&corpus);
+        assert_eq!(comparability.tag("trace_id", "stream"), Some("metadata"));
+        assert_eq!(comparability.tag("pod_ip", "entry"), Some("metadata"));
+        assert_eq!(comparability.tag("app", "stream"), Some("stream"));
+        assert_eq!(comparability.tag("level", "entry"), Some("entry"));
+        assert_eq!(comparability.tag("detected_level", "stream"), None);
     }
 
     #[test]

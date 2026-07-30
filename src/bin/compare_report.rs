@@ -418,7 +418,10 @@ fn row_equality(page: &mut String, matrix: &BTreeMap<&str, Value>) {
     let mut per_shape: BTreeMap<&str, (u64, u64)> =
         SHAPES.iter().map(|shape| (*shape, (0u64, 0u64))).collect();
     let mut mismatches: Vec<String> = Vec::new();
-    let mut label_notes: Vec<String> = Vec::new();
+    // Disagreements are grouped by the label difference they carry, because the
+    // interesting statement is "these 24 queries differ in the same way", not
+    // the same paragraph twenty-four times.
+    let mut label_groups: BTreeMap<(Vec<String>, Vec<String>), Vec<String>> = BTreeMap::new();
     let mut off_by_one = 0u64;
     for (id, left) in &lt {
         let Some(right) = lk.get(id) else { continue };
@@ -435,24 +438,30 @@ fn row_equality(page: &mut String, matrix: &BTreeMap<&str, Value>) {
         entry.1 += 1;
         if left["digest"] == right["digest"] && !left["digest"].is_null() {
             entry.0 += 1;
-        } else {
-            if left["rows"].as_u64() == right["rows"].as_u64().map(|rows| rows + 1) {
-                off_by_one += 1;
-            }
-            mismatches.push(format!(
-                "| `{id}` | {} | {} | `{}` | `{}` |",
-                num(&left["rows"]),
-                num(&right["rows"]),
-                left["digest"].as_str().unwrap_or("null"),
-                right["digest"].as_str().unwrap_or("null"),
-            ));
+            continue;
         }
-        if left["label_keys"] != right["label_keys"] && label_notes.len() < 2 {
-            label_notes.push(format!(
-                "`{id}`: loggytracy returned `{}`, Loki returned `{}`",
-                num(&left["label_keys"]),
-                num(&right["label_keys"]),
-            ));
+        if left["rows"].as_u64() == right["rows"].as_u64().map(|rows| rows + 1) {
+            off_by_one += 1;
+        }
+        let only_left = only_in(&left["label_keys"], &right["label_keys"]);
+        let only_right = only_in(&right["label_keys"], &left["label_keys"]);
+        mismatches.push(format!(
+            "| `{id}` | {} | {} | `{}` | `{}` | {} |",
+            num(&left["rows"]),
+            num(&right["rows"]),
+            left["digest"].as_str().unwrap_or("null"),
+            right["digest"].as_str().unwrap_or("null"),
+            if only_left.is_empty() && only_right.is_empty() {
+                "no".to_string()
+            } else {
+                format!("{} / {}", only_left.len(), only_right.len())
+            },
+        ));
+        if !(only_left.is_empty() && only_right.is_empty()) {
+            label_groups
+                .entry((only_left, only_right))
+                .or_default()
+                .push(id.clone());
         }
     }
     let total: u64 = per_shape.values().map(|(_, all)| *all).sum();
@@ -465,9 +474,40 @@ This is the check that matters more than any timing, because a fast wrong
 answer is not a win. Both systems hold the same entries by construction — the
 same generator, the same seed, the same fixed log timestamps — so the same
 query over the same absolute window has one right answer, and each response is
-reduced to an order-independent digest over its `(timestamp, line)` pairs. For
-`sum(rate(...))` the digest is over the series identity and the samples,
-compared at six decimals.
+reduced to an order-independent digest over **the whole answer**: one record per
+returned entry holding its timestamp, its line, and every label that entry
+carried together with where the response put it. A response that returns the
+right lines under the wrong stream is therefore not equal. For `sum(rate(...))`
+the digest is one record per series identity — so an extra empty series cannot
+hide — plus one per sample, compared at six decimals.
+
+The digest was over `(timestamp, line)` pairs alone until this run, which is how
+a `| json` label difference was once reported as 24 of 24 agreed (`todo.md`,
+"Open correctness defects"). Two differences between the two response shapes are
+declared rather than discovered, and the digest normalizes those two by name
+instead of looking away from labels altogether:
+
+* Labels the seed pushed as **structured metadata** are digested without their
+  placement. Loki promotes them into the identity of whatever it returns — into
+  a log response's stream labels, and into metric identity, which is why the
+  matrix asks for `sum(rate(...))` — while loggytracy returns them in the third
+  element of each `values` tuple. Same information, different place, so both
+  digest to one `metadata:` record. Their **values are still compared per
+  entry**, so a row carrying the wrong `trace_id` is still a disagreement.
+* `detected_level` and `service_name` are **dropped**, because Loki derives them
+  at ingest from the line and the stream and nothing in this bed pushes either.
+  Every answer records which of them it carried, and that is reported below
+  rather than left implicit.
+
+Every other label keeps its placement. That is what makes the `| json` shape a
+disagreement rather than a normalization: the extracted fields are stream labels
+on Loki and entry metadata on loggytracy, and Grafana's Logs panel renders the
+two differently.
+
+The metric step grid is the third known difference and it is handled by the
+query rather than by the digest: `align_to_step` snaps every window boundary to
+a whole `step`, so Loki's absolute-multiple alignment and loggytracy's
+step-from-`start` produce the same instants.
 
 **{agreed} of {total} queries agreed.**
 
@@ -480,18 +520,15 @@ compared at six decimals.
         page.push_str(&format!("| `{shape}` | {same} / {all} |\n"));
     }
     if mismatches.is_empty() {
-        page.push_str(
-            "\nNo mismatches. Stream labels are deliberately outside the row digest, \
-because Loki promotes structured metadata and its own `detected_level` and \
-`service_name` into the labels of a result and loggytracy does not — a \
-presentation difference, not a different row. Where the label sets differed:\n\n",
-        );
+        page.push_str("\nNo mismatches.\n");
     } else {
         page.push_str(&format!(
             "\n**{} queries disagreed.** This is a correctness finding and it is \
-reported before any timing conclusion is drawn from the same run.\n\n\
-| query | loggytracy rows | Loki rows | loggytracy digest | Loki digest |\n\
-|---|---|---|---|---|\n{}\n\n",
+reported before any timing conclusion is drawn from the same run. The last \
+column counts label names only loggytracy had against label names only Loki \
+had.\n\n\
+| query | loggytracy rows | Loki rows | loggytracy digest | Loki digest | labels only one side had |\n\
+|---|---|---|---|---|---|\n{}\n\n",
             mismatches.len(),
             mismatches
                 .iter()
@@ -508,21 +545,149 @@ window's `end`. Checked directly against both endpoints over the same window:
 loggytracy's `query_range` treats `end` as **inclusive**, Loki treats it as
 **exclusive**, and both include `start`. Loki's is the contract loggytracy's
 endpoint claims to implement, so this is a Loki-compatibility defect on the
-loggytracy side, found by this check and recorded in `todo.md` rather than
-patched here — M9 is the ruler, and a ruler that edits the thing it is
-measuring in the same change measures nothing. It is invisible whenever no
-entry lands exactly on a window boundary, which is why an unaligned window
-never surfaced it.
+loggytracy side, found by this check and recorded in `todo.md`. It is invisible
+whenever no entry lands exactly on a window boundary, which is why an unaligned
+window never surfaced it.
 
 "#,
                 mismatches.len()
             ));
         }
+        if !label_groups.is_empty() {
+            page.push_str(
+                "Which labels differed, grouped by the difference. `stream:` is a label \
+the response put in the stream's label set, `entry:` one it put in the entry's \
+structured-metadata object, `metric:` one in a series' identity, and \
+`metadata:` a pushed metadata key whose placement is normalized above:\n\n",
+            );
+            for ((only_left, only_right), ids) in &label_groups {
+                page.push_str(&format!(
+                    "* **{} quer{}** — {}{}:\n    * only loggytracy: {}\n    * only Loki: {}\n",
+                    ids.len(),
+                    if ids.len() == 1 { "y" } else { "ies" },
+                    ids.iter()
+                        .take(3)
+                        .map(|id| format!("`{id}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if ids.len() > 3 {
+                        format!(" and {} more", ids.len() - 3)
+                    } else {
+                        String::new()
+                    },
+                    join_labels(only_left),
+                    join_labels(only_right),
+                ));
+            }
+            page.push('\n');
+        }
     }
-    for note in &label_notes {
-        page.push_str(&format!("* {note}\n"));
+    page.push_str(&dropped_labels_note(&lt, &lk));
+    page.push_str(&ordering_note(&lt, &lk));
+    page.push_str(
+        "\n`data.stats` is recorded per answer and deliberately outside the digest: it \
+reports how much each engine had to read to produce the answer, which is the \
+thing the two are supposed to differ on, not part of the answer.\n\n",
+    );
+}
+
+/// Label names in `left`'s array that `right`'s does not have.
+fn only_in(left: &Value, right: &Value) -> Vec<String> {
+    let right: Vec<&str> = right
+        .as_array()
+        .map(|names| names.iter().filter_map(|name| name.as_str()).collect())
+        .unwrap_or_default();
+    left.as_array()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str())
+                .filter(|name| !right.contains(name))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn join_labels(names: &[String]) -> String {
+    if names.is_empty() {
+        return "none".to_string();
     }
-    page.push('\n');
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The declared exemption, stated with the count of answers it applied to.
+///
+/// A digest that is narrower than it claims is the failure mode this whole
+/// section exists to avoid, so what was left out is published beside what was
+/// checked rather than only in the code.
+fn dropped_labels_note(lt: &BTreeMap<String, Value>, lk: &BTreeMap<String, Value>) -> String {
+    let mut note = String::new();
+    for (target, answers) in [("loggytracy", lt), ("Loki", lk)] {
+        let mut names: BTreeMap<String, u64> = BTreeMap::new();
+        for answer in answers.values() {
+            for name in answer["dropped_label_keys"]
+                .as_array()
+                .map(|names| names.as_slice())
+                .unwrap_or_default()
+            {
+                if let Some(name) = name.as_str() {
+                    *names.entry(name.to_string()).or_default() += 1;
+                }
+            }
+        }
+        if names.is_empty() {
+            continue;
+        }
+        note.push_str(&format!(
+            "* **{target}** returned {}, dropped from the digest by declaration.\n",
+            names
+                .iter()
+                .map(|(name, count)| format!("`{name}` on {count} answers"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    if note.is_empty() {
+        return "\nNeither side returned a label the digest drops.\n".to_string();
+    }
+    format!("\nThe declared exemption, as it applied to this run:\n\n{note}")
+}
+
+/// The digest is order-independent on purpose, so the order a response came
+/// back in has to be checked as its own fact.
+fn ordering_note(lt: &BTreeMap<String, Value>, lk: &BTreeMap<String, Value>) -> String {
+    let mut out = Vec::new();
+    for (target, answers) in [("loggytracy", lt), ("Loki", lk)] {
+        let offenders: Vec<&String> = answers
+            .iter()
+            .filter(|(_, answer)| answer["ordered"] == Value::Bool(false))
+            .map(|(id, _)| id)
+            .collect();
+        if !offenders.is_empty() {
+            out.push(format!(
+                "* **{target}** answered {} quer{} outside the order it was asked for \
+(`direction=backward` for logs, ascending time for a metric range), starting with \
+`{}`.\n",
+                offenders.len(),
+                if offenders.len() == 1 { "y" } else { "ies" },
+                offenders[0],
+            ));
+        }
+    }
+    if out.is_empty() {
+        return "\nEvery answer on both sides came back in the order the query asked for; \
+the digest itself is order-independent, so this is checked separately.\n"
+            .to_string();
+    }
+    format!(
+        "\nResponse order, checked separately because the digest is order-independent:\n\n{}",
+        out.join("")
+    )
 }
 
 fn memory_table(page: &mut String, bed: &Value, load: &BTreeMap<&str, Value>) {
@@ -984,6 +1149,20 @@ different corpora sizes. Treat the disk and query columns as indicative only."
                 "**{errors} queries errored on {target}** and are excluded from its \
 percentiles, so those percentiles describe the queries that succeeded rather \
 than the workload that was offered."
+            ));
+        }
+        let out_of_order: u64 = SHAPES
+            .iter()
+            .filter_map(|shape| {
+                matrix[target]["matrix"]["shapes"][shape]["answers_out_of_requested_order"].as_u64()
+            })
+            .sum();
+        if out_of_order > 0 {
+            items.push(format!(
+                "**{out_of_order} answers on {target} came back in an order the query did \
+not ask for.** The row digest is order-independent, so this does not show up as \
+a disagreement, but `direction=backward` is part of the contract a Logs panel \
+relies on."
             ));
         }
         let unstable: u64 = SHAPES
