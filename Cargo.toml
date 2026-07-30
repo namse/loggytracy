@@ -81,3 +81,7 @@ harness = false
 [[bench]]
 name = "logql"
 harness = false
+
+[[bench]]
+name = "query"
+harness = false

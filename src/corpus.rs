@@ -151,6 +151,13 @@ impl CorpusSpec {
         self
     }
 
+    /// Where this corpus's window starts. What lets a bench build several parts
+    /// whose ranges do not overlap, the way a flush interval produces them.
+    pub fn start_ts_ns(mut self, start_ts_ns: i64) -> Self {
+        self.start_ts_ns = start_ts_ns;
+        self
+    }
+
     pub fn out_of_order(mut self, out_of_order: bool) -> Self {
         self.out_of_order = out_of_order;
         self

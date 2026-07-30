@@ -12,6 +12,7 @@ mod flush;
 mod ingest;
 pub mod journal;
 mod log_ingest;
+pub mod log_scan;
 pub mod logql;
 pub mod memprof;
 pub mod memtable;

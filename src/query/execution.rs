@@ -80,153 +80,30 @@ fn unified_query_with_stats_cancellable_with_memory(
     max_memory_bytes: Option<u64>,
     max_scan_bytes: Option<u64>,
 ) -> Result<QueryExecution, String> {
-    let mut all: Vec<(SharedLabels, LogEntry)> = Vec::new();
     // The one place every read path meets its rows, which is why the deletion
     // mask is here and not at each handler. A second scan would be a second
     // place to forget it, and forgetting it means serving a line a tenant asked
     // to have deleted.
     let deleted = state.delete_requests.mask_for(tenant);
-    let mut scanned_rows = 0u64;
-    let mut scanned_bytes = 0u64;
-    let mut materialized_memory_bytes = 0u64;
-
-    // Pipeline predicates run after storage scans. Do not let the API log
-    // limit truncate raw rows before a json/logfmt/field stage has evaluated.
-    let normal_scan_limit = if parsed.stages.len() == parsed.line_filters.len() {
-        limit
-    } else {
-        usize::MAX
+    let hidden_rows = &state.delete_requests.metrics.hidden_rows;
+    let hidden = |labels: &Labels, entry: &LogEntry| {
+        if deleted.hides(labels, entry) {
+            hidden_rows.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
     };
-    let scan_limit = scan_budget.map(|budget| budget.saturating_add(1));
-
-    let memtable_result = state.memtable.query_with_scan_limit(
-        tenant,
-        &parsed.matchers,
-        &parsed.line_filters,
-        range,
-        normal_scan_limit,
-        forward,
-        scan_limit,
-        cancellation,
-    );
-    scanned_rows = scanned_rows.saturating_add(memtable_result.scanned_rows as u64);
-    for sr in memtable_result.results {
-        for mut e in sr.entries {
-            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-                return Err("query timed out".to_string());
-            }
-            // Before the pipeline runs: a delete selector matches the line as
-            // it was written, and `line_format` would have rewritten it.
-            if deleted.hides(&sr.labels, &e) {
-                state
-                    .delete_requests
-                    .metrics
-                    .hidden_rows
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            if parsed.process_entry_with_labels_cancellable(&sr.labels, &mut e, cancellation)? {
-                materialized_memory_bytes = materialized_memory_bytes
-                    .checked_add(estimated_log_entry_memory_bytes(&sr.labels, &e))
-                    .ok_or_else(|| "query materialized memory accounting overflowed".to_string())?;
-                if max_memory_bytes.is_some_and(|max| materialized_memory_bytes > max) {
-                    return Err(format!(
-                        "query exceeds the maximum of {} materialized bytes",
-                        max_memory_bytes.unwrap_or_default()
-                    ));
-                }
-                all.push((sr.labels.clone(), e));
-            }
-        }
-    }
-
-    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-        return Err("query timed out".to_string());
-    }
-    if let Some(budget) = scan_budget
-        && scanned_rows > budget as u64
-    {
-        return Err(format!(
-            "query exceeds the maximum of {budget} scanned rows"
-        ));
-    }
-
-    let exact_fields = parsed.exact_field_predicates();
-    let part_scan_limit = scan_limit.map(|budget| budget.saturating_sub(scanned_rows as usize));
-    let part_scan_bytes_limit = max_scan_bytes.map(|budget| budget.saturating_sub(scanned_bytes));
-    let part_result = state.parts.query_with_exact_field_pruning_and_scan_limits(
-        tenant,
-        &parsed.matchers,
-        crate::part::ExactFieldPruning::new(&parsed.line_filters, &exact_fields),
-        range,
-        normal_scan_limit,
-        forward,
-        part_scan_limit,
-        part_scan_bytes_limit,
-        cancellation,
-    )?;
-    scanned_rows = scanned_rows.saturating_add(part_result.scanned_rows as u64);
-    scanned_bytes = scanned_bytes.saturating_add(part_result.scanned_bytes);
-    for sr in part_result.results {
-        for mut e in sr.entries {
-            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-                return Err("query timed out".to_string());
-            }
-            if deleted.hides(&sr.labels, &e) {
-                state
-                    .delete_requests
-                    .metrics
-                    .hidden_rows
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            if parsed.process_entry_with_labels_cancellable(&sr.labels, &mut e, cancellation)? {
-                materialized_memory_bytes = materialized_memory_bytes
-                    .checked_add(estimated_log_entry_memory_bytes(&sr.labels, &e))
-                    .ok_or_else(|| "query materialized memory accounting overflowed".to_string())?;
-                if max_memory_bytes.is_some_and(|max| materialized_memory_bytes > max) {
-                    return Err(format!(
-                        "query exceeds the maximum of {} materialized bytes",
-                        max_memory_bytes.unwrap_or_default()
-                    ));
-                }
-                all.push((sr.labels.clone(), e));
-            }
-        }
-    }
-
-    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-        return Err("query timed out".to_string());
-    }
-    if let Some(budget) = scan_budget
-        && scanned_rows > budget as u64
-    {
-        return Err(format!(
-            "query exceeds the maximum of {budget} scanned rows"
-        ));
-    }
-    if let Some(budget) = max_scan_bytes
-        && scanned_bytes > budget
-    {
-        return Err(format!(
-            "query exceeds the maximum of {budget} scanned bytes"
-        ));
-    }
-
-    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-        return Err("query timed out".to_string());
-    }
-    if forward {
-        all.sort_by_key(|e| e.1.timestamp_ns);
-    } else {
-        all.sort_by_key(|e| std::cmp::Reverse(e.1.timestamp_ns));
-    }
-    all.truncate(limit);
-
+    let scan = crate::log_scan::LogScan::new(tenant, parsed, range, limit, forward)
+        .scan_budget(scan_budget)
+        .max_scan_bytes(max_scan_bytes)
+        .max_memory_bytes(max_memory_bytes)
+        .cancellation(cancellation)
+        .hidden(&hidden);
+    let result = scan.run(&state.memtable, &state.parts)?;
     Ok(QueryExecution {
-        results: part::group_by_labels(all),
-        scanned_rows,
-        scanned_bytes,
+        results: result.results,
+        scanned_rows: result.scanned_rows,
+        scanned_bytes: result.scanned_bytes,
     })
 }
 

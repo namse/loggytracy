@@ -375,22 +375,6 @@ fn estimated_query_memory_bytes(results: &[StreamResult]) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn estimated_log_entry_memory_bytes(labels: &Labels, entry: &LogEntry) -> u64 {
-    let labels = labels
-        .iter()
-        .map(|(name, value)| name.len().saturating_add(value.len()))
-        .sum::<usize>();
-    let metadata = entry
-        .structured_metadata
-        .iter()
-        .map(|(name, value)| name.len().saturating_add(value.len()))
-        .sum::<usize>();
-    labels
-        .saturating_add(metadata)
-        .saturating_add(entry.line.len())
-        .saturating_add(std::mem::size_of::<LogEntry>()) as u64
-}
-
 include!("execution.rs");
 include!("restore.rs");
 include!("metrics.rs");
