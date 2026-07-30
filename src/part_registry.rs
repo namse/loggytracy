@@ -852,6 +852,61 @@ mod tests {
         );
     }
 
+    /// The same, backwards, which is the direction the sink's frontier prunes
+    /// parts in.
+    ///
+    /// The part whose segment starts latest is scanned first and holds only an
+    /// old row, so a bound that took "this part is full" for "the answer is
+    /// full" would return `out-of-order` and miss `late`. The frontier is what
+    /// makes skipping a part sound: it skips one whose whole segment is behind
+    /// the worst row already held, and this part's segment is not.
+    #[test]
+    fn a_backward_limit_still_finds_the_newest_row_in_an_overlapping_part() {
+        let dir = temp_dir();
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = PartRegistry::new();
+        registry
+            .register(
+                part::flush_rows(vec![row("first", 0), row("late", 1_000)], &parts_root, 100)
+                    .unwrap(),
+            )
+            .unwrap();
+        registry
+            .register(part::flush_rows(vec![row("out-of-order", 1)], &parts_root, 100).unwrap())
+            .unwrap();
+
+        let newest = |limit| {
+            registry
+                .query(
+                    &test_tenant(),
+                    &[],
+                    &[],
+                    crate::part::QueryTimeRange::closed(0, 1_000),
+                    limit,
+                    false,
+                )
+                .unwrap()
+                .into_iter()
+                .flat_map(|stream| stream.entries)
+                .map(|entry| (entry.timestamp_ns, entry.line))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(newest(1), vec![(1_000, "late".to_string())]);
+        assert_eq!(
+            newest(2),
+            vec![(1_000, "late".to_string()), (1, "out-of-order".to_string())]
+        );
+        assert_eq!(
+            newest(3),
+            vec![
+                (1_000, "late".to_string()),
+                (1, "out-of-order".to_string()),
+                (0, "first".to_string())
+            ]
+        );
+    }
+
     #[test]
     fn replace_keeps_old_set_when_any_new_part_fails_to_open() {
         let dir = temp_dir();
