@@ -321,63 +321,75 @@ fn encode_blooms(rows: &[Row], row_group_size: usize) -> io::Result<Vec<u8>> {
     buf.extend_from_slice(BLOOM_MAGIC_V4);
     buf.extend_from_slice(&(bounds.len() as u32).to_le_bytes());
     for (start, end) in &bounds {
-        let mut unique_trigrams: BTreeSet<[u8; 3]> = BTreeSet::new();
-        // Count the actual indexed tokens instead of estimating from rows.
-        // The second pass keeps the existing bounded-memory insertion path,
-        // while sizing the filter for wide structured rows as well as sparse
-        // rows.
-        let mut exact_capacity = 0usize;
-        for row in &rows[*start..*end] {
-            for (_name, value) in &row.structured_metadata {
-                exact_capacity = exact_capacity
-                    .saturating_add(crate::logql::canonical_index_values(value).len());
-            }
-            for (_name, values) in crate::logql::indexed_parser_fields(&row.line) {
-                for value in values {
-                    exact_capacity = exact_capacity
-                        .saturating_add(crate::logql::canonical_index_values(&value).len());
-                }
-            }
-        }
-        // No token to index means no filter. A filter built for zero items
-        // still costs the `optimal_bits` floor, and an all-zero filter and an
-        // absent one prune identically — the absent one just does it without
-        // occupying 140 bytes in every row group of every part.
-        let mut exact_fields =
-            (exact_capacity > 0).then(|| BloomFilter::with_capacity(exact_capacity, 0.01));
-        for row in &rows[*start..*end] {
-            for tri in crate::bloom::trigrams(&row.line) {
-                unique_trigrams.insert(tri);
-            }
-            let Some(exact_fields) = &mut exact_fields else {
-                continue;
-            };
-            for (name, value) in &row.structured_metadata {
-                for value in crate::logql::canonical_index_values(value) {
-                    exact_fields.insert(&encode_exact_field_token(name, &value)?);
-                }
-            }
-            for (name, values) in crate::logql::indexed_parser_fields(&row.line) {
-                for value in values {
-                    for value in crate::logql::canonical_index_values(&value) {
-                        exact_fields.insert(&encode_exact_field_token(&name, &value)?);
-                    }
-                }
-            }
-        }
-        let estimated_items = unique_trigrams.len().max(1);
-        let mut bloom = BloomFilter::with_capacity(estimated_items, 0.01);
-        for tri in &unique_trigrams {
-            bloom.insert(tri);
-        }
-        let bytes = bloom.encode();
-        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&bytes);
-        let bytes = exact_fields
-            .map(|exact_fields| exact_fields.encode())
-            .unwrap_or_default();
-        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&bytes);
+        buf.extend_from_slice(&encode_group_blooms(&rows[*start..*end])?);
     }
+    Ok(buf)
+}
+
+/// One row group's two filters, length-prefixed, exactly as they sit in the
+/// `BTF4` section.
+///
+/// Split out of [`encode_blooms`] so a writer that never holds the whole part
+/// can produce the same bytes a row group at a time. The batch path above still
+/// calls it, so the existing part-format tests are what prove the two agree.
+fn encode_group_blooms(rows: &[Row]) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut unique_trigrams: BTreeSet<[u8; 3]> = BTreeSet::new();
+    // Count the actual indexed tokens instead of estimating from rows.
+    // The second pass keeps the existing bounded-memory insertion path,
+    // while sizing the filter for wide structured rows as well as sparse
+    // rows.
+    let mut exact_capacity = 0usize;
+    for row in rows {
+        for (_name, value) in &row.structured_metadata {
+            exact_capacity = exact_capacity
+                .saturating_add(crate::logql::canonical_index_values(value).len());
+        }
+        for (_name, values) in crate::logql::indexed_parser_fields(&row.line) {
+            for value in values {
+                exact_capacity = exact_capacity
+                    .saturating_add(crate::logql::canonical_index_values(&value).len());
+            }
+        }
+    }
+    // No token to index means no filter. A filter built for zero items
+    // still costs the `optimal_bits` floor, and an all-zero filter and an
+    // absent one prune identically — the absent one just does it without
+    // occupying 140 bytes in every row group of every part.
+    let mut exact_fields =
+        (exact_capacity > 0).then(|| BloomFilter::with_capacity(exact_capacity, 0.01));
+    for row in rows {
+        for tri in crate::bloom::trigrams(&row.line) {
+            unique_trigrams.insert(tri);
+        }
+        let Some(exact_fields) = &mut exact_fields else {
+            continue;
+        };
+        for (name, value) in &row.structured_metadata {
+            for value in crate::logql::canonical_index_values(value) {
+                exact_fields.insert(&encode_exact_field_token(name, &value)?);
+            }
+        }
+        for (name, values) in crate::logql::indexed_parser_fields(&row.line) {
+            for value in values {
+                for value in crate::logql::canonical_index_values(&value) {
+                    exact_fields.insert(&encode_exact_field_token(&name, &value)?);
+                }
+            }
+        }
+    }
+    let estimated_items = unique_trigrams.len().max(1);
+    let mut bloom = BloomFilter::with_capacity(estimated_items, 0.01);
+    for tri in &unique_trigrams {
+        bloom.insert(tri);
+    }
+    let bytes = bloom.encode();
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&bytes);
+    let bytes = exact_fields
+        .map(|exact_fields| exact_fields.encode())
+        .unwrap_or_default();
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&bytes);
     Ok(buf)
 }
