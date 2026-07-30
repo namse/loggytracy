@@ -216,18 +216,25 @@ impl MemTable {
         let mut inner = self.inner.write().unwrap();
         let overhead = stream_overhead_bytes(&tenant, &labels);
         let streams = inner.entry(tenant).or_default();
-        // The `Arc` is allocated only for a stream this buffer has not seen.
-        // `entry` would need an owned key and so would allocate one per push
-        // batch and immediately drop it again.
-        let key = match streams.get_key_value(&labels) {
-            Some((existing, _)) => existing.clone(),
-            None => Arc::new(labels),
-        };
-        let stream = streams.entry(key).or_default();
-        if stream.is_empty() {
-            delta += overhead;
+        // One hash of the label set, whether or not the stream is new. Looking
+        // the key up first to avoid allocating an `Arc` for a stream that is
+        // already buffered costs a second hash of the whole `BTreeMap`, which
+        // measured dearer than the 32-byte allocation it saves.
+        match streams.entry(Arc::new(labels)) {
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                let stream = occupied.get_mut();
+                if stream.is_empty() {
+                    delta += overhead;
+                }
+                stream.extend(entries);
+            }
+            // Moved, not extended into an empty vector: a stream's first push
+            // used to copy every `LogEntry` it carried.
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                delta += overhead;
+                vacant.insert(entries);
+            }
         }
-        stream.extend(entries);
         // Published under the same write lock as the mutation, so a reader
         // that sees the entries also sees them counted.
         self.inner_bytes.fetch_add(delta, Ordering::Relaxed);
