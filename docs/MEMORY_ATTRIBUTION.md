@@ -517,6 +517,60 @@ declared number** instead of eight defaults that never appear next to each other
 
 ---
 
+## The settle, measured (2026-07-30)
+
+The first attribution sampled while load was running. The budget gate has since
+been extended through a settle, and the engine turns out to die there rather
+than under load — so the phase after the last row was accepted was measured the
+same way. Run `settle_attr`, build `1edb750`, `--budget 2GiB --limit 8GiB` so
+the kernel does not end the run before the peak is visible, server built with
+`--features memprof`, `/metrics` scraped at 1 Hz.
+
+Anon peaked at **2805 MiB in the settle** against **1766 MiB in ingest**, at
+t=91.6 s with load stopping at t=61.8 s. Live bytes by arena, at the last sample
+before load stopped and at the settle peak:
+
+| arena | at ingest end | at settle peak | change | live allocations at peak |
+|---|---|---|---|---|
+| ingest | 338.6 MiB | 0.0 | −338.6 | 0 |
+| flush | 217.2 MiB | 0.0 | −217.2 | 3 |
+| **merge** | **0.0** | **829.4 MiB** | **+829.4** | **7,217,588** |
+| sidecar | 7.7 | 16.2 | +8.5 | 652 |
+| part_meta | 0.3 | 0.6 | +0.3 | 12,738 |
+| query | 0.0 | 0.0 | — | 0 |
+| **total live** | **564.3 MiB** | **846.7 MiB** | +282.4 | |
+
+**The settle peak is merge, and nothing else is in the room.** Ingest and flush
+have both released everything by then; merge holds 98% of what is live. It runs
+from about t=85 s to t=125 s and then the process falls to 16.8 MiB, so the term
+is transient and very large rather than retained.
+
+**This corrects a statement made when the derived-budget experiment failed.**
+That experiment concluded "the merge budget is not the binding term at 2 GiB",
+and the second half of that is right while the first half is not: merge *is* the
+term. What the experiment established is narrower and still holds — **its budget
+is not the lever.** Shrinking it to 512 MiB produced more, smaller merges that
+overlapped ingest and moved the kill earlier; merge at the 1 GiB default runs to
+829 MiB, close enough to its ceiling that the ceiling is doing its job.
+
+**What the lever is, from the allocation count.** 7.2 million live allocations
+holding 829 MiB is about 120 bytes each: `read_all_rows_with_limit` materializes
+the whole group as a `Vec<Row>` whose lines and structured metadata are still
+owned per row. `Arc<Labels>` removed the label term from this and the rest of it
+is untouched. The ratio is the same story the first attribution told — 2805 MiB
+of anon over 846.7 MiB of live is **3.3×**, and the ingest phase reads 1766 over
+564.3, or 3.1× — so the allocator is holding roughly two thirds of the footprint
+in both phases, and it is holding it because of the count, not the size.
+
+So the direction is invariant II applied to merge, the same shape as the
+streaming top-K executor was for the read path: rewrite a group without
+materializing it. Not a smaller budget, which was measured.
+
+Caveat carried from the first attribution: the instrument costs 16 bytes per
+live allocation, so at 7.2 million allocations about **115 MiB** of merge's
+829 MiB is the tag. The uninstrumented arm of this comparison is the gate's own
+`settle_red` and `old1g_2` runs, which peak at 1991 and 1954 MiB of anon.
+
 ## The one-line summary
 
 The memtable was never where the memory went, and neither was any single arena.
