@@ -515,24 +515,24 @@ impl PartReader {
             {
                 continue;
             }
-            let result = self.query_internal(
+            // Straight into `Row`s. This used to build `StreamResult`s grouped
+            // by label set so that the caller could immediately flatten them
+            // again, which is the reader's share of the triple materialize.
+            let mut collector = RowCollector::new(&segment.tenant);
+            self.scan_into(
                 &segment.tenant,
                 &[],
                 &[],
                 &[],
                 QueryTimeRange::unbounded(),
-                usize::MAX,
                 true,
                 None,
                 scan_bytes_limit,
                 None,
                 Some(row_groups.clone()),
+                &mut collector,
             )?;
-            for stream in result.results {
-                for entry in stream.entries {
-                    rows.push(Row::from_entry(&segment.tenant, &stream.labels, &entry));
-                }
-            }
+            rows.append(&mut collector.into_rows());
         }
         Ok(rows)
     }
@@ -622,20 +622,59 @@ impl PartReader {
         cancellation: Option<&AtomicBool>,
         row_group_window: Option<std::ops::Range<u32>>,
     ) -> Result<QueryResult, String> {
-        let rg_count = self.bloom.len();
-        if rg_count == 0 {
-            return Ok(QueryResult {
-                results: Vec::new(),
-                scanned_rows: 0,
-                scanned_bytes: 0,
-            });
-        }
-        if limit == 0 {
-            return Ok(QueryResult {
-                results: Vec::new(),
-                scanned_rows: 0,
-                scanned_bytes: 0,
-            });
+        let mut rows = TopKRows::new(limit, forward);
+        let stats = self.scan_into(
+            tenant,
+            matchers,
+            line_filters,
+            exact_fields,
+            time_range,
+            forward,
+            scan_limit,
+            scan_bytes_limit,
+            cancellation,
+            row_group_window,
+            &mut rows,
+        )?;
+        Ok(QueryResult {
+            results: rows.into_stream_results(),
+            scanned_rows: stats.scanned_rows,
+            scanned_bytes: stats.scanned_bytes,
+        })
+    }
+
+    /// One part's rows, offered to `sink` in the query's direction.
+    ///
+    /// The scan is bounded by whatever the sink can still take rather than by a
+    /// `limit` argument, which is the point: the caller that knows whether a row
+    /// survives the pipeline is the caller that owns the sink, so it is the sink
+    /// that says when to stop.
+    ///
+    /// **This relies on rows being ordered within a tenant** — `Row::sort_key`
+    /// is `(tenant, timestamp_ns, …)` and every writer sorts, which is also what
+    /// makes `row_group_min_ts`/`max_ts` selective. So the first row on the far
+    /// side of the sink's frontier ends the part: every row after it in this
+    /// direction is on the far side too.
+    /// `part::tests::a_parts_rows_come_back_in_timestamp_order_within_a_tenant`
+    /// is what holds it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_into(
+        &self,
+        tenant: &TenantId,
+        matchers: &[LabelMatcher],
+        line_filters: &[LineFilter],
+        exact_fields: &[ExactFieldPredicate],
+        time_range: QueryTimeRange,
+        forward: bool,
+        scan_limit: Option<usize>,
+        scan_bytes_limit: Option<u64>,
+        cancellation: Option<&AtomicBool>,
+        row_group_window: Option<std::ops::Range<u32>>,
+        sink: &mut dyn RowSink,
+    ) -> Result<ScanStats, String> {
+        let mut stats = ScanStats::default();
+        if self.bloom.is_empty() || sink.is_closed() {
+            return Ok(stats);
         }
 
         let selected = if exact_fields.is_empty() {
@@ -649,176 +688,275 @@ impl PartReader {
                 time_range,
             )
         };
-        if selected.is_empty() {
-            return Ok(QueryResult {
-                results: Vec::new(),
-                scanned_rows: 0,
-                scanned_bytes: 0,
-            });
-        }
-        let mut sorted_selected = selected.clone();
+        let mut sorted_selected = selected;
         if let Some(window) = &row_group_window {
             sorted_selected.retain(|row_group| window.contains(row_group));
-            if sorted_selected.is_empty() {
-                return Ok(QueryResult {
-                    results: Vec::new(),
-                    scanned_rows: 0,
-                    scanned_bytes: 0,
-                });
-            }
+        }
+        if sorted_selected.is_empty() {
+            return Ok(stats);
         }
         sorted_selected.sort_unstable();
         if !forward {
             sorted_selected.reverse();
         }
 
-        let mut collected: Vec<(SharedLabels, LogEntry)> = Vec::new();
-        let mut scanned_rows = 0usize;
-        let mut scanned_bytes = 0u64;
         // Outside the row-group loop: a stream spans row groups, so a cache per
         // group would rebuild every label set once per group.
         let mut label_sets = LabelSetCache::new();
+        // One footer parse for the whole scan. This used to re-open the file and
+        // re-run `ArrowReaderMetadata::load` inside the loop, so two hundred
+        // selected row groups were two hundred footer parses
+        // (`docs/VISION.md` III). Both handles are cheap to clone — a `File`
+        // behind an `Arc` and an `Arc<ParquetMetaData>` — which is what makes a
+        // reader per row group, and per window inside one, affordable.
+        let (data_file, part_metadata) = open_part_data(&self.part, false)?;
 
-        let batch_size = scan_limit
-            .into_iter()
-            .chain(forward.then_some(limit))
-            .min()
-            .map(|value| value.clamp(1, 1024))
-            .unwrap_or(1024);
         'row_groups: for &row_group in &sorted_selected {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 break;
             }
-            // Parquet may normalize a multi-row-group selection back to file
-            // order. Build one reader per group so backward scans really start
-            // at the newest group and can stop once the limit is satisfied.
-            let (data_file, arrow_reader_metadata) = open_part_data(&self.part, false)?;
-            let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
-                data_file,
-                arrow_reader_metadata,
-            )
-            .with_batch_size(batch_size);
-            let reader = builder
-                .with_row_groups(vec![row_group as usize])
+            let rgu = row_group as usize;
+            // Re-read per group, because the frontier tightens as the sink
+            // fills: a group whose whole span is behind it holds nothing that
+            // can enter the result, and is rejected from `meta.json` without the
+            // Parquet body being touched at all.
+            if span_beyond_frontier(
+                sink.frontier_ns(),
+                forward,
+                self.part.meta.row_group_min_ts[rgu],
+                self.part.meta.row_group_max_ts[rgu],
+            ) {
+                continue;
+            }
+            let group_rows = part_metadata.metadata().row_group(rgu).num_rows().max(0) as usize;
+            if forward {
+                // Forwards, Parquet's own order is the query's order, so one
+                // reader streams the group and the sink's frontier ends it.
+                let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    data_file.clone(),
+                    part_metadata.clone(),
+                )
+                .with_batch_size(window_rows(scan_limit, stats.scanned_rows, &*sink))
+                .with_row_groups(vec![rgu])
                 .build()
                 .map_err(|e| e.to_string())?;
-
-            // Parquet yields batches in row order even when a single row
-            // group is selected. Buffer only this row group and reverse the
-            // batches as well as the rows; reversing rows inside each batch
-            // alone would return the oldest batch first for backward scans.
-            let mut batches: Vec<_> = reader
-                .collect::<Result<_, _>>()
+                for batch in reader {
+                    let batch = batch.map_err(|e| e.to_string())?;
+                    if self.scan_batch(
+                        &batch,
+                        tenant,
+                        matchers,
+                        line_filters,
+                        time_range,
+                        forward,
+                        row_group,
+                        scan_limit,
+                        scan_bytes_limit,
+                        cancellation,
+                        &mut label_sets,
+                        &mut stats,
+                        sink,
+                    )? == ScanStep::Stop
+                    {
+                        break 'row_groups;
+                    }
+                }
+                continue;
+            }
+            // Backwards, Parquet still only reads forwards. This used to decode
+            // the whole group into Arrow arrays and reverse the batches — eight
+            // thousand rows of string arrays built to answer a `limit=100`, in
+            // the direction Grafana defaults to. `with_offset` skips those
+            // records instead of materializing them, so the group is read in
+            // windows from its end and only the windows that are reached are
+            // built.
+            let mut cursor = group_rows;
+            let mut window = window_rows(scan_limit, stats.scanned_rows, &*sink);
+            while cursor > 0 {
+                let offset = cursor.saturating_sub(window);
+                let length = cursor - offset;
+                let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    data_file.clone(),
+                    part_metadata.clone(),
+                )
+                .with_batch_size(length)
+                .with_row_groups(vec![rgu])
+                .with_offset(offset)
+                .with_limit(length)
+                .build()
                 .map_err(|e| e.to_string())?;
-            if !forward {
+                // Arrow may still split a window into several batches, and it
+                // yields them in row order, so the batches are reversed as well
+                // as the rows inside each.
+                let mut batches: Vec<_> = reader
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
                 batches.reverse();
-            }
-            for batch in batches {
-                if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-                    break 'row_groups;
-                }
-                let batch_bytes = batch.get_array_memory_size() as u64;
-                scanned_bytes = scanned_bytes.saturating_add(batch_bytes);
-                if scan_bytes_limit.is_some_and(|limit| scanned_bytes > limit) {
-                    return Err(format!(
-                        "query exceeds the maximum of {} scanned bytes",
-                        scan_bytes_limit.unwrap_or_default()
-                    ));
-                }
-                let rows_to_scan = scan_limit
-                    .map(|limit| limit.saturating_sub(scanned_rows).min(batch.num_rows()))
-                    .unwrap_or(batch.num_rows());
-                scanned_rows = scanned_rows.saturating_add(rows_to_scan);
-                let row_tenant = batch.column(0).as_string::<i32>();
-                let ts = batch.column(1).as_primitive::<Int64Type>();
-                let msg = batch.column(2).as_string::<i32>();
-                let sm_col_idx = 3 + self.stream_labels.len();
-                let sm = batch.column(sm_col_idx).as_string::<i32>();
-                let label_cols: Vec<&StringArray> = (0..self.stream_labels.len())
-                    .map(|label_index| batch.column(3 + label_index).as_string::<i32>())
-                    .collect();
-
-                let row_start = if forward {
-                    0
-                } else {
-                    batch.num_rows().saturating_sub(rows_to_scan)
-                };
-                let row_end = row_start + rows_to_scan;
-                let row_indices: Box<dyn Iterator<Item = usize>> = if forward {
-                    Box::new(row_start..row_end)
-                } else {
-                    Box::new((row_start..row_end).rev())
-                };
-                for i in row_indices {
-                    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-                        break 'row_groups;
-                    }
-                    // Row groups are tenant-aligned, so this never rejects a
-                    // row in a well-formed part. It is kept so isolation does
-                    // not depend on `meta.json` alone: a metadata bug becomes
-                    // an empty result rather than a cross-tenant read.
-                    if row_tenant.value(i) != tenant.as_str() {
-                        return Err(format!(
-                            "part {} row group {row_group} contains rows outside tenant {tenant}",
-                            self.part.meta.id
-                        ));
-                    }
-                    let ts_val = ts.value(i);
-                    if !time_range.contains(ts_val) {
-                        continue;
-                    }
-                    let labels = label_sets.labels_for(&self.stream_labels, &label_cols, i);
-                    if !matchers.iter().all(|m| m.matches(&labels)) {
-                        continue;
-                    }
-                    let line = msg.value(i).to_string();
-                    if !line_filters.iter().all(|f| f.matches(&line)) {
-                        continue;
-                    }
-                    let structured_metadata = if sm.is_null(i) {
-                        Vec::new()
-                    } else {
-                        serde_json::from_str(sm.value(i)).map_err(|error| {
-                        format!(
-                            "invalid structured metadata in part {} at timestamp {ts_val}: {error}",
-                            self.part.meta.id
-                        )
-                    })?
-                    };
-                    collected.push((
-                        labels,
-                        LogEntry {
-                            timestamp_ns: ts_val,
-                            line,
-                            structured_metadata,
-                        },
-                    ));
-                    if forward && collected.len() >= limit {
+                for batch in &batches {
+                    if self.scan_batch(
+                        batch,
+                        tenant,
+                        matchers,
+                        line_filters,
+                        time_range,
+                        forward,
+                        row_group,
+                        scan_limit,
+                        scan_bytes_limit,
+                        cancellation,
+                        &mut label_sets,
+                        &mut stats,
+                        sink,
+                    )? == ScanStep::Stop
+                    {
                         break 'row_groups;
                     }
                 }
-                if scan_limit.is_some_and(|limit| scanned_rows >= limit) {
-                    break 'row_groups;
+                cursor = offset;
+                if span_beyond_frontier(
+                    sink.frontier_ns(),
+                    forward,
+                    self.part.meta.row_group_min_ts[rgu],
+                    self.part.meta.row_group_max_ts[rgu],
+                ) {
+                    continue 'row_groups;
                 }
-            }
-            if !forward && collected.len() >= limit {
-                break;
+                // Geometric: a scan that does have to read the whole group pays
+                // O(group rows) in skipped records overall rather than one skip
+                // over the whole prefix per window.
+                window = window.saturating_mul(2);
             }
         }
 
-        if forward {
-            collected.sort_by_key(|e| e.1.timestamp_ns);
-        } else {
-            collected.sort_by_key(|e| std::cmp::Reverse(e.1.timestamp_ns));
-        }
-        collected.truncate(limit);
-
-        Ok(QueryResult {
-            results: group_by_labels(collected),
-            scanned_rows,
-            scanned_bytes,
-        })
+        Ok(stats)
     }
+
+    /// One decoded batch, offered row by row.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_batch(
+        &self,
+        batch: &RecordBatch,
+        tenant: &TenantId,
+        matchers: &[LabelMatcher],
+        line_filters: &[LineFilter],
+        time_range: QueryTimeRange,
+        forward: bool,
+        row_group: u32,
+        scan_limit: Option<usize>,
+        scan_bytes_limit: Option<u64>,
+        cancellation: Option<&AtomicBool>,
+        label_sets: &mut LabelSetCache,
+        stats: &mut ScanStats,
+        sink: &mut dyn RowSink,
+    ) -> Result<ScanStep, String> {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Ok(ScanStep::Stop);
+        }
+        stats.scanned_bytes = stats
+            .scanned_bytes
+            .saturating_add(batch.get_array_memory_size() as u64);
+        if scan_bytes_limit.is_some_and(|limit| stats.scanned_bytes > limit) {
+            return Err(format!(
+                "query exceeds the maximum of {} scanned bytes",
+                scan_bytes_limit.unwrap_or_default()
+            ));
+        }
+        let row_tenant = batch.column(0).as_string::<i32>();
+        let ts = batch.column(1).as_primitive::<Int64Type>();
+        let msg = batch.column(2).as_string::<i32>();
+        let sm_col_idx = 3 + self.stream_labels.len();
+        let sm = batch.column(sm_col_idx).as_string::<i32>();
+        let label_cols: Vec<&StringArray> = (0..self.stream_labels.len())
+            .map(|label_index| batch.column(3 + label_index).as_string::<i32>())
+            .collect();
+
+        let row_indices: Box<dyn Iterator<Item = usize>> = if forward {
+            Box::new(0..batch.num_rows())
+        } else {
+            Box::new((0..batch.num_rows()).rev())
+        };
+        for i in row_indices {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Ok(ScanStep::Stop);
+            }
+            // Row groups are tenant-aligned, so this never rejects a row in a
+            // well-formed part. It is kept so isolation does not depend on
+            // `meta.json` alone: a metadata bug becomes an empty result rather
+            // than a cross-tenant read.
+            if row_tenant.value(i) != tenant.as_str() {
+                return Err(format!(
+                    "part {} row group {row_group} contains rows outside tenant {tenant}",
+                    self.part.meta.id
+                ));
+            }
+            let ts_val = ts.value(i);
+            // The rows are ordered within the tenant, so this row being on the
+            // far side of the frontier means every row after it is too.
+            if beyond_frontier(sink.frontier_ns(), forward, ts_val) {
+                return Ok(ScanStep::Stop);
+            }
+            if scan_limit.is_some_and(|limit| stats.scanned_rows >= limit) {
+                return Ok(ScanStep::Stop);
+            }
+            // Counted per row examined rather than per batch decoded. The batch
+            // is a read granularity the client never asked for, and charging a
+            // whole one to `totalLinesProcessed` reported a query that stopped
+            // after two rows as having processed a thousand.
+            stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+            if !time_range.contains(ts_val) {
+                continue;
+            }
+            let labels = label_sets.labels_for(&self.stream_labels, &label_cols, i);
+            if !matchers.iter().all(|m| m.matches(&labels)) {
+                continue;
+            }
+            let line = msg.value(i).to_string();
+            if !line_filters.iter().all(|f| f.matches(&line)) {
+                continue;
+            }
+            let structured_metadata = if sm.is_null(i) {
+                Vec::new()
+            } else {
+                serde_json::from_str(sm.value(i)).map_err(|error| {
+                    format!(
+                        "invalid structured metadata in part {} at timestamp {ts_val}: {error}",
+                        self.part.meta.id
+                    )
+                })?
+            };
+            sink.accept(
+                &labels,
+                LogEntry {
+                    timestamp_ns: ts_val,
+                    line,
+                    structured_metadata,
+                },
+            )?;
+        }
+        Ok(ScanStep::Continue)
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum ScanStep {
+    Continue,
+    Stop,
+}
+
+/// How many rows one read of a row group should decode.
+///
+/// A read larger than the sink can still take is mostly decoded for nothing; a
+/// tiny one pays Arrow's per-batch cost per row. The floor is what keeps a
+/// `limit=1` from reading one row at a time through a whole window, and the
+/// ceiling is the batch size this reader always used.
+fn window_rows(scan_limit: Option<usize>, scanned_rows: usize, sink: &dyn RowSink) -> usize {
+    scan_limit
+        .map(|limit| limit.saturating_sub(scanned_rows))
+        .into_iter()
+        .chain(sink.remaining().map(|remaining| remaining.max(256)))
+        .min()
+        .unwrap_or(1024)
+        .clamp(1, 1024)
 }
 
 impl PartReader {

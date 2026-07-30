@@ -510,6 +510,71 @@
         assert_eq!(result.results[0].entries[0].timestamp_ns, 0);
     }
 
+    /// The ordering the bounded scan's early termination rests on.
+    ///
+    /// `PartReader::scan_into` treats the first row on the far side of the
+    /// sink's frontier as the end of the part, which is only sound because a
+    /// tenant's rows come back in timestamp order — `Row::sort_key` starts
+    /// `(tenant, timestamp_ns, …)` and every writer sorts. Written deliberately
+    /// out of order, in two tenants and across several row groups, and asserted
+    /// in both directions, because an unsorted part would make a limited query
+    /// silently drop rows rather than fail.
+    #[test]
+    fn a_parts_rows_come_back_in_timestamp_order_within_a_tenant() {
+        let tmp = tempfile_dir();
+        let other = crate::tenant::TenantId::parse("other").unwrap();
+        let rows: Vec<Row> = [7i64, 2, 9, 0, 5, 3, 8, 1, 6, 4]
+            .into_iter()
+            .flat_map(|timestamp_ns| {
+                [test_tenant(), other.clone()]
+                    .into_iter()
+                    .map(move |tenant| Row {
+                        tenant,
+                        timestamp_ns,
+                        labels: std::sync::Arc::new(BTreeMap::new()),
+                        line: format!("line-{timestamp_ns}"),
+                        structured_metadata: vec![],
+                    })
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 3).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        for tenant in [test_tenant(), other] {
+            for forward in [true, false] {
+                let mut collector = RowCollector::new(&tenant);
+                reader
+                    .scan_into(
+                        &tenant,
+                        &[],
+                        &[],
+                        &[],
+                        QueryTimeRange::unbounded(),
+                        forward,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &mut collector,
+                    )
+                    .unwrap();
+                let seen: Vec<i64> = collector
+                    .into_rows()
+                    .iter()
+                    .map(|row| row.timestamp_ns)
+                    .collect();
+                let mut wanted: Vec<i64> = (0..10).collect();
+                if !forward {
+                    wanted.reverse();
+                }
+                assert_eq!(
+                    seen, wanted,
+                    "tenant {tenant} scanned {} order",
+                    if forward { "forward" } else { "backward" }
+                );
+            }
+        }
+    }
+
     #[test]
     fn scan_limit_stops_before_collecting_the_rest_of_a_part() {
         let tmp = tempfile_dir();

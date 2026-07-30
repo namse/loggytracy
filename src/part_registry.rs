@@ -526,13 +526,51 @@ impl PartRegistry {
         scan_bytes_limit: Option<u64>,
         cancellation: Option<&AtomicBool>,
     ) -> Result<QueryResult, String> {
+        let mut rows = crate::part::TopKRows::new(limit, forward);
+        let stats = self.scan_into(
+            tenant,
+            matchers,
+            pruning,
+            range,
+            forward,
+            scan_limit,
+            scan_bytes_limit,
+            cancellation,
+            &mut rows,
+        )?;
+        Ok(QueryResult {
+            results: rows.into_stream_results(),
+            scanned_rows: stats.scanned_rows,
+            scanned_bytes: stats.scanned_bytes,
+        })
+    }
+
+    /// Every candidate part's rows, offered to `sink` in the query's direction.
+    ///
+    /// The registry used to materialize each part's result, flatten it into one
+    /// `Vec`, sort that and truncate it — the middle of the three
+    /// materialize-and-sort hops (`docs/VISION.md` II). It now passes the
+    /// caller's sink straight down, so the rows are never assembled here at all,
+    /// and it uses the sink's frontier to skip a whole part from its tenant
+    /// segment's timestamp span: a part that cannot hold a row good enough to
+    /// enter the result is never opened, and its `.access` marker is not written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_into(
+        &self,
+        tenant: &TenantId,
+        matchers: &[LabelMatcher],
+        pruning: ExactFieldPruning<'_>,
+        range: QueryTimeRange,
+        forward: bool,
+        scan_limit: Option<usize>,
+        scan_bytes_limit: Option<u64>,
+        cancellation: Option<&AtomicBool>,
+        sink: &mut dyn crate::part::RowSink,
+    ) -> Result<crate::part::ScanStats, String> {
+        let mut stats = crate::part::ScanStats::default();
         let readers = self.snapshot();
-        if readers.is_empty() {
-            return Ok(QueryResult {
-                results: Vec::new(),
-                scanned_rows: 0,
-                scanned_bytes: 0,
-            });
+        if readers.is_empty() || sink.is_closed() {
+            return Ok(stats);
         }
 
         let mut candidates: Vec<Arc<PartReader>> = readers
@@ -562,20 +600,30 @@ impl PartRegistry {
             candidates.reverse();
         }
 
-        let mut all: Vec<(crate::memtable::SharedLabels, crate::memtable::LogEntry)> = Vec::new();
-        let mut scanned_rows = 0usize;
-        let mut scanned_bytes = 0u64;
         for reader in &candidates {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 break;
             }
-            // Every part must be considered. Parts can contain overlapping and
-            // out-of-order timestamp ranges, so reaching the global limit in
-            // an earlier part is not a safe reason to skip later parts.
-            let part_limit = limit;
-            let part_scan_limit = scan_limit.map(|budget| budget.saturating_sub(scanned_rows));
+            // Parts can hold overlapping and out-of-order timestamp ranges, so a
+            // full earlier part is not a reason to skip a later one. What *is* a
+            // reason is the frontier: once the sink holds `limit` rows, a part
+            // whose whole segment is behind the worst of them cannot contribute,
+            // whatever its overlap with the others.
+            let Some(segment) = reader.meta().tenant_segment(tenant) else {
+                continue;
+            };
+            if crate::part::span_beyond_frontier(
+                sink.frontier_ns(),
+                forward,
+                segment.min_ts_ns,
+                segment.max_ts_ns,
+            ) {
+                continue;
+            }
+            let part_scan_limit =
+                scan_limit.map(|budget| budget.saturating_sub(stats.scanned_rows));
             let part_scan_bytes_limit =
-                scan_bytes_limit.map(|budget| budget.saturating_sub(scanned_bytes));
+                scan_bytes_limit.map(|budget| budget.saturating_sub(stats.scanned_bytes));
             if part_scan_limit == Some(0) {
                 break;
             }
@@ -594,48 +642,34 @@ impl PartRegistry {
                     let _ = std::fs::write(&access_marker, []);
                 }
             }
-            let result = reader
-                .query_with_exact_field_pruning_and_scan_limits(
+            let part_stats = reader
+                .scan_into(
                     tenant,
                     matchers,
-                    pruning,
+                    pruning.line_filters,
+                    pruning.exact_fields,
                     range,
-                    part_limit,
                     forward,
                     part_scan_limit,
                     part_scan_bytes_limit,
                     cancellation,
+                    None,
+                    sink,
                 )
                 .map_err(|error| {
                     format!("failed to query part {}: {error}", reader.part().meta.id)
                 })?;
-            scanned_rows = scanned_rows.saturating_add(result.scanned_rows);
-            scanned_bytes = scanned_bytes.saturating_add(result.scanned_bytes);
-            for sr in result.results {
-                for entry in sr.entries {
-                    all.push((sr.labels.clone(), entry));
-                }
-            }
-            if part_scan_limit.is_some_and(|limit| result.scanned_rows >= limit) {
+            stats.scanned_rows = stats.scanned_rows.saturating_add(part_stats.scanned_rows);
+            stats.scanned_bytes = stats.scanned_bytes.saturating_add(part_stats.scanned_bytes);
+            if part_scan_limit.is_some_and(|limit| part_stats.scanned_rows >= limit) {
                 break;
             }
-            if part_scan_bytes_limit.is_some_and(|limit| result.scanned_bytes >= limit) {
+            if part_scan_bytes_limit.is_some_and(|limit| part_stats.scanned_bytes >= limit) {
                 break;
             }
         }
 
-        if forward {
-            all.sort_by_key(|e| e.1.timestamp_ns);
-        } else {
-            all.sort_by_key(|e| std::cmp::Reverse(e.1.timestamp_ns));
-        }
-        all.truncate(limit);
-
-        Ok(QueryResult {
-            results: crate::part::group_by_labels(all),
-            scanned_rows,
-            scanned_bytes,
-        })
+        Ok(stats)
     }
 
     /// Whether the part still holds anything for the tenant that its

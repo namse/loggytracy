@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::logql::LogQuery;
 use crate::memtable::{Labels, LogEntry, MemTable, SharedLabels, StreamResult};
-use crate::part::{ExactFieldPruning, QueryTimeRange};
+use crate::part::{ExactFieldPruning, QueryTimeRange, RowSink, TopKRows};
 use crate::part_registry::PartRegistry;
 use crate::tenant::TenantId;
 
@@ -106,58 +106,42 @@ impl<'a> LogScan<'a> {
             .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
+    /// The memtable and then the parts, both streaming into one bounded sink.
+    ///
+    /// There is no `normal_scan_limit` any more. It existed because the limit
+    /// had to be handed to the storage scan *before* the pipeline could say
+    /// which rows survived, so any `| json` had to be given `usize::MAX` and the
+    /// whole window was materialized. The sink inverts that: the pipeline runs
+    /// as each row arrives, the sink holds the best `limit` survivors, and the
+    /// scan reads until it has them rather than until it has read everything.
+    ///
+    /// The memtable is scanned first in both directions. It holds the newest
+    /// rows, so a backward query fills the sink from it and prunes most parts on
+    /// their metadata; a forward query fills the sink with rows the parts then
+    /// displace, which costs the sink's own bookkeeping and nothing else.
     pub fn run(&self, memtable: &MemTable, parts: &PartRegistry) -> Result<LogScanResult, String> {
-        let mut all: Vec<(SharedLabels, LogEntry)> = Vec::new();
+        let mut sink = PipelineSink {
+            query: self.query,
+            hidden: self.hidden,
+            cancellation: self.cancellation,
+            max_memory_bytes: self.max_memory_bytes,
+            materialized_memory_bytes: 0,
+            rows: TopKRows::new(self.limit, self.forward),
+        };
         let mut scanned_rows = 0u64;
         let mut scanned_bytes = 0u64;
-        let mut materialized_memory_bytes = 0u64;
-
-        // Pipeline predicates run after storage scans. Do not let the API log
-        // limit truncate raw rows before a json/logfmt/field stage has
-        // evaluated.
-        let normal_scan_limit = if self.query.stages.len() == self.query.line_filters.len() {
-            self.limit
-        } else {
-            usize::MAX
-        };
         let scan_limit = self.scan_budget.map(|budget| budget.saturating_add(1));
 
-        let memtable_result = memtable.query_with_scan_limit(
+        scanned_rows = scanned_rows.saturating_add(memtable.scan_into(
             self.tenant,
             &self.query.matchers,
             &self.query.line_filters,
             self.range,
-            normal_scan_limit,
             self.forward,
             scan_limit,
             self.cancellation,
-        );
-        scanned_rows = scanned_rows.saturating_add(memtable_result.scanned_rows as u64);
-        for sr in memtable_result.results {
-            for mut e in sr.entries {
-                if self.cancelled() {
-                    return Err("query timed out".to_string());
-                }
-                // Before the pipeline runs: a delete selector matches the line
-                // as it was written, and `line_format` would have rewritten it.
-                if self.hidden.is_some_and(|hidden| hidden(&sr.labels, &e)) {
-                    continue;
-                }
-                if self.query.process_entry_with_labels_cancellable(
-                    &sr.labels,
-                    &mut e,
-                    self.cancellation,
-                )? {
-                    materialized_memory_bytes = materialized_memory_bytes
-                        .checked_add(estimated_log_entry_memory_bytes(&sr.labels, &e))
-                        .ok_or_else(|| {
-                            "query materialized memory accounting overflowed".to_string()
-                        })?;
-                    self.check_memory(materialized_memory_bytes)?;
-                    all.push((sr.labels.clone(), e));
-                }
-            }
-        }
+            &mut sink,
+        )? as u64);
 
         if self.cancelled() {
             return Err("query timed out".to_string());
@@ -169,42 +153,19 @@ impl<'a> LogScan<'a> {
         let part_scan_bytes_limit = self
             .max_scan_bytes
             .map(|budget| budget.saturating_sub(scanned_bytes));
-        let part_result = parts.query_with_exact_field_pruning_and_scan_limits(
+        let part_stats = parts.scan_into(
             self.tenant,
             &self.query.matchers,
             ExactFieldPruning::new(&self.query.line_filters, &exact_fields),
             self.range,
-            normal_scan_limit,
             self.forward,
             part_scan_limit,
             part_scan_bytes_limit,
             self.cancellation,
+            &mut sink,
         )?;
-        scanned_rows = scanned_rows.saturating_add(part_result.scanned_rows as u64);
-        scanned_bytes = scanned_bytes.saturating_add(part_result.scanned_bytes);
-        for sr in part_result.results {
-            for mut e in sr.entries {
-                if self.cancelled() {
-                    return Err("query timed out".to_string());
-                }
-                if self.hidden.is_some_and(|hidden| hidden(&sr.labels, &e)) {
-                    continue;
-                }
-                if self.query.process_entry_with_labels_cancellable(
-                    &sr.labels,
-                    &mut e,
-                    self.cancellation,
-                )? {
-                    materialized_memory_bytes = materialized_memory_bytes
-                        .checked_add(estimated_log_entry_memory_bytes(&sr.labels, &e))
-                        .ok_or_else(|| {
-                            "query materialized memory accounting overflowed".to_string()
-                        })?;
-                    self.check_memory(materialized_memory_bytes)?;
-                    all.push((sr.labels.clone(), e));
-                }
-            }
-        }
+        scanned_rows = scanned_rows.saturating_add(part_stats.scanned_rows as u64);
+        scanned_bytes = scanned_bytes.saturating_add(part_stats.scanned_bytes);
 
         if self.cancelled() {
             return Err("query timed out".to_string());
@@ -218,15 +179,8 @@ impl<'a> LogScan<'a> {
             ));
         }
 
-        if self.forward {
-            all.sort_by_key(|e| e.1.timestamp_ns);
-        } else {
-            all.sort_by_key(|e| std::cmp::Reverse(e.1.timestamp_ns));
-        }
-        all.truncate(self.limit);
-
         Ok(LogScanResult {
-            results: crate::part::group_by_labels(all),
+            results: sink.rows.into_stream_results(),
             scanned_rows,
             scanned_bytes,
         })
@@ -242,16 +196,71 @@ impl<'a> LogScan<'a> {
         }
         Ok(())
     }
+}
 
-    fn check_memory(&self, materialized_memory_bytes: u64) -> Result<(), String> {
+/// The executor's sink: the pipeline, the deletion mask and the bounded result.
+///
+/// This is where the read path's three materializations collapsed into one. The
+/// reader and the registry hand rows straight through, and the only rows that
+/// are held anywhere are the `limit` in `rows`.
+struct PipelineSink<'a> {
+    query: &'a LogQuery,
+    hidden: Option<HiddenRow<'a>>,
+    cancellation: Option<&'a AtomicBool>,
+    max_memory_bytes: Option<u64>,
+    /// Charged for every row that survives the pipeline, not for the rows the
+    /// sink kept. The bound is on what the query materialized on its way to an
+    /// answer, and lowering it to what it *held* would loosen a limit — which is
+    /// the metering work, not this (`todo.md`, M10 honest metering).
+    materialized_memory_bytes: u64,
+    rows: TopKRows,
+}
+
+impl RowSink for PipelineSink<'_> {
+    fn accept(&mut self, labels: &SharedLabels, mut entry: LogEntry) -> Result<(), String> {
+        if self
+            .cancellation
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err("query timed out".to_string());
+        }
+        // Before the pipeline runs: a delete selector matches the line as it was
+        // written, and `line_format` would have rewritten it.
+        if self.hidden.is_some_and(|hidden| hidden(labels, &entry)) {
+            return Ok(());
+        }
+        if !self.query.process_entry_with_labels_cancellable(
+            labels,
+            &mut entry,
+            self.cancellation,
+        )? {
+            return Ok(());
+        }
+        self.materialized_memory_bytes = self
+            .materialized_memory_bytes
+            .checked_add(estimated_log_entry_memory_bytes(labels, &entry))
+            .ok_or_else(|| "query materialized memory accounting overflowed".to_string())?;
         if let Some(max) = self.max_memory_bytes
-            && materialized_memory_bytes > max
+            && self.materialized_memory_bytes > max
         {
             return Err(format!(
                 "query exceeds the maximum of {max} materialized bytes"
             ));
         }
+        self.rows.offer(labels, entry);
         Ok(())
+    }
+
+    fn frontier_ns(&self) -> Option<i64> {
+        self.rows.frontier_ns()
+    }
+
+    fn remaining(&self) -> Option<usize> {
+        self.rows.remaining()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.rows.is_closed()
     }
 }
 

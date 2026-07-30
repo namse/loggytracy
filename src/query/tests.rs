@@ -308,8 +308,18 @@
         assert_eq!(response.data.result[0]["values"][0][1], "1");
     }
 
+    /// The output limit bounds the physical scan.
+    ///
+    /// This test used to assert the opposite, under the name
+    /// `query_scan_stats_count_rows_before_applying_output_limit`: three rows
+    /// were read to answer a `limit=1`, because the limit could only truncate
+    /// the result after the scan had produced it. That is
+    /// `docs/VISION.md` III — "the worst violation is the most common query" —
+    /// and what the bounded sink removes. The scan budget is still a budget on
+    /// rows *read*, so it is asserted with a limit loose enough not to bound
+    /// them.
     #[tokio::test]
-    async fn query_scan_stats_count_rows_before_applying_output_limit() {
+    async fn the_output_limit_bounds_the_physical_scan() {
         let data_dir = temp_dir();
         let labels: Labels = [("app".to_string(), "api".to_string())]
             .into_iter()
@@ -328,25 +338,32 @@
         );
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
         let parsed = logql::parse("{}").unwrap();
-        let execution =
-            run_unified_query_with_stats(
+        for (forward, wanted_line) in [(true, "line-0"), (false, "line-2")] {
+            let execution = run_unified_query_with_stats(
                 state.clone(),
                 test_tenant(),
-                parsed.clone(), crate::part::QueryTimeRange::closed(0, 2),
+                parsed.clone(),
+                crate::part::QueryTimeRange::closed(0, 2),
                 1,
-                true,
+                forward,
                 None,
             )
-                .await
-                .unwrap();
-        assert_eq!(execution.results[0].entries.len(), 1);
-        assert_eq!(execution.scanned_rows, 3);
+            .await
+            .unwrap();
+            assert_eq!(execution.results[0].entries.len(), 1);
+            assert_eq!(execution.results[0].entries[0].line, wanted_line);
+            assert_eq!(
+                execution.scanned_rows, 1,
+                "one row of answer must cost one row of scan"
+            );
+        }
 
         let error = match unified_query_with_stats_cancellable(
             &state,
             &test_tenant(),
-            &parsed, crate::part::QueryTimeRange::closed(0, 2),
-            1,
+            &parsed,
+            crate::part::QueryTimeRange::closed(0, 2),
+            10,
             true,
             Some(2),
             None,
@@ -355,6 +372,188 @@
             Err(error) => error,
         };
         assert!(error.contains("2 scanned rows"));
+    }
+
+    /// The bed the early-termination tests share: rows in both the memtable and
+    /// several parts, out of order, with timestamps spread far wider than any
+    /// limit those tests ask for.
+    fn early_termination_state(data_dir: &std::path::Path) -> Arc<AppState> {
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let shared = std::sync::Arc::new(labels.clone());
+        let line = |timestamp_ns: i64| {
+            format!(r#"{{"status":"{}","seq":{timestamp_ns}}}"#, 500 - (timestamp_ns % 3))
+        };
+        let memtable = Arc::new(MemTable::new());
+        // Newest, and out of order within the stream.
+        memtable.insert(
+            test_tenant(),
+            labels,
+            [93i64, 90, 92, 91]
+                .into_iter()
+                .map(|timestamp_ns| LogEntry {
+                    timestamp_ns,
+                    line: line(timestamp_ns),
+                    structured_metadata: Vec::new(),
+                })
+                .collect(),
+        );
+        let parts = Arc::new(PartRegistry::new());
+        // Three parts whose windows do not overlap, so the frontier can reject a
+        // whole part from its metadata, in row groups of three so it can also
+        // reject a row group inside the part it does open. Adjacent rather than
+        // separated, so "the answer is contiguous" is a statement the boundary
+        // test can make.
+        for base in [0i64, 30, 60] {
+            parts
+                .register(
+                    part::flush_rows(
+                        (0..30)
+                            .rev()
+                            .map(|offset| Row {
+                                tenant: test_tenant(),
+                                timestamp_ns: base + offset,
+                                labels: shared.clone(),
+                                line: line(base + offset),
+                                structured_metadata: Vec::new(),
+                            })
+                            .collect(),
+                        &data_dir.join("parts"),
+                        3,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        test_state(data_dir, memtable, parts, None)
+    }
+
+    fn flatten(results: &[StreamResult]) -> Vec<(i64, String)> {
+        let mut rows: Vec<(i64, String)> = results
+            .iter()
+            .flat_map(|stream| {
+                stream
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.timestamp_ns, entry.line.clone()))
+            })
+            .collect();
+        rows.sort_by_key(|(timestamp_ns, _)| *timestamp_ns);
+        rows
+    }
+
+    /// A limit changes how many rows a query answers with, never which ones.
+    ///
+    /// Stated as an identity rather than as a fixture, because that is what
+    /// makes early termination a performance change: `limit = n` has to return
+    /// the first `n` rows of the answer the same query gives when nothing is
+    /// truncated. Checked in both directions and through a `| json | field=`
+    /// pipeline, which is the shape whose limit used to be `usize::MAX`.
+    #[tokio::test]
+    async fn a_limited_query_returns_a_prefix_of_the_unlimited_answer() {
+        let data_dir = temp_dir();
+        let state = early_termination_state(&data_dir);
+        let range = crate::part::QueryTimeRange::closed(0, 1_000);
+        for query in ["{app=\"api\"}", "{app=\"api\"} | json | status=\"500\""] {
+            let parsed = logql::parse(query).unwrap();
+            for forward in [true, false] {
+                let unlimited = flatten(
+                    &unified_query(&state, &test_tenant(), &parsed, range, 1_000, forward).unwrap(),
+                );
+                assert!(
+                    unlimited.len() > 20,
+                    "{query} must match more than any limit below asks for"
+                );
+                for limit in [1usize, 2, 7, 20] {
+                    let limited =
+                        unified_query(&state, &test_tenant(), &parsed, range, limit, forward)
+                            .unwrap();
+                    let rows = flatten(&limited);
+                    assert_eq!(
+                        rows.len(),
+                        limit,
+                        "{query} at limit {limit} ({}) must return exactly the limit",
+                        if forward { "forward" } else { "backward" }
+                    );
+                    // Forwards the answer starts at the oldest row, backwards at
+                    // the newest, so the prefix is taken from the matching end.
+                    let wanted: Vec<(i64, String)> = if forward {
+                        unlimited[..limit].to_vec()
+                    } else {
+                        unlimited[unlimited.len() - limit..].to_vec()
+                    };
+                    assert_eq!(
+                        rows, wanted,
+                        "{query} at limit {limit} returned different rows, not fewer"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The limit is honoured exactly on the boundary where the parts stop and the
+    /// memtable starts, and on the boundary between two parts.
+    ///
+    /// Those are the two places a bounded scan decides to stop reading, so an
+    /// off-by-one there returns 99 rows or 101 rather than an obviously wrong
+    /// answer.
+    #[tokio::test]
+    async fn a_limit_is_honoured_exactly_at_a_source_boundary() {
+        let data_dir = temp_dir();
+        let state = early_termination_state(&data_dir);
+        let range = crate::part::QueryTimeRange::closed(0, 1_000);
+        let parsed = logql::parse("{app=\"api\"}").unwrap();
+        // 4 memtable rows and 30 rows in the newest part: 4 is the memtable
+        // exactly, 5 is one row past it, 34 is the newest part exactly, and 35
+        // is one row into the part before it.
+        for limit in [3usize, 4, 5, 33, 34, 35] {
+            let rows = flatten(
+                &unified_query(&state, &test_tenant(), &parsed, range, limit, false).unwrap(),
+            );
+            assert_eq!(rows.len(), limit, "backward limit {limit}");
+            let newest = rows.last().unwrap().0;
+            assert_eq!(newest, 93, "backward always answers from the newest row");
+            let oldest = rows.first().unwrap().0;
+            assert_eq!(
+                oldest,
+                94 - limit as i64,
+                "the rows are contiguous from the newest downwards at limit {limit}"
+            );
+        }
+    }
+
+    /// Early termination must not reach a row the scan budget already refused.
+    /// The budget counts rows read, so a limit that stops the scan early makes a
+    /// query that used to be refused succeed — and one whose pipeline discards
+    /// most rows still has to be refused.
+    #[tokio::test]
+    async fn the_scan_budget_still_refuses_a_query_the_limit_cannot_bound() {
+        let data_dir = temp_dir();
+        let state = early_termination_state(&data_dir);
+        let range = crate::part::QueryTimeRange::closed(0, 1_000);
+        // Matches nothing, so no limit can ever be reached and the scan runs
+        // until the budget stops it. A regex rather than an equality, because an
+        // equality on an indexed field is answered by the exact-field bloom and
+        // never reaches a row at all — which is the pruning working, not the
+        // budget.
+        let parsed = logql::parse("{app=\"api\"} | json | status=~\"418\"").unwrap();
+        let error = match unified_query_with_stats(
+            &state,
+            &test_tenant(),
+            &parsed,
+            range,
+            10,
+            false,
+            Some(20),
+        ) {
+            Ok(execution) => panic!(
+                "a query that survives nothing must exhaust the budget, read {} rows",
+                execution.scanned_rows
+            ),
+            Err(error) => error,
+        };
+        assert!(error.contains("20 scanned rows"), "{error}");
     }
 
     #[test]

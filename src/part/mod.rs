@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
@@ -396,6 +396,7 @@ impl Row {
     }
 }
 
+include!("sink.rs");
 include!("format.rs");
 include!("indexes.rs");
 include!("metadata.rs");

@@ -145,28 +145,42 @@ fn merge_snapshot(target: &mut MemTableSnapshot, source: MemTableSnapshot) -> u6
     redundant_overhead
 }
 
+/// One stream, offered to the sink in the query's direction.
+///
+/// The stream is sorted first, so the sink's frontier ends it: the first entry
+/// on the far side of the frontier means every later one in this direction is
+/// too. That replaces "each stream contributes at most `limit` rows", which was
+/// only sound when nothing filtered rows after the scan — with a `| json |
+/// field=` stage the surviving count is not the scanned count, and the old rule
+/// was therefore restricted to backward scans and bypassed entirely by
+/// `normal_scan_limit = usize::MAX`.
 #[allow(clippy::too_many_arguments)]
 fn scan_memtable_stream(
     labels: &SharedLabels,
     entries: &[LogEntry],
     line_filters: &[LineFilter],
     range: QueryTimeRange,
-    limit: usize,
     forward: bool,
     scan_limit: Option<usize>,
     cancellation: Option<&AtomicBool>,
     scanned_rows: &mut usize,
-    grouped: &mut BTreeMap<SharedLabels, Vec<LogEntry>>,
+    sink: &mut dyn crate::part::RowSink,
     scan_stopped: &mut bool,
-) {
+) -> Result<(), String> {
     let mut ordered: Vec<&LogEntry> = entries.iter().collect();
     ordered.sort_unstable_by_key(|entry| entry.timestamp_ns);
     if !forward {
         ordered.reverse();
     }
-    let mut matched = 0usize;
     for entry in ordered {
         if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            *scan_stopped = true;
+            break;
+        }
+        if crate::part::beyond_frontier(sink.frontier_ns(), forward, entry.timestamp_ns) {
+            break;
+        }
+        if scan_limit.is_some_and(|limit| *scanned_rows >= limit) {
             *scan_stopped = true;
             break;
         }
@@ -176,23 +190,10 @@ fn scan_memtable_stream(
                 .iter()
                 .all(|filter| filter.matches(&entry.line))
         {
-            grouped
-                .entry(labels.clone())
-                .or_default()
-                .push(entry.clone());
-            matched += 1;
-            // Each stream contributes at most `limit` rows to the global top
-            // or bottom `limit`, so older rows from this stream cannot affect
-            // the final result once its own candidate set is full.
-            if !forward && matched >= limit {
-                break;
-            }
-        }
-        if scan_limit.is_some_and(|limit| *scanned_rows >= limit) {
-            *scan_stopped = true;
-            break;
+            sink.accept(labels, entry.clone())?;
         }
     }
+    Ok(())
 }
 
 impl Default for MemTable {
@@ -397,99 +398,96 @@ impl MemTable {
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
     ) -> QueryResult {
-        if limit == 0 {
-            return QueryResult {
-                results: Vec::new(),
-                scanned_rows: 0,
-                scanned_bytes: 0,
-            };
+        let mut rows = crate::part::TopKRows::new(limit, forward);
+        // A `TopKRows` never refuses a row, so the scan cannot fail here; the
+        // fallible signature is for the executor's sink, which runs the pipeline.
+        let scanned_rows = self
+            .scan_into(
+                tenant,
+                matchers,
+                line_filters,
+                range,
+                forward,
+                scan_limit,
+                cancellation,
+                &mut rows,
+            )
+            .unwrap_or_default();
+        QueryResult {
+            results: rows.into_stream_results(),
+            scanned_rows,
+            scanned_bytes: 0,
         }
-        let mut grouped: BTreeMap<SharedLabels, Vec<LogEntry>> = BTreeMap::new();
+    }
+
+    /// Both buffers' rows for one tenant, offered to `sink` in the query's
+    /// direction.
+    ///
+    /// Streams are visited in label order, which is what the `BTreeMap` this
+    /// used to group into gave for free and what a bounded sink needs kept: it
+    /// breaks ties by arrival, so the arrival order is part of which rows a
+    /// limited query returns. `HashMap` iteration order would have made that
+    /// answer differ between two runs of the same query.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_into(
+        &self,
+        tenant: &TenantId,
+        matchers: &[LabelMatcher],
+        line_filters: &[LineFilter],
+        range: QueryTimeRange,
+        forward: bool,
+        scan_limit: Option<usize>,
+        cancellation: Option<&AtomicBool>,
+        sink: &mut dyn crate::part::RowSink,
+    ) -> Result<usize, String> {
         let mut scanned_rows = 0usize;
+        if sink.is_closed() {
+            return Ok(scanned_rows);
+        }
         let mut scan_stopped = false;
 
         // begin_flush and abort_flush acquire inner before flushing. Holding
         // both read guards in that order prevents observing the same entry in
         // both buffers if a flush starts between the two reads.
         let inner = self.inner.read().unwrap();
-        if let Some(streams) = inner.get(tenant) {
-            for (labels, entries) in streams.iter() {
-                if !matchers.iter().all(|m| m.matches(labels)) {
-                    continue;
-                }
-                scan_memtable_stream(
-                    labels,
-                    entries,
-                    line_filters,
-                    range,
-                    limit,
-                    forward,
-                    scan_limit,
-                    cancellation,
-                    &mut scanned_rows,
-                    &mut grouped,
-                    &mut scan_stopped,
+        let flushing = self.flushing.read().unwrap();
+        // The live buffer first, so that for a stream present in both the rows
+        // that were pushed earlier also arrive earlier. `sort_by` is stable, so
+        // ordering by label set does not disturb that.
+        let mut streams: Vec<(&SharedLabels, &[LogEntry])> = Vec::new();
+        for buffer in std::iter::once(&*inner).chain(flushing.as_deref()) {
+            if let Some(tenant_streams) = buffer.get(tenant) {
+                streams.extend(
+                    tenant_streams
+                        .iter()
+                        .filter(|(labels, _)| matchers.iter().all(|m| m.matches(labels)))
+                        .map(|(labels, entries)| (labels, entries.as_slice())),
                 );
-                if scan_stopped {
-                    break;
-                }
             }
         }
-        let flushing = self.flushing.read().unwrap();
-        if !scan_stopped && let Some(streams) = flushing.as_ref().and_then(|f| f.get(tenant)) {
-            for (labels, entries) in streams {
-                if !matchers.iter().all(|m| m.matches(labels)) {
-                    continue;
-                }
-                scan_memtable_stream(
-                    labels,
-                    entries,
-                    line_filters,
-                    range,
-                    limit,
-                    forward,
-                    scan_limit,
-                    cancellation,
-                    &mut scanned_rows,
-                    &mut grouped,
-                    &mut scan_stopped,
-                );
-                if scan_stopped {
-                    break;
-                }
+        streams.sort_by(|left, right| left.0.cmp(right.0));
+
+        let mut result = Ok(());
+        for (labels, entries) in streams {
+            result = scan_memtable_stream(
+                labels,
+                entries,
+                line_filters,
+                range,
+                forward,
+                scan_limit,
+                cancellation,
+                &mut scanned_rows,
+                sink,
+                &mut scan_stopped,
+            );
+            if result.is_err() || scan_stopped {
+                break;
             }
         }
         drop(flushing);
         drop(inner);
-
-        let mut all_entries: Vec<(SharedLabels, LogEntry)> = grouped
-            .into_iter()
-            .flat_map(|(labels, entries)| {
-                entries
-                    .into_iter()
-                    .map(move |entry| (labels.clone(), entry))
-            })
-            .collect();
-        if forward {
-            all_entries.sort_by_key(|e| e.1.timestamp_ns);
-        } else {
-            all_entries.sort_by_key(|e| std::cmp::Reverse(e.1.timestamp_ns));
-        }
-        all_entries.truncate(limit);
-        let mut result_groups: BTreeMap<SharedLabels, Vec<LogEntry>> = BTreeMap::new();
-        for (labels, entry) in all_entries {
-            result_groups.entry(labels).or_default().push(entry);
-        }
-        let results = result_groups
-            .into_iter()
-            .map(|(labels, entries)| StreamResult { labels, entries })
-            .collect();
-
-        QueryResult {
-            results,
-            scanned_rows,
-            scanned_bytes: 0,
-        }
+        result.map(|()| scanned_rows)
     }
 
     /// Run `visit` over both buffers of one tenant while holding the read
