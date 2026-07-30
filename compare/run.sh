@@ -59,6 +59,17 @@ MATRIX_REPEATS="${COMPARE_MATRIX_REPEATS:-5}"
 MATRIX_WINDOWS="${COMPARE_MATRIX_WINDOWS:-3}"
 SETTLE_SECONDS="${COMPARE_SETTLE_SECONDS:-150}"
 SEED="${COMPARE_SEED:-1592598566}"
+# The query matrix runs once per limit in this list, and each one is given its
+# own restart so every limit gets a cold pass.
+#
+# The first published run used 20000 alone, and that limit never binds: a window
+# holds about 1250 matching rows, so no bound reaches the scan and a bounded
+# executor cannot show in the number. That made the comparison blind to the one
+# thing the read path was changed to do. 100 is Loki's own default and what
+# Grafana sends unless told otherwise. Both are reported: dropping 20000 would
+# break continuity with the published table, and reporting only 100 would be
+# choosing the condition that flatters this engine.
+MATRIX_LIMITS="${COMPARE_MATRIX_LIMITS:-20000 100}"
 
 # The verification dataset's log timestamps. Computed once and given to both
 # runs, because two runs deriving it from their own clocks would seed two
@@ -151,8 +162,8 @@ run_load() {
 }
 
 run_verify() {
-  local phase=$1 target=$2 port=$3 cgroup=$4
-  say "$phase: $target"
+  local phase=$1 target=$2 port=$3 cgroup=$4 limit=${5:-20000} suffix=${6:-}
+  say "$phase: $target${suffix:+ (limit $limit)}"
   LOGGYTRACY_LOAD_TARGET="$target" \
   LOGGYTRACY_LOAD_PHASE="$phase" \
   LOGGYTRACY_LOAD_ADDR="127.0.0.1:$port" \
@@ -165,7 +176,8 @@ run_verify() {
   LOGGYTRACY_LOAD_MATRIX_REPEATS="$MATRIX_REPEATS" \
   LOGGYTRACY_LOAD_MATRIX_WINDOWS="$MATRIX_WINDOWS" \
   LOGGYTRACY_LOAD_MATRIX_STEP_SECONDS="$MATRIX_STEP_SECONDS" \
-  LOGGYTRACY_LOAD_RESULT_PATH="$OUT/${phase}_$target.json" \
+  LOGGYTRACY_LOAD_MATRIX_LIMIT="$limit" \
+  LOGGYTRACY_LOAD_RESULT_PATH="$OUT/${phase}_$target$suffix.json" \
   LOGGYTRACY_BUILD_REVISION="$LOGGYTRACY_BUILD_REVISION" \
     "$LOAD_BIN" >/dev/null || echo "  ($phase verdict was not PASS for $target; the result file says why)" >&2
 }
@@ -242,18 +254,38 @@ LK_DISK_PARTS=$(disk_breakdown loggytracy-compare-loki-1 /loki)
 LT_PEAK_INGEST=$(cat "$LT_CGROUP/memory.peak")
 LK_PEAK_INGEST=$(cat "$LK_CGROUP/memory.peak")
 
-say "restarting both so the cold query pass is cold"
-docker compose restart
-wait_ready "$LOGGYTRACY_PORT" loggytracy
-wait_ready "$LOKI_PORT" loki
-LT_CGROUP=$(cgroup_of loggytracy-compare-loggytracy-1)
-LK_CGROUP=$(cgroup_of loggytracy-compare-loki-1)
+LT_PEAK_QUERY=0
+LK_PEAK_QUERY=0
+PRIMARY_LIMIT=""
+MATRIX_RUNS=""
+for LIMIT in $MATRIX_LIMITS; do
+  say "restarting both so the cold query pass at limit $LIMIT is cold"
+  docker compose restart
+  wait_ready "$LOGGYTRACY_PORT" loggytracy
+  wait_ready "$LOKI_PORT" loki
+  LT_CGROUP=$(cgroup_of loggytracy-compare-loggytracy-1)
+  LK_CGROUP=$(cgroup_of loggytracy-compare-loki-1)
 
-run_verify matrix loggytracy "$LOGGYTRACY_PORT" "$LT_CGROUP"
-run_verify matrix loki "$LOKI_PORT" "$LK_CGROUP"
+  run_verify matrix loggytracy "$LOGGYTRACY_PORT" "$LT_CGROUP" "$LIMIT" "_l$LIMIT"
+  run_verify matrix loki "$LOKI_PORT" "$LK_CGROUP" "$LIMIT" "_l$LIMIT"
 
-LT_PEAK_QUERY=$(cat "$LT_CGROUP/memory.peak")
-LK_PEAK_QUERY=$(cat "$LK_CGROUP/memory.peak")
+  # The query-phase memory peak is the worst any limit reached, not the last
+  # one measured: a terminal sample meaning nothing is a lesson this repository
+  # already paid for three times over.
+  LT_THIS=$(cat "$LT_CGROUP/memory.peak")
+  LK_THIS=$(cat "$LK_CGROUP/memory.peak")
+  [ "$LT_THIS" -gt "$LT_PEAK_QUERY" ] && LT_PEAK_QUERY=$LT_THIS
+  [ "$LK_THIS" -gt "$LK_PEAK_QUERY" ] && LK_PEAK_QUERY=$LK_THIS
+
+  MATRIX_RUNS="$MATRIX_RUNS${MATRIX_RUNS:+,}{\"limit\":$LIMIT,\"suffix\":\"_l$LIMIT\"}"
+  # The first limit in the list carries the report's headline tables, so the
+  # document stays comparable with the published one.
+  if [ -z "$PRIMARY_LIMIT" ]; then
+    PRIMARY_LIMIT=$LIMIT
+    cp "$OUT/matrix_loggytracy_l$LIMIT.json" "$OUT/matrix_loggytracy.json"
+    cp "$OUT/matrix_loki_l$LIMIT.json" "$OUT/matrix_loki.json"
+  fi
+done
 LT_DISK_END=$(disk_of loggytracy-compare-loggytracy-1 /var/lib/loggytracy)
 LK_DISK_END=$(disk_of loggytracy-compare-loki-1 /loki)
 
@@ -277,6 +309,8 @@ cat >"$OUT/bed.json" <<JSON
   "memory_limit_bytes": $(docker exec loggytracy-compare-loggytracy-1 cat /sys/fs/cgroup/memory.max),
   "settle_seconds": $SETTLE_SECONDS,
   "verify_anchor_ns": $ANCHOR_NS,
+  "matrix_primary_limit": $PRIMARY_LIMIT,
+  "matrix_runs": [$MATRIX_RUNS],
   "object_store": "none: both systems are on their local filesystem",
   "peak_bytes": {
     "loggytracy": { "ingest": $LT_PEAK_INGEST, "query": $LT_PEAK_QUERY, "oom_killed": $LT_OOM },

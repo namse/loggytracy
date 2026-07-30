@@ -52,6 +52,7 @@ fn main() {
     what_was_compared(&mut page, &bed, dir);
     ingest_table(&mut page, &load);
     query_table(&mut page, &matrix);
+    query_limits(&mut page, &bed, dir);
     row_equality(&mut page, &matrix);
     memory_table(&mut page, &bed, &load);
     disk_table(&mut page, &bed, &load, &seed);
@@ -64,6 +65,94 @@ fn main() {
         eprintln!("failed to write {out}: {error}");
         std::process::exit(1);
     }
+}
+
+/// The query matrix is run once per `limit`, and this is why.
+///
+/// The first published run used one limit, 20000, over windows holding about
+/// 1250 matching rows — so no bound ever reached the scan, and the table could
+/// not see a bounded executor at all. Reporting only the limit where a bound
+/// binds would be choosing the flattering condition; reporting only the
+/// original would keep measuring nothing. Both are here.
+///
+/// Emitted only when the bed ran more than one, so a single-limit run's
+/// document is unchanged.
+fn query_limits(page: &mut String, bed: &Value, dir: &Path) {
+    let runs = match bed["matrix_runs"].as_array() {
+        Some(runs) if runs.len() > 1 => runs,
+        _ => return,
+    };
+
+    page.push_str(
+        "## The same four shapes at each query limit\n\n\
+A `limit` above the number of rows a window holds never reaches the scan, so it \
+measures an engine that cannot stop early as if it were one that can. The rows \
+below are the same queries over the same dataset, differing only in the bound \
+Grafana would have sent.\n\n\
+| shape | limit | loggytracy cold p50 | Loki cold p50 | ratio | loggytracy lines read | Loki lines read | rows returned |\n\
+|---|---|---|---|---|---|---|---|\n",
+    );
+
+    for shape in SHAPES {
+        for run in runs {
+            let limit = &run["limit"];
+            let suffix = run["suffix"].as_str().unwrap_or("");
+            let lt = read_json(dir, &format!("matrix_loggytracy{suffix}.json"));
+            let lk = read_json(dir, &format!("matrix_loki{suffix}.json"));
+            let lt_shape = &lt["matrix"]["shapes"][shape]["cold_ms"];
+            let lk_shape = &lk["matrix"]["shapes"][shape]["cold_ms"];
+            page.push_str(&format!(
+                "| `{shape}` | {} | {} | {} | **{}** | {} | {} | {} |\n",
+                num(limit),
+                num(&lt_shape["p50_ms"]),
+                num(&lk_shape["p50_ms"]),
+                ratio(&lt_shape["p50_ms"], &lk_shape["p50_ms"]),
+                lines_read(&lt, shape),
+                lines_read(&lk, shape),
+                rows_returned(&lt, shape),
+            ));
+        }
+    }
+
+    page.push_str(
+        "\nMilliseconds, and a ratio above `1.00x` means loggytracy took longer. \
+\"Lines read\" is each system's own `data.stats.summary.totalLinesProcessed`, \
+summed over the shape's answers — what the engine had to touch to produce the \
+answer, which is the quantity pruning and early termination exist to reduce. \
+It is reported rather than gated: the two count it in their own terms.\n\n",
+    );
+}
+
+fn lines_read(matrix: &Value, shape: &str) -> String {
+    let total: u64 = matrix["matrix"]["answers"]
+        .as_array()
+        .map(|answers| {
+            answers
+                .iter()
+                .filter(|answer| answer["shape"].as_str() == Some(shape))
+                .filter_map(|answer| answer["lines_processed"].as_u64())
+                .sum()
+        })
+        .unwrap_or(0);
+    if total == 0 {
+        "not reported".to_string()
+    } else {
+        total.to_string()
+    }
+}
+
+fn rows_returned(matrix: &Value, shape: &str) -> String {
+    let total: u64 = matrix["matrix"]["answers"]
+        .as_array()
+        .map(|answers| {
+            answers
+                .iter()
+                .filter(|answer| answer["shape"].as_str() == Some(shape))
+                .filter_map(|answer| answer["rows"].as_u64())
+                .sum()
+        })
+        .unwrap_or(0);
+    total.to_string()
 }
 
 fn read_json(dir: &Path, name: &str) -> Value {
