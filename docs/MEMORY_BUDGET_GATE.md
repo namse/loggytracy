@@ -6,7 +6,7 @@ the comparison bed's mixed load and asserts that the **cgroup's anonymous
 footprint** stays under the number that was declared.
 
 **The current, honest answer to "at what declared budget does this engine survive
-its own load?" is: not known, and above 2 GiB.**
+its own load, settle included?" is 1792 MiB.**
 
 Every "2 GiB" figure below it was measured with a gate that stopped when the
 workload stopped, so what it answered was **"survives ingest"** — a narrower
@@ -342,6 +342,39 @@ ingest — query response p95 was **22.9 s** today at 2 GiB, and was **5.7 s at
 published comparison table never showed this, because its query columns come
 from the matrix phase: one connection, a small dataset, no ingest running. Query
 latency *under* ingest is a third measured axis with no gate on it.
+
+## After streaming the merge
+
+The settle attribution named the term: merge held **829 of 847 live megabytes**
+at the settle peak, because `rewrite_group` materialized the whole group as a
+`Vec<Row>` before writing anything. It now streams — a k-way merge over the
+group's parts feeds a part writer that holds one row group — so nothing
+accumulates. Build `3ca3bb8`, same command, seed, machine and workload.
+
+| declared budget | verdict | `anon` peak | share | ingest phase | settle phase | achieved eps |
+|---|---|---|---|---|---|---|
+| 1536 MiB | **`OOM_KILLED`** | 1501 MiB | 98 % | 1501 | — | — |
+| 1792 MiB (`sm2_1792MiB`) | `UNDER_BUDGET` | 1709 MiB | 95 % | 1709 | 1709 | 19 891 |
+| 2 GiB (`stream_merge_2GiB`) | `UNDER_BUDGET` | 1817 MiB | 89 % | 1817 | 1817 | 19 876 |
+| 2 GiB (`sm2_2GiB`) | `UNDER_BUDGET` | 1832 MiB | 89 % | 1832 | 1832 | 19 874 |
+
+**2 GiB was `OOM_KILLED` through the settle before this and is green after**, and
+1792 MiB — red even on ingest alone before — is green too. The smallest surviving
+budget is **1792 MiB**, with 1536 MiB still red.
+
+The clearest signal is not the totals but the two phase columns: they are now
+**equal in every passing run**. The settle no longer adds anything, which is what
+"merge stopped accumulating" looks like from outside. Before, the settle added
+about 290 MiB on top of ingest and that addition is what killed the process.
+
+Delivered load is unchanged at 19.87–19.89 k eps, so this is not a budget met by
+refusing work.
+
+Two things it does not establish. The gate's spread at these budgets has been
+wide before, and two runs at 2 GiB agreeing to 15 MiB is better than the earlier
+spread but is still two runs. And `merge_max_memory_bytes` no longer bounds
+anything, so `peak_materialized_bytes` — which still adds it — now overstates;
+correcting that is a claim about memory and wants its own measurement.
 
 ## Shrinking the merge budget was tried, and it made things worse
 
