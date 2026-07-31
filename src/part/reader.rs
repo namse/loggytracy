@@ -1054,6 +1054,7 @@ impl PartReader {
     /// own accounting — the rows examined here are the rows
     /// `totalLinesProcessed` reports — and its own frontier semantics in the
     /// pass that follows.
+    #[allow(clippy::too_many_arguments)]
     fn select_rows_in_group(
         &self,
         data_file: &PreadReader,
