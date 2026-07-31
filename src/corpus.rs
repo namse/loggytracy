@@ -519,6 +519,36 @@ fn metadata(rng: &mut Rng, facts: &LineFacts, pairs: usize) -> Vec<(String, Stri
     out
 }
 
+/// A value the corpus actually contains, for a query whose predicate is rare.
+///
+/// The comparison's `json_field` shape filters on `status` or `level`, which
+/// match roughly a fifth of the rows — so it measures scanning, not pruning,
+/// and pruning is what a columnar layout with a per-row-group bloom is *for*.
+/// A `trace_id` is drawn from a population of `rows / 4`, so one of them selects
+/// about four rows out of a hundred and fifty thousand.
+///
+/// Reproducible because [`Vocab::new`] is the first thing to touch the seeded
+/// generator, so rebuilding it here rebuilds the same vocabulary without
+/// regenerating a single row.
+///
+/// The value is *probably* present rather than certainly: with four expected
+/// occurrences, about 2% of the population never gets drawn. An empty answer is
+/// still a fair comparison — both engines are asked the same thing — and the
+/// matrix reports the row count, so it is visible rather than silent.
+pub struct RareValues {
+    pub trace_id: String,
+    pub user_id: String,
+}
+
+pub fn rare_field_values(spec: &CorpusSpec) -> RareValues {
+    let mut rng = Rng::new(spec.seed);
+    let vocab = Vocab::new(&mut rng, spec.rows);
+    RareValues {
+        trace_id: vocab.trace_ids[vocab.trace_ids.len() / 2].clone(),
+        user_id: vocab.user_ids[vocab.user_ids.len() / 2].clone(),
+    }
+}
+
 pub fn generate(spec: &CorpusSpec) -> Corpus {
     let mut rng = Rng::new(spec.seed);
     let vocab = Vocab::new(&mut rng, spec.rows);

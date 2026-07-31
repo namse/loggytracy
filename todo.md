@@ -326,6 +326,48 @@ against the batch one), and `3ca3bb8` (the switchover, retiring the split fallba
 - [ ] **`peak_materialized_bytes` now overstates.** It still adds `merge_max_memory_bytes`, which no longer
       bounds a rewrite. Correcting it is a claim about memory and wants its own measurement rather than an edit
 
+## The selectivity axis, and the tension it found
+
+`json_field` filters on `status` or `level`, which match about a fifth of the rows, so the comparison has only
+ever measured how fast each engine *scans*. `json_field_rare` filters on a `trace_id` drawn from a population
+of `rows / 4` — four rows in thirty thousand — which is what a per-row-group bloom over a columnized field
+exists to answer. It carries no `app` selector, because a trace is drawn independently of the app and "find
+this trace across everything" is both the real query and the one where the field predicate is the only
+selective thing.
+
+Short run, 30,000 rows over 8 streams, limit 100, both systems local, build `f18b8ea`:
+
+| shape | loggytracy | Loki | ratio | lt lines | Loki lines | rows |
+|---|---|---|---|---|---|---|
+| `label_only` | 0.71 ms | 8.37 ms | **0.08x** | 32,400 | 35,633 | 2,400 |
+| `line_filter` | 0.95 ms | 6.16 ms | **0.15x** | 90,000 | 35,839 | 2,008 |
+| `json_field` | 4.44 ms | 9.53 ms | **0.47x** | 56,556 | 35,781 | 2,393 |
+| **`json_field_rare`** | **39.18 ms** | **23.14 ms** | **1.69x** | **671,184** | 334,032 | **72** |
+| `rate` | 8.95 ms | 4.75 ms | 1.89x | 253,728 | 60,034 | 41 |
+
+**It loses on the one shape the design exists to win**, reading 671,184 lines to return 72 rows — every query
+reading exactly 30,000, which is the whole dataset, so nothing was pruned at all.
+
+**It is not a bug, and the bloom is not broken.** An absent `trace_id` prunes to **0 lines**; the present one
+reads 24,576, which is three full row groups. The filter answers correctly both times. The rows are simply
+*there*: a trace's four rows belong to four different streams, rows are now ordered by stream, so those four
+rows land in three or four different row groups and not one of them can be skipped.
+
+**So the layout has a tension in it, and both halves are measured.** Ordering by stream is what took
+`label_only` to 0.08x and `json_field` to 0.47x, because a label predicate selects streams. The same ordering
+scatters a high-cardinality field across every group, because such a field is orthogonal to the stream. Row
+groups can be organized for one or the other, not both.
+
+- [ ] **Decide what answers a rare field, given that row-group granularity cannot.** The options are not
+      equivalent and one is already excluded: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) says "no inverted
+      index" as a decided choice, so a secondary index on high-cardinality fields would reverse a decision
+      rather than add a feature. What remains is sub-row-group skipping — Parquet's page index and
+      `RowSelection` let a bloom hit narrow to pages instead of whole groups — or accepting that a rare-field
+      lookup costs a scan and saying so
+- [ ] Confirm the other four rows in the full bed. This run is 30,000 rows with both systems local, not the
+      containerized comparison, so the ratios are indicative and the *shape* of the finding is what matters
+- [ ] `rate` is still 1.89x and still reads what it reads at any limit, unchanged by the layout
+
 ## Next — the backward scan does not know the layout changed
 
 Rows are now ordered by stream before time (`part/mod.rs`, `Row::sort_key`), which is what localizes a stream

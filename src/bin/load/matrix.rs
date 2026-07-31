@@ -46,13 +46,28 @@ pub enum Shape {
     LabelOnly,
     LineFilter,
     JsonField,
+    /// The same parser stage, on a predicate that is actually rare.
+    ///
+    /// `json_field` filters on `status` or `level`, which match roughly a fifth
+    /// of the rows, so it measures how fast an engine scans. This one filters on
+    /// a `trace_id` drawn from a population of `rows / 4` — about four rows in a
+    /// hundred and fifty thousand — which is what a per-row-group bloom over a
+    /// columnized field exists to answer. Without this axis the comparison never
+    /// tests the condition the design is supposed to win.
+    ///
+    /// It carries no `app` selector on purpose. A trace is drawn independently
+    /// of the app, so constraining one would leave the answer empty for seven
+    /// apps in eight; and "find this trace across everything" is both the real
+    /// query and the one where the field predicate is the only selective thing.
+    JsonFieldRare,
     Rate,
 }
 
-pub const SHAPES: [Shape; 4] = [
+pub const SHAPES: [Shape; 5] = [
     Shape::LabelOnly,
     Shape::LineFilter,
     Shape::JsonField,
+    Shape::JsonFieldRare,
     Shape::Rate,
 ];
 
@@ -62,6 +77,7 @@ impl Shape {
             Shape::LabelOnly => "label_only",
             Shape::LineFilter => "line_filter",
             Shape::JsonField => "json_field",
+            Shape::JsonFieldRare => "json_field_rare",
             Shape::Rate => "rate",
         }
     }
@@ -76,7 +92,13 @@ impl Shape {
 /// load phase and a jittered duplicate here would be a row-equality failure
 /// that says nothing about either engine.
 pub fn verify_corpus(cfg: &Config) -> Corpus {
-    loggytracy::corpus::generate(&CorpusSpec {
+    loggytracy::corpus::generate(&verify_spec(cfg))
+}
+
+/// The spec `verify_corpus` generates from, on its own so the query builder can
+/// rebuild the seeded vocabulary without rebuilding the rows.
+fn verify_spec(cfg: &Config) -> CorpusSpec {
+    CorpusSpec {
         seed: cfg.seed ^ VERIFY_SEED_SALT,
         tenants: 1,
         streams: cfg.verify.streams,
@@ -90,7 +112,7 @@ pub fn verify_corpus(cfg: &Config) -> Corpus {
         start_ts_ns: cfg.verify.anchor_ns,
         step_ns: cfg.verify.step_ns,
         out_of_order: false,
-    })
+    }
 }
 
 /// Anchors that are not `> 0` are refused rather than defaulted.
@@ -318,6 +340,9 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
     let span = cfg.verify_span_ns();
     let windows = cfg.verify.windows as i64;
     let step_ns = cfg.verify.step_seconds * 1_000_000_000;
+    // Rebuilt from the seed rather than scanned out of the corpus, so the
+    // matrix phase does not have to hold the rows the seed phase wrote.
+    let rare = loggytracy::corpus::rare_field_values(&verify_spec(cfg));
     let mut queries = Vec::new();
     for shape in SHAPES {
         for (app_index, app) in apps.iter().enumerate() {
@@ -333,6 +358,13 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                 let selector = format!("{{app=\"{app}\"}}");
                 let variant = app_index * cfg.verify.windows + window;
                 let expression = match shape {
+                    // No app selector: a trace is drawn independently of the
+                    // app, so pinning one would empty the answer for seven apps
+                    // in eight, and the point is a predicate that is the only
+                    // selective thing in the query.
+                    Shape::JsonFieldRare => {
+                        format!("{{app=~\".+\"}} | json | trace_id=\"{}\"", rare.trace_id)
+                    }
                     Shape::LabelOnly => selector,
                     Shape::LineFilter => {
                         format!("{selector} |= \"{}\"", PHRASES[variant % PHRASES.len()])
