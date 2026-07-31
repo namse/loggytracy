@@ -513,11 +513,13 @@ neither is a defect in either engine.
       half. The VictoriaLogs half is the columnization gap, unchanged in kind
 - [x] Report the reduced digest as its own agreement column — the report prints agreement per pair per
       shape, names the basis of each pair, and withholds any ratio over a disagreement
-- [ ] The metric gap is now **61x** against VictoriaLogs (`rate` 0.41 ms against 25 ms) and 2.3x against
-      Loki, and the plan addresses it in order: metric-path projection pushdown first (decode the timestamp
-      and label columns, not the line and the metadata blob), then sidecar-only evaluation for filterless
-      windows (per-row-group row counts land with the next format change), which is the step VictoriaLogs
-      itself does not have
+- [ ] The metric gap: projection pushdown took `rate` from 25 ms to **9.5 ms** — a 2.33x loss to Loki is
+      now a 0.87x win, and the VictoriaLogs gap fell from 61x to 23x. What remains for it is sidecar-only
+      evaluation for filterless windows (the per-row-group row counts are in `meta.json` already), which is
+      the step VictoriaLogs itself does not have. And the two-pass scan over the `_sm:` columns took
+      `metadata_rare` from 18.5 ms to **3.7 ms** — 0.05x against Loki, and the VictoriaLogs side of the
+      claim is now 2.42x where it was 12.6x. **Every shape now beats Loki**; `json_field_rare` (25x against
+      VictoriaLogs) waits on parsed-field columnization, the one shape whose cost is the line parse itself
 
 ## The claim moved onto its worst shape, and the measurement said so within the hour
 
