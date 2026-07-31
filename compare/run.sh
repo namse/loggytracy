@@ -74,13 +74,7 @@ ready_path_of() {
     *) echo /ready ;;
   esac
 }
-data_dir_of() {
-  case "$1" in
-    loggytracy) echo /var/lib/loggytracy ;;
-    loki) echo /loki ;;
-    victorialogs) echo /victoria-logs-data ;;
-  esac
-}
+volume_of() { echo "loggytracy-compare_$1-data"; }
 
 # Ingest phase. The event target is the stop condition; the duration is only a
 # cap, and a run that hits the cap instead is reported as such.
@@ -306,17 +300,23 @@ curl -s -X POST "http://127.0.0.1:$LOKI_PORT/flush" >/dev/null || true
 curl -s "http://127.0.0.1:$VICTORIALOGS_PORT/internal/force_flush" >/dev/null || true
 sleep "$SETTLE_SECONDS"
 
+# Disk is measured from each service's *volume*, mounted read-only into a
+# busybox helper, not with `docker exec du` inside the service container —
+# VictoriaLogs' image is built from scratch and carries neither a shell nor
+# `du`, and a measurement path that only works for some targets is how a
+# target gets silently measured differently.
 disk_of() {
-  docker exec "$1" du -sb "$2" | cut -f1
+  docker run --rm -v "$(volume_of "$1"):/data:ro" busybox du -sb /data | cut -f1
 }
 disk_breakdown() {
-  docker exec "$1" sh -c "du -sb $2/* 2>/dev/null" | awk '{printf "%s%s:%s", (NR>1?",":""), $2, $1}'
+  docker run --rm -v "$(volume_of "$1"):/data:ro" busybox sh -c 'du -sb /data/* 2>/dev/null' \
+    | awk '{printf "%s%s:%s", (NR>1?",":""), $2, $1}'
 }
 
 declare -A DISK DISK_PARTS PEAK_INGEST PEAK_QUERY DISK_END OOM
 for TARGET in $TARGETS; do
-  DISK[$TARGET]=$(disk_of "$(container_of "$TARGET")" "$(data_dir_of "$TARGET")")
-  DISK_PARTS[$TARGET]=$(disk_breakdown "$(container_of "$TARGET")" "$(data_dir_of "$TARGET")")
+  DISK[$TARGET]=$(disk_of "$TARGET")
+  DISK_PARTS[$TARGET]=$(disk_breakdown "$TARGET")
   PEAK_INGEST[$TARGET]=$(cat "${CGROUP[$TARGET]}/memory.peak")
   PEAK_QUERY[$TARGET]=0
 done
@@ -355,7 +355,7 @@ done
 # result, not an error, and a comparison that quietly restarted through one
 # would be reporting the wrong thing.
 for TARGET in $TARGETS; do
-  DISK_END[$TARGET]=$(disk_of "$(container_of "$TARGET")" "$(data_dir_of "$TARGET")")
+  DISK_END[$TARGET]=$(disk_of "$TARGET")
   OOM[$TARGET]=$(docker inspect -f '{{.State.OOMKilled}}' "$(container_of "$TARGET")")
 done
 
