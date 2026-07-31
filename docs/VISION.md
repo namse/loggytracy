@@ -379,6 +379,20 @@ is what would say.
   it is smaller than the integration.
 - **No TLS, no authentication.** Already decided; unchanged.
 - **No per-tenant object paths.** Already decided on cost grounds; unchanged.
+- **No format versioning.** Nothing on disk or on the wire carries a version, and
+  nothing reads data written by an older build — not parts, trace parts, the
+  manifest, the WAL, the compaction state, or the bloom container. There is no
+  deployment, so there is never old data, and every compatibility path was code
+  that could not run. It is not free to keep: the bloom container carried four
+  formats, which made the reader hold three flags describing what each writer had
+  been capable of and made `exact_field_bloom` an `Option` that was always
+  `Some`. Changing a format is therefore just changing it; a stale local data
+  directory is deleted rather than migrated.
+
+  Two things that resemble versioning and are not: `object_store`'s
+  `UpdateVersion`, which is the compare-and-swap ETag every durability guarantee
+  here rests on, and `CARGO_PKG_VERSION` in `/metrics` and the Loki `buildinfo`
+  endpoint, which is API surface.
 
 ---
 

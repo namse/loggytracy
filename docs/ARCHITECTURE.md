@@ -9,7 +9,9 @@ the two disagree, `VISION.md` is the intent and this one is the implementation.
 
 [`COMPARISON.md`](COMPARISON.md) records how it currently measures against Loki on the same machine, at the
 same container memory limit, over the same corpus. **The claim in `VISION.md` does not survive that run**:
-loggytracy loses `| json | field="x"`, its own headline query, and is OOM-killed at a limit Loki survives.
+loggytracy loses `| json | field="x"`, its own headline query, by 1.85x. It no longer loses on memory —
+both systems survived a 2 GiB container, where the first run had to be published at 8 GiB because
+loggytracy was OOM-killed at 2.
 The bed is [`compare/`](../compare/), the raw artifacts are in [`artifacts/m9/`](artifacts/m9/), and the
 document is regenerated from them rather than written. Read it before trusting any performance statement
 elsewhere in these docs.
@@ -22,6 +24,7 @@ elsewhere in these docs.
 | Source of truth | S3-compatible object storage |
 | Local disk | Cache (LRU eviction) |
 | Memory | **One declared budget** (`LOGGYTRACY_MEMORY_BUDGET`) divided into ingest/flush/merge/query/sidecar arenas, each with its own accounting and its own refusal. Not a set of independent limits whose product is discovered afterwards — see [`VISION.md`](VISION.md) invariant I |
+| Format versioning | **None.** Nothing on disk or on the wire is versioned and no build reads another's data — see [`VISION.md`](VISION.md), "What is deliberately not built". Changing a format means changing it; a stale data directory is deleted |
 | Execution engine | **Hand-written.** DataFusion is rejected: its memory is not accountable at arena granularity, and the LogQL surface is small enough that a planner for it is smaller than the integration |
 | Durability | Journal (append-only) + group commit + ack after fsync. Alloy WAL is assumed as a safety net |
 | Replication | No replicas. For unexpected server or disk loss, the accepted loss window (RPO) is determined by the flush interval (`flush_max_bytes`/`flush_max_interval`, whichever comes first: 1 MiB/5 s by default), and this is intentionally accepted |
