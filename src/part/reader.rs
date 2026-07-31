@@ -927,10 +927,13 @@ impl PartReader {
             if !matchers.iter().all(|m| m.matches(&labels)) {
                 continue;
             }
-            let line = msg.value(i).to_string();
-            if !line_filters.iter().all(|f| f.matches(&line)) {
+            // Filters test the borrowed value; the `String` is built only for
+            // a row that survives them. Allocating first charged every
+            // rejected row for a line nothing would read.
+            if !line_filters.iter().all(|f| f.matches(msg.value(i))) {
                 continue;
             }
+            let line = msg.value(i).to_string();
             // Rebuilt from the `_sm:` columns plus the residual blob — a merge
             // of two key-sorted lists, so the canonical order survives without
             // a sort. The residual is null for any row whose keys all made
