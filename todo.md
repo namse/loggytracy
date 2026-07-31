@@ -566,7 +566,15 @@ neither is a defect in either engine.
       target is intersecting `time_page_selection` into pass one (a few lines, then the narrow window
       should land near VictoriaLogs); and the **server-side trace↔log join is rejected** — the client
       already sends the window, so once the window actually cuts work the join has nothing left to buy,
-      and its soundness caveats (clock skew, late logs, absent traces) buy nothing back
+      and its soundness caveats (clock skew, late logs, absent traces) buy nothing back.
+      *Both halves then ran.* Pass one obeys the page selection now, and the pages had to be given a row
+      bound first — an 8192-row group's timestamp chunk fit one default-sized page, so the page index was
+      exactly as coarse as the group bounds it exists to refine. At 1024 rows a page: `trace_window`
+      lines-read 589,824 → **221,184** and `metadata_rare` → 360,448, disk *improved* to 0.60x Loki, and
+      the latency barely moved (5.1 → 5.0 ms) — so the rare shapes' remaining ~5 ms floor is no longer row
+      volume but per-scan constants, the footer and page-index load per part times the parts a
+      matcherless `{app=~".+"}` query admits. That is where the next read-path work goes, and it is a
+      caching question (footers across scans) rather than a pruning one
 
 ## The claim moved onto its worst shape, and the measurement said so within the hour
 
