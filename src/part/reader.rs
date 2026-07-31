@@ -696,6 +696,31 @@ impl PartReader {
             "a scan that skips the line column cannot evaluate line filters"
         );
         let projection = ScanProjection::build(&self.stream_labels, &self.metadata_keys, columns);
+        // The predicates a `_sm:` column answers *exactly* for this part: a
+        // string equality on a field no parser can shadow, whose key is one of
+        // this part's columns and not one of its stream labels. For such a
+        // predicate the column value is precisely the field the filter would
+        // see, so rows can be selected on the narrow column *before* the wide
+        // decode — the row-level precision the row-group bloom cannot give. A
+        // rare value scattered across every group then costs one narrow column
+        // read per group instead of a full-width decode, and a bloom false
+        // positive costs the same narrow read instead of a whole group.
+        let mut definitive: Vec<(usize, &ExactFieldPredicate)> = exact_fields
+            .iter()
+            .filter(|predicate| {
+                !predicate.may_be_extracted
+                    && !predicate.canonical
+                    && !predicate.value.is_empty()
+                    && self.stream_labels.binary_search(&predicate.name).is_err()
+            })
+            .filter_map(|predicate| {
+                self.metadata_keys
+                    .binary_search(&predicate.name)
+                    .ok()
+                    .map(|key_index| (key_index, predicate))
+            })
+            .collect();
+        definitive.sort_by_key(|(key_index, _)| *key_index);
 
         let selected = if exact_fields.is_empty() {
             self.select_row_groups(tenant, matchers, line_filters, time_range)
@@ -758,10 +783,32 @@ impl PartReader {
             ) {
                 continue;
             }
+            // Pass one, when a definitive predicate exists: read only the
+            // timestamp and the predicate columns, keep the row indices that
+            // satisfy them, and hand the wide decode a `RowSelection` instead
+            // of the whole group. The group the bloom admitted wrongly costs
+            // one narrow read; the group holding four of a rare value decodes
+            // four rows wide instead of eight thousand.
+            let selection = if definitive.is_empty() {
+                None
+            } else {
+                match self.select_rows_in_group(
+                    &data_file,
+                    &part_metadata,
+                    rgu,
+                    &definitive,
+                    time_range,
+                    &mut stats,
+                )? {
+                    Some(selection) => Some(selection),
+                    None => continue,
+                }
+            };
+            let count_scanned_rows = selection.is_none();
             if forward {
                 // Forwards, Parquet's own order is the query's order, so one
                 // reader streams the group and the sink's frontier ends it.
-                let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
                     data_file.clone(),
                     part_metadata.clone(),
                 )
@@ -770,9 +817,11 @@ impl PartReader {
                     projection.leaves.iter().copied(),
                 ))
                 .with_batch_size(window_rows(scan_limit, stats.scanned_rows, &*sink))
-                .with_row_groups(vec![rgu])
-                .build()
-                .map_err(|e| e.to_string())?;
+                .with_row_groups(vec![rgu]);
+                if let Some(selection) = selection.clone() {
+                    builder = builder.with_row_selection(selection);
+                }
+                let reader = builder.build().map_err(|e| e.to_string())?;
                 for batch in reader {
                     let batch = batch.map_err(|e| e.to_string())?;
                     match self.scan_batch(
@@ -787,6 +836,7 @@ impl PartReader {
                         scan_bytes_limit,
                         cancellation,
                         &projection,
+                        count_scanned_rows,
                         &mut label_sets,
                         &mut stats,
                         sink,
@@ -812,7 +862,7 @@ impl PartReader {
             // needs to know the group is time-ordered, which the format does
             // not record yet — when it does, the windowed walk can return for
             // exactly the groups it was correct on.
-            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
                 data_file.clone(),
                 part_metadata.clone(),
             )
@@ -821,9 +871,11 @@ impl PartReader {
                 projection.leaves.iter().copied(),
             ))
             .with_batch_size(1024)
-            .with_row_groups(vec![rgu])
-            .build()
-            .map_err(|e| e.to_string())?;
+            .with_row_groups(vec![rgu]);
+            if let Some(selection) = selection {
+                builder = builder.with_row_selection(selection);
+            }
+            let reader = builder.build().map_err(|e| e.to_string())?;
             let mut batches: Vec<_> = reader
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
@@ -841,6 +893,7 @@ impl PartReader {
                     scan_bytes_limit,
                     cancellation,
                     &projection,
+                    count_scanned_rows,
                     &mut label_sets,
                     &mut stats,
                     sink,
@@ -853,6 +906,79 @@ impl PartReader {
         }
 
         Ok(stats)
+    }
+
+    /// The narrow first pass of a two-pass scan: the timestamp column plus the
+    /// definitive predicates' `_sm:` columns, one row group, no strings
+    /// materialized. Returns `None` when no row qualifies, so the caller skips
+    /// the group without a wide decode.
+    ///
+    /// Hand-rolled rather than parquet's `RowFilter`, so the engine keeps its
+    /// own accounting — the rows examined here are the rows
+    /// `totalLinesProcessed` reports — and its own frontier semantics in the
+    /// pass that follows.
+    fn select_rows_in_group(
+        &self,
+        data_file: &PreadReader,
+        part_metadata: &ArrowReaderMetadata,
+        rgu: usize,
+        definitive: &[(usize, &ExactFieldPredicate)],
+        time_range: QueryTimeRange,
+        stats: &mut ScanStats,
+    ) -> Result<Option<RowSelection>, String> {
+        let labels = self.stream_labels.len();
+        let mut leaves = vec![1usize];
+        leaves.extend(
+            definitive
+                .iter()
+                .map(|(key_index, _)| 3 + labels + key_index),
+        );
+        let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            data_file.clone(),
+            part_metadata.clone(),
+        )
+        .with_projection(ProjectionMask::leaves(
+            part_metadata.metadata().file_metadata().schema_descr(),
+            leaves.iter().copied(),
+        ))
+        .with_batch_size(8192)
+        .with_row_groups(vec![rgu])
+        .build()
+        .map_err(|e| e.to_string())?;
+
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut row = 0usize;
+        for batch in reader {
+            let batch = batch.map_err(|e| e.to_string())?;
+            stats.scanned_bytes = stats
+                .scanned_bytes
+                .saturating_add(batch.get_array_memory_size() as u64);
+            let ts = batch.column(0).as_primitive::<Int64Type>();
+            let columns: Vec<&StringArray> = (0..definitive.len())
+                .map(|index| batch.column(1 + index).as_string::<i32>())
+                .collect();
+            for i in 0..batch.num_rows() {
+                stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+                let keep = time_range.contains(ts.value(i))
+                    && definitive.iter().enumerate().all(|(index, (_, predicate))| {
+                        !columns[index].is_null(i) && columns[index].value(i) == predicate.value
+                    });
+                if keep {
+                    match ranges.last_mut() {
+                        Some(range) if range.end == row => range.end = row + 1,
+                        _ => ranges.push(row..row + 1),
+                    }
+                }
+                row += 1;
+            }
+        }
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(RowSelection::from_consecutive_ranges(
+            ranges.into_iter(),
+            row,
+        )))
     }
 
     /// One decoded batch, offered row by row.
@@ -870,6 +996,7 @@ impl PartReader {
         scan_bytes_limit: Option<u64>,
         cancellation: Option<&AtomicBool>,
         projection: &ScanProjection,
+        count_scanned_rows: bool,
         label_sets: &mut LabelSetCache,
         stats: &mut ScanStats,
         sink: &mut dyn RowSink,
@@ -942,8 +1069,12 @@ impl PartReader {
             // Counted per row examined rather than per batch decoded. The batch
             // is a read granularity the client never asked for, and charging a
             // whole one to `totalLinesProcessed` reported a query that stopped
-            // after two rows as having processed a thousand.
-            stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+            // after two rows as having processed a thousand. Counted once: a
+            // two-pass scan already charged these rows when the narrow pass
+            // examined them.
+            if count_scanned_rows {
+                stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+            }
             if !time_range.contains(ts_val) {
                 continue;
             }

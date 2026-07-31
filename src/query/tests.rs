@@ -1301,6 +1301,96 @@
         assert_eq!(instant.data.result[0]["value"][1], "3");
     }
 
+    /// `| trace_id="x"` with no parser stage — the shape the claim rests on —
+    /// takes the two-pass path in a part: the narrow `_sm:trace_id` column
+    /// selects the rows before anything wide is decoded. The memtable cannot
+    /// do that, so memtable-against-part equality is the late-materialization
+    /// on/off check, covering a hit, a miss, and a predicate the pass must
+    /// refuse (a stream-label name, answered by the label instead).
+    #[tokio::test]
+    async fn a_metadata_filter_answers_identically_through_the_two_pass_scan() {
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let entries: Vec<LogEntry> = (0..50i64)
+            .map(|i| LogEntry {
+                timestamp_ns: 1_000 + i,
+                line: format!("line-{i}"),
+                structured_metadata: vec![("trace_id".to_string(), format!("t{}", i % 10))],
+            })
+            .collect();
+        let in_memtable = {
+            let data_dir = temp_dir();
+            let memtable = Arc::new(MemTable::new());
+            memtable.insert(test_tenant(), labels.clone(), entries.clone());
+            test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None)
+        };
+        let in_parts = {
+            let data_dir = temp_dir();
+            let rows: Vec<Row> = entries
+                .iter()
+                .map(|entry| Row {
+                    tenant: test_tenant(),
+                    timestamp_ns: entry.timestamp_ns,
+                    labels: std::sync::Arc::new(labels.clone()),
+                    line: entry.line.clone(),
+                    structured_metadata: entry.structured_metadata.clone(),
+                })
+                .collect();
+            let parts = Arc::new(PartRegistry::new());
+            parts
+                .register(part::flush_rows(rows, &data_dir.join("parts"), 16).unwrap())
+                .unwrap();
+            test_state(&data_dir, Arc::new(MemTable::new()), parts, None)
+        };
+
+        for expression in [
+            r#"{app="api"} | trace_id="t3""#,
+            r#"{app="api"} | trace_id="absent""#,
+            r#"{app="api"} | app="api" | trace_id="t3""#,
+        ] {
+            let parsed = logql::parse(expression).unwrap();
+            let flat = |results: Vec<StreamResult>| -> Vec<(i64, String)> {
+                let mut rows: Vec<(i64, String)> = results
+                    .into_iter()
+                    .flat_map(|stream| {
+                        stream
+                            .entries
+                            .into_iter()
+                            .map(|entry| (entry.timestamp_ns, entry.line))
+                    })
+                    .collect();
+                rows.sort();
+                rows
+            };
+            let range = crate::part::QueryTimeRange::closed(0, 10_000);
+            let from_memtable = flat(
+                run_unified_query(
+                    in_memtable.clone(),
+                    test_tenant(),
+                    parsed.clone(),
+                    range,
+                    1000,
+                    false,
+                )
+                .await
+                .unwrap(),
+            );
+            let from_parts = flat(
+                run_unified_query(in_parts.clone(), test_tenant(), parsed, range, 1000, false)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                from_memtable, from_parts,
+                "the two-pass scan must not change the answer to {expression}"
+            );
+            if expression.contains("t3") {
+                assert_eq!(from_parts.len(), 5, "the hit case must actually hit");
+            }
+        }
+    }
+
     /// The metric path projects columns — only the timestamp, the labels and
     /// the fields the expression names come off disk. The memtable cannot
     /// project, so the same rows in the memtable and in a part are a

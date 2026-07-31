@@ -11,7 +11,9 @@ use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArra
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection,
+};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::Result as ParquetResult;
