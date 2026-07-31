@@ -656,6 +656,65 @@
         }
     }
 
+    /// A row group holds several whole streams, each time-ordered inside
+    /// itself, so the group as a whole is *not* time-ordered — and a bounded
+    /// query must still answer exactly what an unbounded scan truncated to the
+    /// limit would. The comparison bed caught the violation live: a backward
+    /// `limit=100` over one app returned rows from the middle of the window
+    /// while Loki returned the newest hundred, because the scan stopped a
+    /// whole group at the first row beyond the sink's frontier when only that
+    /// *stream's* remaining rows were beyond it.
+    #[test]
+    fn a_limited_scan_over_interleaved_streams_returns_what_truncation_would() {
+        let tmp = tempfile_dir();
+        let stream = |name: &str| -> SharedLabels {
+            std::sync::Arc::new(BTreeMap::from([("app".to_string(), name.to_string())]))
+        };
+        // Stream `a` owns the even timestamps, stream `b` the odd ones, and
+        // one row group holds both — sorted by stream first, the group's tail
+        // is all of `b`, so its last row is not the newest row.
+        let rows: Vec<Row> = (0..40)
+            .map(|timestamp_ns: i64| Row {
+                tenant: test_tenant(),
+                timestamp_ns,
+                labels: stream(if timestamp_ns % 2 == 0 { "a" } else { "b" }),
+                line: format!("line-{timestamp_ns}"),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 64).unwrap().remove(0);
+        assert_eq!(part.meta.row_group_count, 1, "the test needs a shared group");
+        let reader = PartReader::open(part).unwrap();
+        for forward in [true, false] {
+            let results = reader
+                .query(
+                    &test_tenant(),
+                    &[],
+                    &[],
+                    QueryTimeRange::unbounded(),
+                    5,
+                    forward,
+                )
+                .unwrap();
+            let mut seen: Vec<i64> = results
+                .iter()
+                .flat_map(|stream| stream.entries.iter().map(|entry| entry.timestamp_ns))
+                .collect();
+            seen.sort_unstable();
+            let wanted: Vec<i64> = if forward {
+                (0..5).collect()
+            } else {
+                (35..40).collect()
+            };
+            assert_eq!(
+                seen,
+                wanted,
+                "a limited {} scan must return the rows truncation would",
+                if forward { "forward" } else { "backward" }
+            );
+        }
+    }
+
     #[test]
     fn scan_limit_stops_before_collecting_the_rest_of_a_part() {
         let tmp = tempfile_dir();

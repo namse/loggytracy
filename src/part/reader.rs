@@ -735,7 +735,6 @@ impl PartReader {
             ) {
                 continue;
             }
-            let group_rows = part_metadata.metadata().row_group(rgu).num_rows().max(0) as usize;
             if forward {
                 // Forwards, Parquet's own order is the query's order, so one
                 // reader streams the group and the sink's frontier ends it.
@@ -765,77 +764,58 @@ impl PartReader {
                         sink,
                     ) {
                         Ok(ScanStep::Continue) => {}
-                        Ok(ScanStep::StopGroup) => continue 'row_groups,
                         Ok(ScanStep::Stop) => break 'row_groups,
                         Err(error) => return Err(error),
                     }
                 }
                 continue;
             }
-            // Backwards, Parquet still only reads forwards. This used to decode
-            // the whole group into Arrow arrays and reverse the batches — eight
-            // thousand rows of string arrays built to answer a `limit=100`, in
-            // the direction Grafana defaults to. `with_offset` skips those
-            // records instead of materializing them, so the group is read in
-            // windows from its end and only the windows that are reached are
-            // built.
-            let mut cursor = group_rows;
-            let mut window = window_rows(scan_limit, stats.scanned_rows, &*sink);
-            while cursor > 0 {
-                let offset = cursor.saturating_sub(window);
-                let length = cursor - offset;
-                let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
-                    data_file.clone(),
-                    part_metadata.clone(),
-                )
-                .with_batch_size(length)
-                .with_row_groups(vec![rgu])
-                .with_offset(offset)
-                .with_limit(length)
-                .build()
+            // Backwards, Parquet still only reads forwards, so the group is
+            // decoded once in row order and the batches offered newest-first.
+            //
+            // This *was* a doubling-window walk from the group's end
+            // (`with_offset`), which was exact when a group was one
+            // timestamp-ordered run. A group now holds several whole streams,
+            // so its end is the last *stream's* rows, not the newest — the
+            // walk fed the sink one stream's tail, the frontier tightened on
+            // it, and the scan stopped before the other streams' newer rows,
+            // which is the wrong-answer the comparison bed caught. Reading the
+            // group whole is the correct baseline; reading *less* of a group
+            // needs to know the group is time-ordered, which the format does
+            // not record yet — when it does, the windowed walk can return for
+            // exactly the groups it was correct on.
+            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                data_file.clone(),
+                part_metadata.clone(),
+            )
+            .with_batch_size(1024)
+            .with_row_groups(vec![rgu])
+            .build()
+            .map_err(|e| e.to_string())?;
+            let mut batches: Vec<_> = reader
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
-                // Arrow may still split a window into several batches, and it
-                // yields them in row order, so the batches are reversed as well
-                // as the rows inside each.
-                let mut batches: Vec<_> = reader
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| e.to_string())?;
-                batches.reverse();
-                for batch in &batches {
-                    match self.scan_batch(
-                        batch,
-                        tenant,
-                        matchers,
-                        line_filters,
-                        time_range,
-                        forward,
-                        row_group,
-                        scan_limit,
-                        scan_bytes_limit,
-                        cancellation,
-                        &mut label_sets,
-                        &mut stats,
-                        sink,
-                    ) {
-                        Ok(ScanStep::Continue) => {}
-                        Ok(ScanStep::StopGroup) => continue 'row_groups,
-                        Ok(ScanStep::Stop) => break 'row_groups,
-                        Err(error) => return Err(error),
-                    }
-                }
-                cursor = offset;
-                if span_beyond_frontier(
-                    sink.frontier_ns(),
+            batches.reverse();
+            for batch in &batches {
+                match self.scan_batch(
+                    batch,
+                    tenant,
+                    matchers,
+                    line_filters,
+                    time_range,
                     forward,
-                    self.part.meta.row_group_min_ts[rgu],
-                    self.part.meta.row_group_max_ts[rgu],
+                    row_group,
+                    scan_limit,
+                    scan_bytes_limit,
+                    cancellation,
+                    &mut label_sets,
+                    &mut stats,
+                    sink,
                 ) {
-                    continue 'row_groups;
+                    Ok(ScanStep::Continue) => {}
+                    Ok(ScanStep::Stop) => break 'row_groups,
+                    Err(error) => return Err(error),
                 }
-                // Geometric: a scan that does have to read the whole group pays
-                // O(group rows) in skipped records overall rather than one skip
-                // over the whole prefix per window.
-                window = window.saturating_mul(2);
             }
         }
 
@@ -901,12 +881,16 @@ impl PartReader {
                 ));
             }
             let ts_val = ts.value(i);
-            // A row group is one stream's run, ordered by time, so this row
-            // being on the far side of the frontier means every row after it
-            // *in this group* is too — and nothing about the groups after it,
-            // which belong to other streams.
+            // Per row, not per group. A row group holds a run of *whole
+            // streams*, each ordered by time inside itself, so the group as a
+            // whole is not time-ordered and one row past the frontier says
+            // nothing about the rows after it — they may belong to another
+            // stream and still qualify. Stopping the group here returned rows
+            // from the middle of the window while Loki returned the newest
+            // hundred, live in the comparison bed. Only `span_beyond_frontier`
+            // over the group's `meta.json` span may skip whole groups.
             if beyond_frontier(sink.frontier_ns(), forward, ts_val) {
-                return Ok(ScanStep::StopGroup);
+                continue;
             }
             if scan_limit.is_some_and(|limit| stats.scanned_rows >= limit) {
                 return Ok(ScanStep::Stop);
@@ -953,15 +937,14 @@ impl PartReader {
 #[derive(PartialEq, Eq)]
 enum ScanStep {
     Continue,
-    /// Nothing further in *this row group* can enter the result.
-    ///
-    /// A row group is one stream's run and is ordered by time inside it, but
-    /// the part is ordered by stream first, so a row past the frontier says
-    /// nothing about the groups after this one. Before the layout changed the
-    /// two were the same statement, and this was `Stop`.
-    StopGroup,
     /// Nothing further in the part can enter the result: a limit was reached or
     /// the query was cancelled, neither of which depends on order.
+    ///
+    /// There is deliberately no group-level step between these two. A row
+    /// group holds several whole streams, so no single row's position proves
+    /// anything about the rest of its group; the sound group-level skip is
+    /// `span_beyond_frontier` over the group's recorded span, taken before the
+    /// group is opened.
     Stop,
 }
 
