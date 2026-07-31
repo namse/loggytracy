@@ -1,5 +1,5 @@
---- /dev/fd/63	2026-07-31 16:33:10.132825034 +0900
-+++ /dev/fd/62	2026-07-31 16:33:10.132825034 +0900
+--- /dev/fd/63	2026-07-31 16:55:38.283683156 +0900
++++ /dev/fd/62	2026-07-31 16:55:38.283683156 +0900
 @@ -7 +7 @@
 -  http_listen_address: ""
 +  http_listen_address: 0.0.0.0
@@ -97,7 +97,7 @@
 -    ingestername: ""
 -    mode: ""
 -    ingesterdbretainperiod: 0s
-+    ingestername: fb3113196d98
++    ingestername: 68b9991c2751
 +    mode: RW
 +    ingesterdbretainperiod: 20m0s
 @@ -1774,2 +1787,2 @@
@@ -109,7 +109,7 @@
 -    ingestername: ""
 -    mode: ""
 -    ingesterdbretainperiod: 0s
-+    ingestername: fb3113196d98
++    ingestername: 68b9991c2751
 +    mode: RW
 +    ingesterdbretainperiod: 20m0s
 @@ -1809 +1822 @@
