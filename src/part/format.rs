@@ -306,12 +306,19 @@ fn write_part_files(
     Ok(())
 }
 
-/// Row-group boundaries for a `(tenant, timestamp)`-sorted row set.
+/// Row-group boundaries for a `(tenant, labels, timestamp)`-sorted row set.
 ///
-/// A row group never spans two tenants. That is what keeps the stream index
-/// and the bloom sidecars — both row-group granular — able to prune: with
-/// timestamp-only ordering every active tenant appears in every row group and
-/// the posting lists degenerate to all-ones.
+/// A row group never spans two tenants, and holds a contiguous run of whole
+/// streams rather than one stream each.
+///
+/// Cutting on every stream change was tried and measured worse: with 128
+/// streams across 8 parts it turned roughly 3 row groups per part into 128, all
+/// far under `row_group_size`, and the per-group cost swamped the pruning win —
+/// `label_only` forward went from 2.04 ms to 5.19 ms while reading half the
+/// rows. The selectivity does not come from the cut; it comes from the sort
+/// order. Rows ordered by stream before time make a stream contiguous, so it
+/// touches one or two groups instead of all of them, and the groups stay the
+/// size they were.
 fn row_group_bounds(rows: &[Row], row_group_size: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut segment_start = 0usize;

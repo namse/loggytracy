@@ -377,7 +377,12 @@
             &[ExactFieldPredicate::new("trace_id", "second")],
             QueryTimeRange::closed(i64::MIN, i64::MAX),
         );
-        assert_eq!(selected, vec![1]);
+        // Row group 2, not 1: rows are ordered by stream before time now, and
+        // `labels2` (`app="other"`) sorts before `labels1` (`app="test"`), so
+        // the two rows sharing `labels1` land in groups 1 and 2. What the test
+        // is about — the bloom selecting exactly the one group holding the
+        // value — is unchanged.
+        assert_eq!(selected, vec![2]);
 
         // Stream labels are pipeline fields too, but are not in the exact
         // field bloom. Their predicate must therefore remain conservative.
@@ -390,7 +395,9 @@
                 &[ExactFieldPredicate::new("app", "test")],
                 QueryTimeRange::closed(i64::MIN, i64::MAX),
             ),
-            vec![0, 1]
+            // The two groups holding `labels1`, which are 1 and 2 under
+            // stream-before-time ordering.
+            vec![1, 2]
         );
 
         assert!(!reader.may_match_exact_fields(&test_tenant(),
@@ -495,7 +502,11 @@
                 )],
                 time_range,
             ),
-            vec![0]
+            // Groups 1 and 2, not 0 and 1: `labels2` sorts before `labels1`
+            // now that rows are ordered by stream before time, so the row group
+            // holding the third row comes first. The property under test — one
+            // group per value, selected exactly — is unchanged.
+            vec![1]
         );
         assert_eq!(
             reader.select_row_groups_with_exact_fields(&test_tenant(),
@@ -507,7 +518,7 @@
                 )],
                 time_range,
             ),
-            vec![1]
+            vec![2]
         );
         assert_eq!(
             reader.select_row_groups_with_exact_fields(&test_tenant(),
@@ -521,7 +532,10 @@
                 )],
                 time_range,
             ),
-            vec![0]
+            // The first row's own group. It is 1 rather than 0 because
+            // `labels2` sorts ahead of `labels1` under stream-before-time
+            // ordering, not because the bloom selected differently.
+            vec![1]
         );
     }
 

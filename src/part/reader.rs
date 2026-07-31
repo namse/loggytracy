@@ -695,10 +695,20 @@ impl PartReader {
         if sorted_selected.is_empty() {
             return Ok(stats);
         }
-        sorted_selected.sort_unstable();
-        if !forward {
-            sorted_selected.reverse();
-        }
+        // By time, not by ordinal. Ordinal order used to be time order; now it
+        // is stream order, and visiting streams in turn would fill the sink
+        // with one stream's rows before seeing another's — leaving the frontier
+        // loose and the per-group skip below unable to reject anything. Sorting
+        // the selected groups by the end the scan reaches first tightens it as
+        // fast as the old layout did.
+        sorted_selected.sort_unstable_by_key(|&row_group| {
+            let rgu = row_group as usize;
+            if forward {
+                (self.part.meta.row_group_min_ts[rgu], row_group)
+            } else {
+                (-self.part.meta.row_group_max_ts[rgu], row_group)
+            }
+        });
 
         // Outside the row-group loop: a stream spans row groups, so a cache per
         // group would rebuild every label set once per group.
@@ -742,7 +752,7 @@ impl PartReader {
                 .map_err(|e| e.to_string())?;
                 for batch in reader {
                     let batch = batch.map_err(|e| e.to_string())?;
-                    if self.scan_batch(
+                    match self.scan_batch(
                         &batch,
                         tenant,
                         matchers,
@@ -756,9 +766,11 @@ impl PartReader {
                         &mut label_sets,
                         &mut stats,
                         sink,
-                    )? == ScanStep::Stop
-                    {
-                        break 'row_groups;
+                    ) {
+                        Ok(ScanStep::Continue) => {}
+                        Ok(ScanStep::StopGroup) => continue 'row_groups,
+                        Ok(ScanStep::Stop) => break 'row_groups,
+                        Err(error) => return Err(error),
                     }
                 }
                 continue;
@@ -793,7 +805,7 @@ impl PartReader {
                     .map_err(|e| e.to_string())?;
                 batches.reverse();
                 for batch in &batches {
-                    if self.scan_batch(
+                    match self.scan_batch(
                         batch,
                         tenant,
                         matchers,
@@ -807,9 +819,11 @@ impl PartReader {
                         &mut label_sets,
                         &mut stats,
                         sink,
-                    )? == ScanStep::Stop
-                    {
-                        break 'row_groups;
+                    ) {
+                        Ok(ScanStep::Continue) => {}
+                        Ok(ScanStep::StopGroup) => continue 'row_groups,
+                        Ok(ScanStep::Stop) => break 'row_groups,
+                        Err(error) => return Err(error),
                     }
                 }
                 cursor = offset;
@@ -890,10 +904,12 @@ impl PartReader {
                 ));
             }
             let ts_val = ts.value(i);
-            // The rows are ordered within the tenant, so this row being on the
-            // far side of the frontier means every row after it is too.
+            // A row group is one stream's run, ordered by time, so this row
+            // being on the far side of the frontier means every row after it
+            // *in this group* is too — and nothing about the groups after it,
+            // which belong to other streams.
             if beyond_frontier(sink.frontier_ns(), forward, ts_val) {
-                return Ok(ScanStep::Stop);
+                return Ok(ScanStep::StopGroup);
             }
             if scan_limit.is_some_and(|limit| stats.scanned_rows >= limit) {
                 return Ok(ScanStep::Stop);
@@ -940,6 +956,15 @@ impl PartReader {
 #[derive(PartialEq, Eq)]
 enum ScanStep {
     Continue,
+    /// Nothing further in *this row group* can enter the result.
+    ///
+    /// A row group is one stream's run and is ordered by time inside it, but
+    /// the part is ordered by stream first, so a row past the frontier says
+    /// nothing about the groups after this one. Before the layout changed the
+    /// two were the same statement, and this was `Stop`.
+    StopGroup,
+    /// Nothing further in the part can enter the result: a limit was reached or
+    /// the query was cancelled, neither of which depends on order.
     Stop,
 }
 

@@ -48,7 +48,7 @@ pub const MERGE_TOMBSTONE_FILE: &str = ".merge.tombstone";
 /// agree on what the struct is. Without this a format change surfaces as a
 /// checksum mismatch, which reads as corruption rather than as a version the
 /// build cannot handle.
-pub const PART_META_VERSION: u32 = 2;
+pub const PART_META_VERSION: u32 = 3;
 
 const BLOOM_MAGIC_V1: &[u8; 4] = b"BTF1";
 const BLOOM_MAGIC_V2: &[u8; 4] = b"BTF2";
@@ -385,11 +385,24 @@ impl Row {
     /// groups and time order within a tenant. Everything after the timestamp is
     /// a tie-break, which the ordering never cared about, and which makes two
     /// copies of one entry sort adjacent so a duplicate can be recognised.
-    fn sort_key(&self) -> (&str, i64, &Labels, &str, &[(String, String)]) {
+    /// Sorted by stream before time, so a row group holds one stream.
+    ///
+    /// It used to be `(tenant, timestamp, labels, …)`, which interleaved every
+    /// active stream through every row group. `docs/COMPARISON.md` measured
+    /// what that costs: answering `{app="api-gateway"}` returned 6,250 rows and
+    /// decoded **57,344**, because a row group containing one matching row
+    /// contains rows of all eight apps and every one of them is decoded. Loki
+    /// read 6,254 for the same answer, because its chunks are per stream.
+    ///
+    /// Ordering by the label set first makes a row group a single stream's run,
+    /// which is what lets the stream index prune to the streams a query names
+    /// rather than merely to the parts that hold them. The cost is that a part
+    /// is no longer one timestamp-ordered run — see [`ScanStep::StopGroup`].
+    fn sort_key(&self) -> (&str, &Labels, i64, &str, &[(String, String)]) {
         (
             self.tenant.as_str(),
-            self.timestamp_ns,
             self.labels.as_ref(),
+            self.timestamp_ns,
             self.line.as_str(),
             &self.structured_metadata,
         )

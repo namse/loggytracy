@@ -12,13 +12,27 @@ fn write_meta(
     // no longer the first and last row.
     let min_ts = rows.iter().map(|r| r.timestamp_ns).min().unwrap_or_default();
     let max_ts = rows.iter().map(|r| r.timestamp_ns).max().unwrap_or_default();
+    // Scanned, not read off the ends. Rows are ordered by stream before time,
+    // so a group spanning two streams does not start at its own minimum.
     let row_group_min_ts: Vec<i64> = bounds
         .iter()
-        .map(|(start, _)| rows[*start].timestamp_ns)
+        .map(|(start, end)| {
+            rows[*start..*end]
+                .iter()
+                .map(|row| row.timestamp_ns)
+                .min()
+                .unwrap_or_default()
+        })
         .collect();
     let row_group_max_ts: Vec<i64> = bounds
         .iter()
-        .map(|(_, end)| rows[*end - 1].timestamp_ns)
+        .map(|(start, end)| {
+            rows[*start..*end]
+                .iter()
+                .map(|row| row.timestamp_ns)
+                .max()
+                .unwrap_or_default()
+        })
         .collect();
     let tenants = tenant_segments(rows, &bounds);
 
@@ -303,11 +317,15 @@ fn validate_tenant_segments(meta: &MetaFile) -> Result<(), String> {
         if segment.min_ts_ns != segment_min || segment.max_ts_ns != segment_max {
             return Err("part tenant segment timestamps do not match its row groups".to_string());
         }
-        // Timestamp order is preserved inside a tenant. The reader relies on
-        // this for row-group time pruning and backward early termination.
-        for row_group in groups.start + 1..groups.end {
-            if meta.row_group_min_ts[row_group] < meta.row_group_max_ts[row_group - 1] {
-                return Err("part tenant segment row groups are not time-ordered".to_string());
+        // Each row group is one stream's run and is ordered by time inside
+        // itself; across groups a tenant's segment is ordered by stream, so a
+        // later group can start earlier than an earlier one ends. What the
+        // reader relies on is the weaker property checked here — a group's own
+        // bounds are consistent — plus `ScanStep::StopGroup`, which is what
+        // replaced the assumption that a part is one timestamp-ordered run.
+        for row_group in groups.clone() {
+            if meta.row_group_min_ts[row_group] > meta.row_group_max_ts[row_group] {
+                return Err("part row group timestamps are inverted".to_string());
             }
         }
         if segment.row_count == 0 {

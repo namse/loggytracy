@@ -326,6 +326,41 @@ against the batch one), and `3ca3bb8` (the switchover, retiring the split fallba
 - [ ] **`peak_materialized_bytes` now overstates.** It still adds `merge_max_memory_bytes`, which no longer
       bounds a rewrite. Correcting it is a claim about memory and wants its own measurement rather than an edit
 
+## Next — the backward scan does not know the layout changed
+
+Rows are now ordered by stream before time (`part/mod.rs`, `Row::sort_key`), which is what localizes a stream
+to one or two row groups instead of spreading it through all of them. `docs/COMPARISON.md` measured the
+reason: `{app="api-gateway"}` returned 6,250 rows and decoded 57,344 against Loki's 6,254.
+
+Measured on `benches/query.rs`, limit 100 over 202,000 rows, against the pre-layout build:
+
+| shape | direction | lines read | time |
+|---|---|---|---|
+| `label_only` | backward | 187 → 187 | 243 → 250 µs |
+| `label_only` | forward | 1,003 → **288** | 2.04 → **1.65 ms** |
+| `line_filter` | backward | 9,517 → 6,867 | 17.19 → **10.98 ms** |
+| `line_filter` | forward | 15,183 → **2,187** | 10.32 → **2.15 ms** |
+| **`json_field`** | **backward** | 3,130 → **5,701** | 13.07 → **14.60 ms** |
+| `json_field` | forward | 4,783 → **820** | 9.26 → **6.81 ms** |
+
+**Four improved, one flat, and one regressed — the claim's own shape, in Grafana's default direction.** That
+is not a caveat to a win; it is the thing to fix next.
+
+- [ ] **Backward scans read a row group from its end, and the end is no longer the newest row.**
+      `reader.rs` reads a group in doubling windows with `with_offset` from the last record, which was exact
+      when a group was one timestamp-ordered run. A group now holds several whole streams, each ordered by
+      time inside itself, so its last records are the last *stream's*, not the latest. The window walk is
+      still correct — the sink ranks what it is given — but it no longer reaches the newest rows first, so
+      the frontier tightens late and more of the group is read. Either merge the group's streams by time
+      within the read, or stop windowing from the end when a group holds more than one stream and read it
+      whole
+- [ ] **Cutting a row group on every stream change is not the answer, and was measured.** With 128 streams
+      over 8 parts it turned ~3 row groups per part into 128, all far under `row_group_size`, and per-group
+      cost swamped the pruning: `label_only` forward went 2.04 → 5.19 ms while reading *half* the rows. The
+      selectivity comes from the sort order, not from the cut. Recorded so it is not retried
+- [ ] Re-run `compare/run.sh` once the backward path is fixed. The bench says what changed in isolation; only
+      the bed says whether it moved against Loki
+
 ## M10 — declared memory budget ([`docs/VISION.md`](docs/VISION.md) I)
 
 M9 supplied the number this milestone was missing: **at a 2 GiB container limit, ingesting 1.2 M events at an

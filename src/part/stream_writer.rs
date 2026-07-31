@@ -79,6 +79,9 @@ impl StreamingPartWriter {
     }
 
     pub fn push(&mut self, row: Row) -> io::Result<()> {
+        // The same rule `row_group_bounds` applies to a slice: one tenant per
+        // group, cut on size. Not on stream change — that was measured worse,
+        // and the selectivity comes from the sort order rather than the cut.
         let cut = self
             .group
             .first()
@@ -145,13 +148,10 @@ impl StreamingPartWriter {
             }
         }
 
-        // Rows arrive sorted, so a group's extremes are its ends — the same
-        // thing the batch path reads off `bounds`.
         let first = self.group.first().expect("checked non-empty");
-        let last = self.group.last().expect("checked non-empty");
-        self.row_group_min_ts.push(first.timestamp_ns);
-        self.row_group_max_ts.push(last.timestamp_ns);
-
+        // Scanned rather than taken from the ends: rows are ordered by stream
+        // before time, so a group holding two streams does not start at its own
+        // minimum.
         let min_ts_ns = self
             .group
             .iter()
@@ -164,6 +164,8 @@ impl StreamingPartWriter {
             .map(|row| row.timestamp_ns)
             .max()
             .unwrap_or_default();
+        self.row_group_min_ts.push(min_ts_ns);
+        self.row_group_max_ts.push(max_ts_ns);
         match self.tenants.last_mut() {
             Some(segment) if segment.tenant == first.tenant => {
                 segment.row_group_end = ordinal + 1;
