@@ -240,7 +240,13 @@ fn open_part_data(
     let data_file =
         PreadReader::new(fs::File::open(part.data_path()).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
-    let options = parquet::arrow::arrow_reader::ArrowReaderOptions::new().with_page_index(page_index);
+    let policy = if page_index {
+        parquet::file::metadata::PageIndexPolicy::Optional
+    } else {
+        parquet::file::metadata::PageIndexPolicy::Skip
+    };
+    let options =
+        parquet::arrow::arrow_reader::ArrowReaderOptions::new().with_page_index_policy(policy);
     let arrow_reader_metadata =
         ArrowReaderMetadata::load(&data_file, options).map_err(|e| e.to_string())?;
 
