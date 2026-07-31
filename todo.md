@@ -574,7 +574,14 @@ neither is a defect in either engine.
       the latency barely moved (5.1 → 5.0 ms) — so the rare shapes' remaining ~5 ms floor is no longer row
       volume but per-scan constants, the footer and page-index load per part times the parts a
       matcherless `{app=~".+"}` query admits. That is where the next read-path work goes, and it is a
-      caching question (footers across scans) rather than a pruning one
+      caching question (footers across scans) rather than a pruning one.
+      *Answered:* the reader now caches the parsed footer and page index for its lifetime — the parse, not
+      the descriptor, so eviction still reclaims the bytes — and the floor fell exactly as named:
+      `metadata_rare` 5.1 → **2.5 ms** (1.87x against VictoriaLogs, from 12.6x at the start),
+      `trace_window` → 2.4 ms, `json_field_rare` → 3.0 ms, `rate` → **3.25 ms** (0.31x against Loki, 8.0x
+      against VictoriaLogs from 31.6x), `label_only/backward` in the bench −68%. Memory gate UNDER_BUDGET
+      at 2 GiB with the cache resident; the footers join the sidecars in the outside-the-budget residency
+      question M10 already owns
 
 ## The claim moved onto its worst shape, and the measurement said so within the hour
 
