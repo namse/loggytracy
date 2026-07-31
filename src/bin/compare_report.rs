@@ -17,8 +17,138 @@ use std::path::Path;
 
 use serde_json::Value;
 
-const SHAPES: [&str; 4] = ["label_only", "line_filter", "json_field", "rate"];
-const TARGETS: [&str; 2] = ["loggytracy", "loki"];
+const SHAPES: [&str; 6] = [
+    "label_only",
+    "line_filter",
+    "json_field",
+    "json_field_rare",
+    "metadata_rare",
+    "rate",
+];
+const TARGETS: [&str; 3] = ["loggytracy", "loki", "victorialogs"];
+
+/// Which digest a pair of systems can be held to.
+///
+/// The strict digest covers the timestamp, the line and every label with its
+/// placement; it exists between the two systems that keep lines. VictoriaLogs
+/// parses JSON at ingest and has no line for such a row, so any pair
+/// containing it is compared on the reduced basis — the timestamp plus the
+/// query-named fields (`matrix.rs`, `Query::basis_fields`). The report states
+/// which basis every agreement number is on, because the two are not the same
+/// strength of claim.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Basis {
+    Strict,
+    Reduced,
+}
+
+impl Basis {
+    fn field(self) -> &'static str {
+        match self {
+            Basis::Strict => "digest",
+            Basis::Reduced => "reduced_digest",
+        }
+    }
+}
+
+const PAIRS: [(&str, &str, Basis); 3] = [
+    ("loggytracy", "loki", Basis::Strict),
+    ("loggytracy", "victorialogs", Basis::Reduced),
+    ("loki", "victorialogs", Basis::Reduced),
+];
+
+/// Per-shape agreement for one pair of systems: `(agreed, compared)`.
+struct PairAgreement {
+    left: &'static str,
+    right: &'static str,
+    basis: Basis,
+    per_shape: BTreeMap<&'static str, (u64, u64)>,
+}
+
+impl PairAgreement {
+    fn shape(&self, shape: &str) -> (u64, u64) {
+        self.per_shape.get(shape).copied().unwrap_or((0, 0))
+    }
+    fn shape_agrees(&self, shape: &str) -> bool {
+        let (same, all) = self.shape(shape);
+        all > 0 && same == all
+    }
+}
+
+fn indexed_answers(matrix: &BTreeMap<&str, Value>, target: &str) -> BTreeMap<String, Value> {
+    matrix[target]["matrix"]["answers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|answer| {
+            answer["id"]
+                .as_str()
+                .map(|id| (id.to_string(), answer.clone()))
+        })
+        .collect()
+}
+
+fn compute_agreements(matrix: &BTreeMap<&str, Value>) -> Vec<PairAgreement> {
+    PAIRS
+        .iter()
+        .map(|(left, right, basis)| {
+            let left_answers = indexed_answers(matrix, left);
+            let right_answers = indexed_answers(matrix, right);
+            let mut per_shape: BTreeMap<&'static str, (u64, u64)> =
+                SHAPES.iter().map(|shape| (*shape, (0u64, 0u64))).collect();
+            for (id, one) in &left_answers {
+                let Some(other) = right_answers.get(id) else {
+                    continue;
+                };
+                let shape = one["shape"].as_str().unwrap_or("?");
+                let Some(entry) = SHAPES
+                    .iter()
+                    .find(|name| **name == shape)
+                    .and_then(|name| per_shape.get_mut(name))
+                else {
+                    continue;
+                };
+                entry.1 += 1;
+                let field = basis.field();
+                if one[field] == other[field] && !one[field].is_null() {
+                    entry.0 += 1;
+                }
+            }
+            PairAgreement {
+                left,
+                right,
+                basis: *basis,
+                per_shape,
+            }
+        })
+        .collect()
+}
+
+/// A timing ratio is printed only over answers that agreed; a ratio over a
+/// disagreement would be comparing the speeds of different answers, and the
+/// three-way run that skipped this rule published exactly that table.
+fn gated_ratio(
+    agreements: &[PairAgreement],
+    left: &str,
+    right: &str,
+    shape: &str,
+    numerator: &Value,
+    denominator: &Value,
+) -> String {
+    let Some(pair) = agreements
+        .iter()
+        .find(|pair| pair.left == left && pair.right == right)
+    else {
+        return "null".to_string();
+    };
+    if pair.shape_agrees(shape) {
+        ratio(numerator, denominator)
+    } else {
+        let (same, all) = pair.shape(shape);
+        format!("withheld ({}/{all} disagree)", all - same)
+    }
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -46,18 +176,24 @@ fn main() {
         .map(|target| (*target, read_json(dir, &format!("matrix_{target}.json"))))
         .collect();
 
+    let agreements = compute_agreements(&matrix);
+
     let mut page = String::new();
     header(&mut page, &bed);
     reproduction(&mut page, &bed);
     what_was_compared(&mut page, &bed, dir);
     ingest_table(&mut page, &load);
-    query_table(&mut page, &matrix);
-    query_limits(&mut page, &bed, dir);
-    row_equality(&mut page, &matrix);
+    // Agreement is printed before any timing, and the timing tables refuse a
+    // ratio for a shape whose answers disagreed. The order is the rule: a fast
+    // wrong answer is not a win, so the reader meets the check before the
+    // race.
+    row_equality(&mut page, &matrix, &agreements);
+    query_table(&mut page, &matrix, &agreements);
+    query_limits(&mut page, &bed, dir, &agreements);
     memory_table(&mut page, &bed, &load);
     disk_table(&mut page, &bed, &load, &seed);
     object_store(&mut page, &bed);
-    verdict(&mut page, &bed, &matrix, &load);
+    verdict(&mut page, &bed, &matrix, &load, &agreements);
     distrust(&mut page, &bed, &load, &matrix);
     configuration(&mut page, dir);
 
@@ -77,20 +213,20 @@ fn main() {
 ///
 /// Emitted only when the bed ran more than one, so a single-limit run's
 /// document is unchanged.
-fn query_limits(page: &mut String, bed: &Value, dir: &Path) {
+fn query_limits(page: &mut String, bed: &Value, dir: &Path, agreements: &[PairAgreement]) {
     let runs = match bed["matrix_runs"].as_array() {
         Some(runs) if runs.len() > 1 => runs,
         _ => return,
     };
 
     page.push_str(
-        "## The same four shapes at each query limit\n\n\
+        "## The same six shapes at each query limit\n\n\
 A `limit` above the number of rows a window holds never reaches the scan, so it \
 measures an engine that cannot stop early as if it were one that can. The rows \
 below are the same queries over the same dataset, differing only in the bound \
 Grafana would have sent.\n\n\
-| shape | limit | loggytracy cold p50 | Loki cold p50 | ratio | loggytracy lines read | Loki lines read | rows returned |\n\
-|---|---|---|---|---|---|---|---|\n",
+| shape | limit | loggytracy cold p50 | Loki cold p50 | VictoriaLogs cold p50 | lt / Loki | lt / VL | loggytracy lines read | Loki lines read | rows returned |\n\
+|---|---|---|---|---|---|---|---|---|---|\n",
     );
 
     for shape in SHAPES {
@@ -99,14 +235,32 @@ Grafana would have sent.\n\n\
             let suffix = run["suffix"].as_str().unwrap_or("");
             let lt = read_json(dir, &format!("matrix_loggytracy{suffix}.json"));
             let lk = read_json(dir, &format!("matrix_loki{suffix}.json"));
+            let vl = read_json(dir, &format!("matrix_victorialogs{suffix}.json"));
             let lt_shape = &lt["matrix"]["shapes"][shape]["cold_ms"];
             let lk_shape = &lk["matrix"]["shapes"][shape]["cold_ms"];
+            let vl_shape = &vl["matrix"]["shapes"][shape]["cold_ms"];
             page.push_str(&format!(
-                "| `{shape}` | {} | {} | {} | **{}** | {} | {} | {} |\n",
+                "| `{shape}` | {} | {} | {} | {} | **{}** | **{}** | {} | {} | {} |\n",
                 num(limit),
                 num(&lt_shape["p50_ms"]),
                 num(&lk_shape["p50_ms"]),
-                ratio(&lt_shape["p50_ms"], &lk_shape["p50_ms"]),
+                num(&vl_shape["p50_ms"]),
+                gated_ratio(
+                    agreements,
+                    "loggytracy",
+                    "loki",
+                    shape,
+                    &lt_shape["p50_ms"],
+                    &lk_shape["p50_ms"]
+                ),
+                gated_ratio(
+                    agreements,
+                    "loggytracy",
+                    "victorialogs",
+                    shape,
+                    &lt_shape["p50_ms"],
+                    &vl_shape["p50_ms"]
+                ),
                 lines_read(&lt, shape),
                 lines_read(&lk, shape),
                 rows_returned(&lt, shape),
@@ -119,7 +273,9 @@ Grafana would have sent.\n\n\
 \"Lines read\" is each system's own `data.stats.summary.totalLinesProcessed`, \
 summed over the shape's answers — what the engine had to touch to produce the \
 answer, which is the quantity pruning and early termination exist to reduce. \
-It is reported rather than gated: the two count it in their own terms.\n\n",
+It is reported rather than gated: the systems count it in their own terms, and \
+VictoriaLogs does not report it at all. The agreement gate on the ratio columns \
+is the primary run's; each limit's own agreement is in its artifact.\n\n",
     );
 }
 
@@ -211,7 +367,7 @@ fn mib(value: &Value) -> String {
 
 fn header(page: &mut String, bed: &Value) {
     page.push_str(&format!(
-        r#"# loggytracy against Loki
+        r#"# loggytracy against Loki and VictoriaLogs
 
 **Generated by `compare/run.sh` on {}, from revision `{}` (`{}`). Do not edit
 this file: it is regenerated from the result JSON in `target/compare/`, and the
@@ -222,13 +378,15 @@ artifacts the two disagreed on both the build and the verdict.**
 falsifiable one:
 
 > At an equal container memory limit, on the same corpus and the same machine,
-> loggytracy answers `{{...}} | json | field="value"` over a window Loki must
-> scan in materially less time, without giving up ingest throughput or disk
-> footprint.
+> loggytracy answers `{{...}} | field="value"` over structured metadata — the
+> shape an OTLP attribute produces — in materially less time than Loki, which
+> does not index it, and not materially worse than VictoriaLogs, which
+> columnizes it, without giving up ingest throughput or disk footprint.
 
 It also says what publishing it honestly requires: *"Publishing the comparison
 means publishing it when it loses."* The verdict is below, computed from the
-numbers rather than asserted.
+numbers rather than asserted — and no timing ratio in this document is printed
+for a shape whose answers disagreed, because a fast wrong answer is not a win.
 
 "#,
         bed["generated_at"].as_str().unwrap_or("unknown"),
@@ -245,10 +403,16 @@ fn reproduction(page: &mut String, bed: &Value) {
 compare/run.sh
 ```
 
-That builds the loggytracy image, brings both systems up under
+That builds the loggytracy image, brings all three systems up under
 `compare/docker-compose.yml` at `{}` per container, runs every phase, and
 rewrites this file. It takes minutes rather than hours; the run this document
 was generated from settled for {} seconds between ingest and query.
+
+There is deliberately no other way to run a three-way comparison. The first
+three-way numbers came from an ad-hoc shell loop that bypassed this script and
+with it the agreement check, and a timing table went out over answers nobody
+had compared — two of its six shapes were not even answering the same
+question. The script is the path, and the check is on the path.
 
 The knobs are defaults, not assignments — `COMPARE_MEMORY`,
 `COMPARE_MEMORY_LIMITS`, `COMPARE_LOAD_EPS`, `COMPARE_LOAD_EVENTS`,
@@ -274,38 +438,53 @@ fn what_was_compared(page: &mut String, bed: &Value, dir: &Path) {
     page.push_str(&format!(
         r#"## What was compared
 
-| | loggytracy | Loki |
-|---|---|---|
-| build | `{}` (`{}`) | `{}` (`{}`) |
-| image | built from `Dockerfile` at that revision | `{}` |
-| storage | local filesystem, **no object store** | local filesystem (`common.storage.filesystem`) |
-| index | Parquet parts plus `index.bin` sidecars | TSDB, schema `v13`, 24h period |
-| container memory limit | {} | {} (identical, `mem_limit` and `memswap_limit`) |
-| CPU limit | none | none |
-| volume | `loggytracy-data` | `loki-data` |
+| | loggytracy | Loki | VictoriaLogs |
+|---|---|---|---|
+| build | `{}` (`{}`) | `{}` (`{}`) | `{}` |
+| image | built from `Dockerfile` at that revision | `{}` | `{}` |
+| storage | local filesystem, **no object store** | local filesystem (`common.storage.filesystem`) | local filesystem (`-storageDataPath`) |
+| index | Parquet parts plus `index.bin` sidecars | TSDB, schema `v13`, 24h period | per-block columns plus its own indexdb |
+| data model | stores the line, parses at query time | stores the line, parses at query time | **parses JSON at ingest, does not keep the line** |
+| memory limit | {} | identical | identical (`mem_limit` and `memswap_limit`) |
+| CPU limit | none | none | none |
+| volume | `loggytracy-data` | `loki-data` | `victorialogs-data` |
 
 Machine: {}. Docker {}, Compose {}.
 
+The data-model row is not a footnote; it is the axis this comparison exists to
+measure. Schema-on-write means a field the other two reach through a `| json`
+stage is already a column in VictoriaLogs, so its `json_field` and
+`json_field_rare` numbers are the same work as its `metadata_rare` number — and
+it also means there is no line to hold its answers to, which is why every pair
+containing it is compared on the reduced basis below.
+
 **Why loggytracy runs with no object store.** Loki's filesystem backend keeps
-exactly one durable copy of a chunk on local disk. Pointing loggytracy at a
-`file://` object store would make it keep a local part *and* a remote copy of
-the same part, so the bytes-on-disk axis would be measuring the bed rather than
-the engine. Local-only is the configuration that makes the two comparable. It
-is also the configuration in which loggytracy's object-store request counters
-are all zero, which is half of why that axis is deferred below.
+exactly one durable copy of a chunk on local disk, and so does VictoriaLogs.
+Pointing loggytracy at a `file://` object store would make it keep a local part
+*and* a remote copy of the same part, so the bytes-on-disk axis would be
+measuring the bed rather than the engine. Local-only is the configuration that
+makes the three comparable. It is also the configuration in which loggytracy's
+object-store request counters are all zero, which is half of why that axis is
+deferred below.
 
 Everything else on the loggytracy side is the engine's own default. The
 container sets three variables — the listen addresses and the data directory —
 and nothing else. Its full environment and its startup log are at the end of
-this document.
+this document, beside Loki's config diff and VictoriaLogs' non-default flags.
 
 "#,
         bed["revision"].as_str().unwrap_or("unknown"),
         bed["branch"].as_str().unwrap_or("unknown"),
         loki_build["version"].as_str().unwrap_or("unknown"),
         loki_build["revision"].as_str().unwrap_or("unknown"),
+        bed["victorialogs_image"]
+            .as_str()
+            .unwrap_or("unknown")
+            .rsplit(':')
+            .next()
+            .unwrap_or("unknown"),
         bed["loki_image"].as_str().unwrap_or("unknown"),
-        bed["memory_limit"].as_str().unwrap_or("?"),
+        bed["victorialogs_image"].as_str().unwrap_or("unknown"),
         bed["memory_limit"].as_str().unwrap_or("?"),
         bed["machine"].as_str().unwrap_or("unknown"),
         bed["docker"].as_str().unwrap_or("unknown"),
@@ -314,29 +493,31 @@ this document.
 }
 
 fn ingest_table(page: &mut String, load: &BTreeMap<&str, Value>) {
-    let lt = &load["loggytracy"];
-    let lk = &load["loki"];
     let row = |label: &str, pointer: &str| -> String {
-        format!(
-            "| {label} | {} | {} |\n",
-            num(lt.pointer(pointer).unwrap_or(&Value::Null)),
-            num(lk.pointer(pointer).unwrap_or(&Value::Null)),
-        )
+        let mut cells = String::new();
+        for target in TARGETS {
+            cells.push_str(&format!(
+                " {} |",
+                num(load[target].pointer(pointer).unwrap_or(&Value::Null))
+            ));
+        }
+        format!("| {label} |{cells}\n")
     };
     page.push_str(
         r#"## Ingest
 
 Same corpus, same seed, same offered rate, same number of connections, same
-wire format — loggytracy's push endpoint is Loki's, so these are the same bytes
-sent twice. The two runs are **sequential**, not concurrent, so neither
-system's throughput is a function of what the other was doing with the same
-twelve cores; the cost of that choice is that the second run started with a
-warmer page cache, and it is the only asymmetry in this phase.
+wire format — the push endpoint is Loki's on all three (VictoriaLogs accepts
+Loki push in protobuf+snappy), so these are the same bytes sent three times.
+The runs are **sequential**, not concurrent, so no system's throughput is a
+function of what the others were doing with the same twelve cores; the cost of
+that choice is that a later run starts with a warmer page cache, and it is the
+only asymmetry in this phase.
 
-Both runs stop at the same event target rather than after the same time, so the
-two systems end up holding the same number of entries. `ended_on` says which
+Every run stops at the same event target rather than after the same time, so
+all three end up holding the same number of entries. `ended_on` says which
 condition actually stopped each one: a run that says `duration_cap` did not
-reach the target, and its data volume is smaller than the other's.
+reach the target, and its data volume is smaller than the others'.
 
 Latency is reported twice. **Service time** starts when the bytes went out;
 **response time** starts when the pacer intended them to. Their gap is the
@@ -346,7 +527,7 @@ achieved rate a sixth of the offered one.
 
 "#,
     );
-    page.push_str("| | loggytracy | Loki |\n|---|---|---|\n");
+    page.push_str("| | loggytracy | Loki | VictoriaLogs |\n|---|---|---|---|\n");
     page.push_str(&row("offered eps", "/ingest/offered_eps"));
     page.push_str(&row("**achieved eps**", "/ingest/achieved_eps"));
     page.push_str(&row("events accepted", "/ingest/events_accepted"));
@@ -389,45 +570,56 @@ achieved rate a sixth of the offered one.
         "/ingest/tcp_connections_opened",
     ));
 
-    let discarded = lk
+    let discarded = load["loki"]
         .pointer("/behavioral/discarded_samples")
+        .unwrap_or(&Value::Null);
+    let dropped = load["victorialogs"]
+        .pointer("/behavioral/rows_dropped")
         .unwrap_or(&Value::Null);
     page.push_str(&format!(
         r#"
-Loki discarded **{}** samples during its run. Every deviation this bed makes
-from Loki's defaults exists to keep that number at zero — a non-zero value
-would be this bed throttling Loki where loggytracy is unthrottled, which is a
-misconfiguration reported as a loss, and that is the same defect as a rigged
-win. The breakdown by reason is `behavioral.discarded_by_reason` in
-`target/compare/load_loki.json`.
+Loki discarded **{}** samples and VictoriaLogs dropped **{}** rows during their
+runs. Every deviation this bed makes from either system's defaults exists to
+keep those numbers at zero — a non-zero value would be this bed throttling a
+system where loggytracy is unthrottled, which is a misconfiguration reported as
+a loss, and that is the same defect as a rigged win.
 
-Queries ran concurrently with ingest on both sides at {} qps, so reads
-contended with writes; those latencies are not the query measurement and are
-not reported here. The query measurement is the next section, taken on a
-quiescent system over a dataset both hold identically.
+Queries ran concurrently with ingest on every side at {} qps — in each
+system's own query language, at its own endpoint — so reads contended with
+writes; those latencies are not the query measurement and are not reported
+here. The query measurement is below, taken on a quiescent system over a
+dataset all three hold identically.
 
 "#,
         num(discarded),
-        num(lt.pointer("/config/query_eps").unwrap_or(&Value::Null)),
+        num(dropped),
+        num(load["loggytracy"]
+            .pointer("/config/query_eps")
+            .unwrap_or(&Value::Null)),
     ));
 }
 
-fn query_table(page: &mut String, matrix: &BTreeMap<&str, Value>) {
+fn query_table(page: &mut String, matrix: &BTreeMap<&str, Value>, agreements: &[PairAgreement]) {
     page.push_str(&format!(
-        r#"## The four query shapes
+        r#"## The six query shapes
 
-Both systems were **restarted** after the settle and before this phase, so
+Every system was **restarted** after the settle and before this phase, so
 "cold" is a process that has just started. Each shape is issued as
 `apps x sub-windows` distinct queries over absolute time ranges of the
 verification dataset; **cold** is the first issue of each, after every other
 query of every other shape has already run, and **warm** is the {} repeats that
-follow. Both systems cache — Loki has an embedded result cache on by default,
-loggytracy has resident part sidecars and the page cache under both — so
-reporting one number would hide which was being measured.
+follow. All three cache — Loki has an embedded result cache on by default,
+loggytracy has resident part sidecars, VictoriaLogs has its own caches, and the
+page cache sits under everything — so reporting one number would hide which was
+being measured.
 
 The dataset is {} rows over {} streams at fixed timestamps, pushed identically
-to both systems (`src/bin/load/matrix.rs`). One request at a time, one
+to every system (`src/bin/load/matrix.rs`). One request at a time, one
 connection: this is a latency instrument, not a throughput one.
+
+A ratio cell reading `withheld` is the agreement gate above doing its job: that
+shape's answers disagreed, and the speed of a different answer is not a
+measurement of anything.
 
 "#,
         num(&matrix["loggytracy"]["config"]["verify"]["repeats"]),
@@ -436,36 +628,51 @@ connection: this is a latency instrument, not a throughput one.
     ));
 
     page.push_str(
-        "| shape | pass | loggytracy p50 | Loki p50 | loggytracy p95 | Loki p95 | \
-loggytracy p99 | Loki p99 | samples | loggytracy / Loki (p50) |\n\
+        "| shape | pass | loggytracy p50 | Loki p50 | VictoriaLogs p50 | \
+loggytracy p95 | Loki p95 | VictoriaLogs p95 | lt / Loki (p50) | lt / VL (p50) |\n\
 |---|---|---|---|---|---|---|---|---|---|\n",
     );
     for shape in SHAPES {
         for pass in ["cold_ms", "warm_ms"] {
             let lt = &matrix["loggytracy"]["matrix"]["shapes"][shape][pass];
             let lk = &matrix["loki"]["matrix"]["shapes"][shape][pass];
+            let vl = &matrix["victorialogs"]["matrix"]["shapes"][shape][pass];
             page.push_str(&format!(
-                "| `{shape}` | {} | {} | {} | {} | {} | {} | {} | {} / {} | **{}** |\n",
+                "| `{shape}` | {} | {} | {} | {} | {} | {} | {} | **{}** | **{}** |\n",
                 pass.trim_end_matches("_ms"),
                 num(&lt["p50_ms"]),
                 num(&lk["p50_ms"]),
+                num(&vl["p50_ms"]),
                 num(&lt["p95_ms"]),
                 num(&lk["p95_ms"]),
-                num(&lt["p99_ms"]),
-                num(&lk["p99_ms"]),
-                num(&lt["count"]),
-                num(&lk["count"]),
-                ratio(&lt["p50_ms"], &lk["p50_ms"]),
+                num(&vl["p95_ms"]),
+                gated_ratio(
+                    agreements,
+                    "loggytracy",
+                    "loki",
+                    shape,
+                    &lt["p50_ms"],
+                    &lk["p50_ms"]
+                ),
+                gated_ratio(
+                    agreements,
+                    "loggytracy",
+                    "victorialogs",
+                    shape,
+                    &lt["p50_ms"],
+                    &vl["p50_ms"]
+                ),
             ));
         }
     }
     page.push_str(
         "\nMilliseconds. A ratio above `1.00x` means loggytracy took longer. A `null` \
 percentile is one the sample count could not support — `stats.rs::min_samples_for` \
-refuses `p99` under 101 samples and `p95` under 21, and `null` is not a pass.\n\n",
+refuses `p99` under 101 samples and `p95` under 21, and `null` is not a pass. p99 \
+is in the artifacts.\n\n",
     );
 
-    page.push_str("The expressions, one per shape:\n\n");
+    page.push_str("The expressions, one per shape (the LogQL side; the LogsQL translation is `logsql()` in `src/bin/load/matrix.rs`):\n\n");
     for shape in SHAPES {
         page.push_str(&format!(
             "* `{shape}` — `{}`\n",
@@ -480,32 +687,27 @@ refuses `p99` under 101 samples and `p95` under 21, and `null` is not a pass.\n\
 measured decision rather than a stylistic one. Loki promotes structured
 metadata into a metric's identity, so a bare `rate()` over this corpus returns
 one series per `trace_id` on Loki and one series per stream on loggytracy —
-neither the same amount of work nor a comparable answer. Summed, both have to
-produce the same number, which is what the row-equality check tests.
+neither the same amount of work nor a comparable answer. Summed, all three have
+to produce the same number, which is what the row-equality check tests. Its
+window equals the query step, because that is the one configuration in which
+LogQL's sliding window and LogsQL's tumbling `_time` buckets ask the same
+question.
+
+`json_field`, `json_field_rare` and `metadata_rare` are three different
+questions to the two systems that parse at query time and **one question asked
+three ways** to VictoriaLogs, which parsed at ingest. Read those rows together:
+the spread between them on the loggytracy side is what the parser stage and
+the storage each cost, and the absence of a spread on the VictoriaLogs side is
+its design.
 
 "#,
     );
 }
 
-fn row_equality(page: &mut String, matrix: &BTreeMap<&str, Value>) {
-    let index = |target: &str| -> BTreeMap<String, Value> {
-        matrix[target]["matrix"]["answers"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|answer| {
-                answer["id"]
-                    .as_str()
-                    .map(|id| (id.to_string(), answer.clone()))
-            })
-            .collect()
-    };
-    let lt = index("loggytracy");
-    let lk = index("loki");
+fn row_equality(page: &mut String, matrix: &BTreeMap<&str, Value>, agreements: &[PairAgreement]) {
+    let lt = indexed_answers(matrix, "loggytracy");
+    let lk = indexed_answers(matrix, "loki");
 
-    let mut per_shape: BTreeMap<&str, (u64, u64)> =
-        SHAPES.iter().map(|shape| (*shape, (0u64, 0u64))).collect();
     let mut mismatches: Vec<String> = Vec::new();
     // Disagreements are grouped by the label difference they carry, because the
     // interesting statement is "these 24 queries differ in the same way", not
@@ -514,19 +716,7 @@ fn row_equality(page: &mut String, matrix: &BTreeMap<&str, Value>) {
     let mut off_by_one = 0u64;
     for (id, left) in &lt {
         let Some(right) = lk.get(id) else { continue };
-        let shape = left["shape"].as_str().unwrap_or("?");
-        let entry = per_shape
-            .entry(
-                SHAPES
-                    .iter()
-                    .find(|name| **name == shape)
-                    .copied()
-                    .unwrap_or("?"),
-            )
-            .or_insert((0, 0));
-        entry.1 += 1;
         if left["digest"] == right["digest"] && !left["digest"].is_null() {
-            entry.0 += 1;
             continue;
         }
         if left["rows"].as_u64() == right["rows"].as_u64().map(|rows| rows + 1) {
@@ -553,22 +743,42 @@ fn row_equality(page: &mut String, matrix: &BTreeMap<&str, Value>) {
                 .push(id.clone());
         }
     }
-    let total: u64 = per_shape.values().map(|(_, all)| *all).sum();
-    let agreed: u64 = per_shape.values().map(|(same, _)| *same).sum();
+    let strict = &agreements[0];
+    let total: u64 = strict.per_shape.values().map(|(_, all)| *all).sum();
+    let agreed: u64 = strict.per_shape.values().map(|(same, _)| *same).sum();
 
     page.push_str(&format!(
         r#"## Do they return the same rows?
 
 This is the check that matters more than any timing, because a fast wrong
-answer is not a win. Both systems hold the same entries by construction — the
-same generator, the same seed, the same fixed log timestamps — so the same
-query over the same absolute window has one right answer, and each response is
-reduced to an order-independent digest over **the whole answer**: one record per
+answer is not a win — and **no timing ratio below is printed for a shape whose
+answers disagreed here**. All three systems hold the same entries by
+construction — the same generator, the same seed, the same fixed log
+timestamps — so the same query over the same absolute window has one right
+answer.
+
+Two bases, because there are two kinds of pair. Between the two systems that
+store the line — loggytracy and Loki — each response is reduced to an
+order-independent **strict** digest over the whole answer: one record per
 returned entry holding its timestamp, its line, and every label that entry
 carried together with where the response put it. A response that returns the
 right lines under the wrong stream is therefore not equal. For `sum(rate(...))`
 the digest is one record per series identity — so an extra empty series cannot
 hide — plus one per sample, compared at six decimals.
+
+Any pair containing VictoriaLogs is compared on the **reduced** basis: each
+row's nanosecond timestamp plus the values of the fields the query itself
+named. VictoriaLogs parses JSON at ingest and does not keep the line, so there
+is no line to compare; and the whole field set cannot be the basis either,
+because schema-on-write answers `{{app="x"}}` with every field it parsed where
+schema-on-read answers with what the pipeline produced — a basis of "all
+fields" compares the storage models and disagrees always and everywhere, which
+an earlier checker did, reporting 0/24 zeros that were its own. What every
+system returns for the same row is the row's time and the fields the query
+constrained, so that is the basis, and it is deliberately the weaker claim of
+the two. A metric answer's remaining representation difference — LogsQL labels
+a `_time` bucket by its start where LogQL labels the sample by its evaluation
+point — is converted with the query's own step, not exempted.
 
 The digest was over `(timestamp, line)` pairs alone until this run, which is how
 a `| json` label difference was once reported as 24 of 24 agreed (`todo.md`,
@@ -580,11 +790,14 @@ the same defect the `| json` shape was open as — the same slot — and it is f
 rather than declared, so both sides now answer with one flat stream label set and
 a two-element tuple, and a regression back into that slot is a disagreement here.
 
-One exemption remains, and it is by name rather than by placement:
-`detected_level` and `service_name` are **dropped**, because Loki derives them at
-ingest from the line and the stream and nothing in this bed pushes either. Every
-answer records which of them it carried, and that is reported below rather than
-left implicit.
+Two exemptions remain, both by name rather than by placement, both reported
+below with counts rather than left implicit. `detected_level` and
+`service_name` are **dropped**, because Loki derives them at ingest from the
+line and the stream and nothing in this bed pushes either. And
+`__error_details__` is compared by **presence with its value normalized**: an
+answer missing the label is a disagreement — 16 of 24 `json_field_rare`
+answers once were exactly that — while its wording is each engine's own parser
+internals and matching it would be matching Loki's JSON library.
 
 Two known differences are left, and neither is normalized away by the digest.
 The metric step grid is handled by the query: `align_to_step` snaps every window
@@ -595,18 +808,63 @@ metadata and extracted fields into it, loggytracy groups by stream labels and by
 whatever the query names in `by`/`without` — which is why the matrix asks for
 `sum(rate(...))`, and which is reported as a difference rather than hidden.
 
-**{agreed} of {total} queries agreed.**
+**loggytracy and Loki agreed on {agreed} of {total} queries on the strict
+basis.** Every pair, per shape:
 
-| shape | agreed |
-|---|---|
+| shape | loggytracy = Loki (strict) | loggytracy = VictoriaLogs (reduced) | Loki = VictoriaLogs (reduced) |
+|---|---|---|---|
 "#
     ));
     for shape in SHAPES {
-        let (same, all) = per_shape.get(shape).copied().unwrap_or((0, 0));
-        page.push_str(&format!("| `{shape}` | {same} / {all} |\n"));
+        let mut row = format!("| `{shape}` |");
+        for pair in agreements {
+            let (same, all) = pair.shape(shape);
+            row.push_str(&format!(" {same} / {all} |"));
+        }
+        row.push('\n');
+        page.push_str(&row);
+    }
+    for pair in agreements {
+        if pair.basis == Basis::Reduced {
+            let mut disagreeing: Vec<String> = Vec::new();
+            let left = indexed_answers(matrix, pair.left);
+            let right = indexed_answers(matrix, pair.right);
+            for (id, one) in &left {
+                if let Some(other) = right.get(id)
+                    && (one["reduced_digest"] != other["reduced_digest"]
+                        || one["reduced_digest"].is_null())
+                {
+                    disagreeing.push(format!(
+                        "`{id}` ({} against {} rows)",
+                        num(&one["rows"]),
+                        num(&other["rows"])
+                    ));
+                }
+            }
+            if !disagreeing.is_empty() {
+                page.push_str(&format!(
+                    "\n**{} against {} disagreed on {} quer{}** (reduced basis): {}{}\n",
+                    pair.left,
+                    pair.right,
+                    disagreeing.len(),
+                    if disagreeing.len() == 1 { "y" } else { "ies" },
+                    disagreeing
+                        .iter()
+                        .take(10)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if disagreeing.len() > 10 {
+                        format!(", and {} more", disagreeing.len() - 10)
+                    } else {
+                        String::new()
+                    },
+                ));
+            }
+        }
     }
     if mismatches.is_empty() {
-        page.push_str("\nNo mismatches.\n");
+        page.push_str("\nNo strict-basis mismatches between loggytracy and Loki.\n");
     } else {
         page.push_str(&format!(
             "\n**{} queries disagreed.** This is a correctness finding and it is \
@@ -667,12 +925,17 @@ structured-metadata object, and `metric:` one in a series' identity:\n\n",
             page.push('\n');
         }
     }
-    page.push_str(&dropped_labels_note(&lt, &lk));
-    page.push_str(&ordering_note(&lt, &lk));
+    let vl = indexed_answers(matrix, "victorialogs");
+    let all_answers: [(&str, &BTreeMap<String, Value>); 3] =
+        [("loggytracy", &lt), ("Loki", &lk), ("VictoriaLogs", &vl)];
+    page.push_str(&dropped_labels_note(&all_answers));
+    page.push_str(&ordering_note(&all_answers));
     page.push_str(
         "\n`data.stats` is recorded per answer and deliberately outside the digest: it \
 reports how much each engine had to read to produce the answer, which is the \
-thing the two are supposed to differ on, not part of the answer.\n\n",
+thing they are supposed to differ on, not part of the answer. VictoriaLogs \
+reports no such counter, and its \"lines read\" cells below say so rather than \
+printing zero.\n\n",
     );
 }
 
@@ -710,9 +973,9 @@ fn join_labels(names: &[String]) -> String {
 /// A digest that is narrower than it claims is the failure mode this whole
 /// section exists to avoid, so what was left out is published beside what was
 /// checked rather than only in the code.
-fn dropped_labels_note(lt: &BTreeMap<String, Value>, lk: &BTreeMap<String, Value>) -> String {
+fn dropped_labels_note(all: &[(&str, &BTreeMap<String, Value>)]) -> String {
     let mut note = String::new();
-    for (target, answers) in [("loggytracy", lt), ("Loki", lk)] {
+    for (target, answers) in all {
         let mut names: BTreeMap<String, u64> = BTreeMap::new();
         for answer in answers.values() {
             for name in answer["dropped_label_keys"]
@@ -745,9 +1008,9 @@ fn dropped_labels_note(lt: &BTreeMap<String, Value>, lk: &BTreeMap<String, Value
 
 /// The digest is order-independent on purpose, so the order a response came
 /// back in has to be checked as its own fact.
-fn ordering_note(lt: &BTreeMap<String, Value>, lk: &BTreeMap<String, Value>) -> String {
+fn ordering_note(all: &[(&str, &BTreeMap<String, Value>)]) -> String {
     let mut out = Vec::new();
-    for (target, answers) in [("loggytracy", lt), ("Loki", lk)] {
+    for (target, answers) in all {
         let offenders: Vec<&String> = answers
             .iter()
             .filter(|(_, answer)| answer["ordered"] == Value::Bool(false))
@@ -786,23 +1049,25 @@ fn memory_table(page: &mut String, bed: &Value, load: &BTreeMap<&str, Value>) {
             r#"## The memory limit the comparison could actually run at
 
 The bed sweeps container memory limits and runs the rest of the pipeline at the
-first one **both** systems survive. A limit where one of them is killed is not
+first one **every** system survives. A limit where one of them is killed is not
 a failed setup to be retried past quietly; it is an ingest result at that
 limit, and it is the first row of this comparison.
 
-| limit | loggytracy survived | OOM-killed | Loki survived | OOM-killed |
-|---|---|---|---|---|
+| limit | loggytracy survived / OOM | Loki survived / OOM | VictoriaLogs survived / OOM |
+|---|---|---|---|
 "#,
         );
         for attempt in &attempts {
-            page.push_str(&format!(
-                "| {} | {} | {} | {} | {} |\n",
-                num(&attempt["limit"]),
-                num(&attempt["loggytracy_survived"]),
-                num(&attempt["loggytracy_oom_killed"]),
-                num(&attempt["loki_survived"]),
-                num(&attempt["loki_oom_killed"]),
-            ));
+            let mut row = format!("| {} |", num(&attempt["limit"]));
+            for target in TARGETS {
+                row.push_str(&format!(
+                    " {} / {} |",
+                    num(&attempt[format!("{target}_survived")]),
+                    num(&attempt[format!("{target}_oom_killed")]),
+                ));
+            }
+            row.push('\n');
+            page.push_str(&row);
         }
         page.push_str(&format!(
             r#"
@@ -823,41 +1088,44 @@ The per-limit ingest results are kept as `load_<system>_<limit>.json` in
 
 cgroup v2 `memory.peak` per container: the kernel's own high-water mark for the
 cgroup, which is the analogue of the `VmHWM` the harness reads for a local
-process and the only figure comparable between a Rust process and a Go one,
-whose RSS is a statement about when its garbage collector last ran.
+process and the only figure comparable between a Rust process and two Go ones,
+whose RSS is a statement about when their garbage collectors last ran.
 
 The containers are restarted between the two phases, so each phase's peak is
 measured against a fresh cgroup.
 
 **`memory.peak` is not the process's footprint on its own.** A cgroup's memory
-accounting includes the page cache its own file I/O created, and both systems
-write a write-ahead log and then large data files, so both carry hundreds of
-megabytes of reclaimable cache inside their limit. That was measured here, not
+accounting includes the page cache its own file I/O created, and every system
+here writes a write-ahead log or journal and then large data files, so all
+carry reclaimable cache inside their limit. That was measured here, not
 assumed: an ingest-only run drove `memory.peak` to exactly the 2 GiB limit
 without being killed, while the same run with the query workload on was killed.
 So the anonymous high-water mark is reported beside it — sampled from the
 cgroup's `memory.stat` during the ingest phase — and it is the number an OOM
 kill is actually decided on.
 
-| | loggytracy | Loki |
-|---|---|---|
-| limit | {} | {} |
-| `memory.peak` during ingest | {} | {} |
-| **anonymous peak during ingest** | {} | {} |
-| `memory.peak` during queries | {} | {} |
-| OOM-killed | {} | {} |
+| | loggytracy | Loki | VictoriaLogs |
+|---|---|---|---|
+| limit | {} | identical | identical |
+| `memory.peak` during ingest | {} | {} | {} |
+| **anonymous peak during ingest** | {} | {} | {} |
+| `memory.peak` during queries | {} | {} | {} |
+| OOM-killed | {} | {} | {} |
 
 "#,
         mib(&bed["memory_limit_bytes"]),
-        mib(&bed["memory_limit_bytes"]),
         mib(&peak["loggytracy"]["ingest"]),
         mib(&peak["loki"]["ingest"]),
+        mib(&peak["victorialogs"]["ingest"]),
         anon("loggytracy"),
         anon("loki"),
+        anon("victorialogs"),
         mib(&peak["loggytracy"]["query"]),
         mib(&peak["loki"]["query"]),
+        mib(&peak["victorialogs"]["query"]),
         num(&peak["loggytracy"]["oom_killed"]),
         num(&peak["loki"]["oom_killed"]),
+        num(&peak["victorialogs"]["oom_killed"]),
     ));
 }
 
@@ -904,29 +1172,52 @@ fn disk_table(
     let settled = |target: &str| f64_of(&disk[target]["settled"]).unwrap_or(0.0);
     let bytes = |value: f64| mib(&Value::from(value));
 
+    let mut rows = String::new();
+    let mut push_row = |label: &str, cell: &dyn Fn(&str) -> String| {
+        rows.push_str(&format!("| {label} |"));
+        for target in TARGETS {
+            rows.push_str(&format!(" {} |", cell(target)));
+        }
+        rows.push('\n');
+    };
+    push_row("line bytes ingested", &|target| {
+        format!("{:.0}", ingested(target))
+    });
+    push_row("total on disk, settled", &|target| {
+        mib(&disk[target]["settled"])
+    });
+    push_row("of which write-ahead log", &|target| bytes(wal_of(target)));
+    push_row("settled data (total minus WAL)", &|target| {
+        bytes(settled(target) - wal_of(target))
+    });
+    push_row("**total per GB ingested**", &|target| {
+        per_gb(settled(target), ingested(target))
+    });
+    push_row("**settled data per GB ingested**", &|target| {
+        per_gb(settled(target) - wal_of(target), ingested(target))
+    });
+    push_row("total after the query phase", &|target| {
+        mib(&disk[target]["after_queries"])
+    });
+
     page.push_str(&format!(
         r#"## Bytes on disk
 
 Measured per volume with `du -sb` inside each container, after the settle and
-before the query phase, so both had the same chance to flush, cut chunks and
-compact.
+before the query phase, so every system had the same chance to flush, cut
+chunks and compact.
 
-| | loggytracy | Loki |
-|---|---|---|
-| line bytes ingested | {:.0} | {:.0} |
-| total on disk, settled | {} | {} |
-| of which write-ahead log | {} | {} |
-| settled data (total minus WAL) | {} | {} |
-| **total per GB ingested** | {} | {} |
-| **settled data per GB ingested** | {} | {} |
-| total after the query phase | {} | {} |
-
+| | loggytracy | Loki | VictoriaLogs |
+|---|---|---|---|
+{rows}
 Breakdown:
 
 * loggytracy — `{}`
 * Loki — `{}`
+* VictoriaLogs — `{}`
 
-**The two rows say different things and the second is the fairer one.**
+**The total row and the settled-data row say different things and the second is
+the fairer one.**
 loggytracy compacts its write-ahead log only when an object store is
 configured — `flush.rs:219` passes `remote_cache.is_some()` as the `compact`
 flag, so in the local-only mode this bed runs it in, the checkpoint offset
@@ -946,29 +1237,14 @@ The settle was {} seconds. Loki's chunks were flushed explicitly first, because
 Loki holds a chunk in its ingester until it has been idle for `chunk_idle_period`
 (30 minutes) or has reached `max_chunk_age` (2 hours), and neither happens
 inside a run that takes minutes; without the flush its disk number would be a
-fact about the run's length. loggytracy flushes every five seconds at its
-default and needed no equivalent.
+fact about the run's length. VictoriaLogs was told to flush its in-memory parts
+for the same reason — its rows are not even *searchable* before that flush.
+loggytracy flushes every five seconds at its default and needed no equivalent.
 
 "#,
-        ingested("loggytracy"),
-        ingested("loki"),
-        mib(&disk["loggytracy"]["settled"]),
-        mib(&disk["loki"]["settled"]),
-        bytes(wal_of("loggytracy")),
-        bytes(wal_of("loki")),
-        bytes(settled("loggytracy") - wal_of("loggytracy")),
-        bytes(settled("loki") - wal_of("loki")),
-        per_gb(settled("loggytracy"), ingested("loggytracy")),
-        per_gb(settled("loki"), ingested("loki")),
-        per_gb(
-            settled("loggytracy") - wal_of("loggytracy"),
-            ingested("loggytracy")
-        ),
-        per_gb(settled("loki") - wal_of("loki"), ingested("loki")),
-        mib(&disk["loggytracy"]["after_queries"]),
-        mib(&disk["loki"]["after_queries"]),
         disk["loggytracy"]["breakdown"].as_str().unwrap_or(""),
         disk["loki"]["breakdown"].as_str().unwrap_or(""),
+        disk["victorialogs"]["breakdown"].as_str().unwrap_or(""),
         num(&bed["settle_seconds"]),
     ));
 }
@@ -1011,114 +1287,125 @@ fn verdict(
     bed: &Value,
     matrix: &BTreeMap<&str, Value>,
     load: &BTreeMap<&str, Value>,
+    agreements: &[PairAgreement],
 ) {
     let shape = |name: &str, pass: &str, target: &str| -> Option<f64> {
         f64_of(&matrix[target]["matrix"]["shapes"][name][pass]["p50_ms"])
     };
-    let describe = |name: &str, pass: &str| -> String {
-        match (shape(name, pass, "loggytracy"), shape(name, pass, "loki")) {
-            (Some(lt), Some(lk)) if lk > 0.0 => {
-                let factor = lt / lk;
+    let pair_agrees = |left: &str, right: &str, name: &str| -> bool {
+        agreements
+            .iter()
+            .find(|pair| pair.left == left && pair.right == right)
+            .is_some_and(|pair| pair.shape_agrees(name))
+    };
+    let describe = |name: &str, pass: &str, other: &str, other_label: &str| -> String {
+        if !pair_agrees("loggytracy", other, name) {
+            return format!("**withheld** — the {name} answers disagree with {other_label}");
+        }
+        match (shape(name, pass, "loggytracy"), shape(name, pass, other)) {
+            (Some(lt), Some(them)) if them > 0.0 => {
+                let factor = lt / them;
                 if factor < 0.9 {
                     format!(
-                        "loggytracy is {:.2}x faster ({lt:.1} ms against {lk:.1} ms)",
+                        "loggytracy is {:.2}x faster ({lt:.1} ms against {them:.1} ms)",
                         1.0 / factor
                     )
                 } else if factor > 1.1 {
-                    format!("loggytracy is {factor:.2}x slower ({lt:.1} ms against {lk:.1} ms)")
+                    format!("loggytracy is {factor:.2}x slower ({lt:.1} ms against {them:.1} ms)")
                 } else {
-                    format!("within 10% ({lt:.1} ms against {lk:.1} ms)")
+                    format!("within 10% ({lt:.1} ms against {them:.1} ms)")
                 }
             }
             _ => "not measured".to_string(),
         }
     };
-    let ingest_lt = f64_of(&load["loggytracy"]["ingest"]["achieved_eps"]).unwrap_or(0.0);
-    let ingest_lk = f64_of(&load["loki"]["ingest"]["achieved_eps"]).unwrap_or(0.0);
+    let ingest_of = |target: &str| f64_of(&load[target]["ingest"]["achieved_eps"]).unwrap_or(0.0);
     let disk_line = {
-        let lt = f64_of(&bed["disk_bytes"]["loggytracy"]["settled"]).unwrap_or(0.0);
-        let lk = f64_of(&bed["disk_bytes"]["loki"]["settled"]).unwrap_or(0.0);
-        let lt_data = lt - wal_bytes(bed, "loggytracy");
-        let lk_data = lk - wal_bytes(bed, "loki");
-        if lk > 0.0 && lk_data > 0.0 {
+        let data_of = |target: &str| {
+            f64_of(&bed["disk_bytes"][target]["settled"]).unwrap_or(0.0) - wal_bytes(bed, target)
+        };
+        let lt = data_of("loggytracy");
+        let lk = data_of("loki");
+        let vl = data_of("victorialogs");
+        if lk > 0.0 && vl > 0.0 {
             format!(
-                "loggytracy holds {:.2}x Loki's total on disk, and {:.2}x once each \
-system's write-ahead log is taken out",
+                "loggytracy's settled data is {:.2}x Loki's and {:.2}x VictoriaLogs' \
+(write-ahead logs excluded on every side)",
                 lt / lk,
-                lt_data / lk_data,
+                lt / vl,
             )
         } else {
             "not measured".to_string()
         }
     };
-    let claim_cold = shape("json_field", "cold_ms", "loggytracy")
-        .zip(shape("json_field", "cold_ms", "loki"))
-        .map(|(lt, lk)| lt < lk * 0.9);
-    let claim_warm = shape("json_field", "warm_ms", "loggytracy")
-        .zip(shape("json_field", "warm_ms", "loki"))
-        .map(|(lt, lk)| lt < lk * 0.9);
+    // The claim's two halves, each decided only over agreeing answers:
+    // materially faster than Loki (under 0.9x) and not materially worse than
+    // VictoriaLogs (under 1.1x), on the shape an OTLP attribute produces.
+    let against = |other: &str, threshold: f64, pass: &str| -> Option<bool> {
+        if !pair_agrees("loggytracy", other, "metadata_rare") {
+            return None;
+        }
+        shape("metadata_rare", pass, "loggytracy")
+            .zip(shape("metadata_rare", pass, other))
+            .map(|(lt, them)| lt < them * threshold)
+    };
+    let verdict_line = |pass: &str| -> String {
+        match (
+            against("loki", 0.9, pass),
+            against("victorialogs", 1.1, pass),
+        ) {
+            (Some(true), Some(true)) => "**holds** — materially faster than Loki and not \
+materially worse than VictoriaLogs"
+                .to_string(),
+            (Some(loki_ok), Some(vl_ok)) => format!(
+                "**does not hold** — {} Loki's side, {} the VictoriaLogs side",
+                if loki_ok { "survives" } else { "fails" },
+                if vl_ok { "survives" } else { "fails" },
+            ),
+            _ => "**could not be decided** — the answers disagreed, and a verdict over \
+disagreeing answers is the mistake this report refuses"
+                .to_string(),
+        }
+    };
 
     page.push_str(&format!(
         r#"## The verdict on the claim
 
-The claim is about one shape: `{{...}} | json | field="value"`, where Loki has
-to run its parser over every line in the window and loggytracy has columnized
-and bloomed those fields at ingest.
+The claim is about one shape: `{{...}} | field="value"` over **structured
+metadata**, with no parser stage — what an OTLP attribute produces. The three
+systems genuinely differ here by design: loggytracy indexes structured metadata
+into a per-row-group bloom, Loki stores it without indexing it, VictoriaLogs
+turns it into a column. The claim has two halves and both must hold: materially
+less time than Loki (below 0.9x), not materially worse than VictoriaLogs
+(below 1.1x).
 
-* `json_field`, cold: **{}**
-* `json_field`, warm: **{}**
-* `line_filter`, cold: {}
-* `label_only`, cold: {}
-* `rate`, cold: {}
-* ingest: loggytracy achieved {ingest_lt:.0} eps against Loki's {ingest_lk:.0}
+* `metadata_rare`, cold: {}
+* `metadata_rare`, warm: {}
+* against Loki, cold: {}
+* against Loki, warm: {}
+* against VictoriaLogs, cold: {}
+* against VictoriaLogs, warm: {}
+* ingest: loggytracy achieved {:.0} eps against Loki's {:.0} and VictoriaLogs' {:.0}
 * disk: {}
 
-**{}**
-
-{}
+The previous claim's shape stays measured beside it: `json_field` cold is {}
+against Loki and {} against VictoriaLogs. That claim was measured, lost, and
+replaced — moving the target does not retract the loss, and the row is here so
+the reader can see it.
 
 "#,
-        describe("json_field", "cold_ms"),
-        describe("json_field", "warm_ms"),
-        describe("line_filter", "cold_ms"),
-        describe("label_only", "cold_ms"),
-        describe("rate", "cold_ms"),
+        verdict_line("cold_ms"),
+        verdict_line("warm_ms"),
+        describe("metadata_rare", "cold_ms", "loki", "Loki"),
+        describe("metadata_rare", "warm_ms", "loki", "Loki"),
+        describe("metadata_rare", "cold_ms", "victorialogs", "VictoriaLogs"),
+        describe("metadata_rare", "warm_ms", "victorialogs", "VictoriaLogs"),
+        ingest_of("loggytracy"),
+        ingest_of("loki"),
+        ingest_of("victorialogs"),
         disk_line,
-        match (claim_cold, claim_warm) {
-            (Some(true), Some(true)) =>
-                "The claim survives this run on both the cold and the warm pass.",
-            (Some(true), Some(false)) | (Some(false), Some(true)) =>
-                "The claim survives on one pass and not the other, which is not \
-'materially less time' — it is a result that depends on which number you quote.",
-            (Some(false), Some(false)) =>
-                "The claim does not survive this run. loggytracy loses its own headline \
-query.",
-            _ => "The claim could not be decided from this run; the measurement is missing.",
-        },
-        match (claim_cold, claim_warm) {
-            (Some(false), Some(false)) => {
-                r#"That is a valid and valuable result and it is not tuned around. No
-loggytracy setting was changed from its default to produce it.
-
-The two things `docs/VISION.md` invariant III named as the cause of the first
-loss are now built, and the per-limit table above shows they work: the scan limit
-reaches the scan, so at a limit of 100 this engine reads a fraction of what it
-reads at 20000. It is still not enough. What remains is that loggytracy reads
-several times the lines Loki does for the same answer, and the row groups it
-decodes carry every label column and the structured-metadata blob whether the
-query names them or not. That is projection and predicate pushdown, which is
-unbuilt, and it is where the residue lives.
-
-The `rate` row is the clearest statement of the limit: its lines-read figure is
-identical at both query limits, because a metric query has no `limit` to push
-down at all. Nothing in the executor can help it; only reading less per row can."#
-            }
-            _ => {
-                r#"The numbers above are the whole argument; the sections below say what is
-wrong with them. No loggytracy setting was changed from its default to produce
-this run, and the Loki deviations are listed in full with their reasons."#
-            }
-        },
+        describe("json_field", "cold_ms", "loki", "Loki"),
+        describe("json_field", "cold_ms", "victorialogs", "VictoriaLogs"),
     ));
 }
 
@@ -1182,14 +1469,15 @@ the one an operator running local-only actually gets.",
     }
 
     items.push(format!(
-        "**The two ingest runs are sequential, and loggytracy went first.** Loki's \
-run started with a warmer page cache and a machine that had just finished \
-doing work. Running them concurrently would remove that and introduce a worse \
-problem — each system's throughput would depend on the other's — so this is a \
-chosen bias rather than an overlooked one, and its direction favours Loki on \
-ingest ({} against {} achieved eps).",
+        "**The ingest runs are sequential, and loggytracy went first.** A later run \
+starts with a warmer page cache and a machine that has just finished doing \
+work. Running them concurrently would remove that and introduce a worse \
+problem — each system's throughput would depend on the others' — so this is a \
+chosen bias rather than an overlooked one, and its direction favours the \
+systems that ran later ({} / {} / {} achieved eps in run order).",
         num(&load["loggytracy"]["ingest"]["achieved_eps"]),
         num(&load["loki"]["ingest"]["achieved_eps"]),
+        num(&load["victorialogs"]["ingest"]["achieved_eps"]),
     ));
 
     items.push(
@@ -1218,14 +1506,26 @@ it."
         .to_string(),
     );
 
-    let ended_lt = load["loggytracy"]["run"]["ended_on"].as_str().unwrap_or("");
-    let ended_lk = load["loki"]["run"]["ended_on"].as_str().unwrap_or("");
-    if ended_lt != ended_lk {
+    let ended: Vec<(&str, &str)> = TARGETS
+        .iter()
+        .map(|target| {
+            (
+                *target,
+                load[target]["run"]["ended_on"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    if ended.iter().any(|(_, how)| *how != ended[0].1) {
         items.push(format!(
-            "**The two ingest runs did not stop the same way** — loggytracy on \
-`{ended_lt}`, Loki on `{ended_lk}`. They therefore hold different amounts of \
-data, and every axis downstream of that (disk, query, memory) is comparing two \
-different corpora sizes. Treat the disk and query columns as indicative only."
+            "**The ingest runs did not all stop the same way** — {}. They therefore \
+hold different amounts of data, and every axis downstream of that (disk, \
+query, memory) is comparing different corpora sizes. Treat the disk and query \
+columns as indicative only.",
+            ended
+                .iter()
+                .map(|(target, how)| format!("{target} on `{how}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
         ));
     }
 

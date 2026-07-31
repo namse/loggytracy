@@ -8,26 +8,35 @@
 # rather than an assignment so a caller can vary one without editing anything
 # (the rule scripts/run_load_local.sh was fixed to follow in M8).
 #
+# Three targets, one script. The first three-way numbers were produced by an
+# ad-hoc shell loop that bypassed this file — and with it the agreement check,
+# which is how a timing table went out over answers nobody had compared. The
+# fix is structural: there is no per-target code path here to fork, only the
+# TARGETS list, so a run that includes a system includes its checks.
+#
 # The shape of the run, and why it is this shape:
 #
-#   1. Fresh volumes, both containers up at the same memory limit.
+#   1. Fresh volumes, all containers up at the same memory limit.
 #   2. **Ingest**, one target at a time. Sequential rather than concurrent, so
-#      neither system's throughput is a function of what the other was doing on
-#      the same twelve cores. Both are stopped at the same *event target*, so
-#      both end up holding the same number of entries — a run capped on time
-#      would let the faster system hold more data and then be measured querying
+#      no system's throughput is a function of what the others were doing on
+#      the same twelve cores. All are stopped at the same *event target*, so
+#      all end up holding the same number of entries — a run capped on time
+#      would let a faster system hold more data and then be measured querying
 #      it.
 #   3. **Seed**, the fixed verification dataset, identical bytes at identical
-#      timestamps on both sides. This is what the query numbers and the
+#      timestamps on every side. This is what the query numbers and the
 #      row-equality check are taken over; see src/bin/load/matrix.rs.
 #   4. **Settle**, equally: Loki is told to flush (its chunks otherwise sit in
 #      the ingester for up to `max_chunk_age`, two hours, and a disk number
-#      taken before that is not a disk number), then both are left alone for
-#      SETTLE_SECONDS so loggytracy's flush and merge and Loki's compactor can
-#      run. Disk and the ingest memory peak are read here.
-#   5. **Restart both**, so "cold" in the query matrix means a process that has
+#      taken before that is not a disk number), VictoriaLogs is told to flush
+#      its in-memory parts (rows are not searchable before that flush — three
+#      whole runs once returned zero VictoriaLogs rows because a loop queried
+#      immediately after seeding), then everything is left alone for
+#      SETTLE_SECONDS so flush, merge and compaction can run. Disk and the
+#      ingest memory peak are read here.
+#   5. **Restart all**, so "cold" in the query matrix means a process that has
 #      just started rather than one whose caches the seeding filled.
-#   6. **Matrix**, one target at a time, four shapes, cold then warm.
+#   6. **Matrix**, one target at a time, six shapes, cold then warm.
 #   7. Read the query-phase memory peak and disk again, then generate the
 #      document from the JSON.
 set -euo pipefail
@@ -42,8 +51,36 @@ mkdir -p "$OUT"
 export COMPARE_MEMORY="${COMPARE_MEMORY:-2g}"
 export LOGGYTRACY_PORT="${LOGGYTRACY_PORT:-3110}"
 export LOKI_PORT="${LOKI_PORT:-3120}"
+export VICTORIALOGS_PORT="${VICTORIALOGS_PORT:-3130}"
 export LOGGYTRACY_BUILD_REVISION="${LOGGYTRACY_BUILD_REVISION:-$(git -C "$ROOT" rev-parse --short HEAD)}"
 export LOGGYTRACY_BUILD_BRANCH="${LOGGYTRACY_BUILD_BRANCH:-$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)}"
+
+TARGETS="loggytracy loki victorialogs"
+LOKI_IMAGE="grafana/loki:3.3.2"
+VICTORIALOGS_IMAGE="victoriametrics/victoria-logs:v1.52.0"
+
+port_of() {
+  case "$1" in
+    loggytracy) echo "$LOGGYTRACY_PORT" ;;
+    loki) echo "$LOKI_PORT" ;;
+    victorialogs) echo "$VICTORIALOGS_PORT" ;;
+  esac
+}
+container_of() { echo "loggytracy-compare-$1-1"; }
+# VictoriaLogs has no /ready; /health is its readiness endpoint.
+ready_path_of() {
+  case "$1" in
+    victorialogs) echo /health ;;
+    *) echo /ready ;;
+  esac
+}
+data_dir_of() {
+  case "$1" in
+    loggytracy) echo /var/lib/loggytracy ;;
+    loki) echo /loki ;;
+    victorialogs) echo /victoria-logs-data ;;
+  esac
+}
 
 # Ingest phase. The event target is the stop condition; the duration is only a
 # cap, and a run that hits the cap instead is reported as such.
@@ -71,16 +108,17 @@ SEED="${COMPARE_SEED:-1592598566}"
 # choosing the condition that flatters this engine.
 MATRIX_LIMITS="${COMPARE_MATRIX_LIMITS:-20000 100}"
 
-# The verification dataset's log timestamps. Computed once and given to both
-# runs, because two runs deriving it from their own clocks would seed two
-# different datasets and the row-equality check would fail for a reason that
-# has nothing to do with either engine.
+# The verification dataset's log timestamps. Computed once and given to every
+# run, because runs deriving it from their own clocks would seed different
+# datasets and the row-equality check would fail for a reason that has nothing
+# to do with any engine.
 VERIFY_STEP_NS=1000000
 MATRIX_STEP_SECONDS="${COMPARE_MATRIX_STEP_SECONDS:-10}"
 VERIFY_SPAN_S=$(( VERIFY_ROWS * VERIFY_STEP_NS / 1000000000 ))
 # Rounded down to a whole query step, so that the matrix's window boundaries
-# land on the grid Loki aligns metric samples to and the last window is not
-# truncated by the alignment. See `align_to_step` in src/bin/load/matrix.rs.
+# land on the grid Loki aligns metric samples to — which is also the grid
+# LogsQL aligns `_time` buckets to — and the last window is not truncated by
+# the alignment. See `align_to_step` in src/bin/load/matrix.rs.
 ANCHOR_S=$(( ( $(date +%s) - VERIFY_SPAN_S - 300 ) / MATRIX_STEP_SECONDS * MATRIX_STEP_SECONDS ))
 ANCHOR_NS=$(( ANCHOR_S * 1000000000 ))
 
@@ -93,15 +131,27 @@ cgroup_of() {
 }
 
 wait_ready() {
-  local port=$1 name=$2 tries=0
-  until [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/ready")" = "200" ]; do
+  local target=$1 tries=0
+  local port path
+  port=$(port_of "$target")
+  path=$(ready_path_of "$target")
+  until [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port$path")" = "200" ]; do
     tries=$((tries + 1))
     if [ "$tries" -gt 120 ]; then
-      echo "$name never became ready" >&2
-      docker compose logs --tail 40 "$name" >&2
+      echo "$target never became ready" >&2
+      docker compose logs --tail 40 "$target" >&2
       exit 1
     fi
     sleep 2
+  done
+}
+
+declare -A CGROUP
+
+read_cgroups() {
+  local target
+  for target in $TARGETS; do
+    CGROUP[$target]=$(cgroup_of "$(container_of "$target")")
   done
 }
 
@@ -109,10 +159,11 @@ bring_up() {
   say "starting the bed at ${COMPARE_MEMORY} per container"
   docker compose down -v --remove-orphans >/dev/null 2>&1 || true
   docker compose up -d
-  wait_ready "$LOGGYTRACY_PORT" loggytracy
-  wait_ready "$LOKI_PORT" loki
-  LT_CGROUP=$(cgroup_of loggytracy-compare-loggytracy-1)
-  LK_CGROUP=$(cgroup_of loggytracy-compare-loki-1)
+  local target
+  for target in $TARGETS; do
+    wait_ready "$target"
+  done
+  read_cgroups
 }
 
 alive() {
@@ -121,12 +172,14 @@ alive() {
 
 say "building the images"
 docker compose build
+docker compose pull --ignore-buildable -q || true
 bring_up
 
-# Loki's own report of what it is running with, captured from the process
-# rather than from the file this repository wrote. `?mode=diff` is broken in
-# 3.3.2 ("unsupported type <nil>"), so the full config and Loki's own defaults
-# are both captured and the document diffs them.
+# Each system's own report of what it is running with, captured from the
+# process rather than from a file this repository wrote. Loki: `?mode=diff` is
+# broken in 3.3.2 ("unsupported type <nil>"), so the full config and Loki's
+# own defaults are both captured and the document diffs them. VictoriaLogs:
+# /flags lists exactly the flags set to non-default values.
 curl -s "http://127.0.0.1:$LOKI_PORT/config" -o "$OUT/loki_config.yaml"
 curl -s "http://127.0.0.1:$LOKI_PORT/config?mode=defaults" -o "$OUT/loki_config_defaults.yaml"
 diff -U0 \
@@ -135,19 +188,20 @@ diff -U0 \
   >"$OUT/loki_config.diff" || true
 curl -s "http://127.0.0.1:$LOKI_PORT/loki/api/v1/status/buildinfo" -o "$OUT/loki_buildinfo.json"
 curl -s "http://127.0.0.1:$LOGGYTRACY_PORT/loki/api/v1/status/buildinfo" -o "$OUT/loggytracy_buildinfo.json"
+curl -s "http://127.0.0.1:$VICTORIALOGS_PORT/flags" -o "$OUT/victorialogs_flags.txt"
 # loggytracy's side of the same disclosure: the container's environment is its
 # whole configuration surface, and it logs the derived numbers at startup.
 docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' \
-  loggytracy-compare-loggytracy-1 >"$OUT/loggytracy_env.txt"
+  "$(container_of loggytracy)" >"$OUT/loggytracy_env.txt"
 docker compose logs --no-color --no-log-prefix loggytracy >"$OUT/loggytracy_startup.log" 2>&1 || true
 
 run_load() {
-  local target=$1 port=$2 cgroup=$3
+  local target=$1
   say "ingest: $target"
   LOGGYTRACY_LOAD_TARGET="$target" \
   LOGGYTRACY_LOAD_PHASE=load \
-  LOGGYTRACY_LOAD_ADDR="127.0.0.1:$port" \
-  LOGGYTRACY_LOAD_CGROUP="$cgroup" \
+  LOGGYTRACY_LOAD_ADDR="127.0.0.1:$(port_of "$target")" \
+  LOGGYTRACY_LOAD_CGROUP="${CGROUP[$target]}" \
   LOGGYTRACY_LOAD_TIER=compare \
   LOGGYTRACY_LOAD_SEED="$SEED" \
   LOGGYTRACY_LOAD_SECONDS="$LOAD_SECONDS" \
@@ -162,12 +216,12 @@ run_load() {
 }
 
 run_verify() {
-  local phase=$1 target=$2 port=$3 cgroup=$4 limit=${5:-20000} suffix=${6:-}
+  local phase=$1 target=$2 limit=${3:-20000} suffix=${4:-}
   say "$phase: $target${suffix:+ (limit $limit)}"
   LOGGYTRACY_LOAD_TARGET="$target" \
   LOGGYTRACY_LOAD_PHASE="$phase" \
-  LOGGYTRACY_LOAD_ADDR="127.0.0.1:$port" \
-  LOGGYTRACY_LOAD_CGROUP="$cgroup" \
+  LOGGYTRACY_LOAD_ADDR="127.0.0.1:$(port_of "$target")" \
+  LOGGYTRACY_LOAD_CGROUP="${CGROUP[$target]}" \
   LOGGYTRACY_LOAD_SEED="$SEED" \
   LOGGYTRACY_LOAD_VERIFY_ANCHOR_NS="$ANCHOR_NS" \
   LOGGYTRACY_LOAD_VERIFY_ROWS="$VERIFY_ROWS" \
@@ -187,57 +241,69 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --release --bin load
 LOAD_BIN="$ROOT/target/release/load"
 
 # The ingest phase is run at each limit in COMPARE_MEMORY_LIMITS, in order, and
-# the first limit at which **both** systems survive carries the rest of the
+# the first limit at which **every** system survives carries the rest of the
 # pipeline. A limit at which one of them is OOM-killed is not an error to
 # retry past silently: it is an ingest result at that limit, it is recorded in
 # `attempts` below, and the published document reports it. The list is a
 # default like everything else here, and a single-entry list turns the sweep
 # off.
+declare -A ALIVE OOM_AT
 ATTEMPTS=""
 SURVIVED=""
 for LIMIT in ${COMPARE_MEMORY_LIMITS:-2g 8g}; do
   export COMPARE_MEMORY="$LIMIT"
   bring_up
-  run_load loggytracy "$LOGGYTRACY_PORT" "$LT_CGROUP"
-  LT_ALIVE=$(alive loggytracy-compare-loggytracy-1 && echo true || echo false)
-  LT_OOM_AT=$(docker inspect -f '{{.State.OOMKilled}}' loggytracy-compare-loggytracy-1)
-  if [ "$LT_ALIVE" = "true" ]; then
-    run_load loki "$LOKI_PORT" "$LK_CGROUP"
-  fi
-  LK_ALIVE=$(alive loggytracy-compare-loki-1 && echo true || echo false)
-  LK_OOM_AT=$(docker inspect -f '{{.State.OOMKilled}}' loggytracy-compare-loki-1)
+  ALL_PRIOR_ALIVE=true
+  for TARGET in $TARGETS; do
+    if [ "$ALL_PRIOR_ALIVE" = "true" ]; then
+      run_load "$TARGET"
+    fi
+    if alive "$(container_of "$TARGET")"; then
+      ALIVE[$TARGET]=true
+    else
+      ALIVE[$TARGET]=false
+      ALL_PRIOR_ALIVE=false
+    fi
+    OOM_AT[$TARGET]=$(docker inspect -f '{{.State.OOMKilled}}' "$(container_of "$TARGET")")
+  done
 
-  ATTEMPTS="$ATTEMPTS${ATTEMPTS:+,}{\"limit\":\"$LIMIT\",\"loggytracy_survived\":$LT_ALIVE,\
-\"loggytracy_oom_killed\":$LT_OOM_AT,\"loki_survived\":$LK_ALIVE,\"loki_oom_killed\":$LK_OOM_AT}"
+  ATTEMPT="{\"limit\":\"$LIMIT\""
+  ALL_ALIVE=true
+  for TARGET in $TARGETS; do
+    ATTEMPT="$ATTEMPT,\"${TARGET}_survived\":${ALIVE[$TARGET]},\"${TARGET}_oom_killed\":${OOM_AT[$TARGET]}"
+    [ "${ALIVE[$TARGET]}" = "true" ] || ALL_ALIVE=false
+    cp "$OUT/load_$TARGET.json" "$OUT/load_${TARGET}_$LIMIT.json" 2>/dev/null || true
+  done
+  ATTEMPTS="$ATTEMPTS${ATTEMPTS:+,}$ATTEMPT}"
 
-  if [ "$LT_ALIVE" = "true" ] && [ "$LK_ALIVE" = "true" ]; then
+  if [ "$ALL_ALIVE" = "true" ]; then
     SURVIVED="$LIMIT"
-    cp "$OUT/load_loggytracy.json" "$OUT/load_loggytracy_$LIMIT.json"
-    cp "$OUT/load_loki.json" "$OUT/load_loki_$LIMIT.json"
     break
   fi
   say "a container did not survive ${LIMIT}; keeping the result and trying the next limit"
-  cp "$OUT/load_loggytracy.json" "$OUT/load_loggytracy_$LIMIT.json" 2>/dev/null || true
-  cp "$OUT/load_loki.json" "$OUT/load_loki_$LIMIT.json" 2>/dev/null || true
 done
 
 if [ -z "$SURVIVED" ]; then
-  echo "no limit in '${COMPARE_MEMORY_LIMITS:-2g 8g}' let both systems finish the ingest phase;" >&2
+  echo "no limit in '${COMPARE_MEMORY_LIMITS:-2g 8g}' let every system finish the ingest phase;" >&2
   echo "the per-limit results are in $OUT and no query comparison was run." >&2
   exit 1
 fi
 
-run_verify seed loggytracy "$LOGGYTRACY_PORT" "$LT_CGROUP"
-run_verify seed loki "$LOKI_PORT" "$LK_CGROUP"
+for TARGET in $TARGETS; do
+  run_verify seed "$TARGET"
+done
 
 say "settling for ${SETTLE_SECONDS}s"
 # Loki holds a chunk in the ingester until it is idle for `chunk_idle_period`
 # (30m) or reaches `max_chunk_age` (2h). Neither happens inside a run that
 # takes minutes, so without this its chunks would never reach the filesystem
-# and its bytes-on-disk would be a number about the run length. loggytracy
-# flushes on its own every five seconds at its default, so this is what makes
-# the two comparable rather than what gives Loki an advantage.
+# and its bytes-on-disk would be a number about the run length. VictoriaLogs
+# makes rows searchable only after its in-memory flush, so it is flushed too —
+# the settle is load-bearing for it, not a courtesy. loggytracy flushes on its
+# own every five seconds at its default, so this is what makes the three
+# comparable rather than what gives anyone an advantage.
 curl -s -X POST "http://127.0.0.1:$LOKI_PORT/flush" >/dev/null || true
+curl -s "http://127.0.0.1:$VICTORIALOGS_PORT/internal/force_flush" >/dev/null || true
 sleep "$SETTLE_SECONDS"
 
 disk_of() {
@@ -247,53 +313,60 @@ disk_breakdown() {
   docker exec "$1" sh -c "du -sb $2/* 2>/dev/null" | awk '{printf "%s%s:%s", (NR>1?",":""), $2, $1}'
 }
 
-LT_DISK=$(disk_of loggytracy-compare-loggytracy-1 /var/lib/loggytracy)
-LK_DISK=$(disk_of loggytracy-compare-loki-1 /loki)
-LT_DISK_PARTS=$(disk_breakdown loggytracy-compare-loggytracy-1 /var/lib/loggytracy)
-LK_DISK_PARTS=$(disk_breakdown loggytracy-compare-loki-1 /loki)
-LT_PEAK_INGEST=$(cat "$LT_CGROUP/memory.peak")
-LK_PEAK_INGEST=$(cat "$LK_CGROUP/memory.peak")
+declare -A DISK DISK_PARTS PEAK_INGEST PEAK_QUERY DISK_END OOM
+for TARGET in $TARGETS; do
+  DISK[$TARGET]=$(disk_of "$(container_of "$TARGET")" "$(data_dir_of "$TARGET")")
+  DISK_PARTS[$TARGET]=$(disk_breakdown "$(container_of "$TARGET")" "$(data_dir_of "$TARGET")")
+  PEAK_INGEST[$TARGET]=$(cat "${CGROUP[$TARGET]}/memory.peak")
+  PEAK_QUERY[$TARGET]=0
+done
 
-LT_PEAK_QUERY=0
-LK_PEAK_QUERY=0
 PRIMARY_LIMIT=""
 MATRIX_RUNS=""
 for LIMIT in $MATRIX_LIMITS; do
-  say "restarting both so the cold query pass at limit $LIMIT is cold"
+  say "restarting everything so the cold query pass at limit $LIMIT is cold"
   docker compose restart
-  wait_ready "$LOGGYTRACY_PORT" loggytracy
-  wait_ready "$LOKI_PORT" loki
-  LT_CGROUP=$(cgroup_of loggytracy-compare-loggytracy-1)
-  LK_CGROUP=$(cgroup_of loggytracy-compare-loki-1)
+  for TARGET in $TARGETS; do
+    wait_ready "$TARGET"
+  done
+  read_cgroups
 
-  run_verify matrix loggytracy "$LOGGYTRACY_PORT" "$LT_CGROUP" "$LIMIT" "_l$LIMIT"
-  run_verify matrix loki "$LOKI_PORT" "$LK_CGROUP" "$LIMIT" "_l$LIMIT"
-
-  # The query-phase memory peak is the worst any limit reached, not the last
-  # one measured: a terminal sample meaning nothing is a lesson this repository
-  # already paid for three times over.
-  LT_THIS=$(cat "$LT_CGROUP/memory.peak")
-  LK_THIS=$(cat "$LK_CGROUP/memory.peak")
-  [ "$LT_THIS" -gt "$LT_PEAK_QUERY" ] && LT_PEAK_QUERY=$LT_THIS
-  [ "$LK_THIS" -gt "$LK_PEAK_QUERY" ] && LK_PEAK_QUERY=$LK_THIS
+  for TARGET in $TARGETS; do
+    run_verify matrix "$TARGET" "$LIMIT" "_l$LIMIT"
+    # The query-phase memory peak is the worst any limit reached, not the last
+    # one measured: a terminal sample meaning nothing is a lesson this
+    # repository already paid for three times over.
+    THIS=$(cat "${CGROUP[$TARGET]}/memory.peak")
+    [ "$THIS" -gt "${PEAK_QUERY[$TARGET]}" ] && PEAK_QUERY[$TARGET]=$THIS
+  done
 
   MATRIX_RUNS="$MATRIX_RUNS${MATRIX_RUNS:+,}{\"limit\":$LIMIT,\"suffix\":\"_l$LIMIT\"}"
   # The first limit in the list carries the report's headline tables, so the
   # document stays comparable with the published one.
   if [ -z "$PRIMARY_LIMIT" ]; then
     PRIMARY_LIMIT=$LIMIT
-    cp "$OUT/matrix_loggytracy_l$LIMIT.json" "$OUT/matrix_loggytracy.json"
-    cp "$OUT/matrix_loki_l$LIMIT.json" "$OUT/matrix_loki.json"
+    for TARGET in $TARGETS; do
+      cp "$OUT/matrix_${TARGET}_l$LIMIT.json" "$OUT/matrix_$TARGET.json"
+    done
   fi
 done
-LT_DISK_END=$(disk_of loggytracy-compare-loggytracy-1 /var/lib/loggytracy)
-LK_DISK_END=$(disk_of loggytracy-compare-loki-1 /loki)
 
-# Whether either container was killed for exceeding the limit. An OOM kill is
-# a result, not an error, and a comparison that quietly restarted through one
+# Whether a container was killed for exceeding the limit. An OOM kill is a
+# result, not an error, and a comparison that quietly restarted through one
 # would be reporting the wrong thing.
-LT_OOM=$(docker inspect -f '{{.State.OOMKilled}}' loggytracy-compare-loggytracy-1)
-LK_OOM=$(docker inspect -f '{{.State.OOMKilled}}' loggytracy-compare-loki-1)
+for TARGET in $TARGETS; do
+  DISK_END[$TARGET]=$(disk_of "$(container_of "$TARGET")" "$(data_dir_of "$TARGET")")
+  OOM[$TARGET]=$(docker inspect -f '{{.State.OOMKilled}}' "$(container_of "$TARGET")")
+done
+
+PEAK_JSON=""
+DISK_JSON=""
+for TARGET in $TARGETS; do
+  PEAK_JSON="$PEAK_JSON${PEAK_JSON:+,}
+    \"$TARGET\": { \"ingest\": ${PEAK_INGEST[$TARGET]}, \"query\": ${PEAK_QUERY[$TARGET]}, \"oom_killed\": ${OOM[$TARGET]} }"
+  DISK_JSON="$DISK_JSON${DISK_JSON:+,}
+    \"$TARGET\": { \"settled\": ${DISK[$TARGET]}, \"after_queries\": ${DISK_END[$TARGET]}, \"breakdown\": \"${DISK_PARTS[$TARGET]}\" }"
+done
 
 cat >"$OUT/bed.json" <<JSON
 {
@@ -303,22 +376,19 @@ cat >"$OUT/bed.json" <<JSON
   "machine": "$(uname -sr); $(nproc) logical CPUs; $(awk '/MemTotal/ {printf "%.1f GiB RAM", $2/1048576}' /proc/meminfo)",
   "docker": "$(docker version --format '{{.Server.Version}}')",
   "compose": "$(docker compose version --short)",
-  "loki_image": "grafana/loki:3.3.2",
+  "loki_image": "$LOKI_IMAGE",
+  "victorialogs_image": "$VICTORIALOGS_IMAGE",
   "memory_limit": "$COMPARE_MEMORY",
   "memory_limit_attempts": [$ATTEMPTS],
-  "memory_limit_bytes": $(docker exec loggytracy-compare-loggytracy-1 cat /sys/fs/cgroup/memory.max),
+  "memory_limit_bytes": $(docker exec "$(container_of loggytracy)" cat /sys/fs/cgroup/memory.max),
   "settle_seconds": $SETTLE_SECONDS,
   "verify_anchor_ns": $ANCHOR_NS,
   "matrix_primary_limit": $PRIMARY_LIMIT,
   "matrix_runs": [$MATRIX_RUNS],
-  "object_store": "none: both systems are on their local filesystem",
-  "peak_bytes": {
-    "loggytracy": { "ingest": $LT_PEAK_INGEST, "query": $LT_PEAK_QUERY, "oom_killed": $LT_OOM },
-    "loki": { "ingest": $LK_PEAK_INGEST, "query": $LK_PEAK_QUERY, "oom_killed": $LK_OOM }
+  "object_store": "none: every system is on its local filesystem",
+  "peak_bytes": {$PEAK_JSON
   },
-  "disk_bytes": {
-    "loggytracy": { "settled": $LT_DISK, "after_queries": $LT_DISK_END, "breakdown": "$LT_DISK_PARTS" },
-    "loki": { "settled": $LK_DISK, "after_queries": $LK_DISK_END, "breakdown": "$LK_DISK_PARTS" }
+  "disk_bytes": {$DISK_JSON
   }
 }
 JSON
@@ -333,10 +403,13 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --release --bin compare_report
 # another that disagreed with the document citing it.
 ARTIFACTS="${COMPARE_ARTIFACTS:-$ROOT/docs/artifacts/m9}"
 mkdir -p "$ARTIFACTS"
-for name in bed.json load_loggytracy.json load_loki.json seed_loggytracy.json \
-  seed_loki.json matrix_loggytracy.json matrix_loki.json loki_config.diff \
-  loggytracy_env.txt; do
+for name in bed.json loki_config.diff loggytracy_env.txt victorialogs_flags.txt; do
   cp "$OUT/$name" "$ARTIFACTS/$name" 2>/dev/null || true
+done
+for TARGET in $TARGETS; do
+  for phase in load seed matrix; do
+    cp "$OUT/${phase}_$TARGET.json" "$ARTIFACTS/${phase}_$TARGET.json" 2>/dev/null || true
+  done
 done
 cp "$OUT"/load_*_*g.json "$ARTIFACTS/" 2>/dev/null || true
 echo "results: $OUT" >&2
