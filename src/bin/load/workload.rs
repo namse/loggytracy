@@ -204,6 +204,7 @@ pub struct QueryPlan {
 pub struct QueryGenerator {
     corpus: std::sync::Arc<Corpus>,
     rng: Rng,
+    target: crate::config::Target,
     weights: [u32; 5],
     window_seconds: i64,
     restore_lookback_seconds: i64,
@@ -214,6 +215,7 @@ impl QueryGenerator {
     pub fn new(
         corpus: std::sync::Arc<Corpus>,
         seed: u64,
+        target: crate::config::Target,
         weights: [u32; 5],
         window_seconds: i64,
         restore_lookback_seconds: i64,
@@ -222,6 +224,7 @@ impl QueryGenerator {
         Self {
             corpus,
             rng: Rng::new(seed ^ 0x2545_f491),
+            target,
             weights,
             window_seconds,
             restore_lookback_seconds,
@@ -241,25 +244,17 @@ impl QueryGenerator {
             .get("app")
             .cloned()
             .unwrap_or_else(|| "api-gateway".to_string());
-        let selector = format!("{{app=\"{app}\"}}");
-        let expression = match shape {
-            QueryShape::LabelOnly | QueryShape::RestoreProbe => selector,
-            QueryShape::LineFilter => {
-                let phrase = PHRASES[self.rng.below(PHRASES.len())];
-                format!("{selector} |= \"{phrase}\"")
-            }
-            QueryShape::JsonField => {
-                if self.rng.below(2) == 0 {
-                    let status = STATUSES[self.rng.below(STATUSES.len())];
-                    format!("{selector} | json | status=\"{status}\"")
-                } else {
-                    let level = LEVELS[self.rng.below(LEVELS.len())];
-                    format!("{selector} | json | level=\"{level}\"")
-                }
-            }
-            QueryShape::Rate => format!("rate({selector}[1m])"),
+        // Both languages are drawn from the same rolls, so the paced sequence
+        // of questions is identical whichever target answers them.
+        let json_field = if self.rng.below(2) == 0 {
+            (
+                "status",
+                STATUSES[self.rng.below(STATUSES.len())].to_string(),
+            )
+        } else {
+            ("level", LEVELS[self.rng.below(LEVELS.len())].to_string())
         };
-
+        let phrase = PHRASES[self.rng.below(PHRASES.len())];
         let (start, end, step, direction) = match shape {
             QueryShape::RestoreProbe => {
                 let start = now_seconds - self.restore_lookback_seconds;
@@ -272,17 +267,62 @@ impl QueryGenerator {
                 "backward",
             ),
         };
-        let query = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("query", &expression)
-            .append_pair("start", &start.to_string())
-            .append_pair("end", &end.to_string())
-            .append_pair("step", &step.to_string())
-            .append_pair("limit", &self.limit.to_string())
-            .append_pair("direction", direction)
-            .finish();
+        let (expression, path) = match self.target {
+            crate::config::Target::Loggytracy | crate::config::Target::Loki => {
+                let selector = format!("{{app=\"{app}\"}}");
+                let expression = match shape {
+                    QueryShape::LabelOnly | QueryShape::RestoreProbe => selector,
+                    QueryShape::LineFilter => format!("{selector} |= \"{phrase}\""),
+                    QueryShape::JsonField => {
+                        let (field, value) = &json_field;
+                        format!("{selector} | json | {field}=\"{value}\"")
+                    }
+                    QueryShape::Rate => format!("rate({selector}[1m])"),
+                };
+                let query = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("query", &expression)
+                    .append_pair("start", &start.to_string())
+                    .append_pair("end", &end.to_string())
+                    .append_pair("step", &step.to_string())
+                    .append_pair("limit", &self.limit.to_string())
+                    .append_pair("direction", direction)
+                    .finish();
+                (expression, format!("/loki/api/v1/query_range?{query}"))
+            }
+            // The same questions in LogsQL, the translation `matrix::logsql`
+            // uses. This phase measures latency under load rather than row
+            // equality, so the languages' bucket-labeling difference does not
+            // matter here; sending Loki paths would 404 and measure nothing.
+            crate::config::Target::VictoriaLogs => {
+                let selector = format!("app:\"{app}\"");
+                let expression = match shape {
+                    QueryShape::LabelOnly | QueryShape::RestoreProbe => {
+                        format!("{selector} | limit {}", self.limit)
+                    }
+                    QueryShape::LineFilter => {
+                        format!("{selector} AND ~\"{phrase}\" | limit {}", self.limit)
+                    }
+                    QueryShape::JsonField => {
+                        let (field, value) = &json_field;
+                        format!("{selector} AND {field}:\"{value}\" | limit {}", self.limit)
+                    }
+                    QueryShape::Rate => {
+                        format!("{selector} | stats by (_time:1m) rate() as value")
+                    }
+                };
+                let query = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("query", &expression)
+                    // Milliseconds: `/select/logsql/query` reads `start`/`end`
+                    // in a different unit than the Loki API's nanoseconds.
+                    .append_pair("start", &(start * 1000).to_string())
+                    .append_pair("end", &(end * 1000).to_string())
+                    .finish();
+                (expression, format!("/select/logsql/query?{query}"))
+            }
+        };
         QueryPlan {
             shape,
-            path: format!("/loki/api/v1/query_range?{query}"),
+            path,
             tenant,
             expression,
         }
@@ -311,18 +351,27 @@ impl QueryGenerator {
 /// describes what came back. A restore probe that answers `200` over an empty
 /// window is not the same event as one that answered from a restored part, and
 /// only the row count tells them apart.
-pub fn loki_result_rows(body: &[u8]) -> u64 {
-    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return 0;
-    };
-    let result = &parsed["data"]["result"];
-    let Some(entries) = result.as_array() else {
-        return 0;
-    };
-    entries
-        .iter()
-        .map(|entry| entry["values"].as_array().map_or(0, Vec::len) as u64)
-        .sum()
+pub fn result_rows(target: crate::config::Target, body: &[u8]) -> u64 {
+    match target {
+        crate::config::Target::Loggytracy | crate::config::Target::Loki => {
+            let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) else {
+                return 0;
+            };
+            let result = &parsed["data"]["result"];
+            let Some(entries) = result.as_array() else {
+                return 0;
+            };
+            entries
+                .iter()
+                .map(|entry| entry["values"].as_array().map_or(0, Vec::len) as u64)
+                .sum()
+        }
+        // Newline-delimited JSON, one object per row.
+        crate::config::Target::VictoriaLogs => String::from_utf8_lossy(body)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count() as u64,
+    }
 }
 
 #[cfg(test)]
@@ -346,14 +395,14 @@ mod tests {
         let body = br#"{"status":"success","data":{"resultType":"streams","result":[
             {"stream":{"app":"a"},"values":[["1","x"],["2","y"]]},
             {"stream":{"app":"b"},"values":[["3","z"]]}]}}"#;
-        assert_eq!(loki_result_rows(body), 3);
+        assert_eq!(result_rows(crate::config::Target::Loki, body), 3);
     }
 
     #[test]
     fn an_empty_result_counts_zero_rows() {
         let body = br#"{"status":"success","data":{"resultType":"streams","result":[]}}"#;
-        assert_eq!(loki_result_rows(body), 0);
-        assert_eq!(loki_result_rows(b"not json"), 0);
+        assert_eq!(result_rows(crate::config::Target::Loki, body), 0);
+        assert_eq!(result_rows(crate::config::Target::Loki, b"not json"), 0);
     }
 
     /// Every stream in one push has to belong to the tenant in the header,
@@ -431,7 +480,15 @@ mod tests {
     #[test]
     fn every_query_shape_names_a_stream_that_exists() {
         let corpus = corpus();
-        let mut generator = QueryGenerator::new(corpus.clone(), 11, [1, 1, 1, 1, 1], 300, 600, 100);
+        let mut generator = QueryGenerator::new(
+            corpus.clone(),
+            11,
+            crate::config::Target::Loggytracy,
+            [1, 1, 1, 1, 1],
+            300,
+            600,
+            100,
+        );
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..400 {
             let plan = generator.next_plan(1_772_000_000);
@@ -455,6 +512,32 @@ mod tests {
                     .iter()
                     .any(|stream| stream.labels.get("app") == Some(&app))
             );
+        }
+        assert_eq!(seen.len(), QUERY_SHAPES.len(), "every shape must be drawn");
+    }
+
+    /// The load phase against VictoriaLogs asks LogsQL at its own endpoint —
+    /// a Loki path would 404 there and the phase would measure error handling.
+    /// Same seed, same rolls: the sequence of questions is the sequence the
+    /// other two targets get.
+    #[test]
+    fn victorialogs_plans_ask_logsql_at_its_own_endpoint() {
+        let corpus = corpus();
+        let mut generator = QueryGenerator::new(
+            corpus.clone(),
+            11,
+            crate::config::Target::VictoriaLogs,
+            [1, 1, 1, 1, 1],
+            300,
+            600,
+            100,
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..400 {
+            let plan = generator.next_plan(1_772_000_000);
+            seen.insert(plan.shape.name());
+            assert!(plan.path.starts_with("/select/logsql/query?query="));
+            assert!(plan.expression.starts_with("app:\""));
         }
         assert_eq!(seen.len(), QUERY_SHAPES.len(), "every shape must be drawn");
     }

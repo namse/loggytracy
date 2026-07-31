@@ -1,6 +1,6 @@
-# The comparison bed: loggytracy and Loki side by side, same machine, same
-# container memory limit, each on local filesystem storage, each with its own
-# volume so disk usage is separately measurable.
+# The comparison bed: loggytracy, Loki and VictoriaLogs side by side, same
+# machine, same container memory limit, each on local filesystem storage, each
+# with its own volume so disk usage is separately measurable.
 #
 # What is deliberately identical: the memory limit, the storage medium, the
 # absence of a CPU limit, and the fact that both are single-process. What is
@@ -58,6 +58,21 @@ services:
       - loki-data:/loki
     stop_grace_period: 120s
 
+  victorialogs:
+    <<: *memory
+    image: victoriametrics/victoria-logs:v1.52.0
+    # The one non-default flag is where the data lives, so the disk axis has a
+    # directory to measure. Everything else runs at VictoriaLogs' own defaults,
+    # captured from its /flags endpoint by run.sh the same way Loki's config is
+    # captured from /config.
+    command: -storageDataPath=/victoria-logs-data
+    ports:
+      - "${VICTORIALOGS_PORT:-3130}:9428"
+    volumes:
+      - victorialogs-data:/victoria-logs-data
+    stop_grace_period: 120s
+
 volumes:
   loggytracy-data:
   loki-data:
+  victorialogs-data:

@@ -47,7 +47,7 @@ use tokio::time::Instant;
 use config::{Config, Phase, Target};
 use http::{Client, Request};
 use stats::{GaugeSeries, LatencyPair, target_row, wal_backlog_drains};
-use workload::{ArrivalOrder, PushGenerator, QUERY_SHAPES, QueryGenerator, loki_result_rows};
+use workload::{ArrivalOrder, PushGenerator, QUERY_SHAPES, QueryGenerator, result_rows};
 
 const PUSH_CONTENT_TYPE: &str = "application/x-protobuf";
 /// Row group size the engine itself flushes at, so the measured compression
@@ -675,6 +675,7 @@ async fn query_pacer(
     let mut generator = QueryGenerator::new(
         corpus,
         cfg.seed,
+        cfg.target,
         cfg.query_weights,
         cfg.query_window_seconds,
         cfg.restore_lookback_seconds,
@@ -729,7 +730,7 @@ async fn query_worker(
                 match response.status {
                     200 => {
                         outcome.answered += 1;
-                        let rows = loki_result_rows(&response.body);
+                        let rows = result_rows(cfg.target, &response.body);
                         outcome.rows_returned += rows;
                         if shape == workload::QueryShape::RestoreProbe {
                             outcome.restore_probes += 1;
