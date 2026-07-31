@@ -326,6 +326,47 @@ against the batch one), and `3ca3bb8` (the switchover, retiring the split fallba
 - [ ] **`peak_materialized_bytes` now overstates.** It still adds `merge_max_memory_bytes`, which no longer
       bounds a rewrite. Correcting it is a claim about memory and wants its own measurement rather than an edit
 
+## VictoriaLogs is in the measurement now, and it changes the reading
+
+The query adapter is built: LogsQL translation for all six shapes, `/select/logsql/query`'s
+newline-delimited JSON parsed, and a **reduced digest** computed by every system so the three can be compared
+at all — the strict digest covers a timestamp, a line and every label with its placement, and VictoriaLogs has
+no line for a JSON row, so it is computed on the basis all three share (timestamp plus field set, no message,
+no placement) and the strict one still holds between the two that keep lines.
+
+Same corpus, same seed, same anchor, 30,000 rows over 8 streams, limit 100, all three local, build `0f7ca1c`:
+
+| shape | loggytracy | Loki | VictoriaLogs | lt/Loki | lt/VL | lt rows | VL rows |
+|---|---|---|---|---|---|---|---|
+| `label_only` | 0.77 ms | 8.76 ms | 3.10 ms | **0.09x** | **0.25x** | 2,400 | 2,400 |
+| `line_filter` | 1.00 ms | 6.17 ms | 1.63 ms | **0.16x** | **0.61x** | 2,008 | 1,147 |
+| `json_field` | 4.55 ms | 10.03 ms | 1.44 ms | **0.45x** | 3.15x | 2,393 | 2,393 |
+| `json_field_rare` | 38.11 ms | 31.38 ms | 3.60 ms | 1.21x | **10.57x** | 72 | 72 |
+| `metadata_rare` | 43.09 ms | 18.02 ms | 3.59 ms | 2.39x | **11.99x** | 72 | 72 |
+| `rate` | 8.57 ms | 4.95 ms | 0.27 ms | 1.73x | **31.56x** | 41 | 24 |
+
+**Against Loki the picture was mixed. Against VictoriaLogs it is not.** loggytracy wins the two label-and-
+substring shapes and loses everything else, by an order of magnitude on the two rare-value lookups and by
+thirty on the metric.
+
+**And VictoriaLogs answers `json_field_rare` and `metadata_rare` identically** — 3.60 ms and 3.59 ms — because
+it does not distinguish a field that arrived as an attribute from one it extracted from the message. Both are
+columns. That is the clearest statement of the gap: the 1.4x that columnizing bought *inside* VictoriaLogs
+(measured earlier, JSON versus logfmt) is not the same thing as the 12x between the two engines. Columnizing
+is necessary and it is not sufficient.
+
+Two caveats on the numbers. `line_filter` returns 2,008 rows here and 1,147 there — LogQL's `|=` is a raw
+substring and LogsQL's is a tokenized phrase, so those two are not answering quite the same question, and the
+`rate` row is 41 series against 24 for the same reason of bucket semantics. Both are stated in `logsql()` and
+neither is a defect in either engine.
+
+- [ ] The three-way run is ad hoc: local processes, no container memory limits, and `compare/run.sh` still
+      drives two systems. Fold VictoriaLogs into the bed so this table comes out of a reproducible run rather
+      than a shell loop
+- [ ] Report the reduced digest as its own agreement column, and say which basis each pair was compared on.
+      Computing it is done; presenting it is not
+- [ ] The metric gap is 31x and nothing in the plan addresses it
+
 ## The claim moved onto its worst shape, and the measurement said so within the hour
 
 `metadata_rare` — `| trace_id="x"` with no parser stage, which is what an OTLP attribute produces and what

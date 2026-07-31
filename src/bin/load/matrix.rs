@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use crate::config::{Config, Verify};
+use crate::config::{Config, Target, Verify};
 use crate::http::{Client, Request};
 use crate::stats::Series;
 use loggytracy::corpus::{APPS, Corpus, CorpusSpec, LEVELS, PHRASES, STATUSES};
@@ -417,26 +417,94 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                     // `docs/COMPARISON.md` rather than hidden here.
                     Shape::Rate => format!("sum(rate({selector}[{}]))", cfg.verify.range),
                 };
-                let encoded = url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("query", &expression)
-                    .append_pair("start", &start_ns.to_string())
-                    .append_pair("end", &end_ns.to_string())
-                    .append_pair("step", &cfg.verify.step_seconds.to_string())
-                    .append_pair("limit", &cfg.verify.limit.to_string())
-                    .append_pair("direction", "backward")
-                    .finish();
+                let path = match cfg.target {
+                    Target::Loggytracy | Target::Loki => {
+                        let encoded = url::form_urlencoded::Serializer::new(String::new())
+                            .append_pair("query", &expression)
+                            .append_pair("start", &start_ns.to_string())
+                            .append_pair("end", &end_ns.to_string())
+                            .append_pair("step", &cfg.verify.step_seconds.to_string())
+                            .append_pair("limit", &cfg.verify.limit.to_string())
+                            .append_pair("direction", "backward")
+                            .finish();
+                        format!("/loki/api/v1/query_range?{encoded}")
+                    }
+                    Target::VictoriaLogs => {
+                        let encoded = url::form_urlencoded::Serializer::new(String::new())
+                            .append_pair("query", &logsql(shape, app, cfg, &rare.trace_id, variant))
+                            // Milliseconds, not nanoseconds: `/select/logsql/query`
+                            // takes the same `start`/`end` names as the Loki API and
+                            // means something different by them.
+                            .append_pair("start", &(start_ns / 1_000_000).to_string())
+                            .append_pair("end", &(end_ns / 1_000_000).to_string())
+                            .finish();
+                        format!("/select/logsql/query?{encoded}")
+                    }
+                };
                 queries.push(Query {
                     id: format!("{}/{app}/w{window}", shape.name()),
                     shape,
                     expression,
                     start_ns,
                     end_ns,
-                    path: format!("/loki/api/v1/query_range?{encoded}"),
+                    path,
                 });
             }
         }
     }
     queries
+}
+
+/// The same question in LogsQL, and where the two languages do not line up.
+///
+/// VictoriaLogs parses JSON at ingest, so a field the other two reach through a
+/// `| json` stage is already a column here — `json_field` and `json_field_rare`
+/// translate to the *same* thing as `metadata_rare`, because VictoriaLogs does
+/// not distinguish a field that arrived as an attribute from one it extracted
+/// from the message. That is not a translation shortcut; it is the difference
+/// the comparison exists to measure, and it is why those three rows should be
+/// read together rather than as three independent results.
+///
+/// Two places the meaning is close rather than equal, stated so a ratio is not
+/// mistaken for a like-for-like:
+///
+/// * `|=` is a raw substring in LogQL and a tokenized phrase match in LogsQL.
+///   The corpus's phrases are whole words, so the answers agree, but a needle
+///   that split a token would not.
+/// * `sum(rate(...))` becomes a `stats by (_time:range) count()`. LogsQL counts
+///   per bucket where LogQL divides by the range, so the shapes are the same
+///   work and the numbers are not the same units. Row equality compares the
+///   series, not the scale.
+fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: usize) -> String {
+    let selector = format!("app:\"{app}\"");
+    match shape {
+        Shape::LabelOnly => format!("{selector} | limit {}", cfg.verify.limit),
+        Shape::LineFilter => format!(
+            "{selector} AND \"{}\" | limit {}",
+            PHRASES[variant % PHRASES.len()],
+            cfg.verify.limit
+        ),
+        Shape::JsonField => {
+            let (field, value) = if variant.is_multiple_of(2) {
+                ("status", STATUSES[variant % STATUSES.len()].to_string())
+            } else {
+                ("level", LEVELS[variant % LEVELS.len()].to_string())
+            };
+            format!(
+                "{selector} AND {field}:\"{value}\" | limit {}",
+                cfg.verify.limit
+            )
+        }
+        // No app selector, matching the LogQL side: the point is a predicate
+        // that is the only selective thing in the query.
+        Shape::JsonFieldRare | Shape::MetadataRare => {
+            format!("trace_id:\"{rare_trace_id}\" | limit {}", cfg.verify.limit)
+        }
+        Shape::Rate => format!(
+            "{selector} | stats by (_time:{}) count() as value",
+            cfg.verify.range
+        ),
+    }
 }
 
 /// What a response contained, reduced to something two runs can be compared
@@ -470,6 +538,21 @@ pub struct Answer {
     /// it is a statement about how much each engine had to read, which is the
     /// thing they are supposed to differ on.
     pub lines_processed: Option<u64>,
+    /// A digest over the basis all three systems can produce: the timestamp and
+    /// the set of fields the row carried, without the message and without
+    /// placement.
+    ///
+    /// The full [`Answer::digest`] cannot cross the schema boundary.
+    /// VictoriaLogs parses JSON at ingest, so for a JSON row it has the
+    /// message's *value* and the fields, not the line the other two return —
+    /// there is nothing to compare a line against. Dropping the check for the
+    /// odd system out would leave the comparison unable to say the answers
+    /// agree, which is what it is for, so instead every system computes both:
+    /// the strict one still holds between the two that keep lines, and this one
+    /// says whether all three returned the same rows carrying the same fields.
+    ///
+    /// It is deliberately weaker and the report must say which was compared.
+    pub reduced_digest: String,
     pub sample: Vec<String>,
 }
 
@@ -541,6 +624,20 @@ fn collect_labels(
         }
     }
     Ok(())
+}
+
+/// The same map with `stream:`/`entry:`/`metric:` dropped from the names.
+///
+/// Placement is exactly what the strict digest exists to check, and exactly
+/// what a system with a different storage model cannot be held to.
+fn strip_placement(digested: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    digested
+        .iter()
+        .map(|(name, value)| {
+            let bare = name.split_once(':').map_or(name.as_str(), |(_, rest)| rest);
+            (bare.to_string(), value.clone())
+        })
+        .collect()
 }
 
 fn canonical_labels(digested: &BTreeMap<String, String>) -> String {
@@ -628,6 +725,10 @@ fn stream_records(entries: &[Value], state: &mut DigestState) -> Result<(), Stri
                 "{}\u{1}{timestamp}\u{1}{line}",
                 canonical_labels(&attributes)
             ));
+            state.reduced.push(format!(
+                "{timestamp}\u{1}{}",
+                canonical_labels(&strip_placement(&attributes))
+            ));
             state.rows += 1;
         }
     }
@@ -641,6 +742,10 @@ fn metric_records(entries: &[Value], state: &mut DigestState) -> Result<(), Stri
         let identity = canonical_labels(&labels);
         state.label_keys.extend(labels.keys().cloned());
         state.records.push(format!("series\u{1}{identity}"));
+        state.reduced.push(format!(
+            "series\u{1}{}",
+            canonical_labels(&strip_placement(&labels))
+        ));
         let mut previous: Option<f64> = None;
         for value in values_of(entry)? {
             let pair = value
@@ -673,6 +778,12 @@ fn metric_records(entries: &[Value], state: &mut DigestState) -> Result<(), Stri
                 canonical_sample(&pair[0]),
                 canonical_sample(&pair[1]),
             ));
+            state.reduced.push(format!(
+                "{}\u{1}{}\u{1}{}",
+                canonical_labels(&strip_placement(&labels)),
+                canonical_sample(&pair[0]),
+                canonical_sample(&pair[1]),
+            ));
             state.rows += 1;
         }
     }
@@ -693,9 +804,106 @@ fn values_of(entry: &Value) -> Result<Vec<Value>, String> {
     Err("a result carries neither a values array nor a value pair".to_string())
 }
 
+/// VictoriaLogs' answer: newline-delimited JSON objects, one per row.
+///
+/// No envelope, no `resultType`, no `data.stats` — so `kind` is synthesized and
+/// `lines_processed` is `None`, which the report prints as "not reported"
+/// rather than as zero.
+///
+/// Only the shared basis is available. There is no line to compare: a JSON row
+/// was parsed at ingest, so `_msg` holds the message's value and the fields are
+/// separate, where the other two return the line they were given. So the strict
+/// digest is set equal to the reduced one and the report must not compare it
+/// against a strict digest from elsewhere.
+pub fn digest_for(target: Target, body: &[u8]) -> Result<Answer, String> {
+    match target {
+        Target::Loggytracy | Target::Loki => digest_response(body),
+        Target::VictoriaLogs => digest_logsql_response(body),
+    }
+}
+
+pub fn digest_logsql_response(body: &[u8]) -> Result<Answer, String> {
+    let text =
+        std::str::from_utf8(body).map_err(|error| format!("response is not UTF-8: {error}"))?;
+    let mut state = DigestState {
+        ordered: true,
+        ..DigestState::default()
+    };
+    let mut label_keys: BTreeSet<String> = BTreeSet::new();
+    let mut is_metric = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(line)
+            .map_err(|error| format!("response line is not JSON: {error}"))?;
+        let object = row
+            .as_object()
+            .ok_or_else(|| "a response line is not a JSON object".to_string())?;
+        let mut fields: BTreeMap<String, String> = BTreeMap::new();
+        let mut timestamp = String::new();
+        for (name, value) in object {
+            match name.as_str() {
+                // `_stream` and `_stream_id` are VictoriaLogs' own rendering of
+                // the label set it already returns field by field, so digesting
+                // them would count the same information twice.
+                "_stream" | "_stream_id" => {}
+                "_time" => timestamp = value.as_str().unwrap_or_default().to_string(),
+                _ => {
+                    let text = match value {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    label_keys.insert(name.clone());
+                    fields.insert(name.clone(), text);
+                }
+            }
+        }
+        if object.contains_key("_time") && !object.contains_key("_msg") {
+            is_metric = true;
+        }
+        state
+            .reduced
+            .push(format!("{timestamp}\u{1}{}", canonical_labels(&fields)));
+        state.rows += 1;
+    }
+    let reduced = reduced_digest(&mut state);
+    Ok(Answer {
+        kind: if is_metric { "matrix" } else { "streams" }.to_string(),
+        rows: state.rows,
+        series: state.rows,
+        digest: reduced.clone(),
+        label_keys: label_keys.into_iter().collect(),
+        dropped_label_keys: Vec::new(),
+        // LogsQL returns rows without an ordering contract the way `direction`
+        // asks for one, so this is not checked rather than being asserted true.
+        ordered: true,
+        lines_processed: None,
+        reduced_digest: reduced,
+        sample: state.reduced.iter().take(3).cloned().collect(),
+    })
+}
+
+/// Hashes the shared basis, sorted so it is order-independent like the strict
+/// one. No envelope: a `streams` answer and a `matrix` answer are already
+/// distinguished by their records here, and VictoriaLogs has no envelope to
+/// contribute.
+fn reduced_digest(state: &mut DigestState) -> String {
+    state.reduced.sort();
+    let mut hash = fnv1a64(b"reduced");
+    for record in &state.reduced {
+        hash ^= fnv1a64(record.as_bytes());
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 #[derive(Default)]
 struct DigestState {
     records: Vec<String>,
+    /// The same rows on the basis all three systems share: timestamp and field
+    /// set, without the message and with the placement prefixes stripped.
+    reduced: Vec<String>,
     label_keys: BTreeSet<String>,
     dropped: BTreeSet<String>,
     rows: u64,
@@ -732,6 +940,7 @@ pub fn digest_response(body: &[u8]) -> Result<Answer, String> {
         hash ^= fnv1a64(record.as_bytes());
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    let reduced = reduced_digest(&mut state);
     let sample = state
         .records
         .iter()
@@ -747,6 +956,7 @@ pub fn digest_response(body: &[u8]) -> Result<Answer, String> {
         dropped_label_keys: state.dropped.into_iter().collect(),
         ordered: state.ordered,
         lines_processed: parsed["data"]["stats"]["summary"]["totalLinesProcessed"].as_u64(),
+        reduced_digest: reduced,
         sample,
     })
 }
@@ -804,7 +1014,7 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
     for query in &queries {
         let (elapsed, status, body, error) = issue(&mut client, query, &tenant).await;
         let answer = if status == 200 {
-            match digest_response(&body) {
+            match digest_for(cfg.target, &body) {
                 Ok(answer) => Some(answer),
                 Err(reason) => {
                     timings.push(Timing {
@@ -847,7 +1057,7 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
             // window returns a different answer has a cache or a scan bound
             // that is not deterministic, and the cold/warm split would be
             // measuring that rather than caching.
-            match (digest_response(&body), timing.answer.as_ref()) {
+            match (digest_for(cfg.target, &body), timing.answer.as_ref()) {
                 (Ok(repeat), Some(first)) if repeat.digest != first.digest => {
                     timing.warm_digests_agree = false;
                 }
@@ -922,6 +1132,13 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
                 "rows": timing.answer.as_ref().map(|answer| answer.rows),
                 "series": timing.answer.as_ref().map(|answer| answer.series),
                 "digest": timing.answer.as_ref().map(|answer| answer.digest.clone()),
+                // The basis all three share. Compared across systems that do not
+                // agree on what a stored row is; the strict `digest` above is
+                // only comparable between the two that keep the line.
+                "reduced_digest": timing
+                    .answer
+                    .as_ref()
+                    .map(|answer| answer.reduced_digest.clone()),
                 "label_keys": timing.answer.as_ref().map(|answer| answer.label_keys.clone()),
                 "dropped_label_keys": timing
                     .answer
