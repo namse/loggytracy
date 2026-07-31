@@ -784,6 +784,51 @@
         }
     }
 
+    /// Page-index time pruning may skip a page, never a row: every sub-window
+    /// answer must equal the brute-force filter of the same rows. Interleaved
+    /// streams make the group piecewise-ordered — the case where per-page
+    /// bounds are loosest — and windows at every alignment sweep the page
+    /// boundaries.
+    #[test]
+    fn page_index_time_pruning_never_drops_a_row_any_window_asks_for() {
+        let tmp = tempfile_dir();
+        let stream = |name: &str| -> SharedLabels {
+            std::sync::Arc::new(BTreeMap::from([("app".to_string(), name.to_string())]))
+        };
+        let rows: Vec<Row> = (0..2_000)
+            .map(|timestamp_ns: i64| Row {
+                tenant: test_tenant(),
+                timestamp_ns,
+                labels: stream(if timestamp_ns % 3 == 0 { "a" } else { "b" }),
+                line: format!("line-{timestamp_ns}"),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let part = flush_rows(rows.clone(), &tmp, 4096).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        for (start, end) in [(0, 2_000), (137, 411), (999, 1_001), (1_990, 2_500), (0, 1)] {
+            for forward in [true, false] {
+                let results = reader
+                    .query(
+                        &test_tenant(),
+                        &[],
+                        &[],
+                        QueryTimeRange::half_open(start, end),
+                        usize::MAX,
+                        forward,
+                    )
+                    .unwrap();
+                let mut seen: Vec<i64> = results
+                    .iter()
+                    .flat_map(|stream| stream.entries.iter().map(|entry| entry.timestamp_ns))
+                    .collect();
+                seen.sort_unstable();
+                let wanted: Vec<i64> = (start.max(0)..end.min(2_000)).collect();
+                assert_eq!(seen, wanted, "window [{start}, {end}) {forward}");
+            }
+        }
+    }
+
     #[test]
     fn scan_limit_stops_before_collecting_the_rest_of_a_part() {
         let tmp = tempfile_dir();

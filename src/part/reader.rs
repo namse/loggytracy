@@ -174,9 +174,53 @@ fn validate_sidecar_files(part: &Part) -> Result<(), String> {
     Ok(())
 }
 
+/// The rows of one group whose *pages* can hold a row in the window, from the
+/// timestamp column's page index — or `None` when the file carries no page
+/// index to ask, which selects everything.
+fn time_page_selection(
+    part_metadata: &ArrowReaderMetadata,
+    rgu: usize,
+    time_range: QueryTimeRange,
+) -> Option<RowSelection> {
+    let column_index = part_metadata.metadata().column_index()?.get(rgu)?;
+    let offset_index = part_metadata.metadata().offset_index()?.get(rgu)?;
+    // `timestamp_ns` is column 1 in every part schema.
+    let parquet::file::page_index::column_index::ColumnIndexMetaData::INT64(ts_index) =
+        column_index.get(1)?
+    else {
+        return None;
+    };
+    let pages = offset_index.get(1)?.page_locations();
+    let group_rows = part_metadata.metadata().row_group(rgu).num_rows().max(0) as usize;
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for (page, location) in pages.iter().enumerate() {
+        let start = location.first_row_index.max(0) as usize;
+        let end = pages
+            .get(page + 1)
+            .map(|next| next.first_row_index.max(0) as usize)
+            .unwrap_or(group_rows);
+        let keep = match (ts_index.min_value(page), ts_index.max_value(page)) {
+            (Some(min), Some(max)) => time_range.overlaps(*min, *max),
+            // A page without recorded bounds cannot be excluded.
+            _ => true,
+        };
+        if keep {
+            match ranges.last_mut() {
+                Some(range) if range.end == start => range.end = end,
+                _ => ranges.push(start..end),
+            }
+        }
+    }
+    Some(RowSelection::from_consecutive_ranges(
+        ranges.into_iter(),
+        group_rows,
+    ))
+}
+
 fn open_part_data(
     part: &Part,
     validate_checksum: bool,
+    page_index: bool,
 ) -> Result<(PreadReader, ArrowReaderMetadata), String> {
     if validate_checksum {
         let actual = file_crc32(&part.data_path()).map_err(|error| {
@@ -196,8 +240,9 @@ fn open_part_data(
     let data_file =
         PreadReader::new(fs::File::open(part.data_path()).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
+    let options = parquet::arrow::arrow_reader::ArrowReaderOptions::new().with_page_index(page_index);
     let arrow_reader_metadata =
-        ArrowReaderMetadata::load(&data_file, Default::default()).map_err(|e| e.to_string())?;
+        ArrowReaderMetadata::load(&data_file, options).map_err(|e| e.to_string())?;
 
     let parquet_rg_count = arrow_reader_metadata.metadata().num_row_groups();
     if parquet_rg_count != part.meta.row_group_count as usize {
@@ -302,7 +347,7 @@ impl PartReader {
             .map(|(key, _)| key.clone())
             .collect();
         if require_data || part.data_path().exists() {
-            open_part_data(&part, true)?;
+            open_part_data(&part, true, false)?;
         }
         let index_resident_bytes = resident_bytes(&decoded_blooms, &stream_index);
         Ok(Self {
@@ -779,7 +824,7 @@ impl PartReader {
         // (`docs/VISION.md` III). Both handles are cheap to clone — a `File`
         // behind an `Arc` and an `Arc<ParquetMetaData>` — which is what makes a
         // reader per row group, and per window inside one, affordable.
-        let (data_file, part_metadata) = open_part_data(&self.part, false)?;
+        let (data_file, part_metadata) = open_part_data(&self.part, false, true)?;
 
         'row_groups: for &row_group in &sorted_selected {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -804,7 +849,7 @@ impl PartReader {
             // of the whole group. The group the bloom admitted wrongly costs
             // one narrow read; the group holding four of a rare value decodes
             // four rows wide instead of eight thousand.
-            let selection = if definitive.is_empty() {
+            let mut selection = if definitive.is_empty() {
                 None
             } else {
                 match self.select_rows_in_group(
@@ -820,6 +865,23 @@ impl PartReader {
                 }
             };
             let count_scanned_rows = selection.is_none();
+            // Sub-group time pruning off the page index: `timestamp_ns` is the
+            // one column that keeps page-level bounds (`part_writer_properties`),
+            // and a page whose whole span misses the window is skipped before
+            // it is decoded. Rows are piecewise time-ordered — one run per
+            // stream — so the bounds stay tight when a group holds few streams.
+            // Exactly `QueryTimeRange::overlaps`, page-sized: it can only drop
+            // a page the row-level test would reject row by row.
+            if let Some(time_selection) = time_page_selection(&part_metadata, rgu, time_range) {
+                let combined = match selection.take() {
+                    Some(selected) => selected.intersection(&time_selection),
+                    None => time_selection,
+                };
+                if !combined.selects_any() {
+                    continue;
+                }
+                selection = Some(combined);
+            }
             if forward {
                 // Forwards, Parquet's own order is the query's order, so one
                 // reader streams the group and the sink's frontier ends it.
