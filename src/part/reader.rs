@@ -907,6 +907,19 @@ impl PartReader {
             // of the whole group. The group the bloom admitted wrongly costs
             // one narrow read; the group holding four of a rare value decodes
             // four rows wide instead of eight thousand.
+            // Sub-group time pruning off the page index: `timestamp_ns` is the
+            // one column that keeps page-level bounds (`part_writer_properties`),
+            // and a page whose whole span misses the window is skipped before
+            // it is decoded — by the narrow first pass too, which is what the
+            // `trace_window` measurement forced: without it the first pass
+            // examined every row of every admitted group whatever the window
+            // said, and a two-second window cost what the whole range cost.
+            let time_selection = time_page_selection(&part_metadata, rgu, time_range);
+            if let Some(time_selection) = &time_selection
+                && !time_selection.selects_any()
+            {
+                continue;
+            }
             let mut selection = if definitive.is_empty() {
                 None
             } else {
@@ -916,6 +929,7 @@ impl PartReader {
                     rgu,
                     &definitive,
                     time_range,
+                    time_selection.as_ref(),
                     &mut stats,
                 )? {
                     Some(selection) => Some(selection),
@@ -923,22 +937,10 @@ impl PartReader {
                 }
             };
             let count_scanned_rows = selection.is_none();
-            // Sub-group time pruning off the page index: `timestamp_ns` is the
-            // one column that keeps page-level bounds (`part_writer_properties`),
-            // and a page whose whole span misses the window is skipped before
-            // it is decoded. Rows are piecewise time-ordered — one run per
-            // stream — so the bounds stay tight when a group holds few streams.
-            // Exactly `QueryTimeRange::overlaps`, page-sized: it can only drop
-            // a page the row-level test would reject row by row.
-            if let Some(time_selection) = time_page_selection(&part_metadata, rgu, time_range) {
-                let combined = match selection.take() {
-                    Some(selected) => selected.intersection(&time_selection),
-                    None => time_selection,
-                };
-                if !combined.selects_any() {
-                    continue;
-                }
-                selection = Some(combined);
+            if selection.is_none()
+                && let Some(time_selection) = time_selection
+            {
+                selection = Some(time_selection);
             }
             if forward {
                 // Forwards, Parquet's own order is the query's order, so one
@@ -1059,6 +1061,7 @@ impl PartReader {
         rgu: usize,
         definitive: &[DefinitiveColumn],
         time_range: QueryTimeRange,
+        time_selection: Option<&RowSelection>,
         stats: &mut ScanStats,
     ) -> Result<Option<RowSelection>, String> {
         let labels = self.stream_labels.len();
@@ -1081,12 +1084,34 @@ impl PartReader {
             leaves.iter().copied(),
         ))
         .with_batch_size(8192)
-        .with_row_groups(vec![rgu])
+        .with_row_groups(vec![rgu]);
+        let reader = match time_selection {
+            Some(time_selection) => reader.with_row_selection(time_selection.clone()),
+            None => reader,
+        }
         .build()
         .map_err(|e| e.to_string())?;
+        // Under a row selection the reader yields only the selected rows, so
+        // the running index must walk the selection to stay group-absolute —
+        // the returned `RowSelection` addresses the group, not the pass.
+        let group_rows = part_metadata.metadata().row_group(rgu).num_rows().max(0) as usize;
+        let mut absolute: Box<dyn Iterator<Item = usize>> = match time_selection {
+            Some(time_selection) => {
+                let mut at = 0usize;
+                let mut indices = Vec::new();
+                for selector in time_selection.iter() {
+                    if !selector.skip {
+                        indices.extend(at..at + selector.row_count);
+                    }
+                    at += selector.row_count;
+                }
+                Box::new(indices.into_iter())
+            }
+            None => Box::new(0..group_rows),
+        };
 
         let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-        let mut row = 0usize;
+        let mut last_row = 0usize;
         for batch in reader {
             let batch = batch.map_err(|e| e.to_string())?;
             stats.scanned_bytes = stats
@@ -1107,6 +1132,10 @@ impl PartReader {
                 })
                 .collect();
             for i in 0..batch.num_rows() {
+                let row = absolute
+                    .next()
+                    .ok_or_else(|| "row selection shorter than the batch".to_string())?;
+                last_row = last_row.max(row + 1);
                 stats.scanned_rows = stats.scanned_rows.saturating_add(1);
                 let keep = time_range.contains(ts.value(i))
                     && definitive.iter().zip(&columns).all(|(def, (sm, pf))| {
@@ -1129,7 +1158,6 @@ impl PartReader {
                         _ => ranges.push(row..row + 1),
                     }
                 }
-                row += 1;
             }
         }
         if ranges.is_empty() {
@@ -1137,7 +1165,7 @@ impl PartReader {
         }
         Ok(Some(RowSelection::from_consecutive_ranges(
             ranges.into_iter(),
-            row,
+            last_row.max(group_rows),
         )))
     }
 
