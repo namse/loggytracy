@@ -553,16 +553,26 @@ is the per-row parse showing up on its own.
 fields are "stored in columns and pruned with bloom filters". They are pruned with bloom filters. They are not
 in columns.
 
-- [ ] **Columnize structured metadata**, or explain in the architecture why it is a blob. A per-row
-      `serde_json::from_str` on the consumer's own query shape is the finding, and it is a write-path change:
-      the schema already grows a column per stream label, and metadata keys are the same kind of thing at a
-      different cardinality
+- [x] **Columnize structured metadata** — done, and the architecture sentence is true now. One canonical
+      form at the memtable door (sorted keys, first value wins — the visibility the pipeline already gave a
+      duplicate); one nullable `_sm:<key>` Utf8 column per key up to `MAX_METADATA_COLUMNS = 128`, chosen by
+      row count so key churn cannot evict `trace_id`, with the leftover pairs in the old blob column and the
+      invariant that a columnized key never also appears in a row's residual; the key list and per-key row
+      counts in `meta.json`, so a merge picks its output's columns by summing its inputs' counts the way it
+      already unions their `stream_labels` — no row read before the schema exists. `meta.json` also gained
+      `row_group_rows` and `row_group_ts_monotonic` in the same format change, for the read-path work that
+      needs them. The reader rebuilds a row's pairs by merging two key-sorted lists; the residual is null
+      for every row of the intended consumer, so the common path runs no serde at all. Measured:
+      `part/scan_label_columns` **−76–77%** (a full-part scan's per-row cost, which was the 1.8x/line term),
+      `part/write/json` **−17%** (the bloom encoder now parses each line once instead of twice — sizing
+      reused the tokens), `part/write/plain` flat, and the 2 GiB memory gate `UNDER_BUDGET` at **74.8%** of
+      budget against 78–83% before. The bed rerun is the number that decides `metadata_rare`
 - [ ] The scatter problem is still underneath it. 72 rows across 8 streams cannot be pruned to fewer row groups
       by any bloom, so even a free filter leaves the lines-read gap. Columnizing addresses the per-line cost,
-      not the count
-- [ ] **`docs/VISION.md`'s claim is now unsupported by its first measurement and says so.** It is not
-      retracted — the claim is about where the design *should* win, and the reason it does not is identified —
-      but it must not be repeated as though it held
+      not the count — sub-row-group selection over the `_sm:` columns (late materialization) is the next step
+- [x] **`docs/VISION.md`'s claim** — rewritten from the three-way agreement run: the Loki half holds at
+      0.24x and the VictoriaLogs half fails at 12.6x, with the earlier 3.10x loss identified as this side's
+      own bounded-scan defect. See the claim section in `docs/VISION.md`
 
 ## Next — OTLP only, and the claim moves with it
 
