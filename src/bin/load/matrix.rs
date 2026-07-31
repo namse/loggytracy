@@ -332,6 +332,21 @@ pub struct Query {
     pub start_ns: i64,
     pub end_ns: i64,
     pub path: String,
+    /// The fields the reduced digest compares, which are the fields this query
+    /// itself names. A digest is computed by each system alone, so its basis
+    /// must be something every system returns for the same row — and the only
+    /// fields with that property across schema-on-read and schema-on-write are
+    /// the ones the query constrained: a system that returns the row at all
+    /// returns the value that satisfied the constraint. Everything else
+    /// differs *by design*: VictoriaLogs answers `{app="x"}` with every field
+    /// it parsed at ingest, and the other two answer with what the pipeline
+    /// produced. A basis of "the whole field set" therefore compares the
+    /// storage models, not the answers — that basis reported 0/24 everywhere
+    /// and the zeros were its own.
+    pub basis_fields: Vec<String>,
+    /// The metric bucket width, for converting VictoriaLogs' bucket-start
+    /// labels to LogQL's bucket-end evaluation points in the digest.
+    pub step_ns: i64,
 }
 
 /// `apps x sub-windows` queries per shape, built from the corpus so every one
@@ -458,6 +473,23 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                         format!("/select/logsql/query?{encoded}")
                     }
                 };
+                let basis_fields: Vec<String> = match shape {
+                    Shape::LabelOnly | Shape::LineFilter => vec!["app".to_string()],
+                    Shape::JsonField => {
+                        let field = if variant.is_multiple_of(2) {
+                            "status"
+                        } else {
+                            "level"
+                        };
+                        vec!["app".to_string(), field.to_string()]
+                    }
+                    Shape::JsonFieldRare | Shape::MetadataRare => {
+                        vec!["app".to_string(), "trace_id".to_string()]
+                    }
+                    // `sum()` strips every label, so the series identity is
+                    // empty on both sides and the samples are the basis.
+                    Shape::Rate => Vec::new(),
+                };
                 queries.push(Query {
                     id: format!("{}/{app}/w{window}", shape.name()),
                     shape,
@@ -465,6 +497,8 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                     start_ns,
                     end_ns,
                     path,
+                    basis_fields,
+                    step_ns,
                 });
             }
         }
@@ -576,18 +610,20 @@ pub struct Answer {
     /// it is a statement about how much each engine had to read, which is the
     /// thing they are supposed to differ on.
     pub lines_processed: Option<u64>,
-    /// A digest over the basis all three systems can produce: the timestamp and
-    /// the set of fields the row carried, without the message and without
-    /// placement.
+    /// A digest over the basis all three systems can produce: each row's
+    /// nanosecond timestamp plus the values of the fields *the query named*
+    /// ([`Query::basis_fields`]), without the message, without placement.
     ///
     /// The full [`Answer::digest`] cannot cross the schema boundary.
     /// VictoriaLogs parses JSON at ingest, so for a JSON row it has the
     /// message's *value* and the fields, not the line the other two return —
-    /// there is nothing to compare a line against. Dropping the check for the
-    /// odd system out would leave the comparison unable to say the answers
-    /// agree, which is what it is for, so instead every system computes both:
-    /// the strict one still holds between the two that keep lines, and this one
-    /// says whether all three returned the same rows carrying the same fields.
+    /// there is nothing to compare a line against. And the whole field set
+    /// cannot cross it either: schema-on-write returns every field it parsed
+    /// where schema-on-read returns what the pipeline produced, so a basis of
+    /// "all fields" compares the storage models and always disagrees — it
+    /// reported 0/24 on every shape, and the zeros were the checker's own.
+    /// What the systems *do* all return for the same row is the row's time and
+    /// the fields the query constrained, so that is the basis.
     ///
     /// It is deliberately weaker and the report must say which was compared.
     pub reduced_digest: String,
@@ -702,6 +738,38 @@ fn canonical_labels(digested: &BTreeMap<String, String>) -> String {
         .join(",")
 }
 
+/// The reduced basis's field set: of everything the row carried, only the
+/// fields the query named. See [`Query::basis_fields`] for why the basis is
+/// the query's fields and not the row's.
+fn basis_projection(fields: &BTreeMap<String, String>, basis: &[String]) -> String {
+    let mut parts: Vec<String> = basis
+        .iter()
+        .filter_map(|name| fields.get(name).map(|value| format!("{name}={value}")))
+        .collect();
+    parts.sort();
+    parts.dedup();
+    parts.join(",")
+}
+
+/// A LogsQL `_time` (RFC 3339, fractional seconds truncated) as Unix
+/// nanoseconds — the log-record timestamp encoding the Loki side already uses.
+fn rfc3339_to_ns(text: &str) -> Result<i64, String> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .map_err(|error| format!("a _time value is not RFC 3339: '{text}': {error}"))?
+        .timestamp_nanos_opt()
+        .ok_or_else(|| format!("a _time value does not fit in nanoseconds: '{text}'"))
+}
+
+/// Nanoseconds as the six-decimal seconds string `canonical_sample` produces,
+/// without a float division that would wobble in the last microsecond.
+fn ns_to_sample_seconds(ns: i64) -> String {
+    format!(
+        "{}.{:06}",
+        ns.div_euclid(1_000_000_000),
+        ns.rem_euclid(1_000_000_000) / 1_000
+    )
+}
+
 /// Metric samples are compared at six decimals.
 ///
 /// Both systems compute `rate()` in f64 and print it themselves, so the last
@@ -732,7 +800,11 @@ fn canonical_sample(value: &Value) -> String {
 /// why the labels are digested per row. A metric response's grouping *is* its
 /// identity, so there each series contributes a record of its own and an extra
 /// empty series cannot hide.
-fn stream_records(entries: &[Value], state: &mut DigestState) -> Result<(), String> {
+fn stream_records(
+    entries: &[Value],
+    state: &mut DigestState,
+    basis: &[String],
+) -> Result<(), String> {
     for entry in entries {
         let mut stream_labels = BTreeMap::new();
         collect_labels(
@@ -780,8 +852,8 @@ fn stream_records(entries: &[Value], state: &mut DigestState) -> Result<(), Stri
                 canonical_labels(&attributes)
             ));
             state.reduced.push(format!(
-                "{timestamp}\u{1}{}",
-                canonical_labels(&strip_placement(&attributes))
+                "{parsed}\u{1}{}",
+                basis_projection(&strip_placement(&attributes), basis)
             ));
             state.rows += 1;
         }
@@ -789,17 +861,19 @@ fn stream_records(entries: &[Value], state: &mut DigestState) -> Result<(), Stri
     Ok(())
 }
 
-fn metric_records(entries: &[Value], state: &mut DigestState) -> Result<(), String> {
+fn metric_records(
+    entries: &[Value],
+    state: &mut DigestState,
+    basis: &[String],
+) -> Result<(), String> {
     for entry in entries {
         let mut labels = BTreeMap::new();
         collect_labels(&entry["metric"], "metric", &mut labels, &mut state.dropped)?;
         let identity = canonical_labels(&labels);
+        let reduced_identity = basis_projection(&strip_placement(&labels), basis);
         state.label_keys.extend(labels.keys().cloned());
         state.records.push(format!("series\u{1}{identity}"));
-        state.reduced.push(format!(
-            "series\u{1}{}",
-            canonical_labels(&strip_placement(&labels))
-        ));
+        state.reduced.push(format!("series\u{1}{reduced_identity}"));
         let mut previous: Option<f64> = None;
         for value in values_of(entry)? {
             let pair = value
@@ -833,8 +907,7 @@ fn metric_records(entries: &[Value], state: &mut DigestState) -> Result<(), Stri
                 canonical_sample(&pair[1]),
             ));
             state.reduced.push(format!(
-                "{}\u{1}{}\u{1}{}",
-                canonical_labels(&strip_placement(&labels)),
+                "{reduced_identity}\u{1}{}\u{1}{}",
                 canonical_sample(&pair[0]),
                 canonical_sample(&pair[1]),
             ));
@@ -869,14 +942,18 @@ fn values_of(entry: &Value) -> Result<Vec<Value>, String> {
 /// separate, where the other two return the line they were given. So the strict
 /// digest is set equal to the reduced one and the report must not compare it
 /// against a strict digest from elsewhere.
-pub fn digest_for(target: Target, body: &[u8]) -> Result<Answer, String> {
+pub fn digest_for(target: Target, body: &[u8], query: &Query) -> Result<Answer, String> {
     match target {
-        Target::Loggytracy | Target::Loki => digest_response(body),
-        Target::VictoriaLogs => digest_logsql_response(body),
+        Target::Loggytracy | Target::Loki => digest_response(body, &query.basis_fields),
+        Target::VictoriaLogs => digest_logsql_response(body, &query.basis_fields, query.step_ns),
     }
 }
 
-pub fn digest_logsql_response(body: &[u8]) -> Result<Answer, String> {
+pub fn digest_logsql_response(
+    body: &[u8],
+    basis: &[String],
+    step_ns: i64,
+) -> Result<Answer, String> {
     let text =
         std::str::from_utf8(body).map_err(|error| format!("response is not UTF-8: {error}"))?;
     let mut state = DigestState {
@@ -884,6 +961,7 @@ pub fn digest_logsql_response(body: &[u8]) -> Result<Answer, String> {
         ..DigestState::default()
     };
     let mut label_keys: BTreeSet<String> = BTreeSet::new();
+    let mut series_seen: BTreeSet<String> = BTreeSet::new();
     let mut is_metric = false;
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -895,37 +973,77 @@ pub fn digest_logsql_response(body: &[u8]) -> Result<Answer, String> {
             .as_object()
             .ok_or_else(|| "a response line is not a JSON object".to_string())?;
         let mut fields: BTreeMap<String, String> = BTreeMap::new();
-        let mut timestamp = String::new();
+        let mut time_text = String::new();
+        let mut has_msg = false;
         for (name, value) in object {
             match name.as_str() {
                 // `_stream` and `_stream_id` are VictoriaLogs' own rendering of
                 // the label set it already returns field by field, so digesting
                 // them would count the same information twice.
                 "_stream" | "_stream_id" => {}
-                "_time" => timestamp = value.as_str().unwrap_or_default().to_string(),
+                "_time" => time_text = value.as_str().unwrap_or_default().to_string(),
+                // The line. The reduced basis has no line — that is the schema
+                // boundary the basis exists to cross — so it must not reappear
+                // as a field. Its *presence* still matters below: a log row
+                // carries `_msg` and a `stats` row does not.
+                "_msg" => has_msg = true,
                 _ => {
                     let text = match value {
                         Value::String(text) => text.clone(),
                         other => other.to_string(),
+                    };
+                    let text = if UNMATCHABLE_VALUE_LABELS.contains(&name.as_str()) {
+                        UNMATCHABLE_VALUE.to_string()
+                    } else {
+                        text
                     };
                     label_keys.insert(name.clone());
                     fields.insert(name.clone(), text);
                 }
             }
         }
-        if object.contains_key("_time") && !object.contains_key("_msg") {
+        let time_ns = rfc3339_to_ns(&time_text)?;
+        if has_msg {
+            state.reduced.push(format!(
+                "{time_ns}\u{1}{}",
+                basis_projection(&fields, basis)
+            ));
+        } else {
+            // A `stats by (_time:step)` row. Its `_time` is the bucket's
+            // *start*, aligned to epoch multiples of the width; LogQL labels
+            // the same bucket by its evaluation point — the *end*. One step
+            // converts the one labeling into the other; the value needs no
+            // conversion because an aligned window contains whole buckets and
+            // both languages divide by the full width.
             is_metric = true;
+            let value = object
+                .get("value")
+                .ok_or_else(|| "a stats row has no `value` field".to_string())?;
+            if canonical_sample(value).parse::<f64>().is_err() {
+                return Err(format!("a stats row's value is not a number: {value}"));
+            }
+            fields.remove("value");
+            let identity = basis_projection(&fields, basis);
+            if series_seen.insert(identity.clone()) {
+                state.reduced.push(format!("series\u{1}{identity}"));
+            }
+            state.reduced.push(format!(
+                "{identity}\u{1}{}\u{1}{}",
+                ns_to_sample_seconds(time_ns + step_ns),
+                canonical_sample(value),
+            ));
         }
-        state
-            .reduced
-            .push(format!("{timestamp}\u{1}{}", canonical_labels(&fields)));
         state.rows += 1;
     }
     let reduced = reduced_digest(&mut state);
     Ok(Answer {
         kind: if is_metric { "matrix" } else { "streams" }.to_string(),
         rows: state.rows,
-        series: state.rows,
+        series: if is_metric {
+            series_seen.len() as u64
+        } else {
+            state.rows
+        },
         digest: reduced.clone(),
         label_keys: label_keys.into_iter().collect(),
         dropped_label_keys: Vec::new(),
@@ -955,8 +1073,8 @@ fn reduced_digest(state: &mut DigestState) -> String {
 #[derive(Default)]
 struct DigestState {
     records: Vec<String>,
-    /// The same rows on the basis all three systems share: timestamp and field
-    /// set, without the message and with the placement prefixes stripped.
+    /// The same rows on the basis all three systems share: nanosecond
+    /// timestamp plus the query-named fields, message and placement excluded.
     reduced: Vec<String>,
     label_keys: BTreeSet<String>,
     dropped: BTreeSet<String>,
@@ -964,7 +1082,7 @@ struct DigestState {
     ordered: bool,
 }
 
-pub fn digest_response(body: &[u8]) -> Result<Answer, String> {
+pub fn digest_response(body: &[u8], basis: &[String]) -> Result<Answer, String> {
     let parsed: Value =
         serde_json::from_slice(body).map_err(|error| format!("response is not JSON: {error}"))?;
     let kind = parsed["data"]["resultType"]
@@ -981,9 +1099,9 @@ pub fn digest_response(body: &[u8]) -> Result<Answer, String> {
         ..DigestState::default()
     };
     if kind == "matrix" || kind == "vector" {
-        metric_records(entries, &mut state)?;
+        metric_records(entries, &mut state, basis)?;
     } else {
-        stream_records(entries, &mut state)?;
+        stream_records(entries, &mut state, basis)?;
     }
     state.records.sort();
     // The envelope goes in before the rows and outside the sort: a `streams`
@@ -1068,7 +1186,7 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
     for query in &queries {
         let (elapsed, status, body, error) = issue(&mut client, query, &tenant).await;
         let answer = if status == 200 {
-            match digest_for(cfg.target, &body) {
+            match digest_for(cfg.target, &body, query) {
                 Ok(answer) => Some(answer),
                 Err(reason) => {
                     timings.push(Timing {
@@ -1111,7 +1229,7 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
             // window returns a different answer has a cache or a scan bound
             // that is not deterministic, and the cold/warm split would be
             // measuring that rather than caching.
-            match (digest_for(cfg.target, &body), timing.answer.as_ref()) {
+            match (digest_for(cfg.target, &body, query), timing.answer.as_ref()) {
                 (Ok(repeat), Some(first)) if repeat.digest != first.digest => {
                     timing.warm_digests_agree = false;
                 }
@@ -1226,9 +1344,9 @@ mod tests {
         let changed_line = br#"{"data":{"resultType":"streams","result":[
             {"stream":{"app":"a"},"values":[["1","alpha"],["2","BETA"]]}]}}"#;
 
-        let first = digest_response(first).expect("valid");
-        let regrouped = digest_response(regrouped).expect("valid");
-        let changed_line = digest_response(changed_line).expect("valid");
+        let first = digest_response(first, &[]).expect("valid");
+        let regrouped = digest_response(regrouped, &[]).expect("valid");
+        let changed_line = digest_response(changed_line, &[]).expect("valid");
         assert_eq!(
             first.digest, regrouped.digest,
             "the same rows under the same labels, split into more streams, are the same answer"
@@ -1256,7 +1374,7 @@ mod tests {
         let other_value = br#"{"data":{"resultType":"streams","result":[
             {"stream":{"app":"b"},"values":[["1","alpha"],["2","beta"]]}]}}"#;
 
-        let one_stream = digest_response(one_stream).expect("valid");
+        let one_stream = digest_response(one_stream, &[]).expect("valid");
         for (name, body) in [
             ("a line under the wrong stream", mislabelled.as_slice()),
             ("an extra label on every row", extra_label.as_slice()),
@@ -1264,7 +1382,7 @@ mod tests {
         ] {
             assert_ne!(
                 one_stream.digest,
-                digest_response(body).expect("valid").digest,
+                digest_response(body, &[]).expect("valid").digest,
                 "{name} must not digest equal"
             );
         }
@@ -1288,11 +1406,74 @@ mod tests {
             {"stream":{"app":"a","__error__":"JSONParserErr"},
              "values":[["1","alpha"]]}]}}"#;
 
-        let loki_wording = digest_response(loki_wording).expect("valid");
-        let our_wording = digest_response(our_wording).expect("valid");
-        let missing = digest_response(missing).expect("valid");
+        let loki_wording = digest_response(loki_wording, &[]).expect("valid");
+        let our_wording = digest_response(our_wording, &[]).expect("valid");
+        let missing = digest_response(missing, &[]).expect("valid");
         assert_eq!(loki_wording.digest, our_wording.digest);
         assert_ne!(loki_wording.digest, missing.digest);
+    }
+
+    /// The reduced basis is a *common* basis: the same logical answer in the
+    /// Loki shape and in the LogsQL shape must produce the same digest. The
+    /// previous basis could not — the LogsQL side put `_msg` into the field
+    /// set and encoded timestamps as RFC 3339 — so 0/24 everywhere was the
+    /// checker disagreeing with itself, not the engines disagreeing.
+    #[test]
+    fn the_same_log_rows_in_both_response_shapes_reduce_to_the_same_digest() {
+        let basis = vec!["app".to_string(), "trace_id".to_string()];
+        // 1_700_000_000.123 s = 2023-11-14T22:13:20.123Z.
+        let loki = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a","trace_id":"t1","env":"prod","pod_ip":"10.0.0.1"},
+             "values":[["1700000000123000000","{\"level\":\"info\",\"_msg\":\"boom\"}"]]}]}}"#;
+        // Schema-on-write: the line is gone, its parsed fields and more are
+        // top-level, `_stream`/`_stream_id` render the label set again.
+        let logsql = br#"{"_time":"2023-11-14T22:13:20.123Z","_msg":"boom","app":"a","trace_id":"t1","level":"info","status":200,"_stream":"{app=\"a\"}","_stream_id":"s1"}"#;
+        let wrong_value = br#"{"_time":"2023-11-14T22:13:20.123Z","_msg":"boom","app":"a","trace_id":"t2","level":"info","_stream":"{app=\"a\"}"}"#;
+
+        let loki = digest_response(loki, &basis).expect("valid");
+        let logsql = digest_logsql_response(logsql, &basis, 0).expect("valid");
+        let wrong_value = digest_logsql_response(wrong_value, &basis, 0).expect("valid");
+        assert_eq!(loki.reduced_digest, logsql.reduced_digest);
+        assert_ne!(loki.reduced_digest, wrong_value.reduced_digest);
+        assert_ne!(
+            loki.reduced_digest,
+            digest_logsql_response(b"", &basis, 0)
+                .expect("valid")
+                .reduced_digest,
+            "a missing row must not reduce equal"
+        );
+    }
+
+    /// A metric answer crosses too: LogsQL labels a bucket by its start,
+    /// LogQL by its evaluation point — the end — and the digest converts with
+    /// the query's step. Values meet at six decimals.
+    #[test]
+    fn the_same_metric_answer_in_both_response_shapes_reduces_to_the_same_digest() {
+        let step_ns = 10_000_000_000;
+        // Buckets [22:13:20, 22:13:30) and [22:13:30, 22:13:40): LogQL samples
+        // at 1_700_000_010 and 1_700_000_020, LogsQL rows at the starts.
+        let loki = br#"{"data":{"resultType":"matrix","result":[
+            {"metric":{},"values":[[1700000010,"20.833333333333"],[1700000020,"41.666666666666"]]}]}}"#;
+        let logsql = concat!(
+            r#"{"_time":"2023-11-14T22:13:20Z","value":20.833333333333332}"#,
+            "\n",
+            r#"{"_time":"2023-11-14T22:13:30Z","value":41.666666666666664}"#,
+        )
+        .as_bytes();
+        let wrong_value = concat!(
+            r#"{"_time":"2023-11-14T22:13:20Z","value":20.833333333333332}"#,
+            "\n",
+            r#"{"_time":"2023-11-14T22:13:30Z","value":41.7}"#,
+        )
+        .as_bytes();
+
+        let loki = digest_response(loki, &[]).expect("valid");
+        let logsql = digest_logsql_response(logsql, &[], step_ns).expect("valid");
+        let wrong_value = digest_logsql_response(wrong_value, &[], step_ns).expect("valid");
+        assert_eq!(loki.kind, "matrix");
+        assert_eq!(logsql.kind, "matrix");
+        assert_eq!(loki.reduced_digest, logsql.reduced_digest);
+        assert_ne!(loki.reduced_digest, wrong_value.reduced_digest);
     }
 
     /// Pushed structured metadata used to be exempt from placement here, which
@@ -1312,8 +1493,8 @@ mod tests {
             {"stream":{"app":"a","trace_id":"t2","pod_ip":"10.0.0.1"},
              "values":[["1","alpha"]]}]}}"#;
 
-        let promoted = digest_response(promoted).expect("valid");
-        let in_the_triple = digest_response(in_the_triple).expect("valid");
+        let promoted = digest_response(promoted, &[]).expect("valid");
+        let in_the_triple = digest_response(in_the_triple, &[]).expect("valid");
         assert_ne!(promoted.digest, in_the_triple.digest);
         assert_eq!(
             in_the_triple.label_keys,
@@ -1325,7 +1506,7 @@ mod tests {
         );
         assert_ne!(
             promoted.digest,
-            digest_response(wrong_trace).expect("valid").digest,
+            digest_response(wrong_trace, &[]).expect("valid").digest,
             "the metadata values are still part of the row"
         );
         assert_eq!(
@@ -1354,8 +1535,8 @@ mod tests {
              "values":[["1","{\"level\":\"info\"}",
                         {"level":"info","status":"200","trace_id":"t1"}]]}]}}"#;
 
-        let promoted = digest_response(promoted).expect("valid");
-        let in_the_triple = digest_response(in_the_triple).expect("valid");
+        let promoted = digest_response(promoted, &[]).expect("valid");
+        let in_the_triple = digest_response(in_the_triple, &[]).expect("valid");
         assert_ne!(promoted.digest, in_the_triple.digest);
         assert_eq!(
             promoted.label_keys,
@@ -1387,12 +1568,12 @@ mod tests {
         let different = br#"{"data":{"resultType":"matrix","result":[
             {"metric":{"app":"a"},"values":[[1772000000,"0.07"]]}]}}"#;
         assert_eq!(
-            digest_response(loki).expect("valid").digest,
-            digest_response(other).expect("valid").digest
+            digest_response(loki, &[]).expect("valid").digest,
+            digest_response(other, &[]).expect("valid").digest
         );
         assert_ne!(
-            digest_response(loki).expect("valid").digest,
-            digest_response(different).expect("valid").digest
+            digest_response(loki, &[]).expect("valid").digest,
+            digest_response(different, &[]).expect("valid").digest
         );
     }
 
@@ -1408,12 +1589,12 @@ mod tests {
         let regrouped = br#"{"data":{"resultType":"matrix","result":[
             {"metric":{"app":"a"},"values":[[1772000000,"1"]]}]}}"#;
         assert_ne!(
-            digest_response(one).expect("valid").digest,
-            digest_response(plus_empty).expect("valid").digest
+            digest_response(one, &[]).expect("valid").digest,
+            digest_response(plus_empty, &[]).expect("valid").digest
         );
         assert_ne!(
-            digest_response(one).expect("valid").digest,
-            digest_response(regrouped).expect("valid").digest,
+            digest_response(one, &[]).expect("valid").digest,
+            digest_response(regrouped, &[]).expect("valid").digest,
             "a sample under a different series identity is a different answer"
         );
     }
@@ -1423,8 +1604,8 @@ mod tests {
         let streams = br#"{"status":"success","data":{"resultType":"streams","result":[]}}"#;
         let matrix = br#"{"status":"success","data":{"resultType":"matrix","result":[]}}"#;
         assert_ne!(
-            digest_response(streams).expect("valid").digest,
-            digest_response(matrix).expect("valid").digest
+            digest_response(streams, &[]).expect("valid").digest,
+            digest_response(matrix, &[]).expect("valid").digest
         );
     }
 
@@ -1434,8 +1615,8 @@ mod tests {
             {"stream":{"app":"a"},"values":[["2","beta"],["1","alpha"]]}]}}"#;
         let forward = br#"{"data":{"resultType":"streams","result":[
             {"stream":{"app":"a"},"values":[["1","alpha"],["2","beta"]]}]}}"#;
-        let backward = digest_response(backward).expect("valid");
-        let forward = digest_response(forward).expect("valid");
+        let backward = digest_response(backward, &[]).expect("valid");
+        let forward = digest_response(forward, &[]).expect("valid");
         assert!(backward.ordered);
         assert!(
             !forward.ordered,
@@ -1450,8 +1631,8 @@ different one"
 
     #[test]
     fn a_body_that_is_not_a_loki_result_is_an_error_not_an_empty_answer() {
-        assert!(digest_response(b"not json").is_err());
-        assert!(digest_response(br#"{"status":"error"}"#).is_err());
+        assert!(digest_response(b"not json", &[]).is_err());
+        assert!(digest_response(br#"{"status":"error"}"#, &[]).is_err());
     }
 
     /// A malformed response used to digest as an empty agreement: the old
@@ -1475,7 +1656,7 @@ different one"
                 .as_slice(),
         ] {
             assert!(
-                digest_response(body).is_err(),
+                digest_response(body, &[]).is_err(),
                 "{} digested instead of erroring",
                 String::from_utf8_lossy(body)
             );
