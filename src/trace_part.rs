@@ -21,9 +21,6 @@ use crate::trace::TraceSpan;
 pub const TRACE_DATA_FILE: &str = "data.parquet";
 pub const TRACE_BLOOM_FILE: &str = "trace.bloom";
 pub const TRACE_META_FILE: &str = "meta.json";
-/// On-disk layout of a trace part's `meta.json`, checked for the same reason
-/// as [`crate::part::PART_META_VERSION`].
-pub const TRACE_META_VERSION: u32 = 1;
 
 const TRACE_BLOOM_MAGIC: &[u8; 4] = b"TBF1";
 
@@ -188,7 +185,6 @@ struct TracePartIntegrity {
 #[derive(Clone, Serialize, Deserialize)]
 struct TraceMetaFile {
     #[serde(default)]
-    version: u32,
     id: String,
     partition: String,
     min_ts_ns: i64,
@@ -292,7 +288,6 @@ fn write_trace_part_files(
     let min_ts = spans.iter().map(|span| span.start_time_ns).min().unwrap();
     let max_ts = spans.iter().map(|span| span.end_time_ns).max().unwrap();
     let meta_without_crc = TraceMetaFile {
-        version: TRACE_META_VERSION,
         id: id.to_string(),
         partition: partition.to_string(),
         min_ts_ns: min_ts,
@@ -510,13 +505,6 @@ pub fn load_trace_part(dir: &Path) -> Result<TracePart, String> {
     }
     let bytes = fs::read(dir.join(TRACE_META_FILE)).map_err(|error| error.to_string())?;
     let meta: TraceMetaFile = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if meta.version != TRACE_META_VERSION {
-        return Err(format!(
-            "unsupported trace part metadata version {} in {}: this build reads version {TRACE_META_VERSION}",
-            meta.version,
-            dir.display()
-        ));
-    }
     if metadata_crc32(&meta)? != meta.integrity.metadata_crc32 {
         return Err(format!(
             "trace metadata checksum mismatch in {}",

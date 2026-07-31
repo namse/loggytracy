@@ -41,26 +41,7 @@ pub const INDEX_FILE: &str = "index.bin";
 pub const INDEX_MAGIC: &[u8; 5] = b"LTIX1";
 pub const META_FILE: &str = "meta.json";
 pub const MERGE_TOMBSTONE_FILE: &str = ".merge.tombstone";
-/// On-disk layout of `meta.json`.
-///
-/// Read and rejected before the checksum is verified, because the checksum is
-/// computed over the struct and therefore only means anything once both sides
-/// agree on what the struct is. Without this a format change surfaces as a
-/// checksum mismatch, which reads as corruption rather than as a version the
-/// build cannot handle.
-pub const PART_META_VERSION: u32 = 3;
-
-const BLOOM_MAGIC_V1: &[u8; 4] = b"BTF1";
-const BLOOM_MAGIC_V2: &[u8; 4] = b"BTF2";
-const BLOOM_MAGIC_V3: &[u8; 4] = b"BTF3";
-/// As V3, except a row group that indexed no exact-field token stores a
-/// zero-length filter instead of an empty one.
-///
-/// V3 spent a filter per row group whether or not there was anything to put in
-/// it, and `optimal_bits` has a 1024-bit floor, so a row group with no
-/// structured metadata and no parser fields still cost 140 bytes on disk and
-/// the same resident. Tenant-aligned row groups make that per tenant per part.
-const BLOOM_MAGIC_V4: &[u8; 4] = b"BTF4";
+const BLOOM_MAGIC: &[u8; 4] = b"BTF4";
 const STREAM_MAGIC: &[u8; 4] = b"SIX1";
 
 const EXACT_FIELD_TOKEN_MAGIC: &[u8; 4] = b"FEQ1";

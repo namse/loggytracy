@@ -202,7 +202,7 @@ impl StreamingPartWriter {
         sync_file(&self.data_path)?;
 
         let mut blooms = Vec::new();
-        blooms.extend_from_slice(BLOOM_MAGIC_V4);
+        blooms.extend_from_slice(BLOOM_MAGIC);
         blooms.extend_from_slice(&(self.bloom_sections.len() as u32).to_le_bytes());
         for section in &self.bloom_sections {
             blooms.extend_from_slice(section);
@@ -226,7 +226,6 @@ impl StreamingPartWriter {
             metadata_crc32: 0,
         };
         let mut meta = MetaFile {
-            version: PART_META_VERSION,
             id: id.to_string(),
             partition: partition.to_string(),
             min_ts_ns: if self.row_count == 0 {

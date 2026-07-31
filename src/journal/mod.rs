@@ -22,18 +22,11 @@ const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
 const WAL_FILE: &str = "journal.wal";
 const CKPT_FILE: &str = "journal.ckpt";
 const COMPACTION_STATE_FILE: &str = "journal.wal.compact.state";
-const COMPACTION_STATE_VERSION: u8 = 1;
-/// Pre-tenancy trace record: an OTLP export with no tenant. Replay attributes
-/// it to the configured default tenant so an existing WAL still recovers.
-const TRACE_RECORD_MAGIC: &[u8; 4] = b"LGY2";
-const TRACE_RECORD_VERSION: u8 = 1;
-/// Tenant-carrying record:
-/// `LGY3 | version | kind | tenant_len:u8 | tenant | payload`.
+/// `LGY3 | kind | tenant_len:u8 | tenant | payload`.
 const TENANT_RECORD_MAGIC: &[u8; 4] = b"LGY3";
-const TENANT_RECORD_VERSION: u8 = 1;
 const TENANT_RECORD_KIND_LOGS: u8 = 0;
 const TENANT_RECORD_KIND_TRACES: u8 = 1;
-const TENANT_RECORD_PREFIX_SIZE: usize = TENANT_RECORD_MAGIC.len() + 3;
+const TENANT_RECORD_PREFIX_SIZE: usize = TENANT_RECORD_MAGIC.len() + 2;
 
 /// Where a compaction crash is simulated.
 ///
@@ -92,7 +85,6 @@ fn frame_tenant_record(tenant: &TenantId, kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut framed =
         Vec::with_capacity(TENANT_RECORD_PREFIX_SIZE + tenant_bytes.len() + payload.len());
     framed.extend_from_slice(TENANT_RECORD_MAGIC);
-    framed.push(TENANT_RECORD_VERSION);
     framed.push(kind);
     framed.push(tenant_bytes.len() as u8);
     framed.extend_from_slice(tenant_bytes);
@@ -107,14 +99,8 @@ fn decode_tenant_record(data: &[u8]) -> Result<Option<TenantRecord<'_>>, String>
     if data.len() < TENANT_RECORD_PREFIX_SIZE {
         return Err("tenant journal record is truncated".to_string());
     }
-    let version = data[TENANT_RECORD_MAGIC.len()];
-    if version != TENANT_RECORD_VERSION {
-        return Err(format!(
-            "unsupported tenant journal record version {version}"
-        ));
-    }
-    let kind = data[TENANT_RECORD_MAGIC.len() + 1];
-    let tenant_len = data[TENANT_RECORD_MAGIC.len() + 2] as usize;
+    let kind = data[TENANT_RECORD_MAGIC.len()];
+    let tenant_len = data[TENANT_RECORD_MAGIC.len() + 1] as usize;
     let tenant_end = TENANT_RECORD_PREFIX_SIZE + tenant_len;
     if data.len() < tenant_end {
         return Err("tenant journal record is truncated".to_string());

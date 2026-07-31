@@ -61,7 +61,6 @@ fn write_meta(
         metadata_crc32: 0,
     };
     let mut meta = MetaFile {
-        version: PART_META_VERSION,
         id: id.to_string(),
         partition: partition.to_string(),
         min_ts_ns: min_ts,
@@ -130,7 +129,6 @@ struct MetaFile {
     /// a value this build never writes, so those parts are reported as an
     /// unsupported version rather than as corruption.
     #[serde(default)]
-    version: u32,
     id: String,
     partition: String,
     min_ts_ns: i64,
@@ -176,13 +174,6 @@ pub fn load_part(dir: &Path) -> Result<Part, String> {
     let _arena = crate::memprof::enter(crate::memprof::Arena::PartMeta);
     let meta_str = fs::read_to_string(dir.join(META_FILE)).map_err(|e| e.to_string())?;
     let meta_file: MetaFile = serde_json::from_str(&meta_str).map_err(|e| e.to_string())?;
-    if meta_file.version != PART_META_VERSION {
-        return Err(format!(
-            "unsupported part metadata version {} in {}: this build reads version {PART_META_VERSION}",
-            meta_file.version,
-            dir.display()
-        ));
-    }
     let actual_metadata_crc = metadata_crc32(&meta_file)?;
     if actual_metadata_crc != meta_file.integrity.metadata_crc32 {
         return Err(format!(

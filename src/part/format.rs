@@ -419,7 +419,7 @@ fn write_parquet(
 fn encode_blooms(rows: &[Row], row_group_size: usize) -> io::Result<Vec<u8>> {
     let bounds = row_group_bounds(rows, row_group_size);
     let mut buf = Vec::new();
-    buf.extend_from_slice(BLOOM_MAGIC_V4);
+    buf.extend_from_slice(BLOOM_MAGIC);
     buf.extend_from_slice(&(bounds.len() as u32).to_le_bytes());
     for (start, end) in &bounds {
         buf.extend_from_slice(&encode_group_blooms(&rows[*start..*end])?);

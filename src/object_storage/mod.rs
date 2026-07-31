@@ -27,7 +27,6 @@ const CATALOG_FILES: [&str; 2] = [INDEX_FILE, META_FILE];
 /// unbounded fan-out opens a connection per part and turns a restore into a
 /// self-inflicted outage of the store it is reading.
 const RESTORE_CONCURRENCY: usize = 16;
-const MANIFEST_FORMAT_VERSION: u32 = 1;
 const TRACE_MANIFEST_FILE: &str = "trace-manifest.json";
 /// Per-tenant retention policies, one object per tenant. Deliberately outside
 /// the `parts`/`trace_parts` prefixes that `garbage_collect_orphans` sweeps.
@@ -99,9 +98,8 @@ impl From<&Part> for ManifestPart {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Manifest {
-    pub format_version: u32,
     pub generation: u64,
     /// Which writer owns this prefix. Carried in the manifest rather than in
     /// an object of its own so that checking it costs nothing: every write
@@ -120,9 +118,8 @@ pub struct TraceManifestPart {
     pub partition: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TraceManifest {
-    pub format_version: u32,
     pub generation: u64,
     #[serde(default)]
     pub writer_epoch: u64,
@@ -137,28 +134,6 @@ pub(crate) struct FlushTransaction {
     pub offset: u64,
     pub log_parts: Vec<ManifestPart>,
     pub trace_parts: Vec<TraceManifestPart>,
-}
-
-impl Default for TraceManifest {
-    fn default() -> Self {
-        Self {
-            format_version: MANIFEST_FORMAT_VERSION,
-            generation: 0,
-            writer_epoch: 0,
-            parts: Vec::new(),
-        }
-    }
-}
-
-impl Default for Manifest {
-    fn default() -> Self {
-        Self {
-            format_version: MANIFEST_FORMAT_VERSION,
-            generation: 0,
-            writer_epoch: 0,
-            parts: Vec::new(),
-        }
-    }
 }
 
 struct LoadedManifest {

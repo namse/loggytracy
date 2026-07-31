@@ -637,7 +637,13 @@ Read path:
       **M6's "fully drain the old instance before starting the new one" procedure is now enforced.**
 - [x] **Tenant allowlist**: `LOGGYTRACY_ALLOWED_TENANTS`. Tenants outside the list receive 403.
       Startup fails if the default tenant is not in the list.
-- [x] **On-disk format version**: Check `version` in part/trace-part `meta.json` before checksum validation.
+- [x] ~~**On-disk format version**: Check `version` in part/trace-part `meta.json` before checksum validation.~~
+      **Removed.** loggytracy does not version its formats: it is not deployed anywhere, so there is no old
+      data to read and every compatibility path was code that could never run. Gone with it: the manifest's
+      `format_version`, the WAL's per-record version bytes, the pre-tenancy `LGY2` trace record that only
+      replay could produce, the compaction state's version byte and its phase-2 acceptance, and the `BTF1`,
+      `BTF2` and `BTF3` bloom readers. `PartReader` is simpler for it — three format flags that were constant
+      became nothing, and `exact_field_bloom` stopped being an `Option`
 - [x] **Metadata endpoint guards**: Add semaphore, timeout, `start`/`end`, and `match[]` count limits to
       `labels`/`label_values`/`series`/`index_stats`.
 - [x] **Remove O(parts) from `/metrics`**: Workers publish merge-debt and unknown-tenant gauges.

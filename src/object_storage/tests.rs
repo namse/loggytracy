@@ -205,34 +205,6 @@
         );
     }
 
-    /// A manifest this build cannot interpret must stop the boot rather than
-    /// be treated as absent — the fallback for absent is "empty", which would
-    /// drop every part the newer writer registered.
-    #[tokio::test]
-    async fn an_unknown_manifest_format_version_is_refused() {
-        let storage = ObjectStorage::in_memory();
-        let future = serde_json::json!({
-            "format_version": MANIFEST_FORMAT_VERSION + 1,
-            "generation": 7,
-            "writer_epoch": 1,
-            "parts": [],
-        });
-        storage
-            .store
-            .put(
-                &storage.manifest_path(),
-                Bytes::from(serde_json::to_vec(&future).unwrap()).into(),
-            )
-            .await
-            .unwrap();
-
-        let error = storage
-            .load_manifest()
-            .await
-            .expect_err("a newer format must not be guessed at");
-        assert!(error.contains("format version"), "{error}");
-    }
-
     #[test]
     fn object_store_environment_keys_are_normalized_and_explicit_values_win() {
         let options: BTreeMap<_, _> = normalized_object_store_options([
@@ -1332,7 +1304,6 @@
     fn manifest_rejects_relative_path_components() {
         for value in [".", "..", "a/b", ""] {
             let manifest = Manifest {
-                format_version: MANIFEST_FORMAT_VERSION,
                 generation: 1,
                 writer_epoch: 1,
                 parts: vec![ManifestPart {

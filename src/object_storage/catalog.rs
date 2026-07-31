@@ -297,12 +297,6 @@ production or on shared/network storage."
                     .map_err(|error| format!("failed to read manifest body: {error}"))?;
                 let manifest: Manifest = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("invalid object-store manifest: {error}"))?;
-                if manifest.format_version != MANIFEST_FORMAT_VERSION {
-                    return Err(format!(
-                        "unsupported manifest format version {}",
-                        manifest.format_version
-                    ));
-                }
                 validate_manifest(&manifest)?;
                 Ok(LoadedManifest { manifest, version })
             }
@@ -582,12 +576,6 @@ single-process development store use a file:// URL, which opts out of CAS delibe
                     .map_err(|error| format!("failed to read trace manifest body: {error}"))?;
                 let manifest: TraceManifest = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("invalid trace object-store manifest: {error}"))?;
-                if manifest.format_version != MANIFEST_FORMAT_VERSION {
-                    return Err(format!(
-                        "unsupported trace manifest format version {}",
-                        manifest.format_version
-                    ));
-                }
                 validate_trace_manifest(&manifest)?;
                 Ok((manifest, version))
             }

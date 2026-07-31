@@ -66,8 +66,7 @@ pub struct PartReader {
     /// and nothing may be pruned. `Some` with a `None` entry means the row
     /// group is known to have indexed no exact-field token at all, which is a
     /// stronger statement: no exact-field predicate can match it.
-    exact_field_bloom: Option<Vec<Option<BloomFilter>>>,
-    exact_field_bloom_canonical: bool,
+    exact_field_bloom: Vec<Option<BloomFilter>>,
     stream_index: StreamMap,
     stream_labels: Vec<String>,
     /// Bytes the blooms and the stream index occupy for as long as this reader
@@ -82,8 +81,7 @@ pub struct PartReader {
 
 struct DecodedBlooms {
     line: Vec<BloomFilter>,
-    exact_fields: Option<Vec<Option<BloomFilter>>>,
-    exact_fields_canonical: bool,
+    exact_fields: Vec<Option<BloomFilter>>,
 }
 
 /// The distinct label sets one scan has already decoded, so a part holding a
@@ -297,7 +295,6 @@ impl PartReader {
             part,
             bloom: decoded_blooms.line,
             exact_field_bloom: decoded_blooms.exact_fields,
-            exact_field_bloom_canonical: decoded_blooms.exact_fields_canonical,
             stream_index,
             stream_labels,
             index_resident_bytes,
@@ -997,13 +994,8 @@ impl PartReader {
     }
 
     fn exact_field_bloom_prune(&self, rg: usize, exact_fields: &[ExactFieldPredicate]) -> bool {
-        let Some(blooms) = &self.exact_field_bloom else {
-            return true;
-        };
+        let blooms = &self.exact_field_bloom;
         exact_fields.iter().all(|predicate| {
-            if predicate.canonical && !self.exact_field_bloom_canonical {
-                return true;
-            }
             // A stream label is not in the exact-field bloom, but it is in the
             // stream index — so the predicate is answerable, just from the
             // other side. This used to scan unconditionally, which made
@@ -1090,10 +1082,8 @@ fn resident_bytes(blooms: &DecodedBlooms, stream_index: &StreamMap) -> u64 {
     for bloom in &blooms.line {
         total = total.saturating_add(bloom.resident_bytes() as u64);
     }
-    if let Some(exact) = &blooms.exact_fields {
-        for bloom in exact.iter().flatten() {
-            total = total.saturating_add(bloom.resident_bytes() as u64);
-        }
+    for bloom in blooms.exact_fields.iter().flatten() {
+        total = total.saturating_add(bloom.resident_bytes() as u64);
     }
     for (name, values) in stream_index {
         total = total.saturating_add(name.len() as u64);
@@ -1109,21 +1099,9 @@ fn decode_blooms(buf: &[u8], expected_count: usize) -> Result<DecodedBlooms, Str
     if buf.len() < 8 {
         return Err("bloom file too short".to_string());
     }
-    // `omittable_exact_fields` is per-version rather than universal: only V4
-    // writers emit a zero-length filter, so accepting one from V2 or V3 would
-    // turn a truncated file into a silent licence to prune.
-    let (has_exact_fields, exact_fields_canonical, omittable_exact_fields) =
-        if &buf[0..4] == BLOOM_MAGIC_V1 {
-            (false, false, false)
-        } else if &buf[0..4] == BLOOM_MAGIC_V2 {
-            (true, false, false)
-        } else if &buf[0..4] == BLOOM_MAGIC_V3 {
-            (true, true, false)
-        } else if &buf[0..4] == BLOOM_MAGIC_V4 {
-            (true, true, true)
-        } else {
-            return Err("bloom magic mismatch".to_string());
-        };
+    if &buf[0..4] != BLOOM_MAGIC {
+        return Err("bloom magic mismatch".to_string());
+    }
     let count = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
     if count != expected_count {
         return Err(format!(
@@ -1132,16 +1110,10 @@ fn decode_blooms(buf: &[u8], expected_count: usize) -> Result<DecodedBlooms, Str
     }
     let mut pos = 8;
     let mut line = Vec::with_capacity(count);
-    let mut exact_fields = has_exact_fields.then(|| Vec::with_capacity(count));
+    let mut exact_fields = Vec::with_capacity(count);
     for _ in 0..count {
         line.push(decode_length_prefixed_bloom(buf, &mut pos)?);
-        if let Some(exact_fields) = &mut exact_fields {
-            exact_fields.push(decode_optional_length_prefixed_bloom(
-                buf,
-                &mut pos,
-                omittable_exact_fields,
-            )?);
-        }
+        exact_fields.push(decode_optional_length_prefixed_bloom(buf, &mut pos)?);
     }
     if pos != buf.len() {
         return Err("bloom file has trailing bytes".to_string());
@@ -1149,7 +1121,6 @@ fn decode_blooms(buf: &[u8], expected_count: usize) -> Result<DecodedBlooms, Str
     Ok(DecodedBlooms {
         line,
         exact_fields,
-        exact_fields_canonical,
     })
 }
 
@@ -1161,9 +1132,8 @@ fn decode_blooms(buf: &[u8], expected_count: usize) -> Result<DecodedBlooms, Str
 fn decode_optional_length_prefixed_bloom(
     buf: &[u8],
     pos: &mut usize,
-    omittable: bool,
 ) -> Result<Option<BloomFilter>, String> {
-    if omittable && buf.get(*pos..*pos + 4) == Some(&[0, 0, 0, 0]) {
+    if buf.get(*pos..*pos + 4) == Some(&[0, 0, 0, 0]) {
         *pos += 4;
         return Ok(None);
     }

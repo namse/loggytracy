@@ -232,7 +232,6 @@
         let state_path = h.journal.wal_path().with_file_name(COMPACTION_STATE_FILE);
         let tmp_path = h.journal.wal_path().with_extension("wal.compact.tmp");
         let state = CompactionState {
-            phase: 1,
             offset: checkpoint.offset,
             source_len,
             retained_len: 0,
@@ -300,56 +299,6 @@
         }
         let state_path = h.journal.wal_path().with_file_name(COMPACTION_STATE_FILE);
         assert!(!state_path.exists(), "the intent record outlived compaction");
-    }
-
-    fn write_legacy_phase_two_state(state_path: &std::path::Path, offset: u64) {
-        let mut bytes = vec![COMPACTION_STATE_VERSION, 2];
-        bytes.extend_from_slice(&offset.to_le_bytes());
-        bytes.extend_from_slice(&offset.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        std::fs::write(state_path, bytes).unwrap();
-    }
-
-    /// An instance upgraded while already wedged must recover on its own: the
-    /// documented workaround was for an operator to delete this file by hand.
-    #[tokio::test]
-    async fn a_leftover_phase_two_record_no_longer_wedges_compaction() {
-        let h = harness("legacy_phase_two_compact").await;
-        let state_path = h.journal.wal_path().with_file_name(COMPACTION_STATE_FILE);
-        write_legacy_phase_two_state(&state_path, u64::MAX);
-
-        let offset = flush_round(&h, "wedged", "recovered").await;
-        h.journal.compact_checkpoint(offset).await.unwrap();
-
-        assert_eq!(std::fs::metadata(h.journal.wal_path()).unwrap().len(), 0);
-        assert!(!state_path.exists());
-    }
-
-    #[tokio::test]
-    async fn replay_retires_a_leftover_phase_two_record() {
-        let h = harness("legacy_phase_two_replay").await;
-        let state_path = h.journal.wal_path().with_file_name(COMPACTION_STATE_FILE);
-        push(&h, make_push_req(&[("{app=\"a\"}", vec![("kept", 100)])])).await;
-        write_legacy_phase_two_state(&state_path, u64::MAX);
-
-        let restored = MemTable::new();
-        replay(
-            h.journal.wal_path(),
-            h.journal.ckpt_path(),
-            &restored,
-            &test_tenant(),
-        )
-        .unwrap();
-
-        // The record goes, and the unflushed record it was sitting next to
-        // still replays: retiring stale bookkeeping is not a data decision.
-        assert!(!state_path.exists());
-        let lines: Vec<_> = restored
-            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
-            .into_iter()
-            .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
-            .collect();
-        assert_eq!(lines, vec!["kept"]);
     }
 
     /// The removal is the last durable step. A crash there leaves a phase-1

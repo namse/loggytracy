@@ -1,76 +1,6 @@
     use super::*;
     use crate::tenant::test_tenant;
 
-    fn encode_btf1(line_blooms: &[BloomFilter]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(BLOOM_MAGIC_V1);
-        bytes.extend_from_slice(&(line_blooms.len() as u32).to_le_bytes());
-        for bloom in line_blooms {
-            let encoded = bloom.encode();
-            bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(&encoded);
-        }
-        bytes
-    }
-
-    fn encode_btf2(line_blooms: &[BloomFilter], exact_blooms: &[Option<BloomFilter>]) -> Vec<u8> {
-        assert_eq!(line_blooms.len(), exact_blooms.len());
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(BLOOM_MAGIC_V2);
-        bytes.extend_from_slice(&(line_blooms.len() as u32).to_le_bytes());
-        for (line, exact) in line_blooms.iter().zip(exact_blooms) {
-            // V2 had no way to say "nothing indexed here", so it spent an empty
-            // filter. Reproducing that is what makes this a real downgrade.
-            let empty = BloomFilter::with_capacity(1, 0.01);
-            for bloom in [line, exact.as_ref().unwrap_or(&empty)] {
-                let encoded = bloom.encode();
-                bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-                bytes.extend_from_slice(&encoded);
-            }
-        }
-        bytes
-    }
-
-    /// Replaces the bloom section of a part's index container, leaving the
-    /// stream index alone, and repairs both checksums. Downgrade tests need to
-    /// put an older bloom encoding on disk without disturbing anything else.
-    fn replace_bloom_section(part: &Part, replacement: &[u8]) {
-        let bytes = fs::read(part.index_path()).unwrap();
-        let (_, streams) = split_index(&bytes).unwrap();
-        let mut rebuilt = Vec::new();
-        rebuilt.extend_from_slice(INDEX_MAGIC);
-        for section in [replacement, streams] {
-            rebuilt.extend_from_slice(&(section.len() as u32).to_le_bytes());
-            rebuilt.extend_from_slice(section);
-        }
-        fs::write(part.index_path(), &rebuilt).unwrap();
-
-        let meta_path = part.meta_path();
-        let mut meta: MetaFile =
-            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-        meta.integrity.index_crc32 = crc32fast::hash(&rebuilt);
-        meta.integrity.metadata_crc32 = 0;
-        meta.integrity.metadata_crc32 = metadata_crc32(&meta).unwrap();
-        fs::write(meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
-    }
-
-    fn part_blooms(part: &Part) -> DecodedBlooms {
-        let bytes = fs::read(part.index_path()).unwrap();
-        let (bloom, _) = split_index(&bytes).unwrap();
-        decode_blooms(bloom, part.meta.row_group_count as usize).unwrap()
-    }
-
-    fn rewrite_part_bloom_as_v1(part: &Part) {
-        let decoded = part_blooms(part);
-        replace_bloom_section(part, &encode_btf1(&decoded.line));
-    }
-
-    fn rewrite_part_bloom_as_v2(part: &Part) {
-        let decoded = part_blooms(part);
-        let legacy = encode_btf2(&decoded.line, decoded.exact_fields.as_ref().unwrap());
-        replace_bloom_section(part, &legacy);
-    }
-
     fn make_rows() -> Vec<Row> {
         let mut labels1: Labels = BTreeMap::new();
         labels1.insert("app".to_string(), "test".to_string());
@@ -359,7 +289,7 @@
     }
 
     #[test]
-    fn btf2_exact_field_bloom_prunes_structured_metadata_by_row_group() {
+    fn exact_field_bloom_prunes_structured_metadata_by_row_group() {
         let tmp = tempfile_dir();
         let mut rows = make_rows();
         rows[0].structured_metadata = vec![("trace_id".to_string(), "first".to_string())];
@@ -367,7 +297,7 @@
         let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
         let index_bytes = fs::read(part.index_path()).unwrap();
         assert_eq!(&index_bytes[..INDEX_MAGIC.len()], INDEX_MAGIC);
-        assert_eq!(&split_index(&index_bytes).unwrap().0[..4], BLOOM_MAGIC_V4);
+        assert_eq!(&split_index(&index_bytes).unwrap().0[..4], BLOOM_MAGIC);
         let reader = PartReader::open(part).unwrap();
 
         let selected = reader.select_row_groups_with_exact_fields(&test_tenant(),
@@ -483,7 +413,7 @@
     }
 
     #[test]
-    fn btf2_exact_field_bloom_indexes_parser_scalars_without_raw_substring_assumptions() {
+    fn exact_field_bloom_indexes_parser_scalars_without_raw_substring_assumptions() {
         let tmp = tempfile_dir();
         let mut rows = make_rows();
         rows[0].line = r#"{"user":"\u0061lice","namespace:key":"value"}"#.to_string();
@@ -540,7 +470,7 @@
     }
 
     #[test]
-    fn btf2_exact_field_bloom_indexes_canonical_numeric_and_duration_values() {
+    fn exact_field_bloom_indexes_canonical_numeric_and_duration_values() {
         let tmp = tempfile_dir();
         let rows = vec![
             Row {
@@ -588,70 +518,29 @@
     }
 
     #[test]
-    fn btf2_indexes_scan_typed_equality_conservatively() {
-        let tmp = tempfile_dir();
-        let rows = vec![
-            Row {
-                tenant: test_tenant(),
-                timestamp_ns: 1,
-                labels: std::sync::Arc::new(BTreeMap::new()),
-                line: r#"{"value":500.0}"#.to_string(),
-                structured_metadata: vec![],
-            },
-            Row {
-                tenant: test_tenant(),
-                timestamp_ns: 2,
-                labels: std::sync::Arc::new(BTreeMap::new()),
-                line: r#"{"value":999}"#.to_string(),
-                structured_metadata: vec![],
-            },
-        ];
-        let part = flush_rows(rows, &tmp, 1).unwrap().remove(0);
-        rewrite_part_bloom_as_v2(&part);
-        let reader = PartReader::open(load_part(&part.dir).unwrap()).unwrap();
-        let query = crate::logql::parse("{} | json | value=500").unwrap();
-        let selected = reader.select_row_groups_with_exact_fields(&test_tenant(),
+    fn the_bloom_container_rejects_invalid_framing() {
+        // One row group: a line bloom, then a zero-length exact-field slot.
+        let mut valid = Vec::new();
+        valid.extend_from_slice(BLOOM_MAGIC);
+        valid.extend_from_slice(&1u32.to_le_bytes());
+        let encoded = BloomFilter::with_capacity(1, 0.01).encode();
+        valid.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        valid.extend_from_slice(&encoded);
+        valid.extend_from_slice(&0u32.to_le_bytes());
 
-            &[],
-            &[],
-            &query.exact_field_predicates(),
-            QueryTimeRange::closed(i64::MIN, i64::MAX),
-        );
-        assert_eq!(selected, vec![0, 1]);
-    }
-
-    #[test]
-    fn btf1_part_loads_and_exact_fields_fall_back_to_scanning() {
-        let tmp = tempfile_dir();
-        let part = flush_rows(make_rows(), &tmp, 1).unwrap().remove(0);
-        rewrite_part_bloom_as_v1(&part);
-
-        let legacy_part = load_part(&part.dir).unwrap();
-        let reader = PartReader::open(legacy_part).unwrap();
-        assert!(reader.exact_field_bloom.is_none());
-        assert!(reader.may_match_exact_fields(&test_tenant(),
-
-            &[],
-            &[],
-            &[ExactFieldPredicate::new("trace_id", "not-present")], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
-        ));
-    }
-
-    #[test]
-    fn bloom_container_versions_reject_invalid_framing() {
-        let bloom = BloomFilter::with_capacity(1, 0.01);
-        let legacy = encode_btf1(&[bloom]);
-        let decoded = decode_blooms(&legacy, 1).unwrap();
+        let decoded = decode_blooms(&valid, 1).unwrap();
         assert_eq!(decoded.line.len(), 1);
-        assert!(decoded.exact_fields.is_none());
+        assert_eq!(decoded.exact_fields.len(), 1);
+        assert!(decoded.exact_fields[0].is_none());
+
         assert!(
-            decode_blooms(&legacy, 2)
+            decode_blooms(&valid, 2)
                 .err()
                 .unwrap()
                 .contains("row group count mismatch")
         );
 
-        let mut trailing = legacy.clone();
+        let mut trailing = valid.clone();
         trailing.push(0);
         assert!(
             decode_blooms(&trailing, 1)
@@ -660,8 +549,8 @@
                 .contains("trailing bytes")
         );
 
-        let mut unknown = legacy.clone();
-        unknown[..4].copy_from_slice(b"BTF9");
+        let mut unknown = valid.clone();
+        unknown[..4].copy_from_slice(b"XXXX");
         assert!(
             decode_blooms(&unknown, 1)
                 .err()
@@ -669,16 +558,8 @@
                 .contains("magic mismatch")
         );
 
-        let mut truncated_v2 = Vec::new();
-        truncated_v2.extend_from_slice(BLOOM_MAGIC_V2);
-        truncated_v2.extend_from_slice(&1u32.to_le_bytes());
-        truncated_v2.extend_from_slice(&legacy[8..]);
-        assert!(
-            decode_blooms(&truncated_v2, 1)
-                .err()
-                .unwrap()
-                .contains("length truncated")
-        );
+        let truncated = &valid[..valid.len() - 2];
+        assert!(decode_blooms(truncated, 1).is_err());
     }
 
     #[test]
@@ -1153,33 +1034,6 @@
         fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
 
         assert!(load_part(&part.dir).is_err());
-    }
-
-    /// A metadata layout this build does not know has to say so. Reporting it
-    /// as a checksum mismatch would read as corruption and send an operator
-    /// looking for a failing disk instead of a version skew.
-    #[test]
-    fn load_reports_an_unknown_metadata_version_as_such() {
-        let tmp = tempfile_dir();
-        let part = flush_rows(make_rows(), &tmp, 100).expect("flush").remove(0);
-        let meta_path = part.meta_path();
-        let mut meta: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-        meta["version"] = serde_json::Value::from(PART_META_VERSION + 1);
-        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
-
-        let error = load_part(&part.dir).expect_err("a future version must be refused");
-        assert!(error.contains("unsupported part metadata version"), "{error}");
-
-        // A part written before the field existed reads as version 0, which is
-        // the pre-versioning marker rather than a checksum problem.
-        let mut meta: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-        meta.as_object_mut().unwrap().remove("version");
-        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
-
-        let error = load_part(&part.dir).expect_err("an unversioned part must be refused");
-        assert!(error.contains("version 0"), "{error}");
     }
 
     /// What tenant breadth costs a part.
@@ -1865,7 +1719,7 @@ resident {:.0} B",
         let part = flush_rows(make_rows(), &tmp, 1).unwrap().remove(0);
         let bytes = fs::read(part.index_path()).unwrap();
         let (bloom, streams) = split_index(&bytes).unwrap();
-        assert_eq!(&bloom[..4], BLOOM_MAGIC_V4);
+        assert_eq!(&bloom[..4], BLOOM_MAGIC);
         assert_eq!(&streams[..STREAM_MAGIC.len()], STREAM_MAGIC);
         assert_eq!(
             INDEX_MAGIC.len() + 4 + bloom.len() + 4 + streams.len(),

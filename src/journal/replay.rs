@@ -67,14 +67,6 @@ fn recover_unfinished_compaction(wal_path: &Path, ckpt_path: &Path) -> Result<()
     let Some(state) = read_compaction_state(&state_path)? else {
         return Ok(());
     };
-    if state.phase != 1 {
-        // A phase-2 record from a build that never removed one. The rename it
-        // describes committed, so the record is stale bookkeeping: leaving it
-        // would make the next compaction compare offsets across the checkpoint
-        // reset and wedge the flush loop permanently.
-        remove_compaction_state(&state_path, wal_path)?;
-        return Ok(());
-    }
     let tmp_path = wal_path.with_extension("wal.compact.tmp");
     if !tmp_path.exists() {
         // The replacement WAL is already in place; replay its suffix from
@@ -186,11 +178,6 @@ fn replay_from(
                     ));
                 }
             }
-        } else if let Some(trace_data) = decode_trace_record(&data)? {
-            // Pre-tenancy record. Attributing it to the default tenant keeps
-            // an upgrade lossless; a deployment that requires the header will
-            // still see the old data under its configured default.
-            replay_trace_record(default_tenant, trace_data, offset, trace_memtable)?;
         } else {
             report.entries += replay_log_record(default_tenant, &data, offset, memtable)?;
         }
@@ -256,18 +243,3 @@ fn replay_trace_record(
     Ok(())
 }
 
-fn decode_trace_record(data: &[u8]) -> Result<Option<&[u8]>, String> {
-    if !data.starts_with(TRACE_RECORD_MAGIC) {
-        return Ok(None);
-    }
-    if data.len() <= TRACE_RECORD_MAGIC.len() {
-        return Err("trace journal record is missing its version".to_string());
-    }
-    if data[TRACE_RECORD_MAGIC.len()] != TRACE_RECORD_VERSION {
-        return Err(format!(
-            "unsupported trace journal record version {}",
-            data[TRACE_RECORD_MAGIC.len()]
-        ));
-    }
-    Ok(Some(&data[TRACE_RECORD_MAGIC.len() + 1..]))
-}

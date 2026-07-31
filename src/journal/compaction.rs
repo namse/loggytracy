@@ -8,15 +8,7 @@ async fn compact_wal(
     let state_path = wal_path.with_file_name(COMPACTION_STATE_FILE);
     let compaction_state = read_compaction_state(&state_path)?;
     if let Some(state) = compaction_state {
-        if state.phase == 2 {
-            // The previous compaction finished: it renamed the replacement WAL
-            // into place and reset the checkpoint to zero. Its offset lives in
-            // a coordinate system this one no longer shares, so comparing the
-            // two is meaningless — the only work left is retiring the record.
-            // Doing that here also un-wedges an instance that was upgraded from
-            // a build which never removed it.
-            remove_compaction_state(&state_path, wal_path)?;
-        } else if state.phase == 1 {
+        {
             let wal_len = std::fs::metadata(wal_path)?.len();
             let tmp_path = wal_path.with_extension("wal.compact.tmp");
             if tmp_path.exists() {
@@ -90,7 +82,6 @@ async fn compact_wal(
     // rename/fsync boundary. A retry observes it and keeps the current WAL
     // intact instead of interpreting the suffix length as the old offset.
     let state = CompactionState {
-        phase: 1,
         offset,
         source_len: *good_len,
         retained_len,
@@ -139,7 +130,6 @@ fn remove_compaction_state(state_path: &Path, wal_path: &Path) -> Result<(), IoE
 
 #[derive(Clone, Copy)]
 struct CompactionState {
-    phase: u8,
     offset: u64,
     source_len: u64,
     retained_len: u64,
@@ -152,18 +142,11 @@ fn read_compaction_state(path: &Path) -> Result<Option<CompactionState>, IoError
         Err(error) => return Err(error),
     };
     match bytes.as_slice() {
-        [version, phase, offset @ ..]
-            if *version == COMPACTION_STATE_VERSION
-                && matches!(*phase, 1 | 2)
-                && offset.len() == 24 =>
-        {
-            Ok(Some(CompactionState {
-                phase: *phase,
-                offset: u64::from_le_bytes(offset[0..8].try_into().unwrap()),
-                source_len: u64::from_le_bytes(offset[8..16].try_into().unwrap()),
-                retained_len: u64::from_le_bytes(offset[16..24].try_into().unwrap()),
-            }))
-        }
+        offset if offset.len() == 24 => Ok(Some(CompactionState {
+            offset: u64::from_le_bytes(offset[0..8].try_into().unwrap()),
+            source_len: u64::from_le_bytes(offset[8..16].try_into().unwrap()),
+            retained_len: u64::from_le_bytes(offset[16..24].try_into().unwrap()),
+        })),
         _ => Err(IoError::new(
             std::io::ErrorKind::InvalidData,
             "invalid WAL compaction state",
@@ -171,13 +154,12 @@ fn read_compaction_state(path: &Path) -> Result<Option<CompactionState>, IoError
     }
 }
 
-/// Only phase 1 is ever written: phase 2 is now expressed by the record's
-/// absence. [`read_compaction_state`] still accepts a phase-2 record so an
-/// instance upgraded from a build that left one behind recovers on its own.
+/// The record's presence means a compaction is in flight; its absence means
+/// none is. There is no completion record — a finished compaction removes this
+/// one, and comparing an offset written before the checkpoint reset against one
+/// written after it is what wedged the flush loop when there was.
 fn write_compaction_state(path: &Path, state: &CompactionState) -> Result<(), IoError> {
-    let mut bytes = Vec::with_capacity(26);
-    bytes.push(COMPACTION_STATE_VERSION);
-    bytes.push(1);
+    let mut bytes = Vec::with_capacity(24);
     bytes.extend_from_slice(&state.offset.to_le_bytes());
     bytes.extend_from_slice(&state.source_len.to_le_bytes());
     bytes.extend_from_slice(&state.retained_len.to_le_bytes());
