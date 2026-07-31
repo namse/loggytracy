@@ -526,6 +526,23 @@ neither is a defect in either engine.
       `metadata_rare` from 18.5 ms to **3.7 ms** — 0.05x against Loki, and the VictoriaLogs side of the
       claim is now 2.42x where it was 12.6x. **Every shape now beats Loki**; `json_field_rare` (25x against
       VictoriaLogs) waits on parsed-field columnization, the one shape whose cost is the line parse itself
+- [x] **Parsed-field columnization landed** — `_pf:` columns holding exactly what `| json` would extract
+      (the same `extract_json`, so the column is right by construction), the line kept, metadata shadowing
+      preserved in the two-pass scan and pinned by a hit/miss/shadowed equality test. Measured in the bed
+      over full agreement: `json_field_rare` 44 ms → **4.5 ms** — 0.03x against Loki, **3.3x** against
+      VictoriaLogs from 28.5x — and `json_field` 48 → 21 ms (0.40x / 3.2x). The price, also measured:
+      ingest 19.8k → 18.5k eps against an offered 20k, and settled disk 0.47x → 0.64x of Loki's. Half the
+      added write cost was a duplicate extraction and is recovered (`part/write/json` −7%, one parse shared
+      by the key counts and the column fill); the ingest number after that recovery is the re-run below
+- [ ] **Sidecar-only metric evaluation has a precondition this bed does not meet, recorded before the
+      wrong version of it gets built.** Counting matched rows from `row_group_rows` is sound only when a
+      group holds matched streams alone; groups are cut per tenant at 8192 rows with streams contiguous
+      inside, so at the bed's rows-per-stream a group nearly always mixes streams and the fast path
+      degenerates into the scan it replaces. It pays exactly where groups are stream-pure — one hot
+      stream, or matcherless windows — and paying anywhere else needs per-(group, stream) row counts in
+      the stream index, a format change. The bed's remaining `rate` gap (0.42 ms against 9.6) is *not*
+      this item: it is the metric path materializing sixty thousand `LogEntry`s to add one per row, which
+      is a count-in-the-sink change, not a sidecar
 
 ## The claim moved onto its worst shape, and the measurement said so within the hour
 
