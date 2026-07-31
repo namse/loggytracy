@@ -556,6 +556,17 @@ neither is a defect in either engine.
       `indexed_parser_fields` cannot reuse the `_pf:` extraction — it tokenizes pre-sanitization name
       variants the exact map no longer has — so the remaining term is the wider Parquet encode, and the
       honest options are per-column encoding choices measured against `part/write`, not more sharing
+- [x] **The trace-to-logs measurement ran, and it answers the join question by pointing somewhere else.**
+      `trace_window` — the rare trace's own occurrence ±1 s, the window a click on a span sends — is in the
+      matrix at full three-way agreement. Loki drops 79 → 32 ms and VictoriaLogs 1.3 → 1.15 ms on the
+      narrow window; **loggytracy does not move at all** (5.2 → 5.1 ms, lines-read 589,824 unchanged),
+      because a stream-first group spans nearly the whole time range — group-level time pruning is inert —
+      and the two-pass scan's first pass does not apply the page-index time selection, so it examines every
+      row of every admitted group whatever the window says. Two conclusions, in order: the next read-path
+      target is intersecting `time_page_selection` into pass one (a few lines, then the narrow window
+      should land near VictoriaLogs); and the **server-side trace↔log join is rejected** — the client
+      already sends the window, so once the window actually cuts work the join has nothing left to buy,
+      and its soundness caveats (clock skew, late logs, absent traces) buy nothing back
 
 ## The claim moved onto its worst shape, and the measurement said so within the hour
 
