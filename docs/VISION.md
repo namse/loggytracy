@@ -391,14 +391,19 @@ The claim is therefore stated as a falsifiable one:
 > index it, and not materially worse than VictoriaLogs, which columnizes it,
 > without giving up ingest throughput or disk footprint.
 
-**Neither half has been measured.** The comparison has never issued a
-structured-metadata filter, and VictoriaLogs was only added to the bed on
-2026-07-31. So this claim starts where the previous one started: unproven, with
-the bed to build before it can be answered. What is different is that the
-previous claim was measured and **lost** — `json_field` 1.85x slower cold —
-which is recorded in [`COMPARISON.md`](COMPARISON.md) and is not retracted by
-moving the target. That shape is still measured; it is just no longer the one
-the engine is judged on.
+**Both halves are measured now, and they split.** The three-way bed
+([`COMPARISON.md`](COMPARISON.md), 2 GiB per container, 150,000 rows, every
+answer agreeing on every shape before any ratio was printed): the Loki half
+**holds** — `metadata_rare` at **0.24x**, 19.2 ms against 79.4 — and the
+VictoriaLogs half **fails** — **12.6x slower**, 19.2 ms against 1.5. An earlier
+short run had loggytracy *losing* the Loki half at 3.10x; that number was this
+engine's own bounded-scan defect wearing a performance costume (`todo.md`,
+"Open correctness defects" — the scan dropped the newest rows), and it reversed
+the day the defect did. What stands between 19.2 ms and 1.5 ms is the
+columnization gap: `structured_metadata` is still a JSON blob parsed per row,
+and VictoriaLogs answers the same question from a column. That is the work, in
+order: columnize, push projection and predicates down, and only then judge the
+claim's second half.
 
 It is abandoned if the comparison shows Loki within noise on that shape despite
 not indexing it, or shows loggytracy losing on ingest or bytes-per-GB by enough
