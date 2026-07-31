@@ -604,6 +604,17 @@ pub struct Answer {
 /// exemption beside the result.
 const DERIVED_LABELS: [&str; 2] = ["detected_level", "service_name"];
 
+/// Labels whose *presence* is comparable and whose *wording* is not.
+///
+/// Loki's `__error_details__` carries its JSON library's internal message
+/// ("Value looks like object, but can't find closing '}' symbol"); this
+/// engine's carries its own. An engine that fails to attach the label at all
+/// was a real disagreement — 16 of 24 `json_field_rare` answers — so the name
+/// is digested in place and only the value is replaced. The exemption is by
+/// name, stated here, not a silent widening of the basis.
+const UNMATCHABLE_VALUE_LABELS: [&str; 1] = ["__error_details__"];
+const UNMATCHABLE_VALUE: &str = "<engine-specific wording>";
+
 /// The digest tag for a label, or `None` when it is declared out of scope.
 ///
 /// **No placement is exempt.** There used to be one: pushed structured
@@ -654,7 +665,12 @@ fn collect_labels(
             .ok_or_else(|| format!("{found_in} label '{name}' is not a string: {value}"))?;
         match tag(name, found_in) {
             Some(tag) => {
-                digested.insert(format!("{tag}:{name}"), text.to_string());
+                let value = if UNMATCHABLE_VALUE_LABELS.contains(&name.as_str()) {
+                    UNMATCHABLE_VALUE.to_string()
+                } else {
+                    text.to_string()
+                };
+                digested.insert(format!("{tag}:{name}"), value);
             }
             None => {
                 dropped.insert(format!("{found_in}:{name}"));
@@ -1254,6 +1270,31 @@ mod tests {
         }
     }
 
+    /// `__error_details__` carries each engine's own wording, so two answers
+    /// differing only in that text are the same answer — while an answer
+    /// missing the label entirely is not, which is what 16 of 24
+    /// `json_field_rare` responses were.
+    #[test]
+    fn error_details_wording_is_exempt_and_its_absence_is_not() {
+        let loki_wording = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a","__error__":"JSONParserErr",
+              "__error_details__":"Value looks like object, but can't find closing '}' symbol"},
+             "values":[["1","alpha"]]}]}}"#;
+        let our_wording = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a","__error__":"JSONParserErr",
+              "__error_details__":"line is not valid JSON"},
+             "values":[["1","alpha"]]}]}}"#;
+        let missing = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"app":"a","__error__":"JSONParserErr"},
+             "values":[["1","alpha"]]}]}}"#;
+
+        let loki_wording = digest_response(loki_wording).expect("valid");
+        let our_wording = digest_response(our_wording).expect("valid");
+        let missing = digest_response(missing).expect("valid");
+        assert_eq!(loki_wording.digest, our_wording.digest);
+        assert_ne!(loki_wording.digest, missing.digest);
+    }
+
     /// Pushed structured metadata used to be exempt from placement here, which
     /// declared as a shape difference the same defect `| json`'s extracted
     /// fields were open as. It is not exempt now, so a regression back into the
@@ -1493,7 +1534,6 @@ different one"
             windows: 3,
             repeats: 2,
             limit: 100,
-            range: "1m".to_string(),
             step_seconds: 10,
         }
     }

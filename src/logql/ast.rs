@@ -162,6 +162,7 @@ impl LogQuery {
                     op: FieldOp::Eq,
                     value,
                 }) if name != PARSER_ERROR_FIELD
+                    && name != PARSER_ERROR_DETAILS_FIELD
                     && (!parser_seen || !may_be_synthesized_extracted_name(name)) =>
                 {
                     let (value, canonical) = match value {
@@ -264,7 +265,7 @@ impl LogQuery {
                         )
                     }
                     Err(ExtractError::Parse) => {
-                        set_parser_error(entry, &mut fields, "JSONParserErr");
+                        set_parser_error(entry, &mut fields, "JSONParserErr", "line is not valid JSON");
                     }
                     Err(ExtractError::Cancelled) => return Err("query timed out".to_string()),
                 },
@@ -279,7 +280,12 @@ impl LogQuery {
                         )
                         }
                         Err(ExtractError::Parse) => {
-                            set_parser_error(entry, &mut fields, "LogfmtParserErr");
+                            set_parser_error(
+                                entry,
+                                &mut fields,
+                                "LogfmtParserErr",
+                                "line is not valid logfmt",
+                            );
                         }
                         Err(ExtractError::Cancelled) => return Err("query timed out".to_string()),
                     }
@@ -341,14 +347,23 @@ fn may_be_synthesized_extracted_name(name: &str) -> bool {
     })
 }
 
-fn set_parser_error(entry: &mut LogEntry, fields: &mut BTreeMap<String, String>, error: &str) {
+fn set_parser_error(
+    entry: &mut LogEntry,
+    fields: &mut BTreeMap<String, String>,
+    error: &str,
+    details: &str,
+) {
     fields.insert(PARSER_ERROR_FIELD.to_string(), error.to_string());
+    fields.insert(PARSER_ERROR_DETAILS_FIELD.to_string(), details.to_string());
     entry
         .structured_metadata
-        .retain(|(name, _)| name != PARSER_ERROR_FIELD);
+        .retain(|(name, _)| name != PARSER_ERROR_FIELD && name != PARSER_ERROR_DETAILS_FIELD);
     entry
         .structured_metadata
         .push((PARSER_ERROR_FIELD.to_string(), error.to_string()));
+    entry
+        .structured_metadata
+        .push((PARSER_ERROR_DETAILS_FIELD.to_string(), details.to_string()));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

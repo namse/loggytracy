@@ -135,6 +135,10 @@
         assert!(field_only.process_entry_with_labels(&labels, &mut entry("line", &[])));
     }
 
+    /// Loki pairs `__error__` with `__error_details__` and Grafana renders
+    /// both, so a response without the second is a measurable disagreement —
+    /// it was 16 of 24 `json_field_rare` answers. The details text is this
+    /// engine's own; only the presence matches Loki.
     #[test]
     fn malformed_parsers_set_a_filterable_error_field() {
         let json = parse(r#"{} | json | __error__="JSONParserErr""#).unwrap();
@@ -143,16 +147,26 @@
         assert!(json.process_entry(&mut malformed));
         assert_eq!(
             malformed.structured_metadata,
-            vec![("__error__".to_string(), "JSONParserErr".to_string())]
+            vec![
+                ("__error__".to_string(), "JSONParserErr".to_string()),
+                (
+                    "__error_details__".to_string(),
+                    "line is not valid JSON".to_string()
+                ),
+            ]
         );
         assert!(logfmt.matches_entry(&entry("missing-equals", &[])));
 
+        let logfmt_error = vec![
+            ("__error__".to_string(), "LogfmtParserErr".to_string()),
+            (
+                "__error_details__".to_string(),
+                "line is not valid logfmt".to_string(),
+            ),
+        ];
         let mut adjacent = entry(r#"level="error"status=500"#, &[]);
         assert!(logfmt.process_entry(&mut adjacent));
-        assert_eq!(
-            adjacent.structured_metadata,
-            vec![("__error__".to_string(), "LogfmtParserErr".to_string())]
-        );
+        assert_eq!(adjacent.structured_metadata, logfmt_error);
         assert!(
             !parse(r#"{} | logfmt | level="error""#)
                 .unwrap()
@@ -162,10 +176,7 @@
 
         let mut bad_escape = entry(r#"value="bad\q""#, &[]);
         assert!(logfmt.process_entry(&mut bad_escape));
-        assert_eq!(
-            bad_escape.structured_metadata,
-            vec![("__error__".to_string(), "LogfmtParserErr".to_string())]
-        );
+        assert_eq!(bad_escape.structured_metadata, logfmt_error);
     }
 
     #[test]
