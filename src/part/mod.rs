@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use bytes::Bytes;
+use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
@@ -62,6 +63,42 @@ pub const TENANT_COLUMN: &str = "_tenant";
 /// churn cannot push `trace_id` out of a column; see
 /// `format::select_metadata_columns`.
 pub const MAX_METADATA_COLUMNS: usize = 128;
+
+/// Which of a part's columns a scan decodes.
+///
+/// The tenant, timestamp and label columns are always read — the first two are
+/// the isolation cross-check and the sort axis, the labels are matcher input
+/// and series identity, and all are cheap dictionary runs. What a query can
+/// spare is the line and the metadata: `sum(rate({app="x"}[5m]))` needs
+/// neither, and decoding them anyway was most of what the metric path paid
+/// per row.
+///
+/// `Named` is only sound when the caller can prove nothing downstream reads an
+/// unlisted field. A parser stage cannot prove it — an extraction is shadowed
+/// by same-named metadata, so dropping a metadata column would change which
+/// value wins — and a template can name any field; those bail to `All`.
+/// The log path always asks for `All`, because a log response returns every
+/// pair it stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetadataProjection {
+    All,
+    Named(BTreeSet<String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnSet {
+    pub line: bool,
+    pub metadata: MetadataProjection,
+}
+
+impl ColumnSet {
+    pub fn all() -> Self {
+        Self {
+            line: true,
+            metadata: MetadataProjection::All,
+        }
+    }
+}
 
 /// The time span a metadata lookup is allowed to see.
 ///

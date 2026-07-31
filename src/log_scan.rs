@@ -52,6 +52,7 @@ pub struct LogScan<'a> {
     max_memory_bytes: Option<u64>,
     cancellation: Option<&'a AtomicBool>,
     hidden: Option<HiddenRow<'a>>,
+    columns: crate::part::ColumnSet,
 }
 
 impl<'a> LogScan<'a> {
@@ -73,7 +74,13 @@ impl<'a> LogScan<'a> {
             max_memory_bytes: None,
             cancellation: None,
             hidden: None,
+            columns: crate::part::ColumnSet::all(),
         }
+    }
+
+    pub fn columns(mut self, columns: crate::part::ColumnSet) -> Self {
+        self.columns = columns;
+        self
     }
 
     pub fn scan_budget(mut self, rows: Option<usize>) -> Self {
@@ -162,6 +169,7 @@ impl<'a> LogScan<'a> {
             part_scan_limit,
             part_scan_bytes_limit,
             self.cancellation,
+            &self.columns,
             &mut sink,
         )?;
         scanned_rows = scanned_rows.saturating_add(part_stats.scanned_rows as u64);

@@ -1301,6 +1301,97 @@
         assert_eq!(instant.data.result[0]["value"][1], "3");
     }
 
+    /// The metric path projects columns — only the timestamp, the labels and
+    /// the fields the expression names come off disk. The memtable cannot
+    /// project, so the same rows in the memtable and in a part are a
+    /// projection-on/projection-off pair, and every shape the projection
+    /// analysis distinguishes must answer identically on both: bare
+    /// aggregation (nothing named), grouping over a metadata field (that field
+    /// named), unwrap (that field named), and a parser stage (bails to every
+    /// column).
+    #[tokio::test]
+    async fn metric_answers_are_identical_with_and_without_projection() {
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let entries: Vec<LogEntry> = (0..40i64)
+            .map(|i| LogEntry {
+                timestamp_ns: 1_000_000_000 + i * 200_000_000,
+                line: format!(r#"{{"level":"{}","status":200}}"#, ["info", "error"][(i % 2) as usize]),
+                structured_metadata: vec![
+                    ("duration_ms".to_string(), format!("{}", 10 + i)),
+                    ("trace_id".to_string(), format!("t{}", i % 4)),
+                ],
+            })
+            .collect();
+
+        let in_memtable = {
+            let data_dir = temp_dir();
+            let memtable = Arc::new(MemTable::new());
+            memtable.insert(test_tenant(), labels.clone(), entries.clone());
+            test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None)
+        };
+        let in_parts = {
+            let data_dir = temp_dir();
+            let rows: Vec<Row> = entries
+                .iter()
+                .map(|entry| Row {
+                    tenant: test_tenant(),
+                    timestamp_ns: entry.timestamp_ns,
+                    labels: std::sync::Arc::new(labels.clone()),
+                    line: entry.line.clone(),
+                    structured_metadata: entry.structured_metadata.clone(),
+                })
+                .collect();
+            let parts = Arc::new(PartRegistry::new());
+            parts
+                .register(part::flush_rows(rows, &data_dir.join("parts"), 8).unwrap())
+                .unwrap();
+            test_state(&data_dir, Arc::new(MemTable::new()), parts, None)
+        };
+
+        for expression in [
+            r#"sum(rate({app="api"}[5s]))"#,
+            r#"sum by (trace_id) (count_over_time({app="api"}[5s]))"#,
+            r#"sum without (trace_id) (count_over_time({app="api"}[5s]))"#,
+            r#"avg_over_time({app="api"} | unwrap duration_ms [5s])"#,
+            r#"sum(bytes_over_time({app="api"}[5s]))"#,
+            r#"sum by (level) (count_over_time({app="api"} | json [5s]))"#,
+            r#"sum(count_over_time({app="api"} | trace_id="t1" [5s]))"#,
+        ] {
+            let parse = |text: &str| -> logql::MetricExpr {
+                match logql::parse_expr(text).unwrap() {
+                    logql::QueryExpr::Metric(expr) => expr,
+                    _ => panic!("expected metric"),
+                }
+            };
+            let times = vec![5_000_000_000, 9_000_000_000];
+            let from_memtable = run_metric_query(
+                in_memtable.clone(),
+                test_tenant(),
+                parse(expression),
+                times.clone(),
+            )
+            .await
+            .unwrap();
+            let from_parts =
+                run_metric_query(in_parts.clone(), test_tenant(), parse(expression), times)
+                    .await
+                    .unwrap();
+            let flat = |series: &[MetricSeries]| -> Vec<String> {
+                series
+                    .iter()
+                    .map(|series| format!("{:?} {:?}", series.labels, series.samples))
+                    .collect()
+            };
+            assert_eq!(
+                flat(&from_memtable),
+                flat(&from_parts),
+                "projection must not change the answer to {expression}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn metric_grouping_uses_extracted_fields_and_parser_errors() {
         let data_dir = temp_dir();

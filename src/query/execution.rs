@@ -64,6 +64,7 @@ fn unified_query_with_stats_cancellable(
         cancellation,
         None,
         None,
+        part::ColumnSet::all(),
     )
 }
 
@@ -79,6 +80,7 @@ fn unified_query_with_stats_cancellable_with_memory(
     cancellation: Option<&AtomicBool>,
     max_memory_bytes: Option<u64>,
     max_scan_bytes: Option<u64>,
+    columns: part::ColumnSet,
 ) -> Result<QueryExecution, String> {
     // The one place every read path meets its rows, which is why the deletion
     // mask is here and not at each handler. A second scan would be a second
@@ -94,6 +96,7 @@ fn unified_query_with_stats_cancellable_with_memory(
         false
     };
     let scan = crate::log_scan::LogScan::new(tenant, parsed, range, limit, forward)
+        .columns(columns)
         .scan_budget(scan_budget)
         .max_scan_bytes(max_scan_bytes)
         .max_memory_bytes(max_memory_bytes)
@@ -209,6 +212,8 @@ async fn run_unified_query_with_stats_cancellable(
         scan_budget,
         cancellation,
         None,
+        // The log path returns every pair a row stored, so it reads them all.
+        part::ColumnSet::all(),
     )
     .await
 }
@@ -224,6 +229,7 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
     scan_budget: Option<usize>,
     cancellation: Arc<AtomicBool>,
     runtime_override: Option<std::time::Duration>,
+    columns: part::ColumnSet,
 ) -> Result<QueryExecution, String> {
     let max_runtime = runtime_override.unwrap_or(state.config.max_query_runtime);
     let scan_permit = tokio::time::timeout(
@@ -260,6 +266,7 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
             Some(task_cancellation.as_ref()),
             Some(max_query_memory_bytes),
             Some(state.config.max_query_scan_bytes),
+            columns,
         )
     });
     let execution = match tokio::time::timeout(max_query_runtime, &mut task).await {

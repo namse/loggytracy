@@ -640,6 +640,7 @@
                         None,
                         None,
                         None,
+                        &ColumnSet::all(),
                         &mut collector,
                     )
                     .unwrap();
@@ -769,6 +770,7 @@
                 None,
                 None,
                 None,
+                &ColumnSet::all(),
                 &mut collector,
             )
             .unwrap();

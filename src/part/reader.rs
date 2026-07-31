@@ -542,6 +542,7 @@ impl PartReader {
                 scan_bytes_limit,
                 None,
                 Some(row_groups.clone()),
+                &ColumnSet::all(),
                 &mut collector,
             )?;
             rows.append(&mut collector.into_rows());
@@ -646,6 +647,7 @@ impl PartReader {
             scan_bytes_limit,
             cancellation,
             row_group_window,
+            &ColumnSet::all(),
             &mut rows,
         )?;
         Ok(QueryResult {
@@ -682,12 +684,18 @@ impl PartReader {
         scan_bytes_limit: Option<u64>,
         cancellation: Option<&AtomicBool>,
         row_group_window: Option<std::ops::Range<u32>>,
+        columns: &ColumnSet,
         sink: &mut dyn RowSink,
     ) -> Result<ScanStats, String> {
         let mut stats = ScanStats::default();
         if self.bloom.is_empty() || sink.is_closed() {
             return Ok(stats);
         }
+        debug_assert!(
+            columns.line || line_filters.is_empty(),
+            "a scan that skips the line column cannot evaluate line filters"
+        );
+        let projection = ScanProjection::build(&self.stream_labels, &self.metadata_keys, columns);
 
         let selected = if exact_fields.is_empty() {
             self.select_row_groups(tenant, matchers, line_filters, time_range)
@@ -757,6 +765,10 @@ impl PartReader {
                     data_file.clone(),
                     part_metadata.clone(),
                 )
+                .with_projection(ProjectionMask::leaves(
+                    part_metadata.metadata().file_metadata().schema_descr(),
+                    projection.leaves.iter().copied(),
+                ))
                 .with_batch_size(window_rows(scan_limit, stats.scanned_rows, &*sink))
                 .with_row_groups(vec![rgu])
                 .build()
@@ -774,6 +786,7 @@ impl PartReader {
                         scan_limit,
                         scan_bytes_limit,
                         cancellation,
+                        &projection,
                         &mut label_sets,
                         &mut stats,
                         sink,
@@ -803,6 +816,10 @@ impl PartReader {
                 data_file.clone(),
                 part_metadata.clone(),
             )
+            .with_projection(ProjectionMask::leaves(
+                part_metadata.metadata().file_metadata().schema_descr(),
+                projection.leaves.iter().copied(),
+            ))
             .with_batch_size(1024)
             .with_row_groups(vec![rgu])
             .build()
@@ -823,6 +840,7 @@ impl PartReader {
                     scan_limit,
                     scan_bytes_limit,
                     cancellation,
+                    &projection,
                     &mut label_sets,
                     &mut stats,
                     sink,
@@ -851,6 +869,7 @@ impl PartReader {
         scan_limit: Option<usize>,
         scan_bytes_limit: Option<u64>,
         cancellation: Option<&AtomicBool>,
+        projection: &ScanProjection,
         label_sets: &mut LabelSetCache,
         stats: &mut ScanStats,
         sink: &mut dyn RowSink,
@@ -869,16 +888,21 @@ impl PartReader {
         }
         let row_tenant = batch.column(0).as_string::<i32>();
         let ts = batch.column(1).as_primitive::<Int64Type>();
-        let msg = batch.column(2).as_string::<i32>();
-        let metadata_start = 3 + self.stream_labels.len();
-        let metadata_cols: Vec<&StringArray> = (0..self.metadata_keys.len())
-            .map(|key_index| batch.column(metadata_start + key_index).as_string::<i32>())
+        let msg = projection
+            .msg
+            .map(|index| batch.column(index).as_string::<i32>());
+        let metadata_cols: Vec<(usize, &StringArray)> = projection
+            .metadata
+            .iter()
+            .map(|&(key_index, batch_index)| {
+                (key_index, batch.column(batch_index).as_string::<i32>())
+            })
             .collect();
-        let sm = batch
-            .column(metadata_start + self.metadata_keys.len())
-            .as_string::<i32>();
+        let sm = projection
+            .residual
+            .map(|index| batch.column(index).as_string::<i32>());
         let label_cols: Vec<&StringArray> = (0..self.stream_labels.len())
-            .map(|label_index| batch.column(3 + label_index).as_string::<i32>())
+            .map(|label_index| batch.column(projection.labels_start + label_index).as_string::<i32>())
             .collect();
 
         let row_indices: Box<dyn Iterator<Item = usize>> = if forward {
@@ -929,11 +953,15 @@ impl PartReader {
             }
             // Filters test the borrowed value; the `String` is built only for
             // a row that survives them. Allocating first charged every
-            // rejected row for a line nothing would read.
-            if !line_filters.iter().all(|f| f.matches(msg.value(i))) {
+            // rejected row for a line nothing would read. When the line is not
+            // projected the filters are guaranteed empty (asserted at scan
+            // entry) and the entry carries an empty line nothing will read.
+            if let Some(msg) = msg
+                && !line_filters.iter().all(|f| f.matches(msg.value(i)))
+            {
                 continue;
             }
-            let line = msg.value(i).to_string();
+            let line = msg.map(|msg| msg.value(i).to_string()).unwrap_or_default();
             // Rebuilt from the `_sm:` columns plus the residual blob — a merge
             // of two key-sorted lists, so the canonical order survives without
             // a sort. The residual is null for any row whose keys all made
@@ -941,24 +969,25 @@ impl PartReader {
             // common path runs no serde at all. The per-row
             // `serde_json::from_str` this replaces was measured as the 1.8x
             // per-line term of `metadata_rare`'s loss.
-            let residual: Vec<(String, String)> = if sm.is_null(i) {
-                Vec::new()
-            } else {
-                serde_json::from_str(sm.value(i)).map_err(|error| {
-                    format!(
-                        "invalid structured metadata in part {} at timestamp {ts_val}: {error}",
-                        self.part.meta.id
-                    )
-                })?
+            let residual: Vec<(String, String)> = match sm {
+                Some(sm) if !sm.is_null(i) => {
+                    serde_json::from_str(sm.value(i)).map_err(|error| {
+                        format!(
+                            "invalid structured metadata in part {} at timestamp {ts_val}: {error}",
+                            self.part.meta.id
+                        )
+                    })?
+                }
+                _ => Vec::new(),
             };
             let mut structured_metadata: Vec<(String, String)> =
-                Vec::with_capacity(residual.len() + self.metadata_keys.len());
+                Vec::with_capacity(residual.len() + metadata_cols.len());
             let mut residual = residual.into_iter().peekable();
-            for (key_index, key) in self.metadata_keys.iter().enumerate() {
+            for &(key_index, column) in &metadata_cols {
+                let key = &self.metadata_keys[key_index];
                 while residual.peek().is_some_and(|(name, _)| name < key) {
                     structured_metadata.extend(residual.next());
                 }
-                let column = metadata_cols[key_index];
                 if !column.is_null(i) {
                     structured_metadata.push((key.clone(), column.value(i).to_string()));
                 }
@@ -974,6 +1003,84 @@ impl PartReader {
             )?;
         }
         Ok(ScanStep::Continue)
+    }
+}
+
+/// Where each logical column landed in a projected batch.
+///
+/// A `ProjectionMask` keeps the projected columns in schema order, so the
+/// positions are computable up front; computing them per batch would re-derive
+/// the same map thousands of times per scan.
+struct ScanProjection {
+    /// Parquet leaf ordinals to project. Every column here is a primitive, so
+    /// leaf ordinals and top-level ordinals coincide.
+    leaves: Vec<usize>,
+    /// Projected index of `_msg`, when the line is read at all.
+    msg: Option<usize>,
+    /// Projected index of the first label column; labels are contiguous.
+    labels_start: usize,
+    /// `(index into metadata_keys, projected index)` per projected `_sm:`.
+    metadata: Vec<(usize, usize)>,
+    /// Projected index of the residual blob, when it is read at all.
+    residual: Option<usize>,
+}
+
+impl ScanProjection {
+    fn build(stream_labels: &[String], metadata_keys: &[String], columns: &ColumnSet) -> Self {
+        let labels = stream_labels.len();
+        let mut leaves = vec![0usize, 1];
+        let mut next = 2usize;
+        let mut msg = None;
+        if columns.line {
+            leaves.push(2);
+            msg = Some(next);
+            next += 1;
+        }
+        let labels_start = next;
+        for label in 0..labels {
+            leaves.push(3 + label);
+        }
+        next += labels;
+        let mut metadata = Vec::new();
+        let mut residual = None;
+        match &columns.metadata {
+            MetadataProjection::All => {
+                for key in 0..metadata_keys.len() {
+                    leaves.push(3 + labels + key);
+                    metadata.push((key, next));
+                    next += 1;
+                }
+                leaves.push(3 + labels + metadata_keys.len());
+                residual = Some(next);
+            }
+            MetadataProjection::Named(names) => {
+                for (key_index, key) in metadata_keys.iter().enumerate() {
+                    if names.contains(key) {
+                        leaves.push(3 + labels + key_index);
+                        metadata.push((key_index, next));
+                        next += 1;
+                    }
+                }
+                // The residual is read only when a named field might live in
+                // it — a name that is not one of this part's columns. The
+                // columnization invariant makes this exact: a columnized key
+                // never also appears in a row's residual.
+                if names
+                    .iter()
+                    .any(|name| metadata_keys.binary_search(name).is_err())
+                {
+                    leaves.push(3 + labels + metadata_keys.len());
+                    residual = Some(next);
+                }
+            }
+        }
+        Self {
+            leaves,
+            msg,
+            labels_start,
+            metadata,
+            residual,
+        }
     }
 }
 

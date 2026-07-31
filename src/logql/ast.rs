@@ -618,6 +618,70 @@ impl MetricExpr {
         }
     }
 
+    /// The columns this expression's scan actually has to decode.
+    ///
+    /// Sound because a metric answer is a function of few things: a sample's
+    /// value (1, the line's length, or one unwrapped field), its series
+    /// identity (stream labels plus exactly the `grouping_fields`, for `by`
+    /// and `without` alike — `Grouping::key` never touches a field nobody
+    /// named), and what the pipeline filters on. Everything the pipeline can
+    /// *read* is therefore enumerable — unless a parser or a template stage is
+    /// present, which can surface any field or be shadowed by one, and then
+    /// this bails to every column rather than guessing.
+    pub fn required_columns(&self) -> crate::part::ColumnSet {
+        let query = self.log_query();
+        let mut line = !query.line_filters.is_empty() || self.reads_lines();
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        for stage in &query.stages {
+            match stage {
+                // An extraction is shadowed by same-named pushed metadata, so
+                // dropping any metadata column could change which value wins;
+                // templates read whatever field they name at render time.
+                PipelineStage::Json
+                | PipelineStage::Logfmt
+                | PipelineStage::LineFormat(_)
+                | PipelineStage::LabelFormat(_) => {
+                    return crate::part::ColumnSet::all();
+                }
+                PipelineStage::Line(_) => line = true,
+                PipelineStage::Field(filter) => {
+                    named.insert(filter.name.clone());
+                }
+            }
+        }
+        named.extend(self.grouping_fields());
+        self.collect_unwrap_fields(&mut named);
+        crate::part::ColumnSet {
+            line,
+            metadata: crate::part::MetadataProjection::Named(named),
+        }
+    }
+
+    /// Whether any range function in the tree reads the line itself.
+    fn reads_lines(&self) -> bool {
+        match self {
+            Self::Range { function, .. } => matches!(function, RangeFunction::BytesOverTime),
+            Self::Aggregate { expr, .. } | Self::TopK { expr, .. } | Self::Binary { expr, .. } => {
+                expr.reads_lines()
+            }
+            Self::Subquery { inner, .. } => inner.reads_lines(),
+        }
+    }
+
+    fn collect_unwrap_fields(&self, into: &mut BTreeSet<String>) {
+        match self {
+            Self::Range { unwrap, .. } => {
+                if let Some(unwrap) = unwrap {
+                    into.insert(unwrap.field.clone());
+                }
+            }
+            Self::Aggregate { expr, .. } | Self::TopK { expr, .. } | Self::Binary { expr, .. } => {
+                expr.collect_unwrap_fields(into)
+            }
+            Self::Subquery { inner, .. } => inner.collect_unwrap_fields(into),
+        }
+    }
+
     /// Structured fields become metric labels only when a grouping clause
     /// needs them. This keeps ordinary range functions at stream-label
     /// cardinality while preserving `sum by (field)` semantics.

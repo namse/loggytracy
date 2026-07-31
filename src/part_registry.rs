@@ -536,6 +536,7 @@ impl PartRegistry {
             scan_limit,
             scan_bytes_limit,
             cancellation,
+            &crate::part::ColumnSet::all(),
             &mut rows,
         )?;
         Ok(QueryResult {
@@ -565,6 +566,7 @@ impl PartRegistry {
         scan_limit: Option<usize>,
         scan_bytes_limit: Option<u64>,
         cancellation: Option<&AtomicBool>,
+        columns: &crate::part::ColumnSet,
         sink: &mut dyn crate::part::RowSink,
     ) -> Result<crate::part::ScanStats, String> {
         let mut stats = crate::part::ScanStats::default();
@@ -654,6 +656,7 @@ impl PartRegistry {
                     part_scan_bytes_limit,
                     cancellation,
                     None,
+                    columns,
                     sink,
                 )
                 .map_err(|error| {

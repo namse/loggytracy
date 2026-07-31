@@ -117,6 +117,12 @@ async fn run_metric_query_with_stats_cancellable(
         Some(max_metric_rows),
         cancellation.clone(),
         Some(remaining),
+        // The metric path decodes only what the expression can read: the
+        // timestamp, the labels, the grouping and unwrap fields — not the
+        // line and not the rest of the metadata, unless a parser or template
+        // stage forces everything. `sum(rate({app="x"}[5m]))` was decoding
+        // every column of every row to add one to a counter per row.
+        expr.required_columns(),
     )
     .await?;
     let row_count: usize = execution
