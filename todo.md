@@ -326,6 +326,51 @@ against the batch one), and `3ca3bb8` (the switchover, retiring the split fallba
 - [ ] **`peak_materialized_bytes` now overstates.** It still adds `merge_max_memory_bytes`, which no longer
       bounds a rewrite. Correcting it is a claim about memory and wants its own measurement rather than an edit
 
+## The three-way table was published without an agreement check, and it should not have been
+
+`docs/COMPARISON.md`'s own rule is that row equality "matters more than any timing, because a fast wrong
+answer is not a win". The two-system bed enforces it — `compare/run.sh` runs the check and
+`compare_report` prints it. The three-way run bypassed the bed and used a shell loop, so nothing compared the
+answers, and a timing table went out anyway.
+
+Comparing the answers afterwards, on the same run:
+
+| shape | loggytracy = Loki (strict) | loggytracy = VictoriaLogs (reduced) | row-count mismatch vs VL |
+|---|---|---|---|
+| `label_only` | 24/24 | **0/24** | 0/24 |
+| `line_filter` | 24/24 | **0/24** | **24/24** |
+| `json_field` | 24/24 | **0/24** | 0/24 |
+| **`json_field_rare`** | **8/24** | **0/24** | 0/24 |
+| `metadata_rare` | 24/24 | **0/24** | 0/24 |
+| `rate` | 24/24 | **0/24** | **17/24** |
+
+### The reduced digest is not a common basis, by construction
+
+It was supposed to be "timestamp plus field set, no message, no placement". The VictoriaLogs parser puts
+`_msg` into the field set and the LogQL parser does not put the line into it at all, so the two can never
+match — 0/24 everywhere is not a finding about the engines, it is a defect in the checker. This is the
+question that was flagged as hard and then answered with a shortcut.
+
+### And loggytracy disagrees with Loki on `json_field_rare`, 16 answers out of 24
+
+Between two systems that *do* share a basis, with the same 72 rows returned on both sides, so the difference
+is content rather than count. Unnoticed because this run looked at no agreement at all.
+
+- [ ] **Fix the reduced basis so it is actually common**, and add a test that a hand-built pair of responses
+      in the two shapes digests equal. A basis that cannot agree is worse than no basis: it reports a
+      disagreement that is its own
+- [ ] **Investigate the 16 `json_field_rare` disagreements between loggytracy and Loki.** Same count,
+      different content, on the shape whose whole point is a rare value
+- [ ] **Fold VictoriaLogs into `compare/run.sh`** so a three-way run cannot skip the check. The shell loop is
+      how the check got skipped; the fix is to stop having a path that can
+- [ ] **Gate the timing table on agreement.** The report should refuse to print a ratio for a shape whose
+      answers disagree, rather than printing it with a caveat underneath
+
+VictoriaLogs does **not** serve the Loki query API — `/loki/api/v1/query_range` answers `unsupported path
+requested`. Only ingest is Loki-compatible. So translating to LogsQL is forced rather than chosen, and the
+`|=` substring-versus-phrase and `rate` bucket differences that follow from it are real inequalities in the
+comparison, not stylistic ones.
+
 ## VictoriaLogs is in the measurement now, and it changes the reading
 
 The query adapter is built: LogsQL translation for all six shapes, `/select/logsql/query`'s
