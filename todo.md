@@ -326,6 +326,50 @@ against the batch one), and `3ca3bb8` (the switchover, retiring the split fallba
 - [ ] **`peak_materialized_bytes` now overstates.** It still adds `merge_max_memory_bytes`, which no longer
       bounds a rewrite. Correcting it is a claim about memory and wants its own measurement rather than an edit
 
+## The languages can ask the same question; two translations were wrong
+
+Established by measurement, not by reading:
+
+* **VictoriaLogs does not serve the Loki query API at all.** `/loki/api/v1/query_range` answers
+  `unsupported path requested`. Only ingest is Loki-compatible. Translating to LogsQL is forced.
+* **But LogsQL can express what LogQL asks**, and both places the comparison did not match were mistranslations
+  rather than limits of the language:
+  * `|=` is a raw substring; a bare quoted string in LogsQL is a *tokenized phrase*. `~"..."` is the
+    equivalent. On five lines built to straddle token boundaries, the phrase filter returned two and `~"..."`
+    returned the same three `|=` does, case-sensitivity included. Fixed.
+  * `rate()` exists in LogsQL and divides by the bucket width exactly as LogQL's does — measured at 0.0833 for
+    five rows in a minute. `count()`, which the translation used, returned the bucket total and made the units
+    incomparable. Fixed.
+
+### The empty VictoriaLogs answers were a missing settle
+
+Three separate three-way runs returned zero rows for VictoriaLogs and the cause was neither the query nor the
+client: **VictoriaLogs makes ingested rows searchable after an in-memory flush**, and the ad-hoc shell loop
+queried immediately after seeding. `compare/run.sh` settles for 150 s and would not have hit it. loggytracy
+and Loki answer from their memtable and ingester, so the bed's settle was never load-bearing before and is now.
+
+### What still does not agree, after the fixes
+
+| shape | lt rows | Loki rows | VL rows | lt = Loki (strict) | lt = VL (reduced) |
+|---|---|---|---|---|---|
+| `label_only` | 2,400 | 2,400 | 2,400 | 24/24 | 0/24 |
+| `line_filter` | 2,008 | 2,008 | **1,147** | 24/24 | 0/24 |
+| `json_field` | 2,393 | 2,393 | 2,393 | 24/24 | 0/24 |
+| `json_field_rare` | 72 | 72 | 72 | **8/24** | 0/24 |
+| `metadata_rare` | 72 | 72 | 72 | 24/24 | 0/24 |
+| `rate` | 41 | 41 | **24** | 24/24 | 0/24 |
+
+- [ ] **`line_filter` is still 2,008 against 1,147 and the substring fix was not the cause** — both filters
+      return 154 on this corpus, so the phrases do not straddle tokens. Something else differs per query
+- [ ] **`rate` is 41 series against 24** and `rate()` is now the right function, so this is bucket alignment
+      rather than units
+- [ ] **The reduced digest still cannot agree**, 0/24 everywhere: the VictoriaLogs parser puts `_msg` in the
+      field set and the LogQL parser puts the line nowhere. A basis that cannot match is worse than none
+- [ ] **loggytracy and Loki disagree on 16 of 24 `json_field_rare` answers** with the same 72 rows on both
+      sides. Two systems that share a basis, on the shape whose point is a rare value
+
+**No timing table is published from this run.** Agreement first.
+
 ## The three-way table was published without an agreement check, and it should not have been
 
 `docs/COMPARISON.md`'s own rule is that row equality "matters more than any timing, because a fast wrong

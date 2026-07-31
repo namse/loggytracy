@@ -479,8 +479,14 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
     let selector = format!("app:\"{app}\"");
     match shape {
         Shape::LabelOnly => format!("{selector} | limit {}", cfg.verify.limit),
+        // `~"..."` and not `"..."`. A bare quoted string in LogsQL is a
+        // tokenized *phrase* filter, which misses a needle that straddles a
+        // token boundary; LogQL's `|=` is a raw substring. Measured on five
+        // lines built to straddle: the phrase filter returned two and the
+        // regexp filter returned the same three `|=` does, case-sensitivity
+        // included.
         Shape::LineFilter => format!(
-            "{selector} AND \"{}\" | limit {}",
+            "{selector} AND ~\"{}\" | limit {}",
             PHRASES[variant % PHRASES.len()],
             cfg.verify.limit
         ),
@@ -500,8 +506,12 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
         Shape::JsonFieldRare | Shape::MetadataRare => {
             format!("trace_id:\"{rare_trace_id}\" | limit {}", cfg.verify.limit)
         }
+        // `rate()` and not `count()`. LogsQL's `rate()` divides by the bucket
+        // width, which is what LogQL's `rate()` does — measured at 0.0833 for
+        // five rows in a minute — so the two produce the same units. `count()`
+        // produced the bucket total and made the numbers incomparable.
         Shape::Rate => format!(
-            "{selector} | stats by (_time:{}) count() as value",
+            "{selector} | stats by (_time:{}) rate() as value",
             cfg.verify.range
         ),
     }
