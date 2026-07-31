@@ -155,6 +155,34 @@ reason expires now — the bed is built and its baseline is published.
       describes the digest that run used. The next `compare/run.sh` publishes the extended one; regenerating it
       from the old artifacts would print the new prose over old digests.
 
+- [x] **A bounded scan over a multi-stream row group dropped the newest rows.**
+      *Found by:* the three-way bed's strict row-equality check, live — `{app="checkout"}` with
+      `direction=backward`, `limit=100`: Loki returned the window's newest hundred rows and loggytracy
+      returned a hundred rows from the *middle* of the window. Two of 24 `label_only` queries and the same
+      two `(app, window)` pairs under `json_field`, wherever the part layout happened to align.
+      *Cause:* `scan_batch` answered a row beyond the sink's frontier with `ScanStep::StopGroup`, on the
+      stated premise that "a row group is one stream's run, ordered by time". It is not: `row_group_bounds`
+      cuts per tenant × size only, so a group holds several whole streams, each ordered inside itself — the
+      backward walk fed the sink one stream's tail, the frontier tightened on it, and the rest of the group,
+      including other streams' newer rows, was skipped. Forward had the same defect: it returned the first
+      stream's oldest rows instead of the oldest rows.
+      *Fixed by:* deleting `StopGroup` — a frontier crossing now rejects the row, never the group; the only
+      group-level skip is `span_beyond_frontier` over `meta.json`'s recorded span, which is sound regardless
+      of interleaving. The backward doubling-window walk from the group's end is gone with it, because
+      windowing from the end is only exact when the end is the newest row; a backward group is decoded once
+      and offered newest-batch-first.
+      *Verify with:* `part::tests::a_limited_scan_over_interleaved_streams_returns_what_truncation_would` —
+      two time-interleaved streams in one group, both directions, asserted equal to unlimited-scan-then-
+      truncate; red before the fix ([0,2,4,6,8] where truncation gives [0,1,2,3,4]). End to end: the bed's
+      strict agreement, 24/24 on every shape after the fix.
+      *Cost, measured and accepted:* `benches/query.rs` backward improved everywhere (`line_filter` −56% to
+      4.81 ms, `json_field` −15% to 12.43 ms — better than the pre-layout 13.07 ms the backward-regression
+      item wanted back) and **forward regressed +108–139%** (`label_only` 1.65 → 3.93 ms), because forward's
+      early group exit was the same unsound assumption. Reading less than a whole group needs the format to
+      record that the group is time-ordered; that flag rides Phase 2's meta change, and projection pushdown
+      shrinks what "whole group" costs. A slower right answer over a faster wrong one is not a trade this
+      repository debates.
+
 ## M8 — the ruler (precondition for everything after it)
 
 No optimization starts before this. Every performance number currently in the repository was produced by a
@@ -348,27 +376,43 @@ client: **VictoriaLogs makes ingested rows searchable after an in-memory flush**
 queried immediately after seeding. `compare/run.sh` settles for 150 s and would not have hit it. loggytracy
 and Loki answer from their memtable and ingester, so the bed's settle was never load-bearing before and is now.
 
-### What still does not agree, after the fixes
+### What did not agree, and every cause — all four resolved
 
-| shape | lt rows | Loki rows | VL rows | lt = Loki (strict) | lt = VL (reduced) |
-|---|---|---|---|---|---|
-| `label_only` | 2,400 | 2,400 | 2,400 | 24/24 | 0/24 |
-| `line_filter` | 2,008 | 2,008 | **1,147** | 24/24 | 0/24 |
-| `json_field` | 2,393 | 2,393 | 2,393 | 24/24 | 0/24 |
-| `json_field_rare` | 72 | 72 | 72 | **8/24** | 0/24 |
-| `metadata_rare` | 72 | 72 | 72 | 24/24 | 0/24 |
-| `rate` | 41 | 41 | **24** | 24/24 | 0/24 |
+Verified by a full `compare/run.sh` smoke (30,000 rows, 8 streams, limit 100, all three containerized):
+**every pair, every shape, 24/24** — strict between loggytracy and Loki, reduced against VictoriaLogs.
 
-- [ ] **`line_filter` is still 2,008 against 1,147 and the substring fix was not the cause** — both filters
-      return 154 on this corpus, so the phrases do not straddle tokens. Something else differs per query
-- [ ] **`rate` is 41 series against 24** and `rate()` is now the right function, so this is bucket alignment
-      rather than units
-- [ ] **The reduced digest still cannot agree**, 0/24 everywhere: the VictoriaLogs parser puts `_msg` in the
-      field set and the LogQL parser puts the line nowhere. A basis that cannot match is worse than none
-- [ ] **loggytracy and Loki disagree on 16 of 24 `json_field_rare` answers** with the same 72 rows on both
-      sides. Two systems that share a basis, on the shape whose point is a rare value
+- [x] **`line_filter` 2,008 against 1,147 — the corpus, not either engine.** `corpus::json_line` named its
+      free-text key `msg`; VictoriaLogs parses JSON at ingest and keeps the message only under `_msg`, so
+      every JSON row's text was discarded and `~"phrase"` (a filter on `_msg`) could not see it —
+      plain+logfmt are 5 weight in 10, which is exactly 1,147/2,008. The key is `_msg` now, so all three
+      engines see the message where they expect it; a unit test pins that `| json` extracting a field named
+      `_msg` stays an ordinary field on this side
+- [x] **`rate` 41 series against 24 — the window was a question only one language could ask.** The LogQL
+      side sampled a 1m sliding window on a 10s step; LogsQL has only tumbling `_time` buckets. The rate
+      window now *equals* the step and the first evaluation point moves one step in, which is the one
+      configuration where consecutive lookbacks tile the range exactly as buckets do. Two residues, both
+      converted rather than exempted: LogsQL labels a bucket by its epoch-aligned *start* where LogQL labels
+      the evaluation point — the digest adds the query's own step; and a bucket closing on the dataset's
+      trailing edge is asymmetric between `(start, end]` and `[start, end)` — measured as 124.9 against
+      125.0, one boundary row — so rate windows are slid one step off the data's edge
+- [x] **The reduced digest could never agree, and the fix was choosing the right basis.** "Timestamp plus
+      the whole field set" compares the *storage models*: schema-on-write returns every field it parsed,
+      schema-on-read returns what the pipeline produced, so 0/24 was the checker disagreeing with itself.
+      The basis is now the row's nanosecond timestamp plus **the fields the query itself named**
+      (`Query::basis_fields`) — the one set of fields every system returns for the same row — with
+      VictoriaLogs' RFC 3339 `_time` converted to the nanosecond encoding the Loki side already used.
+      Unit tests digest a hand-built Loki-shape and LogsQL-shape pair equal, for a log and a metric answer
+- [x] **`json_field_rare` 8/24 against Loki — a label loggytracy never attached.** Loki pairs `__error__`
+      with `__error_details__` on a parser failure and Grafana renders both; loggytracy set only the first.
+      It sets both now. The details *text* is each engine's parser internals — Loki's comes from its JSON
+      library — so the digest compares the label's presence and normalizes its value, an exemption by name,
+      stated in the report with counts
+- [x] **And one more the agreement check caught that no translation explains — see "Open correctness
+      defects": a backward `limit=100` returned rows from the middle of the window.** The strict digest
+      against Loki is what surfaced it; it was never a three-way issue at all
 
-**No timing table is published from this run.** Agreement first.
+**The timing table from this configuration is published by `compare/run.sh` itself now**, and only because
+every shape agrees — the report withholds a ratio for any shape that does not.
 
 ## The three-way table was published without an agreement check, and it should not have been
 
@@ -400,15 +444,24 @@ question that was flagged as hard and then answered with a shortcut.
 Between two systems that *do* share a basis, with the same 72 rows returned on both sides, so the difference
 is content rather than count. Unnoticed because this run looked at no agreement at all.
 
-- [ ] **Fix the reduced basis so it is actually common**, and add a test that a hand-built pair of responses
-      in the two shapes digests equal. A basis that cannot agree is worse than no basis: it reports a
-      disagreement that is its own
-- [ ] **Investigate the 16 `json_field_rare` disagreements between loggytracy and Loki.** Same count,
-      different content, on the shape whose whole point is a rare value
-- [ ] **Fold VictoriaLogs into `compare/run.sh`** so a three-way run cannot skip the check. The shell loop is
-      how the check got skipped; the fix is to stop having a path that can
-- [ ] **Gate the timing table on agreement.** The report should refuse to print a ratio for a shape whose
-      answers disagree, rather than printing it with a caveat underneath
+- [x] **Fix the reduced basis so it is actually common** — done; the basis is the query's own fields, the
+      full argument and the cross-shape digest tests are recorded in the section above
+- [x] **Investigate the 16 `json_field_rare` disagreements between loggytracy and Loki** — `__error_details__`,
+      a label Loki attaches on parser failure and loggytracy did not; attached now, wording exempted by name
+- [x] **Fold VictoriaLogs into `compare/run.sh`** — `compare/docker-compose.yml` grew a pinned
+      `victoria-logs:v1.52.0` service and `run.sh` is rewritten around a `TARGETS` list with per-target
+      readiness (`/health`), volume-mounted disk measurement (the image is built from scratch and has no
+      shell to `exec du` in), a per-target settle flush (`/internal/force_flush` — the settle is
+      load-bearing for VictoriaLogs, not a courtesy), and a three-way `bed.json`. There is no per-target
+      code path left to fork, so a run that includes a system includes its checks. The load phase asks
+      VictoriaLogs LogsQL at its own endpoint with the same seeded rolls, so its ingest runs under the same
+      concurrent read load as the other two
+- [x] **Gate the timing table on agreement** — `compare_report` now prints agreement per pair per shape
+      *before* any timing, and every ratio cell is `gated_ratio`: a shape whose answers disagree prints
+      `withheld (N/M disagree)` where the ratio would be. The verdict computes only over agreeing shapes.
+      One subtlety a binding limit forced: a bare LogsQL `limit` has no order contract and returned the
+      window's *oldest* rows where `direction=backward` returns the newest — disjoint 100-row sets that are
+      both "100 rows from the window" — so every translated `limit` is now `sort by (_time) desc | limit`
 
 VictoriaLogs does **not** serve the Loki query API — `/loki/api/v1/query_range` answers `unsupported path
 requested`. Only ingest is Loki-compatible. So translating to LogsQL is forced rather than chosen, and the
@@ -627,20 +680,25 @@ Measured on `benches/query.rs`, limit 100 over 202,000 rows, against the pre-lay
 **Four improved, one flat, and one regressed — the claim's own shape, in Grafana's default direction.** That
 is not a caveat to a win; it is the thing to fix next.
 
-- [ ] **Backward scans read a row group from its end, and the end is no longer the newest row.**
-      `reader.rs` reads a group in doubling windows with `with_offset` from the last record, which was exact
-      when a group was one timestamp-ordered run. A group now holds several whole streams, each ordered by
-      time inside itself, so its last records are the last *stream's*, not the latest. The window walk is
-      still correct — the sink ranks what it is given — but it no longer reaches the newest rows first, so
-      the frontier tightens late and more of the group is read. Either merge the group's streams by time
-      within the read, or stop windowing from the end when a group holds more than one stream and read it
-      whole
+- [x] **Backward scans read a row group from its end, and the end is no longer the newest row.** The
+      diagnosis above was half of it — "the window walk is still correct" was the other half, and it was
+      **wrong**: the walk plus `StopGroup` returned rows from the middle of the window, which the three-way
+      bed caught as a strict disagreement with Loki. See "Open correctness defects" at the top of this file
+      for the full account. Of the two fixes this item proposed, "read it whole" won, unconditionally for
+      now: choosing per group needs the format to say which groups are time-ordered, and that flag rides the
+      next format change. Backward is *better* than the pre-layout numbers (`json_field` 12.43 ms against
+      the 13.07 this item wanted back); forward paid +108–139% for losing an early exit that was the same
+      unsound assumption, and that cost is recorded in the defect entry rather than smoothed over
 - [ ] **Cutting a row group on every stream change is not the answer, and was measured.** With 128 streams
       over 8 parts it turned ~3 row groups per part into 128, all far under `row_group_size`, and per-group
       cost swamped the pruning: `label_only` forward went 2.04 → 5.19 ms while reading *half* the rows. The
       selectivity comes from the sort order, not from the cut. Recorded so it is not retried
-- [ ] Re-run `compare/run.sh` once the backward path is fixed. The bench says what changed in isolation; only
-      the bed says whether it moved against Loki
+- [ ] **Record per-group time-monotonicity in `meta.json`** (`row_group_ts_monotonic`, with the next format
+      change), and gate the windowed backward walk and forward's early group exit on it. A single-stream
+      group is exactly the case both were correct on, and it is the common case at low cardinality
+- [x] Re-run `compare/run.sh` once the backward path is fixed — the three-way run at the top of "The
+      languages can ask the same question" is that run, and the fix is what took `label_only` and
+      `json_field` from 22/24 to 24/24 strict
 
 ## M10 — declared memory budget ([`docs/VISION.md`](docs/VISION.md) I)
 
