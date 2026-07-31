@@ -545,6 +545,14 @@ fn part_writer_properties(row_group_size: usize) -> WriterProperties {
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_column_statistics_enabled(ColumnPath::from("timestamp_ns"), EnabledStatistics::Page)
+        // Without a row bound a whole 8192-row group's timestamp chunk fits
+        // one default-sized page, and one page per chunk makes the page index
+        // exactly as coarse as the group bounds it exists to refine — measured
+        // as a two-second window costing what the whole range costs. At 1024
+        // rows a page, a stream's run inside a group carries usefully tight
+        // per-page time bounds; the cost is more pages everywhere, which the
+        // write bench and the disk axis price.
+        .set_data_page_row_count_limit(1024)
         .build()
 }
 
