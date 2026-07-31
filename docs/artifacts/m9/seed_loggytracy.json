@@ -1,6 +1,6 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-ddd4ec122445357d56a3445f1311fdc285e66c4b42fc5d0809ef43ffb196c9bc.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-8e63b6a5e24285557e8d32a6aef247a5300010c4c428938a2fcdf703fb1fa704.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
@@ -52,7 +52,7 @@
     "tenants": 4,
     "tier": "B",
     "verify": {
-      "anchor_ns": 1785484040000000000,
+      "anchor_ns": 1785485120000000000,
       "entries_per_push": 100,
       "labels_per_stream": 6,
       "limit": 20000,
@@ -68,24 +68,24 @@
     "warmup_seconds": 10
   },
   "memory": {
-    "anon_bytes_end": 1831706624,
-    "anon_peak_bytes": 1831473152,
-    "current_bytes": 2147446784,
+    "anon_bytes_end": 1643982848,
+    "anon_peak_bytes": 1814790144,
+    "current_bytes": 2025369600,
     "error": null,
-    "file_bytes_end": 301199360,
-    "peak_bytes": 2147524608,
+    "file_bytes_end": 363802624,
+    "peak_bytes": 2147483648,
     "peak_bytes_before": 2147483648,
-    "source": "/sys/fs/cgroup/system.slice/docker-ddd4ec122445357d56a3445f1311fdc285e66c4b42fc5d0809ef43ffb196c9bc.scope/memory.peak"
+    "source": "/sys/fs/cgroup/system.slice/docker-8e63b6a5e24285557e8d32a6aef247a5300010c4c428938a2fcdf703fb1fa704.scope/memory.peak"
   },
   "phase": "seed",
   "run": {
-    "build_revision": "d91014b",
+    "build_revision": "640a996",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "seed": 1592598566
   },
   "seed": {
     "complete": true,
-    "elapsed_seconds": 5.419528909,
+    "elapsed_seconds": 5.436434279,
     "errors": 0,
     "first_error": null,
     "line_bytes": 49029829,
@@ -95,12 +95,12 @@
     "statuses": {
       "204": 1504
     },
-    "wire_bytes": 23457433
+    "wire_bytes": 23459613
   },
   "target": "loggytracy",
   "verdict": "PASS",
   "verify": {
-    "anchor_ns": 1785484040000000000,
+    "anchor_ns": 1785485120000000000,
     "line_bytes": 49029829,
     "rows": 150000,
     "span_ns": 150000000000,

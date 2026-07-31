@@ -1,6 +1,6 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-83a024996e9fb4a30077c3d33345c620ce29ed7a3342cabdf2d075febd8ac0d3.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-eca609442a0afe37fe101c300ecb3c3010ddf87909400ca71b4a4ca2c856f5ea.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
@@ -52,7 +52,7 @@
     "tenants": 4,
     "tier": "B",
     "verify": {
-      "anchor_ns": 1785484040000000000,
+      "anchor_ns": 1785485120000000000,
       "entries_per_push": 100,
       "labels_per_stream": 6,
       "limit": 20000,
@@ -70,13 +70,13 @@
   "matrix": {
     "answers": [
       {
-        "cold_ms": 184.23055699999998,
-        "digest": "7a57f688af0e1aca",
+        "cold_ms": 182.193064,
+        "digest": "0daa9a1e6eedbec2",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"api-gateway\"}",
         "id": "label_only/api-gateway/w0",
@@ -92,7 +92,7 @@
         ],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "d4ecc7aa60f798da",
+        "reduced_digest": "c8821c748b700362",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -102,25 +102,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          191.497236,
-          194.15266400000002,
-          190.293778,
-          186.792392,
-          189.715945
+          186.97587800000002,
+          189.618943,
+          188.485026,
+          189.281545,
+          182.922417
         ]
       },
       {
-        "cold_ms": 169.669972,
-        "digest": "e3ecb1b7152b37c9",
+        "cold_ms": 175.11216,
+        "digest": "ee9cfdc32d9171c1",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"api-gateway\"}",
         "id": "label_only/api-gateway/w1",
@@ -136,7 +136,7 @@
         ],
         "lines_processed": 6490,
         "ordered": true,
-        "reduced_digest": "efe3ade9bb1f10a8",
+        "reduced_digest": "31018765f1e3cec8",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -146,25 +146,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          171.840699,
-          180.608637,
-          176.30390300000002,
-          180.41485500000002,
-          176.73977399999998
+          172.123713,
+          182.383988,
+          179.94365000000002,
+          178.81255800000002,
+          179.091375
         ]
       },
       {
-        "cold_ms": 177.854493,
-        "digest": "8c914b09129667f6",
+        "cold_ms": 175.722726,
+        "digest": "1596a219287231b2",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"api-gateway\"}",
         "id": "label_only/api-gateway/w2",
@@ -180,7 +180,7 @@
         ],
         "lines_processed": 6711,
         "ordered": true,
-        "reduced_digest": "93d9d4b8a1bea6ac",
+        "reduced_digest": "60979ffefa7ce9a8",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -190,25 +190,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          182.743356,
-          179.718274,
-          178.73576,
-          175.626462,
-          180.889688
+          176.927161,
+          178.450313,
+          180.318714,
+          178.933937,
+          178.839411
         ]
       },
       {
-        "cold_ms": 175.14744900000002,
-        "digest": "7a8d826faec42232",
+        "cold_ms": 173.166968,
+        "digest": "63019c5055904222",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"billing\"}",
         "id": "label_only/billing/w0",
@@ -224,7 +224,7 @@
         ],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "f8465d63121fc104",
+        "reduced_digest": "f3b0a620cd0de304",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -234,25 +234,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          175.55443400000001,
-          174.644836,
-          178.52945300000002,
-          174.00760200000002,
-          173.405481
+          174.918109,
+          177.210015,
+          172.915815,
+          180.57637000000003,
+          173.45356
         ]
       },
       {
-        "cold_ms": 177.848712,
-        "digest": "f9bb315bf688594e",
+        "cold_ms": 170.386748,
+        "digest": "b4590e6e9a44224e",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"billing\"}",
         "id": "label_only/billing/w1",
@@ -268,7 +268,7 @@
         ],
         "lines_processed": 6600,
         "ordered": true,
-        "reduced_digest": "4c0e571a367a8952",
+        "reduced_digest": "fb696665bb1c5672",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -278,25 +278,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          177.896522,
-          175.169823,
-          173.515967,
-          172.62927200000001,
-          170.261707
+          174.238583,
+          175.19200500000002,
+          170.79440200000002,
+          177.669913,
+          174.960529
         ]
       },
       {
-        "cold_ms": 181.150743,
-        "digest": "f53cb9d16fcc1772",
+        "cold_ms": 179.401093,
+        "digest": "64643512b1378444",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"billing\"}",
         "id": "label_only/billing/w2",
@@ -312,7 +312,7 @@
         ],
         "lines_processed": 6849,
         "ordered": true,
-        "reduced_digest": "73807a416d735786",
+        "reduced_digest": "54924498022032b2",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -322,25 +322,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          170.470225,
-          174.768248,
-          170.65954299999999,
-          176.299787,
-          174.344525
+          172.8577,
+          175.94705299999998,
+          178.727146,
+          183.448002,
+          176.515839
         ]
       },
       {
-        "cold_ms": 172.61193699999998,
-        "digest": "125472d8ddd92515",
+        "cold_ms": 178.11592000000002,
+        "digest": "85be6cb9932f2cc9",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"checkout\"}",
         "id": "label_only/checkout/w0",
@@ -356,7 +356,7 @@
         ],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "9b63e423237a2780",
+        "reduced_digest": "1316fe0b5b02d998",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -366,25 +366,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          170.31811,
-          173.088814,
-          173.090147,
-          177.439016,
-          171.19493899999998
+          169.51282,
+          177.684876,
+          173.506213,
+          176.765435,
+          180.604867
         ]
       },
       {
-        "cold_ms": 178.80097,
-        "digest": "5e7d8016573c600a",
+        "cold_ms": 171.95372,
+        "digest": "d0a26dc1c45b0c72",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"checkout\"}",
         "id": "label_only/checkout/w1",
@@ -400,7 +400,7 @@
         ],
         "lines_processed": 6448,
         "ordered": true,
-        "reduced_digest": "31f791705e5b84fa",
+        "reduced_digest": "24853cb14e61484a",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -410,25 +410,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          169.88665,
-          175.024169,
-          175.49024599999998,
-          174.167483,
-          177.137361
+          178.49050599999998,
+          183.70100300000001,
+          176.755293,
+          181.930132,
+          175.612464
         ]
       },
       {
-        "cold_ms": 179.075275,
-        "digest": "d54b07b59845aa46",
+        "cold_ms": 178.38719,
+        "digest": "f64200927cc57424",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"checkout\"}",
         "id": "label_only/checkout/w2",
@@ -444,7 +444,7 @@
         ],
         "lines_processed": 6757,
         "ordered": true,
-        "reduced_digest": "cba94687801fad8a",
+        "reduced_digest": "4d6d74f007e8a12a",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -454,25 +454,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          190.852595,
-          176.385706,
-          176.82381,
-          177.513616,
-          176.21457700000002
+          174.05579,
+          183.573882,
+          170.586912,
+          179.806004,
+          174.672899
         ]
       },
       {
-        "cold_ms": 179.559364,
-        "digest": "22b487ababe480cd",
+        "cold_ms": 185.28950799999998,
+        "digest": "b71e1950546b0f31",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"ingest\"}",
         "id": "label_only/ingest/w0",
@@ -488,7 +488,7 @@
         ],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "ae1f705da13d2e1a",
+        "reduced_digest": "60dc6d033a6a8eaa",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -498,25 +498,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          180.77665100000002,
-          173.277528,
-          174.492892,
-          174.670086,
-          168.25061
+          174.306211,
+          176.743839,
+          175.926478,
+          173.38731299999998,
+          178.40367400000002
         ]
       },
       {
-        "cold_ms": 181.970032,
-        "digest": "85f534979214b34e",
+        "cold_ms": 175.822384,
+        "digest": "421814c91f2a3bec",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"ingest\"}",
         "id": "label_only/ingest/w1",
@@ -532,7 +532,7 @@
         ],
         "lines_processed": 6537,
         "ordered": true,
-        "reduced_digest": "d386f621154144c8",
+        "reduced_digest": "837dac75ed071b00",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -542,25 +542,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          173.310189,
-          174.35973099999998,
-          178.890511,
-          173.35432500000002,
-          168.73169399999998
+          169.541835,
+          174.53702600000003,
+          176.04620300000002,
+          176.966172,
+          176.75986799999998
         ]
       },
       {
-        "cold_ms": 176.09609,
-        "digest": "afb9cbddaeec4986",
+        "cold_ms": 175.274084,
+        "digest": "cfb67a61bc1a7a70",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"ingest\"}",
         "id": "label_only/ingest/w2",
@@ -576,7 +576,7 @@
         ],
         "lines_processed": 6717,
         "ordered": true,
-        "reduced_digest": "8ac6863f34fe2b68",
+        "reduced_digest": "a691fa0301d3bc40",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -586,25 +586,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          171.903638,
-          176.785607,
-          182.291469,
-          172.681852,
-          174.747712
+          171.710667,
+          177.698702,
+          183.951275,
+          176.317405,
+          177.471624
         ]
       },
       {
-        "cold_ms": 177.090108,
-        "digest": "be31d460d1c9cf70",
+        "cold_ms": 171.80606400000002,
+        "digest": "7484cf76aceeeeec",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"notifier\"}",
         "id": "label_only/notifier/w0",
@@ -620,7 +620,7 @@
         ],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "fa6fe7078ce2f6a2",
+        "reduced_digest": "f009c888d7ad3262",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -630,25 +630,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          176.93155099999998,
-          174.793165,
-          170.710629,
-          181.53204300000002,
-          179.194173
+          179.642249,
+          181.647426,
+          176.525292,
+          180.38221700000003,
+          183.096855
         ]
       },
       {
-        "cold_ms": 174.661386,
-        "digest": "bca61b282544833d",
+        "cold_ms": 176.936216,
+        "digest": "2267f7da7802d275",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"notifier\"}",
         "id": "label_only/notifier/w1",
@@ -664,7 +664,7 @@
         ],
         "lines_processed": 6544,
         "ordered": true,
-        "reduced_digest": "33910a901ccfa208",
+        "reduced_digest": "f5709d65f5c079a8",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -674,25 +674,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          166.799932,
-          171.022534,
-          179.303396,
-          173.048812,
-          177.8931
+          175.613435,
+          176.109058,
+          175.577583,
+          176.86320899999998,
+          178.03159499999998
         ]
       },
       {
-        "cold_ms": 176.69183999999998,
-        "digest": "5198254b78743698",
+        "cold_ms": 176.120704,
+        "digest": "ba012ffb4b1f7848",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"notifier\"}",
         "id": "label_only/notifier/w2",
@@ -708,7 +708,7 @@
         ],
         "lines_processed": 6813,
         "ordered": true,
-        "reduced_digest": "adeb6850b90560a0",
+        "reduced_digest": "8f55bd78989828b0",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -718,25 +718,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          181.203634,
-          178.65652200000002,
-          177.776711,
-          183.381677,
-          177.324643
+          170.572821,
+          175.080768,
+          177.88744,
+          183.408228,
+          172.818207
         ]
       },
       {
-        "cold_ms": 178.204881,
-        "digest": "6536d8db1498a41f",
+        "cold_ms": 175.736133,
+        "digest": "d23c52fa9a235239",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"scheduler\"}",
         "id": "label_only/scheduler/w0",
@@ -752,7 +752,7 @@
         ],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "2221ec9611d3d6e4",
+        "reduced_digest": "07be986bae409dac",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -762,25 +762,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          177.700184,
-          178.898867,
-          178.136535,
-          177.79319099999998,
-          178.062408
+          179.237108,
+          178.654247,
+          175.627537,
+          177.64379499999998,
+          175.231288
         ]
       },
       {
-        "cold_ms": 181.31372000000002,
-        "digest": "e8a3c62b8ba4a59a",
+        "cold_ms": 182.06144799999998,
+        "digest": "8c73bc40b3f51d62",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"scheduler\"}",
         "id": "label_only/scheduler/w1",
@@ -796,7 +796,7 @@
         ],
         "lines_processed": 6568,
         "ordered": true,
-        "reduced_digest": "1b4216c52782b1ce",
+        "reduced_digest": "ac09ed0ace855296",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -806,25 +806,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          174.07942400000002,
-          172.499257,
-          175.93453,
-          181.930121,
-          177.073661
+          173.93363200000002,
+          180.26271699999998,
+          179.937038,
+          180.32387699999998,
+          173.216616
         ]
       },
       {
-        "cold_ms": 180.677785,
-        "digest": "85afdbd2cb8df35c",
+        "cold_ms": 176.706975,
+        "digest": "a98a78c3f980c908",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"scheduler\"}",
         "id": "label_only/scheduler/w2",
@@ -840,7 +840,7 @@
         ],
         "lines_processed": 6843,
         "ordered": true,
-        "reduced_digest": "b2089f9652506ad6",
+        "reduced_digest": "f9c4b9f95470f906",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -850,25 +850,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          176.847252,
-          181.580061,
-          175.15736,
-          183.594006,
-          168.983647
+          179.831574,
+          176.569884,
+          181.372713,
+          174.588248,
+          177.140082
         ]
       },
       {
-        "cold_ms": 169.681273,
-        "digest": "279018813d761ead",
+        "cold_ms": 177.427869,
+        "digest": "d7831ada0e5586f9",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"search\"}",
         "id": "label_only/search/w0",
@@ -884,7 +884,7 @@
         ],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "5bde6538e3117724",
+        "reduced_digest": "527324cfd5208254",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -894,25 +894,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          175.660464,
-          171.008848,
-          175.808934,
-          176.73248999999998,
-          176.219527
+          175.265622,
+          169.891594,
+          172.513089,
+          176.179495,
+          172.639522
         ]
       },
       {
-        "cold_ms": 174.833549,
-        "digest": "1763c59dc538fa16",
+        "cold_ms": 171.17016900000002,
+        "digest": "cd8075e8197da4f4",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"search\"}",
         "id": "label_only/search/w1",
@@ -928,7 +928,7 @@
         ],
         "lines_processed": 6493,
         "ordered": true,
-        "reduced_digest": "d000840dd5cdb93e",
+        "reduced_digest": "467dc6b9ed7a046e",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -938,25 +938,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          184.535641,
-          171.261252,
-          174.254304,
-          171.07822000000002,
-          181.251518
+          171.719193,
+          181.84593900000002,
+          177.35852699999998,
+          175.023776,
+          180.018657
         ]
       },
       {
-        "cold_ms": 176.799522,
-        "digest": "5decdbc00f28c003",
+        "cold_ms": 173.420485,
+        "digest": "147444bb7adfa60d",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"search\"}",
         "id": "label_only/search/w2",
@@ -972,7 +972,7 @@
         ],
         "lines_processed": 6737,
         "ordered": true,
-        "reduced_digest": "1a612a414bfe4be2",
+        "reduced_digest": "c520e86f2d00b496",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -982,25 +982,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          170.66647300000002,
-          176.785287,
-          177.844668,
-          173.659779,
-          170.328714
+          172.250771,
+          178.254396,
+          173.131099,
+          167.25257499999998,
+          180.268125
         ]
       },
       {
-        "cold_ms": 175.012145,
-        "digest": "1ea08d2f595e2f2b",
+        "cold_ms": 168.40154099999998,
+        "digest": "ff9f99293193296f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"web\"}",
         "id": "label_only/web/w0",
@@ -1016,7 +1016,7 @@
         ],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "6a248b213be422e8",
+        "reduced_digest": "9d9f6a4bd7316318",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -1026,25 +1026,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          169.02907,
-          172.995629,
-          171.700197,
-          176.55016700000002,
-          176.48602799999998
+          168.405973,
+          175.018079,
+          171.229129,
+          178.14552799999998,
+          171.355751
         ]
       },
       {
-        "cold_ms": 174.667328,
-        "digest": "d7e70d881d91653e",
+        "cold_ms": 170.628793,
+        "digest": "72acd8556d232fbe",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"web\"}",
         "id": "label_only/web/w1",
@@ -1060,7 +1060,7 @@
         ],
         "lines_processed": 6536,
         "ordered": true,
-        "reduced_digest": "62bb5af81bd4e2ba",
+        "reduced_digest": "8f10e380a6e9828a",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -1070,25 +1070,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          180.166035,
-          170.741095,
-          171.780448,
-          176.848808,
-          172.769327
+          170.901589,
+          166.859322,
+          175.445725,
+          180.671841,
+          174.009955
         ]
       },
       {
-        "cold_ms": 170.639182,
-        "digest": "093205faedc6c14b",
+        "cold_ms": 174.46437500000002,
+        "digest": "f7f3efefe98b4441",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"web\"}",
         "id": "label_only/web/w2",
@@ -1104,7 +1104,7 @@
         ],
         "lines_processed": 6841,
         "ordered": true,
-        "reduced_digest": "3b49928f7720fe32",
+        "reduced_digest": "b4f819dd4e7b7caa",
         "result_type": "streams",
         "rows": 6250,
         "sample": [
@@ -1114,25 +1114,25 @@
         ],
         "series": 6250,
         "shape": "label_only",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          173.516527,
-          169.541423,
-          173.69329,
-          176.766934,
-          174.814418
+          169.555371,
+          182.291106,
+          175.752282,
+          174.350281,
+          187.784167
         ]
       },
       {
-        "cold_ms": 23.486308,
-        "digest": "360e4d87ecd97dfc",
+        "cold_ms": 23.187615,
+        "digest": "9a22c838134d1081",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"api-gateway\"} |= \"request completed successfully\"",
         "id": "line_filter/api-gateway/w0",
@@ -1148,7 +1148,7 @@
         ],
         "lines_processed": 6281,
         "ordered": true,
-        "reduced_digest": "3337b070a7d3fc3c",
+        "reduced_digest": "c1179bbe70e5f3c4",
         "result_type": "streams",
         "rows": 399,
         "sample": [
@@ -1158,25 +1158,25 @@
         ],
         "series": 399,
         "shape": "line_filter",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          24.225868000000002,
-          23.361144,
-          22.761929,
-          25.27538,
-          24.041902
+          22.597717,
+          24.467928,
+          23.953111999999997,
+          23.502506999999998,
+          22.978754000000002
         ]
       },
       {
-        "cold_ms": 22.837289000000002,
-        "digest": "da3dfb1b4d2b3e91",
+        "cold_ms": 23.524036000000002,
+        "digest": "8dc5c9cd6594053e",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"api-gateway\"} |= \"upstream connection reset by peer, retrying\"",
         "id": "line_filter/api-gateway/w1",
@@ -1192,7 +1192,7 @@
         ],
         "lines_processed": 6518,
         "ordered": true,
-        "reduced_digest": "b7ffd2b37f2627e2",
+        "reduced_digest": "2961e14c24558c41",
         "result_type": "streams",
         "rows": 424,
         "sample": [
@@ -1202,25 +1202,25 @@
         ],
         "series": 424,
         "shape": "line_filter",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          25.023927,
-          25.482979999999998,
-          23.707145,
-          24.050288,
-          23.758411
+          23.235345000000002,
+          25.831971,
+          24.147307,
+          23.808703,
+          24.931269999999998
         ]
       },
       {
-        "cold_ms": 24.275871000000002,
-        "digest": "92898bbf17110eeb",
+        "cold_ms": 23.685068,
+        "digest": "93225b2c0c2eb7b5",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"api-gateway\"} |= \"cache miss, restoring object from remote store\"",
         "id": "line_filter/api-gateway/w2",
@@ -1236,7 +1236,7 @@
         ],
         "lines_processed": 6711,
         "ordered": true,
-        "reduced_digest": "a8925954164fbe09",
+        "reduced_digest": "0568729bf8a62b09",
         "result_type": "streams",
         "rows": 428,
         "sample": [
@@ -1246,25 +1246,25 @@
         ],
         "series": 428,
         "shape": "line_filter",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          26.832112000000002,
-          26.779785,
-          24.155124999999998,
-          24.470548,
-          24.169473
+          23.533775,
+          25.334787000000002,
+          26.404586000000002,
+          24.512463,
+          28.039846
         ]
       },
       {
-        "cold_ms": 25.977166999999998,
-        "digest": "302ecf20d1aeb4c7",
+        "cold_ms": 23.347074,
+        "digest": "92431296ead1a70d",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"billing\"} |= \"tenant quota exceeded, shedding load\"",
         "id": "line_filter/billing/w0",
@@ -1280,7 +1280,7 @@
         ],
         "lines_processed": 6290,
         "ordered": true,
-        "reduced_digest": "5ee577e379737777",
+        "reduced_digest": "b59a8127c9121b47",
         "result_type": "streams",
         "rows": 452,
         "sample": [
@@ -1290,25 +1290,25 @@
         ],
         "series": 452,
         "shape": "line_filter",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          24.465217000000003,
-          23.757549,
-          25.624585,
-          24.763268,
-          26.5746
+          23.763616000000003,
+          24.41499,
+          24.150944,
+          24.845017000000002,
+          25.018013
         ]
       },
       {
-        "cold_ms": 23.031745,
-        "digest": "ddf396e1c9aebab0",
+        "cold_ms": 22.680763,
+        "digest": "756b862d3cdd6533",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"billing\"} |= \"backpressure engaged: memtable above threshold\"",
         "id": "line_filter/billing/w1",
@@ -1324,7 +1324,7 @@
         ],
         "lines_processed": 6627,
         "ordered": true,
-        "reduced_digest": "ab9a5b6754fa4a9a",
+        "reduced_digest": "ecb09c734f00d8e1",
         "result_type": "streams",
         "rows": 396,
         "sample": [
@@ -1334,25 +1334,25 @@
         ],
         "series": 396,
         "shape": "line_filter",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          22.488205,
-          22.301703999999997,
-          22.287969,
-          23.442157,
-          23.327431
+          24.328818,
+          24.591110999999998,
+          22.221251000000002,
+          24.65904,
+          23.041892
         ]
       },
       {
-        "cold_ms": 23.173502,
-        "digest": "0af0eea88c2f6008",
+        "cold_ms": 24.306776,
+        "digest": "8648a23fa4e9ea18",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"billing\"} |= \"flush segment committed, manifest generation advanced\"",
         "id": "line_filter/billing/w2",
@@ -1368,7 +1368,7 @@
         ],
         "lines_processed": 6849,
         "ordered": true,
-        "reduced_digest": "30b18098de015e23",
+        "reduced_digest": "1fd23fe18b05a677",
         "result_type": "streams",
         "rows": 414,
         "sample": [
@@ -1378,25 +1378,25 @@
         ],
         "series": 414,
         "shape": "line_filter",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          22.6405,
-          23.161058,
-          23.067071000000002,
-          24.190953,
-          22.601949
+          23.558421,
+          23.396277,
+          23.763517,
+          22.261477,
+          23.49315
         ]
       },
       {
-        "cold_ms": 23.462062999999997,
-        "digest": "d5e93c3984c8d763",
+        "cold_ms": 22.518329,
+        "digest": "15731977d806f636",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"checkout\"} |= \"compaction scheduled for partition\"",
         "id": "line_filter/checkout/w0",
@@ -1412,7 +1412,7 @@
         ],
         "lines_processed": 6300,
         "ordered": true,
-        "reduced_digest": "62c1ddf7cdf2f7f6",
+        "reduced_digest": "759e52364a15652e",
         "result_type": "streams",
         "rows": 419,
         "sample": [
@@ -1422,25 +1422,25 @@
         ],
         "series": 419,
         "shape": "line_filter",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          21.868862,
-          25.646305,
-          22.539571000000002,
-          22.462687,
-          22.23517
+          22.185864,
+          24.474941,
+          23.495924000000002,
+          22.018662000000003,
+          27.123686
         ]
       },
       {
-        "cold_ms": 27.194032,
-        "digest": "ded4ceefe0637786",
+        "cold_ms": 23.561646,
+        "digest": "59d5a8de21df0e96",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"checkout\"} |= \"row group pruned by bloom filter\"",
         "id": "line_filter/checkout/w1",
@@ -1456,7 +1456,7 @@
         ],
         "lines_processed": 6504,
         "ordered": true,
-        "reduced_digest": "bb5a7e5bb1032c25",
+        "reduced_digest": "c53b093bf6291d97",
         "result_type": "streams",
         "rows": 432,
         "sample": [
@@ -1466,25 +1466,25 @@
         ],
         "series": 432,
         "shape": "line_filter",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          25.561847,
-          23.966942000000003,
-          23.448088,
-          23.567472,
-          24.516063000000003
+          24.862069,
+          24.205076,
+          26.487742,
+          23.629165,
+          23.462002
         ]
       },
       {
-        "cold_ms": 23.078002,
-        "digest": "404828555a595767",
+        "cold_ms": 23.846873000000002,
+        "digest": "8f73b7dfb7b3d2ec",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"checkout\"} |= \"candidate deadline exceeded before first byte\"",
         "id": "line_filter/checkout/w2",
@@ -1500,7 +1500,7 @@
         ],
         "lines_processed": 6757,
         "ordered": true,
-        "reduced_digest": "1c4552e1d6aa2072",
+        "reduced_digest": "f9e4f804704c92f0",
         "result_type": "streams",
         "rows": 431,
         "sample": [
@@ -1510,25 +1510,25 @@
         ],
         "series": 431,
         "shape": "line_filter",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          24.169000999999998,
-          23.389246,
-          25.879264,
-          23.730518,
-          25.687082
+          25.850965,
+          24.040046,
+          23.248289,
+          27.813071,
+          24.315394
         ]
       },
       {
-        "cold_ms": 22.369242,
-        "digest": "6465088ddee68dea",
+        "cold_ms": 22.333279,
+        "digest": "61392961507e083f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"ingest\"} |= \"shard rebalanced after lease renewal\"",
         "id": "line_filter/ingest/w0",
@@ -1544,7 +1544,7 @@
         ],
         "lines_processed": 6302,
         "ordered": true,
-        "reduced_digest": "b6cff4cd6426ca10",
+        "reduced_digest": "e14e2928c576ebbc",
         "result_type": "streams",
         "rows": 403,
         "sample": [
@@ -1554,25 +1554,25 @@
         ],
         "series": 403,
         "shape": "line_filter",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          22.547396,
-          22.714781,
-          22.055622,
-          22.52809,
-          22.752642
+          21.818053,
+          23.107885000000003,
+          22.229226,
+          22.842739,
+          22.527207
         ]
       },
       {
-        "cold_ms": 22.479107000000003,
-        "digest": "8ba0af70b5ed26d9",
+        "cold_ms": 23.175993,
+        "digest": "6ac9cc386bc81dc5",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"ingest\"} |= \"checkpoint durable, replay resumed from offset\"",
         "id": "line_filter/ingest/w1",
@@ -1588,7 +1588,7 @@
         ],
         "lines_processed": 6569,
         "ordered": true,
-        "reduced_digest": "78e423232e11f112",
+        "reduced_digest": "3d0b3c95877055a8",
         "result_type": "streams",
         "rows": 424,
         "sample": [
@@ -1598,25 +1598,25 @@
         ],
         "series": 424,
         "shape": "line_filter",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          23.363348,
-          26.247424,
-          23.461984,
-          22.642275,
-          23.451605
+          23.312269999999998,
+          23.364759,
+          23.705178,
+          23.643131,
+          23.490586
         ]
       },
       {
-        "cold_ms": 25.942401,
-        "digest": "ee2e219be759241a",
+        "cold_ms": 25.681376999999998,
+        "digest": "f7af0d70934e1b22",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"ingest\"} |= \"connection idle, closing after keepalive timeout\"",
         "id": "line_filter/ingest/w2",
@@ -1632,7 +1632,7 @@
         ],
         "lines_processed": 6717,
         "ordered": true,
-        "reduced_digest": "6fd409d51b248ca6",
+        "reduced_digest": "2d2530b2e9293ef6",
         "result_type": "streams",
         "rows": 440,
         "sample": [
@@ -1642,25 +1642,25 @@
         ],
         "series": 440,
         "shape": "line_filter",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          23.649215,
-          23.890017999999998,
-          23.969828,
-          26.407877,
-          24.010213999999998
+          22.829562000000003,
+          25.67746,
+          23.111663,
+          23.251095,
+          25.691878000000003
         ]
       },
       {
-        "cold_ms": 23.650146,
-        "digest": "4e08b87bd795c9e0",
+        "cold_ms": 24.087343,
+        "digest": "003d8fec6e3597ff",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"notifier\"} |= \"retrying request after transient upstream failure\"",
         "id": "line_filter/notifier/w0",
@@ -1676,7 +1676,7 @@
         ],
         "lines_processed": 6286,
         "ordered": true,
-        "reduced_digest": "fdd8577c2c352cb7",
+        "reduced_digest": "929e17cddb0fdf5f",
         "result_type": "streams",
         "rows": 451,
         "sample": [
@@ -1686,25 +1686,25 @@
         ],
         "series": 451,
         "shape": "line_filter",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          26.224381,
-          23.970027,
-          26.892685999999998,
-          24.075556000000002,
-          24.296781
+          23.240053,
+          24.39951,
+          27.871029,
+          24.055055,
+          23.110201
         ]
       },
       {
-        "cold_ms": 23.522938,
-        "digest": "b0a2ddc2aa53cecc",
+        "cold_ms": 23.356101,
+        "digest": "e66136fd6fadc350",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"notifier\"} |= \"handler returned early: client disconnected\"",
         "id": "line_filter/notifier/w1",
@@ -1720,7 +1720,7 @@
         ],
         "lines_processed": 6634,
         "ordered": true,
-        "reduced_digest": "9ca4e2946ab8cee3",
+        "reduced_digest": "924e9bb64fd79b17",
         "result_type": "streams",
         "rows": 430,
         "sample": [
@@ -1730,25 +1730,25 @@
         ],
         "series": 430,
         "shape": "line_filter",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          23.245977,
-          23.290822,
-          23.422330000000002,
-          23.358149,
-          24.702293
+          25.993873,
+          23.340182000000002,
+          23.570915000000003,
+          25.641533000000003,
+          23.394013
         ]
       },
       {
-        "cold_ms": 26.134472,
-        "digest": "261f9f285ebc288b",
+        "cold_ms": 23.959764,
+        "digest": "c1361469d83bc339",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"notifier\"} |= \"authorization token accepted for principal\"",
         "id": "line_filter/notifier/w2",
@@ -1764,7 +1764,7 @@
         ],
         "lines_processed": 6813,
         "ordered": true,
-        "reduced_digest": "14ff30820c4c97c1",
+        "reduced_digest": "bc48f91a66ddde75",
         "result_type": "streams",
         "rows": 430,
         "sample": [
@@ -1774,25 +1774,25 @@
         ],
         "series": 430,
         "shape": "line_filter",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          24.528336000000003,
-          24.080124,
-          24.4184,
-          23.653463,
-          23.185715
+          22.974264,
+          23.622712,
+          24.373903,
+          24.103195,
+          23.107546
         ]
       },
       {
-        "cold_ms": 24.285040000000002,
-        "digest": "8d38637081810f21",
+        "cold_ms": 24.264898,
+        "digest": "57d1f79d48d3f38f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"scheduler\"} |= \"rate limiter admitted request within budget\"",
         "id": "line_filter/scheduler/w0",
@@ -1808,7 +1808,7 @@
         ],
         "lines_processed": 6267,
         "ordered": true,
-        "reduced_digest": "8c2afea1ec017d59",
+        "reduced_digest": "fd5f698515f1a33d",
         "result_type": "streams",
         "rows": 462,
         "sample": [
@@ -1818,25 +1818,25 @@
         ],
         "series": 462,
         "shape": "line_filter",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          24.035230000000002,
-          25.988269000000003,
-          23.619729999999997,
-          23.952084,
-          23.972192
+          23.577186,
+          24.699163,
+          24.454344,
+          24.529716,
+          24.62758
         ]
       },
       {
-        "cold_ms": 25.284296,
-        "digest": "e0bb651341b84710",
+        "cold_ms": 24.000902,
+        "digest": "8f71c06eb1adbef3",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"scheduler\"} |= \"background worker woke on schedule\"",
         "id": "line_filter/scheduler/w1",
@@ -1852,7 +1852,7 @@
         ],
         "lines_processed": 6620,
         "ordered": true,
-        "reduced_digest": "908a2c080740a74a",
+        "reduced_digest": "fcd74248dedf86e0",
         "result_type": "streams",
         "rows": 443,
         "sample": [
@@ -1862,25 +1862,25 @@
         ],
         "series": 443,
         "shape": "line_filter",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          25.564913,
-          23.960509000000002,
-          24.793284,
-          24.916074,
-          22.939372
+          24.117561,
+          25.614302,
+          24.013146,
+          23.980264000000002,
+          24.087085000000002
         ]
       },
       {
-        "cold_ms": 22.528871,
-        "digest": "388613828ab678e6",
+        "cold_ms": 22.867604,
+        "digest": "c00721fca80d4733",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"scheduler\"} |= \"object store returned a throttling response\"",
         "id": "line_filter/scheduler/w2",
@@ -1896,7 +1896,7 @@
         ],
         "lines_processed": 6843,
         "ordered": true,
-        "reduced_digest": "213b478e231b19e6",
+        "reduced_digest": "4908b7236198dcec",
         "result_type": "streams",
         "rows": 427,
         "sample": [
@@ -1906,25 +1906,25 @@
         ],
         "series": 427,
         "shape": "line_filter",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          23.650086,
-          23.369801,
-          23.147682999999997,
-          23.810658,
-          23.130211000000003
+          26.307142,
+          23.900283,
+          26.157732,
+          23.608677,
+          24.969191000000002
         ]
       },
       {
-        "cold_ms": 22.751517999999997,
-        "digest": "058642a9023384b5",
+        "cold_ms": 23.387811000000003,
+        "digest": "595077d3669609a2",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"search\"} |= \"manifest CAS lost the race, reloading\"",
         "id": "line_filter/search/w0",
@@ -1940,7 +1940,7 @@
         ],
         "lines_processed": 6329,
         "ordered": true,
-        "reduced_digest": "301bfe96119fafcd",
+        "reduced_digest": "32a85b6d7aba4731",
         "result_type": "streams",
         "rows": 395,
         "sample": [
@@ -1950,25 +1950,25 @@
         ],
         "series": 395,
         "shape": "line_filter",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          22.483226,
-          21.727626,
-          22.338724,
-          21.654259,
-          21.168688000000003
+          22.137853,
+          21.500768,
+          22.145339,
+          22.965510000000002,
+          22.549689
         ]
       },
       {
-        "cold_ms": 25.663217,
-        "digest": "a92bf2a72bda4ae2",
+        "cold_ms": 22.899442999999998,
+        "digest": "40494453f37bf1c8",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"search\"} |= \"writer epoch verified against the manifest\"",
         "id": "line_filter/search/w1",
@@ -1984,7 +1984,7 @@
         ],
         "lines_processed": 6593,
         "ordered": true,
-        "reduced_digest": "29e0a862eb0707be",
+        "reduced_digest": "92d0b43c0ed13b00",
         "result_type": "streams",
         "rows": 412,
         "sample": [
@@ -1994,25 +1994,25 @@
         ],
         "series": 412,
         "shape": "line_filter",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          22.561953,
-          22.733976,
-          21.956736,
-          22.169877,
-          23.615944
+          22.28448,
+          22.464478,
+          22.366684000000003,
+          22.288777999999997,
+          22.719207
         ]
       },
       {
-        "cold_ms": 24.420684,
-        "digest": "9eecef4b1444f0c4",
+        "cold_ms": 23.833988,
+        "digest": "29ba126ed12163d0",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"search\"} |= \"structured metadata parsed without error\"",
         "id": "line_filter/search/w2",
@@ -2028,7 +2028,7 @@
         ],
         "lines_processed": 6737,
         "ordered": true,
-        "reduced_digest": "6a85481876cc3cec",
+        "reduced_digest": "19c796cc65416650",
         "result_type": "streams",
         "rows": 432,
         "sample": [
@@ -2038,25 +2038,25 @@
         ],
         "series": 432,
         "shape": "line_filter",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          25.273776,
-          23.716192,
-          23.642112,
-          23.275954000000002,
-          22.809027999999998
+          23.798682000000003,
+          22.724916,
+          22.513019,
+          22.497329999999998,
+          23.484734
         ]
       },
       {
-        "cold_ms": 22.368049,
-        "digest": "8acdc52f95e20ceb",
+        "cold_ms": 22.80714,
+        "digest": "cdc360f2642a4f41",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"web\"} |= \"query admitted after waiting for a scan permit\"",
         "id": "line_filter/web/w0",
@@ -2072,7 +2072,7 @@
         ],
         "lines_processed": 6311,
         "ordered": true,
-        "reduced_digest": "88973ca6bfda3df1",
+        "reduced_digest": "f808fa332a1e03c9",
         "result_type": "streams",
         "rows": 424,
         "sample": [
@@ -2082,25 +2082,25 @@
         ],
         "series": 424,
         "shape": "line_filter",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          22.297296000000003,
-          24.217150999999998,
-          24.666515999999998,
-          24.30113,
-          22.588853
+          21.680856,
+          23.346784,
+          22.025894,
+          21.74612,
+          24.054123
         ]
       },
       {
-        "cold_ms": 24.166216000000002,
-        "digest": "73de5874e9f5e54c",
+        "cold_ms": 22.521233000000002,
+        "digest": "373363af65947f6b",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"web\"} |= \"partial result returned: scan limit reached\"",
         "id": "line_filter/web/w1",
@@ -2116,7 +2116,7 @@
         ],
         "lines_processed": 6605,
         "ordered": true,
-        "reduced_digest": "077fd701cc2a6531",
+        "reduced_digest": "dcd624a3567359db",
         "result_type": "streams",
         "rows": 423,
         "sample": [
@@ -2126,25 +2126,25 @@
         ],
         "series": 423,
         "shape": "line_filter",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          22.575097,
-          22.814548000000002,
-          23.008432,
-          23.249114000000002,
-          22.795492
+          24.771288,
+          23.293865,
+          25.202198,
+          23.091305,
+          23.513217
         ]
       },
       {
-        "cold_ms": 27.265046,
-        "digest": "6469d0fc917e7c56",
+        "cold_ms": 24.552758,
+        "digest": "be82c1d52ead1bf9",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"web\"} |= \"graceful shutdown drained in-flight requests\"",
         "id": "line_filter/web/w2",
@@ -2160,7 +2160,7 @@
         ],
         "lines_processed": 6841,
         "ordered": true,
-        "reduced_digest": "11fde1e8bc1b6364",
+        "reduced_digest": "2e924de23acc4dd6",
         "result_type": "streams",
         "rows": 417,
         "sample": [
@@ -2170,25 +2170,25 @@
         ],
         "series": 417,
         "shape": "line_filter",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          23.036114,
-          22.847008,
-          22.795310999999998,
-          23.115073,
-          22.909816
+          22.761635,
+          23.641037,
+          23.063060999999998,
+          23.487417999999998,
+          24.068109
         ]
       },
       {
-        "cold_ms": 65.579652,
-        "digest": "b9c31b617675bf6e",
+        "cold_ms": 64.589827,
+        "digest": "057bef0a29f3494a",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"api-gateway\"} | json | status=\"200\"",
         "id": "json_field/api-gateway/w0",
@@ -2216,7 +2216,7 @@
         ],
         "lines_processed": 6275,
         "ordered": true,
-        "reduced_digest": "962ed2cafb31d1e2",
+        "reduced_digest": "be977d6a70edc0f6",
         "result_type": "streams",
         "rows": 1003,
         "sample": [
@@ -2226,25 +2226,25 @@
         ],
         "series": 1003,
         "shape": "json_field",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          65.23092799999999,
-          69.033631,
-          63.942730000000005,
-          65.42051599999999,
-          67.650814
+          65.430526,
+          66.374581,
+          66.790341,
+          63.15188100000001,
+          66.034464
         ]
       },
       {
-        "cold_ms": 52.350148,
-        "digest": "28fa1a846981f1ce",
+        "cold_ms": 53.940813999999996,
+        "digest": "041b704e7378a3e8",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"api-gateway\"} | json | level=\"warn\"",
         "id": "json_field/api-gateway/w1",
@@ -2272,7 +2272,7 @@
         ],
         "lines_processed": 6519,
         "ordered": true,
-        "reduced_digest": "226b2a2567b26c8f",
+        "reduced_digest": "3b9ffae06b625323",
         "result_type": "streams",
         "rows": 752,
         "sample": [
@@ -2282,25 +2282,25 @@
         ],
         "series": 752,
         "shape": "json_field",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          50.29084,
-          50.091726,
-          50.799155,
-          50.345163,
-          55.05760299999999
+          51.529776999999996,
+          51.383473,
+          50.461854,
+          53.26074,
+          52.285429
         ]
       },
       {
-        "cold_ms": 38.326269,
-        "digest": "284b99781c3a9639",
+        "cold_ms": 38.658471,
+        "digest": "403e69b1cba608f5",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"api-gateway\"} | json | status=\"204\"",
         "id": "json_field/api-gateway/w2",
@@ -2328,7 +2328,7 @@
         ],
         "lines_processed": 6711,
         "ordered": true,
-        "reduced_digest": "d9b59ce1876eaed3",
+        "reduced_digest": "7daa73bfb44308e5",
         "result_type": "streams",
         "rows": 495,
         "sample": [
@@ -2338,25 +2338,25 @@
         ],
         "series": 495,
         "shape": "json_field",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          39.072502,
-          37.314991,
-          38.422421,
-          37.717155000000005,
-          39.443969
+          40.758584,
+          39.151097,
+          41.235351,
+          38.926476,
+          41.976454000000004
         ]
       },
       {
-        "cold_ms": 53.036756999999994,
-        "digest": "c6cbb81ec9ead069",
+        "cold_ms": 52.965723,
+        "digest": "f3ac6950af6d87fb",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"billing\"} | json | level=\"debug\"",
         "id": "json_field/billing/w0",
@@ -2384,7 +2384,7 @@
         ],
         "lines_processed": 6283,
         "ordered": true,
-        "reduced_digest": "43cbdec4080af9d2",
+        "reduced_digest": "a1ec0bd7cc6d2c4e",
         "result_type": "streams",
         "rows": 795,
         "sample": [
@@ -2394,25 +2394,25 @@
         ],
         "series": 795,
         "shape": "json_field",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          54.11387,
-          53.954401,
-          52.149431,
-          56.570665,
-          52.82485
+          51.771842,
+          55.483742,
+          52.645073000000004,
+          51.580495,
+          51.896860000000004
         ]
       },
       {
-        "cold_ms": 41.563047999999995,
-        "digest": "5cd45e8af3b320ef",
+        "cold_ms": 41.671948,
+        "digest": "115cf576683a4af1",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"billing\"} | json | status=\"404\"",
         "id": "json_field/billing/w1",
@@ -2440,7 +2440,7 @@
         ],
         "lines_processed": 6663,
         "ordered": true,
-        "reduced_digest": "f2322de5df9c0912",
+        "reduced_digest": "1d8fa206add46d18",
         "result_type": "streams",
         "rows": 526,
         "sample": [
@@ -2450,25 +2450,25 @@
         ],
         "series": 526,
         "shape": "json_field",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          39.458777,
-          39.991357,
-          39.312773,
-          39.987258999999995,
-          41.659921000000004
+          42.125893,
+          39.358627,
+          42.940603,
+          43.805526,
+          42.659766000000005
         ]
       },
       {
-        "cold_ms": 52.642857,
-        "digest": "b28352404afe3209",
+        "cold_ms": 53.169606,
+        "digest": "82fad5f132a7939d",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"billing\"} | json | level=\"warn\"",
         "id": "json_field/billing/w2",
@@ -2496,7 +2496,7 @@
         ],
         "lines_processed": 6849,
         "ordered": true,
-        "reduced_digest": "9f49594017ffc80e",
+        "reduced_digest": "4db730814d6d9e36",
         "result_type": "streams",
         "rows": 794,
         "sample": [
@@ -2506,25 +2506,25 @@
         ],
         "series": 794,
         "shape": "json_field",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          53.966273,
-          55.445982,
-          54.333744,
-          56.731497,
-          53.498736
+          54.034239,
+          54.583772,
+          52.798451,
+          52.213404,
+          51.816088
         ]
       },
       {
-        "cold_ms": 68.61702799999999,
-        "digest": "a90fde933aaccf2d",
+        "cold_ms": 66.743191,
+        "digest": "7c8901789da4fae7",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"checkout\"} | json | status=\"200\"",
         "id": "json_field/checkout/w0",
@@ -2552,7 +2552,7 @@
         ],
         "lines_processed": 6274,
         "ordered": true,
-        "reduced_digest": "d813c9bb2358a2d3",
+        "reduced_digest": "aa54eef1816e300f",
         "result_type": "streams",
         "rows": 1037,
         "sample": [
@@ -2562,25 +2562,25 @@
         ],
         "series": 1037,
         "shape": "json_field",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          68.16707199999999,
-          66.116492,
-          66.507957,
-          65.248914,
-          65.632604
+          68.945936,
+          67.260853,
+          68.434048,
+          65.778823,
+          69.402047
         ]
       },
       {
-        "cold_ms": 54.766515,
-        "digest": "42d96facd5a07273",
+        "cold_ms": 54.137513999999996,
+        "digest": "1db4c184cc26a74e",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"checkout\"} | json | level=\"debug\"",
         "id": "json_field/checkout/w1",
@@ -2608,7 +2608,7 @@
         ],
         "lines_processed": 6479,
         "ordered": true,
-        "reduced_digest": "c59ca824238c179a",
+        "reduced_digest": "f6bd91ab27b9d981",
         "result_type": "streams",
         "rows": 805,
         "sample": [
@@ -2618,25 +2618,25 @@
         ],
         "series": 805,
         "shape": "json_field",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          54.514753,
-          56.361031,
-          55.115713,
-          57.002636,
-          57.207440999999996
+          53.70919,
+          53.97596,
+          54.710181,
+          53.812536,
+          54.044101999999995
         ]
       },
       {
-        "cold_ms": 38.833993,
-        "digest": "515f16006a4ce607",
+        "cold_ms": 39.571374999999996,
+        "digest": "011988f725ac060b",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"checkout\"} | json | status=\"204\"",
         "id": "json_field/checkout/w2",
@@ -2664,7 +2664,7 @@
         ],
         "lines_processed": 6757,
         "ordered": true,
-        "reduced_digest": "6eddc1ef28d592ef",
+        "reduced_digest": "7886dc86531a17ad",
         "result_type": "streams",
         "rows": 463,
         "sample": [
@@ -2674,25 +2674,25 @@
         ],
         "series": 463,
         "shape": "json_field",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          35.507165,
-          36.675179,
-          36.009017,
-          36.58987,
-          36.623263
+          38.832849,
+          39.368835999999995,
+          38.040112,
+          38.597390000000004,
+          38.900137
         ]
       },
       {
-        "cold_ms": 49.738413,
-        "digest": "92d7dd31702f18f3",
+        "cold_ms": 50.609268,
+        "digest": "e77b500b6728cdf5",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"ingest\"} | json | level=\"warn\"",
         "id": "json_field/ingest/w0",
@@ -2720,7 +2720,7 @@
         ],
         "lines_processed": 6266,
         "ordered": true,
-        "reduced_digest": "0e3c2b7032a65dd4",
+        "reduced_digest": "d60928d6e0600f28",
         "result_type": "streams",
         "rows": 781,
         "sample": [
@@ -2730,25 +2730,25 @@
         ],
         "series": 781,
         "shape": "json_field",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          52.123122,
-          52.522211,
-          51.524297,
-          49.589653999999996,
-          50.022307000000005
+          50.904393999999996,
+          50.139207,
+          50.261798000000006,
+          51.392112,
+          53.051948
         ]
       },
       {
-        "cold_ms": 38.589204,
-        "digest": "1e4f4a3ffc57eb7d",
+        "cold_ms": 38.630117,
+        "digest": "57051f91b69ebb01",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"ingest\"} | json | status=\"404\"",
         "id": "json_field/ingest/w1",
@@ -2776,7 +2776,7 @@
         ],
         "lines_processed": 6595,
         "ordered": true,
-        "reduced_digest": "372725fa56938e81",
+        "reduced_digest": "0b876bc7f2d38e3d",
         "result_type": "streams",
         "rows": 506,
         "sample": [
@@ -2786,25 +2786,25 @@
         ],
         "series": 506,
         "shape": "json_field",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          38.972223,
-          37.703009,
-          38.131834000000005,
-          41.433336000000004,
-          40.367764
+          38.215770000000006,
+          38.083753,
+          39.137622,
+          37.801874999999995,
+          38.93874
         ]
       },
       {
-        "cold_ms": 53.82677,
-        "digest": "f6f7f5444e41f3d8",
+        "cold_ms": 55.625286,
+        "digest": "43c4581f78f264c8",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"ingest\"} | json | level=\"debug\"",
         "id": "json_field/ingest/w2",
@@ -2832,7 +2832,7 @@
         ],
         "lines_processed": 6717,
         "ordered": true,
-        "reduced_digest": "4ecdf4c3a8e8120d",
+        "reduced_digest": "cd1f2f1d4220033b",
         "result_type": "streams",
         "rows": 799,
         "sample": [
@@ -2842,25 +2842,25 @@
         ],
         "series": 799,
         "shape": "json_field",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          53.685796,
-          52.928323999999996,
-          55.906065999999996,
-          52.57477,
-          53.845968
+          54.840132,
+          53.41605,
+          53.089078,
+          54.633407000000005,
+          53.929435999999995
         ]
       },
       {
-        "cold_ms": 67.054203,
-        "digest": "03d58773b130acc8",
+        "cold_ms": 70.043616,
+        "digest": "d34a50d0f3dcee94",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"notifier\"} | json | status=\"200\"",
         "id": "json_field/notifier/w0",
@@ -2888,7 +2888,7 @@
         ],
         "lines_processed": 6294,
         "ordered": true,
-        "reduced_digest": "0ce59a0f380fea80",
+        "reduced_digest": "21d0ae56baf0375c",
         "result_type": "streams",
         "rows": 1066,
         "sample": [
@@ -2898,25 +2898,25 @@
         ],
         "series": 1066,
         "shape": "json_field",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          70.01030499999999,
-          69.187299,
-          68.289273,
-          71.27965999999999,
-          71.248781
+          70.671877,
+          70.781915,
+          70.819927,
+          71.099994,
+          69.173999
         ]
       },
       {
-        "cold_ms": 52.648477,
-        "digest": "ae5fc8c82e7961a3",
+        "cold_ms": 50.435243,
+        "digest": "940734a737db0336",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"notifier\"} | json | level=\"warn\"",
         "id": "json_field/notifier/w1",
@@ -2944,7 +2944,7 @@
         ],
         "lines_processed": 6579,
         "ordered": true,
-        "reduced_digest": "9822fcbb08cd6d4d",
+        "reduced_digest": "20b012cf0770b8e0",
         "result_type": "streams",
         "rows": 760,
         "sample": [
@@ -2954,25 +2954,25 @@
         ],
         "series": 760,
         "shape": "json_field",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          49.647331,
-          52.782159,
-          51.687523,
-          51.183367,
-          53.999396
+          50.899325000000005,
+          49.840536,
+          50.862346,
+          50.831208000000004,
+          50.624410000000005
         ]
       },
       {
-        "cold_ms": 39.946563,
-        "digest": "fd334ab9a22d4aa7",
+        "cold_ms": 38.988802,
+        "digest": "1a8b4243e33c538b",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"notifier\"} | json | status=\"204\"",
         "id": "json_field/notifier/w2",
@@ -3000,7 +3000,7 @@
         ],
         "lines_processed": 6813,
         "ordered": true,
-        "reduced_digest": "277c17d4c4d84e9e",
+        "reduced_digest": "a9a62dd4b1ffc948",
         "result_type": "streams",
         "rows": 519,
         "sample": [
@@ -3010,25 +3010,25 @@
         ],
         "series": 519,
         "shape": "json_field",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          43.073245,
-          39.125551,
-          39.740566,
-          41.274027,
-          40.018129
+          39.633792,
+          41.574968,
+          45.595076999999996,
+          39.812661,
+          39.925975
         ]
       },
       {
-        "cold_ms": 53.342822,
-        "digest": "33a0d1e7491261ed",
+        "cold_ms": 53.332119999999996,
+        "digest": "8ea14dfa3552d935",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"scheduler\"} | json | level=\"debug\"",
         "id": "json_field/scheduler/w0",
@@ -3056,7 +3056,7 @@
         ],
         "lines_processed": 6265,
         "ordered": true,
-        "reduced_digest": "3d7d416f60ff152a",
+        "reduced_digest": "290f4869f95ac8f2",
         "result_type": "streams",
         "rows": 779,
         "sample": [
@@ -3066,25 +3066,25 @@
         ],
         "series": 779,
         "shape": "json_field",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          50.576617,
-          51.056398,
-          53.125574,
-          50.702053,
-          53.216856
+          52.938842,
+          50.673942,
+          51.439398999999995,
+          52.230124,
+          53.56905
         ]
       },
       {
-        "cold_ms": 40.12627,
-        "digest": "24779c481cad1bf8",
+        "cold_ms": 40.331271,
+        "digest": "696228557390c021",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"scheduler\"} | json | status=\"404\"",
         "id": "json_field/scheduler/w1",
@@ -3112,7 +3112,7 @@
         ],
         "lines_processed": 6602,
         "ordered": true,
-        "reduced_digest": "a1cd5c6a05c5f0cd",
+        "reduced_digest": "5c36bf437899ce00",
         "result_type": "streams",
         "rows": 531,
         "sample": [
@@ -3122,25 +3122,25 @@
         ],
         "series": 531,
         "shape": "json_field",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          40.100622,
-          42.063699,
-          40.177656999999996,
-          42.651493,
-          40.045139
+          40.354346,
+          41.404758,
+          39.691863,
+          39.954607,
+          40.561817
         ]
       },
       {
-        "cold_ms": 51.405053,
-        "digest": "10c7cdc3ccf333e7",
+        "cold_ms": 51.191361,
+        "digest": "69c982d74bd20bef",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"scheduler\"} | json | level=\"warn\"",
         "id": "json_field/scheduler/w2",
@@ -3168,7 +3168,7 @@
         ],
         "lines_processed": 6843,
         "ordered": true,
-        "reduced_digest": "947d660c3c7f670f",
+        "reduced_digest": "f86d2a308af179bb",
         "result_type": "streams",
         "rows": 748,
         "sample": [
@@ -3178,25 +3178,25 @@
         ],
         "series": 748,
         "shape": "json_field",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          51.520841,
-          50.996916000000006,
-          51.063250999999994,
-          50.856213,
-          52.958221
+          53.007923,
+          49.832912,
+          52.447202,
+          53.926109,
+          54.377868
         ]
       },
       {
-        "cold_ms": 64.30028,
-        "digest": "707899033144a3f1",
+        "cold_ms": 68.952608,
+        "digest": "bd799c47c0827585",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"search\"} | json | status=\"200\"",
         "id": "json_field/search/w0",
@@ -3224,7 +3224,7 @@
         ],
         "lines_processed": 6281,
         "ordered": true,
-        "reduced_digest": "7cbdeb3b29dd8898",
+        "reduced_digest": "dc63ce5379906c3c",
         "result_type": "streams",
         "rows": 1017,
         "sample": [
@@ -3234,25 +3234,25 @@
         ],
         "series": 1017,
         "shape": "json_field",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          66.369677,
-          66.836534,
-          64.476602,
-          65.450511,
-          66.94655200000001
+          62.604581,
+          64.623964,
+          67.395918,
+          66.164998,
+          65.231176
         ]
       },
       {
-        "cold_ms": 54.248843,
-        "digest": "82337ca0f8feb157",
+        "cold_ms": 52.733297,
+        "digest": "dc2ee9c45048b481",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"search\"} | json | level=\"debug\"",
         "id": "json_field/search/w1",
@@ -3280,7 +3280,7 @@
         ],
         "lines_processed": 6506,
         "ordered": true,
-        "reduced_digest": "957a482842d28ed5",
+        "reduced_digest": "ddc8a788bd566133",
         "result_type": "streams",
         "rows": 796,
         "sample": [
@@ -3290,25 +3290,25 @@
         ],
         "series": 796,
         "shape": "json_field",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          53.369021000000004,
-          54.778518999999996,
-          56.317378,
-          55.308094000000004,
-          55.283237
+          55.766311,
+          51.125820000000004,
+          52.20672,
+          54.106097,
+          54.526046
         ]
       },
       {
-        "cold_ms": 41.01009,
-        "digest": "9cdca78797f29814",
+        "cold_ms": 42.197103999999996,
+        "digest": "1e211ee2a897398a",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"search\"} | json | status=\"204\"",
         "id": "json_field/search/w2",
@@ -3336,7 +3336,7 @@
         ],
         "lines_processed": 6737,
         "ordered": true,
-        "reduced_digest": "c0c6ba42ae302677",
+        "reduced_digest": "51e701a6cbe20453",
         "result_type": "streams",
         "rows": 532,
         "sample": [
@@ -3346,25 +3346,25 @@
         ],
         "series": 532,
         "shape": "json_field",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          42.479580000000006,
-          40.351694,
-          40.443616,
-          43.302345,
-          39.525202
+          39.416806,
+          40.290096,
+          42.654844999999995,
+          39.442234,
+          39.538776999999996
         ]
       },
       {
-        "cold_ms": 51.687854,
-        "digest": "af61aa7b51193648",
+        "cold_ms": 51.014950000000006,
+        "digest": "006296d2b5ef1cc0",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=\"web\"} | json | level=\"warn\"",
         "id": "json_field/web/w0",
@@ -3392,7 +3392,7 @@
         ],
         "lines_processed": 6283,
         "ordered": true,
-        "reduced_digest": "4052f70c58b0cce4",
+        "reduced_digest": "dcd95db8022a55c8",
         "result_type": "streams",
         "rows": 807,
         "sample": [
@@ -3402,25 +3402,25 @@
         ],
         "series": 807,
         "shape": "json_field",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          52.581852999999995,
-          53.536706,
-          55.727672,
-          51.116211,
-          52.089419
+          53.823443999999995,
+          54.224697,
+          54.006189000000006,
+          54.327131,
+          57.292541
         ]
       },
       {
-        "cold_ms": 41.862339999999996,
-        "digest": "2dd7fdc1af4e3b2f",
+        "cold_ms": 41.580668,
+        "digest": "95ce21eec4feeb61",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=\"web\"} | json | status=\"404\"",
         "id": "json_field/web/w1",
@@ -3448,7 +3448,7 @@
         ],
         "lines_processed": 6556,
         "ordered": true,
-        "reduced_digest": "b9b76b907a1d84fb",
+        "reduced_digest": "0715780e9eca94bb",
         "result_type": "streams",
         "rows": 536,
         "sample": [
@@ -3458,25 +3458,25 @@
         ],
         "series": 536,
         "shape": "json_field",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          39.834161,
-          42.075261000000005,
-          41.188816,
-          42.710605,
-          42.158268
+          40.390934,
+          41.123650999999995,
+          42.059067999999996,
+          40.910832,
+          41.547899
         ]
       },
       {
-        "cold_ms": 54.803304,
-        "digest": "0adaf094774e3cc7",
+        "cold_ms": 56.030035,
+        "digest": "bb62c2c29fad5e53",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=\"web\"} | json | level=\"debug\"",
         "id": "json_field/web/w2",
@@ -3504,7 +3504,7 @@
         ],
         "lines_processed": 6841,
         "ordered": true,
-        "reduced_digest": "f70b23bbe503d070",
+        "reduced_digest": "cdc9387e471afbd0",
         "result_type": "streams",
         "rows": 814,
         "sample": [
@@ -3514,25 +3514,25 @@
         ],
         "series": 814,
         "shape": "json_field",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          55.273026,
-          53.881624,
-          56.451541,
-          54.317523,
-          53.204703
+          53.920346,
+          55.65324,
+          54.588352,
+          54.761196999999996,
+          58.445506
         ]
       },
       {
-        "cold_ms": 137.71611000000001,
-        "digest": "a31428c0a35297a8",
+        "cold_ms": 137.084114,
+        "digest": "9b8d1f8cecfcc48f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/api-gateway/w0",
@@ -3550,7 +3550,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -3558,25 +3558,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          136.174266,
-          138.387723,
-          136.762691,
-          139.279679,
-          138.101899
+          137.294532,
+          135.164255,
+          136.502238,
+          135.03472499999998,
+          136.49988800000003
         ]
       },
       {
-        "cold_ms": 136.76289,
-        "digest": "7a21c2fecf03c535",
+        "cold_ms": 139.416864,
+        "digest": "62f39553ef9ed14c",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/api-gateway/w1",
@@ -3604,7 +3604,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -3612,25 +3612,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          135.75473699999998,
-          136.45459300000002,
-          136.017613,
-          135.830161,
-          136.216277
+          136.55877,
+          138.74710100000001,
+          135.61304900000002,
+          137.448367,
+          135.506122
         ]
       },
       {
-        "cold_ms": 106.26969199999999,
-        "digest": "545f7859af1dae13",
+        "cold_ms": 105.55592,
+        "digest": "b33d001560940494",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/api-gateway/w2",
@@ -3648,7 +3648,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -3656,25 +3656,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          107.224947,
-          105.16984699999999,
-          106.777617,
-          105.052078,
-          105.35557800000001
+          105.41683,
+          105.733517,
+          105.31339000000001,
+          105.444097,
+          105.11975899999999
         ]
       },
       {
-        "cold_ms": 135.54376100000002,
-        "digest": "a31428c0a35297a8",
+        "cold_ms": 136.365585,
+        "digest": "9b8d1f8cecfcc48f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/billing/w0",
@@ -3692,7 +3692,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -3700,25 +3700,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          137.287566,
-          135.34343600000003,
-          136.380765,
-          135.929879,
-          135.66397
+          135.88809099999997,
+          135.32183,
+          136.38024900000002,
+          135.776126,
+          138.56790999999998
         ]
       },
       {
-        "cold_ms": 139.706479,
-        "digest": "7a21c2fecf03c535",
+        "cold_ms": 135.39416100000003,
+        "digest": "62f39553ef9ed14c",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/billing/w1",
@@ -3746,7 +3746,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -3754,25 +3754,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          135.634692,
-          137.82136,
-          135.961066,
-          137.91466699999998,
-          137.96392
+          137.75375400000001,
+          136.055327,
+          138.308089,
+          134.70918400000002,
+          135.49835700000003
         ]
       },
       {
-        "cold_ms": 105.19968300000001,
-        "digest": "545f7859af1dae13",
+        "cold_ms": 107.12277300000001,
+        "digest": "b33d001560940494",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/billing/w2",
@@ -3790,7 +3790,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -3798,25 +3798,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          105.362679,
-          104.723469,
-          106.68720800000001,
-          105.220975,
-          105.461026
+          103.84104099999999,
+          108.59729399999999,
+          105.43458799999999,
+          105.064745,
+          104.673251
         ]
       },
       {
-        "cold_ms": 136.004976,
-        "digest": "a31428c0a35297a8",
+        "cold_ms": 135.279345,
+        "digest": "9b8d1f8cecfcc48f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/checkout/w0",
@@ -3834,7 +3834,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -3842,25 +3842,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          136.44124699999998,
-          137.097841,
-          136.23391900000001,
-          135.47161699999998,
-          136.083178
+          136.377731,
+          134.776386,
+          136.232732,
+          135.799992,
+          137.047897
         ]
       },
       {
-        "cold_ms": 136.176138,
-        "digest": "7a21c2fecf03c535",
+        "cold_ms": 136.86577499999999,
+        "digest": "62f39553ef9ed14c",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/checkout/w1",
@@ -3888,7 +3888,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -3896,25 +3896,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          136.89802500000002,
-          138.264802,
-          136.509145,
-          138.442759,
-          139.667699
+          138.19764700000002,
+          135.953616,
+          136.37997900000002,
+          138.09998000000002,
+          135.20685
         ]
       },
       {
-        "cold_ms": 106.628035,
-        "digest": "545f7859af1dae13",
+        "cold_ms": 105.123839,
+        "digest": "b33d001560940494",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/checkout/w2",
@@ -3932,7 +3932,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -3940,25 +3940,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          104.332133,
-          105.668263,
-          106.688119,
-          106.06379700000001,
-          104.846392
+          105.916519,
+          105.331392,
+          107.4545,
+          105.024439,
+          105.36124400000001
         ]
       },
       {
-        "cold_ms": 134.383001,
-        "digest": "a31428c0a35297a8",
+        "cold_ms": 136.62471200000002,
+        "digest": "9b8d1f8cecfcc48f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/ingest/w0",
@@ -3976,7 +3976,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -3984,25 +3984,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          138.153774,
-          135.133662,
-          137.46741600000001,
-          136.892507,
-          135.584721
+          136.054613,
+          138.60741900000002,
+          136.02345,
+          135.69772999999998,
+          134.565145
         ]
       },
       {
-        "cold_ms": 135.16563100000002,
-        "digest": "7a21c2fecf03c535",
+        "cold_ms": 136.428113,
+        "digest": "62f39553ef9ed14c",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/ingest/w1",
@@ -4030,7 +4030,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4038,25 +4038,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          136.33989699999998,
-          135.796126,
-          135.863443,
-          136.78752899999998,
-          137.776287
+          136.755019,
+          136.639043,
+          135.57923499999998,
+          138.27561999999998,
+          138.074675
         ]
       },
       {
-        "cold_ms": 106.588851,
-        "digest": "545f7859af1dae13",
+        "cold_ms": 104.99722200000001,
+        "digest": "b33d001560940494",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/ingest/w2",
@@ -4074,7 +4074,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4082,25 +4082,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          104.763313,
-          107.289198,
-          105.356458,
-          107.856996,
-          105.302098
+          105.26685900000001,
+          105.399841,
+          107.349724,
+          105.10463,
+          105.386671
         ]
       },
       {
-        "cold_ms": 136.96277600000002,
-        "digest": "a31428c0a35297a8",
+        "cold_ms": 137.150679,
+        "digest": "9b8d1f8cecfcc48f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/notifier/w0",
@@ -4118,7 +4118,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4126,25 +4126,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          137.229387,
-          135.78628700000002,
-          137.162082,
-          135.63768000000002,
-          134.35730600000002
+          135.563472,
+          136.981286,
+          134.867129,
+          135.385754,
+          134.92443
         ]
       },
       {
-        "cold_ms": 136.398787,
-        "digest": "7a21c2fecf03c535",
+        "cold_ms": 134.599931,
+        "digest": "62f39553ef9ed14c",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/notifier/w1",
@@ -4172,7 +4172,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4180,25 +4180,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          134.997726,
-          136.880653,
-          135.06198799999999,
-          135.634053,
-          136.578948
+          136.412586,
+          136.506604,
+          136.155448,
+          136.05981,
+          139.513777
         ]
       },
       {
-        "cold_ms": 104.25055,
-        "digest": "545f7859af1dae13",
+        "cold_ms": 105.248413,
+        "digest": "b33d001560940494",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/notifier/w2",
@@ -4216,7 +4216,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4224,25 +4224,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          105.204072,
-          107.039489,
-          105.0432,
-          106.58201100000001,
-          107.687618
+          104.63102500000001,
+          105.44445400000001,
+          106.649309,
+          106.387579,
+          105.002099
         ]
       },
       {
-        "cold_ms": 137.807913,
-        "digest": "a31428c0a35297a8",
+        "cold_ms": 135.736044,
+        "digest": "9b8d1f8cecfcc48f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/scheduler/w0",
@@ -4260,7 +4260,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4268,25 +4268,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          136.771478,
-          134.815314,
-          136.33194300000002,
-          135.410924,
-          136.357753
+          135.14707,
+          135.477492,
+          134.62044600000002,
+          135.344888,
+          135.41573200000002
         ]
       },
       {
-        "cold_ms": 136.292988,
-        "digest": "7a21c2fecf03c535",
+        "cold_ms": 136.191739,
+        "digest": "62f39553ef9ed14c",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/scheduler/w1",
@@ -4314,7 +4314,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4322,25 +4322,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          136.006611,
-          135.825271,
-          136.15824700000002,
-          135.394173,
-          137.326212
+          135.761343,
+          138.127368,
+          135.958659,
+          136.476712,
+          137.628697
         ]
       },
       {
-        "cold_ms": 104.972645,
-        "digest": "545f7859af1dae13",
+        "cold_ms": 104.698931,
+        "digest": "b33d001560940494",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/scheduler/w2",
@@ -4358,7 +4358,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4366,25 +4366,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          105.010627,
-          106.938429,
-          104.664419,
-          107.509122,
-          104.82530299999999
+          106.339343,
+          105.225995,
+          108.734343,
+          107.177852,
+          104.904055
         ]
       },
       {
-        "cold_ms": 137.224548,
-        "digest": "a31428c0a35297a8",
+        "cold_ms": 138.299085,
+        "digest": "9b8d1f8cecfcc48f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/search/w0",
@@ -4402,7 +4402,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4410,25 +4410,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          135.968078,
-          134.785528,
-          134.81304,
-          136.518013,
-          135.30451499999998
+          135.46464699999999,
+          135.73116900000002,
+          135.53397,
+          135.87894,
+          136.56678399999998
         ]
       },
       {
-        "cold_ms": 136.408495,
-        "digest": "7a21c2fecf03c535",
+        "cold_ms": 135.075513,
+        "digest": "62f39553ef9ed14c",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/search/w1",
@@ -4456,7 +4456,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4464,25 +4464,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          139.099059,
-          137.614251,
-          137.722294,
-          136.2976,
-          138.62411
+          137.57566,
+          137.884341,
+          136.41567700000002,
+          137.408672,
+          138.141381
         ]
       },
       {
-        "cold_ms": 105.00496700000001,
-        "digest": "545f7859af1dae13",
+        "cold_ms": 105.133718,
+        "digest": "b33d001560940494",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/search/w2",
@@ -4500,7 +4500,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4508,25 +4508,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          104.834597,
-          106.935564,
-          104.9311,
-          106.05703399999999,
-          105.53077800000001
+          105.30935099999999,
+          104.658389,
+          104.837898,
+          107.524474,
+          105.537003
         ]
       },
       {
-        "cold_ms": 136.807163,
-        "digest": "a31428c0a35297a8",
+        "cold_ms": 136.77013499999998,
+        "digest": "9b8d1f8cecfcc48f",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/web/w0",
@@ -4544,7 +4544,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4552,25 +4552,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          138.154845,
-          135.705506,
-          135.49768600000002,
-          138.64945600000001,
-          134.55731100000003
+          134.59644500000002,
+          135.775221,
+          138.03666,
+          135.40974,
+          135.34787500000002
         ]
       },
       {
-        "cold_ms": 135.409408,
-        "digest": "7a21c2fecf03c535",
+        "cold_ms": 136.06964,
+        "digest": "62f39553ef9ed14c",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/web/w1",
@@ -4598,7 +4598,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4606,25 +4606,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          137.994254,
-          136.028332,
-          136.702429,
-          137.031668,
-          135.685181
+          134.866253,
+          139.11083399999998,
+          136.988442,
+          136.319267,
+          136.244268
         ]
       },
       {
-        "cold_ms": 105.43588600000001,
-        "digest": "545f7859af1dae13",
+        "cold_ms": 104.696518,
+        "digest": "b33d001560940494",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | json | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "json_field_rare/web/w2",
@@ -4642,7 +4642,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4650,25 +4650,25 @@
         ],
         "series": 1,
         "shape": "json_field_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          104.746612,
-          107.516905,
-          104.530366,
-          105.652034,
-          107.71040099999999
+          107.24597499999999,
+          105.364735,
+          105.615798,
+          105.11735399999999,
+          106.169832
         ]
       },
       {
-        "cold_ms": 79.903605,
-        "digest": "d74cd38122934a22",
+        "cold_ms": 79.194076,
+        "digest": "c617a622f0ecb345",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/api-gateway/w0",
@@ -4684,7 +4684,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4692,25 +4692,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          78.93220099999999,
-          81.815105,
-          78.714102,
-          80.913624,
-          79.01629
+          79.46365399999999,
+          78.819667,
+          80.50933,
+          81.048113,
+          79.212627
         ]
       },
       {
-        "cold_ms": 82.27023,
-        "digest": "d2388da90d3eaa5d",
+        "cold_ms": 81.69373900000001,
+        "digest": "f60b28a5259fb5d3",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/api-gateway/w1",
@@ -4726,7 +4726,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4734,25 +4734,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          79.171881,
-          79.929073,
-          79.659107,
-          79.847401,
-          79.327496
+          79.696601,
+          79.608237,
+          79.269942,
+          79.533488,
+          79.647554
         ]
       },
       {
-        "cold_ms": 62.379954,
-        "digest": "9edcca2d7cf0c021",
+        "cold_ms": 62.73249,
+        "digest": "cc66945435f02772",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/api-gateway/w2",
@@ -4768,7 +4768,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4776,25 +4776,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          64.18347100000001,
-          62.463221,
-          64.574897,
-          63.75142,
-          62.830892
+          62.377083,
+          62.345926000000006,
+          62.63379700000001,
+          62.417883,
+          63.382776
         ]
       },
       {
-        "cold_ms": 79.432801,
-        "digest": "d74cd38122934a22",
+        "cold_ms": 79.30836099999999,
+        "digest": "c617a622f0ecb345",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/billing/w0",
@@ -4810,7 +4810,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4818,25 +4818,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          79.656402,
-          78.997975,
-          79.255429,
-          79.029705,
-          78.556888
+          79.021955,
+          81.249218,
+          79.29314699999999,
+          78.692921,
+          80.123577
         ]
       },
       {
-        "cold_ms": 79.605925,
-        "digest": "d2388da90d3eaa5d",
+        "cold_ms": 79.767183,
+        "digest": "f60b28a5259fb5d3",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/billing/w1",
@@ -4852,7 +4852,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4860,25 +4860,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          79.394499,
-          79.276288,
-          79.254707,
-          79.60421400000001,
-          81.46537
+          82.92592499999999,
+          79.57555500000001,
+          79.491208,
+          80.782273,
+          79.92219
         ]
       },
       {
-        "cold_ms": 62.645803,
-        "digest": "9edcca2d7cf0c021",
+        "cold_ms": 62.513768999999996,
+        "digest": "cc66945435f02772",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/billing/w2",
@@ -4894,7 +4894,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4902,25 +4902,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          62.498076,
-          65.045862,
-          62.368513,
-          64.488305,
-          62.723912000000006
+          65.81106100000001,
+          62.591247,
+          64.573108,
+          62.908535,
+          63.155289
         ]
       },
       {
-        "cold_ms": 80.95193400000001,
-        "digest": "d74cd38122934a22",
+        "cold_ms": 80.291878,
+        "digest": "c617a622f0ecb345",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/checkout/w0",
@@ -4936,7 +4936,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4944,25 +4944,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          79.310962,
-          78.864985,
-          78.720785,
-          79.39571199999999,
-          79.134673
+          79.33707700000001,
+          78.760415,
+          79.402481,
+          79.046445,
+          78.74572
         ]
       },
       {
-        "cold_ms": 79.876533,
-        "digest": "d2388da90d3eaa5d",
+        "cold_ms": 79.628952,
+        "digest": "f60b28a5259fb5d3",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/checkout/w1",
@@ -4978,7 +4978,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -4986,25 +4986,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          81.099561,
-          79.92048799999999,
-          81.526764,
-          79.66881500000001,
-          79.30866999999999
+          79.659993,
+          81.95430200000001,
+          79.599722,
+          79.44341,
+          82.01563
         ]
       },
       {
-        "cold_ms": 62.944424,
-        "digest": "9edcca2d7cf0c021",
+        "cold_ms": 62.66369099999999,
+        "digest": "cc66945435f02772",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/checkout/w2",
@@ -5020,7 +5020,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5028,25 +5028,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          62.830451,
-          62.84634,
-          63.038141,
-          62.891977000000004,
-          62.51511
+          63.234795,
+          62.43326,
+          62.56555900000001,
+          62.460203,
+          62.751850999999995
         ]
       },
       {
-        "cold_ms": 79.245148,
-        "digest": "d74cd38122934a22",
+        "cold_ms": 78.782073,
+        "digest": "c617a622f0ecb345",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/ingest/w0",
@@ -5062,7 +5062,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5070,25 +5070,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          78.90534000000001,
-          79.20321,
-          79.075641,
-          79.77226,
-          80.997812
+          79.090934,
+          79.137193,
+          78.677711,
+          80.982229,
+          78.837063
         ]
       },
       {
-        "cold_ms": 79.371816,
-        "digest": "d2388da90d3eaa5d",
+        "cold_ms": 79.417296,
+        "digest": "f60b28a5259fb5d3",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/ingest/w1",
@@ -5104,7 +5104,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5112,25 +5112,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          79.162914,
-          80.581359,
-          79.456457,
-          81.278177,
-          79.906612
+          82.691825,
+          79.236268,
+          81.95477299999999,
+          79.551513,
+          79.44275
         ]
       },
       {
-        "cold_ms": 65.313614,
-        "digest": "9edcca2d7cf0c021",
+        "cold_ms": 62.740985,
+        "digest": "cc66945435f02772",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/ingest/w2",
@@ -5146,7 +5146,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5154,25 +5154,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          66.73762799999999,
-          62.51440699999999,
-          62.79839,
-          62.961116999999994,
-          62.98425
+          62.667638999999994,
+          62.808234000000006,
+          62.799619,
+          62.422993000000005,
+          63.629177999999996
         ]
       },
       {
-        "cold_ms": 79.658384,
-        "digest": "d74cd38122934a22",
+        "cold_ms": 80.62672699999999,
+        "digest": "c617a622f0ecb345",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/notifier/w0",
@@ -5188,7 +5188,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5196,25 +5196,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          83.534393,
-          78.801095,
-          80.32616900000001,
-          80.281236,
-          78.677043
+          79.224926,
+          80.96801,
+          79.09843,
+          78.728737,
+          82.125977
         ]
       },
       {
-        "cold_ms": 79.734497,
-        "digest": "d2388da90d3eaa5d",
+        "cold_ms": 79.192333,
+        "digest": "f60b28a5259fb5d3",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/notifier/w1",
@@ -5230,7 +5230,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5238,25 +5238,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          79.70899,
-          79.195836,
-          79.40721500000001,
-          79.393057,
-          79.376267
+          79.563962,
+          79.66385,
+          79.42411200000001,
+          79.93356899999999,
+          79.377126
         ]
       },
       {
-        "cold_ms": 62.279044999999996,
-        "digest": "9edcca2d7cf0c021",
+        "cold_ms": 62.58673700000001,
+        "digest": "cc66945435f02772",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/notifier/w2",
@@ -5272,7 +5272,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5280,25 +5280,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          62.774536000000005,
-          62.58424899999999,
-          63.19986399999999,
-          62.526631,
-          63.589597
+          63.184841000000006,
+          62.774330000000006,
+          62.165759,
+          63.998762,
+          62.388299
         ]
       },
       {
-        "cold_ms": 79.103922,
-        "digest": "d74cd38122934a22",
+        "cold_ms": 79.622922,
+        "digest": "c617a622f0ecb345",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/scheduler/w0",
@@ -5314,7 +5314,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5322,25 +5322,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          79.13887899999999,
-          79.982844,
-          79.01754199999999,
-          80.546735,
-          78.87965299999999
+          82.159415,
+          78.995467,
+          80.497708,
+          79.241791,
+          79.279213
         ]
       },
       {
-        "cold_ms": 81.089532,
-        "digest": "d2388da90d3eaa5d",
+        "cold_ms": 81.35917099999999,
+        "digest": "f60b28a5259fb5d3",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/scheduler/w1",
@@ -5356,7 +5356,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5364,25 +5364,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          79.454993,
-          79.641904,
-          79.955975,
-          79.431569,
-          79.118262
+          79.987969,
+          79.362415,
+          80.02782599999999,
+          79.35531499999999,
+          79.72208499999999
         ]
       },
       {
-        "cold_ms": 63.039241999999994,
-        "digest": "9edcca2d7cf0c021",
+        "cold_ms": 62.84793700000001,
+        "digest": "cc66945435f02772",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/scheduler/w2",
@@ -5398,7 +5398,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5406,25 +5406,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          62.83957699999999,
-          62.54823,
-          64.946475,
-          62.582967000000004,
-          62.379665
+          62.706122,
+          64.49161600000001,
+          62.391112,
+          62.50418500000001,
+          64.032196
         ]
       },
       {
-        "cold_ms": 78.786376,
-        "digest": "d74cd38122934a22",
+        "cold_ms": 79.170672,
+        "digest": "c617a622f0ecb345",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/search/w0",
@@ -5440,7 +5440,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5448,25 +5448,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          80.66358199999999,
-          79.02653799999999,
-          79.11795000000001,
-          79.13734699999999,
-          78.771511
+          79.031702,
+          79.069245,
+          79.677357,
+          78.981813,
+          79.135573
         ]
       },
       {
-        "cold_ms": 79.413524,
-        "digest": "d2388da90d3eaa5d",
+        "cold_ms": 79.686842,
+        "digest": "f60b28a5259fb5d3",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/search/w1",
@@ -5482,7 +5482,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5490,25 +5490,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          80.243904,
-          79.404739,
-          79.302778,
-          79.40383800000001,
-          81.06271299999999
+          81.472426,
+          79.47317299999999,
+          79.690423,
+          80.664982,
+          79.737623
         ]
       },
       {
-        "cold_ms": 62.221376,
-        "digest": "9edcca2d7cf0c021",
+        "cold_ms": 62.368646,
+        "digest": "cc66945435f02772",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/search/w2",
@@ -5524,7 +5524,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5532,25 +5532,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          64.684673,
-          63.866748,
-          62.314392000000005,
-          64.836849,
-          62.399443
+          62.446113999999994,
+          63.04757299999999,
+          64.18009099999999,
+          62.712356,
+          62.384581000000004
         ]
       },
       {
-        "cold_ms": 79.214281,
-        "digest": "d74cd38122934a22",
+        "cold_ms": 80.01436700000001,
+        "digest": "c617a622f0ecb345",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/web/w0",
@@ -5566,7 +5566,7 @@
         ],
         "lines_processed": 71628,
         "ordered": true,
-        "reduced_digest": "951e1ac1359837e2",
+        "reduced_digest": "7528dfe78df9252e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5574,25 +5574,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          80.1831,
-          79.024474,
-          79.259175,
-          79.08880599999999,
-          78.696169
+          79.33045399999999,
+          78.847739,
+          79.105354,
+          78.998865,
+          79.019866
         ]
       },
       {
-        "cold_ms": 81.91893,
-        "digest": "d2388da90d3eaa5d",
+        "cold_ms": 80.671421,
+        "digest": "f60b28a5259fb5d3",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/web/w1",
@@ -5608,7 +5608,7 @@
         ],
         "lines_processed": 71890,
         "ordered": true,
-        "reduced_digest": "71e7ad63e67569ce",
+        "reduced_digest": "3852eb520a195543",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5616,25 +5616,25 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          80.719788,
-          79.19195900000001,
-          79.427953,
-          79.15781600000001,
-          79.515679
+          79.544636,
+          80.244522,
+          79.573623,
+          79.400559,
+          81.378363
         ]
       },
       {
-        "cold_ms": 63.597972000000006,
-        "digest": "9edcca2d7cf0c021",
+        "cold_ms": 62.734203,
+        "digest": "cc66945435f02772",
         "dropped_label_keys": [
           "stream:detected_level",
           "stream:service_name"
         ],
-        "end_ns": 1785484190000000000,
+        "end_ns": 1785485270000000000,
         "error": null,
         "expression": "{app=~\".+\"} | trace_id=\"f0266dffea641a1e42950ef8ae1ada6a\"",
         "id": "metadata_rare/web/w2",
@@ -5650,7 +5650,7 @@
         ],
         "lines_processed": 54268,
         "ordered": true,
-        "reduced_digest": "7d81de8e3bf47964",
+        "reduced_digest": "b1a8e81ebe3ad24e",
         "result_type": "streams",
         "rows": 1,
         "sample": [
@@ -5658,783 +5658,783 @@
         ],
         "series": 1,
         "shape": "metadata_rare",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          64.828503,
-          62.60067900000001,
-          64.740538,
-          62.62735,
-          62.529917000000005
+          64.15134499999999,
+          64.463382,
+          62.573353999999995,
+          62.673403,
+          62.34108
         ]
       },
       {
-        "cold_ms": 11.103283000000001,
-        "digest": "8f37ea895e72a398",
+        "cold_ms": 12.289994,
+        "digest": "5d798ef078ae7988",
         "dropped_label_keys": [],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "sum(rate({app=\"api-gateway\"}[10s]))",
         "id": "rate/api-gateway/w0",
         "label_keys": [],
         "lines_processed": 6255,
         "ordered": true,
-        "reduced_digest": "42d24a2bd847a417",
+        "reduced_digest": "70aa29365415d80f",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484050.000000\u0001125.000000",
-          "\u00011785484060.000000\u0001125.000000",
-          "\u00011785484070.000000\u0001125.000000"
+          "\u00011785485130.000000\u0001125.000000",
+          "\u00011785485140.000000\u0001125.000000",
+          "\u00011785485150.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          12.638796000000001,
-          11.603232,
-          11.774372999999999,
-          10.657426,
-          11.62937
+          10.507909,
+          10.80174,
+          12.517261999999999,
+          11.736025000000001,
+          11.728832
         ]
       },
       {
-        "cold_ms": 11.837402,
-        "digest": "ee03f64b9ecdc7da",
+        "cold_ms": 11.346653,
+        "digest": "6b6dd080dfa711fe",
         "dropped_label_keys": [],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "sum(rate({app=\"api-gateway\"}[10s]))",
         "id": "rate/api-gateway/w1",
         "label_keys": [],
         "lines_processed": 6491,
         "ordered": true,
-        "reduced_digest": "49afb18623ccd0fd",
+        "reduced_digest": "b457d1ea3adecacd",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484100.000000\u0001125.000000",
-          "\u00011785484110.000000\u0001125.000000",
-          "\u00011785484120.000000\u0001125.000000"
+          "\u00011785485180.000000\u0001125.000000",
+          "\u00011785485190.000000\u0001125.000000",
+          "\u00011785485200.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          11.135645,
-          10.640304,
-          10.536109,
-          10.747784999999999,
-          12.045653
+          10.835714,
+          10.427448,
+          10.68417,
+          12.793089,
+          10.881892
         ]
       },
       {
-        "cold_ms": 10.156395,
-        "digest": "54a0ccfe1edf9d73",
+        "cold_ms": 10.320978,
+        "digest": "89ca38775761e36f",
         "dropped_label_keys": [],
-        "end_ns": 1785484180000000000,
+        "end_ns": 1785485260000000000,
         "error": null,
         "expression": "sum(rate({app=\"api-gateway\"}[10s]))",
         "id": "rate/api-gateway/w2",
         "label_keys": [],
         "lines_processed": 5466,
         "ordered": true,
-        "reduced_digest": "25b917b7eebe99ee",
+        "reduced_digest": "b4dd045a1206a0c2",
         "result_type": "matrix",
         "rows": 4,
         "sample": [
-          "\u00011785484150.000000\u0001125.000000",
-          "\u00011785484160.000000\u0001125.000000",
-          "\u00011785484170.000000\u0001125.000000"
+          "\u00011785485230.000000\u0001125.000000",
+          "\u00011785485240.000000\u0001125.000000",
+          "\u00011785485250.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          9.118444,
-          9.999309,
-          9.238230999999999,
-          9.251154,
-          9.83417
+          9.169336,
+          10.314555,
+          9.968746000000001,
+          9.48583,
+          10.585284999999999
         ]
       },
       {
-        "cold_ms": 10.661884,
-        "digest": "8f37ea895e72a398",
+        "cold_ms": 10.633214,
+        "digest": "5d798ef078ae7988",
         "dropped_label_keys": [],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "sum(rate({app=\"billing\"}[10s]))",
         "id": "rate/billing/w0",
         "label_keys": [],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "42d24a2bd847a417",
+        "reduced_digest": "70aa29365415d80f",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484050.000000\u0001125.000000",
-          "\u00011785484060.000000\u0001125.000000",
-          "\u00011785484070.000000\u0001125.000000"
+          "\u00011785485130.000000\u0001125.000000",
+          "\u00011785485140.000000\u0001125.000000",
+          "\u00011785485150.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          10.431281,
-          11.650861,
-          10.431701,
-          10.650653,
-          11.093685
+          10.067632,
+          11.218744,
+          11.127974,
+          10.478584000000001,
+          10.481981
         ]
       },
       {
-        "cold_ms": 10.570122,
-        "digest": "ee03f64b9ecdc7da",
+        "cold_ms": 11.145826,
+        "digest": "6b6dd080dfa711fe",
         "dropped_label_keys": [],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "sum(rate({app=\"billing\"}[10s]))",
         "id": "rate/billing/w1",
         "label_keys": [],
         "lines_processed": 6600,
         "ordered": true,
-        "reduced_digest": "49afb18623ccd0fd",
+        "reduced_digest": "b457d1ea3adecacd",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484100.000000\u0001125.000000",
-          "\u00011785484110.000000\u0001125.000000",
-          "\u00011785484120.000000\u0001125.000000"
+          "\u00011785485180.000000\u0001125.000000",
+          "\u00011785485190.000000\u0001125.000000",
+          "\u00011785485200.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          10.377139,
-          12.370944999999999,
-          10.638720000000001,
-          13.064625999999999,
-          10.728399
+          10.758349,
+          10.454659999999999,
+          10.643483,
+          11.255342,
+          11.313873000000001
         ]
       },
       {
-        "cold_ms": 10.101762,
-        "digest": "54a0ccfe1edf9d73",
+        "cold_ms": 9.574997,
+        "digest": "89ca38775761e36f",
         "dropped_label_keys": [],
-        "end_ns": 1785484180000000000,
+        "end_ns": 1785485260000000000,
         "error": null,
         "expression": "sum(rate({app=\"billing\"}[10s]))",
         "id": "rate/billing/w2",
         "label_keys": [],
         "lines_processed": 5603,
         "ordered": true,
-        "reduced_digest": "25b917b7eebe99ee",
+        "reduced_digest": "b4dd045a1206a0c2",
         "result_type": "matrix",
         "rows": 4,
         "sample": [
-          "\u00011785484150.000000\u0001125.000000",
-          "\u00011785484160.000000\u0001125.000000",
-          "\u00011785484170.000000\u0001125.000000"
+          "\u00011785485230.000000\u0001125.000000",
+          "\u00011785485240.000000\u0001125.000000",
+          "\u00011785485250.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          9.234653,
-          9.608095,
-          9.864607,
-          10.097424,
-          9.517555
+          10.058775,
+          9.1667,
+          12.124915,
+          9.619361,
+          9.547055
         ]
       },
       {
-        "cold_ms": 11.286717,
-        "digest": "8f37ea895e72a398",
+        "cold_ms": 12.174408,
+        "digest": "5d798ef078ae7988",
         "dropped_label_keys": [],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "sum(rate({app=\"checkout\"}[10s]))",
         "id": "rate/checkout/w0",
         "label_keys": [],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "42d24a2bd847a417",
+        "reduced_digest": "70aa29365415d80f",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484050.000000\u0001125.000000",
-          "\u00011785484060.000000\u0001125.000000",
-          "\u00011785484070.000000\u0001125.000000"
+          "\u00011785485130.000000\u0001125.000000",
+          "\u00011785485140.000000\u0001125.000000",
+          "\u00011785485150.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          10.298662,
-          10.666423,
-          10.713421,
-          10.282291,
-          10.565272
+          10.270423000000001,
+          10.222774000000001,
+          11.737437,
+          10.940802,
+          10.529449999999999
         ]
       },
       {
-        "cold_ms": 12.125983999999999,
-        "digest": "ee03f64b9ecdc7da",
+        "cold_ms": 11.878221,
+        "digest": "6b6dd080dfa711fe",
         "dropped_label_keys": [],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "sum(rate({app=\"checkout\"}[10s]))",
         "id": "rate/checkout/w1",
         "label_keys": [],
         "lines_processed": 6448,
         "ordered": true,
-        "reduced_digest": "49afb18623ccd0fd",
+        "reduced_digest": "b457d1ea3adecacd",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484100.000000\u0001125.000000",
-          "\u00011785484110.000000\u0001125.000000",
-          "\u00011785484120.000000\u0001125.000000"
+          "\u00011785485180.000000\u0001125.000000",
+          "\u00011785485190.000000\u0001125.000000",
+          "\u00011785485200.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          10.753385000000002,
-          10.725513000000001,
-          10.799652,
-          10.770549,
-          10.437923
+          11.377721000000001,
+          11.21673,
+          10.696734,
+          10.354241,
+          11.737689000000001
         ]
       },
       {
-        "cold_ms": 9.655154000000001,
-        "digest": "54a0ccfe1edf9d73",
+        "cold_ms": 9.747761,
+        "digest": "89ca38775761e36f",
         "dropped_label_keys": [],
-        "end_ns": 1785484180000000000,
+        "end_ns": 1785485260000000000,
         "error": null,
         "expression": "sum(rate({app=\"checkout\"}[10s]))",
         "id": "rate/checkout/w2",
         "label_keys": [],
         "lines_processed": 5511,
         "ordered": true,
-        "reduced_digest": "25b917b7eebe99ee",
+        "reduced_digest": "b4dd045a1206a0c2",
         "result_type": "matrix",
         "rows": 4,
         "sample": [
-          "\u00011785484150.000000\u0001125.000000",
-          "\u00011785484160.000000\u0001125.000000",
-          "\u00011785484170.000000\u0001125.000000"
+          "\u00011785485230.000000\u0001125.000000",
+          "\u00011785485240.000000\u0001125.000000",
+          "\u00011785485250.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          9.257206,
-          9.2007,
-          10.017244,
-          10.149552,
-          9.811438
+          9.307044000000001,
+          10.94591,
+          9.905348,
+          9.958778,
+          10.097379
         ]
       },
       {
-        "cold_ms": 10.96344,
-        "digest": "8f37ea895e72a398",
+        "cold_ms": 11.025860999999999,
+        "digest": "5d798ef078ae7988",
         "dropped_label_keys": [],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "sum(rate({app=\"ingest\"}[10s]))",
         "id": "rate/ingest/w0",
         "label_keys": [],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "42d24a2bd847a417",
+        "reduced_digest": "70aa29365415d80f",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484050.000000\u0001125.000000",
-          "\u00011785484060.000000\u0001125.000000",
-          "\u00011785484070.000000\u0001125.000000"
+          "\u00011785485130.000000\u0001125.000000",
+          "\u00011785485140.000000\u0001125.000000",
+          "\u00011785485150.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          11.2514,
-          10.970093,
-          10.358343000000001,
-          11.178704,
-          11.040875999999999
+          12.764605999999999,
+          11.3499,
+          11.208684,
+          10.135430000000001,
+          12.516882
         ]
       },
       {
-        "cold_ms": 11.248826,
-        "digest": "ee03f64b9ecdc7da",
+        "cold_ms": 10.646429000000001,
+        "digest": "6b6dd080dfa711fe",
         "dropped_label_keys": [],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "sum(rate({app=\"ingest\"}[10s]))",
         "id": "rate/ingest/w1",
         "label_keys": [],
         "lines_processed": 6537,
         "ordered": true,
-        "reduced_digest": "49afb18623ccd0fd",
+        "reduced_digest": "b457d1ea3adecacd",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484100.000000\u0001125.000000",
-          "\u00011785484110.000000\u0001125.000000",
-          "\u00011785484120.000000\u0001125.000000"
+          "\u00011785485180.000000\u0001125.000000",
+          "\u00011785485190.000000\u0001125.000000",
+          "\u00011785485200.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          12.602779,
-          10.944956000000001,
-          13.355794000000001,
-          11.262021,
-          11.430999
+          10.750654,
+          10.718383999999999,
+          11.348317,
+          10.668541,
+          10.663191000000001
         ]
       },
       {
-        "cold_ms": 10.119416,
-        "digest": "54a0ccfe1edf9d73",
+        "cold_ms": 9.575838999999998,
+        "digest": "89ca38775761e36f",
         "dropped_label_keys": [],
-        "end_ns": 1785484180000000000,
+        "end_ns": 1785485260000000000,
         "error": null,
         "expression": "sum(rate({app=\"ingest\"}[10s]))",
         "id": "rate/ingest/w2",
         "label_keys": [],
         "lines_processed": 5471,
         "ordered": true,
-        "reduced_digest": "25b917b7eebe99ee",
+        "reduced_digest": "b4dd045a1206a0c2",
         "result_type": "matrix",
         "rows": 4,
         "sample": [
-          "\u00011785484150.000000\u0001125.000000",
-          "\u00011785484160.000000\u0001125.000000",
-          "\u00011785484170.000000\u0001125.000000"
+          "\u00011785485230.000000\u0001125.000000",
+          "\u00011785485240.000000\u0001125.000000",
+          "\u00011785485250.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          9.937714,
-          9.348858,
-          10.123692,
-          9.295818,
-          9.533204999999999
+          9.809207,
+          9.218157,
+          9.926086000000002,
+          9.555671,
+          9.810780999999999
         ]
       },
       {
-        "cold_ms": 10.387148,
-        "digest": "8f37ea895e72a398",
+        "cold_ms": 10.65228,
+        "digest": "5d798ef078ae7988",
         "dropped_label_keys": [],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "sum(rate({app=\"notifier\"}[10s]))",
         "id": "rate/notifier/w0",
         "label_keys": [],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "42d24a2bd847a417",
+        "reduced_digest": "70aa29365415d80f",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484050.000000\u0001125.000000",
-          "\u00011785484060.000000\u0001125.000000",
-          "\u00011785484070.000000\u0001125.000000"
+          "\u00011785485130.000000\u0001125.000000",
+          "\u00011785485140.000000\u0001125.000000",
+          "\u00011785485150.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          11.290745,
-          10.65444,
-          10.547298999999999,
-          11.150813000000001,
-          12.171179
+          10.150808000000001,
+          10.699118,
+          11.222731,
+          11.769599000000001,
+          10.366394
         ]
       },
       {
-        "cold_ms": 10.809821000000001,
-        "digest": "ee03f64b9ecdc7da",
+        "cold_ms": 10.720758,
+        "digest": "6b6dd080dfa711fe",
         "dropped_label_keys": [],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "sum(rate({app=\"notifier\"}[10s]))",
         "id": "rate/notifier/w1",
         "label_keys": [],
         "lines_processed": 6544,
         "ordered": true,
-        "reduced_digest": "49afb18623ccd0fd",
+        "reduced_digest": "b457d1ea3adecacd",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484100.000000\u0001125.000000",
-          "\u00011785484110.000000\u0001125.000000",
-          "\u00011785484120.000000\u0001125.000000"
+          "\u00011785485180.000000\u0001125.000000",
+          "\u00011785485190.000000\u0001125.000000",
+          "\u00011785485200.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          10.531719,
-          11.561463,
-          10.520508,
-          10.535717,
-          10.766681
+          11.030339,
+          11.310766,
+          10.474717,
+          12.134963,
+          10.756546
         ]
       },
       {
-        "cold_ms": 10.092334,
-        "digest": "54a0ccfe1edf9d73",
+        "cold_ms": 10.277705999999998,
+        "digest": "89ca38775761e36f",
         "dropped_label_keys": [],
-        "end_ns": 1785484180000000000,
+        "end_ns": 1785485260000000000,
         "error": null,
         "expression": "sum(rate({app=\"notifier\"}[10s]))",
         "id": "rate/notifier/w2",
         "label_keys": [],
         "lines_processed": 5567,
         "ordered": true,
-        "reduced_digest": "25b917b7eebe99ee",
+        "reduced_digest": "b4dd045a1206a0c2",
         "result_type": "matrix",
         "rows": 4,
         "sample": [
-          "\u00011785484150.000000\u0001125.000000",
-          "\u00011785484160.000000\u0001125.000000",
-          "\u00011785484170.000000\u0001125.000000"
+          "\u00011785485230.000000\u0001125.000000",
+          "\u00011785485240.000000\u0001125.000000",
+          "\u00011785485250.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          9.33935,
-          9.6318,
-          9.651898000000001,
-          9.400604999999999,
-          9.550896999999999
+          9.391633,
+          10.128626,
+          9.487964,
+          9.274925,
+          9.286847000000002
         ]
       },
       {
-        "cold_ms": 11.285164,
-        "digest": "8f37ea895e72a398",
+        "cold_ms": 10.277937,
+        "digest": "5d798ef078ae7988",
         "dropped_label_keys": [],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "sum(rate({app=\"scheduler\"}[10s]))",
         "id": "rate/scheduler/w0",
         "label_keys": [],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "42d24a2bd847a417",
+        "reduced_digest": "70aa29365415d80f",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484050.000000\u0001125.000000",
-          "\u00011785484060.000000\u0001125.000000",
-          "\u00011785484070.000000\u0001125.000000"
+          "\u00011785485130.000000\u0001125.000000",
+          "\u00011785485140.000000\u0001125.000000",
+          "\u00011785485150.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          11.428614,
-          12.413484,
-          11.486422,
-          12.639949,
-          10.331845
+          11.186924000000001,
+          10.355924,
+          10.238413,
+          10.220129,
+          10.593369000000001
         ]
       },
       {
-        "cold_ms": 11.541245,
-        "digest": "ee03f64b9ecdc7da",
+        "cold_ms": 11.569602,
+        "digest": "6b6dd080dfa711fe",
         "dropped_label_keys": [],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "sum(rate({app=\"scheduler\"}[10s]))",
         "id": "rate/scheduler/w1",
         "label_keys": [],
         "lines_processed": 6568,
         "ordered": true,
-        "reduced_digest": "49afb18623ccd0fd",
+        "reduced_digest": "b457d1ea3adecacd",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484100.000000\u0001125.000000",
-          "\u00011785484110.000000\u0001125.000000",
-          "\u00011785484120.000000\u0001125.000000"
+          "\u00011785485180.000000\u0001125.000000",
+          "\u00011785485190.000000\u0001125.000000",
+          "\u00011785485200.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          10.868863,
-          12.128618000000001,
-          10.523094,
-          11.635171,
-          10.463742
+          11.366661,
+          10.514811,
+          10.533627000000001,
+          11.358777,
+          11.330563999999999
         ]
       },
       {
-        "cold_ms": 9.667517,
-        "digest": "54a0ccfe1edf9d73",
+        "cold_ms": 11.256124,
+        "digest": "89ca38775761e36f",
         "dropped_label_keys": [],
-        "end_ns": 1785484180000000000,
+        "end_ns": 1785485260000000000,
         "error": null,
         "expression": "sum(rate({app=\"scheduler\"}[10s]))",
         "id": "rate/scheduler/w2",
         "label_keys": [],
         "lines_processed": 5597,
         "ordered": true,
-        "reduced_digest": "25b917b7eebe99ee",
+        "reduced_digest": "b4dd045a1206a0c2",
         "result_type": "matrix",
         "rows": 4,
         "sample": [
-          "\u00011785484150.000000\u0001125.000000",
-          "\u00011785484160.000000\u0001125.000000",
-          "\u00011785484170.000000\u0001125.000000"
+          "\u00011785485230.000000\u0001125.000000",
+          "\u00011785485240.000000\u0001125.000000",
+          "\u00011785485250.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          9.766752,
-          9.587326000000001,
-          10.159118999999999,
-          9.495052000000001,
-          10.242877
+          10.409163000000001,
+          9.879198,
+          11.468423,
+          9.355024,
+          9.981971
         ]
       },
       {
-        "cold_ms": 12.571309,
-        "digest": "8f37ea895e72a398",
+        "cold_ms": 10.701070999999999,
+        "digest": "5d798ef078ae7988",
         "dropped_label_keys": [],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "sum(rate({app=\"search\"}[10s]))",
         "id": "rate/search/w0",
         "label_keys": [],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "42d24a2bd847a417",
+        "reduced_digest": "70aa29365415d80f",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484050.000000\u0001125.000000",
-          "\u00011785484060.000000\u0001125.000000",
-          "\u00011785484070.000000\u0001125.000000"
+          "\u00011785485130.000000\u0001125.000000",
+          "\u00011785485140.000000\u0001125.000000",
+          "\u00011785485150.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          12.963196,
-          11.367428,
-          11.205094,
-          10.176572,
-          10.934987
+          10.773458,
+          10.969436,
+          11.629995000000001,
+          10.295119999999999,
+          10.752889
         ]
       },
       {
-        "cold_ms": 10.825621,
-        "digest": "ee03f64b9ecdc7da",
+        "cold_ms": 10.569483,
+        "digest": "6b6dd080dfa711fe",
         "dropped_label_keys": [],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "sum(rate({app=\"search\"}[10s]))",
         "id": "rate/search/w1",
         "label_keys": [],
         "lines_processed": 6493,
         "ordered": true,
-        "reduced_digest": "49afb18623ccd0fd",
+        "reduced_digest": "b457d1ea3adecacd",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484100.000000\u0001125.000000",
-          "\u00011785484110.000000\u0001125.000000",
-          "\u00011785484120.000000\u0001125.000000"
+          "\u00011785485180.000000\u0001125.000000",
+          "\u00011785485190.000000\u0001125.000000",
+          "\u00011785485200.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          10.867931,
-          11.515978,
-          10.477458,
-          10.628891999999999,
-          10.730443
+          10.936483,
+          12.158708,
+          11.539346,
+          11.000283,
+          10.548676
         ]
       },
       {
-        "cold_ms": 9.353688,
-        "digest": "54a0ccfe1edf9d73",
+        "cold_ms": 10.113658,
+        "digest": "89ca38775761e36f",
         "dropped_label_keys": [],
-        "end_ns": 1785484180000000000,
+        "end_ns": 1785485260000000000,
         "error": null,
         "expression": "sum(rate({app=\"search\"}[10s]))",
         "id": "rate/search/w2",
         "label_keys": [],
         "lines_processed": 5491,
         "ordered": true,
-        "reduced_digest": "25b917b7eebe99ee",
+        "reduced_digest": "b4dd045a1206a0c2",
         "result_type": "matrix",
         "rows": 4,
         "sample": [
-          "\u00011785484150.000000\u0001125.000000",
-          "\u00011785484160.000000\u0001125.000000",
-          "\u00011785484170.000000\u0001125.000000"
+          "\u00011785485230.000000\u0001125.000000",
+          "\u00011785485240.000000\u0001125.000000",
+          "\u00011785485250.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          9.341904,
-          9.861651,
-          9.692974,
-          10.169068999999999,
-          9.97346
+          11.586574,
+          10.315026999999999,
+          9.579816,
+          9.921839,
+          11.511533
         ]
       },
       {
-        "cold_ms": 10.406184000000001,
-        "digest": "8f37ea895e72a398",
+        "cold_ms": 11.008238,
+        "digest": "5d798ef078ae7988",
         "dropped_label_keys": [],
-        "end_ns": 1785484090000000000,
+        "end_ns": 1785485170000000000,
         "error": null,
         "expression": "sum(rate({app=\"web\"}[10s]))",
         "id": "rate/web/w0",
         "label_keys": [],
         "lines_processed": 6254,
         "ordered": true,
-        "reduced_digest": "42d24a2bd847a417",
+        "reduced_digest": "70aa29365415d80f",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484050.000000\u0001125.000000",
-          "\u00011785484060.000000\u0001125.000000",
-          "\u00011785484070.000000\u0001125.000000"
+          "\u00011785485130.000000\u0001125.000000",
+          "\u00011785485140.000000\u0001125.000000",
+          "\u00011785485150.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484040000000000,
+        "start_ns": 1785485120000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          10.691539,
-          11.235602,
-          11.627607,
-          10.471365,
-          10.498808
+          10.434672,
+          11.273536,
+          10.328914,
+          10.128808,
+          11.382942
         ]
       },
       {
-        "cold_ms": 11.364602999999999,
-        "digest": "ee03f64b9ecdc7da",
+        "cold_ms": 10.758659999999999,
+        "digest": "6b6dd080dfa711fe",
         "dropped_label_keys": [],
-        "end_ns": 1785484140000000000,
+        "end_ns": 1785485220000000000,
         "error": null,
         "expression": "sum(rate({app=\"web\"}[10s]))",
         "id": "rate/web/w1",
         "label_keys": [],
         "lines_processed": 6536,
         "ordered": true,
-        "reduced_digest": "49afb18623ccd0fd",
+        "reduced_digest": "b457d1ea3adecacd",
         "result_type": "matrix",
         "rows": 5,
         "sample": [
-          "\u00011785484100.000000\u0001125.000000",
-          "\u00011785484110.000000\u0001125.000000",
-          "\u00011785484120.000000\u0001125.000000"
+          "\u00011785485180.000000\u0001125.000000",
+          "\u00011785485190.000000\u0001125.000000",
+          "\u00011785485200.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484090000000000,
+        "start_ns": 1785485170000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          10.92059,
-          11.076863,
-          10.674869,
-          10.72356,
-          11.208701
+          10.569054,
+          10.715347999999999,
+          11.677094,
+          10.452024000000002,
+          10.568473000000001
         ]
       },
       {
-        "cold_ms": 9.607744,
-        "digest": "54a0ccfe1edf9d73",
+        "cold_ms": 9.593171,
+        "digest": "89ca38775761e36f",
         "dropped_label_keys": [],
-        "end_ns": 1785484180000000000,
+        "end_ns": 1785485260000000000,
         "error": null,
         "expression": "sum(rate({app=\"web\"}[10s]))",
         "id": "rate/web/w2",
         "label_keys": [],
         "lines_processed": 5595,
         "ordered": true,
-        "reduced_digest": "25b917b7eebe99ee",
+        "reduced_digest": "b4dd045a1206a0c2",
         "result_type": "matrix",
         "rows": 4,
         "sample": [
-          "\u00011785484150.000000\u0001125.000000",
-          "\u00011785484160.000000\u0001125.000000",
-          "\u00011785484170.000000\u0001125.000000"
+          "\u00011785485230.000000\u0001125.000000",
+          "\u00011785485240.000000\u0001125.000000",
+          "\u00011785485250.000000\u0001125.000000"
         ],
         "series": 1,
         "shape": "rate",
-        "start_ns": 1785484140000000000,
+        "start_ns": 1785485220000000000,
         "status": 200,
         "warm_digests_agree": true,
         "warm_ms": [
-          10.390053,
-          9.319483,
-          9.341693999999999,
-          10.285777,
-          11.300463
+          9.721051,
+          10.103881,
+          10.193439,
+          10.657711,
+          10.184863
         ]
       }
     ],
@@ -6444,11 +6444,11 @@
         "answers_out_of_requested_order": 0,
         "cold_ms": {
           "count": 24,
-          "max_ms": 68.61702799999999,
-          "mean_ms": 50.846114708333324,
-          "min_ms": 38.326269,
-          "p50_ms": 52.642857,
-          "p95_ms": 67.054203,
+          "max_ms": 70.043616,
+          "mean_ms": 51.13100895833333,
+          "min_ms": 38.630117,
+          "p50_ms": 52.733297,
+          "p95_ms": 68.952608,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 24"
@@ -6461,12 +6461,12 @@
         "warm_answers_differed": 0,
         "warm_ms": {
           "count": 120,
-          "max_ms": 71.27965999999999,
-          "mean_ms": 51.079063175,
-          "min_ms": 35.507165,
-          "p50_ms": 52.149431,
-          "p95_ms": 68.289273,
-          "p99_ms": 71.248781,
+          "max_ms": 71.099994,
+          "mean_ms": 51.17368265833332,
+          "min_ms": 37.801874999999995,
+          "p50_ms": 52.20672,
+          "p95_ms": 69.173999,
+          "p99_ms": 70.819927,
           "unsupported": []
         }
       },
@@ -6474,11 +6474,11 @@
         "answers_out_of_requested_order": 0,
         "cold_ms": {
           "count": 24,
-          "max_ms": 139.706479,
-          "mean_ms": 126.21339054166664,
-          "min_ms": 104.25055,
-          "p50_ms": 136.004976,
-          "p95_ms": 137.807913,
+          "max_ms": 139.416864,
+          "mean_ms": 126.080365375,
+          "min_ms": 104.696518,
+          "p50_ms": 135.736044,
+          "p95_ms": 138.299085,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 24"
@@ -6491,12 +6491,12 @@
         "warm_answers_differed": 0,
         "warm_ms": {
           "count": 120,
-          "max_ms": 139.667699,
-          "mean_ms": 126.32013015,
-          "min_ms": 104.332133,
-          "p50_ms": 135.705506,
-          "p95_ms": 138.442759,
-          "p99_ms": 139.279679,
+          "max_ms": 139.513777,
+          "mean_ms": 126.1725738833334,
+          "min_ms": 103.84104099999999,
+          "p50_ms": 135.49835700000003,
+          "p95_ms": 138.308089,
+          "p99_ms": 139.11083399999998,
           "unsupported": []
         }
       },
@@ -6504,11 +6504,11 @@
         "answers_out_of_requested_order": 0,
         "cold_ms": {
           "count": 24,
-          "max_ms": 184.23055699999998,
-          "mean_ms": 176.84534637500005,
-          "min_ms": 169.669972,
-          "p50_ms": 177.090108,
-          "p95_ms": 181.970032,
+          "max_ms": 185.28950799999998,
+          "mean_ms": 175.65443070833336,
+          "min_ms": 168.40154099999998,
+          "p50_ms": 175.736133,
+          "p95_ms": 182.193064,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 24"
@@ -6521,12 +6521,12 @@
         "warm_answers_differed": 0,
         "warm_ms": {
           "count": 120,
-          "max_ms": 194.15266400000002,
-          "mean_ms": 176.1976760249999,
-          "min_ms": 166.799932,
-          "p50_ms": 175.808934,
-          "p95_ms": 186.792392,
-          "p99_ms": 191.497236,
+          "max_ms": 189.618943,
+          "mean_ms": 176.93146896666664,
+          "min_ms": 166.859322,
+          "p50_ms": 176.755293,
+          "p95_ms": 183.951275,
+          "p99_ms": 189.281545,
           "unsupported": []
         }
       },
@@ -6534,11 +6534,11 @@
         "answers_out_of_requested_order": 0,
         "cold_ms": {
           "count": 24,
-          "max_ms": 27.265046,
-          "mean_ms": 24.13946758333333,
-          "min_ms": 22.368049,
-          "p50_ms": 23.650146,
-          "p95_ms": 27.194032,
+          "max_ms": 25.681376999999998,
+          "mean_ms": 23.51615891666667,
+          "min_ms": 22.333279,
+          "p50_ms": 23.524036000000002,
+          "p95_ms": 24.552758,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 24"
@@ -6551,12 +6551,12 @@
         "warm_answers_differed": 0,
         "warm_ms": {
           "count": 120,
-          "max_ms": 26.892685999999998,
-          "mean_ms": 23.730756900000003,
-          "min_ms": 21.168688000000003,
-          "p50_ms": 23.619729999999997,
-          "p95_ms": 26.247424,
-          "p99_ms": 26.832112000000002,
+          "max_ms": 28.039846,
+          "mean_ms": 23.851941049999994,
+          "min_ms": 21.500768,
+          "p50_ms": 23.622712,
+          "p95_ms": 26.404586000000002,
+          "p99_ms": 27.871029,
           "unsupported": []
         }
       },
@@ -6564,11 +6564,11 @@
         "answers_out_of_requested_order": 0,
         "cold_ms": {
           "count": 24,
-          "max_ms": 82.27023,
-          "mean_ms": 74.33328616666667,
-          "min_ms": 62.221376,
-          "p50_ms": 79.371816,
-          "p95_ms": 81.91893,
+          "max_ms": 81.69373900000001,
+          "mean_ms": 74.15068629166667,
+          "min_ms": 62.368646,
+          "p50_ms": 79.30836099999999,
+          "p95_ms": 81.35917099999999,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 24"
@@ -6581,12 +6581,12 @@
         "warm_answers_differed": 0,
         "warm_ms": {
           "count": 120,
-          "max_ms": 83.534393,
-          "mean_ms": 74.19854744166666,
-          "min_ms": 62.314392000000005,
-          "p50_ms": 79.118262,
-          "p95_ms": 81.099561,
-          "p99_ms": 81.815105,
+          "max_ms": 82.92592499999999,
+          "mean_ms": 74.21792811666664,
+          "min_ms": 62.165759,
+          "p50_ms": 79.137193,
+          "p95_ms": 81.95477299999999,
+          "p99_ms": 82.691825,
           "unsupported": []
         }
       },
@@ -6594,11 +6594,11 @@
         "answers_out_of_requested_order": 0,
         "cold_ms": {
           "count": 24,
-          "max_ms": 12.571309,
-          "mean_ms": 10.739281791666668,
-          "min_ms": 9.353688,
-          "p50_ms": 10.809821000000001,
-          "p95_ms": 12.125983999999999,
+          "max_ms": 12.289994,
+          "mean_ms": 10.744119541666665,
+          "min_ms": 9.574997,
+          "p50_ms": 10.701070999999999,
+          "p95_ms": 12.174408,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 24"
@@ -6611,37 +6611,37 @@
         "warm_answers_differed": 0,
         "warm_ms": {
           "count": 120,
-          "max_ms": 13.355794000000001,
-          "mean_ms": 10.648707341666663,
-          "min_ms": 9.118444,
-          "p50_ms": 10.638720000000001,
-          "p95_ms": 12.602779,
-          "p99_ms": 13.064625999999999,
+          "max_ms": 12.793089,
+          "mean_ms": 10.65573465833333,
+          "min_ms": 9.1667,
+          "p50_ms": 10.585284999999999,
+          "p95_ms": 12.134963,
+          "p99_ms": 12.764605999999999,
           "unsupported": []
         }
       }
     }
   },
   "memory": {
-    "anon_bytes_end": 138600448,
-    "anon_peak_bytes": 325545984,
-    "current_bytes": 171229184,
+    "anon_bytes_end": 142807040,
+    "anon_peak_bytes": 265416704,
+    "current_bytes": 170881024,
     "error": null,
-    "file_bytes_end": 212992,
-    "peak_bytes": 358486016,
-    "peak_bytes_before": 54366208,
-    "source": "/sys/fs/cgroup/system.slice/docker-83a024996e9fb4a30077c3d33345c620ce29ed7a3342cabdf2d075febd8ac0d3.scope/memory.peak"
+    "file_bytes_end": 73728,
+    "peak_bytes": 289538048,
+    "peak_bytes_before": 52428800,
+    "source": "/sys/fs/cgroup/system.slice/docker-eca609442a0afe37fe101c300ecb3c3010ddf87909400ca71b4a4ca2c856f5ea.scope/memory.peak"
   },
   "phase": "matrix",
   "run": {
-    "build_revision": "d91014b",
+    "build_revision": "640a996",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "seed": 1592598566
   },
   "target": "loki",
   "verdict": "PASS",
   "verify": {
-    "anchor_ns": 1785484040000000000,
+    "anchor_ns": 1785485120000000000,
     "line_bytes": 49029829,
     "rows": 150000,
     "span_ns": 150000000000,
