@@ -40,6 +40,18 @@ pub struct Targets {
 pub enum Target {
     Loggytracy,
     Loki,
+    /// The design this engine took its logical model from.
+    ///
+    /// `docs/ARCHITECTURE.md` names VictoriaLogs' `lib/logstorage` as the design
+    /// reference, so comparing against it asks a different question from
+    /// comparing against Loki: not "are we competitive" but "did the place we
+    /// diverged — Parquet instead of their own columnar format — pay".
+    ///
+    /// It accepts the Loki push API, so ingest is the same bytes. It does not
+    /// speak LogQL, so every query has to be translated and every response
+    /// parsed differently; that asymmetry is why the two halves of this adapter
+    /// look so unalike.
+    VictoriaLogs,
 }
 
 impl Target {
@@ -47,8 +59,9 @@ impl Target {
         match raw.trim().to_ascii_lowercase().as_str() {
             "loggytracy" => Ok(Target::Loggytracy),
             "loki" => Ok(Target::Loki),
+            "victorialogs" | "victoria-logs" | "vl" => Ok(Target::VictoriaLogs),
             other => Err(format!(
-                "LOGGYTRACY_LOAD_TARGET must be loggytracy or loki, got {other:?}"
+                "LOGGYTRACY_LOAD_TARGET must be loggytracy, loki or victorialogs, got {other:?}"
             )),
         }
     }
@@ -57,6 +70,42 @@ impl Target {
         match self {
             Target::Loggytracy => "loggytracy",
             Target::Loki => "loki",
+            Target::VictoriaLogs => "victorialogs",
+        }
+    }
+
+    /// What to put in `X-Scope-OrgID` for this system.
+    ///
+    /// VictoriaLogs reads that header as its numeric `AccountID` and refuses
+    /// anything that is not a `uint32` — `verify-tenant-000` comes back as
+    /// `cannot parse "verify-tenant-000" as uint32`. Its tenancy is
+    /// `AccountID:ProjectID`, not an opaque string, so a name cannot be carried
+    /// across. The comparison corpus is single-tenant, so account `0` holds all
+    /// of it and nothing is lost; a multi-tenant comparison would need a
+    /// name-to-number mapping and would be measuring something else.
+    pub fn tenant_header(self, tenant: &str) -> String {
+        match self {
+            Target::Loggytracy | Target::Loki => tenant.to_string(),
+            Target::VictoriaLogs => "0".to_string(),
+        }
+    }
+
+    pub fn push_path(self) -> &'static str {
+        match self {
+            Target::Loggytracy | Target::Loki => "/loki/api/v1/push",
+            Target::VictoriaLogs => "/insert/loki/api/v1/push",
+        }
+    }
+
+    /// Where a run waits for the system to answer before it starts.
+    ///
+    /// Not `/ready` everywhere: VictoriaLogs exposes `/health` and has no
+    /// separate readiness notion, so asking for one would wait out a timeout on
+    /// a system that was up the whole time.
+    pub fn ready_path(self) -> &'static str {
+        match self {
+            Target::Loggytracy | Target::Loki => "/ready",
+            Target::VictoriaLogs => "/health",
         }
     }
 }

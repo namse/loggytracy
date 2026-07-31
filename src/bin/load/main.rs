@@ -49,7 +49,6 @@ use http::{Client, Request};
 use stats::{GaugeSeries, LatencyPair, target_row, wal_backlog_drains};
 use workload::{ArrivalOrder, PushGenerator, QUERY_SHAPES, QueryGenerator, loki_result_rows};
 
-const PUSH_PATH: &str = "/loki/api/v1/push";
 const PUSH_CONTENT_TYPE: &str = "application/x-protobuf";
 /// Row group size the engine itself flushes at, so the measured compression
 /// ratio is the ratio this data will actually get on disk.
@@ -492,7 +491,7 @@ async fn wait_for_ready(cfg: &Config) -> Result<(), String> {
         match client
             .request(&Request {
                 method: "GET",
-                path: "/ready",
+                path: cfg.target.ready_path(),
                 body: &[],
                 content_type: "",
                 tenant: None,
@@ -542,6 +541,7 @@ async fn push_pacer(
             late_fraction: cfg.late_fraction,
             late_max_ms: cfg.late_max_ms,
         },
+        cfg.target,
     );
     let interval = cfg.push_interval();
     let mut intended = Instant::now();
@@ -601,7 +601,7 @@ async fn push_worker(
         let result = client
             .request(&Request {
                 method: "POST",
-                path: PUSH_PATH,
+                path: cfg.target.push_path(),
                 body: &job.body.bytes,
                 content_type: PUSH_CONTENT_TYPE,
                 tenant: Some(&job.body.tenant),
@@ -832,6 +832,18 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
                         probe::sum_by_prefix(&metrics, "loki_ingester_memory_chunks") as u64,
                     );
                 }
+                // VictoriaLogs' analogues: what is not yet on disk, and how
+                // many parts hold what is.
+                Target::VictoriaLogs => {
+                    outcome.memtable_bytes.push(
+                        elapsed,
+                        probe::sum_by_prefix(&metrics, "vl_storage_inmemory_parts") as u64,
+                    );
+                    outcome.part_count.push(
+                        elapsed,
+                        probe::sum_by_prefix(&metrics, "vl_storage_file_parts") as u64,
+                    );
+                }
             },
             None => outcome.scrape_errors += 1,
         }
@@ -848,7 +860,7 @@ async fn otlp_workload(cfg: Config, stop: Arc<AtomicBool>, deadline: Instant) ->
     let mut outcome = OtlpOutcome::default();
     // Loki has no trace ingest, so a trace workload would be load one side
     // carries and the other does not.
-    if cfg.target == Target::Loki {
+    if cfg.target != Target::Loggytracy {
         return outcome;
     }
     let Some(interval) = cfg.otlp_interval() else {
@@ -1137,6 +1149,29 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 result; the reason label says which limit did it",
                 }),
                 lines_received > 0 && discarded == 0,
+            )
+        }
+        // Same rule as Loki's: a rejection here is this bed misconfiguring the
+        // system rather than a result about it, so the gate is that nothing was
+        // dropped and something arrived.
+        Target::VictoriaLogs => {
+            let rows = probe::sum_delta(&start_metrics, &end_metrics, "vl_rows_ingested_total");
+            let dropped = probe::sum_delta(&start_metrics, &end_metrics, "vl_rows_dropped_total");
+            (
+                json!({
+                    "rows_ingested": rows,
+                    "rows_dropped": dropped,
+                    "dropped_by_reason": probe::breakdown(
+                        &end_metrics,
+                        "vl_rows_dropped_total",
+                        "reason",
+                    ),
+                    "inmemory_parts_end": probe::sum_by_prefix(&end_metrics, "vl_storage_inmemory_parts"),
+                    "file_parts_end": probe::sum_by_prefix(&end_metrics, "vl_storage_file_parts"),
+                    "note": "a non-zero drop count is this bed misconfiguring VictoriaLogs, not a \
+                VictoriaLogs result",
+                }),
+                rows > 0 && dropped == 0,
             )
         }
     };

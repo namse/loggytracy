@@ -35,7 +35,6 @@ use loggytracy::memtable::LogEntry;
 /// corpus's while staying a function of the run seed.
 const VERIFY_SEED_SALT: u64 = 0x1e_4f_a1_ce;
 
-const PUSH_PATH: &str = "/loki/api/v1/push";
 const PUSH_CONTENT_TYPE: &str = "application/x-protobuf";
 
 /// The four shapes `docs/VISION.md` names, in the order the claim is argued
@@ -177,7 +176,8 @@ fn seed_bodies(corpus: &Corpus, entries_per_push: usize) -> Vec<SeedBody> {
 }
 
 pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
-    let tenant = corpus.tenant_ids[0].as_str().to_string();
+    let push_path = cfg.target.push_path();
+    let tenant = cfg.target.tenant_header(corpus.tenant_ids[0].as_str());
     let bodies = Arc::new(Mutex::new(seed_bodies(corpus, cfg.verify.entries_per_push)));
     let start = Instant::now();
 
@@ -211,7 +211,7 @@ pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
                         let result = client
                             .request(&Request {
                                 method: "POST",
-                                path: PUSH_PATH,
+                                path: push_path,
                                 body: &body.bytes,
                                 content_type: PUSH_CONTENT_TYPE,
                                 tenant: Some(&tenant),
@@ -773,7 +773,7 @@ async fn issue(
 /// has already run, so nothing about the second issue is the first one still
 /// being resident in a way the first was not.
 pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
-    let tenant = corpus.tenant_ids[0].as_str().to_string();
+    let tenant = cfg.target.tenant_header(corpus.tenant_ids[0].as_str());
     let queries = build_queries(cfg, corpus);
     let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
     let mut timings: Vec<Timing> = Vec::with_capacity(queries.len());

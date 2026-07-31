@@ -39,6 +39,7 @@ pub struct PushGenerator {
     cursors: Vec<usize>,
     entries_per_push: usize,
     streams_per_push: usize,
+    target: crate::config::Target,
     arrival: ArrivalOrder,
 }
 
@@ -49,6 +50,7 @@ impl PushGenerator {
         entries_per_push: usize,
         streams_per_push: usize,
         arrival: ArrivalOrder,
+        target: crate::config::Target,
     ) -> Self {
         let mut streams_by_tenant = vec![Vec::new(); corpus.tenant_ids.len().max(1)];
         for (index, stream) in corpus.streams.iter().enumerate() {
@@ -67,6 +69,7 @@ impl PushGenerator {
             cursors,
             entries_per_push,
             streams_per_push,
+            target,
             arrival,
         }
     }
@@ -133,7 +136,9 @@ impl PushGenerator {
             .compress_vec(&encoded)
             .expect("snappy encoding must work");
         PushBody {
-            tenant: corpus.tenant_ids[tenant_index].as_str().to_string(),
+            tenant: self
+                .target
+                .tenant_header(corpus.tenant_ids[tenant_index].as_str()),
             entries: batch.iter().map(|(_, entries)| entries.len()).sum(),
             streams: batch.len(),
             line_bytes,
@@ -366,6 +371,7 @@ mod tests {
                 late_fraction: 0.0,
                 late_max_ms: 0,
             },
+            crate::config::Target::Loggytracy,
         );
         for _ in 0..16 {
             let body = generator.next_body(1_772_000_000_000_000_000);
@@ -393,6 +399,7 @@ mod tests {
                 late_fraction: 0.0,
                 late_max_ms: 0,
             },
+            crate::config::Target::Loggytracy,
         );
         let body = ordered.next_body(1_772_000_000_000_000_000);
         assert_eq!(body.out_of_order_entries, 0);
@@ -408,6 +415,7 @@ mod tests {
                 late_fraction: 0.25,
                 late_max_ms: 30_000,
             },
+            crate::config::Target::Loggytracy,
         );
         let mut out_of_order = 0;
         let mut lateness = 0;

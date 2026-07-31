@@ -326,6 +326,44 @@ against the batch one), and `3ca3bb8` (the switchover, retiring the split fallba
 - [ ] **`peak_materialized_bytes` now overstates.** It still adds `merge_max_memory_bytes`, which no longer
       bounds a rewrite. Correcting it is a claim about memory and wants its own measurement rather than an edit
 
+## VictoriaLogs: ingest works, and the query half is a design question
+
+`Target::VictoriaLogs` is in the harness and **seeds successfully**: 30,000 rows, 304 pushes, every response
+`204`, zero errors, verified present with `* | count()`. Three things the documentation did not answer, now
+measured against `victoria-logs` v1.52.0:
+
+- **It accepts Loki push in protobuf+snappy**, not only JSON. The harness sends the same bytes it sends
+  loggytracy and Loki, through `loggytracy::proto`, so ingest is genuinely the same wire format on all three.
+- **`X-Scope-OrgID` must be a `uint32`.** VictoriaLogs reads it as its numeric `AccountID` and refuses a name:
+  `cannot parse "verify-tenant-000" as uint32`. Its tenancy is `AccountID:ProjectID`, so `Target::tenant_header`
+  maps the comparison's single tenant to `0`. A multi-tenant comparison would need a name-to-number mapping.
+- **Readiness is `/health`.** There is no `/ready`.
+
+### The finding that matters, and it is not a defect
+
+**VictoriaLogs parses JSON at ingest and does not keep the line.** A seeded JSON row comes back with `status`,
+`level`, `trace_id`, `duration_ms` as top-level fields and `_msg` reading `missing _msg field`. loggytracy and
+Loki both store the raw line and parse it at query time.
+
+That is schema-on-write against schema-on-read, and it is exactly the axis this comparison exists to test —
+`docs/ARCHITECTURE.md` names VictoriaLogs' `lib/logstorage` as this engine's design reference, so where the two
+diverge is the question. loggytracy indexes JSON fields at ingest **into a bloom** (`indexed_parser_fields`)
+but stores the line; VictoriaLogs turns them into **columns**. A bloom prunes row groups; a column is read
+directly. That is very likely why `json_field_rare` reads 30,000 rows to return four — and it means
+VictoriaLogs is the system that already solved the problem the selectivity axis just found.
+
+- [ ] **Decide what row equality means across schema-on-write and schema-on-read.** The digest compares a
+      timestamp, a line and every label with its placement. VictoriaLogs has no line to compare, so the check
+      as written cannot run against it — and dropping it for one system would leave the comparison unable to
+      say the answers agree, which is the thing it is for. A reduced basis (timestamp plus a canonical field
+      set) is the obvious candidate and needs to be argued rather than assumed
+- [ ] **Translate the five shapes into LogsQL** and parse `/select/logsql/query`'s newline-delimited JSON. This
+      is the expensive half and it was expected to be: the push API is shared, the query language is not
+- [ ] Decide whether to run VictoriaLogs with `disable_message_parsing`. It would make the responses
+      comparable, and it would also handicap it in a way no real deployment would — so probably not, and the
+      difference gets stated instead of removed
+- [ ] VictoriaTraces is pulled and unexamined. The trace path has never been compared against anything
+
 ## The selectivity axis, and the tension it found
 
 `json_field` filters on `status` or `level`, which match about a fifth of the rows, so the comparison has only
