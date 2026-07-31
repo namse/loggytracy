@@ -237,7 +237,19 @@ impl RowSink for PipelineSink<'_> {
         if self.hidden.is_some_and(|hidden| hidden(labels, &entry)) {
             return Ok(());
         }
-        if !self.query.process_entry_with_labels_cancellable(
+        if self.query.stages.is_empty() {
+            // A stage-less pipeline accepts every row, and its one observable
+            // effect is the seeding rule: a metadata pair whose key is a
+            // stream label never enters the field map (the label wins), so it
+            // never survives to the response either. Reproducing that rule
+            // directly skips the full evaluation — which clones the label set
+            // into a `BTreeMap` per row, a per-row cost every bare-selector
+            // query paid, and at `max_metric_rows` scale the dominant term of
+            // a metric scan.
+            entry
+                .structured_metadata
+                .retain(|(name, _)| !labels.contains_key(name));
+        } else if !self.query.process_entry_with_labels_cancellable(
             labels,
             &mut entry,
             self.cancellation,

@@ -1391,6 +1391,45 @@
         }
     }
 
+    /// A stage-less query skips the pipeline, and the skip must keep its one
+    /// observable rule: a metadata pair whose key is a stream label never
+    /// reaches the response — the label wins the field map's seeding.
+    #[tokio::test]
+    async fn the_stageless_fast_path_keeps_the_label_shadowing_rule() {
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            labels,
+            vec![LogEntry {
+                timestamp_ns: 10,
+                line: "line".to_string(),
+                structured_metadata: vec![
+                    ("app".to_string(), "smuggled".to_string()),
+                    ("trace_id".to_string(), "t1".to_string()),
+                ],
+            }],
+        );
+        let data_dir = temp_dir();
+        let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+        let parsed = logql::parse(r#"{app="api"}"#).unwrap();
+        let results = run_unified_query(
+            state,
+            test_tenant(),
+            parsed,
+            crate::part::QueryTimeRange::closed(0, 20),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+        let data = build_stream_data(results, false);
+        assert_eq!(data[0].stream["app"], "api", "the label must win");
+        assert_eq!(data[0].stream["trace_id"], "t1");
+    }
+
     /// `| json | field="x"` — `json_field_rare`'s shape — now takes the
     /// two-pass path too: the `_pf:` column is what `| json` would extract,
     /// and metadata still wins where both exist. Memtable-against-parts is the
