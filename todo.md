@@ -513,6 +513,12 @@ neither is a defect in either engine.
       half. The VictoriaLogs half is the columnization gap, unchanged in kind
 - [x] Report the reduced digest as its own agreement column — the report prints agreement per pair per
       shape, names the basis of each pair, and withholds any ratio over a disagreement
+- [ ] The read path after the pushdown work, all of it measured in the bed over full three-way agreement:
+      the timestamp page index now prunes sub-group pages (a window sweep pins that it never drops a row),
+      `|~` prunes by the literals every match must contain, and a restore no longer holds a scan slot.
+      Final: `metadata_rare` **3.05 ms** — 0.04x against Loki, **2.04x** against VictoriaLogs, from 43 ms
+      and 12.6x at the start. Deferred with its reason: parallel part scans, because backward queries lose
+      cross-part frontier tightening and no measurement yet says the trade wins.
 - [ ] The metric gap: projection pushdown took `rate` from 25 ms to **9.5 ms** — a 2.33x loss to Loki is
       now a 0.87x win, and the VictoriaLogs gap fell from 61x to 23x. What remains for it is sidecar-only
       evaluation for filterless windows (the per-row-group row counts are in `meta.json` already), which is

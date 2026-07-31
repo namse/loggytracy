@@ -1,5 +1,5 @@
+LOGGYTRACY_DATA_DIR=/var/lib/loggytracy
 LOGGYTRACY_LISTEN_ADDR=0.0.0.0:3100
 LOGGYTRACY_OTLP_GRPC_ADDR=0.0.0.0:4317
-LOGGYTRACY_DATA_DIR=/var/lib/loggytracy
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 

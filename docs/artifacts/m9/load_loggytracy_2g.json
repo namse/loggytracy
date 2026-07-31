@@ -2,7 +2,7 @@
   "behavioral": {
     "cache_healthy_end": true,
     "flush_progressing": false,
-    "flush_success_delta": 67,
+    "flush_success_delta": 68,
     "merge_success_delta": 2,
     "no_ingest_errors": true,
     "recovered_flush_errors": 0,
@@ -15,20 +15,20 @@
     "retention_observed": false,
     "wal_backlog": {
       "first": 0,
-      "last": 162115427,
-      "peak": 162115427,
-      "post_peak_min": 162115427,
+      "last": 162281552,
+      "peak": 162281552,
+      "post_peak_min": 162281552,
       "samples": 60,
-      "slope_per_second": 1829778.8706968203,
+      "slope_per_second": 1861458.5621097884,
       "trough": 0
     },
     "wal_backlog_drains": false,
-    "wal_backlog_reason": "backlog rises at 1829778.9 bytes/s and never fell below half its peak of 162115427 after reaching it",
+    "wal_backlog_reason": "backlog rises at 1861458.6 bytes/s and never fell below half its peak of 162281552 after reaching it",
     "wal_backlog_verdict_decided": true
   },
   "behavioral_pass": false,
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-9eac92d6f7c9f94d00faf017073ebba37205ebd901ce961ed88df9e0f8367ac0.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-d06e112cc143f3cf866bbbbb580d9f332405d6ac16337844e3bfd057d5c33bbc.scope",
     "corpus_rows": 50000,
     "duration_seconds": 240,
     "entries_per_push": 100,
@@ -96,18 +96,18 @@
     "warmup_seconds": 10
   },
   "coordinated_omission": {
-    "gap_p99_ms": 0.7848609999999994,
+    "gap_p99_ms": 1.8792610000000014,
     "note": "a large gap means the harness could not issue on schedule, so the service percentiles describe a lower rate than the one offered. The floor is the harness's own: the timer wheel and a channel handoff put roughly a millisecond under every queueing delay, so a queueing p50 sitting at that floor is this process, not the server.",
-    "push_response_p99_ms": 8.650615,
-    "push_service_p99_ms": 7.865754000000001,
+    "push_response_p99_ms": 16.379848000000003,
+    "push_service_p99_ms": 14.500587000000001,
     "queueing_delay_ms": {
-      "count": 10010,
-      "max_ms": 14.679490999999999,
-      "mean_ms": 0.9239704298701281,
-      "min_ms": 0.37021200000000004,
-      "p50_ms": 0.9210759999999999,
-      "p95_ms": 1.376524,
-      "p99_ms": 1.418526,
+      "count": 10009,
+      "max_ms": 71.28710600000001,
+      "mean_ms": 1.5807789190728359,
+      "min_ms": 0.9408179999999999,
+      "p50_ms": 1.502529,
+      "p95_ms": 1.954776,
+      "p99_ms": 2.003368,
       "unsupported": []
     }
   },
@@ -126,335 +126,335 @@
     "source": "loggytracy::corpus, the generator benches/ measures",
     "streams": 256,
     "tenants": 4,
-    "wire_snappy_ratio": 2.0763649673809597
+    "wire_snappy_ratio": 2.076484990791865
   },
   "gauges": {
     "memtable_bytes": {
       "first": 0,
-      "last": 126082066,
-      "peak": 126082066,
-      "post_peak_min": 126082066,
+      "last": 126180672,
+      "peak": 126180672,
+      "post_peak_min": 126180672,
       "samples": 60,
-      "slope_per_second": 1422904.9295939,
+      "slope_per_second": 1446956.5311258144,
       "trough": 0
     },
     "part_count": {
       "first": 0,
-      "last": 46,
-      "peak": 46,
-      "post_peak_min": 46,
+      "last": 47,
+      "peak": 47,
+      "post_peak_min": 47,
       "samples": 60,
-      "slope_per_second": 0.8516976826526933,
+      "slope_per_second": 0.8728531452037173,
       "trough": 0
     },
     "scrape_errors": 0,
     "terminal": {
-      "memtable_bytes": 127352614,
+      "memtable_bytes": 127354388,
       "memtable_entries": 388900,
-      "merge_debt_parts": 46,
-      "part_bytes": 16591083,
+      "merge_debt_parts": 47,
+      "part_bytes": 16553400,
       "part_count": 2,
-      "part_meta_bytes": 68610,
-      "part_sidecar_resident_bytes": 11412379,
+      "part_meta_bytes": 68366,
+      "part_sidecar_resident_bytes": 11410693,
       "part_tenant_segments": 8,
       "trace_part_count": 0
     },
     "wal_backlog_bytes": {
       "first": 0,
-      "last": 162115427,
-      "peak": 162115427,
-      "post_peak_min": 162115427,
+      "last": 162281552,
+      "peak": 162281552,
+      "post_peak_min": 162281552,
       "samples": 60,
-      "slope_per_second": 1829778.8706968203,
+      "slope_per_second": 1861458.5621097884,
       "trough": 0
     }
   },
   "ingest": {
-    "achieved_eps": 19818.15239200433,
-    "attempted_eps": 19818.15239200433,
+    "achieved_eps": 19784.694645242755,
+    "attempted_eps": 19784.694645242755,
     "error_rate": 0.0,
-    "events_accepted": 1201000,
-    "events_offered": 1201000,
+    "events_accepted": 1200900,
+    "events_offered": 1200900,
     "first_error": null,
-    "line_bytes": 393217932,
+    "line_bytes": 393185745,
     "max_lateness_ms": 30227,
     "offered_eps": 20000.0,
-    "out_of_order_entries": 574359,
-    "pushes_accepted": 12010,
+    "out_of_order_entries": 574312,
+    "pushes_accepted": 12009,
     "pushes_failed": 0,
     "pushes_throttled": 0,
     "statuses": {
-      "204": 12010
+      "204": 12009
     },
     "streams_per_push_mean": 4.0,
     "tcp_connections_opened": 8,
     "throttled_rate": 0.0,
-    "wire_bytes": 189378042
+    "wire_bytes": 189351595
   },
   "memory": {
     "anon": {
-      "first": 1490944,
-      "last": 815489024,
-      "peak": 815489024,
-      "post_peak_min": 815489024,
+      "first": 1507328,
+      "last": 907636736,
+      "peak": 907636736,
+      "post_peak_min": 907636736,
       "samples": 60,
-      "slope_per_second": 13673373.532420652,
-      "trough": 1490944
+      "slope_per_second": 15860319.796245499,
+      "trough": 1507328
     },
-    "anon_peak_bytes": 1083035648,
+    "anon_peak_bytes": 1211932672,
     "error": null,
-    "file_bytes_end": 533757952,
+    "file_bytes_end": 533819392,
     "measured": true,
-    "vm_hwm_bytes": 1636933632,
+    "vm_hwm_bytes": 1766027264,
     "vm_rss": {
-      "first": 2351104,
-      "last": 1427599360,
-      "peak": 1427599360,
-      "post_peak_min": 1427599360,
+      "first": 2617344,
+      "last": 1520742400,
+      "peak": 1520742400,
+      "post_peak_min": 1520742400,
       "samples": 60,
-      "slope_per_second": 24058146.224069428,
-      "trough": 2351104
+      "slope_per_second": 26246782.06512368,
+      "trough": 2617344
     },
     "vm_rss_samples": [
       [
-        0.000076945,
-        2351104
+        0.000070993,
+        2617344
       ],
       [
-        1.001276475,
-        41164800
+        1.001534818,
+        41238528
       ],
       [
-        2.003185488,
-        68517888
+        2.003281155,
+        73043968
       ],
       [
-        3.004352268,
-        87912448
+        3.005386585,
+        83984384
       ],
       [
-        4.006394032,
-        100196352
+        4.007832988,
+        102268928
       ],
       [
-        5.008505998,
-        117039104
+        5.010150437,
+        113917952
       ],
       [
-        6.010704889,
-        131571712
+        6.013420626,
+        128094208
       ],
       [
-        7.014580419,
-        142458880
+        7.016660499,
+        142700544
       ],
       [
-        8.01795005,
-        156909568
+        8.020570731,
+        159002624
       ],
       [
-        9.022169757,
-        172331008
+        9.02457994,
+        171995136
       ],
       [
-        10.026165455,
-        185950208
+        10.028719703,
+        190672896
       ],
       [
-        11.03079285,
-        352239616
+        11.033047741,
+        363155456
       ],
       [
-        12.035452226,
-        362303488
+        12.037599949,
+        374231040
       ],
       [
-        13.03997725,
-        377614336
+        13.042032313,
+        392900608
       ],
       [
-        14.044875395,
-        401846272
+        14.047574351,
+        417042432
       ],
       [
-        15.049569709,
-        424837120
+        15.052841183,
+        440926208
       ],
       [
-        16.054381643,
-        532406272
+        16.056866322,
+        526204928
       ],
       [
-        17.05697391,
-        572948480
+        17.059499548,
+        558718976
       ],
       [
-        18.058483363,
-        587714560
+        18.061004474,
+        571183104
       ],
       [
-        19.060434737,
-        662069248
+        19.072839874,
+        618233856
       ],
       [
-        20.063046552,
-        682233856
+        20.075166774,
+        640618496
       ],
       [
-        21.066101851,
-        700481536
+        21.077196928,
+        652521472
       ],
       [
-        22.069170876,
-        713138176
+        22.080363386,
+        668999680
       ],
       [
-        23.072895203,
-        724807680
+        23.082964312,
+        680751104
       ],
       [
-        24.075477726,
-        736014336
+        24.08690801,
+        691511296
       ],
       [
-        25.078339162,
-        752033792
+        25.090548368,
+        704028672
       ],
       [
-        26.082291209,
-        763834368
+        26.094269308,
+        715816960
       ],
       [
-        27.087010437,
-        774811648
+        27.098199932,
+        727789568
       ],
       [
-        28.09191875,
-        791572480
+        28.103217468,
+        743407616
       ],
       [
-        29.096968209,
-        802160640
+        29.108528145,
+        754667520
       ],
       [
-        30.101990188,
-        819994624
+        30.113474768,
+        780181504
       ],
       [
-        31.108028676,
-        835555328
+        31.119081742,
+        792276992
       ],
       [
-        32.113845768,
-        852258816
+        32.12578244,
+        806899712
       ],
       [
-        33.119510526,
-        863952896
+        33.131463884,
+        819081216
       ],
       [
-        34.126448335,
-        875626496
+        34.138415594,
+        830590976
       ],
       [
-        35.133933133,
-        887414784
+        35.145830144,
+        842096640
       ],
       [
-        36.140956925,
-        898727936
+        36.152284971,
+        853618688
       ],
       [
-        37.148119578,
-        909692928
+        37.159809448,
+        864636928
       ],
       [
-        38.155783323,
-        921194496
+        38.166866837,
+        875937792
       ],
       [
-        39.164300081,
-        932601856
+        39.174577614,
+        889847808
       ],
       [
-        40.172715138,
-        944107520
+        40.182297068,
+        900882432
       ],
       [
-        41.180491838,
-        1147129856
+        41.191815901,
+        1245704192
       ],
       [
-        42.191811402,
-        1163411456
+        42.205050194,
+        1264021504
       ],
       [
-        43.200627595,
-        1173118976
+        43.213600058,
+        1273147392
       ],
       [
-        44.210321015,
-        1182371840
+        44.222652686,
+        1283719168
       ],
       [
-        45.218810165,
-        1194180608
+        45.232274384,
+        1296605184
       ],
       [
-        46.22739727,
-        1203900416
+        46.241742473,
+        1311838208
       ],
       [
-        47.236410635,
-        1218162688
+        47.251132275,
+        1328549888
       ],
       [
-        48.246230126,
-        1233661952
+        48.260311703,
+        1341472768
       ],
       [
-        49.254525294,
-        1249320960
+        49.269433682,
+        1355161600
       ],
       [
-        50.263764946,
-        1259614208
+        50.278869642,
+        1366790144
       ],
       [
-        51.273246634,
-        1272950784
+        51.288733605,
+        1381326848
       ],
       [
-        52.282379447,
-        1289437184
+        52.298395109,
+        1397972992
       ],
       [
-        53.291630964,
-        1305182208
+        53.307259465,
+        1415426048
       ],
       [
-        54.30093492,
-        1326575616
+        54.317800632,
+        1433247744
       ],
       [
-        55.309812194,
-        1345626112
+        55.327334766,
+        1452838912
       ],
       [
-        56.31974879,
-        1368272896
+        56.337719329,
+        1470402560
       ],
       [
-        57.328869202,
-        1388679168
+        57.347865253,
+        1487863808
       ],
       [
-        58.337927399,
-        1407733760
+        58.356918215,
+        1504153600
       ],
       [
-        59.348207571,
-        1427599360
+        59.367663325,
+        1520742400
       ]
     ]
   },
@@ -462,7 +462,7 @@
   "object_store_operations": {
     "copies": 0,
     "cycles": {
-      "flush": 67,
+      "flush": 68,
       "merge": 2,
       "retention": 0
     },
@@ -475,33 +475,33 @@
   "push_latency_ms": {
     "note": "service time starts at the actual send, response time at the intended send. Their difference is the delay the offered rate could not be issued at; a large gap means the offered rate was not achievable and the service percentiles describe a rate nobody asked for.",
     "queueing_delay": {
-      "count": 10010,
-      "max_ms": 14.679490999999999,
-      "mean_ms": 0.9239704298701281,
-      "min_ms": 0.37021200000000004,
-      "p50_ms": 0.9210759999999999,
-      "p95_ms": 1.376524,
-      "p99_ms": 1.418526,
+      "count": 10009,
+      "max_ms": 71.28710600000001,
+      "mean_ms": 1.5807789190728359,
+      "min_ms": 0.9408179999999999,
+      "p50_ms": 1.502529,
+      "p95_ms": 1.954776,
+      "p99_ms": 2.003368,
       "unsupported": []
     },
     "response": {
-      "count": 10010,
-      "max_ms": 54.676204000000006,
-      "mean_ms": 3.225377255144869,
-      "min_ms": 2.324336,
-      "p50_ms": 3.0641410000000002,
-      "p95_ms": 3.69935,
-      "p99_ms": 8.650615,
+      "count": 10009,
+      "max_ms": 111.285213,
+      "mean_ms": 6.010811207513251,
+      "min_ms": 2.908666,
+      "p50_ms": 3.839035,
+      "p95_ms": 13.433879,
+      "p99_ms": 16.379848000000003,
       "unsupported": []
     },
     "service": {
-      "count": 10010,
-      "max_ms": 54.022074,
-      "mean_ms": 2.301406825274722,
-      "min_ms": 1.86853,
-      "p50_ms": 2.111646,
-      "p95_ms": 2.535833,
-      "p99_ms": 7.865754000000001,
+      "count": 10009,
+      "max_ms": 110.160062,
+      "mean_ms": 4.430032288440399,
+      "min_ms": 1.875543,
+      "p50_ms": 2.162482,
+      "p95_ms": 12.099597,
+      "p99_ms": 14.500587000000001,
       "unsupported": []
     }
   },
@@ -554,42 +554,42 @@
     "note": "service time starts at the actual send, response time at the intended send. Their difference is the delay the offered rate could not be issued at; a large gap means the offered rate was not achievable and the service percentiles describe a rate nobody asked for.",
     "queueing_delay": {
       "count": 2000,
-      "max_ms": 1.684724,
-      "mean_ms": 0.916875214999998,
-      "min_ms": 0.34275100000000003,
-      "p50_ms": 0.9208820000000001,
-      "p95_ms": 1.377702,
-      "p99_ms": 1.419835,
+      "max_ms": 2.0607059999999997,
+      "mean_ms": 1.5063566945000004,
+      "min_ms": 0.951041,
+      "p50_ms": 1.508639,
+      "p95_ms": 1.9619490000000002,
+      "p99_ms": 1.9982419999999999,
       "unsupported": []
     },
     "response": {
       "count": 2000,
-      "max_ms": 9.191600999999999,
-      "mean_ms": 3.1239106930000013,
-      "min_ms": 2.371494,
-      "p50_ms": 3.0576109999999996,
-      "p95_ms": 3.7489269999999997,
-      "p99_ms": 5.5546120000000005,
+      "max_ms": 16.662682,
+      "mean_ms": 3.7204659390000048,
+      "min_ms": 2.881597,
+      "p50_ms": 3.630617,
+      "p95_ms": 4.326433,
+      "p99_ms": 6.419675,
       "unsupported": []
     },
     "service": {
       "count": 2000,
-      "max_ms": 8.521976,
-      "mean_ms": 2.207035478000001,
-      "min_ms": 1.877877,
-      "p50_ms": 2.110695,
-      "p95_ms": 2.727864,
-      "p99_ms": 4.432434,
+      "max_ms": 14.847349,
+      "mean_ms": 2.2141092445,
+      "min_ms": 1.875803,
+      "p50_ms": 2.090887,
+      "p95_ms": 2.761847,
+      "p99_ms": 5.096092,
       "unsupported": []
     }
   },
   "queries": {
-    "achieved_qps": 3.7293109413763355,
+    "achieved_qps": 3.7233249977723895,
     "answered": 226,
     "errors": 0,
     "first_error": null,
     "restore_probes": 19,
-    "rows_returned": 24066,
+    "rows_returned": 24000,
     "statuses": {
       "200": 226
     },
@@ -603,11 +603,11 @@
         "note": "service time starts at the actual send, response time at the intended send. Their difference is the delay the offered rate could not be issued at; a large gap means the offered rate was not achievable and the service percentiles describe a rate nobody asked for.",
         "queueing_delay": {
           "count": 47,
-          "max_ms": 17392.726330999998,
-          "mean_ms": 1288.526759148936,
-          "min_ms": 0.303155,
-          "p50_ms": 0.909682,
-          "p95_ms": 16604.8491,
+          "max_ms": 17495.749236000003,
+          "mean_ms": 1281.9166136170215,
+          "min_ms": 0.908494,
+          "p50_ms": 1.541216,
+          "p95_ms": 16709.162761000003,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 47"
@@ -615,11 +615,11 @@
         },
         "response": {
           "count": 47,
-          "max_ms": 17404.429872999997,
-          "mean_ms": 1396.399347680851,
-          "min_ms": 6.259226000000001,
-          "p50_ms": 12.920269999999999,
-          "p95_ms": 16620.291264,
+          "max_ms": 17508.598240000003,
+          "mean_ms": 1386.6616862340427,
+          "min_ms": 6.825780000000001,
+          "p50_ms": 11.957441000000001,
+          "p95_ms": 16731.572424,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 47"
@@ -627,11 +627,11 @@
         },
         "service": {
           "count": 47,
-          "max_ms": 4481.105667999999,
-          "mean_ms": 107.87258853191487,
-          "min_ms": 5.433776000000001,
-          "p50_ms": 11.703542,
-          "p95_ms": 19.602368,
+          "max_ms": 4385.091402999999,
+          "mean_ms": 104.74507261702128,
+          "min_ms": 5.469785,
+          "p50_ms": 9.966801,
+          "p95_ms": 25.50112,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 47"
@@ -645,11 +645,11 @@
         "note": "service time starts at the actual send, response time at the intended send. Their difference is the delay the offered rate could not be issued at; a large gap means the offered rate was not achievable and the service percentiles describe a rate nobody asked for.",
         "queueing_delay": {
           "count": 45,
-          "max_ms": 18540.649397999998,
-          "mean_ms": 1919.2641402666663,
-          "min_ms": 0.331181,
-          "p50_ms": 0.9810089999999999,
-          "p95_ms": 16407.825801000003,
+          "max_ms": 18637.437194000002,
+          "mean_ms": 1912.3228936666665,
+          "min_ms": 0.910545,
+          "p50_ms": 1.5842580000000002,
+          "p95_ms": 16509.473384,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 45"
@@ -657,11 +657,11 @@
         },
         "response": {
           "count": 45,
-          "max_ms": 19343.342646999998,
-          "mean_ms": 3196.0821367777776,
-          "min_ms": 1.613581,
-          "p50_ms": 4.934101,
-          "p95_ms": 18740.72481,
+          "max_ms": 19437.96772,
+          "mean_ms": 3195.1160057111115,
+          "min_ms": 2.220987,
+          "p50_ms": 4.640314,
+          "p95_ms": 18837.031361999998,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 45"
@@ -669,11 +669,11 @@
         },
         "service": {
           "count": 45,
-          "max_ms": 19342.677695,
-          "mean_ms": 1276.8179965111112,
-          "min_ms": 1.261158,
-          "p50_ms": 2.922028,
-          "p95_ms": 18740.269448,
+          "max_ms": 19436.202984,
+          "mean_ms": 1282.7931120444446,
+          "min_ms": 1.218188,
+          "p50_ms": 2.812744,
+          "p95_ms": 18835.304749,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 45"
@@ -687,11 +687,11 @@
         "note": "service time starts at the actual send, response time at the intended send. Their difference is the delay the offered rate could not be issued at; a large gap means the offered rate was not achievable and the service percentiles describe a rate nobody asked for.",
         "queueing_delay": {
           "count": 45,
-          "max_ms": 18143.569723,
-          "mean_ms": 2767.7148416,
-          "min_ms": 0.28247500000000003,
-          "p50_ms": 1.0278729999999998,
-          "p95_ms": 17789.107294,
+          "max_ms": 18238.681501,
+          "mean_ms": 2774.481058266667,
+          "min_ms": 0.871737,
+          "p50_ms": 1.6233090000000001,
+          "p95_ms": 17891.281835,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 45"
@@ -699,11 +699,11 @@
         },
         "response": {
           "count": 45,
-          "max_ms": 18944.298442000003,
-          "mean_ms": 3287.7305814444444,
-          "min_ms": 3.037023,
-          "p50_ms": 7.021442,
-          "p95_ms": 17997.162563,
+          "max_ms": 19041.080398000002,
+          "mean_ms": 3293.556321511111,
+          "min_ms": 3.57793,
+          "p50_ms": 6.828354,
+          "p95_ms": 18098.846003000002,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 45"
@@ -711,11 +711,11 @@
         },
         "service": {
           "count": 45,
-          "max_ms": 18943.739821000003,
-          "mean_ms": 520.0157398444445,
-          "min_ms": 2.28431,
-          "p50_ms": 5.847283,
-          "p95_ms": 57.904837,
+          "max_ms": 19039.979564,
+          "mean_ms": 519.0752632444445,
+          "min_ms": 2.27297,
+          "p50_ms": 4.792020999999999,
+          "p95_ms": 57.540893000000004,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 45"
@@ -729,11 +729,11 @@
         "note": "service time starts at the actual send, response time at the intended send. Their difference is the delay the offered rate could not be issued at; a large gap means the offered rate was not achievable and the service percentiles describe a rate nobody asked for.",
         "queueing_delay": {
           "count": 23,
-          "max_ms": 16997.434354,
-          "mean_ms": 833.2062917391304,
-          "min_ms": 0.36042799999999997,
-          "p50_ms": 0.835964,
-          "p95_ms": 2149.97801,
+          "max_ms": 17099.123203000003,
+          "mean_ms": 833.5884746086958,
+          "min_ms": 0.934453,
+          "p50_ms": 1.3265639999999999,
+          "p95_ms": 2046.4317200000003,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 23"
@@ -741,11 +741,11 @@
         },
         "response": {
           "count": 23,
-          "max_ms": 17200.6391,
-          "mean_ms": 1159.538383304348,
-          "min_ms": 62.651285,
-          "p50_ms": 125.551885,
-          "p95_ms": 4731.468545000001,
+          "max_ms": 17298.016678000004,
+          "mean_ms": 1152.9175594347828,
+          "min_ms": 63.79500400000001,
+          "p50_ms": 125.535293,
+          "p95_ms": 4634.200844999999,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 23"
@@ -753,11 +753,11 @@
         },
         "service": {
           "count": 23,
-          "max_ms": 4730.982077000001,
-          "mean_ms": 326.3320915652174,
-          "min_ms": 61.52693,
-          "p50_ms": 121.065016,
-          "p95_ms": 203.204746,
+          "max_ms": 4633.207794999999,
+          "mean_ms": 319.3290848260869,
+          "min_ms": 62.74727200000001,
+          "p50_ms": 117.365565,
+          "p95_ms": 198.893475,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 23"
@@ -771,10 +771,10 @@
         "note": "service time starts at the actual send, response time at the intended send. Their difference is the delay the offered rate could not be issued at; a large gap means the offered rate was not achievable and the service percentiles describe a rate nobody asked for.",
         "queueing_delay": {
           "count": 16,
-          "max_ms": 18340.965502,
-          "mean_ms": 2453.4100368125,
-          "min_ms": 0.28717,
-          "p50_ms": 0.952074,
+          "max_ms": 18438.305365,
+          "mean_ms": 2453.2577407500003,
+          "min_ms": 0.926088,
+          "p50_ms": 1.608772,
           "p95_ms": null,
           "p99_ms": null,
           "unsupported": [
@@ -784,10 +784,10 @@
         },
         "response": {
           "count": 16,
-          "max_ms": 18413.039824,
-          "mean_ms": 2739.819425375,
-          "min_ms": 8.984232,
-          "p50_ms": 16.016574,
+          "max_ms": 18513.145392,
+          "mean_ms": 2732.387564625,
+          "min_ms": 9.089275,
+          "p50_ms": 15.835794000000002,
           "p95_ms": null,
           "p99_ms": null,
           "unsupported": [
@@ -797,10 +797,10 @@
         },
         "service": {
           "count": 16,
-          "max_ms": 4303.190667,
-          "mean_ms": 286.4093885625,
-          "min_ms": 8.417901,
-          "p50_ms": 15.60004,
+          "max_ms": 4203.396655,
+          "mean_ms": 279.12982387499994,
+          "min_ms": 7.837782,
+          "p50_ms": 13.789851,
           "p95_ms": null,
           "p99_ms": null,
           "unsupported": [
@@ -815,38 +815,38 @@
     "note": "service time starts at the actual send, response time at the intended send. Their difference is the delay the offered rate could not be issued at; a large gap means the offered rate was not achievable and the service percentiles describe a rate nobody asked for.",
     "queueing_delay": {
       "count": 176,
-      "max_ms": 18540.649397999998,
-      "mean_ms": 1874.3927111534094,
-      "min_ms": 0.28247500000000003,
-      "p50_ms": 0.937195,
-      "p95_ms": 16997.434354,
-      "p99_ms": 18340.965502,
+      "max_ms": 18637.437194000002,
+      "mean_ms": 1872.618849119318,
+      "min_ms": 0.871737,
+      "p50_ms": 1.535595,
+      "p95_ms": 17099.123203000003,
+      "p99_ms": 18438.305365,
       "unsupported": []
     },
     "response": {
       "count": 176,
-      "max_ms": 19343.342646999998,
-      "mean_ms": 2431.3002004715904,
-      "min_ms": 1.613581,
-      "p50_ms": 12.837479,
-      "p95_ms": 17792.411029000003,
-      "p99_ms": 19140.366978000002,
+      "max_ms": 19437.96772,
+      "mean_ms": 2428.401470903409,
+      "min_ms": 2.220987,
+      "p50_ms": 11.332475,
+      "p95_ms": 17895.790483,
+      "p99_ms": 19238.342284000002,
       "unsupported": []
     },
     "service": {
       "count": 176,
-      "max_ms": 19342.677695,
-      "mean_ms": 556.9074893181819,
-      "min_ms": 1.261158,
-      "p50_ms": 9.181745,
-      "p95_ms": 203.204746,
-      "p99_ms": 19139.338919,
+      "max_ms": 19436.202984,
+      "mean_ms": 555.7826217840909,
+      "min_ms": 1.218188,
+      "p50_ms": 7.837782,
+      "p95_ms": 198.893475,
+      "p99_ms": 19237.156102,
       "unsupported": []
     }
   },
   "run": {
-    "build_revision": "6f3f06e",
-    "elapsed_seconds": 60.601007412,
+    "build_revision": "3a3bcbd",
+    "elapsed_seconds": 60.698434903,
     "ended_on": "event_target",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "pacing": "open_loop",
@@ -867,23 +867,23 @@
       "target": 0.0
     },
     "push_response_p95_ms": {
-      "measured": 3.69935,
+      "measured": 13.433879,
       "note": "from the intended send; the service percentiles are beside it in push_latency_ms",
       "pass": true,
       "target": 250.0
     },
     "push_response_p99_ms": {
-      "measured": 8.650615,
+      "measured": 16.379848000000003,
       "pass": true,
       "target": 1000.0
     },
     "query_response_p95_ms": {
-      "measured": 17792.411029000003,
+      "measured": 17895.790483,
       "pass": false,
       "target": 2000.0
     },
     "rss_peak_bytes": {
-      "measured": 1636933632.0,
+      "measured": 1766027264.0,
       "note": "VmHWM of the server process, not a sampled maximum",
       "pass": true,
       "target": 4294967296.0
@@ -895,7 +895,7 @@
       "target": 0.05
     },
     "wal_backlog_peak_bytes": {
-      "measured": 162115427.0,
+      "measured": 162281552.0,
       "pass": true,
       "target": 1073741824.0
     }
