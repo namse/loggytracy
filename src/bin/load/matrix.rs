@@ -415,13 +415,30 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                     // the same number, which is what the row-equality check is
                     // for. The unsummed difference is reported in
                     // `docs/COMPARISON.md` rather than hidden here.
-                    Shape::Rate => format!("sum(rate({selector}[{}]))", cfg.verify.range),
+                    //
+                    // The window equals the step. LogsQL has no sliding
+                    // window: `stats by (_time:...)` cuts tumbling buckets. A
+                    // sliding window degenerates into those buckets exactly
+                    // when it is one step wide and the query range is aligned
+                    // to it, which the matrix guarantees — any other range
+                    // asks a question one of the two languages cannot ask.
+                    Shape::Rate => format!("sum(rate({selector}[{}s]))", cfg.verify.step_seconds),
                 };
                 let path = match cfg.target {
                     Target::Loggytracy | Target::Loki => {
+                        // A rate evaluation at `t` covers `(t - step, t]`, so
+                        // the point at `t = start` reaches before the window —
+                        // rows no `_time` bucket of the same window holds. The
+                        // first evaluation point is therefore one step in: the
+                        // lookbacks then tile `[start, end)` exactly as the
+                        // buckets do.
+                        let logql_start_ns = match shape {
+                            Shape::Rate => start_ns + step_ns,
+                            _ => start_ns,
+                        };
                         let encoded = url::form_urlencoded::Serializer::new(String::new())
                             .append_pair("query", &expression)
-                            .append_pair("start", &start_ns.to_string())
+                            .append_pair("start", &logql_start_ns.to_string())
                             .append_pair("end", &end_ns.to_string())
                             .append_pair("step", &cfg.verify.step_seconds.to_string())
                             .append_pair("limit", &cfg.verify.limit.to_string())
@@ -465,16 +482,18 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
 /// the comparison exists to measure, and it is why those three rows should be
 /// read together rather than as three independent results.
 ///
-/// Two places the meaning is close rather than equal, stated so a ratio is not
-/// mistaken for a like-for-like:
+/// Two places the languages' defaults differ and the translation has to take a
+/// side, stated so a ratio is not mistaken for a like-for-like:
 ///
-/// * `|=` is a raw substring in LogQL and a tokenized phrase match in LogsQL.
-///   The corpus's phrases are whole words, so the answers agree, but a needle
-///   that split a token would not.
-/// * `sum(rate(...))` becomes a `stats by (_time:range) count()`. LogsQL counts
-///   per bucket where LogQL divides by the range, so the shapes are the same
-///   work and the numbers are not the same units. Row equality compares the
-///   series, not the scale.
+/// * `|=` is a raw substring in LogQL; a bare quoted string in LogsQL is a
+///   tokenized phrase. The translation uses `~"..."`, which is the substring —
+///   measured equal to `|=` on lines built to straddle token boundaries.
+/// * `sum(rate(...))` becomes `stats by (_time:step) rate()`. LogsQL has only
+///   tumbling buckets where LogQL has a sliding window, so the matrix pins the
+///   window to the step and aligns the range — the one configuration in which
+///   both languages are asking the same question. The remaining difference is
+///   labeling (bucket start there, evaluation point here), which the digest
+///   converts rather than exempts.
 fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: usize) -> String {
     let selector = format!("app:\"{app}\"");
     match shape {
@@ -510,9 +529,18 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
         // width, which is what LogQL's `rate()` does — measured at 0.0833 for
         // five rows in a minute — so the two produce the same units. `count()`
         // produced the bucket total and made the numbers incomparable.
+        //
+        // The bucket is the matrix step, matching the LogQL side's window;
+        // see `build_queries`. VictoriaLogs aligns `_time` buckets to epoch
+        // multiples of the width and labels each by its *start*, where LogQL
+        // labels a sample by its evaluation point — the bucket's *end*. The
+        // digest converts starts to ends with this same step, so the two
+        // labelings meet; the values need no conversion, since a bucket that
+        // the aligned window fully contains is divided by its full width on
+        // both sides.
         Shape::Rate => format!(
-            "{selector} | stats by (_time:{}) rate() as value",
-            cfg.verify.range
+            "{selector} | stats by (_time:{}s) rate() as value",
+            cfg.verify.step_seconds
         ),
     }
 }

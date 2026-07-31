@@ -215,7 +215,12 @@ pub struct Verify {
     /// Warm repeats of each query after its cold issue.
     pub repeats: usize,
     pub limit: usize,
-    pub range: String,
+    /// One knob for both the metric sample grid and the `rate` window. They
+    /// are the same number on purpose: LogQL evaluates a sliding window per
+    /// step and LogsQL cuts tumbling `_time` buckets, and the two produce the
+    /// same set of samples only when the window equals the step and the query
+    /// windows are aligned to it — consecutive lookbacks then tile the range
+    /// exactly like buckets do.
     pub step_seconds: i64,
 }
 
@@ -289,7 +294,6 @@ impl Config {
                 windows: env_usize("LOGGYTRACY_LOAD_MATRIX_WINDOWS", 3).max(1),
                 repeats: env_usize("LOGGYTRACY_LOAD_MATRIX_REPEATS", 5).max(1),
                 limit: env_usize("LOGGYTRACY_LOAD_MATRIX_LIMIT", 20_000).max(1),
-                range: env_string("LOGGYTRACY_LOAD_MATRIX_RANGE", "1m"),
                 step_seconds: env_u64("LOGGYTRACY_LOAD_MATRIX_STEP_SECONDS", 10).max(1) as i64,
             },
 
