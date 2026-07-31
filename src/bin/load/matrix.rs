@@ -386,6 +386,26 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                     cfg.verify.anchor_ns + span * (window as i64 + 1) / windows,
                     step_ns,
                 );
+                // The rate shape never lets a bucket close on the dataset's
+                // trailing edge. A LogQL window is `(start, end]` and a LogsQL
+                // bucket is `[start, end)`, so a boundary row is excluded by
+                // one and included by the other — which cancels exactly when
+                // the row at the *other* boundary exists, and the one instant
+                // where it does not is the end of the data. Measured: the last
+                // window's last bucket read 124.9 against 125.0, one boundary
+                // row, everything interior equal. So a rate window that would
+                // end where the data does is slid one step in.
+                let (start_ns, end_ns) = if shape == Shape::Rate {
+                    let dataset_end_ns = align_to_step(cfg.verify.anchor_ns + span, step_ns);
+                    if end_ns >= dataset_end_ns {
+                        let end = end_ns - step_ns;
+                        (start_ns.min(end - step_ns), end)
+                    } else {
+                        (start_ns, end_ns)
+                    }
+                } else {
+                    (start_ns, end_ns)
+                };
                 let selector = format!("{{app=\"{app}\"}}");
                 let variant = app_index * cfg.verify.windows + window;
                 let expression = match shape {
@@ -530,8 +550,15 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
 ///   converts rather than exempts.
 fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: usize) -> String {
     let selector = format!("app:\"{app}\"");
+    // `sort by (_time) desc` before every `limit`, because the LogQL side asks
+    // `direction=backward`: a bound that binds must cut the *newest* N rows.
+    // A bare LogsQL `limit` has no order contract and returns whichever rows
+    // it reaches first — measured on this corpus as the window's oldest —
+    // so without the sort the two engines answer with disjoint row sets that
+    // are both "100 rows from the window".
+    let newest = format!("sort by (_time) desc | limit {}", cfg.verify.limit);
     match shape {
-        Shape::LabelOnly => format!("{selector} | limit {}", cfg.verify.limit),
+        Shape::LabelOnly => format!("{selector} | {newest}"),
         // `~"..."` and not `"..."`. A bare quoted string in LogsQL is a
         // tokenized *phrase* filter, which misses a needle that straddles a
         // token boundary; LogQL's `|=` is a raw substring. Measured on five
@@ -539,9 +566,8 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
         // regexp filter returned the same three `|=` does, case-sensitivity
         // included.
         Shape::LineFilter => format!(
-            "{selector} AND ~\"{}\" | limit {}",
+            "{selector} AND ~\"{}\" | {newest}",
             PHRASES[variant % PHRASES.len()],
-            cfg.verify.limit
         ),
         Shape::JsonField => {
             let (field, value) = if variant.is_multiple_of(2) {
@@ -549,15 +575,12 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
             } else {
                 ("level", LEVELS[variant % LEVELS.len()].to_string())
             };
-            format!(
-                "{selector} AND {field}:\"{value}\" | limit {}",
-                cfg.verify.limit
-            )
+            format!("{selector} AND {field}:\"{value}\" | {newest}")
         }
         // No app selector, matching the LogQL side: the point is a predicate
         // that is the only selective thing in the query.
         Shape::JsonFieldRare | Shape::MetadataRare => {
-            format!("trace_id:\"{rare_trace_id}\" | limit {}", cfg.verify.limit)
+            format!("trace_id:\"{rare_trace_id}\" | {newest}")
         }
         // `rate()` and not `count()`. LogsQL's `rate()` divides by the bucket
         // width, which is what LogQL's `rate()` does — measured at 0.0833 for

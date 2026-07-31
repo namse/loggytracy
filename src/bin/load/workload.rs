@@ -295,16 +295,24 @@ impl QueryGenerator {
             // matter here; sending Loki paths would 404 and measure nothing.
             crate::config::Target::VictoriaLogs => {
                 let selector = format!("app:\"{app}\"");
+                // `sort by (_time)` before a `limit`, matching the direction
+                // the Loki-path query asks for: a bare LogsQL `limit` has no
+                // order contract, and a bound that binds must cut the same
+                // end of the window on every target.
+                let cut = match direction {
+                    "backward" => format!("sort by (_time) desc | limit {}", self.limit),
+                    _ => format!("sort by (_time) | limit {}", self.limit),
+                };
                 let expression = match shape {
                     QueryShape::LabelOnly | QueryShape::RestoreProbe => {
-                        format!("{selector} | limit {}", self.limit)
+                        format!("{selector} | {cut}")
                     }
                     QueryShape::LineFilter => {
-                        format!("{selector} AND ~\"{phrase}\" | limit {}", self.limit)
+                        format!("{selector} AND ~\"{phrase}\" | {cut}")
                     }
                     QueryShape::JsonField => {
                         let (field, value) = &json_field;
-                        format!("{selector} AND {field}:\"{value}\" | limit {}", self.limit)
+                        format!("{selector} AND {field}:\"{value}\" | {cut}")
                     }
                     QueryShape::Rate => {
                         format!("{selector} | stats by (_time:1m) rate() as value")
