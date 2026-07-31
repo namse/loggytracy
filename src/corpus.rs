@@ -442,6 +442,14 @@ fn plain_line(rng: &mut Rng, facts: &LineFacts, target: usize) -> String {
     )
 }
 
+/// The free-text key is `_msg` because that is the field VictoriaLogs treats
+/// as the message when it parses JSON at ingest. Under any other name VL
+/// discards the text and a substring filter over the line has nothing to
+/// match, so the three engines would be answering different questions — the
+/// 2,008-versus-1,147 `line_filter` disagreement was exactly this. To Loki
+/// and loggytracy the key is opaque line text; `| json` extracts it as a
+/// field named `_msg`, which collides with nothing (reserved names are
+/// enforced for stream labels only).
 fn json_line(rng: &mut Rng, facts: &LineFacts, target: usize) -> String {
     let message = message(rng, target, 240);
     format!(
@@ -449,7 +457,7 @@ fn json_line(rng: &mut Rng, facts: &LineFacts, target: usize) -> String {
             r#"{{"ts":"{}","level":"{}","trace_id":"{}","span_id":"{}","#,
             r#""status":{},"duration_ms":{:.3},"user_id":"{}","#,
             r#""http":{{"method":"{}","path":"{}","bytes":{},"remote":"10.{}.{}.{}"}},"#,
-            r#""retry":{},"msg":"{}"}}"#
+            r#""retry":{},"_msg":"{}"}}"#
         ),
         facts.ts_text,
         facts.level,

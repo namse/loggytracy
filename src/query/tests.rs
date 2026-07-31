@@ -3189,6 +3189,45 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         assert_eq!(data[0].values[0].as_array().unwrap().len(), 2);
     }
 
+    /// The comparison corpus names its JSON free-text key `_msg` so that
+    /// VictoriaLogs keeps the text as its message. On this side the name must
+    /// stay an ordinary extracted field: reserved names are enforced for
+    /// stream labels at ingest, not for what `| json` extracts, so `_msg`
+    /// must extract, filter and promote like any other field.
+    #[tokio::test]
+    async fn a_json_field_named_msg_extracts_and_filters_like_any_other() {
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            labels,
+            vec![
+                log_entry(10, r#"{"level":"error","_msg":"boom"}"#, &[]),
+                log_entry(11, r#"{"level":"info","_msg":"fine"}"#, &[]),
+            ],
+        );
+        let data_dir = temp_dir();
+        let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+        let parsed = logql::parse(r#"{app="api"} | json | _msg="boom""#).unwrap();
+        let results = run_unified_query(
+            state,
+            test_tenant(),
+            parsed,
+            crate::part::QueryTimeRange::closed(0, 20),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let data = build_stream_data(results, false);
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].stream["_msg"], "boom");
+        assert_eq!(data[0].values.len(), 1);
+    }
+
     /// An extraction whose name is a pushed metadata key is dropped rather than
     /// renamed, so `trace_id_extracted` — a name Loki's response never contained
     /// — must not appear. Loki 3.3.2 answers `| json | trace_id="<the JSON
