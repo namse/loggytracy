@@ -84,6 +84,15 @@ fn labels_overhead_bytes(tenant_bytes: usize, labels: &Labels) -> u64 {
     (tenant_bytes + labels_bytes) as u64
 }
 
+/// Sorted by key, duplicate keys collapsed to their first occurrence.
+pub fn canonicalize_structured_metadata(pairs: &mut Vec<(String, String)>) {
+    if pairs.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+        return;
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs.dedup_by(|later, earlier| later.0 == earlier.0);
+}
+
 fn entries_bytes(entries: &[LogEntry]) -> u64 {
     entries
         .iter()
@@ -212,7 +221,21 @@ impl MemTable {
         }
     }
 
-    pub fn insert(&self, tenant: TenantId, labels: Labels, entries: Vec<LogEntry>) {
+    pub fn insert(&self, tenant: TenantId, labels: Labels, mut entries: Vec<LogEntry>) {
+        // Every ingest path — Loki push in both encodings, OTLP, and journal
+        // replay of any of them — converges here, so this is where structured
+        // metadata takes its canonical form: sorted by key, one value per key,
+        // first occurrence winning. First-wins is the visibility the pipeline
+        // already has (`fields.entry(name).or_insert`), so canonicalizing does
+        // not change what a query can see; OTLP genuinely produces duplicates
+        // when a record attribute shares a name with a resource attribute.
+        // Sorted-unique is what lets the part format store the pairs as
+        // columns and rebuild them with a merge instead of a sort, and it
+        // makes `Row::sort_key`'s dedup order-insensitive — strictly stronger,
+        // which is the safe direction for at-least-once replay.
+        for entry in &mut entries {
+            canonicalize_structured_metadata(&mut entry.structured_metadata);
+        }
         let mut delta = entries_bytes(&entries);
         let mut inner = self.inner.write().unwrap();
         let overhead = stream_overhead_bytes(&tenant, &labels);
@@ -626,6 +649,43 @@ pub struct IndexStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Insert is the choke point every ingest path converges on, so metadata
+    /// leaving the memtable is canonical whatever order or duplication it
+    /// arrived with — OTLP genuinely duplicates a key when a record attribute
+    /// shares a name with a resource attribute, and first-wins is the
+    /// visibility the pipeline already gives the earlier value.
+    #[test]
+    fn inserted_metadata_is_sorted_and_first_wins_on_duplicate_keys() {
+        let memtable = MemTable::new();
+        let tenant = crate::tenant::test_tenant();
+        let labels: Labels = [("app".to_string(), "canon".to_string())]
+            .into_iter()
+            .collect();
+        memtable.insert(
+            tenant.clone(),
+            labels,
+            vec![LogEntry {
+                timestamp_ns: 1,
+                line: "line".to_string(),
+                structured_metadata: vec![
+                    ("zeta".to_string(), "z".to_string()),
+                    ("alpha".to_string(), "record".to_string()),
+                    ("alpha".to_string(), "resource".to_string()),
+                ],
+            }],
+        );
+        let snapshot = memtable.begin_flush();
+        let entry = &snapshot[&tenant].values().next().unwrap()[0];
+        assert_eq!(
+            entry.structured_metadata,
+            vec![
+                ("alpha".to_string(), "record".to_string()),
+                ("zeta".to_string(), "z".to_string()),
+            ]
+        );
+        memtable.abort_flush(snapshot);
+    }
 
     /// The counters replace an O(rows) walk, so what has to hold is that they
     /// still say what the walk would. Checked after each transition rather
