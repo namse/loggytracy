@@ -510,6 +510,72 @@ fn parse_logfmt_escape_digits(
 /// Values represented in the BTF2 exact-field bloom. The union is deliberate:
 /// it permits conservative push-down after either parser without making the
 /// immutable part format depend on a query's particular pipeline ordering.
+/// The literal substrings every match of `pattern` must contain, for trigram
+/// pruning of `|~`.
+///
+/// Prune-only, so the extraction has one obligation: never return a literal
+/// some matching line could lack. A concatenation's literal runs are all
+/// mandatory; a group's contents are mandatory when the group is; a
+/// repetition's are mandatory when it must occur at least once. An
+/// alternation makes nothing mandatory (a literal shared by every branch
+/// would be, but that is not computed), and `(?i)` case folding turns
+/// literals into classes, so an insensitive pattern naturally extracts
+/// nothing. Anything the parser cannot handle extracts nothing.
+///
+/// Runs under three bytes are dropped: a trigram filter cannot test them.
+pub(crate) fn required_regex_literals(pattern: &str) -> Vec<String> {
+    let Ok(hir) = regex_syntax::parse(pattern) else {
+        return Vec::new();
+    };
+    let mut literals = Vec::new();
+    collect_required_literals(&hir, &mut literals);
+    literals.retain(|literal| literal.len() >= 3);
+    literals
+}
+
+fn collect_required_literals(hir: &regex_syntax::hir::Hir, out: &mut Vec<String>) {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        HirKind::Literal(literal) => {
+            if let Ok(text) = std::str::from_utf8(&literal.0) {
+                out.push(text.to_string());
+            }
+        }
+        HirKind::Concat(parts) => {
+            // Adjacent literal children are one run in the matched text, and a
+            // run long enough to hold a trigram prunes where its split pieces
+            // could not.
+            let mut run = String::new();
+            for part in parts {
+                if let HirKind::Literal(literal) = part.kind() {
+                    if let Ok(text) = std::str::from_utf8(&literal.0) {
+                        run.push_str(text);
+                        continue;
+                    }
+                    // A literal that is not valid UTF-8 on its own ends the
+                    // run without joining it.
+                    if !run.is_empty() {
+                        out.push(std::mem::take(&mut run));
+                    }
+                    continue;
+                }
+                if !run.is_empty() {
+                    out.push(std::mem::take(&mut run));
+                }
+                collect_required_literals(part, out);
+            }
+            if !run.is_empty() {
+                out.push(run);
+            }
+        }
+        HirKind::Capture(capture) => collect_required_literals(&capture.sub, out),
+        HirKind::Repetition(repetition) if repetition.min >= 1 => {
+            collect_required_literals(&repetition.sub, out)
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn indexed_parser_fields(line: &str) -> BTreeMap<String, Vec<String>> {
     let mut indexed: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Avoid invoking both parsers for ordinary plain-text lines. Parser error

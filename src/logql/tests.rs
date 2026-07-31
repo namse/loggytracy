@@ -800,3 +800,53 @@
         };
         assert_eq!(expr.lookback_ns(), (10 + 2) * 60 * 1_000_000_000);
     }
+
+/// The contract is one-sided: a returned literal must appear in every match.
+/// Each case pairs a pattern with lines that match it, and every extracted
+/// literal must be a substring of every one of them; the negative cases pin
+/// the conservative bail-outs.
+#[test]
+fn required_regex_literals_never_name_what_a_match_could_lack() {
+    use crate::logql::required_regex_literals;
+    let cases: &[(&str, &[&str])] = &[
+        ("error.*timeout", &["error timeout", "error, then a timeout"]),
+        ("connection (reset|refused)", &["connection reset", "connection refused"]),
+        ("(abc)+def", &["abcdef", "abcabcdef"]),
+        ("^level=error", &["level=error at start"]),
+        ("failed\\d+times", &["failed12times"]),
+    ];
+    for (pattern, lines) in cases {
+        let literals = required_regex_literals(pattern);
+        let regex = regex::Regex::new(pattern).unwrap();
+        for line in *lines {
+            assert!(regex.is_match(line), "case must actually match: {pattern}");
+            for literal in &literals {
+                assert!(
+                    line.contains(literal.as_str()),
+                    "literal {literal:?} from {pattern} missing in matching line {line:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        required_regex_literals("error.*timeout"),
+        vec!["error".to_string(), "timeout".to_string()]
+    );
+    assert_eq!(
+        required_regex_literals("connection (reset|refused)"),
+        vec!["connection ".to_string()],
+        "an alternation is mandatory as a whole but no branch's literal is"
+    );
+    assert!(
+        required_regex_literals("(?i)error").is_empty(),
+        "case folding removes the literal, so nothing may prune"
+    );
+    assert!(
+        required_regex_literals("(zebra)?stripe").contains(&"stripe".to_string()),
+        "an optional group contributes nothing; the mandatory tail still does"
+    );
+    assert!(
+        !required_regex_literals("(zebra)?stripe").contains(&"zebra".to_string()),
+        "a min-zero repetition must not be required"
+    );
+}

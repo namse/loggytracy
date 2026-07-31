@@ -1280,6 +1280,7 @@ dependencies = [
  "prost 0.14.4",
  "prost-types",
  "regex",
+ "regex-syntax",
  "roaring",
  "serde",
  "serde_json",

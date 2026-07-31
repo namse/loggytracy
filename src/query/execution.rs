@@ -232,6 +232,16 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
     columns: part::ColumnSet,
 ) -> Result<QueryExecution, String> {
     let max_runtime = runtime_override.unwrap_or(state.config.max_query_runtime);
+    // Pin (and possibly restore) the parts *before* taking a scan slot. A
+    // restore is object-store I/O; holding one of the few scan permits across
+    // it stalled CPU-bound scans behind pure network wait. The pin is a
+    // refcount, so nothing is scanned before the permit is held.
+    let part_guard = tokio::time::timeout(
+        max_runtime,
+        pin_query_parts(&state, &tenant, &parsed, range),
+    )
+    .await
+    .map_err(|_| "query timed out".to_string())??;
     let scan_permit = tokio::time::timeout(
         max_runtime,
         state.query_scan_semaphore.clone().acquire_owned(),
@@ -239,12 +249,6 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
     .await
     .map_err(|_| "query timed out".to_string())?
     .map_err(|_| "query scan scheduler is closed".to_string())?;
-    let part_guard = tokio::time::timeout(
-        max_runtime,
-        pin_query_parts(&state, &tenant, &parsed, range),
-    )
-    .await
-    .map_err(|_| "query timed out".to_string())??;
     let task_cancellation = cancellation.clone();
     let max_query_runtime = max_runtime;
     let max_query_memory_bytes = state.config.max_query_memory_bytes;

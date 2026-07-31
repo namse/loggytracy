@@ -575,6 +575,21 @@ impl PartReader {
         let Some(groups) = self.tenant_row_groups(tenant) else {
             return Vec::new();
         };
+        // Once per scan, not per row group: a `|=` needle is a literal as it
+        // stands, and a `|~` contributes the literals every match must
+        // contain, extracted from its parsed form. `|~ "error.*timeout"` was
+        // never pruned before this — both its literals were indexable and the
+        // bloom was only asked about `Contains`.
+        let prune_literals: Vec<String> = line_filters
+            .iter()
+            .flat_map(|filter| match filter {
+                LineFilter::Contains(literal) => vec![literal.clone()],
+                LineFilter::Regex(regex) => {
+                    crate::logql::required_regex_literals(regex.as_str())
+                }
+                LineFilter::NotContains(_) | LineFilter::NotRegex(_) => Vec::new(),
+            })
+            .collect();
         let mut selected = Vec::with_capacity(groups.len());
         for rg in groups {
             let rgu = rg as usize;
@@ -587,7 +602,7 @@ impl PartReader {
             if !row_group_matches_index(rg, matchers, &self.stream_index) {
                 continue;
             }
-            if !self.bloom_prune(rgu, line_filters) {
+            if !self.bloom_prune(rgu, &prune_literals) {
                 continue;
             }
             if !self.exact_field_bloom_prune(rgu, exact_fields) {
@@ -1246,15 +1261,10 @@ fn window_rows(scan_limit: Option<usize>, scanned_rows: usize, sink: &dyn RowSin
 }
 
 impl PartReader {
-    fn bloom_prune(&self, rg: usize, line_filters: &[LineFilter]) -> bool {
-        for f in line_filters {
-            if let LineFilter::Contains(s) = f
-                && !self.bloom[rg].might_contain_substr(s)
-            {
-                return false;
-            }
-        }
-        true
+    fn bloom_prune(&self, rg: usize, literals: &[String]) -> bool {
+        literals
+            .iter()
+            .all(|literal| self.bloom[rg].might_contain_substr(literal))
     }
 
     fn exact_field_bloom_prune(&self, rg: usize, exact_fields: &[ExactFieldPredicate]) -> bool {
