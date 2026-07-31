@@ -1,11 +1,11 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-6f708937d176cede5254c0a80bc786c1f303d3507f38426cf253ae68fa1ff43f.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-d6d8fe75c233e9c7fec0490214549d9cc581cff5d13b4bb0c3cfeaecba912d22.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
     "entry_spread_ms": 250,
-    "http_address": "127.0.0.1:3120",
+    "http_address": "127.0.0.1:3130",
     "ingest_connections": 8,
     "json_weight": 5,
     "labels_per_stream": 6,
@@ -30,13 +30,13 @@
     "query_window_seconds": 60,
     "request_timeout_seconds": 60,
     "restore_lookback_seconds": 60,
-    "result_path": "/home/namse/loggytracy/target/compare/seed_loki.json",
+    "result_path": "/home/namse/loggytracy/target/compare/seed_victorialogs.json",
     "sample_interval_ms": 1000,
     "seed": 1592598566,
     "server_pid": null,
     "streams": 256,
     "streams_per_push": 4,
-    "target": "loki",
+    "target": "victorialogs",
     "target_eps": 3000.0,
     "target_events": 0,
     "targets": {
@@ -68,14 +68,14 @@
     "warmup_seconds": 10
   },
   "memory": {
-    "anon_bytes_end": 999182336,
-    "anon_peak_bytes": 1184772096,
-    "current_bytes": 1982115840,
+    "anon_bytes_end": 527417344,
+    "anon_peak_bytes": 539070464,
+    "current_bytes": 717541376,
     "error": null,
-    "file_bytes_end": 417808384,
-    "peak_bytes": 2147590144,
-    "peak_bytes_before": 2147553280,
-    "source": "/sys/fs/cgroup/system.slice/docker-6f708937d176cede5254c0a80bc786c1f303d3507f38426cf253ae68fa1ff43f.scope/memory.peak"
+    "file_bytes_end": 47669248,
+    "peak_bytes": 717541376,
+    "peak_bytes_before": 546557952,
+    "source": "/sys/fs/cgroup/system.slice/docker-d6d8fe75c233e9c7fec0490214549d9cc581cff5d13b4bb0c3cfeaecba912d22.scope/memory.peak"
   },
   "phase": "seed",
   "run": {
@@ -85,7 +85,7 @@
   },
   "seed": {
     "complete": true,
-    "elapsed_seconds": 0.823984698,
+    "elapsed_seconds": 0.32612703,
     "errors": 0,
     "first_error": null,
     "line_bytes": 49029829,
@@ -97,7 +97,7 @@
     },
     "wire_bytes": 23456834
   },
-  "target": "loki",
+  "target": "victorialogs",
   "verdict": "PASS",
   "verify": {
     "anchor_ns": 1785469140000000000,

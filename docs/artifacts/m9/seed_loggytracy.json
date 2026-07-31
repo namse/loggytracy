@@ -1,6 +1,6 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-5bd9721d907fd6616f9dcbbafec59748513a345889b7aae667a52eff3ba2cbaf.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-09b7ec5a5e0c16c84ad601aa6e6bdd178f53490956d4a4835d0ade8f7477dabe.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
@@ -52,12 +52,11 @@
     "tenants": 4,
     "tier": "B",
     "verify": {
-      "anchor_ns": 1785398290000000000,
+      "anchor_ns": 1785469140000000000,
       "entries_per_push": 100,
       "labels_per_stream": 6,
       "limit": 20000,
       "push_connections": 4,
-      "range": "1m",
       "repeats": 5,
       "rows": 150000,
       "step_ns": 1000000,
@@ -69,40 +68,40 @@
     "warmup_seconds": 10
   },
   "memory": {
-    "anon_bytes_end": 1225543680,
-    "anon_peak_bytes": 1474744320,
-    "current_bytes": 1800278016,
+    "anon_bytes_end": 1252503552,
+    "anon_peak_bytes": 1351680000,
+    "current_bytes": 1898729472,
     "error": null,
-    "file_bytes_end": 553766912,
-    "peak_bytes": 2147483648,
-    "peak_bytes_before": 2147483648,
-    "source": "/sys/fs/cgroup/system.slice/docker-5bd9721d907fd6616f9dcbbafec59748513a345889b7aae667a52eff3ba2cbaf.scope/memory.peak"
+    "file_bytes_end": 621670400,
+    "peak_bytes": 1964019712,
+    "peak_bytes_before": 1958359040,
+    "source": "/sys/fs/cgroup/system.slice/docker-09b7ec5a5e0c16c84ad601aa6e6bdd178f53490956d4a4835d0ade8f7477dabe.scope/memory.peak"
   },
   "phase": "seed",
   "run": {
-    "build_revision": "35def6c",
+    "build_revision": "9195188",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "seed": 1592598566
   },
   "seed": {
     "complete": true,
-    "elapsed_seconds": 5.063930013,
+    "elapsed_seconds": 3.479503176,
     "errors": 0,
     "first_error": null,
-    "line_bytes": 48954727,
+    "line_bytes": 49029829,
     "pushes": 1504,
     "retries": 0,
     "rows": 150000,
     "statuses": {
       "204": 1504
     },
-    "wire_bytes": 23460995
+    "wire_bytes": 23456834
   },
   "target": "loggytracy",
   "verdict": "PASS",
   "verify": {
-    "anchor_ns": 1785398290000000000,
-    "line_bytes": 48954727,
+    "anchor_ns": 1785469140000000000,
+    "line_bytes": 49029829,
     "rows": 150000,
     "span_ns": 150000000000,
     "streams": 32,
