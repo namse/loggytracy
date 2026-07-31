@@ -81,6 +81,17 @@ pub struct PartReader {
     /// `data.parquet` and leaves the sidecars resident — so this is the part of
     /// a part that a growing part count charges to RSS.
     index_resident_bytes: u64,
+    /// The parsed Parquet footer plus the timestamp column's page index,
+    /// cached for the reader's lifetime after the first scan loads it.
+    ///
+    /// The *parse* is cached, never the file handle: a part's `data.parquet`
+    /// is evictable, and a held descriptor would keep the inode's bytes alive
+    /// past the eviction that exists to reclaim them. The metadata is safe to
+    /// keep because a part is immutable and a restore fetches the same
+    /// object — and it is what the rare shapes' latency floor turned out to
+    /// be: a matcherless query re-read and re-parsed every admitted part's
+    /// footer and page index on every scan.
+    data_metadata: std::sync::OnceLock<ArrowReaderMetadata>,
 }
 
 struct DecodedBlooms {
@@ -379,6 +390,7 @@ impl PartReader {
             metadata_keys,
             parsed_keys,
             index_resident_bytes,
+            data_metadata: std::sync::OnceLock::new(),
         })
     }
 
@@ -882,7 +894,7 @@ impl PartReader {
         // (`docs/VISION.md` III). Both handles are cheap to clone — a `File`
         // behind an `Arc` and an `Arc<ParquetMetaData>` — which is what makes a
         // reader per row group, and per window inside one, affordable.
-        let (data_file, part_metadata) = open_part_data(&self.part, false, true)?;
+        let (data_file, part_metadata) = self.scan_part_data()?;
 
         'row_groups: for &row_group in &sorted_selected {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -1054,6 +1066,24 @@ impl PartReader {
     /// own accounting — the rows examined here are the rows
     /// `totalLinesProcessed` reports — and its own frontier semantics in the
     /// pass that follows.
+    /// The scan path's handle pair: a fresh descriptor (so eviction can still
+    /// reclaim the bytes once no scan holds one) and the cached footer.
+    fn scan_part_data(&self) -> Result<(PreadReader, ArrowReaderMetadata), String> {
+        if let Some(part_metadata) = self.data_metadata.get() {
+            let data_file = PreadReader::new(
+                fs::File::open(self.part.data_path()).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            return Ok((data_file, part_metadata.clone()));
+        }
+        let (data_file, part_metadata) = open_part_data(&self.part, false, true)?;
+        let part_metadata = self
+            .data_metadata
+            .get_or_init(|| part_metadata.clone())
+            .clone();
+        Ok((data_file, part_metadata))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn select_rows_in_group(
         &self,
