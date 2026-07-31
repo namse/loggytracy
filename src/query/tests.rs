@@ -1391,6 +1391,59 @@
         }
     }
 
+    /// The counting fast path against the general evaluator, on the same
+    /// state: `sum(...)` takes the sink accumulator and `sum by (app) (...)`
+    /// takes the general path, and over a single `app` value their samples
+    /// must be identical numbers under different labels.
+    #[tokio::test]
+    async fn the_counting_fast_path_matches_the_general_evaluator() {
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let memtable = Arc::new(MemTable::new());
+        memtable.insert(
+            test_tenant(),
+            labels,
+            (0..50i64)
+                .map(|i| LogEntry {
+                    timestamp_ns: 1_000_000_000 + i * 137_000_000,
+                    line: format!("line-{i}"),
+                    structured_metadata: vec![],
+                })
+                .collect(),
+        );
+        let data_dir = temp_dir();
+        let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+        for function in ["rate", "count_over_time", "bytes_over_time"] {
+            let parse = |text: &str| match logql::parse_expr(text).unwrap() {
+                logql::QueryExpr::Metric(expr) => expr,
+                _ => panic!("expected metric"),
+            };
+            let times = vec![3_000_000_000, 5_000_000_000, 9_000_000_000];
+            let fast = run_metric_query(
+                state.clone(),
+                test_tenant(),
+                parse(&format!(r#"sum({function}({{app="api"}}[2s]))"#)),
+                times.clone(),
+            )
+            .await
+            .unwrap();
+            let general = run_metric_query(
+                state.clone(),
+                test_tenant(),
+                parse(&format!(r#"sum by (app) ({function}({{app="api"}}[2s]))"#)),
+                times,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fast.len(), 1, "{function}");
+            assert_eq!(
+                fast[0].samples, general[0].samples,
+                "fast and general paths must agree on {function}"
+            );
+        }
+    }
+
     /// A stage-less query skips the pipeline, and the skip must keep its one
     /// observable rule: a metadata pair whose key is a stream label never
     /// reaches the response — the label wins the field map's seeding.

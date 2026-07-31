@@ -289,3 +289,77 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
     }
     Ok(execution)
 }
+
+/// The metric fast path's scan: same admission (part pin, then the scan
+/// permit), same budgets, but a [`crate::log_scan::CountingSink`] instead of a
+/// bounded row collector — nothing is materialized and nothing is returned but
+/// the per-point totals.
+#[allow(clippy::too_many_arguments)]
+async fn run_metric_count_scan(
+    state: Arc<AppState>,
+    tenant: TenantId,
+    parsed: logql::LogQuery,
+    range: part::QueryTimeRange,
+    scan_budget: Option<usize>,
+    cancellation: Arc<AtomicBool>,
+    runtime_override: Option<std::time::Duration>,
+    columns: part::ColumnSet,
+    times: Vec<i64>,
+    range_ns: i64,
+    bytes: bool,
+) -> Result<(Vec<f64>, u64, u64, u64), String> {
+    let max_runtime = runtime_override.unwrap_or(state.config.max_query_runtime);
+    let part_guard = tokio::time::timeout(
+        max_runtime,
+        pin_query_parts(&state, &tenant, &parsed, range),
+    )
+    .await
+    .map_err(|_| "query timed out".to_string())??;
+    let scan_permit = tokio::time::timeout(
+        max_runtime,
+        state.query_scan_semaphore.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| "query timed out".to_string())?
+    .map_err(|_| "query scan scheduler is closed".to_string())?;
+    let task_cancellation = cancellation.clone();
+    let mut task = tokio::task::spawn_blocking(move || {
+        let _scan_permit = scan_permit;
+        let _part_guard = part_guard;
+        let _arena = crate::memprof::enter(crate::memprof::Arena::Query);
+        let deleted = state.delete_requests.mask_for(&tenant);
+        let hidden_rows = &state.delete_requests.metrics.hidden_rows;
+        let hidden = |labels: &Labels, entry: &LogEntry| {
+            if deleted.hides(labels, entry) {
+                hidden_rows.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            false
+        };
+        let mut sink = crate::log_scan::CountingSink {
+            query: &parsed,
+            hidden: Some(&hidden),
+            cancellation: Some(task_cancellation.as_ref()),
+            times: &times,
+            range_ns,
+            bytes,
+            diff: vec![0.0; times.len() + 1],
+            rows: 0,
+        };
+        let scan = crate::log_scan::LogScan::new(&tenant, &parsed, range, usize::MAX, true)
+            .columns(columns)
+            .scan_budget(scan_budget)
+            .max_scan_bytes(Some(state.config.max_query_scan_bytes))
+            .cancellation(Some(task_cancellation.as_ref()));
+        let (scanned_rows, scanned_bytes) = scan.run_into(&state.memtable, &state.parts, &mut sink)?;
+        Ok::<_, String>((sink.diff, sink.rows, scanned_rows, scanned_bytes))
+    });
+    match tokio::time::timeout(max_runtime, &mut task).await {
+        Ok(result) => result.map_err(|error| format!("query task failed: {error}"))?,
+        Err(_) => {
+            cancellation.store(true, Ordering::Release);
+            let _ = task.await;
+            Err("query timed out".to_string())
+        }
+    }
+}

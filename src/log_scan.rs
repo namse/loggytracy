@@ -135,6 +135,23 @@ impl<'a> LogScan<'a> {
             materialized_memory_bytes: 0,
             rows: TopKRows::new(self.limit, self.forward),
         };
+        let (scanned_rows, scanned_bytes) = self.run_into(memtable, parts, &mut sink)?;
+        Ok(LogScanResult {
+            results: sink.rows.into_stream_results(),
+            scanned_rows,
+            scanned_bytes,
+        })
+    }
+
+    /// The same orchestration into a caller-supplied sink — the memtable first,
+    /// then the parts, budgets checked between — for consumers that aggregate
+    /// rows instead of holding them.
+    pub fn run_into(
+        &self,
+        memtable: &MemTable,
+        parts: &PartRegistry,
+        sink: &mut dyn crate::part::RowSink,
+    ) -> Result<(u64, u64), String> {
         let mut scanned_rows = 0u64;
         let mut scanned_bytes = 0u64;
         let scan_limit = self.scan_budget.map(|budget| budget.saturating_add(1));
@@ -147,7 +164,7 @@ impl<'a> LogScan<'a> {
             self.forward,
             scan_limit,
             self.cancellation,
-            &mut sink,
+            sink,
         )? as u64);
 
         if self.cancelled() {
@@ -170,7 +187,7 @@ impl<'a> LogScan<'a> {
             part_scan_bytes_limit,
             self.cancellation,
             &self.columns,
-            &mut sink,
+            sink,
         )?;
         scanned_rows = scanned_rows.saturating_add(part_stats.scanned_rows as u64);
         scanned_bytes = scanned_bytes.saturating_add(part_stats.scanned_bytes);
@@ -187,11 +204,7 @@ impl<'a> LogScan<'a> {
             ));
         }
 
-        Ok(LogScanResult {
-            results: sink.rows.into_stream_results(),
-            scanned_rows,
-            scanned_bytes,
-        })
+        Ok((scanned_rows, scanned_bytes))
     }
 
     fn check_scan_budget(&self, scanned_rows: u64) -> Result<(), String> {
@@ -305,4 +318,78 @@ pub(crate) fn estimated_log_entry_memory_bytes(labels: &Labels, entry: &LogEntry
         .saturating_add(metadata)
         .saturating_add(entry.line.len())
         .saturating_add(std::mem::size_of::<LogEntry>()) as u64
+}
+
+/// The metric fast path's sink: `sum(rate(...))`-shaped questions never need
+/// the rows, only how many of them (or how many line bytes) land in each
+/// evaluation window — so this accumulates a difference array over the
+/// evaluation grid and materializes nothing. A row at `ts` contributes to
+/// every point `t` with `t - range < ts <= t`, which on a sorted grid is one
+/// contiguous index range: two array updates per row where the general path
+/// built a `LogEntry`, grouped it, sorted it and prefix-summed it.
+pub struct CountingSink<'a> {
+    pub query: &'a LogQuery,
+    pub hidden: Option<HiddenRow<'a>>,
+    pub cancellation: Option<&'a AtomicBool>,
+    /// Sorted evaluation instants.
+    pub times: &'a [i64],
+    pub range_ns: i64,
+    /// Count line bytes instead of rows (`bytes_over_time`).
+    pub bytes: bool,
+    /// `times.len() + 1` slots; prefix-summing it yields the per-point totals.
+    pub diff: Vec<f64>,
+    pub rows: u64,
+}
+
+impl RowSink for CountingSink<'_> {
+    fn accept(&mut self, labels: &SharedLabels, mut entry: LogEntry) -> Result<(), String> {
+        if self
+            .cancellation
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err("query timed out".to_string());
+        }
+        if self.hidden.is_some_and(|hidden| hidden(labels, &entry)) {
+            return Ok(());
+        }
+        // Same rule as `PipelineSink`: stages run per row (a field filter must
+        // still reject), and a stage-less pipeline accepts everything — its
+        // shadowing effect touches only fields nothing here reads.
+        if !self.query.stages.is_empty()
+            && !self.query.process_entry_with_labels_cancellable(
+                labels,
+                &mut entry,
+                self.cancellation,
+            )?
+        {
+            return Ok(());
+        }
+        let start = self.times.partition_point(|&t| t < entry.timestamp_ns);
+        let end = self
+            .times
+            .partition_point(|&t| t < entry.timestamp_ns.saturating_add(self.range_ns));
+        if start < end {
+            let value = if self.bytes {
+                entry.line.len() as f64
+            } else {
+                1.0
+            };
+            self.diff[start] += value;
+            self.diff[end] -= value;
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    fn frontier_ns(&self) -> Option<i64> {
+        None
+    }
+
+    fn remaining(&self) -> Option<usize> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
 }

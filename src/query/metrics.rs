@@ -102,6 +102,82 @@ async fn run_metric_query_with_stats_cancellable(
     let max_metric_rows = state.config.max_metric_rows.min(MAX_METRIC_ROWS);
     let max_metric_series = state.config.max_metric_series.min(MAX_METRIC_SERIES);
     let max_metric_samples = state.config.max_metric_samples.min(MAX_METRIC_SAMPLES);
+
+    // `sum()` of a count-shaped range function needs no rows at all: the
+    // answer is how many rows (or line bytes) land in each evaluation window,
+    // and the sink can accumulate that directly — two array updates per row
+    // where the general path materialized a `LogEntry` per row at
+    // `max_metric_rows` scale, grouped them, sorted them and prefix-summed
+    // them. The general path stays for everything the accumulation cannot
+    // express: unwraps, quantiles, per-series grouping, offsets, subqueries.
+    if let logql::MetricExpr::Aggregate {
+        op: logql::AggregateOp::Sum,
+        grouping: None,
+        expr: inner,
+    } = &expr
+        && let logql::MetricExpr::Range {
+            function,
+            unwrap: None,
+            quantile: None,
+            offset_ns: 0,
+            range_ns,
+            ..
+        } = &**inner
+        && matches!(
+            function,
+            logql::RangeFunction::Rate
+                | logql::RangeFunction::CountOverTime
+                | logql::RangeFunction::BytesOverTime
+        )
+    {
+        let range_ns = *range_ns;
+        let rate = matches!(function, logql::RangeFunction::Rate);
+        let bytes = matches!(function, logql::RangeFunction::BytesOverTime);
+        let columns = expr.required_columns();
+        let (diff, accepted, scanned_rows, scanned_bytes) = run_metric_count_scan(
+            state,
+            tenant,
+            query,
+            part::QueryTimeRange::closed(scan_start, end),
+            Some(max_metric_rows),
+            cancellation,
+            Some(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            columns,
+            evaluation_times.clone(),
+            range_ns,
+            bytes,
+        )
+        .await?;
+        drop(evaluation_permit);
+        if accepted as usize > max_metric_rows {
+            return Err(format!(
+                "metric query exceeds the maximum of {max_metric_rows} scanned rows"
+            ));
+        }
+        let mut series = Vec::new();
+        if accepted > 0 {
+            let mut samples = Vec::with_capacity(evaluation_times.len());
+            let mut running = 0.0;
+            for (index, &at) in evaluation_times.iter().enumerate() {
+                running += diff[index];
+                let value = if rate {
+                    running / (range_ns as f64 / 1_000_000_000.0)
+                } else {
+                    running
+                };
+                samples.push((at, value));
+            }
+            series.push(MetricSeries {
+                labels: SharedLabels::new(Labels::new()),
+                samples,
+            });
+        }
+        return Ok(MetricQueryResult {
+            series,
+            scanned_rows,
+            scanned_bytes,
+        });
+    }
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let execution = run_unified_query_with_stats_cancellable_for_runtime(
         state.clone(),
