@@ -316,53 +316,115 @@ in terms of rather than given private scans.
 
 ---
 
+## Ingest is OTLP
+
+**Logs and traces arrive over OTLP and nothing else.** The Loki push endpoint is
+removed. The Loki *query* API is not — it is how Grafana reads this engine, and
+an ingest protocol and a query protocol are separate decisions that happened to
+share a name.
+
+**Why.** loggytracy has one intended consumer, and everything it would store
+already arrives as OTLP there: guest traces, guest logs (stdout, converted to
+OTLP log records by the host), and the worker's own telemetry. Two things in that
+deployment are not OTLP and neither is loggytracy's business — node metrics go
+by Prometheus remote_write, and this engine does not do metrics at all; and
+systemd journal currently goes by Loki push, which the collector can convert,
+because `otelcol.receiver.loki` exists precisely for that.
+
+**What it buys is larger than one endpoint.** An OTLP record is re-encoded into
+a Loki `PushRequest` before it reaches the WAL, so that replay has a single
+decoder (`proto.rs`). That is a whole second message materialized with a clone
+per line and per label, then serialized, then framed, then batched — five copies
+for the WAL alone, on the exact path the consumer uses. The re-encode exists
+only because two ingest protocols had to converge on one WAL record. With one
+protocol it has nothing to do, and [invariant II](#ii-a-lines-bytes-are-copied-a-bounded-number-of-times-and-label-sets-are-never-de-shared)
+gets the copies back.
+
+**What stays.** The `| json` parser stays and is not deprecated. A guest's
+`println!` becomes the *body* of an OTLP log record as a plain string, and
+nothing in that chain parses it — so a guest that logs JSON still needs a parser
+stage at query time. What changes is that this stops being the headline; see the
+claim below.
+
+**A consequence worth knowing before it surprises someone.** Which OTLP
+attributes become stream labels is a schema decision, and loggytracy currently
+uses *Loki's own default promotion list* (`otlp_log.rs`,
+`PROMOTED_RESOURCE_ATTRIBUTES`), so a collector configured for Loki produces the
+same streams here. The corollary is that a collector which moves a source to
+OTLP without mapping its labels to OTel semantic conventions loses index pruning
+in **both** systems identically: `{unit="fn0-worker"}` stops being a label
+lookup and becomes a structured-metadata filter. The fix is a `transform`
+mapping on the collector — `unit` to `service.name` and so on — and it is one
+piece of work that serves both.
+
+---
+
 ## The claim, and what would falsify it
 
-The differentiator is invariant III applied to one query shape.
+The differentiator is invariant III applied to one query shape — and **which
+shape is the right one changed when ingest became OTLP.**
 
-`| json | field="value"` is a full scan in Loki: Loki indexes labels, not
-structured fields, so the parser stage runs over every line in the window.
-loggytracy columnizes and blooms those fields at ingest, so the same query prunes
-at row-group granularity. ~~**This is built and has never been measured against
-anything.**~~ **It has now been measured, and it lost.**
+The claim used to be about `| json | field="value"`: a log line written as JSON
+text, parsed at query time. That is a real shape and it is still supported, but
+it is not the one the consumer sends. Over OTLP the fields that matter arrive as
+**attributes** — `project_id`, `unit`, `trace_id`, `span_id`, severity — and
+loggytracy puts them in `structured_metadata`, which the exact-field bloom
+already indexes. The query is `| trace_id="x"`, with **no parser stage at all**.
+
+So the claim is now about that shape, and it is a better claim, because it is
+where the three systems genuinely differ:
+
+* **loggytracy** indexes structured metadata into a per-row-group bloom.
+* **Loki** stores structured metadata and **does not index it** — the filter is a
+  scan.
+* **VictoriaLogs** turns OTLP attributes into columns.
+
+`| json | field="value"` remains measured, as `json_field` and
+`json_field_rare` in [`COMPARISON.md`](COMPARISON.md), because a guest that
+prints JSON produces exactly it. It is no longer what the engine is *for*.
 
 The claim is therefore stated as a falsifiable one:
 
 > At an equal container memory limit, on the same corpus and the same machine,
-> loggytracy answers `{...} | json | field="value"` over a window Loki must scan
-> in materially less time, without giving up ingest throughput or disk footprint.
+> loggytracy answers `{...} | field="value"` over structured metadata — the shape
+> an OTLP attribute produces — in materially less time than Loki, which does not
+> index it, and not materially worse than VictoriaLogs, which columnizes it,
+> without giving up ingest throughput or disk footprint.
 
-It is abandoned if the comparison in [`COMPARISON.md`](COMPARISON.md) shows Loki
-within noise on that shape, or shows loggytracy losing on ingest or
-bytes-per-GB by enough that the query win does not pay for it. Publishing the
-comparison means publishing it when it loses.
+**Neither half has been measured.** The comparison has never issued a
+structured-metadata filter, and VictoriaLogs was only added to the bed on
+2026-07-31. So this claim starts where the previous one started: unproven, with
+the bed to build before it can be answered. What is different is that the
+previous claim was measured and **lost** — `json_field` 1.85x slower cold —
+which is recorded in [`COMPARISON.md`](COMPARISON.md) and is not retracted by
+moving the target. That shape is still measured; it is just no longer the one
+the engine is judged on.
 
-**The M9 result, and this section is subordinate to it — "if a measurement
-contradicts this document, the measurement wins".** On the same corpus, the same
-machine and the same container limit, loggytracy is **1.49x slower cold and
-1.44x slower warm** on `| json | field=`; it is 1.69x slower on `|=` and 7.1x
-slower on `sum(rate())`; it wins only the label-only shape, at 0.36x. It
-achieves 16.8 k eps against Loki's 19.9 k and holds 323 MiB per GB of settled
-data against 267. And the limits were not equal by choice: at 2 GiB loggytracy
-was OOM-killed and Loki was not, so the published run is at 8 GiB.
+It is abandoned if the comparison shows Loki within noise on that shape despite
+not indexing it, or shows loggytracy losing on ingest or bytes-per-GB by enough
+that the query win does not pay for it. Publishing the comparison means
+publishing it when it loses — which it has already done once, on the shape this
+claim replaced.
 
-The claim is not abandoned, because none of that is a property of the *format* —
-it is invariant III unbuilt. What the measurement removes is the option of
-asserting the claim before that work is done. The number to beat is now written
-down.
+**What the previous claim's measurements said, kept because moving a target does
+not retract them.** Two comparison runs, both in
+[`COMPARISON.md`](COMPARISON.md) and its artifacts. The first published at 8 GiB
+because loggytracy was OOM-killed at 2 and Loki was not: `| json | field=` 1.49x
+slower cold, `|=` 1.69x, `sum(rate())` 7.1x, winning only label-only at 0.36x.
+The second published at 2 GiB, which both systems survived — that being the
+change — and read 1.85x on `| json | field=`, 2.81x on `|=`, 4.50x on
+`sum(rate())`, 0.57x on label-only, with a per-limit table showing the bounded
+scan working: 282 676 lines read at a limit of 100 against 1 331 072 at 20 000.
 
-**Half of that work is now done and the comparison has not been re-run.**
-`normal_scan_limit = usize::MAX` is gone and the scan is bounded and streaming; a
-`| json | field=` with `limit=100` over a window of 202 000 rows costs 23.6× less
-time and 16× less allocation traffic on `benches/query.rs`, and the 2 GiB limit the
-published run could not use is now met with 17–22% of headroom rather than 6%. But
-the bed itself queried with `limit=20 000` over ~1 250 matching rows, where a limit
-binds nothing, and its `data.stats` figure is unchanged at 16 384 lines against
-Loki's 1 251. So nothing here licenses a claim about the 1.49× either way: the
-shape that got faster is not the shape the bed timed, and re-running
-[`COMPARISON.md`](COMPARISON.md) — with a limit an operator would actually send —
-is what would say.
+Since that second run the rows have been ordered by stream before time, which a
+short local run measured at 0.08x on label-only, 0.15x on `|=` and **0.47x on
+`json_field`** — a shape that was losing. **That has not been confirmed in the
+bed**, and one shape got worse in the same change (`json_field` backward, see
+[`todo.md`](../todo.md)), so it is a signal and not a result.
 
+None of that is retracted by this section. What it establishes is that
+invariant III was unbuilt and is now half built, and that the number to beat is
+written down for the shape that is no longer the headline.
 ---
 
 ## What is deliberately not built

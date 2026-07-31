@@ -326,6 +326,32 @@ against the batch one), and `3ca3bb8` (the switchover, retiring the split fallba
 - [ ] **`peak_materialized_bytes` now overstates.** It still adds `merge_max_memory_bytes`, which no longer
       bounds a rewrite. Correcting it is a claim about memory and wants its own measurement rather than an edit
 
+## Next — OTLP only, and the claim moves with it
+
+Decided 2026-07-31 and written down in [`docs/VISION.md`](docs/VISION.md), "Ingest is OTLP", and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)'s decided choices. The one intended consumer sends OTLP for
+everything this engine would store; node metrics are not this engine's business, and journald can be converted
+by the collector.
+
+**Order matters here and is the opposite of the tempting one.** Measure that the shape being kept actually
+wins *before* deleting the one being dropped — removing code is the irreversible half.
+
+- [ ] **Add the structured-metadata shape to the comparison.** `| trace_id="x"` with no parser stage, which is
+      what an OTLP attribute produces. This is where the three genuinely differ: loggytracy indexes structured
+      metadata into a per-row-group bloom, Loki stores it and does **not** index it, VictoriaLogs turns it into
+      a column. **Never measured, by anyone, here.**
+- [ ] **Move the bed's ingest to OTLP** so all three receive the same records the consumer sends. Loki accepts
+      OTLP at `/otlp/v1/logs`, VictoriaLogs at `/insert/opentelemetry/v1/logs`; both need checking rather than
+      assuming. This also removes the bed's dependence on the endpoint being deleted
+- [ ] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
+      parser, and `proto.rs`'s encode side
+- [ ] **Then stop re-encoding into a Loki `PushRequest` for the WAL.** It exists so replay has one decoder
+      while two protocols converge, and it costs a whole second message materialized with a clone per line and
+      per label, then serialized, framed and batched — five copies for the WAL alone, on the consumer's own
+      path. With one protocol it has nothing to do
+- [ ] Keep the Loki **query** API and the `| json` parser. Grafana reads through the first; a guest's
+      `println!` becomes an OTLP body string that nothing in the chain parses, so the second still has work
+
 ## VictoriaLogs: ingest works, and the query half is a design question
 
 `Target::VictoriaLogs` is in the harness and **seeds successfully**: 30,000 rows, 304 pushes, every response
