@@ -59,14 +59,29 @@ pub enum Shape {
     /// apps in eight; and "find this trace across everything" is both the real
     /// query and the one where the field predicate is the only selective thing.
     JsonFieldRare,
+    /// The same rare value, reached without a parser stage.
+    ///
+    /// `json_field_rare` asks for a `trace_id` that the corpus wrote *into the
+    /// JSON line*, so answering it needs a parser. The corpus also pushes the
+    /// same `trace_id` as **structured metadata**, which is what an OTLP
+    /// attribute becomes — and that is the shape `docs/VISION.md`'s claim now
+    /// rests on, because the one intended consumer sends OTLP.
+    ///
+    /// Same value, same expected rows, one fewer stage. The pair is the
+    /// measurement: it separates what the parser costs from what the storage
+    /// costs, and it is where the three systems differ by design — loggytracy
+    /// indexes structured metadata into a per-row-group bloom, Loki stores it
+    /// without indexing it, VictoriaLogs turns it into a column.
+    MetadataRare,
     Rate,
 }
 
-pub const SHAPES: [Shape; 5] = [
+pub const SHAPES: [Shape; 6] = [
     Shape::LabelOnly,
     Shape::LineFilter,
     Shape::JsonField,
     Shape::JsonFieldRare,
+    Shape::MetadataRare,
     Shape::Rate,
 ];
 
@@ -77,6 +92,7 @@ impl Shape {
             Shape::LineFilter => "line_filter",
             Shape::JsonField => "json_field",
             Shape::JsonFieldRare => "json_field_rare",
+            Shape::MetadataRare => "metadata_rare",
             Shape::Rate => "rate",
         }
     }
@@ -364,6 +380,13 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                     // selective thing in the query.
                     Shape::JsonFieldRare => {
                         format!("{{app=~\".+\"}} | json | trace_id=\"{}\"", rare.trace_id)
+                    }
+                    // The same value with no parser stage: the corpus pushes
+                    // this `trace_id` as structured metadata as well as writing
+                    // it into the line, so the pair separates what the parser
+                    // costs from what the storage costs.
+                    Shape::MetadataRare => {
+                        format!("{{app=~\".+\"}} | trace_id=\"{}\"", rare.trace_id)
                     }
                     Shape::LabelOnly => selector,
                     Shape::LineFilter => {

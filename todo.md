@@ -326,6 +326,51 @@ against the batch one), and `3ca3bb8` (the switchover, retiring the split fallba
 - [ ] **`peak_materialized_bytes` now overstates.** It still adds `merge_max_memory_bytes`, which no longer
       bounds a rewrite. Correcting it is a claim about memory and wants its own measurement rather than an edit
 
+## The claim moved onto its worst shape, and the measurement said so within the hour
+
+`metadata_rare` — `| trace_id="x"` with no parser stage, which is what an OTLP attribute produces and what
+[`docs/VISION.md`](docs/VISION.md)'s claim was rewritten to rest on — was added and run. Short run, 30,000
+rows over 8 streams, limit 100, both systems local, build `b4a8589`:
+
+| shape | loggytracy | Loki | ratio | lt lines | Loki lines | rows |
+|---|---|---|---|---|---|---|
+| `label_only` | 0.77 ms | 8.22 ms | **0.09x** | 32,400 | 35,643 | 2,400 |
+| `line_filter` | 1.00 ms | 6.08 ms | **0.16x** | 90,000 | 35,849 | 2,008 |
+| `json_field` | 4.80 ms | 9.45 ms | **0.51x** | 56,556 | 35,791 | 2,393 |
+| `json_field_rare` | 38.70 ms | 23.46 ms | 1.65x | 703,728 | 334,192 | 72 |
+| **`metadata_rare`** | **42.98 ms** | **13.86 ms** | **3.10x** | 589,824 | 334,192 | 72 |
+| `rate` | 8.55 ms | 4.63 ms | 1.85x | 253,728 | 60,034 | 41 |
+
+**The shape the claim now rests on is the one loggytracy loses worst** — worse than the parser shape it
+replaced, and against a system that does not index structured metadata at all.
+
+### Why: structured metadata is not a column, it is a JSON blob
+
+`format.rs` writes `structured_metadata` as a single `Utf8` Parquet column holding
+`serde_json::to_string` of the pairs, and `reader.rs` runs **`serde_json::from_str` per row** to read it back.
+So a metadata filter pays a JSON parse per row — the same cost `| json` pays on the message, with none of a
+column's benefits.
+
+The arithmetic separates the two effects. loggytracy reads 589,824 lines in 42.98 ms, or 13.7 M lines/s; Loki
+reads 334,192 in 13.86 ms, or 24.1 M lines/s. So it is **1.76x more lines read and 1.8x slower per line**, and
+the two multiply. And `metadata_rare` reads *fewer* lines than `json_field_rare` while taking *longer*, which
+is the per-row parse showing up on its own.
+
+**This contradicts the data model as documented.** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) says general
+fields are "stored in columns and pruned with bloom filters". They are pruned with bloom filters. They are not
+in columns.
+
+- [ ] **Columnize structured metadata**, or explain in the architecture why it is a blob. A per-row
+      `serde_json::from_str` on the consumer's own query shape is the finding, and it is a write-path change:
+      the schema already grows a column per stream label, and metadata keys are the same kind of thing at a
+      different cardinality
+- [ ] The scatter problem is still underneath it. 72 rows across 8 streams cannot be pruned to fewer row groups
+      by any bloom, so even a free filter leaves the lines-read gap. Columnizing addresses the per-line cost,
+      not the count
+- [ ] **`docs/VISION.md`'s claim is now unsupported by its first measurement and says so.** It is not
+      retracted — the claim is about where the design *should* win, and the reason it does not is identified —
+      but it must not be repeated as though it held
+
 ## Next — OTLP only, and the claim moves with it
 
 Decided 2026-07-31 and written down in [`docs/VISION.md`](docs/VISION.md), "Ingest is OTLP", and
