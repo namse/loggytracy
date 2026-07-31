@@ -206,12 +206,14 @@ fn flush_rows_internal(
 
         let stream_labels = collect_stream_labels(&part_rows);
         let metadata_columns = select_metadata_columns(metadata_column_counts(&part_rows));
-        let parsed_columns = select_metadata_columns(parsed_column_counts(&part_rows));
+        let parsed_rows = parse_rows(&part_rows);
+        let parsed_columns = select_metadata_columns(parsed_column_counts(&parsed_rows));
         if let Err(e) = write_part_files(
             &tmp_dir,
             &part_id,
             &partition,
             &part_rows,
+            &parsed_rows,
             &stream_labels,
             &metadata_columns,
             &parsed_columns,
@@ -304,14 +306,22 @@ fn metadata_column_counts(rows: &[Row]) -> BTreeMap<String, u64> {
     counts
 }
 
+/// One `| json` extraction per row, shared by the column-key selection, the
+/// column fill and nothing else — the parse was the whole added write cost of
+/// the `_pf:` columns, and running it once instead of twice is half of it
+/// back.
+fn parse_rows(rows: &[Row]) -> Vec<Option<BTreeMap<String, String>>> {
+    rows.iter()
+        .map(|row| crate::logql::parsed_json_fields(&row.line))
+        .collect()
+}
+
 /// How many rows' lines `| json` would extract each field from.
-fn parsed_column_counts(rows: &[Row]) -> BTreeMap<String, u64> {
+fn parsed_column_counts(parsed: &[Option<BTreeMap<String, String>>]) -> BTreeMap<String, u64> {
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
-    for row in rows {
-        if let Some(fields) = crate::logql::parsed_json_fields(&row.line) {
-            for name in fields.keys() {
-                *counts.entry(name.clone()).or_default() += 1;
-            }
+    for fields in parsed.iter().flatten() {
+        for name in fields.keys() {
+            *counts.entry(name.clone()).or_default() += 1;
         }
     }
     counts
@@ -342,6 +352,7 @@ fn write_part_files(
     id: &str,
     partition: &str,
     rows: &[Row],
+    parsed_rows: &[Option<BTreeMap<String, String>>],
     stream_labels: &[String],
     metadata_columns: &[(String, u64)],
     parsed_columns: &[(String, u64)],
@@ -350,6 +361,7 @@ fn write_part_files(
     write_parquet(
         &dir.join(DATA_FILE),
         rows,
+        parsed_rows,
         stream_labels,
         metadata_columns,
         parsed_columns,
@@ -443,6 +455,7 @@ fn part_schema(
 fn row_group_batch(
     schema: &Arc<Schema>,
     rows: &[Row],
+    parsed_rows: &[Option<BTreeMap<String, String>>],
     stream_labels: &[String],
     metadata_keys: &[String],
     parsed_keys: &[String],
@@ -500,25 +513,17 @@ fn row_group_batch(
             .collect();
         columns.push(Arc::new(StringArray::from(vals)));
     }
-    if !parsed_keys.is_empty() {
-        // One parse per row, filled into every `_pf:` column, so the column
-        // count does not multiply the parse count.
-        let parsed: Vec<Option<BTreeMap<String, String>>> = rows
+    for key in parsed_keys {
+        let vals: Vec<Option<&str>> = parsed_rows
             .iter()
-            .map(|r| crate::logql::parsed_json_fields(&r.line))
+            .map(|fields| {
+                fields
+                    .as_ref()
+                    .and_then(|fields| fields.get(key))
+                    .map(String::as_str)
+            })
             .collect();
-        for key in parsed_keys {
-            let vals: Vec<Option<&str>> = parsed
-                .iter()
-                .map(|fields| {
-                    fields
-                        .as_ref()
-                        .and_then(|fields| fields.get(key))
-                        .map(String::as_str)
-                })
-                .collect();
-            columns.push(Arc::new(StringArray::from(vals)));
-        }
+        columns.push(Arc::new(StringArray::from(vals)));
     }
     columns.push(Arc::new(StringArray::from(sm)));
 
@@ -543,9 +548,11 @@ fn part_writer_properties(row_group_size: usize) -> WriterProperties {
         .build()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_parquet(
     path: &Path,
     rows: &[Row],
+    parsed_rows: &[Option<BTreeMap<String, String>>],
     stream_labels: &[String],
     metadata_columns: &[(String, u64)],
     parsed_columns: &[(String, u64)],
@@ -570,6 +577,7 @@ fn write_parquet(
         let batch = row_group_batch(
             &schema,
             &rows[*start..*end],
+            &parsed_rows[*start..*end],
             stream_labels,
             &metadata_keys,
             &parsed_keys,

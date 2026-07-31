@@ -161,10 +161,11 @@
             .into_iter()
             .map(|(key, _)| key)
             .collect();
-        let parsed_keys: Vec<String> = select_metadata_columns(parsed_column_counts(&rows))
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
+        let parsed_keys: Vec<String> =
+            select_metadata_columns(parsed_column_counts(&parse_rows(&rows)))
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
         let mut writer =
             StreamingPartWriter::create(&streamed_dir, stream_labels, metadata_keys, parsed_keys, 7)
                 .expect("create");

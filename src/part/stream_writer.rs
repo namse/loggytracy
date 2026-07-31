@@ -39,6 +39,9 @@ pub struct StreamingPartWriter {
     parsed_counts: BTreeMap<String, u64>,
     row_group_size: usize,
     group: Vec<Row>,
+    /// `parsed_json_fields` of each `group` row, computed once in `push` and
+    /// consumed by both the counts and the column fill.
+    group_parsed: Vec<Option<BTreeMap<String, String>>>,
 
     bloom_sections: Vec<Vec<u8>>,
     index: BTreeMap<String, BTreeMap<String, RoaringBitmap>>,
@@ -80,6 +83,7 @@ impl StreamingPartWriter {
             parsed_counts: BTreeMap::new(),
             row_group_size,
             group: Vec::new(),
+            group_parsed: Vec::new(),
             bloom_sections: Vec::new(),
             index: BTreeMap::new(),
             streams: BTreeSet::new(),
@@ -121,15 +125,19 @@ impl StreamingPartWriter {
                 *self.metadata_counts.entry(name.clone()).or_default() += 1;
             }
         }
-        if !self.parsed_keys.is_empty()
-            && let Some(fields) = crate::logql::parsed_json_fields(&row.line)
-        {
+        let parsed = if self.parsed_keys.is_empty() {
+            None
+        } else {
+            crate::logql::parsed_json_fields(&row.line)
+        };
+        if let Some(fields) = &parsed {
             for name in fields.keys() {
                 if self.parsed_keys.binary_search(name).is_ok() {
                     *self.parsed_counts.entry(name.clone()).or_default() += 1;
                 }
             }
         }
+        self.group_parsed.push(parsed);
         self.group.push(row);
         Ok(())
     }
@@ -142,6 +150,7 @@ impl StreamingPartWriter {
         let batch = row_group_batch(
             &self.schema,
             &self.group,
+            &self.group_parsed,
             &self.stream_labels,
             &self.metadata_keys,
             &self.parsed_keys,
@@ -227,6 +236,7 @@ impl StreamingPartWriter {
         }
 
         self.group.clear();
+        self.group_parsed.clear();
         Ok(())
     }
 
