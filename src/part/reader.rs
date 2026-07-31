@@ -71,6 +71,8 @@ pub struct PartReader {
     stream_labels: Vec<String>,
     /// The keys stored as `_sm:` columns, in schema (sorted) order.
     metadata_keys: Vec<String>,
+    /// The `| json`-extracted fields stored as `_pf:` columns, sorted.
+    parsed_keys: Vec<String>,
     /// Bytes the blooms and the stream index occupy for as long as this reader
     /// lives. Recorded at open because that is the only moment the sizes are
     /// free: recomputing it per scrape would walk every filter of every part.
@@ -270,7 +272,13 @@ fn open_part_data(
         .iter()
         .map(|(key, _)| key.clone())
         .collect();
-    let expected_schema = part_schema(&part.meta.stream_labels, &metadata_keys);
+    let parsed_keys: Vec<String> = part
+        .meta
+        .parsed_columns
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect();
+    let expected_schema = part_schema(&part.meta.stream_labels, &metadata_keys, &parsed_keys);
     if arrow_reader_metadata.schema().fields() != expected_schema.fields() {
         return Err(format!(
             "parquet schema does not match metadata for part {}: expected {:?}, got {:?}",
@@ -352,6 +360,12 @@ impl PartReader {
             .iter()
             .map(|(key, _)| key.clone())
             .collect();
+        let parsed_keys: Vec<String> = part
+            .meta
+            .parsed_columns
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
         if require_data || part.data_path().exists() {
             open_part_data(&part, true, false)?;
         }
@@ -363,6 +377,7 @@ impl PartReader {
             stream_index,
             stream_labels,
             metadata_keys,
+            parsed_keys,
             index_resident_bytes,
         })
     }
@@ -761,32 +776,69 @@ impl PartReader {
             columns.line || line_filters.is_empty(),
             "a scan that skips the line column cannot evaluate line filters"
         );
-        let projection = ScanProjection::build(&self.stream_labels, &self.metadata_keys, columns);
-        // The predicates a `_sm:` column answers *exactly* for this part: a
-        // string equality on a field no parser can shadow, whose key is one of
-        // this part's columns and not one of its stream labels. For such a
-        // predicate the column value is precisely the field the filter would
-        // see, so rows can be selected on the narrow column *before* the wide
-        // decode — the row-level precision the row-group bloom cannot give. A
-        // rare value scattered across every group then costs one narrow column
-        // read per group instead of a full-width decode, and a bloom false
-        // positive costs the same narrow read instead of a whole group.
-        let mut definitive: Vec<(usize, &ExactFieldPredicate)> = exact_fields
-            .iter()
-            .filter(|predicate| {
-                !predicate.may_be_extracted
-                    && !predicate.canonical
-                    && !predicate.value.is_empty()
-                    && self.stream_labels.binary_search(&predicate.name).is_err()
-            })
-            .filter_map(|predicate| {
-                self.metadata_keys
-                    .binary_search(&predicate.name)
-                    .ok()
-                    .map(|key_index| (key_index, predicate))
-            })
-            .collect();
-        definitive.sort_by_key(|(key_index, _)| *key_index);
+        let projection = ScanProjection::build(
+            &self.stream_labels,
+            &self.metadata_keys,
+            &self.parsed_keys,
+            columns,
+        );
+        // The predicates the part's own columns answer *exactly*: a string
+        // equality on a field that is not one of this part's stream labels,
+        // read from the `_sm:` column (pushed metadata) and — when the only
+        // parser in the pipeline is `| json` over the stored line — falling
+        // back to the `_pf:` column exactly as the pipeline falls back from
+        // metadata to extraction. For such a predicate the columns *are* the
+        // field the filter would see, so rows are selected on the narrow
+        // columns before the wide decode — the row-level precision the
+        // row-group bloom cannot give.
+        //
+        // Absence is decidable when a key list is under its cap: every present
+        // key then has a column, so a key that is not listed is on no row. A
+        // predicate whose field is provably absent on both sides matches
+        // nothing — the whole part is skipped, which is what turns a bloom
+        // false positive from a group decode into no read at all.
+        let mut definitive: Vec<DefinitiveColumn> = Vec::new();
+        for predicate in exact_fields {
+            if predicate.canonical
+                || predicate.value.is_empty()
+                || self.stream_labels.binary_search(&predicate.name).is_ok()
+            {
+                continue;
+            }
+            let sm_key = self.metadata_keys.binary_search(&predicate.name).ok();
+            let sm_decidable =
+                sm_key.is_some() || self.metadata_keys.len() < MAX_METADATA_COLUMNS;
+            if !predicate.may_be_extracted {
+                match sm_key {
+                    Some(key) => definitive.push(DefinitiveColumn {
+                        value: predicate.value.clone(),
+                        sm_key: Some(key),
+                        pf_key: None,
+                        extracted: false,
+                    }),
+                    None if sm_decidable => return Ok(stats),
+                    None => {}
+                }
+                continue;
+            }
+            if !predicate.json_only_extraction {
+                continue;
+            }
+            let pf_key = self.parsed_keys.binary_search(&predicate.name).ok();
+            let pf_decidable = pf_key.is_some() || self.parsed_keys.len() < MAX_METADATA_COLUMNS;
+            if !(sm_decidable && pf_decidable) {
+                continue;
+            }
+            if sm_key.is_none() && pf_key.is_none() {
+                return Ok(stats);
+            }
+            definitive.push(DefinitiveColumn {
+                value: predicate.value.clone(),
+                sm_key,
+                pf_key,
+                extracted: true,
+            });
+        }
 
         let selected = if exact_fields.is_empty() {
             self.select_row_groups(tenant, matchers, line_filters, time_range)
@@ -1005,17 +1057,21 @@ impl PartReader {
         data_file: &PreadReader,
         part_metadata: &ArrowReaderMetadata,
         rgu: usize,
-        definitive: &[(usize, &ExactFieldPredicate)],
+        definitive: &[DefinitiveColumn],
         time_range: QueryTimeRange,
         stats: &mut ScanStats,
     ) -> Result<Option<RowSelection>, String> {
         let labels = self.stream_labels.len();
+        let sm_leaf = |key: usize| 3 + labels + key;
+        let pf_leaf = |key: usize| 3 + labels + self.metadata_keys.len() + key;
         let mut leaves = vec![1usize];
-        leaves.extend(
-            definitive
-                .iter()
-                .map(|(key_index, _)| 3 + labels + key_index),
-        );
+        for def in definitive {
+            leaves.extend(def.sm_key.map(sm_leaf));
+            leaves.extend(def.pf_key.map(pf_leaf));
+        }
+        leaves.sort_unstable();
+        leaves.dedup();
+        let position = |leaf: usize| leaves.binary_search(&leaf).expect("projected leaf");
         let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
             data_file.clone(),
             part_metadata.clone(),
@@ -1036,15 +1092,36 @@ impl PartReader {
             stats.scanned_bytes = stats
                 .scanned_bytes
                 .saturating_add(batch.get_array_memory_size() as u64);
-            let ts = batch.column(0).as_primitive::<Int64Type>();
-            let columns: Vec<&StringArray> = (0..definitive.len())
-                .map(|index| batch.column(1 + index).as_string::<i32>())
+            let ts = batch
+                .column(position(1))
+                .as_primitive::<Int64Type>();
+            let columns: Vec<(Option<&StringArray>, Option<&StringArray>)> = definitive
+                .iter()
+                .map(|def| {
+                    (
+                        def.sm_key
+                            .map(|key| batch.column(position(sm_leaf(key))).as_string::<i32>()),
+                        def.pf_key
+                            .map(|key| batch.column(position(pf_leaf(key))).as_string::<i32>()),
+                    )
+                })
                 .collect();
             for i in 0..batch.num_rows() {
                 stats.scanned_rows = stats.scanned_rows.saturating_add(1);
                 let keep = time_range.contains(ts.value(i))
-                    && definitive.iter().enumerate().all(|(index, (_, predicate))| {
-                        !columns[index].is_null(i) && columns[index].value(i) == predicate.value
+                    && definitive.iter().zip(&columns).all(|(def, (sm, pf))| {
+                        // Metadata wins over extraction, exactly as the
+                        // pipeline's shadowing rule: when the row carries the
+                        // key as metadata, extraction never reaches the field.
+                        let value = match sm {
+                            Some(sm) if !sm.is_null(i) => Some(sm.value(i)),
+                            _ if def.extracted => match pf {
+                                Some(pf) if !pf.is_null(i) => Some(pf.value(i)),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        value == Some(def.value.as_str())
                     });
                 if keep {
                     match ranges.last_mut() {
@@ -1220,6 +1297,18 @@ impl PartReader {
     }
 }
 
+/// One exact-field predicate the part's columns can answer per row.
+struct DefinitiveColumn {
+    value: String,
+    /// Index into the part's `_sm:` key list, when the key is columnized.
+    sm_key: Option<usize>,
+    /// Index into the part's `_pf:` key list, for json-only extraction.
+    pf_key: Option<usize>,
+    /// Whether `| json` extraction may supply the field when metadata does
+    /// not. `false` means the predicate reads pushed metadata alone.
+    extracted: bool,
+}
+
 /// Where each logical column landed in a projected batch.
 ///
 /// A `ProjectionMask` keeps the projected columns in schema order, so the
@@ -1240,8 +1329,17 @@ struct ScanProjection {
 }
 
 impl ScanProjection {
-    fn build(stream_labels: &[String], metadata_keys: &[String], columns: &ColumnSet) -> Self {
+    fn build(
+        stream_labels: &[String],
+        metadata_keys: &[String],
+        parsed_keys: &[String],
+        columns: &ColumnSet,
+    ) -> Self {
         let labels = stream_labels.len();
+        // `_pf:` columns are never part of a wide read: entries carry the line
+        // and extraction stays a query-time stage. They exist for the narrow
+        // first pass alone, which addresses them by ordinal directly.
+        let residual_leaf = 3 + labels + metadata_keys.len() + parsed_keys.len();
         let mut leaves = vec![0usize, 1];
         let mut next = 2usize;
         let mut msg = None;
@@ -1264,7 +1362,7 @@ impl ScanProjection {
                     metadata.push((key, next));
                     next += 1;
                 }
-                leaves.push(3 + labels + metadata_keys.len());
+                leaves.push(residual_leaf);
                 residual = Some(next);
             }
             MetadataProjection::Named(names) => {
@@ -1283,7 +1381,7 @@ impl ScanProjection {
                     .iter()
                     .any(|name| metadata_keys.binary_search(name).is_err())
                 {
-                    leaves.push(3 + labels + metadata_keys.len());
+                    leaves.push(residual_leaf);
                     residual = Some(next);
                 }
             }

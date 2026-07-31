@@ -153,10 +153,18 @@ pub struct LogQuery {
 impl LogQuery {
     pub fn exact_field_predicates(&self) -> Vec<ExactFieldPredicate> {
         let mut parser_seen = false;
+        // Whether `| json` over the *stored* line is the only way this
+        // predicate's field can have been extracted: no logfmt stage, and no
+        // `line_format` having rewritten the line a later parser would read.
+        let mut json_only = true;
         let mut predicates = Vec::new();
         for stage in &self.stages {
             match stage {
-                PipelineStage::Json | PipelineStage::Logfmt => parser_seen = true,
+                PipelineStage::Json => parser_seen = true,
+                PipelineStage::Logfmt => {
+                    parser_seen = true;
+                    json_only = false;
+                }
                 PipelineStage::Field(FieldFilter {
                     name,
                     op: FieldOp::Eq,
@@ -171,7 +179,7 @@ impl LogQuery {
                         FieldValue::Duration(value) => (value.to_string(), true),
                         FieldValue::Regex(_) => continue,
                     };
-                    predicates.push(if canonical {
+                    let mut predicate = if canonical {
                         ExactFieldPredicate::new_canonical_with_extraction(
                             name.clone(),
                             value,
@@ -179,7 +187,9 @@ impl LogQuery {
                         )
                     } else {
                         ExactFieldPredicate::new_with_extraction(name.clone(), value, parser_seen)
-                    });
+                    };
+                    predicate.json_only_extraction = parser_seen && json_only;
+                    predicates.push(predicate);
                 }
                 PipelineStage::Line(_) | PipelineStage::Field(_) => {}
                 // A `label_format` can synthesize any name, so a later
@@ -189,8 +199,10 @@ impl LogQuery {
                 // rewrite anything.
                 PipelineStage::LabelFormat(_) => return predicates,
                 // `line_format` rewrites the line, not the fields, so the
-                // exact-field index is unaffected by it.
-                PipelineStage::LineFormat(_) => {}
+                // exact-field index is unaffected by it — but a parser *after*
+                // it reads the rewritten line, which is not the line the
+                // `_pf:` columns were extracted from.
+                PipelineStage::LineFormat(_) => json_only = false,
             }
         }
         predicates

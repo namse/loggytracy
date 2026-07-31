@@ -240,6 +240,11 @@ pub struct ExactFieldPredicate {
     /// Whether `value` is a canonical numeric/duration representation. Older
     /// BTF2 indexes contain only raw values and must not prune such queries.
     pub canonical: bool,
+    /// True when the only parser that can produce this field is `| json` with
+    /// the stored line intact — no logfmt stage, no `line_format` rewriting
+    /// the line first. Exactly then the `_pf:` column *is* what the stage
+    /// would extract, and the two-pass scan may answer the predicate from it.
+    pub json_only_extraction: bool,
 }
 
 impl ExactFieldPredicate {
@@ -249,6 +254,7 @@ impl ExactFieldPredicate {
             value: value.into(),
             may_be_extracted: false,
             canonical: false,
+            json_only_extraction: false,
         }
     }
 
@@ -262,6 +268,7 @@ impl ExactFieldPredicate {
             value: value.into(),
             may_be_extracted,
             canonical: false,
+            json_only_extraction: false,
         }
     }
 
@@ -275,6 +282,7 @@ impl ExactFieldPredicate {
             value: value.into(),
             may_be_extracted,
             canonical: true,
+            json_only_extraction: false,
         }
     }
 }
@@ -337,6 +345,11 @@ pub struct PartMeta {
     /// The metadata keys stored as `_sm:` columns, sorted, with the number of
     /// rows carrying each. See `MAX_METADATA_COLUMNS`.
     pub metadata_columns: Vec<(String, u64)>,
+    /// The `| json`-extracted fields stored as `_pf:` columns, same shape and
+    /// cap. The line itself stays; these are the schema-on-write copy of what
+    /// the query-time parser would produce, exact by construction because the
+    /// writer runs the same extraction.
+    pub parsed_columns: Vec<(String, u64)>,
     pub streams: Vec<Labels>,
     /// Size of `meta.json` on disk, recorded when it was read.
     ///

@@ -35,6 +35,8 @@ pub struct StreamingPartWriter {
     /// dropped do not inflate the next merge's choice.
     metadata_keys: Vec<String>,
     metadata_counts: BTreeMap<String, u64>,
+    parsed_keys: Vec<String>,
+    parsed_counts: BTreeMap<String, u64>,
     row_group_size: usize,
     group: Vec<Row>,
 
@@ -58,9 +60,10 @@ impl StreamingPartWriter {
         dir: &Path,
         stream_labels: Vec<String>,
         metadata_keys: Vec<String>,
+        parsed_keys: Vec<String>,
         row_group_size: usize,
     ) -> io::Result<Self> {
-        let schema = part_schema(&stream_labels, &metadata_keys);
+        let schema = part_schema(&stream_labels, &metadata_keys, &parsed_keys);
         let data_path = dir.join(DATA_FILE);
         let file = fs::File::create(&data_path)?;
         let props = part_writer_properties(row_group_size);
@@ -73,6 +76,8 @@ impl StreamingPartWriter {
             stream_labels,
             metadata_keys,
             metadata_counts: BTreeMap::new(),
+            parsed_keys,
+            parsed_counts: BTreeMap::new(),
             row_group_size,
             group: Vec::new(),
             bloom_sections: Vec::new(),
@@ -116,6 +121,15 @@ impl StreamingPartWriter {
                 *self.metadata_counts.entry(name.clone()).or_default() += 1;
             }
         }
+        if !self.parsed_keys.is_empty()
+            && let Some(fields) = crate::logql::parsed_json_fields(&row.line)
+        {
+            for name in fields.keys() {
+                if self.parsed_keys.binary_search(name).is_ok() {
+                    *self.parsed_counts.entry(name.clone()).or_default() += 1;
+                }
+            }
+        }
         self.group.push(row);
         Ok(())
     }
@@ -125,7 +139,13 @@ impl StreamingPartWriter {
             return Ok(());
         }
         let ordinal = self.row_group_min_ts.len() as u32;
-        let batch = row_group_batch(&self.schema, &self.group, &self.stream_labels, &self.metadata_keys)?;
+        let batch = row_group_batch(
+            &self.schema,
+            &self.group,
+            &self.stream_labels,
+            &self.metadata_keys,
+            &self.parsed_keys,
+        )?;
         self.writer.write(&batch).map_err(io::Error::other)?;
         // The sidecars address row groups by ordinal, so a flush per batch pins
         // the boundary rather than letting the writer pick one that straddles a
@@ -283,6 +303,11 @@ impl StreamingPartWriter {
                         self.metadata_counts.get(key).copied().unwrap_or(0),
                     )
                 })
+                .collect(),
+            parsed_columns: self
+                .parsed_keys
+                .iter()
+                .map(|key| (key.clone(), self.parsed_counts.get(key).copied().unwrap_or(0)))
                 .collect(),
             stream_labels: self.stream_labels,
             streams: self

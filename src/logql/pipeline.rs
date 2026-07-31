@@ -576,6 +576,24 @@ fn collect_required_literals(hir: &regex_syntax::hir::Hir, out: &mut Vec<String>
     }
 }
 
+/// What `| json` would extract from this line, or `None` when it would fail —
+/// the write-side twin of the query-time stage, for the `_pf:` columns.
+///
+/// Deliberately `extract_json` itself and not `indexed_parser_fields`: the
+/// bloom indexes every sanitization variant of a name, but a column holds one
+/// value, and the one that is exact is the one the pipeline will produce.
+/// Logfmt is deliberately absent for now; a logfmt extraction keeps its
+/// query-time cost until this is extended.
+///
+/// No fast-path gate on the first byte, on purpose: the column is only exact
+/// if this function accepts and rejects *precisely* the lines the query-time
+/// stage does, and `| json` also extracts from top-level arrays and tolerates
+/// leading whitespace. A cheap pre-check that disagreed on either would turn
+/// the two-pass scan's exactness into a wrong answer.
+pub(crate) fn parsed_json_fields(line: &str) -> Option<BTreeMap<String, String>> {
+    extract_json(line).ok()
+}
+
 pub(crate) fn indexed_parser_fields(line: &str) -> BTreeMap<String, Vec<String>> {
     let mut indexed: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Avoid invoking both parsers for ordinary plain-text lines. Parser error

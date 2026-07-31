@@ -6,6 +6,7 @@ fn write_meta(
     row_group_size: usize,
     stream_labels: &[String],
     metadata_columns: &[(String, u64)],
+    parsed_columns: &[(String, u64)],
 ) -> io::Result<()> {
     let n = rows.len();
     let bounds = row_group_bounds(rows, row_group_size);
@@ -93,6 +94,7 @@ fn write_meta(
         materialized_bytes: rows.iter().map(Row::materialized_bytes).sum(),
         stream_labels: stream_labels.to_vec(),
         metadata_columns: metadata_columns.to_vec(),
+        parsed_columns: parsed_columns.to_vec(),
         streams,
         integrity,
     };
@@ -167,6 +169,9 @@ struct MetaFile {
     /// the number of rows carrying it. The counts are what let a merge choose
     /// its output's columns deterministically without reading a row.
     metadata_columns: Vec<(String, u64)>,
+    /// The same for `_pf:` columns: the fields `| json` extracts from the
+    /// part's lines, stored beside the line it still keeps.
+    parsed_columns: Vec<(String, u64)>,
     streams: Vec<Vec<(String, String)>>,
     integrity: PartIntegrity,
 }
@@ -229,6 +234,7 @@ pub fn load_part(dir: &Path) -> Result<Part, String> {
         materialized_bytes: meta_file.materialized_bytes,
         stream_labels: meta_file.stream_labels,
         metadata_columns: meta_file.metadata_columns,
+        parsed_columns: meta_file.parsed_columns,
         streams,
         meta_bytes: meta_str.len() as u64,
         integrity: meta_file.integrity,
@@ -290,6 +296,11 @@ fn validate_meta_file(dir: &Path, meta: &MetaFile) -> Result<(), String> {
         .windows(2)
         .any(|pair| pair[0].0 >= pair[1].0)
         || meta.metadata_columns.len() > MAX_METADATA_COLUMNS
+        || meta
+            .parsed_columns
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+        || meta.parsed_columns.len() > MAX_METADATA_COLUMNS
     {
         return Err("part metadata columns are not sorted, unique and capped".to_string());
     }

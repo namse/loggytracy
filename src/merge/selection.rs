@@ -246,6 +246,17 @@ pub fn rewrite_group(
         .into_iter()
         .map(|(key, _)| key)
         .collect();
+    let mut parsed_counts: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    for reader in readers {
+        for (key, count) in &reader.meta().parsed_columns {
+            *parsed_counts.entry(key.clone()).or_default() += count;
+        }
+    }
+    let parsed_keys: Vec<String> = part::select_metadata_columns(parsed_counts)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
 
     let mut merged = part::MergedRows::new(readers, STREAM_PAGE_BYTES);
     let mut keep = |row: &part::Row| {
@@ -271,6 +282,7 @@ pub fn rewrite_group(
         &partition,
         stream_labels.into_iter().collect(),
         metadata_keys,
+        parsed_keys,
         row_group_size,
         old_dirs,
     )

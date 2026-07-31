@@ -92,6 +92,7 @@ pub fn flush_row_stream_with_merge_tombstone(
     partition: &str,
     stream_labels: Vec<String>,
     metadata_keys: Vec<String>,
+    parsed_keys: Vec<String>,
     row_group_size: usize,
     old_dirs: &[PathBuf],
 ) -> io::Result<(Vec<Part>, u64, u64)> {
@@ -103,7 +104,8 @@ pub fn flush_row_stream_with_merge_tombstone(
     }
     fs::create_dir_all(&staging)?;
 
-    let mut writer = StreamingPartWriter::create(&staging, stream_labels, metadata_keys, row_group_size)?;
+    let mut writer =
+        StreamingPartWriter::create(&staging, stream_labels, metadata_keys, parsed_keys, row_group_size)?;
     let mut dropped = 0u64;
     let mut kept = 0u64;
     loop {
@@ -204,6 +206,7 @@ fn flush_rows_internal(
 
         let stream_labels = collect_stream_labels(&part_rows);
         let metadata_columns = select_metadata_columns(metadata_column_counts(&part_rows));
+        let parsed_columns = select_metadata_columns(parsed_column_counts(&part_rows));
         if let Err(e) = write_part_files(
             &tmp_dir,
             &part_id,
@@ -211,6 +214,7 @@ fn flush_rows_internal(
             &part_rows,
             &stream_labels,
             &metadata_columns,
+            &parsed_columns,
             row_group_size,
         ) {
             rollback_committed(&committed_dirs);
@@ -300,6 +304,19 @@ fn metadata_column_counts(rows: &[Row]) -> BTreeMap<String, u64> {
     counts
 }
 
+/// How many rows' lines `| json` would extract each field from.
+fn parsed_column_counts(rows: &[Row]) -> BTreeMap<String, u64> {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for row in rows {
+        if let Some(fields) = crate::logql::parsed_json_fields(&row.line) {
+            for name in fields.keys() {
+                *counts.entry(name.clone()).or_default() += 1;
+            }
+        }
+    }
+    counts
+}
+
 /// Which metadata keys become columns in this part: the `MAX_METADATA_COLUMNS`
 /// most frequent, returned **sorted by key** with their row counts.
 ///
@@ -319,6 +336,7 @@ pub(crate) fn select_metadata_columns(counts: BTreeMap<String, u64>) -> Vec<(Str
     by_count
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_part_files(
     dir: &Path,
     id: &str,
@@ -326,6 +344,7 @@ fn write_part_files(
     rows: &[Row],
     stream_labels: &[String],
     metadata_columns: &[(String, u64)],
+    parsed_columns: &[(String, u64)],
     row_group_size: usize,
 ) -> io::Result<()> {
     write_parquet(
@@ -333,6 +352,7 @@ fn write_part_files(
         rows,
         stream_labels,
         metadata_columns,
+        parsed_columns,
         row_group_size,
     )?;
     write_index(&dir.join(INDEX_FILE), rows, row_group_size, stream_labels)?;
@@ -344,6 +364,7 @@ fn write_part_files(
         row_group_size,
         stream_labels,
         metadata_columns,
+        parsed_columns,
     )?;
     Ok(())
 }
@@ -390,7 +411,17 @@ fn metadata_column_name(key: &str) -> String {
     format!("_sm:{key}")
 }
 
-fn part_schema(stream_labels: &[String], metadata_keys: &[String]) -> Arc<Schema> {
+/// The Parquet column a `| json`-extracted field is stored in. Same
+/// injectivity argument as [`metadata_column_name`].
+fn parsed_column_name(key: &str) -> String {
+    format!("_pf:{key}")
+}
+
+fn part_schema(
+    stream_labels: &[String],
+    metadata_keys: &[String],
+    parsed_keys: &[String],
+) -> Arc<Schema> {
     let mut fields = vec![
         Field::new(TENANT_COLUMN, DataType::Utf8, false),
         Field::new("timestamp_ns", DataType::Int64, false),
@@ -402,6 +433,9 @@ fn part_schema(stream_labels: &[String], metadata_keys: &[String]) -> Arc<Schema
     for key in metadata_keys {
         fields.push(Field::new(metadata_column_name(key), DataType::Utf8, true));
     }
+    for key in parsed_keys {
+        fields.push(Field::new(parsed_column_name(key), DataType::Utf8, true));
+    }
     fields.push(Field::new("structured_metadata", DataType::Utf8, true));
     Arc::new(Schema::new(fields))
 }
@@ -411,6 +445,7 @@ fn row_group_batch(
     rows: &[Row],
     stream_labels: &[String],
     metadata_keys: &[String],
+    parsed_keys: &[String],
 ) -> io::Result<RecordBatch> {
     let tenants: Vec<&str> = rows.iter().map(|r| r.tenant.as_str()).collect();
     let ts: Vec<i64> = rows.iter().map(|r| r.timestamp_ns).collect();
@@ -465,6 +500,26 @@ fn row_group_batch(
             .collect();
         columns.push(Arc::new(StringArray::from(vals)));
     }
+    if !parsed_keys.is_empty() {
+        // One parse per row, filled into every `_pf:` column, so the column
+        // count does not multiply the parse count.
+        let parsed: Vec<Option<BTreeMap<String, String>>> = rows
+            .iter()
+            .map(|r| crate::logql::parsed_json_fields(&r.line))
+            .collect();
+        for key in parsed_keys {
+            let vals: Vec<Option<&str>> = parsed
+                .iter()
+                .map(|fields| {
+                    fields
+                        .as_ref()
+                        .and_then(|fields| fields.get(key))
+                        .map(String::as_str)
+                })
+                .collect();
+            columns.push(Arc::new(StringArray::from(vals)));
+        }
+    }
     columns.push(Arc::new(StringArray::from(sm)));
 
     RecordBatch::try_new(schema.clone(), columns).map_err(io::Error::other)
@@ -493,13 +548,15 @@ fn write_parquet(
     rows: &[Row],
     stream_labels: &[String],
     metadata_columns: &[(String, u64)],
+    parsed_columns: &[(String, u64)],
     row_group_size: usize,
 ) -> io::Result<()> {
     let metadata_keys: Vec<String> = metadata_columns
         .iter()
         .map(|(key, _)| key.clone())
         .collect();
-    let schema = part_schema(stream_labels, &metadata_keys);
+    let parsed_keys: Vec<String> = parsed_columns.iter().map(|(key, _)| key.clone()).collect();
+    let schema = part_schema(stream_labels, &metadata_keys, &parsed_keys);
     let bounds = row_group_bounds(rows, row_group_size);
 
     let file = fs::File::create(path)?;
@@ -510,7 +567,13 @@ fn write_parquet(
     // must be exactly `bounds`. Flushing after each batch pins the boundary
     // instead of letting the writer choose one that straddles a tenant.
     for (start, end) in &bounds {
-        let batch = row_group_batch(&schema, &rows[*start..*end], stream_labels, &metadata_keys)?;
+        let batch = row_group_batch(
+            &schema,
+            &rows[*start..*end],
+            stream_labels,
+            &metadata_keys,
+            &parsed_keys,
+        )?;
         writer.write(&batch).map_err(io::Error::other)?;
         writer.flush().map_err(io::Error::other)?;
     }

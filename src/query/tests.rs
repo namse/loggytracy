@@ -1391,6 +1391,108 @@
         }
     }
 
+    /// `| json | field="x"` — `json_field_rare`'s shape — now takes the
+    /// two-pass path too: the `_pf:` column is what `| json` would extract,
+    /// and metadata still wins where both exist. Memtable-against-parts is the
+    /// on/off pair; the cases are a line-value hit, a miss, and the shadowing
+    /// row whose metadata must silence its line.
+    #[tokio::test]
+    async fn a_json_extraction_filter_answers_identically_through_the_two_pass_scan() {
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let mut entries: Vec<LogEntry> = (0..40i64)
+            .map(|i| LogEntry {
+                timestamp_ns: 1_000 + i,
+                line: format!(r#"{{"trace_id":"t{}","status":200}}"#, i % 8),
+                structured_metadata: vec![],
+            })
+            .collect();
+        // The shadowing row: the line says t3, the pushed metadata says
+        // other — Loki's rule discards the extraction, so `trace_id="t3"`
+        // must not return this row and `trace_id="other"` must.
+        entries.push(LogEntry {
+            timestamp_ns: 2_000,
+            line: r#"{"trace_id":"t3"}"#.to_string(),
+            structured_metadata: vec![("trace_id".to_string(), "other".to_string())],
+        });
+        // A non-JSON row: extraction fails, the filter sees nothing.
+        entries.push(LogEntry {
+            timestamp_ns: 2_001,
+            line: "trace_id=t3 not json".to_string(),
+            structured_metadata: vec![],
+        });
+
+        let in_memtable = {
+            let data_dir = temp_dir();
+            let memtable = Arc::new(MemTable::new());
+            memtable.insert(test_tenant(), labels.clone(), entries.clone());
+            test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None)
+        };
+        let in_parts = {
+            let data_dir = temp_dir();
+            let rows: Vec<Row> = entries
+                .iter()
+                .map(|entry| Row {
+                    tenant: test_tenant(),
+                    timestamp_ns: entry.timestamp_ns,
+                    labels: std::sync::Arc::new(labels.clone()),
+                    line: entry.line.clone(),
+                    structured_metadata: entry.structured_metadata.clone(),
+                })
+                .collect();
+            let parts = Arc::new(PartRegistry::new());
+            parts
+                .register(part::flush_rows(rows, &data_dir.join("parts"), 16).unwrap())
+                .unwrap();
+            test_state(&data_dir, Arc::new(MemTable::new()), parts, None)
+        };
+
+        for (expression, expected_rows) in [
+            (r#"{app="api"} | json | trace_id="t3""#, 5usize),
+            (r#"{app="api"} | json | trace_id="absent""#, 0),
+            (r#"{app="api"} | json | trace_id="other""#, 1),
+        ] {
+            let parsed = logql::parse(expression).unwrap();
+            let flat = |results: Vec<StreamResult>| -> Vec<(i64, String)> {
+                let mut rows: Vec<(i64, String)> = results
+                    .into_iter()
+                    .flat_map(|stream| {
+                        stream
+                            .entries
+                            .into_iter()
+                            .map(|entry| (entry.timestamp_ns, entry.line))
+                    })
+                    .collect();
+                rows.sort();
+                rows
+            };
+            let range = crate::part::QueryTimeRange::closed(0, 10_000);
+            let from_memtable = flat(
+                run_unified_query(
+                    in_memtable.clone(),
+                    test_tenant(),
+                    parsed.clone(),
+                    range,
+                    1000,
+                    false,
+                )
+                .await
+                .unwrap(),
+            );
+            let from_parts = flat(
+                run_unified_query(in_parts.clone(), test_tenant(), parsed, range, 1000, false)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                from_memtable, from_parts,
+                "the two-pass json path must not change the answer to {expression}"
+            );
+            assert_eq!(from_parts.len(), expected_rows, "{expression}");
+        }
+    }
+
     /// The metric path projects columns — only the timestamp, the labels and
     /// the fields the expression names come off disk. The memtable cannot
     /// project, so the same rows in the memtable and in a part are a
