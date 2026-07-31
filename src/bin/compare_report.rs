@@ -17,12 +17,13 @@ use std::path::Path;
 
 use serde_json::Value;
 
-const SHAPES: [&str; 6] = [
+const SHAPES: [&str; 7] = [
     "label_only",
     "line_filter",
     "json_field",
     "json_field_rare",
     "metadata_rare",
+    "trace_window",
     "rate",
 ];
 const TARGETS: [&str; 3] = ["loggytracy", "loki", "victorialogs"];

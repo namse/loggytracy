@@ -73,15 +73,23 @@ pub enum Shape {
     /// indexes structured metadata into a per-row-group bloom, Loki stores it
     /// without indexing it, VictoriaLogs turns it into a column.
     MetadataRare,
+    /// The same rare value inside the window Grafana's trace-to-logs actually
+    /// sends: the occurrence's own time, one second either side. The wide
+    /// `metadata_rare` asks "find this trace across everything"; this asks the
+    /// question the consumer's click asks — and it is the measurement that
+    /// decides whether a server-side trace-to-log join buys anything the
+    /// client's window has not already bought.
+    TraceWindow,
     Rate,
 }
 
-pub const SHAPES: [Shape; 6] = [
+pub const SHAPES: [Shape; 7] = [
     Shape::LabelOnly,
     Shape::LineFilter,
     Shape::JsonField,
     Shape::JsonFieldRare,
     Shape::MetadataRare,
+    Shape::TraceWindow,
     Shape::Rate,
 ];
 
@@ -93,6 +101,7 @@ impl Shape {
             Shape::JsonField => "json_field",
             Shape::JsonFieldRare => "json_field_rare",
             Shape::MetadataRare => "metadata_rare",
+            Shape::TraceWindow => "trace_window",
             Shape::Rate => "rate",
         }
     }
@@ -374,6 +383,25 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
     // Rebuilt from the seed rather than scanned out of the corpus, so the
     // matrix phase does not have to hold the rows the seed phase wrote.
     let rare = loggytracy::corpus::rare_field_values(&verify_spec(cfg));
+    // Every instant the rare trace occurs at, for the narrow-window shape:
+    // a real trace-to-logs query is anchored on an occurrence, not on a grid.
+    let rare_times: Vec<i64> = {
+        let mut times: Vec<i64> = corpus
+            .streams
+            .iter()
+            .flat_map(|stream| {
+                stream.entries.iter().filter_map(|entry| {
+                    entry
+                        .structured_metadata
+                        .iter()
+                        .any(|(name, value)| name == "trace_id" && value == &rare.trace_id)
+                        .then_some(entry.timestamp_ns)
+                })
+            })
+            .collect();
+        times.sort_unstable();
+        times
+    };
     let mut queries = Vec::new();
     for shape in SHAPES {
         for (app_index, app) in apps.iter().enumerate() {
@@ -395,7 +423,18 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                 // window's last bucket read 124.9 against 125.0, one boundary
                 // row, everything interior equal. So a rate window that would
                 // end where the data does is slid one step in.
-                let (start_ns, end_ns) = if shape == Shape::Rate {
+                // The trace-window shape replaces the grid window with the
+                // occurrence's own: one second either side of the variant-th
+                // time the trace appears, which is what a click on a span
+                // sends. Unaligned on purpose — nothing metric reads it.
+                let variant = app_index * cfg.verify.windows + window;
+                let (start_ns, end_ns) = if shape == Shape::TraceWindow && !rare_times.is_empty() {
+                    let occurrence = rare_times[variant % rare_times.len()];
+                    (
+                        occurrence.saturating_sub(1_000_000_000),
+                        occurrence.saturating_add(1_000_000_000),
+                    )
+                } else if shape == Shape::Rate {
                     let dataset_end_ns = align_to_step(cfg.verify.anchor_ns + span, step_ns);
                     if end_ns >= dataset_end_ns {
                         let end = end_ns - step_ns;
@@ -407,7 +446,6 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                     (start_ns, end_ns)
                 };
                 let selector = format!("{{app=\"{app}\"}}");
-                let variant = app_index * cfg.verify.windows + window;
                 let expression = match shape {
                     // No app selector: a trace is drawn independently of the
                     // app, so pinning one would empty the answer for seven apps
@@ -420,7 +458,7 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                     // this `trace_id` as structured metadata as well as writing
                     // it into the line, so the pair separates what the parser
                     // costs from what the storage costs.
-                    Shape::MetadataRare => {
+                    Shape::MetadataRare | Shape::TraceWindow => {
                         format!("{{app=~\".+\"}} | trace_id=\"{}\"", rare.trace_id)
                     }
                     Shape::LabelOnly => selector,
@@ -503,7 +541,7 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                         };
                         vec!["app".to_string(), field.to_string()]
                     }
-                    Shape::JsonFieldRare | Shape::MetadataRare => {
+                    Shape::JsonFieldRare | Shape::MetadataRare | Shape::TraceWindow => {
                         vec!["app".to_string(), "trace_id".to_string()]
                     }
                     // `sum()` strips every label, so the series identity is
@@ -579,7 +617,7 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
         }
         // No app selector, matching the LogQL side: the point is a predicate
         // that is the only selective thing in the query.
-        Shape::JsonFieldRare | Shape::MetadataRare => {
+        Shape::JsonFieldRare | Shape::MetadataRare | Shape::TraceWindow => {
             format!("trace_id:\"{rare_trace_id}\" | {newest}")
         }
         // `rate()` and not `count()`. LogsQL's `rate()` divides by the bucket
