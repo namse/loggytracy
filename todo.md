@@ -543,6 +543,19 @@ neither is a defect in either engine.
       the stream index, a format change. The bed's remaining `rate` gap (0.42 ms against 9.6) is *not*
       this item: it is the metric path materializing sixty thousand `LogEntry`s to add one per row, which
       is a count-in-the-sink change, not a sidecar
+- [x] **The count went into the sink.** `sum()` of `rate`/`count_over_time`/`bytes_over_time` (no unwrap,
+      no grouping, no offset, no subquery) now accumulates a difference array over the evaluation grid —
+      two array updates per row, nothing materialized — behind the same pipeline, deletion-mask and budget
+      rules, with a fast-against-general equality test and the bed's digest holding at 144/144. With the
+      stage-less pipeline skip that preceded it, `rate` went 11.4 → 8.35 → **6.56 ms**: 0.61x against Loki
+      and 14.5x against VictoriaLogs, from 1.73x and 31.6x at the start. What remains of the 14.5x is scan
+      itself — decode of the timestamp and label columns of 60 k rows against VictoriaLogs reading one
+      column — which is where the (preconditioned) sidecar counts or a dictionary-run count would go
+- [ ] **The last ingest points are the columnar encode itself, not a shareable parse.** 18.9–19.1k eps
+      against an offered 20k after the write-side parse was deduplicated. The bloom encoder's
+      `indexed_parser_fields` cannot reuse the `_pf:` extraction — it tokenizes pre-sanitization name
+      variants the exact map no longer has — so the remaining term is the wider Parquet encode, and the
+      honest options are per-column encoding choices measured against `part/write`, not more sharing
 
 ## The claim moved onto its worst shape, and the measurement said so within the hour
 
