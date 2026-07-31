@@ -14,8 +14,9 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReader
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::Result as ParquetResult;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::{ChunkReader, Length};
+use parquet::schema::types::ColumnPath;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +51,17 @@ const EXACT_FIELD_SCALAR_SCOPE: u8 = 0;
 /// Parquet column holding the row's tenant. It is the leading sort key, so it
 /// is also the leading column.
 pub const TENANT_COLUMN: &str = "_tenant";
+
+/// The most metadata keys one part stores as `_sm:` columns; the rest of a
+/// row's pairs stay in the residual `structured_metadata` blob.
+///
+/// A cap because the schema must not scale with an adversarial tenant's key
+/// churn — wide-JSON keys are unbounded where OTLP attribute names are not —
+/// and 128 because every key the intended consumer sends fits in it several
+/// times over. Which keys make the cut is by row count, not arrival order, so
+/// churn cannot push `trace_id` out of a column; see
+/// `format::select_metadata_columns`.
+pub const MAX_METADATA_COLUMNS: usize = 128;
 
 /// The time span a metadata lookup is allowed to see.
 ///
@@ -271,6 +283,11 @@ pub struct PartMeta {
     pub row_group_count: u32,
     pub row_group_min_ts: Vec<i64>,
     pub row_group_max_ts: Vec<i64>,
+    pub row_group_rows: Vec<u32>,
+    /// Whether each group is one non-decreasing timestamp run. Only such a
+    /// group may be read partially: the scan's early exits are sound exactly
+    /// when a row's position bounds the rows after it.
+    pub row_group_ts_monotonic: Vec<bool>,
     /// Sorted by tenant, non-overlapping, and covering every row group.
     pub tenants: Vec<TenantSegment>,
     /// Memory a full read of this part materializes, recorded at write time.
@@ -278,6 +295,9 @@ pub struct PartMeta {
     /// size, which is smaller by whatever zstd achieved on the data.
     pub materialized_bytes: u64,
     pub stream_labels: Vec<String>,
+    /// The metadata keys stored as `_sm:` columns, sorted, with the number of
+    /// rows carrying each. See `MAX_METADATA_COLUMNS`.
+    pub metadata_columns: Vec<(String, u64)>,
     pub streams: Vec<Labels>,
     /// Size of `meta.json` on disk, recorded when it was read.
     ///

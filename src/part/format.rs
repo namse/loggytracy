@@ -84,12 +84,14 @@ pub fn flush_rows_with_merge_tombstone(
 ///
 /// A stream that turns out to be empty leaves no part and no tombstone, the
 /// same as flushing an empty `Vec`.
+#[allow(clippy::too_many_arguments)]
 pub fn flush_row_stream_with_merge_tombstone(
     rows: &mut MergedRows,
     keep: &mut dyn FnMut(&Row) -> bool,
     parts_root: &Path,
     partition: &str,
     stream_labels: Vec<String>,
+    metadata_keys: Vec<String>,
     row_group_size: usize,
     old_dirs: &[PathBuf],
 ) -> io::Result<(Vec<Part>, u64, u64)> {
@@ -101,7 +103,7 @@ pub fn flush_row_stream_with_merge_tombstone(
     }
     fs::create_dir_all(&staging)?;
 
-    let mut writer = StreamingPartWriter::create(&staging, stream_labels, row_group_size)?;
+    let mut writer = StreamingPartWriter::create(&staging, stream_labels, metadata_keys, row_group_size)?;
     let mut dropped = 0u64;
     let mut kept = 0u64;
     loop {
@@ -201,12 +203,14 @@ fn flush_rows_internal(
         }
 
         let stream_labels = collect_stream_labels(&part_rows);
+        let metadata_columns = select_metadata_columns(metadata_column_counts(&part_rows));
         if let Err(e) = write_part_files(
             &tmp_dir,
             &part_id,
             &partition,
             &part_rows,
             &stream_labels,
+            &metadata_columns,
             row_group_size,
         ) {
             rollback_committed(&committed_dirs);
@@ -285,15 +289,52 @@ fn collect_stream_labels(rows: &[Row]) -> Vec<String> {
     set.into_iter().collect()
 }
 
+/// How many rows of the part carry each metadata key.
+fn metadata_column_counts(rows: &[Row]) -> BTreeMap<String, u64> {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for row in rows {
+        for (name, _) in &row.structured_metadata {
+            *counts.entry(name.clone()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// Which metadata keys become columns in this part: the `MAX_METADATA_COLUMNS`
+/// most frequent, returned **sorted by key** with their row counts.
+///
+/// Frequency rather than first-N-alphabetical, so an adversarial tenant
+/// churning key names cannot push `trace_id` out of a column; ties break on
+/// the key so the choice is deterministic. The counts travel into `meta.json`
+/// because a merge must choose its output's columns *before* reading a row —
+/// the same constraint that makes `stream_labels` a union of the inputs' metas
+/// — and summing recorded counts is what keeps that choice deterministic too.
+/// Keys past the cap stay in the residual blob column; the invariant the read
+/// path relies on is that a columnized key never also appears in the residual.
+pub(crate) fn select_metadata_columns(counts: BTreeMap<String, u64>) -> Vec<(String, u64)> {
+    let mut by_count: Vec<(String, u64)> = counts.into_iter().collect();
+    by_count.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    by_count.truncate(MAX_METADATA_COLUMNS);
+    by_count.sort_by(|a, b| a.0.cmp(&b.0));
+    by_count
+}
+
 fn write_part_files(
     dir: &Path,
     id: &str,
     partition: &str,
     rows: &[Row],
     stream_labels: &[String],
+    metadata_columns: &[(String, u64)],
     row_group_size: usize,
 ) -> io::Result<()> {
-    write_parquet(&dir.join(DATA_FILE), rows, stream_labels, row_group_size)?;
+    write_parquet(
+        &dir.join(DATA_FILE),
+        rows,
+        stream_labels,
+        metadata_columns,
+        row_group_size,
+    )?;
     write_index(&dir.join(INDEX_FILE), rows, row_group_size, stream_labels)?;
     write_meta(
         &dir.join(META_FILE),
@@ -302,6 +343,7 @@ fn write_part_files(
         rows,
         row_group_size,
         stream_labels,
+        metadata_columns,
     )?;
     Ok(())
 }
@@ -338,7 +380,17 @@ fn row_group_bounds(rows: &[Row], row_group_size: usize) -> Vec<(usize, usize)> 
     out
 }
 
-fn part_schema(stream_labels: &[String]) -> Arc<Schema> {
+/// The Parquet column a metadata key is stored in.
+///
+/// The `_sm:` prefix keeps the metadata namespace disjoint from the label
+/// columns that precede it in the schema: `:` cannot appear in a validated
+/// label name, and metadata keys are arbitrary strings (OTLP attributes keep
+/// their dots), so the mapping is injective in both directions.
+fn metadata_column_name(key: &str) -> String {
+    format!("_sm:{key}")
+}
+
+fn part_schema(stream_labels: &[String], metadata_keys: &[String]) -> Arc<Schema> {
     let mut fields = vec![
         Field::new(TENANT_COLUMN, DataType::Utf8, false),
         Field::new("timestamp_ns", DataType::Int64, false),
@@ -346,6 +398,9 @@ fn part_schema(stream_labels: &[String]) -> Arc<Schema> {
     ];
     for label in stream_labels {
         fields.push(Field::new(label, DataType::Utf8, true));
+    }
+    for key in metadata_keys {
+        fields.push(Field::new(metadata_column_name(key), DataType::Utf8, true));
     }
     fields.push(Field::new("structured_metadata", DataType::Utf8, true));
     Arc::new(Schema::new(fields))
@@ -355,17 +410,33 @@ fn row_group_batch(
     schema: &Arc<Schema>,
     rows: &[Row],
     stream_labels: &[String],
+    metadata_keys: &[String],
 ) -> io::Result<RecordBatch> {
     let tenants: Vec<&str> = rows.iter().map(|r| r.tenant.as_str()).collect();
     let ts: Vec<i64> = rows.iter().map(|r| r.timestamp_ns).collect();
     let msg: Vec<&str> = rows.iter().map(|r| r.line.as_str()).collect();
+    // The residual: only the pairs whose key did not make a column. Most rows
+    // have none, so the common write path runs no serde at all — and the read
+    // path depends on the split being exact: a columnized key must never also
+    // appear in a row's residual.
     let sm: Vec<Option<String>> = rows
         .iter()
         .map(|r| {
-            if r.structured_metadata.is_empty() {
+            debug_assert!(
+                r.structured_metadata
+                    .windows(2)
+                    .all(|pair| pair[0].0 < pair[1].0),
+                "structured metadata must be canonical before it reaches a part"
+            );
+            let residual: Vec<&(String, String)> = r
+                .structured_metadata
+                .iter()
+                .filter(|(name, _)| metadata_keys.binary_search(name).is_err())
+                .collect();
+            if residual.is_empty() {
                 None
             } else {
-                serde_json::to_string(&r.structured_metadata).ok()
+                serde_json::to_string(&residual).ok()
             }
         })
         .collect();
@@ -382,32 +453,64 @@ fn row_group_batch(
             .collect();
         columns.push(Arc::new(StringArray::from(vals)));
     }
+    for key in metadata_keys {
+        let vals: Vec<Option<&str>> = rows
+            .iter()
+            .map(|r| {
+                r.structured_metadata
+                    .binary_search_by(|(name, _)| name.as_str().cmp(key))
+                    .ok()
+                    .map(|index| r.structured_metadata[index].1.as_str())
+            })
+            .collect();
+        columns.push(Arc::new(StringArray::from(vals)));
+    }
     columns.push(Arc::new(StringArray::from(sm)));
 
     RecordBatch::try_new(schema.clone(), columns).map_err(io::Error::other)
+}
+
+/// The one place both writers get their Parquet properties, so the streaming
+/// and the batch path cannot drift into different files.
+///
+/// Statistics are per column on purpose: `timestamp_ns` keeps page-level
+/// min/max because time is the axis the page index can actually prune — rows
+/// are piecewise time-ordered inside a group. Every string column stays at
+/// chunk level: a page's min/max over random hex like `trace_id` spans the
+/// alphabet and prunes nothing, and the page index would carry (and load)
+/// those dead bounds for every page of every wide column.
+fn part_writer_properties(row_group_size: usize) -> WriterProperties {
+    WriterProperties::builder()
+        .set_max_row_group_row_count(Some(row_group_size))
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_column_statistics_enabled(ColumnPath::from("timestamp_ns"), EnabledStatistics::Page)
+        .build()
 }
 
 fn write_parquet(
     path: &Path,
     rows: &[Row],
     stream_labels: &[String],
+    metadata_columns: &[(String, u64)],
     row_group_size: usize,
 ) -> io::Result<()> {
-    let schema = part_schema(stream_labels);
+    let metadata_keys: Vec<String> = metadata_columns
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect();
+    let schema = part_schema(stream_labels, &metadata_keys);
     let bounds = row_group_bounds(rows, row_group_size);
 
     let file = fs::File::create(path)?;
-    let props = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(row_group_size))
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .build();
+    let props = part_writer_properties(row_group_size);
     let mut writer =
         ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(io::Error::other)?;
     // The sidecars address row groups by ordinal, so the Parquet row groups
     // must be exactly `bounds`. Flushing after each batch pins the boundary
     // instead of letting the writer choose one that straddles a tenant.
     for (start, end) in &bounds {
-        let batch = row_group_batch(&schema, &rows[*start..*end], stream_labels)?;
+        let batch = row_group_batch(&schema, &rows[*start..*end], stream_labels, &metadata_keys)?;
         writer.write(&batch).map_err(io::Error::other)?;
         writer.flush().map_err(io::Error::other)?;
     }
@@ -436,20 +539,27 @@ fn encode_blooms(rows: &[Row], row_group_size: usize) -> io::Result<Vec<u8>> {
 fn encode_group_blooms(rows: &[Row]) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut unique_trigrams: BTreeSet<[u8; 3]> = BTreeSet::new();
-    // Count the actual indexed tokens instead of estimating from rows.
-    // The second pass keeps the existing bounded-memory insertion path,
-    // while sizing the filter for wide structured rows as well as sparse
-    // rows.
-    let mut exact_capacity = 0usize;
+    // One pass. Sizing the filter needs the token count and filling it needs
+    // the tokens, and this used to be two passes that each ran the JSON and
+    // logfmt parsers over every line — the whole parse, twice, for a count.
+    // The tokens are collected once instead; the scratch lives for one row
+    // group and its capacity is exactly the count the two-pass version
+    // computed, so the encoded filter is byte-identical.
+    let mut exact_tokens: Vec<Vec<u8>> = Vec::new();
     for row in rows {
-        for (_name, value) in &row.structured_metadata {
-            exact_capacity = exact_capacity
-                .saturating_add(crate::logql::canonical_index_values(value).len());
+        for tri in crate::bloom::trigrams(&row.line) {
+            unique_trigrams.insert(tri);
         }
-        for (_name, values) in crate::logql::indexed_parser_fields(&row.line) {
+        for (name, value) in &row.structured_metadata {
+            for value in crate::logql::canonical_index_values(value) {
+                exact_tokens.push(encode_exact_field_token(name, &value)?);
+            }
+        }
+        for (name, values) in crate::logql::indexed_parser_fields(&row.line) {
             for value in values {
-                exact_capacity = exact_capacity
-                    .saturating_add(crate::logql::canonical_index_values(&value).len());
+                for value in crate::logql::canonical_index_values(&value) {
+                    exact_tokens.push(encode_exact_field_token(&name, &value)?);
+                }
             }
         }
     }
@@ -458,25 +568,10 @@ fn encode_group_blooms(rows: &[Row]) -> io::Result<Vec<u8>> {
     // absent one prune identically — the absent one just does it without
     // occupying 140 bytes in every row group of every part.
     let mut exact_fields =
-        (exact_capacity > 0).then(|| BloomFilter::with_capacity(exact_capacity, 0.01));
-    for row in rows {
-        for tri in crate::bloom::trigrams(&row.line) {
-            unique_trigrams.insert(tri);
-        }
-        let Some(exact_fields) = &mut exact_fields else {
-            continue;
-        };
-        for (name, value) in &row.structured_metadata {
-            for value in crate::logql::canonical_index_values(value) {
-                exact_fields.insert(&encode_exact_field_token(name, &value)?);
-            }
-        }
-        for (name, values) in crate::logql::indexed_parser_fields(&row.line) {
-            for value in values {
-                for value in crate::logql::canonical_index_values(&value) {
-                    exact_fields.insert(&encode_exact_field_token(&name, &value)?);
-                }
-            }
+        (!exact_tokens.is_empty()).then(|| BloomFilter::with_capacity(exact_tokens.len(), 0.01));
+    if let Some(exact_fields) = &mut exact_fields {
+        for token in &exact_tokens {
+            exact_fields.insert(token);
         }
     }
     let estimated_items = unique_trigrams.len().max(1);

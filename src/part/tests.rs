@@ -157,8 +157,13 @@
             .join(&batch.meta.id);
         std::fs::create_dir_all(&streamed_dir).expect("mkdir");
         let stream_labels = collect_stream_labels(&rows);
+        let metadata_keys: Vec<String> = select_metadata_columns(metadata_column_counts(&rows))
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
         let mut writer =
-            StreamingPartWriter::create(&streamed_dir, stream_labels, 7).expect("create");
+            StreamingPartWriter::create(&streamed_dir, stream_labels, metadata_keys, 7)
+                .expect("create");
         // The batch path sorts; the streaming path is promised sorted input,
         // which is MergedRows' job. Sorting here is standing in for it.
         let mut sorted = rows.clone();
@@ -711,6 +716,68 @@
                 wanted,
                 "a limited {} scan must return the rows truncation would",
                 if forward { "forward" } else { "backward" }
+            );
+        }
+    }
+
+    /// More distinct keys than `MAX_METADATA_COLUMNS`: the frequent ones get
+    /// columns, the rest ride the residual blob, and a read cannot tell —
+    /// every row's pairs come back exactly, in canonical order, dotted OTLP
+    /// names included. The split is by row count so key churn cannot evict a
+    /// key every row carries.
+    #[test]
+    fn metadata_past_the_column_cap_survives_in_the_residual() {
+        let tmp = tempfile_dir();
+        let rows: Vec<Row> = (0..(MAX_METADATA_COLUMNS as i64 + 40))
+            .map(|i| Row {
+                tenant: test_tenant(),
+                timestamp_ns: i,
+                labels: std::sync::Arc::new(BTreeMap::new()),
+                line: format!("line-{i}"),
+                // Canonical order: "k.rare..." sorts before "service.name"
+                // and "trace_id". `trace_id` and `service.name` are on every
+                // row; each `k.rare-N` is on one row only, and there are more
+                // of them than the cap leaves room for.
+                structured_metadata: vec![
+                    (format!("k.rare-{i:04}"), format!("v{i}")),
+                    ("service.name".to_string(), "worker".to_string()),
+                    ("trace_id".to_string(), format!("t{i}")),
+                ],
+            })
+            .collect();
+        let part = flush_rows(rows.clone(), &tmp, 8192).unwrap().remove(0);
+        assert_eq!(part.meta.metadata_columns.len(), MAX_METADATA_COLUMNS);
+        assert!(
+            part.meta
+                .metadata_columns
+                .iter()
+                .any(|(key, count)| key == "trace_id" && *count == rows.len() as u64),
+            "an every-row key must hold a column against any amount of churn"
+        );
+        let reader = PartReader::open(part).unwrap();
+        let tenant = test_tenant();
+        let mut collector = RowCollector::new(&tenant);
+        reader
+            .scan_into(
+                &tenant,
+                &[],
+                &[],
+                &[],
+                QueryTimeRange::unbounded(),
+                true,
+                None,
+                None,
+                None,
+                None,
+                &mut collector,
+            )
+            .unwrap();
+        let read = collector.into_rows();
+        assert_eq!(read.len(), rows.len());
+        for (read, wrote) in read.iter().zip(&rows) {
+            assert_eq!(
+                read.structured_metadata, wrote.structured_metadata,
+                "every pair must round-trip whichever side of the cap it landed on"
             );
         }
     }

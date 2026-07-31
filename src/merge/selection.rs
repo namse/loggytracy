@@ -230,6 +230,22 @@ pub fn rewrite_group(
     for reader in readers {
         stream_labels.extend(reader.meta().stream_labels.iter().cloned());
     }
+    // The metadata columns the same way: sum the inputs' recorded per-key row
+    // counts and take the same top-N the batch writer takes. Deterministic
+    // without reading a row — and it is why the counts are in `meta.json` at
+    // all. The writer re-counts during its own pass, so rows that retention or
+    // a delete drops below do not inflate the next merge's choice.
+    let mut metadata_counts: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    for reader in readers {
+        for (key, count) in &reader.meta().metadata_columns {
+            *metadata_counts.entry(key.clone()).or_default() += count;
+        }
+    }
+    let metadata_keys: Vec<String> = part::select_metadata_columns(metadata_counts)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
 
     let mut merged = part::MergedRows::new(readers, STREAM_PAGE_BYTES);
     let mut keep = |row: &part::Row| {
@@ -254,6 +270,7 @@ pub fn rewrite_group(
         parts_root,
         &partition,
         stream_labels.into_iter().collect(),
+        metadata_keys,
         row_group_size,
         old_dirs,
     )

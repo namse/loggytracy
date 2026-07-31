@@ -69,6 +69,8 @@ pub struct PartReader {
     exact_field_bloom: Vec<Option<BloomFilter>>,
     stream_index: StreamMap,
     stream_labels: Vec<String>,
+    /// The keys stored as `_sm:` columns, in schema (sorted) order.
+    metadata_keys: Vec<String>,
     /// Bytes the blooms and the stream index occupy for as long as this reader
     /// lives. Recorded at open because that is the only moment the sizes are
     /// free: recomputing it per scrape would walk every filter of every part.
@@ -211,7 +213,13 @@ fn open_part_data(
             part.meta.id, parquet_row_count, part.meta.row_count
         ));
     }
-    let expected_schema = part_schema(&part.meta.stream_labels);
+    let metadata_keys: Vec<String> = part
+        .meta
+        .metadata_columns
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect();
+    let expected_schema = part_schema(&part.meta.stream_labels, &metadata_keys);
     if arrow_reader_metadata.schema().fields() != expected_schema.fields() {
         return Err(format!(
             "parquet schema does not match metadata for part {}: expected {:?}, got {:?}",
@@ -287,6 +295,12 @@ impl PartReader {
         let stream_index = decode_stream_index(stream_bytes)?;
         validate_stream_index(&part, &stream_index)?;
         let stream_labels = part.meta.stream_labels.clone();
+        let metadata_keys: Vec<String> = part
+            .meta
+            .metadata_columns
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
         if require_data || part.data_path().exists() {
             open_part_data(&part, true)?;
         }
@@ -297,6 +311,7 @@ impl PartReader {
             exact_field_bloom: decoded_blooms.exact_fields,
             stream_index,
             stream_labels,
+            metadata_keys,
             index_resident_bytes,
         })
     }
@@ -855,8 +870,13 @@ impl PartReader {
         let row_tenant = batch.column(0).as_string::<i32>();
         let ts = batch.column(1).as_primitive::<Int64Type>();
         let msg = batch.column(2).as_string::<i32>();
-        let sm_col_idx = 3 + self.stream_labels.len();
-        let sm = batch.column(sm_col_idx).as_string::<i32>();
+        let metadata_start = 3 + self.stream_labels.len();
+        let metadata_cols: Vec<&StringArray> = (0..self.metadata_keys.len())
+            .map(|key_index| batch.column(metadata_start + key_index).as_string::<i32>())
+            .collect();
+        let sm = batch
+            .column(metadata_start + self.metadata_keys.len())
+            .as_string::<i32>();
         let label_cols: Vec<&StringArray> = (0..self.stream_labels.len())
             .map(|label_index| batch.column(3 + label_index).as_string::<i32>())
             .collect();
@@ -911,7 +931,14 @@ impl PartReader {
             if !line_filters.iter().all(|f| f.matches(&line)) {
                 continue;
             }
-            let structured_metadata = if sm.is_null(i) {
+            // Rebuilt from the `_sm:` columns plus the residual blob — a merge
+            // of two key-sorted lists, so the canonical order survives without
+            // a sort. The residual is null for any row whose keys all made
+            // columns, which is every row of the intended consumer, so the
+            // common path runs no serde at all. The per-row
+            // `serde_json::from_str` this replaces was measured as the 1.8x
+            // per-line term of `metadata_rare`'s loss.
+            let residual: Vec<(String, String)> = if sm.is_null(i) {
                 Vec::new()
             } else {
                 serde_json::from_str(sm.value(i)).map_err(|error| {
@@ -921,6 +948,19 @@ impl PartReader {
                     )
                 })?
             };
+            let mut structured_metadata: Vec<(String, String)> =
+                Vec::with_capacity(residual.len() + self.metadata_keys.len());
+            let mut residual = residual.into_iter().peekable();
+            for (key_index, key) in self.metadata_keys.iter().enumerate() {
+                while residual.peek().is_some_and(|(name, _)| name < key) {
+                    structured_metadata.extend(residual.next());
+                }
+                let column = metadata_cols[key_index];
+                if !column.is_null(i) {
+                    structured_metadata.push((key.clone(), column.value(i).to_string()));
+                }
+            }
+            structured_metadata.extend(residual);
             sink.accept(
                 &labels,
                 LogEntry {

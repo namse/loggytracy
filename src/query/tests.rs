@@ -987,9 +987,12 @@
             .into_iter()
             .collect();
         let line = r#"{"code":503,"elapsed":"250ms","json":"ok","level":"error"}"#;
+        // Canonical (key-sorted) order, because this fixture hands a `Row`
+        // straight to the part writer, bypassing the memtable door that
+        // canonicalizes real ingest.
         let metadata = vec![
-            ("trace_id".to_string(), "abc".to_string()),
             ("logfmt".to_string(), "value".to_string()),
+            ("trace_id".to_string(), "abc".to_string()),
         ];
         let memtable = Arc::new(MemTable::new());
         memtable.insert(

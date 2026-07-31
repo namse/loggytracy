@@ -5,6 +5,7 @@ fn write_meta(
     rows: &[Row],
     row_group_size: usize,
     stream_labels: &[String],
+    metadata_columns: &[(String, u64)],
 ) -> io::Result<()> {
     let n = rows.len();
     let bounds = row_group_bounds(rows, row_group_size);
@@ -32,6 +33,23 @@ fn write_meta(
                 .map(|row| row.timestamp_ns)
                 .max()
                 .unwrap_or_default()
+        })
+        .collect();
+    let row_group_rows: Vec<u32> = bounds
+        .iter()
+        .map(|(start, end)| (end - start) as u32)
+        .collect();
+    // Whether the group is one non-decreasing run of timestamps — true exactly
+    // when the group holds one stream's rows (or several that happen not to
+    // interleave). The read path may only stop early inside a group it knows
+    // is ordered; without this bit it must read the group whole, which is the
+    // correctness fix the bed forced (`todo.md`, "Open correctness defects").
+    let row_group_ts_monotonic: Vec<bool> = bounds
+        .iter()
+        .map(|(start, end)| {
+            rows[*start..*end]
+                .windows(2)
+                .all(|pair| pair[0].timestamp_ns <= pair[1].timestamp_ns)
         })
         .collect();
     let tenants = tenant_segments(rows, &bounds);
@@ -69,9 +87,12 @@ fn write_meta(
         row_group_count: bounds.len() as u32,
         row_group_min_ts,
         row_group_max_ts,
+        row_group_rows,
+        row_group_ts_monotonic,
         tenants,
         materialized_bytes: rows.iter().map(Row::materialized_bytes).sum(),
         stream_labels: stream_labels.to_vec(),
+        metadata_columns: metadata_columns.to_vec(),
         streams,
         integrity,
     };
@@ -137,9 +158,15 @@ struct MetaFile {
     row_group_count: u32,
     row_group_min_ts: Vec<i64>,
     row_group_max_ts: Vec<i64>,
+    row_group_rows: Vec<u32>,
+    row_group_ts_monotonic: Vec<bool>,
     tenants: Vec<TenantSegment>,
     materialized_bytes: u64,
     stream_labels: Vec<String>,
+    /// The metadata keys this part stores as `_sm:` columns, sorted, each with
+    /// the number of rows carrying it. The counts are what let a merge choose
+    /// its output's columns deterministically without reading a row.
+    metadata_columns: Vec<(String, u64)>,
     streams: Vec<Vec<(String, String)>>,
     integrity: PartIntegrity,
 }
@@ -196,9 +223,12 @@ pub fn load_part(dir: &Path) -> Result<Part, String> {
         row_group_count: meta_file.row_group_count,
         row_group_min_ts: meta_file.row_group_min_ts,
         row_group_max_ts: meta_file.row_group_max_ts,
+        row_group_rows: meta_file.row_group_rows,
+        row_group_ts_monotonic: meta_file.row_group_ts_monotonic,
         tenants: meta_file.tenants,
         materialized_bytes: meta_file.materialized_bytes,
         stream_labels: meta_file.stream_labels,
+        metadata_columns: meta_file.metadata_columns,
         streams,
         meta_bytes: meta_str.len() as u64,
         integrity: meta_file.integrity,
@@ -247,6 +277,21 @@ fn validate_meta_file(dir: &Path, meta: &MetaFile) -> Result<(), String> {
         || meta.row_group_max_ts.iter().max() != Some(&meta.max_ts_ns)
     {
         return Err("part metadata has inconsistent row-group bounds".to_string());
+    }
+    if meta.row_group_rows.len() != row_group_count
+        || meta.row_group_ts_monotonic.len() != row_group_count
+        || meta.row_group_rows.iter().map(|&n| n as u64).sum::<u64>() != meta.row_count
+        || meta.row_group_rows.contains(&0)
+    {
+        return Err("part metadata has inconsistent row-group row counts".to_string());
+    }
+    if meta
+        .metadata_columns
+        .windows(2)
+        .any(|pair| pair[0].0 >= pair[1].0)
+        || meta.metadata_columns.len() > MAX_METADATA_COLUMNS
+    {
+        return Err("part metadata columns are not sorted, unique and capped".to_string());
     }
     for index in 0..row_group_count {
         if meta.row_group_min_ts[index] > meta.row_group_max_ts[index] {
@@ -308,12 +353,11 @@ fn validate_tenant_segments(meta: &MetaFile) -> Result<(), String> {
         if segment.min_ts_ns != segment_min || segment.max_ts_ns != segment_max {
             return Err("part tenant segment timestamps do not match its row groups".to_string());
         }
-        // Each row group is one stream's run and is ordered by time inside
-        // itself; across groups a tenant's segment is ordered by stream, so a
-        // later group can start earlier than an earlier one ends. What the
-        // reader relies on is the weaker property checked here — a group's own
-        // bounds are consistent — plus `ScanStep::StopGroup`, which is what
-        // replaced the assumption that a part is one timestamp-ordered run.
+        // A row group holds a run of whole streams, each ordered by time
+        // inside itself, so neither the group nor the segment is one
+        // timestamp-ordered run — a later group can start earlier than an
+        // earlier one ends. The reader relies only on the weaker property
+        // checked here: a group's own bounds are consistent.
         for row_group in groups.clone() {
             if meta.row_group_min_ts[row_group] > meta.row_group_max_ts[row_group] {
                 return Err("part row group timestamps are inverted".to_string());

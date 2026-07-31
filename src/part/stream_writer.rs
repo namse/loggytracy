@@ -27,6 +27,14 @@ pub struct StreamingPartWriter {
     writer: ArrowWriter<fs::File>,
     data_path: PathBuf,
     stream_labels: Vec<String>,
+    /// The keys this part stores as `_sm:` columns, chosen before the first
+    /// row: a merge sums its inputs' recorded per-key row counts and takes the
+    /// same top-N `select_metadata_columns` takes — deterministic without
+    /// reading a row, exactly like the stream-label union. The counts are
+    /// re-counted during `push`, so keys whose rows retention or a delete
+    /// dropped do not inflate the next merge's choice.
+    metadata_keys: Vec<String>,
+    metadata_counts: BTreeMap<String, u64>,
     row_group_size: usize,
     group: Vec<Row>,
 
@@ -40,6 +48,8 @@ pub struct StreamingPartWriter {
     materialized_bytes: u64,
     row_group_min_ts: Vec<i64>,
     row_group_max_ts: Vec<i64>,
+    row_group_rows: Vec<u32>,
+    row_group_ts_monotonic: Vec<bool>,
     tenants: Vec<TenantSegment>,
 }
 
@@ -47,15 +57,13 @@ impl StreamingPartWriter {
     pub fn create(
         dir: &Path,
         stream_labels: Vec<String>,
+        metadata_keys: Vec<String>,
         row_group_size: usize,
     ) -> io::Result<Self> {
-        let schema = part_schema(&stream_labels);
+        let schema = part_schema(&stream_labels, &metadata_keys);
         let data_path = dir.join(DATA_FILE);
         let file = fs::File::create(&data_path)?;
-        let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(row_group_size))
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .build();
+        let props = part_writer_properties(row_group_size);
         let writer =
             ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(io::Error::other)?;
         Ok(Self {
@@ -63,6 +71,8 @@ impl StreamingPartWriter {
             writer,
             data_path,
             stream_labels,
+            metadata_keys,
+            metadata_counts: BTreeMap::new(),
             row_group_size,
             group: Vec::new(),
             bloom_sections: Vec::new(),
@@ -74,6 +84,8 @@ impl StreamingPartWriter {
             materialized_bytes: 0,
             row_group_min_ts: Vec::new(),
             row_group_max_ts: Vec::new(),
+            row_group_rows: Vec::new(),
+            row_group_ts_monotonic: Vec::new(),
             tenants: Vec::new(),
         })
     }
@@ -99,6 +111,11 @@ impl StreamingPartWriter {
         if !self.streams.contains(&row.labels) {
             self.streams.insert(row.labels.clone());
         }
+        for (name, _) in &row.structured_metadata {
+            if self.metadata_keys.binary_search(name).is_ok() {
+                *self.metadata_counts.entry(name.clone()).or_default() += 1;
+            }
+        }
         self.group.push(row);
         Ok(())
     }
@@ -108,7 +125,7 @@ impl StreamingPartWriter {
             return Ok(());
         }
         let ordinal = self.row_group_min_ts.len() as u32;
-        let batch = row_group_batch(&self.schema, &self.group, &self.stream_labels)?;
+        let batch = row_group_batch(&self.schema, &self.group, &self.stream_labels, &self.metadata_keys)?;
         self.writer.write(&batch).map_err(io::Error::other)?;
         // The sidecars address row groups by ordinal, so a flush per batch pins
         // the boundary rather than letting the writer pick one that straddles a
@@ -166,6 +183,12 @@ impl StreamingPartWriter {
             .unwrap_or_default();
         self.row_group_min_ts.push(min_ts_ns);
         self.row_group_max_ts.push(max_ts_ns);
+        self.row_group_rows.push(self.group.len() as u32);
+        self.row_group_ts_monotonic.push(
+            self.group
+                .windows(2)
+                .all(|pair| pair[0].timestamp_ns <= pair[1].timestamp_ns),
+        );
         match self.tenants.last_mut() {
             Some(segment) if segment.tenant == first.tenant => {
                 segment.row_group_end = ordinal + 1;
@@ -242,8 +265,25 @@ impl StreamingPartWriter {
             row_group_count: self.row_group_min_ts.len() as u32,
             row_group_min_ts: self.row_group_min_ts,
             row_group_max_ts: self.row_group_max_ts,
+            row_group_rows: self.row_group_rows,
+            row_group_ts_monotonic: self.row_group_ts_monotonic,
             tenants: self.tenants,
             materialized_bytes: self.materialized_bytes,
+            // Every declared key stays listed, even at a count of zero:
+            // the Parquet file carries its (all-null) column either way, and
+            // `meta.json`'s key list is what the schema check rebuilds. Same
+            // superset behavior as `stream_labels` after retention drops a
+            // stream.
+            metadata_columns: self
+                .metadata_keys
+                .iter()
+                .map(|key| {
+                    (
+                        key.clone(),
+                        self.metadata_counts.get(key).copied().unwrap_or(0),
+                    )
+                })
+                .collect(),
             stream_labels: self.stream_labels,
             streams: self
                 .streams
