@@ -1,6 +1,6 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-88f32e6166fbf4ff4da2f02fe15e9c10fc209b6ebd49f35c7ab455a53ec1de44.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-3093f13a62c0cdcb64c23a9755b038b6ba20f72e25e1f7c252e6e3cb6040c885.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
@@ -52,7 +52,7 @@
     "tenants": 4,
     "tier": "B",
     "verify": {
-      "anchor_ns": 1785487570000000000,
+      "anchor_ns": 1785502020000000000,
       "entries_per_push": 100,
       "labels_per_stream": 6,
       "limit": 20000,
@@ -68,24 +68,24 @@
     "warmup_seconds": 10
   },
   "memory": {
-    "anon_bytes_end": 1456291840,
-    "anon_peak_bytes": 1665470464,
-    "current_bytes": 1995546624,
+    "anon_bytes_end": 1693327360,
+    "anon_peak_bytes": 1899536384,
+    "current_bytes": 1993523200,
     "error": null,
-    "file_bytes_end": 517410816,
+    "file_bytes_end": 286208000,
     "peak_bytes": 2147483648,
     "peak_bytes_before": 2147483648,
-    "source": "/sys/fs/cgroup/system.slice/docker-88f32e6166fbf4ff4da2f02fe15e9c10fc209b6ebd49f35c7ab455a53ec1de44.scope/memory.peak"
+    "source": "/sys/fs/cgroup/system.slice/docker-3093f13a62c0cdcb64c23a9755b038b6ba20f72e25e1f7c252e6e3cb6040c885.scope/memory.peak"
   },
   "phase": "seed",
   "run": {
-    "build_revision": "d0ccf0b",
+    "build_revision": "33645ff",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "seed": 1592598566
   },
   "seed": {
     "complete": true,
-    "elapsed_seconds": 5.169145734,
+    "elapsed_seconds": 5.315762593,
     "errors": 0,
     "first_error": null,
     "line_bytes": 49029829,
@@ -95,12 +95,12 @@
     "statuses": {
       "204": 1504
     },
-    "wire_bytes": 23456243
+    "wire_bytes": 23456474
   },
   "target": "loggytracy",
   "verdict": "PASS",
   "verify": {
-    "anchor_ns": 1785487570000000000,
+    "anchor_ns": 1785502020000000000,
     "line_bytes": 49029829,
     "rows": 150000,
     "span_ns": 150000000000,
