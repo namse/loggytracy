@@ -1256,6 +1256,13 @@ impl PartReader {
         } else {
             Box::new((0..batch.num_rows()).rev())
         };
+        // Rows are sorted by stream inside a group, so consecutive rows almost
+        // always share a label set — one *run* per stream. Hashing into the
+        // label cache and re-evaluating every matcher per row charged every
+        // row for work that only changes at a run boundary; comparing the
+        // label columns against the previous row is a handful of memcmps, and
+        // only a boundary pays the full lookup.
+        let mut run: Option<(usize, SharedLabels, bool)> = None;
         for i in row_indices {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Ok(ScanStep::Stop);
@@ -1297,8 +1304,24 @@ impl PartReader {
             if !time_range.contains(ts_val) {
                 continue;
             }
-            let labels = label_sets.labels_for(&self.stream_labels, &label_cols, i);
-            if !matchers.iter().all(|m| m.matches(&labels)) {
+            let (labels, matched) = match &run {
+                Some((previous, labels, matched))
+                    if label_cols.iter().all(|column| {
+                        column.is_null(i) == column.is_null(*previous)
+                            && (column.is_null(i) || column.value(i) == column.value(*previous))
+                    }) =>
+                {
+                    (labels.clone(), *matched)
+                }
+                _ => {
+                    let labels = label_sets.labels_for(&self.stream_labels, &label_cols, i);
+                    let matched = matchers.iter().all(|m| m.matches(&labels));
+                    run = Some((i, labels.clone(), matched));
+                    (labels, matched)
+                }
+            };
+            run = run.map(|(_, labels, matched)| (i, labels, matched));
+            if !matched {
                 continue;
             }
             // Filters test the borrowed value; the `String` is built only for
