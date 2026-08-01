@@ -221,10 +221,57 @@ fn bench_shapes(c: &mut Criterion, bed: &Bed) {
     group.finish();
 }
 
+/// The metric counting path: `sum(rate({app}[10s]))` over the bed, evaluated
+/// on a 10-second grid across the whole range. No rows are materialized; what
+/// this measures is the scan itself — decode, run detection, and two array
+/// updates per row — which is the whole of what stands between this engine and
+/// a columnar counter.
+fn bench_rate(c: &mut Criterion, bed: &Bed) {
+    let mut group = c.benchmark_group("query/rate");
+    group
+        .sample_size(10)
+        .warm_up_time(WARM_UP)
+        .measurement_time(Duration::from_secs(2));
+    let query = parse(&format!("{{app=\"{}\"}}", bed.app));
+    let columns = {
+        let expr = match logql::parse_expr(&format!("sum(rate({{app=\"{}\"}}[10s]))", bed.app))
+            .expect("bench metric parses")
+        {
+            logql::QueryExpr::Metric(expr) => expr,
+            _ => unreachable!(),
+        };
+        expr.required_columns()
+    };
+    let times: Vec<i64> = (1..=20)
+        .map(|step| 1_772_000_000_000_000_000i64 + step * 10_000_000_000)
+        .collect();
+    group.bench_function("sum_rate", |b| {
+        b.iter(|| {
+            let mut sink = loggytracy::log_scan::CountingSink {
+                query: &query,
+                hidden: None,
+                cancellation: None,
+                times: &times,
+                range_ns: 10_000_000_000,
+                bytes: false,
+                diff: vec![0.0; times.len() + 1],
+                rows: 0,
+            };
+            LogScan::new(&bed.tenant, &query, bed.range, usize::MAX, true)
+                .columns(columns.clone())
+                .run_into(&bed.memtable, &bed.parts, &mut sink)
+                .expect("bench scan succeeds");
+            sink.rows
+        });
+    });
+    group.finish();
+}
+
 fn benches(c: &mut Criterion) {
     let bed = bed();
     report_allocations(&bed);
     bench_shapes(c, &bed);
+    bench_rate(c, &bed);
 }
 
 criterion_group!(query, benches);

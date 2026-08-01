@@ -788,12 +788,28 @@ impl PartReader {
             columns.line || line_filters.is_empty(),
             "a scan that skips the line column cannot evaluate line filters"
         );
+        // Two projections when the caller does not read labels: the full one
+        // for groups where matches must be checked row by row, and a blind one
+        // — no label columns at all — for groups the stream index proves
+        // match uniformly. Uniform means: every matcher is a non-empty
+        // equality, every stream in the part carries the label, and no other
+        // value of it touches the group; the group was already admitted, so
+        // its rows then all match and counting them needs only timestamps.
         let projection = ScanProjection::build(
             &self.stream_labels,
             &self.metadata_keys,
             &self.parsed_keys,
-            columns,
+            &ColumnSet {
+                labels: true,
+                ..columns.clone()
+            },
         );
+        let blind = (!columns.labels).then(|| {
+            (
+                ScanProjection::build(&self.stream_labels, &self.metadata_keys, &self.parsed_keys, columns),
+                self.uniform_match_precondition(matchers),
+            )
+        });
         // The predicates the part's own columns answer *exactly*: a string
         // equality on a field that is not one of this part's stream labels,
         // read from the `_sm:` column (pushed metadata) and — when the only
@@ -949,6 +965,14 @@ impl PartReader {
                 }
             };
             let count_scanned_rows = selection.is_none();
+            let projection = match &blind {
+                Some((blind_projection, precondition))
+                    if *precondition && self.group_matches_uniformly(row_group, matchers) =>
+                {
+                    blind_projection
+                }
+                _ => &projection,
+            };
             if selection.is_none()
                 && let Some(time_selection) = time_selection
             {
@@ -1066,6 +1090,38 @@ impl PartReader {
     /// own accounting — the rows examined here are the rows
     /// `totalLinesProcessed` reports — and its own frontier semantics in the
     /// pass that follows.
+    /// Part-wide half of the uniform-match proof: every matcher is a
+    /// non-empty equality on a label every stream of this part carries. A
+    /// stream without the label could put a non-matching row into any group,
+    /// so nothing group-level can be proven without this.
+    fn uniform_match_precondition(&self, matchers: &[LabelMatcher]) -> bool {
+        matchers.iter().all(|matcher| {
+            matches!(matcher.op, MatcherOp::Eq)
+                && !matcher.value.is_empty()
+                && self
+                    .part
+                    .meta
+                    .streams
+                    .iter()
+                    .all(|stream| stream.contains_key(&matcher.name))
+        })
+    }
+
+    /// Group-level half: no *other* value of any matched label touches this
+    /// group. The group was admitted, so the wanted value does; if it is the
+    /// only one, every row of the group matches every matcher.
+    fn group_matches_uniformly(&self, row_group: u32, matchers: &[LabelMatcher]) -> bool {
+        matchers.iter().all(|matcher| {
+            self.stream_index
+                .get(&matcher.name)
+                .is_some_and(|values| {
+                    values.iter().all(|(value, bitmap)| {
+                        value == &matcher.value || !bitmap.contains(row_group)
+                    })
+                })
+        })
+    }
+
     /// The scan path's handle pair: a fresh descriptor (so eviction can still
     /// reclaim the bytes once no scan holds one) and the cached footer.
     fn scan_part_data(&self) -> Result<(PreadReader, ArrowReaderMetadata), String> {
@@ -1254,9 +1310,17 @@ impl PartReader {
         let sm = projection
             .residual
             .map(|index| batch.column(index).as_string::<i32>());
-        let label_cols: Vec<&StringArray> = (0..self.stream_labels.len())
-            .map(|label_index| batch.column(projection.labels_start + label_index).as_string::<i32>())
-            .collect();
+        let label_cols: Vec<&StringArray> = if projection.labels_projected {
+            (0..self.stream_labels.len())
+                .map(|label_index| {
+                    batch
+                        .column(projection.labels_start + label_index)
+                        .as_string::<i32>()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let row_indices: Box<dyn Iterator<Item = usize>> = if forward {
             Box::new(0..batch.num_rows())
@@ -1270,6 +1334,11 @@ impl PartReader {
         // label columns against the previous row is a handful of memcmps, and
         // only a boundary pays the full lookup.
         let mut run: Option<(usize, SharedLabels, bool)> = None;
+        // The blind-count projection carries no label columns: the stream
+        // index already proved every row of this group matches, so the sink
+        // gets one shared empty label set and no per-row label work at all.
+        let blind_labels: Option<SharedLabels> =
+            (!projection.labels_projected).then(|| Arc::new(Labels::new()));
         for i in row_indices {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Ok(ScanStep::Stop);
@@ -1311,7 +1380,10 @@ impl PartReader {
             if !time_range.contains(ts_val) {
                 continue;
             }
-            let (labels, matched) = match &run {
+            let (labels, matched) = if let Some(blind) = &blind_labels {
+                (blind.clone(), true)
+            } else {
+                match &run {
                 Some((previous, labels, matched))
                     if label_cols.iter().all(|column| {
                         column.is_null(i) == column.is_null(*previous)
@@ -1325,6 +1397,7 @@ impl PartReader {
                     let matched = matchers.iter().all(|m| m.matches(&labels));
                     run = Some((i, labels.clone(), matched));
                     (labels, matched)
+                }
                 }
             };
             run = run.map(|(_, labels, matched)| (i, labels, matched));
@@ -1432,6 +1505,9 @@ struct ScanProjection {
     msg: Option<usize>,
     /// Projected index of the first label column; labels are contiguous.
     labels_start: usize,
+    /// Whether the label columns are in the mask at all. `false` only for the
+    /// blind-count projection, used on groups the stream index proved uniform.
+    labels_projected: bool,
     /// `(index into metadata_keys, projected index)` per projected `_sm:`.
     metadata: Vec<(usize, usize)>,
     /// `(index into parsed_keys, projected index)` per projected `_pf:` —
@@ -1456,8 +1532,10 @@ impl ScanProjection {
         if columns.line {
             leaves.push(2);
         }
-        for label in 0..labels {
-            leaves.push(3 + label);
+        if columns.labels {
+            for label in 0..labels {
+                leaves.push(3 + label);
+            }
         }
         let mut metadata_leaves: Vec<(usize, usize)> = Vec::new();
         let mut include_residual = false;
@@ -1509,7 +1587,12 @@ impl ScanProjection {
         };
         Self {
             msg: columns.line.then(|| rank(2)),
-            labels_start: if labels > 0 { rank(3) } else { leaves.len() },
+            labels_start: if columns.labels && labels > 0 {
+                rank(3)
+            } else {
+                leaves.len()
+            },
+            labels_projected: columns.labels,
             metadata: metadata_leaves
                 .iter()
                 .map(|&(key, leaf)| (key, rank(leaf)))

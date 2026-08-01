@@ -91,6 +91,13 @@ pub enum MetadataProjection {
 pub struct ColumnSet {
     pub line: bool,
     pub metadata: MetadataProjection,
+    /// Whether any consumer of this scan reads the label set. A counting sink
+    /// under a stage-less pipeline with no deletion mask does not — and for a
+    /// row group the stream index *proves* matches uniformly, the reader may
+    /// then skip the label columns entirely and count timestamps blind.
+    /// `false` is a permission, not a promise: mixed groups still decode and
+    /// check labels row by row.
+    pub labels: bool,
     /// Also decode the `_pf:` columns so the scan can hand the pipeline its
     /// `| json` extraction precomputed. Only worth asking for when the query
     /// has a `Json` stage; the columns are otherwise dead weight.
@@ -102,6 +109,7 @@ impl ColumnSet {
         Self {
             line: true,
             metadata: MetadataProjection::All,
+            labels: true,
             parsed_fields: false,
         }
     }
