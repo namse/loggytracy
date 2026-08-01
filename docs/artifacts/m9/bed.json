@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-07-31T13:05:09Z",
-  "revision": "33645ff",
+  "generated_at": "2026-08-01T09:24:31Z",
+  "revision": "cb53540",
   "branch": "master",
   "machine": "Linux 6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
   "docker": "29.1.3",
@@ -11,18 +11,18 @@
   "memory_limit_attempts": [{"limit":"2g","loggytracy_survived":true,"loggytracy_oom_killed":false,"loki_survived":true,"loki_oom_killed":false,"victorialogs_survived":true,"victorialogs_oom_killed":false}],
   "memory_limit_bytes": 2147483648,
   "settle_seconds": 150,
-  "verify_anchor_ns": 1785502020000000000,
+  "verify_anchor_ns": 1785575180000000000,
   "matrix_primary_limit": 20000,
   "matrix_runs": [{"limit":20000,"suffix":"_l20000"},{"limit":100,"suffix":"_l100"}],
   "object_store": "none: every system is on its local filesystem",
   "peak_bytes": {
-    "loggytracy": { "ingest": 2147483648, "query": 108765184, "oom_killed": false },
-    "loki": { "ingest": 2147553280, "query": 280915968, "oom_killed": false },
-    "victorialogs": { "ingest": 712503296, "query": 220299264, "oom_killed": false }
+    "loggytracy": { "ingest": 2147516416, "query": 142086144, "oom_killed": false },
+    "loki": { "ingest": 2147536896, "query": 307380224, "oom_killed": false },
+    "victorialogs": { "ingest": 728502272, "query": 228831232, "oom_killed": false }
   },
   "disk_bytes": {
-    "loggytracy": { "settled": 643245493, "after_queries": 643241397, "breakdown": "/data/journal.ckpt:8,/data/journal.wal:569776748,/data/parts:73460545,/data/traces:4096" },
-    "loki": { "settled": 123510349, "after_queries": 123548554, "breakdown": "/data/chunks:123384706,/data/compactor:4096,/data/rules:4096,/data/rules-temp:4096,/data/tsdb-shipper-active:76491,/data/tsdb-shipper-cache:24576,/data/wal:8192" },
-    "victorialogs": { "settled": 60785305, "after_queries": 60785305, "breakdown": "/data/flock.lock:0,/data/partitions:60781209" }
+    "loggytracy": { "settled": 641738624, "after_queries": 641734528, "breakdown": "/data/journal.ckpt:8,/data/journal.wal:567944660,/data/parts:73785764,/data/traces:4096" },
+    "loki": { "settled": 123426673, "after_queries": 123492370, "breakdown": "/data/chunks:123281598,/data/compactor:4096,/data/rules:4096,/data/rules-temp:4096,/data/tsdb-shipper-active:95923,/data/tsdb-shipper-cache:24576,/data/wal:8192" },
+    "victorialogs": { "settled": 60795768, "after_queries": 60795768, "breakdown": "/data/flock.lock:0,/data/partitions:60791672" }
   }
 }
