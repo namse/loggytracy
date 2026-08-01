@@ -590,6 +590,13 @@ neither is a defect in either engine.
       2.9x, whose remaining cost is the response's own semantics — every returned row must carry the
       extracted fields, so the pipeline parses the line per survivor; feeding that extraction from the
       `_pf:` columns is the one idea left on this axis.
+      *After it, the counting scan stopped reading labels where the index proves it may:* a stage-less
+      count with no deletion mask needs a label only to check the matchers, and for a group that one
+      value of every matched label touches — checkable from the stream index per group, given every
+      stream carries the label — the check is already done. Such groups project no label columns at all.
+      The bench's 128-stream corpus has no uniform groups (streams shorter than a group) and did not
+      move; the bed's does, and `rate` went 1.68 → **1.47 ms cold, 1.30 warm** — 0.14x against Loki,
+      **3.2–3.4x** against VictoriaLogs, from 31.6x at the session's start.
       *Tried, measured, and turned off with its reason in `ColumnSet::for_log_query`:* the machinery is
       wired and correctness-pinned (sinks accept a precomputed extraction, `line_format` revokes it, the
       memtable-against-parts tests hold), but decoding ~15 parsed columns wide cost more than the
