@@ -589,7 +589,12 @@ neither is a defect in either engine.
       `part/scan_tenants/128` 1.9 ms → 216 µs. What still stands against VictoriaLogs: `json_field` at
       2.9x, whose remaining cost is the response's own semantics — every returned row must carry the
       extracted fields, so the pipeline parses the line per survivor; feeding that extraction from the
-      `_pf:` columns is the one idea left on this axis
+      `_pf:` columns is the one idea left on this axis.
+      *Tried, measured, and turned off with its reason in `ColumnSet::for_log_query`:* the machinery is
+      wired and correctness-pinned (sinks accept a precomputed extraction, `line_format` revokes it, the
+      memtable-against-parts tests hold), but decoding ~15 parsed columns wide cost more than the
+      per-survivor parse it saved — `json_field` 21.5 → 25.7 ms with it on, back to 20.6 off. It flips
+      sign only when the survivor share of the decode is high; the projection waits for that measurement
 
 ## The claim moved onto its worst shape, and the measurement said so within the hour
 
