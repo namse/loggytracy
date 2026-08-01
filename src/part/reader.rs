@@ -1538,13 +1538,12 @@ impl ScanProjection {
             }
         }
         let mut metadata_leaves: Vec<(usize, usize)> = Vec::new();
-        let include_residual;
-        match &columns.metadata {
+        let include_residual = match &columns.metadata {
             MetadataProjection::All => {
                 for key in 0..metadata_keys.len() {
                     metadata_leaves.push((key, 3 + labels + key));
                 }
-                include_residual = true;
+                true
             }
             MetadataProjection::Named(names) => {
                 for (key_index, key) in metadata_keys.iter().enumerate() {
@@ -1556,11 +1555,11 @@ impl ScanProjection {
                 // it — a name that is not one of this part's columns. The
                 // columnization invariant makes this exact: a columnized key
                 // never also appears in a row's residual.
-                include_residual = names
+                names
                     .iter()
-                    .any(|name| metadata_keys.binary_search(name).is_err());
+                    .any(|name| metadata_keys.binary_search(name).is_err())
             }
-        }
+        };
         let mut parsed_leaves: Vec<(usize, usize)> = Vec::new();
         // A capped parsed-key list cannot promise a complete extraction, and
         // an incomplete one silently changes what `| json` produces — so the
