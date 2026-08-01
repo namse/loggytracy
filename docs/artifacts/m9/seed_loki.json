@@ -1,6 +1,6 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-1a9ba8bbd7c29207e2ee3ca21d34efec76fb169e3956f930039bcda281617ed8.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-fdf22ac0eb4e578b427671ad6c252faf11d908844c9358b5b4e5d4e9b5771c57.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
@@ -52,7 +52,7 @@
     "tenants": 4,
     "tier": "B",
     "verify": {
-      "anchor_ns": 1785583560000000000,
+      "anchor_ns": 1785584260000000000,
       "entries_per_push": 100,
       "labels_per_stream": 6,
       "limit": 20000,
@@ -68,24 +68,24 @@
     "warmup_seconds": 10
   },
   "memory": {
-    "anon_bytes_end": 771514368,
-    "anon_peak_bytes": 1174167552,
-    "current_bytes": 1742225408,
+    "anon_bytes_end": 970215424,
+    "anon_peak_bytes": 1104191488,
+    "current_bytes": 1991110656,
     "error": null,
-    "file_bytes_end": 420573184,
+    "file_bytes_end": 451346432,
     "peak_bytes": 2147536896,
     "peak_bytes_before": 2147536896,
-    "source": "/sys/fs/cgroup/system.slice/docker-1a9ba8bbd7c29207e2ee3ca21d34efec76fb169e3956f930039bcda281617ed8.scope/memory.peak"
+    "source": "/sys/fs/cgroup/system.slice/docker-fdf22ac0eb4e578b427671ad6c252faf11d908844c9358b5b4e5d4e9b5771c57.scope/memory.peak"
   },
   "phase": "seed",
   "run": {
-    "build_revision": "c798e5b",
+    "build_revision": "5231058",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "seed": 1592598566
   },
   "seed": {
     "complete": true,
-    "elapsed_seconds": 0.821590423,
+    "elapsed_seconds": 0.810695484,
     "errors": 0,
     "first_error": null,
     "line_bytes": 49029829,
@@ -95,12 +95,12 @@
     "statuses": {
       "204": 1504
     },
-    "wire_bytes": 23456069
+    "wire_bytes": 23455842
   },
   "target": "loki",
   "verdict": "PASS",
   "verify": {
-    "anchor_ns": 1785583560000000000,
+    "anchor_ns": 1785584260000000000,
     "line_bytes": 49029829,
     "rows": 150000,
     "span_ns": 150000000000,
