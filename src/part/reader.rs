@@ -1008,7 +1008,7 @@ impl PartReader {
                         scan_limit,
                         scan_bytes_limit,
                         cancellation,
-                        &projection,
+                        projection,
                         count_scanned_rows,
                         &mut label_sets,
                         &mut stats,
@@ -1065,7 +1065,7 @@ impl PartReader {
                     scan_limit,
                     scan_bytes_limit,
                     cancellation,
-                    &projection,
+                    projection,
                     count_scanned_rows,
                     &mut label_sets,
                     &mut stats,
@@ -1538,7 +1538,7 @@ impl ScanProjection {
             }
         }
         let mut metadata_leaves: Vec<(usize, usize)> = Vec::new();
-        let mut include_residual = false;
+        let include_residual;
         match &columns.metadata {
             MetadataProjection::All => {
                 for key in 0..metadata_keys.len() {

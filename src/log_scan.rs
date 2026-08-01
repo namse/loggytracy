@@ -409,10 +409,11 @@ impl CountingSink<'_> {
         // still reject), and a stage-less pipeline accepts everything — its
         // shadowing effect touches only fields nothing here reads.
         if !self.query.stages.is_empty()
-            && !self.query.process_entry_with_labels_cancellable(
+            && !self.query.process_entry_with_precomputed_json(
                 labels,
                 &mut entry,
                 self.cancellation,
+                extracted_json.as_ref(),
             )?
         {
             return Ok(());
