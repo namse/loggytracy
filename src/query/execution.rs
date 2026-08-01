@@ -202,6 +202,10 @@ async fn run_unified_query_with_stats_cancellable(
     scan_budget: Option<usize>,
     cancellation: Arc<AtomicBool>,
 ) -> Result<QueryExecution, String> {
+    // The log path returns every pair a row stored, so it reads them all —
+    // plus the `_pf:` columns when a `| json` stage can consume them
+    // precomputed instead of parsing every surviving line.
+    let columns = part::ColumnSet::for_log_query(&parsed);
     run_unified_query_with_stats_cancellable_for_runtime(
         state,
         tenant,
@@ -212,8 +216,7 @@ async fn run_unified_query_with_stats_cancellable(
         scan_budget,
         cancellation,
         None,
-        // The log path returns every pair a row stored, so it reads them all.
-        part::ColumnSet::all(),
+        columns,
     )
     .await
 }

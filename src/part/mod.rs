@@ -91,6 +91,10 @@ pub enum MetadataProjection {
 pub struct ColumnSet {
     pub line: bool,
     pub metadata: MetadataProjection,
+    /// Also decode the `_pf:` columns so the scan can hand the pipeline its
+    /// `| json` extraction precomputed. Only worth asking for when the query
+    /// has a `Json` stage; the columns are otherwise dead weight.
+    pub parsed_fields: bool,
 }
 
 impl ColumnSet {
@@ -98,7 +102,31 @@ impl ColumnSet {
         Self {
             line: true,
             metadata: MetadataProjection::All,
+            parsed_fields: false,
         }
+    }
+
+    /// `all()`, plus the `_pf:` columns when the query's pipeline can consume
+    /// them — the log path's projection.
+    pub fn for_log_query(query: &crate::logql::LogQuery) -> Self {
+        Self {
+            line: true,
+            metadata: MetadataProjection::All,
+            parsed_fields: query
+                .stages
+                .iter()
+                .any(|stage| matches!(stage, crate::logql::PipelineStage::Json)),
+        }
+    }
+
+    /// A sink that aggregates instead of holding rows still needs the fields
+    /// its pipeline stages read; same rule as the log path.
+    pub fn parsed_fields_for(mut self, query: &crate::logql::LogQuery) -> Self {
+        self.parsed_fields = query
+            .stages
+            .iter()
+            .any(|stage| matches!(stage, crate::logql::PipelineStage::Json));
+        self
     }
 }
 

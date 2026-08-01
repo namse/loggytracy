@@ -14,6 +14,19 @@
 /// truncating raw rows before the pipeline ran, but by scanning only until
 /// `limit` rows have *survived* it.
 pub trait RowSink {
+    /// `accept`, with the row's `| json` extraction already reconstructed
+    /// from the part's `_pf:` columns when the scan was asked to project
+    /// them. The default discards it; sinks that run a pipeline override
+    /// this to spare the per-row parse.
+    fn accept_extracted(
+        &mut self,
+        labels: &SharedLabels,
+        entry: LogEntry,
+        _extracted_json: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<(), String> {
+        self.accept(labels, entry)
+    }
+
     /// Offer one row. Ownership is taken: a row the sink does not want is
     /// dropped here rather than carried up a hop first.
     fn accept(&mut self, labels: &SharedLabels, entry: LogEntry) -> Result<(), String>;

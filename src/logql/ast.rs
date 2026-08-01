@@ -238,6 +238,26 @@ impl LogQuery {
         entry: &mut LogEntry,
         cancellation: Option<&AtomicBool>,
     ) -> Result<bool, String> {
+        self.process_entry_with_precomputed_json(labels, entry, cancellation, None)
+    }
+
+    /// The pipeline with the `| json` extraction optionally supplied by the
+    /// caller — the storage's `_pf:` columns hold exactly what
+    /// `extract_json` would produce, so a scan that already decoded them can
+    /// spare the per-row parse. `Some` is only sound when the map is known
+    /// complete (the part's parsed-key list under its cap) and non-empty
+    /// (an empty reconstruction cannot distinguish a parse failure, which
+    /// must set `__error__`, from a line with no scalar fields).
+    pub fn process_entry_with_precomputed_json(
+        &self,
+        labels: &Labels,
+        entry: &mut LogEntry,
+        cancellation: Option<&AtomicBool>,
+        precomputed_json: Option<&BTreeMap<String, String>>,
+    ) -> Result<bool, String> {
+        // Only the *stored* line's extraction was precomputed; a `line_format`
+        // rewrites what a later `| json` reads, so it revokes the shortcut.
+        let mut precomputed_json = precomputed_json;
         let mut fields: BTreeMap<String, String> = labels.clone();
         let mut next_extracted_suffix = BTreeMap::new();
         for name in fields.keys() {
@@ -266,6 +286,14 @@ impl LogQuery {
                     if !filter.matches(&entry.line) {
                         return Ok(false);
                     }
+                }
+                PipelineStage::Json if precomputed_json.is_some() => {
+                    merge_extracted(
+                        &mut fields,
+                        &mut next_extracted_suffix,
+                        &shadowed_by_metadata,
+                        precomputed_json.cloned().unwrap_or_default(),
+                    )
                 }
                 PipelineStage::Json => match extract_json_cancellable(&entry.line, cancellation) {
                     Ok(extracted) => {
@@ -312,6 +340,7 @@ impl LogQuery {
                 // which is what makes the two composable in either order.
                 PipelineStage::LineFormat(template) => {
                     entry.line = template.render(&fields);
+                    precomputed_json = None;
                 }
                 PipelineStage::LabelFormat(formats) => {
                     // Every assignment reads the field set as it was before
@@ -653,7 +682,7 @@ impl MetricExpr {
                 | PipelineStage::Logfmt
                 | PipelineStage::LineFormat(_)
                 | PipelineStage::LabelFormat(_) => {
-                    return crate::part::ColumnSet::all();
+                    return crate::part::ColumnSet::for_log_query(query);
                 }
                 PipelineStage::Line(_) => line = true,
                 PipelineStage::Field(filter) => {
@@ -666,6 +695,7 @@ impl MetricExpr {
         crate::part::ColumnSet {
             line,
             metadata: crate::part::MetadataProjection::Named(named),
+            parsed_fields: false,
         }
     }
 

@@ -1244,6 +1244,13 @@ impl PartReader {
                 (key_index, batch.column(batch_index).as_string::<i32>())
             })
             .collect();
+        let parsed_cols: Vec<(usize, &StringArray)> = projection
+            .parsed
+            .iter()
+            .map(|&(key_index, batch_index)| {
+                (key_index, batch.column(batch_index).as_string::<i32>())
+            })
+            .collect();
         let sm = projection
             .residual
             .map(|index| batch.column(index).as_string::<i32>());
@@ -1366,13 +1373,34 @@ impl PartReader {
                 }
             }
             structured_metadata.extend(residual);
-            sink.accept(
+            // The row's `| json` extraction, straight off the `_pf:` columns.
+            // Non-empty means the write-side parse succeeded and every key is
+            // here (the projection refuses capped lists); empty is ambiguous
+            // between "no scalar fields" and "not JSON", so the sink's
+            // pipeline falls back to parsing the line and setting `__error__`
+            // itself.
+            let extracted_json = (!parsed_cols.is_empty())
+                .then(|| {
+                    let mut extracted = std::collections::BTreeMap::new();
+                    for &(key_index, column) in &parsed_cols {
+                        if !column.is_null(i) {
+                            extracted.insert(
+                                self.parsed_keys[key_index].clone(),
+                                column.value(i).to_string(),
+                            );
+                        }
+                    }
+                    extracted
+                })
+                .filter(|extracted| !extracted.is_empty());
+            sink.accept_extracted(
                 &labels,
                 LogEntry {
                     timestamp_ns: ts_val,
                     line,
                     structured_metadata,
                 },
+                extracted_json,
             )?;
         }
         Ok(ScanStep::Continue)
@@ -1406,6 +1434,11 @@ struct ScanProjection {
     labels_start: usize,
     /// `(index into metadata_keys, projected index)` per projected `_sm:`.
     metadata: Vec<(usize, usize)>,
+    /// `(index into parsed_keys, projected index)` per projected `_pf:` —
+    /// non-empty only when the caller asked to feed the pipeline's `| json`
+    /// from the columns, and only on a part whose parsed-key list is under
+    /// its cap (a capped list cannot promise a complete extraction).
+    parsed: Vec<(usize, usize)>,
     /// Projected index of the residual blob, when it is read at all.
     residual: Option<usize>,
 }
@@ -1418,62 +1451,75 @@ impl ScanProjection {
         columns: &ColumnSet,
     ) -> Self {
         let labels = stream_labels.len();
-        // `_pf:` columns are never part of a wide read: entries carry the line
-        // and extraction stays a query-time stage. They exist for the narrow
-        // first pass alone, which addresses them by ordinal directly.
         let residual_leaf = 3 + labels + metadata_keys.len() + parsed_keys.len();
         let mut leaves = vec![0usize, 1];
-        let mut next = 2usize;
-        let mut msg = None;
         if columns.line {
             leaves.push(2);
-            msg = Some(next);
-            next += 1;
         }
-        let labels_start = next;
         for label in 0..labels {
             leaves.push(3 + label);
         }
-        next += labels;
-        let mut metadata = Vec::new();
-        let mut residual = None;
+        let mut metadata_leaves: Vec<(usize, usize)> = Vec::new();
+        let mut include_residual = false;
         match &columns.metadata {
             MetadataProjection::All => {
                 for key in 0..metadata_keys.len() {
-                    leaves.push(3 + labels + key);
-                    metadata.push((key, next));
-                    next += 1;
+                    metadata_leaves.push((key, 3 + labels + key));
                 }
-                leaves.push(residual_leaf);
-                residual = Some(next);
+                include_residual = true;
             }
             MetadataProjection::Named(names) => {
                 for (key_index, key) in metadata_keys.iter().enumerate() {
                     if names.contains(key) {
-                        leaves.push(3 + labels + key_index);
-                        metadata.push((key_index, next));
-                        next += 1;
+                        metadata_leaves.push((key_index, 3 + labels + key_index));
                     }
                 }
                 // The residual is read only when a named field might live in
                 // it — a name that is not one of this part's columns. The
                 // columnization invariant makes this exact: a columnized key
                 // never also appears in a row's residual.
-                if names
+                include_residual = names
                     .iter()
-                    .any(|name| metadata_keys.binary_search(name).is_err())
-                {
-                    leaves.push(residual_leaf);
-                    residual = Some(next);
-                }
+                    .any(|name| metadata_keys.binary_search(name).is_err());
             }
         }
+        let mut parsed_leaves: Vec<(usize, usize)> = Vec::new();
+        // A capped parsed-key list cannot promise a complete extraction, and
+        // an incomplete one silently changes what `| json` produces — so the
+        // shortcut is offered only when every extracted key has a column.
+        if columns.parsed_fields && parsed_keys.len() < MAX_METADATA_COLUMNS {
+            for key in 0..parsed_keys.len() {
+                parsed_leaves.push((key, 3 + labels + metadata_keys.len() + key));
+            }
+        }
+        leaves.extend(metadata_leaves.iter().map(|&(_, leaf)| leaf));
+        leaves.extend(parsed_leaves.iter().map(|&(_, leaf)| leaf));
+        if include_residual {
+            leaves.push(residual_leaf);
+        }
+        leaves.sort_unstable();
+        leaves.dedup();
+        // The projected batch follows schema order, so every position is the
+        // leaf's rank in the sorted mask — derived, never counted, which is
+        // what made an interleaving mistake possible when it was counted.
+        let rank = |leaf: usize| -> usize {
+            leaves
+                .binary_search(&leaf)
+                .expect("every projected leaf is in the mask")
+        };
         Self {
+            msg: columns.line.then(|| rank(2)),
+            labels_start: if labels > 0 { rank(3) } else { leaves.len() },
+            metadata: metadata_leaves
+                .iter()
+                .map(|&(key, leaf)| (key, rank(leaf)))
+                .collect(),
+            parsed: parsed_leaves
+                .iter()
+                .map(|&(key, leaf)| (key, rank(leaf)))
+                .collect(),
+            residual: include_residual.then(|| rank(residual_leaf)),
             leaves,
-            msg,
-            labels_start,
-            metadata,
-            residual,
         }
     }
 }

@@ -238,7 +238,39 @@ struct PipelineSink<'a> {
 }
 
 impl RowSink for PipelineSink<'_> {
-    fn accept(&mut self, labels: &SharedLabels, mut entry: LogEntry) -> Result<(), String> {
+    fn accept_extracted(
+        &mut self,
+        labels: &SharedLabels,
+        entry: LogEntry,
+        extracted_json: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<(), String> {
+        self.accept_inner(labels, entry, extracted_json)
+    }
+
+    fn accept(&mut self, labels: &SharedLabels, entry: LogEntry) -> Result<(), String> {
+        self.accept_inner(labels, entry, None)
+    }
+
+    fn frontier_ns(&self) -> Option<i64> {
+        self.rows.frontier_ns()
+    }
+
+    fn remaining(&self) -> Option<usize> {
+        self.rows.remaining()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.rows.is_closed()
+    }
+}
+
+impl PipelineSink<'_> {
+    fn accept_inner(
+        &mut self,
+        labels: &SharedLabels,
+        mut entry: LogEntry,
+        extracted_json: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<(), String> {
         if self
             .cancellation
             .is_some_and(|flag| flag.load(Ordering::Acquire))
@@ -262,10 +294,11 @@ impl RowSink for PipelineSink<'_> {
             entry
                 .structured_metadata
                 .retain(|(name, _)| !labels.contains_key(name));
-        } else if !self.query.process_entry_with_labels_cancellable(
+        } else if !self.query.process_entry_with_precomputed_json(
             labels,
             &mut entry,
             self.cancellation,
+            extracted_json.as_ref(),
         )? {
             return Ok(());
         }
@@ -282,18 +315,6 @@ impl RowSink for PipelineSink<'_> {
         }
         self.rows.offer(labels, entry);
         Ok(())
-    }
-
-    fn frontier_ns(&self) -> Option<i64> {
-        self.rows.frontier_ns()
-    }
-
-    fn remaining(&self) -> Option<usize> {
-        self.rows.remaining()
-    }
-
-    fn is_closed(&self) -> bool {
-        self.rows.is_closed()
     }
 }
 
@@ -342,7 +363,39 @@ pub struct CountingSink<'a> {
 }
 
 impl RowSink for CountingSink<'_> {
-    fn accept(&mut self, labels: &SharedLabels, mut entry: LogEntry) -> Result<(), String> {
+    fn accept_extracted(
+        &mut self,
+        labels: &SharedLabels,
+        entry: LogEntry,
+        extracted_json: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<(), String> {
+        self.accept_inner(labels, entry, extracted_json)
+    }
+
+    fn accept(&mut self, labels: &SharedLabels, entry: LogEntry) -> Result<(), String> {
+        self.accept_inner(labels, entry, None)
+    }
+
+    fn frontier_ns(&self) -> Option<i64> {
+        None
+    }
+
+    fn remaining(&self) -> Option<usize> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+}
+
+impl CountingSink<'_> {
+    fn accept_inner(
+        &mut self,
+        labels: &SharedLabels,
+        mut entry: LogEntry,
+        extracted_json: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<(), String> {
         if self
             .cancellation
             .is_some_and(|flag| flag.load(Ordering::Acquire))
@@ -379,17 +432,5 @@ impl RowSink for CountingSink<'_> {
         }
         self.rows += 1;
         Ok(())
-    }
-
-    fn frontier_ns(&self) -> Option<i64> {
-        None
-    }
-
-    fn remaining(&self) -> Option<usize> {
-        None
-    }
-
-    fn is_closed(&self) -> bool {
-        false
     }
 }
