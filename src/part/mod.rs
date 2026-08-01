@@ -106,27 +106,18 @@ impl ColumnSet {
         }
     }
 
-    /// `all()`, plus the `_pf:` columns when the query's pipeline can consume
-    /// them — the log path's projection.
+    /// The log path's projection. Feeding `| json` from the `_pf:` columns is
+    /// wired and correct, and **measured off**: decoding the parsed columns
+    /// wide costs more than the per-survivor parse it saves — `json_field`
+    /// went 21.5 → 25.7 ms and `json_field_rare` 3.05 → 3.77 in the bed with
+    /// it on, because a scattered row selection still decodes most pages of
+    /// every extra column. The machinery stays (the sinks take a precomputed
+    /// map, the equality tests pin it) for a future where the survivor share
+    /// of the decode is high enough to flip the sign; the projection is what
+    /// stays off.
     pub fn for_log_query(query: &crate::logql::LogQuery) -> Self {
-        Self {
-            line: true,
-            metadata: MetadataProjection::All,
-            parsed_fields: query
-                .stages
-                .iter()
-                .any(|stage| matches!(stage, crate::logql::PipelineStage::Json)),
-        }
-    }
-
-    /// A sink that aggregates instead of holding rows still needs the fields
-    /// its pipeline stages read; same rule as the log path.
-    pub fn parsed_fields_for(mut self, query: &crate::logql::LogQuery) -> Self {
-        self.parsed_fields = query
-            .stages
-            .iter()
-            .any(|stage| matches!(stage, crate::logql::PipelineStage::Json));
-        self
+        let _ = query;
+        Self::all()
     }
 }
 
