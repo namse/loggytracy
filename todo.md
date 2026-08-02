@@ -559,7 +559,11 @@ neither is a defect in either engine.
       Measured: `part/write/json` 331 → **281 ms** (+5% over the pre-`_pf:` 267, the columns' true cost)
       and ingest **19.1k → 19.6k eps** — within 1.3% of Loki's 19.86k at the same offered 20k. What still
       separates the last 2% is the wider Parquet encode, and per-column encoding choices measured against
-      `part/write` remain the honest next lever
+      `part/write` remain the honest next lever.
+      *First choice tried and discarded at the bench:* dictionary off for every `_sm:`/`_pf:` column read
+      281 → 279 ms (p = 0.84) — the dictionary build is not a measurable term of the write, so the change
+      never reached the bed and never earned its complexity. The 2% stays attributed to the encode as a
+      whole, not to any one knob so far tried
 - [x] **The trace-to-logs measurement ran, and it answers the join question by pointing somewhere else.**
       `trace_window` — the rare trace's own occurrence ±1 s, the window a click on a span sends — is in the
       matrix at full three-way agreement. Loki drops 79 → 32 ms and VictoriaLogs 1.3 → 1.15 ms on the
