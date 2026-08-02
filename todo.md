@@ -687,9 +687,20 @@ wins *before* deleting the one being dropped — removing code is the irreversib
       metadata into a per-row-group bloom, Loki stores it and does **not** index it, VictoriaLogs turns it into
       a column. Done as `metadata_rare` (and its narrow-window sibling `trace_window`); it is the shape the
       claim now rests on.
-- [ ] **Move the bed's ingest to OTLP** so all three receive the same records the consumer sends. Loki accepts
+- [x] **Move the bed's ingest to OTLP** so all three receive the same records the consumer sends. Loki accepts
       OTLP at `/otlp/v1/logs`, VictoriaLogs at `/insert/opentelemetry/v1/logs`; both need checking rather than
       assuming. This also removes the bed's dependence on the endpoint being deleted
+
+      **Done 2026-08-02, gated on full agreement: 168/168 on all three pairs, every shape.** The re-baseline
+      (2 GiB, cold p50 ratios, `docs/COMPARISON.md` of that date): vs Loki everything holds — label_only
+      0.29x, line_filter 0.82x, json_field 0.57x, json_field_rare 0.02x, metadata_rare 0.03x, trace_window
+      0.07x, rate 0.27x. vs VictoriaLogs: label_only 1.77x, line_filter 2.19x, json_field 2.10x (VL now
+      pays `unpack_json` at query time, was 3.13x), **json_field_rare 0.04x** (was 2.55x — the parser-stage
+      rare pair finally measures the bloom against a full-scan unpack), metadata_rare **1.49x** (was 2.18x —
+      the claim shape, still shy of the 1.1x bar), trace_window 1.61x, rate 7.13x (was 4.55x — worse, VL's
+      tumbling-bucket rate over OTLP data got faster). Ingest 19,619 eps of 20,000 offered (Loki 19,867,
+      VictoriaLogs 19,941); disk 0.60x Loki / 1.29x VictoriaLogs WAL-excluded; `memory_gate --budget 2GiB`
+      UNDER_BUDGET on the same revision.
 
       **Probed 2026-08-02** (Loki 3.3.2, VictoriaLogs v1.52.0, identical hand-built
       `ExportLogsServiceRequest` to both plus loggytracy's own `/v1/logs`):
@@ -763,10 +774,18 @@ its own budget the way scans have permits; and whether the load verdict's 2s que
 passed by any revision — no retained artifact says it was.
 - [ ] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
       parser, and `proto.rs`'s encode side
-- [ ] **Then stop re-encoding into a Loki `PushRequest` for the WAL.** It exists so replay has one decoder
+- [x] **Then stop re-encoding into a Loki `PushRequest` for the WAL.** It exists so replay has one decoder
       while two protocols converge, and it costs a whole second message materialized with a clone per line and
       per label, then serialized, framed and batched — five copies for the WAL alone, on the consumer's own
       path. With one protocol it has nothing to do
+
+      Done 2026-08-02 as WAL record kind 2: the payload is the `ExportLogsServiceRequest` as it arrived —
+      the HTTP protobuf transport passes its body through verbatim, gRPC and JSON re-encode the decoded
+      message — and replay normalizes by kind, the pattern traces (kind 1) proved. The WAL's bytes did not
+      move: the old path stored the decompressed `PushRequest` at ~415 B/entry and the export measures
+      ~418 B/entry on the same corpus. What moved is the copies — the second message with its clone per
+      line and per label is gone from the consumer's path. Ingest at the bed's offered rate is unchanged
+      (19.6k eps before and after); the gain was allocation, not the wire.
 - [ ] Keep the Loki **query** API and the `| json` parser. Grafana reads through the first; a guest's
       `println!` becomes an OTLP body string that nothing in the chain parses, so the second still has work
 

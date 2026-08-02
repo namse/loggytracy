@@ -391,19 +391,23 @@ The claim is therefore stated as a falsifiable one:
 > index it, and not materially worse than VictoriaLogs, which columnizes it,
 > without giving up ingest throughput or disk footprint.
 
-**Both halves are measured now, and they split.** The three-way bed
-([`COMPARISON.md`](COMPARISON.md), 2 GiB per container, 150,000 rows, every
-answer agreeing on every shape before any ratio was printed): the Loki half
-**holds** — `metadata_rare` at **0.24x**, 19.2 ms against 79.4 — and the
-VictoriaLogs half **fails** — **12.6x slower**, 19.2 ms against 1.5. An earlier
-short run had loggytracy *losing* the Loki half at 3.10x; that number was this
-engine's own bounded-scan defect wearing a performance costume (`todo.md`,
-"Open correctness defects" — the scan dropped the newest rows), and it reversed
-the day the defect did. What stands between 19.2 ms and 1.5 ms is the
-columnization gap: `structured_metadata` is still a JSON blob parsed per row,
-and VictoriaLogs answers the same question from a column. That is the work, in
-order: columnize, push projection and predicates down, and only then judge the
-claim's second half.
+**Both halves are measured now, on the wire the claim was always about.** The
+bed ingests OTLP on all three systems since 2026-08-02 — the same protobuf
+body at each engine's own `/v1/logs` spelling — and every ratio below printed
+only after all three pairs agreed on all 168 queries of every shape. The Loki
+half **holds** — `metadata_rare` at **0.03x**, 2.4 ms against 78.8 — and the
+VictoriaLogs half **does not yet** — **1.49x cold / 1.54x warm**, 2.4 ms
+against 1.6. It began at 12.6x when `structured_metadata` was a JSON blob
+parsed per row; columnizing it, then the page-level time selection and the
+1024-row pages, brought it to 1.5x, and what remains is millisecond-scale
+constant work against a purpose-built column store. An earlier short run had
+loggytracy *losing* the Loki half at 3.10x; that number was this engine's own
+bounded-scan defect wearing a performance costume, and it reversed the day the
+defect did. The honest wire also resolved the `json_field_rare` pair the
+design intended: the same rare value reached *through a parser* is now
+**0.04x** against VictoriaLogs — under OTLP it keeps the line unparsed like
+everyone else, pays the unpack at query time, and the per-row-group bloom over
+the parsed field is the difference.
 
 It is abandoned if the comparison shows Loki within noise on that shape despite
 not indexing it, or shows loggytracy losing on ingest or bytes-per-GB by enough
