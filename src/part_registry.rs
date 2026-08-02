@@ -149,6 +149,7 @@ pub struct PartRegistry {
     /// new stream from one that already exists without walking every part.
     streams: RwLock<StreamCensus>,
     operation_lock: Arc<tokio::sync::RwLock<()>>,
+    deletion_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl Default for PartRegistry {
@@ -164,11 +165,28 @@ impl PartRegistry {
             layout: RwLock::new(LayoutTotals::default()),
             streams: RwLock::new(StreamCensus::default()),
             operation_lock: Arc::new(tokio::sync::RwLock::new(())),
+            deletion_lock: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
     pub fn operation_lock(&self) -> Arc<tokio::sync::RwLock<()>> {
         self.operation_lock.clone()
+    }
+
+    /// Guards part *files* against deletion, and nothing else.
+    ///
+    /// A merge rewrite reads its input directories for as long as the group
+    /// takes — 13 seconds was measured for one 56-part group — and it used to
+    /// hold the read half of `operation_lock` for all of it. That lock is
+    /// fair, so the moment a flush queued its write, every query arriving
+    /// after queued too: the whole 13 seconds became query tail latency, at
+    /// every merge tick. But the rewrite never cared about visibility — only
+    /// that nobody deletes the files under it. That is this lock. Deleters
+    /// (retention retirement, cache eviction) take both, `operation_lock`
+    /// first, then this; long readers of part files that do not need the
+    /// visibility lock take only this one.
+    pub fn deletion_lock(&self) -> Arc<tokio::sync::RwLock<()>> {
+        self.deletion_lock.clone()
     }
 
     /// Every tenant that owns a segment in some part. Visits under the read
@@ -364,19 +382,20 @@ impl PartRegistry {
         // Open every replacement before taking the registry mutation. If any
         // one is corrupt, the old set remains queryable and removable only by
         // a later successful merge.
-        let mut opened = Vec::with_capacity(new_parts.len());
-        for part in new_parts {
-            let id = part.meta.id.clone();
-            match PartReader::open(part) {
-                Ok(reader) => {
-                    opened.push((id, Arc::new(reader)));
-                }
-                Err(e) => {
-                    return Err(format!("failed to open fresh merged part {}: {}", id, e));
-                }
-            }
-        }
+        let opened = Self::open_parts(new_parts)
+            .map_err(|e| format!("failed to open fresh merged part: {e}"))?;
+        Ok(self.replace_opened(old_ids, opened))
+    }
 
+    /// The mutation half of [`replace`](Self::replace): map updates only, so
+    /// the caller can open the replacements — checksum validation over a
+    /// whole merged part — before taking the exclusive lifecycle lock rather
+    /// than under it.
+    pub fn replace_opened(
+        &self,
+        old_ids: &[String],
+        opened: Vec<(String, Arc<PartReader>)>,
+    ) -> Vec<String> {
         let new_ids: Vec<String> = opened.iter().map(|(id, _)| id.clone()).collect();
         let mut inner = self.inner.write().unwrap();
         let mut layout = self.layout.write().unwrap();
@@ -401,7 +420,7 @@ impl PartRegistry {
                 }
             }
         }
-        Ok(new_ids)
+        new_ids
     }
 
     pub fn snapshot(&self) -> Vec<Arc<PartReader>> {

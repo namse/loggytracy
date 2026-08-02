@@ -145,10 +145,13 @@ async fn merge_once(
                 group.iter().map(|r| r.part().dir.clone()).collect();
 
             // Keep input directories alive while the potentially expensive
-            // read/write preparation runs, but allow queries to proceed. The
-            // exclusive lifecycle lock is acquired only for final revalidation
-            // and registry replacement below.
-            let part_guard = registry.operation_lock().read_owned().await;
+            // read/write preparation runs. The deletion lock, not the
+            // operation lock: the rewrite runs for as long as the group takes,
+            // and holding the fair operation lock's read half for that long
+            // meant one queued flush turned the whole rewrite into query tail
+            // latency. The exclusive operation lock is acquired only for the
+            // registry replacement below.
+            let part_guard = registry.deletion_lock().read_owned().await;
             if let Some(cache) = remote_cache {
                 let required: std::collections::HashSet<String> = old_ids.iter().cloned().collect();
                 let missing = registry.missing_data_ids(&required);
@@ -283,7 +286,7 @@ async fn merge_once(
                     continue;
                 }
             };
-            let part_guard = registry.operation_lock().read_owned().await;
+            let part_guard = registry.deletion_lock().read_owned().await;
             let active_ids = registry.part_ids();
             if old_ids.iter().any(|id| !active_ids.contains(id)) {
                 drop(part_guard);
@@ -326,6 +329,37 @@ async fn merge_once(
                 cache.record_remote_success();
                 manifest_committed = true;
             }
+            // Open the replacements while still under the deletion guard —
+            // eviction could otherwise remove an unregistered directory —
+            // and before the exclusive operation lock: opening validates
+            // checksums over the whole merged part, and paying that under
+            // the fair lock made every queued query wait for it.
+            let opened_new = match PartRegistry::open_parts(new_parts) {
+                Ok(opened) => opened,
+                Err(e) => {
+                    drop(part_guard);
+                    // The tombstone is part of each new directory, so remove
+                    // those directories as one failed transaction. Old
+                    // registry entries and old data remain intact.
+                    tracing::error!(
+                        error = %e,
+                        partition = %partition,
+                        "merged part validation failed; keeping old parts"
+                    );
+                    if remote_cache.is_none()
+                        && let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs)
+                    {
+                        tracing::warn!(
+                            error = %cleanup_error,
+                            "failed to remove invalid merged parts"
+                        );
+                    }
+                    errors.push(format!(
+                        "merged part validation failed for partition {partition}: {e}"
+                    ));
+                    continue;
+                }
+            };
             drop(part_guard);
             let _visibility_guard = registry.operation_lock().write_owned().await;
             // Only re-check while the replacement is still abandonable.
@@ -347,71 +381,46 @@ async fn merge_once(
                     continue;
                 }
             }
-            match registry.replace(&old_ids, new_parts) {
-                Ok(_) => {
-                    if let Err(error) = part::remove_part_dirs(&cleanup_old_dirs) {
+            registry.replace_opened(&old_ids, opened_new);
+            if let Err(error) = part::remove_part_dirs(&cleanup_old_dirs) {
+                tracing::warn!(
+                    error = %error,
+                    "old part cleanup incomplete; retaining merge tombstones"
+                );
+            } else {
+                for new_dir in &new_part_dirs {
+                    if let Err(e) = part::remove_merge_tombstone(new_dir) {
                         tracing::warn!(
-                            error = %error,
-                            "old part cleanup incomplete; retaining merge tombstones"
-                        );
-                    } else {
-                        for new_dir in &new_part_dirs {
-                            if let Err(e) = part::remove_merge_tombstone(new_dir) {
-                                tracing::warn!(
-                                    error = %e,
-                                    ?new_dir,
-                                    "failed to remove merge tombstone (will be cleaned on next discover)"
-                                );
-                            }
-                        }
-                    }
-                    if dropped_rows > 0 {
-                        metrics
-                            .retention_expired_rows_dropped
-                            .fetch_add(dropped_rows as u64, Ordering::Relaxed);
-                    }
-                    // Only a group that nothing but retention would
-                    // have selected is a rewrite retention caused. A
-                    // size-driven merge that happened to drop expired
-                    // rows is already counted by the row counter, and
-                    // counting it here would hide how much extra I/O
-                    // retention is actually paying for.
-                    if retention_only {
-                        metrics
-                            .retention_parts_rewritten
-                            .fetch_add(old_ids.len() as u64, Ordering::Relaxed);
-                    }
-                    tracing::info!(
-                        partition = %partition,
-                        merged = old_ids.len(),
-                        produced = new_n,
-                        dropped_rows,
-                        "merge completed"
-                    );
-                }
-                Err(e) => {
-                    // The tombstone is part of each new directory,
-                    // so remove those directories as one failed
-                    // transaction. Old registry entries and old data
-                    // remain intact.
-                    tracing::error!(
-                        error = %e,
-                        partition = %partition,
-                        "merged part validation failed; keeping old parts"
-                    );
-                    if remote_cache.is_none()
-                        && let Err(cleanup_error) = part::remove_part_dirs(&new_part_dirs)
-                    {
-                        tracing::warn!(
-                            error = %cleanup_error,
-                            "failed to remove invalid merged parts"
+                            error = %e,
+                            ?new_dir,
+                            "failed to remove merge tombstone (will be cleaned on next discover)"
                         );
                     }
-                    errors.push(format!(
-                        "merged part validation failed for partition {partition}: {e}"
-                    ));
                 }
             }
+            if dropped_rows > 0 {
+                metrics
+                    .retention_expired_rows_dropped
+                    .fetch_add(dropped_rows as u64, Ordering::Relaxed);
+            }
+            // Only a group that nothing but retention would
+            // have selected is a rewrite retention caused. A
+            // size-driven merge that happened to drop expired
+            // rows is already counted by the row counter, and
+            // counting it here would hide how much extra I/O
+            // retention is actually paying for.
+            if retention_only {
+                metrics
+                    .retention_parts_rewritten
+                    .fetch_add(old_ids.len() as u64, Ordering::Relaxed);
+            }
+            tracing::info!(
+                partition = %partition,
+                merged = old_ids.len(),
+                produced = new_n,
+                dropped_rows,
+                "merge completed"
+            );
         }
     }
 

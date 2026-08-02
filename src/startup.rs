@@ -378,6 +378,10 @@ pub async fn run(config: Arc<Config>) {
                     _ = crate::shutdown::wait_for_drain(&mut drain_rx) => return,
                 }
                 let guard = registry.operation_lock().write_owned().await;
+                // Eviction deletes part bodies, and a merge rewrite reads its
+                // inputs — and opens its unregistered outputs — under only
+                // the deletion lock. Operation first, then deletion.
+                let deletion_guard = registry.deletion_lock().write_owned().await;
                 let eligible = registry.part_dirs();
                 let trace_eligible = trace_registry.part_dirs();
                 // Eviction walks the whole parts tree with `read_dir` and a
@@ -394,6 +398,7 @@ pub async fn run(config: Arc<Config>) {
                 let budget = config.cache_max_bytes;
                 let evicted = tokio::task::spawn_blocking(move || {
                     let _guard = guard;
+                    let _deletion_guard = deletion_guard;
                     match cache_for_eviction.storage.evict_cache(
                         &cache_for_eviction.parts_root,
                         budget,

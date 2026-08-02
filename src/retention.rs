@@ -242,6 +242,10 @@ async fn retention_once_at(
     let mut removed_trace_ids = Vec::new();
     {
         let _guard = registry.operation_lock().write_owned().await;
+        // Deleting part files, so the deletion lock too — a merge rewrite
+        // reads its inputs under only that lock now. Operation first, then
+        // deletion, the one order every double acquisition uses.
+        let _deletion_guard = registry.deletion_lock().write_owned().await;
         // One snapshot per registry, not one per candidate. This runs under the
         // exclusive lifecycle lock, so a scan per candidate stalls flush, merge
         // and queries for as long as the whole batch takes.
