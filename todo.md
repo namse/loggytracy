@@ -551,11 +551,15 @@ neither is a defect in either engine.
       and 14.5x against VictoriaLogs, from 1.73x and 31.6x at the start. What remains of the 14.5x is scan
       itself — decode of the timestamp and label columns of 60 k rows against VictoriaLogs reading one
       column — which is where the (preconditioned) sidecar counts or a dictionary-run count would go
-- [ ] **The last ingest points are the columnar encode itself, not a shareable parse.** 18.9–19.1k eps
-      against an offered 20k after the write-side parse was deduplicated. The bloom encoder's
-      `indexed_parser_fields` cannot reuse the `_pf:` extraction — it tokenizes pre-sanitization name
-      variants the exact map no longer has — so the remaining term is the wider Parquet encode, and the
-      honest options are per-column encoding choices measured against `part/write`, not more sharing
+- [x] **The "unshareable parse" judgment was wrong, and reading the code corrected it.**
+      `indexed_parser_fields`' json half *was* `extract_json` behind a first-byte gate — the same call the
+      `_pf:` columns pay for — so the bloom now reads that parse and only the logfmt half still parses.
+      The gate went with it, which closes a quiet pruning hole: a top-level-array line's extractions never
+      entered the bloom, so an exact-field prune could false-negative a group that held the answer.
+      Measured: `part/write/json` 331 → **281 ms** (+5% over the pre-`_pf:` 267, the columns' true cost)
+      and ingest **19.1k → 19.6k eps** — within 1.3% of Loki's 19.86k at the same offered 20k. What still
+      separates the last 2% is the wider Parquet encode, and per-column encoding choices measured against
+      `part/write` remain the honest next lever
 - [x] **The trace-to-logs measurement ran, and it answers the join question by pointing somewhere else.**
       `trace_window` — the rare trace's own occurrence ±1 s, the window a click on a span sends — is in the
       matrix at full three-way agreement. Loki drops 79 → 32 ms and VictoriaLogs 1.3 → 1.15 ms on the
