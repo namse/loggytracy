@@ -1327,36 +1327,6 @@ impl PartReader {
         } else {
             Box::new((0..batch.num_rows()).rev())
         };
-        // A uniform group under a blind projection carries nothing per row
-        // but a timestamp, and an aggregating sink can take those wholesale —
-        // no `LogEntry`, no per-row dispatch. The tenant cross-check keeps its
-        // own pass; isolation does not ride on an optimization's fast path.
-        let blind_batch = !projection.labels_projected
-            && projection.msg.is_none()
-            && metadata_cols.is_empty()
-            && parsed_cols.is_empty()
-            && sm.is_none();
-        if blind_batch {
-            for i in 0..batch.num_rows() {
-                if row_tenant.value(i) != tenant.as_str() {
-                    return Err(format!(
-                        "part {} row group {row_group} contains rows outside tenant {tenant}",
-                        self.part.meta.id
-                    ));
-                }
-            }
-            let empty: SharedLabels = Arc::new(Labels::new());
-            if sink.accept_timestamps(&empty, ts.values(), time_range)? {
-                if scan_limit.is_some_and(|limit| stats.scanned_rows >= limit) {
-                    return Ok(ScanStep::Stop);
-                }
-                if count_scanned_rows {
-                    stats.scanned_rows =
-                        stats.scanned_rows.saturating_add(batch.num_rows());
-                }
-                return Ok(ScanStep::Continue);
-            }
-        }
         // Rows are sorted by stream inside a group, so consecutive rows almost
         // always share a label set — one *run* per stream. Hashing into the
         // label cache and re-evaluating every matcher per row charged every

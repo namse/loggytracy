@@ -14,21 +14,6 @@
 /// truncating raw rows before the pipeline ran, but by scanning only until
 /// `limit` rows have *survived* it.
 pub trait RowSink {
-    /// A whole batch of rows that already passed every check but the time
-    /// window — offered as bare timestamps when the scan proved nothing else
-    /// about them is read (a uniform group under a blind projection). Returns
-    /// whether the sink consumed them; `false` sends the caller down the
-    /// per-row path. Only a sink that aggregates can say `true`: anything
-    /// holding rows needs the rows.
-    fn accept_timestamps(
-        &mut self,
-        _labels: &SharedLabels,
-        _timestamps: &[i64],
-        _time_range: crate::part::QueryTimeRange,
-    ) -> Result<bool, String> {
-        Ok(false)
-    }
-
     /// `accept`, with the row's `| json` extraction already reconstructed
     /// from the part's `_pf:` columns when the scan was asked to project
     /// them. The default discards it; sinks that run a pipeline override
