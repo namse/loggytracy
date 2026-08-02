@@ -597,6 +597,12 @@ neither is a defect in either engine.
       The bench's 128-stream corpus has no uniform groups (streams shorter than a group) and did not
       move; the bed's does, and `rate` went 1.68 → **1.47 ms cold, 1.30 warm** — 0.14x against Loki,
       **3.2–3.4x** against VictoriaLogs, from 31.6x at the session's start.
+      *Tried after it and reverted as noise:* handing a blind batch's timestamps to the sink whole — no
+      `LogEntry`, no per-row dispatch. The bed read 1.54/1.55 against 1.47/1.30, inside the run-to-run
+      spread, so the per-row structure was not the remaining cost and the complexity went back out
+      (revert of `68f3b98`; the evidence run is committed right before it). What remains of rate's ~3.5x
+      is the timestamp decode and the grid arithmetic itself, which is the shape of a sidecar count — and
+      that still waits on its recorded precondition.
       *Tried, measured, and turned off with its reason in `ColumnSet::for_log_query`:* the machinery is
       wired and correctness-pinned (sinks accept a precomputed extraction, `line_format` revokes it, the
       memtable-against-parts tests hold), but decoding ~15 parsed columns wide cost more than the
