@@ -22,10 +22,11 @@ fn encode_exact_field_token(name: &str, value: &str) -> io::Result<Vec<u8>> {
 fn write_index(
     path: &Path,
     rows: &[Row],
+    parsed_rows: &[Option<BTreeMap<String, String>>],
     row_group_size: usize,
     stream_labels: &[String],
 ) -> io::Result<()> {
-    let bloom = encode_blooms(rows, row_group_size)?;
+    let bloom = encode_blooms(rows, parsed_rows, row_group_size)?;
     let streams = encode_stream_index(rows, row_group_size, stream_labels)?;
     write_index_sections(path, &bloom, &streams)
 }

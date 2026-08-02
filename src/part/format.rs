@@ -367,7 +367,13 @@ fn write_part_files(
         parsed_columns,
         row_group_size,
     )?;
-    write_index(&dir.join(INDEX_FILE), rows, row_group_size, stream_labels)?;
+    write_index(
+        &dir.join(INDEX_FILE),
+        rows,
+        parsed_rows,
+        row_group_size,
+        stream_labels,
+    )?;
     write_meta(
         &dir.join(META_FILE),
         id,
@@ -598,13 +604,20 @@ fn write_parquet(
     Ok(())
 }
 
-fn encode_blooms(rows: &[Row], row_group_size: usize) -> io::Result<Vec<u8>> {
+fn encode_blooms(
+    rows: &[Row],
+    parsed_rows: &[Option<BTreeMap<String, String>>],
+    row_group_size: usize,
+) -> io::Result<Vec<u8>> {
     let bounds = row_group_bounds(rows, row_group_size);
     let mut buf = Vec::new();
     buf.extend_from_slice(BLOOM_MAGIC);
     buf.extend_from_slice(&(bounds.len() as u32).to_le_bytes());
     for (start, end) in &bounds {
-        buf.extend_from_slice(&encode_group_blooms(&rows[*start..*end])?);
+        buf.extend_from_slice(&encode_group_blooms(
+            &rows[*start..*end],
+            &parsed_rows[*start..*end],
+        )?);
     }
     Ok(buf)
 }
@@ -615,7 +628,10 @@ fn encode_blooms(rows: &[Row], row_group_size: usize) -> io::Result<Vec<u8>> {
 /// Split out of [`encode_blooms`] so a writer that never holds the whole part
 /// can produce the same bytes a row group at a time. The batch path above still
 /// calls it, so the existing part-format tests are what prove the two agree.
-fn encode_group_blooms(rows: &[Row]) -> io::Result<Vec<u8>> {
+fn encode_group_blooms(
+    rows: &[Row],
+    parsed_rows: &[Option<BTreeMap<String, String>>],
+) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut unique_trigrams: BTreeSet<[u8; 3]> = BTreeSet::new();
     // One pass. Sizing the filter needs the token count and filling it needs
@@ -625,7 +641,7 @@ fn encode_group_blooms(rows: &[Row]) -> io::Result<Vec<u8>> {
     // group and its capacity is exactly the count the two-pass version
     // computed, so the encoded filter is byte-identical.
     let mut exact_tokens: Vec<Vec<u8>> = Vec::new();
-    for row in rows {
+    for (row, parsed) in rows.iter().zip(parsed_rows) {
         for tri in crate::bloom::trigrams(&row.line) {
             unique_trigrams.insert(tri);
         }
@@ -634,7 +650,19 @@ fn encode_group_blooms(rows: &[Row]) -> io::Result<Vec<u8>> {
                 exact_tokens.push(encode_exact_field_token(name, &value)?);
             }
         }
-        for (name, values) in crate::logql::indexed_parser_fields(&row.line) {
+        // The `| json` half of the parser-visible fields comes off the parse
+        // the `_pf:` columns already paid for — the bloom used to run the same
+        // `extract_json` a second time per row behind a first-byte gate, and
+        // the gate also silently kept top-level-array extractions out of the
+        // filter, which a bloom prune would then have false-negatived on.
+        if let Some(parsed) = parsed {
+            for (name, value) in parsed {
+                for value in crate::logql::canonical_index_values(value) {
+                    exact_tokens.push(encode_exact_field_token(name, &value)?);
+                }
+            }
+        }
+        for (name, values) in crate::logql::indexed_logfmt_fields(&row.line) {
             for value in values {
                 for value in crate::logql::canonical_index_values(&value) {
                     exact_tokens.push(encode_exact_field_token(&name, &value)?);

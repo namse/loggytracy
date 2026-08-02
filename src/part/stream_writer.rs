@@ -160,7 +160,8 @@ impl StreamingPartWriter {
         // the boundary rather than letting the writer pick one that straddles a
         // tenant. Same reason the batch path flushes here.
         self.writer.flush().map_err(io::Error::other)?;
-        self.bloom_sections.push(encode_group_blooms(&self.group)?);
+        self.bloom_sections
+            .push(encode_group_blooms(&self.group, &self.group_parsed)?);
 
         for row in &self.group {
             for label in &self.stream_labels {

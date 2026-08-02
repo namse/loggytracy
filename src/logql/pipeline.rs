@@ -594,18 +594,12 @@ pub(crate) fn parsed_json_fields(line: &str) -> Option<BTreeMap<String, String>>
     extract_json(line).ok()
 }
 
-pub(crate) fn indexed_parser_fields(line: &str) -> BTreeMap<String, Vec<String>> {
+/// The logfmt half of the parser-visible fields; the json half now rides the
+/// `_pf:` parse the writer already ran, so nothing indexes json twice.
+pub(crate) fn indexed_logfmt_fields(line: &str) -> BTreeMap<String, Vec<String>> {
     let mut indexed: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // Avoid invoking both parsers for ordinary plain-text lines. Parser error
-    // fields are intentionally not indexed: exact_field_predicates excludes
-    // __error__, so indexing those values only adds work and memory.
-    if line.trim_start().starts_with('{')
-        && let Ok(fields) = extract_json(line)
-    {
-        for (name, value) in fields {
-            indexed.entry(name).or_default().push(value);
-        }
-    }
+    // Parser error fields are intentionally not indexed: exact_field_predicates
+    // excludes __error__, so indexing those values only adds work and memory.
     if line.contains('=')
         && let Ok(fields) = extract_logfmt(line)
     {
