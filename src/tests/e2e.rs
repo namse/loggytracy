@@ -1,11 +1,14 @@
     use super::*;
     use crate::tenant::test_tenant;
     use crate::journal::Journal;
-    use crate::memtable::{LogEntry, MemTable};
+    use crate::memtable::MemTable;
     use crate::part;
     use crate::part_registry::PartRegistry;
-    use crate::proto::{self, PushRequest};
-    use prost::Message;
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use prost014::Message;
 
     const CRASH_MODE_ENV: &str = "LOGGYTRACY_CRASH_TEST_MODE";
     const CRASH_DIR_ENV: &str = "LOGGYTRACY_CRASH_TEST_DIR";
@@ -25,68 +28,64 @@
         p
     }
 
+    fn string_attribute(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value.to_string())),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn otlp_body(app: &str, lines: &[(&str, i64)]) -> Vec<u8> {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![string_attribute("service.name", app)],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: lines
+                        .iter()
+                        .map(|(line, ts_secs)| LogRecord {
+                            time_unix_nano: (*ts_secs as u64) * 1_000_000_000,
+                            body: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue(line.to_string())),
+                            }),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec()
+    }
+
     fn build_push_req() -> Vec<u8> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let streams = vec![crate::proto::StreamAdapter {
-            labels: r#"{app="test-app", host="local"}"#.to_string(),
-            entries: vec![
-                crate::proto::EntryAdapter {
-                    timestamp: Some(::prost_types::Timestamp {
-                        seconds: now - 60,
-                        nanos: 0,
-                    }),
-                    line: "hello world from loggytracy".to_string(),
-                    structured_metadata: vec![],
-                },
-                crate::proto::EntryAdapter {
-                    timestamp: Some(::prost_types::Timestamp {
-                        seconds: now - 30,
-                        nanos: 0,
-                    }),
-                    line: "error connecting to database".to_string(),
-                    structured_metadata: vec![],
-                },
-                crate::proto::EntryAdapter {
-                    timestamp: Some(::prost_types::Timestamp {
-                        seconds: now,
-                        nanos: 0,
-                    }),
-                    line: "third line all good".to_string(),
-                    structured_metadata: vec![],
-                },
+        otlp_body(
+            "test-app",
+            &[
+                ("hello world from loggytracy", now - 60),
+                ("error connecting to database", now - 30),
+                ("third line all good", now),
             ],
-            hash: 0,
-        }];
-        let req = PushRequest { streams };
-        let mut buf = Vec::new();
-        req.encode(&mut buf).unwrap();
-        buf
+        )
     }
 
     async fn ingest_once(journal: &Journal, raw: &[u8]) {
-        let req = PushRequest::decode(raw).unwrap();
-        let mut streams = Vec::with_capacity(req.streams.len());
-        for stream in &req.streams {
-            let labels = proto::parse_labels(&stream.labels).unwrap();
-            let entries: Vec<LogEntry> = stream
-                .entries
-                .iter()
-                .map(|e| LogEntry {
-                    timestamp_ns: e.timestamp_ns().unwrap(),
-                    line: e.line.clone(),
-                    structured_metadata: e
-                        .structured_metadata
-                        .iter()
-                        .map(|lp| (lp.name.clone(), lp.value.clone()))
-                        .collect(),
-                })
-                .collect();
-            streams.push((labels, entries));
-        }
-        journal.append(test_tenant(), raw.to_vec(), streams).await.unwrap();
+        let request = ExportLogsServiceRequest::decode(raw).unwrap();
+        let streams = crate::otlp_log::normalize_request(&request).unwrap();
+        journal
+            .append_otlp_logs(test_tenant(), raw.to_vec(), streams)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -121,7 +120,7 @@
         let memtable2 = MemTable::new();
         let wal = config.data_dir.join("journal.wal");
         let ckpt_p = config.data_dir.join("journal.ckpt");
-        let (start, end) = journal::replay(&wal, &ckpt_p, &memtable2, &test_tenant()).unwrap();
+        let (start, end) = journal::replay(&wal, &ckpt_p, &memtable2).unwrap();
         assert_eq!(start, ckpt.offset);
         assert_eq!(end, ckpt.offset);
         assert!(memtable2.is_empty(), "no in-flight data after full flush");
@@ -137,7 +136,7 @@
 
         // label index lookup
         let m = crate::logql::LabelMatcher::new(
-            "app".to_string(),
+            "service_name".to_string(),
             crate::logql::MatcherOp::Eq,
             "test-app".to_string(),
         )
@@ -180,7 +179,7 @@
         let memtable2 = MemTable::new();
         let wal = config.data_dir.join("journal.wal");
         let ckpt_p = config.data_dir.join("journal.ckpt");
-        let (start, end) = journal::replay(&wal, &ckpt_p, &memtable2, &test_tenant()).unwrap();
+        let (start, end) = journal::replay(&wal, &ckpt_p, &memtable2).unwrap();
         assert_eq!(start, 0);
         assert!(end > 0);
 
@@ -192,15 +191,11 @@
         assert_eq!(total, 3);
     }
 
-    /// A WAL holding both record kinds — a Loki push and an OTLP export —
-    /// restores both through the production `recover`, because a restart does
-    /// not get to choose which protocol yesterday's traffic used.
+    /// The production `recover` restores an in-flight OTLP export — including
+    /// one whose record has no resource at all, the barest body the protocol
+    /// allows — alongside a full-shaped one.
     #[tokio::test]
-    async fn e2e_inflight_otlp_logs_restored_alongside_push_records() {
-        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-        use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
-        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-
+    async fn e2e_inflight_otlp_logs_restored_through_recover() {
         let dir = tmp_data_dir("inflight_otlp");
         let config = Config {
             data_dir: dir.clone(),
@@ -325,7 +320,7 @@
         let memtable2 = MemTable::new();
         let wal = config.data_dir.join("journal.wal");
         let ckpt_p = config.data_dir.join("journal.ckpt");
-        journal::replay(&wal, &ckpt_p, &memtable2, &test_tenant()).unwrap();
+        journal::replay(&wal, &ckpt_p, &memtable2).unwrap();
 
         let registry = PartRegistry::load_from_disk(&parts_root).unwrap();
         assert_eq!(registry.part_count(), 1);
@@ -585,23 +580,7 @@
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let request = PushRequest {
-            streams: vec![crate::proto::StreamAdapter {
-                labels: format!(r#"{{app="{tenant}-app"}}"#),
-                entries: vec![crate::proto::EntryAdapter {
-                    timestamp: Some(::prost_types::Timestamp {
-                        seconds: now,
-                        nanos: 0,
-                    }),
-                    line: line.to_string(),
-                    structured_metadata: vec![],
-                }],
-                hash: 0,
-            }],
-        };
-        let mut encoded = Vec::new();
-        request.encode(&mut encoded).unwrap();
-        snap::raw::Encoder::new().compress_vec(&encoded).unwrap()
+        otlp_body(&format!("{tenant}-app"), &[(line, now)])
     }
 
     async fn json_body(response: axum::response::Response) -> serde_json::Value {
@@ -643,13 +622,13 @@
             async move {
                 let request = axum::http::Request::builder()
                     .method("POST")
-                    .uri("/loki/api/v1/push")
+                    .uri("/v1/logs")
                     .header("content-type", "application/x-protobuf")
                     .header(crate::tenant::TENANT_HEADER, tenant)
                     .body(axum::body::Body::from(tenant_push_body(tenant, line)))
                     .unwrap();
                 let response = crate::build_router(state).oneshot(request).await.unwrap();
-                assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
             }
         };
         push("acme", "acme secret").await;
@@ -685,7 +664,7 @@
                 "{stage}: globex read acme's line: {globex_lines}"
             );
 
-            let values = get("acme", "/loki/api/v1/label/app/values").await;
+            let values = get("acme", "/loki/api/v1/label/service_name/values").await;
             assert_eq!(
                 values["data"],
                 serde_json::json!(["acme-app"]),
@@ -771,4 +750,121 @@
         let report = crate::startup::recover(&config, &memtable).expect("recover");
         assert_eq!(report.records, 0);
         assert_eq!(report.entries, 0);
+    }
+
+    /// The whole write path under its production flush loop: OTLP exports in,
+    /// parts out, an empty memtable after, and a restart that replays nothing
+    /// while the parts answer. Ported from the Loki push tests when that
+    /// ingest was removed — the pipeline it exercises never was the wire.
+    #[tokio::test]
+    async fn e2e_otlp_flush_loop_persists_through_restart() {
+        let dir = tmp_data_dir("full_pipeline");
+        let config = Config {
+            data_dir: dir.clone(),
+            flush_max_interval: std::time::Duration::from_millis(50),
+            flush_check_interval: std::time::Duration::from_millis(20),
+            ..Config::default()
+        };
+
+        let memtable = Arc::new(MemTable::new());
+        let parts_root = config.data_dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let parts = Arc::new(PartRegistry::new());
+        let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
+
+        let flush_handle = {
+            let memtable = memtable.clone();
+            let journal = journal.clone();
+            let parts = parts.clone();
+            let trace_memtable = journal.trace_memtable();
+            let trace_parts = trace_parts.clone();
+            let config = std::sync::Arc::new(config.clone());
+            let healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            tokio::spawn(async move {
+                crate::flush::flush_loop(
+                    memtable,
+                    trace_memtable,
+                    journal,
+                    parts,
+                    trace_parts,
+                    None,
+                    config,
+                    healthy,
+                    Arc::new(crate::metrics::RuntimeMetrics::new()),
+                    tokio::sync::watch::channel(false).1,
+                )
+                .await;
+            })
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for i in 0..3i64 {
+            ingest_once(
+                &journal,
+                &otlp_body("pipeline-app", &[(&format!("line-{i}"), now + i)]),
+            )
+            .await;
+        }
+
+        let matcher = crate::logql::LabelMatcher::new(
+            "service_name".to_string(),
+            crate::logql::MatcherOp::Eq,
+            "pipeline-app".to_string(),
+        )
+        .unwrap();
+        let mut flushed_total = 0;
+        for _ in 0..300 {
+            let results = parts
+                .query(
+                    &test_tenant(),
+                    std::slice::from_ref(&matcher),
+                    &[],
+                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    100,
+                    true,
+                )
+                .expect("part query");
+            flushed_total = results.iter().map(|s| s.entries.len()).sum::<usize>();
+            if flushed_total == 3 && memtable.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(flushed_total, 3, "flush did not persist all 3 entries");
+        assert!(memtable.is_empty(), "memtable must be empty after flush");
+
+        flush_handle.abort();
+        drop(parts);
+        drop(journal);
+        drop(memtable);
+
+        let memtable2 = MemTable::new();
+        let wal = dir.join("journal.wal");
+        let ckpt = dir.join("journal.ckpt");
+        journal::replay(&wal, &ckpt, &memtable2).expect("replay");
+        assert!(
+            memtable2.is_empty(),
+            "after a full flush, replay yields no in-flight data"
+        );
+
+        let registry = PartRegistry::load_from_disk(&parts_root).unwrap();
+        assert!(registry.part_count() >= 1);
+        let results = registry
+            .query(
+                &test_tenant(),
+                std::slice::from_ref(&matcher),
+                &[],
+                crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                100,
+                true,
+            )
+            .expect("part query after restart");
+        let total: usize = results.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(total, 3);
     }

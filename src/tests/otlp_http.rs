@@ -200,6 +200,61 @@
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     }
 
+    /// 403 and not 400: the request is well formed and there is nothing the
+    /// client can change about it. Ported from the Loki push tests when that
+    /// ingest was removed — the allowlist is about the tenant header, which
+    /// this transport carries the same way.
+    #[tokio::test]
+    async fn an_export_from_a_tenant_outside_the_allowlist_is_refused() {
+        let config = Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("loggytracy-otlp-http-allow-{}", uuid::Uuid::new_v4())),
+            allowed_tenants: Some([test_tenant()].into_iter().collect()),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let memtable = Arc::new(MemTable::new());
+        let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+        let parts = Arc::new(PartRegistry::new());
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
+        let state =
+            crate::test_support::state(config, memtable.clone(), journal, parts, trace_parts, None);
+
+        let body = log_request("accepted").encode_to_vec();
+        let (status, _, _) = post(&state, "/v1/logs", "application/x-protobuf", body).await;
+        assert_eq!(status, StatusCode::OK, "a listed tenant is accepted");
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, "application/x-protobuf")
+            .header(crate::tenant::TENANT_HEADER, "stranger")
+            .body(axum::body::Body::from(
+                log_request("refused").encode_to_vec(),
+            ))
+            .unwrap();
+        let response = crate::build_router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            memtable
+                .query(
+                    &crate::tenant::TenantId::parse("stranger").unwrap(),
+                    &[],
+                    &[],
+                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    10,
+                    true
+                )
+                .is_empty(),
+            "a refused tenant must not have been written"
+        );
+    }
+
     #[tokio::test]
     async fn a_trace_export_over_http_reaches_the_trace_memtable() {
         let (_memtable, state) = fixture();

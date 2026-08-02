@@ -3,10 +3,9 @@ pub fn replay(
     wal_path: &Path,
     ckpt_path: &Path,
     memtable: &MemTable,
-    default_tenant: &TenantId,
 ) -> Result<(u64, u64), String> {
     let traces = TraceMemTable::new();
-    replay_with_traces(wal_path, ckpt_path, memtable, &traces, default_tenant)
+    replay_with_traces(wal_path, ckpt_path, memtable, &traces)
 }
 
 /// What a replay put back, so a restart can be told from a clean start.
@@ -31,9 +30,8 @@ pub fn replay_with_traces(
     ckpt_path: &Path,
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
-    default_tenant: &TenantId,
 ) -> Result<(u64, u64), String> {
-    replay_reporting(wal_path, ckpt_path, memtable, trace_memtable, default_tenant)
+    replay_reporting(wal_path, ckpt_path, memtable, trace_memtable)
         .map(|report| (report.checkpoint, report.end_offset))
 }
 
@@ -42,7 +40,6 @@ pub fn replay_reporting(
     ckpt_path: &Path,
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
-    default_tenant: &TenantId,
 ) -> Result<ReplayReport, String> {
     recover_unfinished_compaction(wal_path, ckpt_path).map_err(|e| e.to_string())?;
     let checkpoint = read_checkpoint(ckpt_path).map_err(|e| e.to_string())?;
@@ -55,7 +52,6 @@ pub fn replay_reporting(
         checkpoint,
         memtable,
         trace_memtable,
-        default_tenant,
         &mut report,
     )?;
     report.end_offset = end;
@@ -92,7 +88,6 @@ fn replay_from(
     checkpoint: u64,
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
-    default_tenant: &TenantId,
     report: &mut ReplayReport,
 ) -> Result<u64, String> {
     if !wal_path.exists() {
@@ -166,8 +161,16 @@ fn replay_from(
             .map_err(|error| format!("journal record invalid at offset {offset}: {error}"))?
         {
             match kind {
+                // The Loki push kind. Nothing writes it since ingest became
+                // OTLP only, and nothing on disk or on the wire is versioned
+                // here by decision — a data directory from before the change
+                // is deleted, not migrated.
                 TENANT_RECORD_KIND_LOGS => {
-                    report.entries += replay_log_record(&tenant, payload, offset, memtable)?;
+                    return Err(format!(
+                        "journal record at offset {offset} is a Loki push record from before \
+ingest became OTLP only; this engine versions nothing, so delete the data directory \
+and re-ingest"
+                    ));
                 }
                 TENANT_RECORD_KIND_TRACES => {
                     replay_trace_record(&tenant, payload, offset, trace_memtable)?;
@@ -182,7 +185,11 @@ fn replay_from(
                 }
             }
         } else {
-            report.entries += replay_log_record(default_tenant, &data, offset, memtable)?;
+            return Err(format!(
+                "journal record at offset {offset} has no tenant frame; that is a WAL from \
+before tenant framing, and this engine versions nothing — delete the data directory \
+and re-ingest"
+            ));
         }
         offset += (RECORD_HEADER_SIZE + len) as u64;
         replayed += 1;
@@ -194,45 +201,7 @@ fn replay_from(
     Ok(offset)
 }
 
-/// Returns the entries put back, which is what an operator needs to size the
-/// duplication a restart may have caused.
-fn replay_log_record(
-    tenant: &TenantId,
-    payload: &[u8],
-    offset: u64,
-    memtable: &MemTable,
-) -> Result<u64, String> {
-    let request = PushRequest::decode(payload)
-        .map_err(|e| format!("journal protobuf decode failed at offset {offset}: {e}"))?;
-    let mut replayed_entries = 0u64;
-    for stream in &request.streams {
-        let labels = proto::parse_labels(&stream.labels)
-            .map_err(|e| format!("journal record has invalid labels at offset {offset}: {e}"))?;
-        let entries: Vec<LogEntry> = stream
-            .entries
-            .iter()
-            .map(|e| {
-                let timestamp_ns = e.timestamp_ns().map_err(|error| {
-                    format!("journal record has invalid timestamp at offset {offset}: {error}")
-                })?;
-                Ok(LogEntry {
-                    timestamp_ns,
-                    line: e.line.clone(),
-                    structured_metadata: e
-                        .structured_metadata
-                        .iter()
-                        .map(|lp| (lp.name.clone(), lp.value.clone()))
-                        .collect(),
-                })
-            })
-            .collect::<Result<Vec<LogEntry>, String>>()?;
-        replayed_entries += entries.len() as u64;
-        memtable.insert(tenant.clone(), labels, entries);
-    }
-    Ok(replayed_entries)
-}
-
-/// The OTLP counterpart of `replay_log_record`: the payload is the export as
+/// The payload is the export as
 /// it arrived, normalized here exactly as ingest normalized it before the
 /// crash. An `EmptyRequest` is skipped rather than fatal — a record was only
 /// appended after normalizing non-empty, so hitting one here is a bug to log,

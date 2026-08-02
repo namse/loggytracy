@@ -337,7 +337,6 @@ mod tests {
             service.journal.ckpt_path(),
             &crate::memtable::MemTable::new(),
             &replayed,
-            &test_tenant(),
         )
         .unwrap();
         assert_eq!(

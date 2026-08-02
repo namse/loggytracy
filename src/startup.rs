@@ -91,13 +91,7 @@ pub fn recover_with_traces(
 
     let wal_path = config.data_dir.join("journal.wal");
     let ckpt_path = config.data_dir.join("journal.ckpt");
-    let replay = journal::replay_reporting(
-        &wal_path,
-        &ckpt_path,
-        memtable,
-        trace_memtable,
-        &config.default_tenant,
-    )?;
+    let replay = journal::replay_reporting(&wal_path, &ckpt_path, memtable, trace_memtable)?;
     let (ckpt_start, replay_end) = (replay.checkpoint, replay.end_offset);
     if replay.records > 0 {
         // Said at WARN rather than INFO. Delivery is at-least-once, so these

@@ -84,8 +84,7 @@ All limits are checked **before** writing to the journal, so rejected requests l
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_MAX_PUSH_BYTES` | 16 MiB | Maximum compressed push body size |
-| `LOGGYTRACY_MAX_DECOMPRESSED_PUSH_BYTES` | 64 MiB | Maximum length reported by the snappy header; prevents the header from determining the allocation size |
+| `LOGGYTRACY_MAX_PUSH_BYTES` | 16 MiB | Largest single request the tenant ingest quota must always admit — the token bucket's burst floor. The OTLP body limit itself is a 16 MiB constant on both transports |
 | `LOGGYTRACY_MAX_LINE_BYTES` | 256 KiB | Maximum size of one log line |
 | `LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM` | 30 | Maximum labels per stream |
 | `LOGGYTRACY_MAX_LABEL_NAME_BYTES` | 1024 | |

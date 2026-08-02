@@ -1,7 +1,9 @@
     use super::*;
-    use crate::tenant::test_tenant;
     use crate::memtable::MemTable;
-    use crate::proto::{EntryAdapter, StreamAdapter};
+    use crate::tenant::test_tenant;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
     use std::sync::Arc;
 
     fn tmp_dir(name: &str) -> PathBuf {
@@ -19,29 +21,43 @@
         p
     }
 
-    fn make_push_req(streams: &[(&str, Vec<(&str, i64)>)]) -> Vec<u8> {
-        let streams: Vec<StreamAdapter> = streams
-            .iter()
-            .map(|(labels, entries)| StreamAdapter {
-                labels: labels.to_string(),
-                entries: entries
-                    .iter()
-                    .map(|(line, ts)| EntryAdapter {
-                        timestamp: Some(::prost_types::Timestamp {
-                            seconds: *ts,
-                            nanos: 0,
-                        }),
-                        line: line.to_string(),
-                        structured_metadata: vec![],
-                    })
-                    .collect(),
-                hash: 0,
-            })
-            .collect();
-        let req = PushRequest { streams };
-        let mut buf = Vec::new();
-        req.encode(&mut buf).unwrap();
-        buf
+    /// An encoded `ExportLogsServiceRequest`: one `ResourceLogs` per `(app,
+    /// entries)` pair, the app riding as `service.name` so it lands as the
+    /// promoted `service_name` label. Timestamps are seconds, as the Loki-push
+    /// helper this replaces took them.
+    fn make_otlp_req(streams: &[(&str, Vec<(&str, i64)>)]) -> Vec<u8> {
+        let request = ExportLogsServiceRequest {
+            resource_logs: streams
+                .iter()
+                .map(|(app, entries)| ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: vec![KeyValue {
+                            key: "service.name".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue(app.to_string())),
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    scope_logs: vec![ScopeLogs {
+                        log_records: entries
+                            .iter()
+                            .map(|(line, ts_secs)| LogRecord {
+                                time_unix_nano: (*ts_secs as u64) * 1_000_000_000,
+                                body: Some(AnyValue {
+                                    value: Some(any_value::Value::StringValue(line.to_string())),
+                                }),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        Prost014Message::encode_to_vec(&request)
     }
 
     struct Harness {
@@ -61,33 +77,19 @@
     }
 
     async fn push(h: &Harness, raw: Vec<u8>) {
-        let req = PushRequest::decode(raw.as_slice()).unwrap();
-        let mut streams = Vec::with_capacity(req.streams.len());
-        for stream in &req.streams {
-            let labels = proto::parse_labels(&stream.labels).unwrap();
-            let entries: Vec<LogEntry> = stream
-                .entries
-                .iter()
-                .map(|e| LogEntry {
-                    timestamp_ns: e.timestamp_ns().unwrap(),
-                    line: e.line.clone(),
-                    structured_metadata: e
-                        .structured_metadata
-                        .iter()
-                        .map(|lp| (lp.name.clone(), lp.value.clone()))
-                        .collect(),
-                })
-                .collect();
-            streams.push((labels, entries));
-        }
-        h.journal.append(test_tenant(), raw, streams).await.unwrap();
+        let request = ExportLogsServiceRequest::decode(raw.as_slice()).unwrap();
+        let streams = crate::otlp_log::normalize_request(&request).unwrap();
+        h.journal
+            .append_otlp_logs(test_tenant(), raw, streams)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn append_and_checkpoint() {
         let h = harness("append_checkpoint").await;
-        push(&h, make_push_req(&[("{app=\"a\"}", vec![("hi", 100)])])).await;
-        push(&h, make_push_req(&[("{app=\"b\"}", vec![("yo", 200)])])).await;
+        push(&h, make_otlp_req(&[("a", vec![("hi", 100)])])).await;
+        push(&h, make_otlp_req(&[("b", vec![("yo", 200)])])).await;
 
         let ckpt = h.journal.checkpoint().await.unwrap();
         assert!(ckpt.offset > 0);
@@ -99,7 +101,6 @@
             h.journal.wal_path(),
             h.journal.ckpt_path(),
             &MemTable::new(),
-            &test_tenant(),
         )
         .unwrap();
         assert_eq!(start, ckpt.offset);
@@ -156,7 +157,6 @@
             h.journal.wal_path(),
             h.journal.ckpt_path(),
             &restored,
-            &test_tenant(),
         )
         .unwrap();
         let results = restored.query(
@@ -181,7 +181,7 @@
         let h = harness("compact_retains_suffix").await;
         push(
             &h,
-            make_push_req(&[("{app=\"flushed\"}", vec![("old", 100)])]),
+            make_otlp_req(&[("flushed", vec![("old", 100)])]),
         )
         .await;
         let checkpoint = h.journal.checkpoint().await.unwrap();
@@ -189,7 +189,7 @@
 
         push(
             &h,
-            make_push_req(&[("{app=\"inflight\"}", vec![("new", 200)])]),
+            make_otlp_req(&[("inflight", vec![("new", 200)])]),
         )
         .await;
         let before = std::fs::metadata(h.journal.wal_path()).unwrap().len();
@@ -206,7 +206,6 @@
             h.journal.wal_path(),
             h.journal.ckpt_path(),
             &restored,
-            &test_tenant(),
         ).unwrap();
         let results = restored.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true);
         let lines: Vec<_> = results
@@ -219,7 +218,7 @@
     #[tokio::test]
     async fn compaction_failure_does_not_fence_journal_writer() {
         let h = harness("compact_retry").await;
-        push(&h, make_push_req(&[("{app=\"old\"}", vec![("old", 100)])])).await;
+        push(&h, make_otlp_req(&[("old", vec![("old", 100)])])).await;
         let checkpoint = h.journal.checkpoint().await.unwrap();
         h.memtable.commit_flush();
 
@@ -233,7 +232,7 @@
         );
         std::fs::remove_dir(&compact_tmp).unwrap();
 
-        push(&h, make_push_req(&[("{app=\"new\"}", vec![("new", 200)])])).await;
+        push(&h, make_otlp_req(&[("new", vec![("new", 200)])])).await;
         h.journal
             .compact_checkpoint(checkpoint.offset)
             .await
@@ -243,7 +242,6 @@
             h.journal.wal_path(),
             h.journal.ckpt_path(),
             &restored,
-            &test_tenant(),
         ).unwrap();
         let lines: Vec<_> = restored
             .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
@@ -256,7 +254,7 @@
     #[tokio::test]
     async fn compaction_retry_after_rename_failure_keeps_acknowledged_suffix() {
         let h = harness("compact_rename_retry").await;
-        push(&h, make_push_req(&[("{app=\"old\"}", vec![("old", 100)])])).await;
+        push(&h, make_otlp_req(&[("old", vec![("old", 100)])])).await;
         let checkpoint = h.journal.checkpoint().await.unwrap();
         h.memtable.commit_flush();
 
@@ -270,7 +268,7 @@
 
         // The writer was reopened after the injected post-rename failure;
         // this append must remain in the replacement WAL before retry.
-        push(&h, make_push_req(&[("{app=\"new\"}", vec![("new", 200)])])).await;
+        push(&h, make_otlp_req(&[("new", vec![("new", 200)])])).await;
         h.journal
             .compact_checkpoint(checkpoint.offset)
             .await
@@ -281,7 +279,6 @@
             h.journal.wal_path(),
             h.journal.ckpt_path(),
             &restored,
-            &test_tenant(),
         ).unwrap();
         let lines: Vec<_> = restored
             .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
@@ -294,7 +291,7 @@
     #[tokio::test]
     async fn replay_rolls_back_uncommitted_compaction_before_rename() {
         let h = harness("compact_replay_rollback").await;
-        push(&h, make_push_req(&[("{app=\"old\"}", vec![("old", 100)])])).await;
+        push(&h, make_otlp_req(&[("old", vec![("old", 100)])])).await;
         let checkpoint = h.journal.checkpoint().await.unwrap();
         h.memtable.commit_flush();
 
@@ -315,7 +312,6 @@
             h.journal.wal_path(),
             h.journal.ckpt_path(),
             &restored,
-            &test_tenant(),
         ).unwrap();
         assert!(
             restored
@@ -335,7 +331,7 @@
     async fn flush_round(harness: &Harness, label: &str, line: &str) -> u64 {
         push(
             harness,
-            make_push_req(&[(&format!("{{app=\"{label}\"}}"), vec![(line, 100)])]),
+            make_otlp_req(&[(label, vec![(line, 100)])]),
         )
         .await;
         let checkpoint = harness.journal.checkpoint().await.unwrap();
@@ -400,7 +396,6 @@
             h.journal.wal_path(),
             h.journal.ckpt_path(),
             &restored,
-            &test_tenant(),
         )
         .unwrap();
         assert!(
@@ -428,7 +423,7 @@
         for index in 0..20 {
             push(
                 &h,
-                make_push_req(&[("{app=\"nolinger\"}", vec![("line", 100 + index)])]),
+                make_otlp_req(&[("nolinger", vec![("line", 100 + index)])]),
             )
             .await;
         }
@@ -463,9 +458,9 @@
             let journal = journal.clone();
             tokio::spawn(async move {
                 journal
-                    .append(
+                    .append_otlp_logs(
                         test_tenant(),
-                        make_push_req(&[("{app=\"a\"}", vec![("first", 100)])]),
+                        make_otlp_req(&[("a", vec![("first", 100)])]),
                         Vec::new(),
                     )
                     .await
@@ -475,9 +470,9 @@
             let journal = journal.clone();
             tokio::spawn(async move {
                 journal
-                    .append(
+                    .append_otlp_logs(
                         test_tenant(),
-                        make_push_req(&[("{app=\"b\"}", vec![("second", 200)])]),
+                        make_otlp_req(&[("b", vec![("second", 200)])]),
                         Vec::new(),
                     )
                     .await
@@ -512,11 +507,11 @@
         let h = harness("replay_unflushed").await;
         push(
             &h,
-            make_push_req(&[("{app=\"a\"}", vec![("line1", 100), ("line2", 200)])]),
+            make_otlp_req(&[("a", vec![("line1", 100), ("line2", 200)])]),
         )
         .await;
         let mt = MemTable::new();
-        let (start, end) = replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt, &test_tenant()).unwrap();
+        let (start, end) = replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt).unwrap();
         assert_eq!(start, 0);
         assert!(end > 0);
         let results = mt.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
@@ -529,14 +524,14 @@
         let dir = tmp_dir("replay_crc_corruption");
         let wal_path = dir.join(WAL_FILE);
         let ckpt_path = dir.join(CKPT_FILE);
-        let data = make_push_req(&[("{app=\"a\"}", vec![("line", 100)])]);
+        let data = make_otlp_req(&[("a", vec![("line", 100)])]);
         let mut record = Vec::new();
         record.extend_from_slice(&(data.len() as u32).to_le_bytes());
         record.extend_from_slice(&(crc32fast::hash(&data) ^ 1).to_le_bytes());
         record.extend_from_slice(&data);
         std::fs::write(&wal_path, record).unwrap();
 
-        let (start, end) = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant()).unwrap();
+        let (start, end) = replay(&wal_path, &ckpt_path, &MemTable::new()).unwrap();
 
         assert_eq!(start, 0);
         assert_eq!(end, 0);
@@ -552,7 +547,7 @@
         header.extend_from_slice(&0u32.to_le_bytes());
         std::fs::write(&wal_path, header).unwrap();
 
-        let (start, end) = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant()).unwrap();
+        let (start, end) = replay(&wal_path, &ckpt_path, &MemTable::new()).unwrap();
 
         assert_eq!(start, 0);
         assert_eq!(end, 0);
@@ -563,8 +558,8 @@
         let dir = tmp_dir("replay_interior_crc_corruption");
         let wal_path = dir.join(WAL_FILE);
         let ckpt_path = dir.join(CKPT_FILE);
-        let first = make_push_req(&[("{app=\"a\"}", vec![("bad", 100)])]);
-        let second = make_push_req(&[("{app=\"b\"}", vec![("good", 200)])]);
+        let first = make_otlp_req(&[("a", vec![("bad", 100)])]);
+        let second = make_otlp_req(&[("b", vec![("good", 200)])]);
         let mut wal = Vec::new();
         wal.extend_from_slice(&(first.len() as u32).to_le_bytes());
         wal.extend_from_slice(&(crc32fast::hash(&first) ^ 1).to_le_bytes());
@@ -574,7 +569,7 @@
         wal.extend_from_slice(&second);
         std::fs::write(&wal_path, wal).unwrap();
 
-        let result = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant());
+        let result = replay(&wal_path, &ckpt_path, &MemTable::new());
 
         assert!(result.is_err());
     }
@@ -586,7 +581,7 @@
         let ckpt_path = dir.join(CKPT_FILE);
         write_checkpoint(&ckpt_path, 128).unwrap();
 
-        let result = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant());
+        let result = replay(&wal_path, &ckpt_path, &MemTable::new());
 
         assert!(result.is_err());
     }
@@ -599,7 +594,7 @@
         std::fs::write(&wal_path, [0u8; 16]).unwrap();
         write_checkpoint(&ckpt_path, 32).unwrap();
 
-        let result = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant());
+        let result = replay(&wal_path, &ckpt_path, &MemTable::new());
 
         assert!(result.is_err());
     }
@@ -613,7 +608,7 @@
 
         for bytes in [&[1u8, 2, 3][..], &[0u8; 9][..]] {
             std::fs::write(&ckpt_path, bytes).unwrap();
-            let error = replay(&wal_path, &ckpt_path, &MemTable::new(), &test_tenant())
+            let error = replay(&wal_path, &ckpt_path, &MemTable::new())
                 .expect_err("malformed checkpoint must stop recovery");
             assert!(error.contains("exactly 8 bytes"));
         }
@@ -636,7 +631,7 @@
     #[tokio::test]
     async fn checkpoint_clears_memtable_and_persists_offset() {
         let h = harness("ckpt_clear").await;
-        push(&h, make_push_req(&[("{app=\"a\"}", vec![("x", 1)])])).await;
+        push(&h, make_otlp_req(&[("a", vec![("x", 1)])])).await;
         let ckpt = h.journal.checkpoint().await.unwrap();
         // checkpoint clears inner and moves the data to the flushing buffer; unified_query still sees it.
         // Call commit_flush to simulate completed flushing.
@@ -644,10 +639,10 @@
         h.journal.set_checkpoint(ckpt.offset).unwrap();
         assert_eq!(h.memtable.approximate_size(), 0);
 
-        push(&h, make_push_req(&[("{app=\"b\"}", vec![("y", 2)])])).await;
+        push(&h, make_otlp_req(&[("b", vec![("y", 2)])])).await;
 
         let mt = MemTable::new();
-        replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt, &test_tenant()).unwrap();
+        replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt).unwrap();
         let results = mt.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
@@ -660,18 +655,18 @@
         let globex = TenantId::parse("globex").unwrap();
         harness
             .journal
-            .append(
+            .append_otlp_logs(
                 acme.clone(),
-                make_push_req(&[(r#"{app="a"}"#, vec![("acme line", 100)])]),
+                make_otlp_req(&[("a", vec![("acme line", 100)])]),
                 vec![],
             )
             .await
             .unwrap();
         harness
             .journal
-            .append(
+            .append_otlp_logs(
                 globex.clone(),
-                make_push_req(&[(r#"{app="b"}"#, vec![("globex line", 200)])]),
+                make_otlp_req(&[("b", vec![("globex line", 200)])]),
                 vec![],
             )
             .await
@@ -682,7 +677,6 @@
             harness.journal.wal_path(),
             harness.journal.ckpt_path(),
             &restored,
-            &test_tenant(),
         )
         .unwrap();
 
@@ -699,30 +693,53 @@
         assert!(lines(&test_tenant()).is_empty());
     }
 
+    /// Records this engine no longer writes fail replay loudly with the
+    /// instruction the no-versioning policy implies: delete and re-ingest.
+    /// Silently skipping either would drop acknowledged data on the floor.
     #[test]
-    fn replay_attributes_a_pre_tenancy_record_to_the_default_tenant() {
-        // A WAL written before tenancy holds bare PushRequest bytes with no
-        // framing. Upgrading must recover that data, not reject it.
-        let dir = tmp_dir("legacy_record");
+    fn replay_refuses_records_from_before_the_otlp_only_change() {
+        // A tenant-framed kind-0 record, the Loki push encoding.
+        let dir = tmp_dir("pre_otlp_record");
         let wal_path = dir.join(WAL_FILE);
         let ckpt_path = dir.join(CKPT_FILE);
-        let payload = make_push_req(&[(r#"{app="legacy"}"#, vec![("from before tenancy", 100)])]);
+        let payload = frame_tenant_record(&test_tenant(), TENANT_RECORD_KIND_LOGS, b"anything");
         let mut wal = Vec::new();
         wal.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         wal.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
         wal.extend_from_slice(&payload);
+        // A valid record after it, so the refusal cannot be mistaken for the
+        // tolerated corrupt-tail case.
+        let good = frame_tenant_record(
+            &test_tenant(),
+            TENANT_RECORD_KIND_OTLP_LOGS,
+            &make_otlp_req(&[("a", vec![("x", 1)])]),
+        );
+        wal.extend_from_slice(&(good.len() as u32).to_le_bytes());
+        wal.extend_from_slice(&crc32fast::hash(&good).to_le_bytes());
+        wal.extend_from_slice(&good);
         std::fs::write(&wal_path, &wal).unwrap();
 
-        let restored = MemTable::new();
-        replay(&wal_path, &ckpt_path, &restored, &test_tenant()).unwrap();
+        let error = replay(&wal_path, &ckpt_path, &MemTable::new())
+            .expect_err("a pre-OTLP record must refuse replay");
+        assert!(error.contains("delete the data directory"), "{error}");
 
-        let entries = restored.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
-        assert_eq!(
-            entries
-                .into_iter()
-                .flat_map(|stream| stream.entries)
-                .map(|entry| entry.line)
-                .collect::<Vec<_>>(),
-            vec!["from before tenancy"]
-        );
+        // An unframed record, the pre-tenancy WAL form, same policy.
+        let unframed_dir = tmp_dir("unframed_record");
+        let unframed_wal = unframed_dir.join(WAL_FILE);
+        let payload = make_otlp_req(&[("legacy", vec![("bare", 100)])]);
+        let mut wal = Vec::new();
+        for _ in 0..2 {
+            wal.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            wal.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+            wal.extend_from_slice(&payload);
+        }
+        std::fs::write(&unframed_wal, &wal).unwrap();
+
+        let error = replay(
+            &unframed_wal,
+            &unframed_dir.join(CKPT_FILE),
+            &MemTable::new(),
+        )
+        .expect_err("an unframed record must refuse replay");
+        assert!(error.contains("delete the data directory"), "{error}");
     }

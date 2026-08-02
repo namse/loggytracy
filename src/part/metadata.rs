@@ -316,7 +316,7 @@ fn validate_meta_file(dir: &Path, meta: &MetaFile) -> Result<(), String> {
     for stream in &meta.streams {
         let mut names = BTreeSet::new();
         for (name, _) in stream {
-            crate::proto::validate_label_name(name)?;
+            crate::label_name::validate_label_name(name)?;
             if !names.insert(name) {
                 return Err(format!("duplicate label {name} in part stream metadata"));
             }

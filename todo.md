@@ -772,8 +772,24 @@ the flush transient can stop being ~4x its input (rows_from_snapshot copies plus
 per JSON row plus arrow plus parquet buffers, all live at once); whether query-under-ingest deserves
 its own budget the way scans have permits; and whether the load verdict's 2s query-p95 target was ever
 passed by any revision — no retained artifact says it was.
-- [ ] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
+- [x] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
       parser, and `proto.rs`'s encode side
+
+      Done 2026-08-02, after the OTLP bed run above proved the kept shape at full agreement — the order the
+      section header demanded. Gone: the `/loki/api/v1/push` route and both body variants, the snappy path,
+      `proto.rs` whole (decode side included — replay of a kind-0 or unframed record now fails with
+      "delete the data directory and re-ingest", which is the no-versioning policy said out loud),
+      `push_test.rs`, `max_decompressed_push_bytes`, and the `snap`/`prost 0.13`/`prost-types`
+      dependencies. Kept and moved: `validate_label_name`/`validate_field_name` to `label_name.rs` — they
+      were never about the wire; LogQL's grammar and the reserved Parquet column names are storage and
+      query properties, and the OTLP path needs no call site because its labels come only from the fixed
+      promotion list (a test on `otlp_log.rs` holds that every promoted name sanitizes valid and
+      unreserved). `max_push_bytes` survives as the tenant quota's burst floor, which was its load-bearing
+      role all along. The uniquely-covering push tests were ported, not dropped: both backpressure gates
+      with their release halves, the allowlist 403, the promoted-label count bound, the u64→i64 timestamp
+      overflow, the disabled window, and the full flush-loop-through-restart pipeline, all speaking OTLP.
+      `bench_encode_push_request` retired with the thing it measured; `wal/append` now appends the bytes
+      the WAL actually stores.
 - [x] **Then stop re-encoding into a Loki `PushRequest` for the WAL.** It exists so replay has one decoder
       while two protocols converge, and it costs a whole second message materialized with a clone per line and
       per label, then serialized, framed and batched — five copies for the WAL alone, on the consumer's own

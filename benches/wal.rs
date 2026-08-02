@@ -11,9 +11,10 @@
 //!   journal cannot be asked to skip its fsync — that is the point of it — so
 //!   the baseline is measured beside it rather than inside it.
 //!
-//! `encode_push_request` is here too: the JSON and OTLP paths re-encode a
-//! whole Loki `PushRequest` for the WAL so replay has one decoder
-//! (`docs/VISION.md` II).
+//! `encode_push_request` was here too, measuring the second message the JSON
+//! and OTLP paths built for the WAL so replay had one decoder. The WAL stores
+//! the OTLP export itself now, so the thing that bench measured no longer
+//! exists (`todo.md`, "Next — OTLP only").
 
 #[path = "corpus/mod.rs"]
 #[allow(dead_code)]
@@ -27,7 +28,6 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use loggytracy::config::Config;
 use loggytracy::journal::Journal;
 use loggytracy::memtable::MemTable;
-use loggytracy::proto;
 use loggytracy::tenant::TenantId;
 
 use corpus::{CorpusSpec, scratch::ScratchDir};
@@ -52,10 +52,59 @@ fn push_payload() -> (Vec<u8>, TenantId) {
             .labels_per_stream(6),
     );
     let batches = corpus::push_batches(&corpus);
-    (
-        proto::encode_push_request(&batches),
-        corpus.tenant().clone(),
-    )
+    (encode_otlp(&batches), corpus.tenant().clone())
+}
+
+/// The bytes the WAL stores: the export itself, one `ResourceLogs` per
+/// stream, the labels riding as resource attributes.
+fn encode_otlp(
+    batches: &[(
+        loggytracy::memtable::Labels,
+        Vec<loggytracy::memtable::LogEntry>,
+    )],
+) -> Vec<u8> {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    let attr = |key: &str, value: &str| KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_string())),
+        }),
+        ..Default::default()
+    };
+    let request = ExportLogsServiceRequest {
+        resource_logs: batches
+            .iter()
+            .map(|(labels, entries)| ResourceLogs {
+                resource: Some(Resource {
+                    attributes: labels.iter().map(|(k, v)| attr(k, v)).collect(),
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: entries
+                        .iter()
+                        .map(|entry| LogRecord {
+                            time_unix_nano: entry.timestamp_ns.max(0) as u64,
+                            body: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue(entry.line.clone())),
+                            }),
+                            attributes: entry
+                                .structured_metadata
+                                .iter()
+                                .map(|(k, v)| attr(k, v))
+                                .collect(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect(),
+    };
+    prost014::Message::encode_to_vec(&request)
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -116,7 +165,7 @@ fn bench_append(c: &mut Criterion) {
                     let record = payload.clone();
                     let started = Instant::now();
                     journal
-                        .append(tenant.clone(), record, Vec::new())
+                        .append_otlp_logs(tenant.clone(), record, Vec::new())
                         .await
                         .expect("append succeeds");
                     elapsed += started.elapsed();
@@ -139,9 +188,9 @@ fn bench_append(c: &mut Criterion) {
                     for _ in 0..iters {
                         let records: Vec<Vec<u8>> = (0..batch).map(|_| payload.clone()).collect();
                         let started = Instant::now();
-                        let appends = records
-                            .into_iter()
-                            .map(|record| journal.append(tenant.clone(), record, Vec::new()));
+                        let appends = records.into_iter().map(|record| {
+                            journal.append_otlp_logs(tenant.clone(), record, Vec::new())
+                        });
                         for result in futures_util::future::join_all(appends).await {
                             result.expect("append succeeds");
                         }
@@ -206,37 +255,5 @@ fn bench_fsync(c: &mut Criterion) {
     group.finish();
 }
 
-/// The second message invariant II objects to: the JSON and OTLP ingest paths
-/// build a whole Loki `PushRequest`, with a clone per line and per label, so
-/// that replay has one decoder.
-fn bench_encode_push_request(c: &mut Criterion) {
-    let mut group = c.benchmark_group("wal/encode_push_request");
-    group
-        .sample_size(20)
-        .warm_up_time(WARM_UP)
-        .measurement_time(Duration::from_secs(1));
-    for entries in [8usize, 512] {
-        let corpus = corpus::generate(
-            &CorpusSpec::default()
-                .rows(entries)
-                .streams(4)
-                .labels_per_stream(6),
-        );
-        let batches = corpus::push_batches(&corpus);
-        group.throughput(Throughput::Bytes(corpus.line_bytes()));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(entries),
-            &batches,
-            |b, batches| b.iter(|| proto::encode_push_request(batches)),
-        );
-    }
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    bench_append,
-    bench_fsync,
-    bench_encode_push_request
-);
+criterion_group!(benches, bench_append, bench_fsync);
 criterion_main!(benches);

@@ -132,7 +132,7 @@ and query paths.
 - **Observability**: Expose every quota and rejection counter on `/metrics` with a tenant label. Operating
   quotas requires visibility into "who was blocked, where, and by how much."
 - **Current state**: Identification, validation, and isolation are implemented. `X-Scope-OrgID` is extracted
-  from Loki push and OTLP gRPC and recorded in WAL records (the owner survives restart), while MemTable,
+  from OTLP HTTP and gRPC and recorded in WAL records (the owner survives restart), while MemTable,
   part, trace part, query, and catalog reads all require a tenant argument. Only `/metrics` retains a
   process-wide operator aggregation. **Per-tenant quotas, throttles, durable usage accounting, and tier
   partitioning** remain; these are steps 5 and 6 in `docs/MULTI_TENANCY_DESIGN.md`
@@ -219,8 +219,7 @@ LogQL parsing (chumsky) → plan → pruning in this order:
 All limits apply **before** journal append, so rejected requests leave no trace in the WAL.
 Protecting the engine takes priority over preserving every log line — Alloy retries or drops rejected batches from its own WAL.
 
-- `LOGGYTRACY_MAX_PUSH_BYTES` (16 MiB by default): Compressed push-body limit. This replaces axum's implicit 2 MiB default, so raise it along with Alloy batch size.
-- `LOGGYTRACY_MAX_DECOMPRESSED_PUSH_BYTES` (64 MiB by default): Limit for the decompressed length reported by the snappy header. `decompress_vec` allocates the reported length before validating the stream, so without this check a header of only a few bytes determines the allocation size.
+- `LOGGYTRACY_MAX_PUSH_BYTES` (16 MiB by default): The largest single request the tenant ingest quota must always be able to admit — the token bucket's burst capacity is floored at this. The OTLP body limit itself is a 16 MiB constant, matched across both transports.
 - `LOGGYTRACY_MAX_LINE_BYTES` (256 KiB by default)
 - `LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM` (30 by default), `LOGGYTRACY_MAX_LABEL_NAME_BYTES` (1 KiB by default), and `LOGGYTRACY_MAX_LABEL_VALUE_BYTES` (2 KiB by default): Defend against stream-cardinality explosions. The stream index is a persistent catalog excluded from the cache limit, so a cardinality explosion becomes non-evictable disk usage.
 - `LOGGYTRACY_MAX_TIMESTAMP_AGE` (7d by default) and `LOGGYTRACY_MAX_TIMESTAMP_SKEW` (1h by default): Acceptance window relative to the server clock. Disable with `off` when bulk-loading historical data. Because partitions are UTC-day based, clock errors or unit mistakes (sending seconds/milliseconds as nanoseconds) multiply partitions; in particular, **a future-date part never reaches the retention cutoff.**
@@ -290,4 +289,4 @@ Unsupported syntax is rejected during parsing with a clear error message.
 
 ## Main crates
 
-`tokio`, `axum`, `tonic`/`prost` (OTLP), `snap` (Loki push), `arrow`/`parquet`, `datafusion` (under consideration), `object_store`, `chumsky` (LogQL), `roaring`, `opentelemetry-proto`
+`tokio`, `axum`, `tonic`/`prost` (OTLP), `arrow`/`parquet`, `datafusion` (under consideration), `object_store`, `chumsky` (LogQL), `roaring`, `opentelemetry-proto`

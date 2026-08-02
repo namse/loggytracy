@@ -40,10 +40,12 @@ pub struct Config {
     /// per second. Raise it only on a disk where an fsync costs more than the
     /// added latency.
     pub max_batch_ms: u64,
-    /// Largest accepted compressed push body. Also bounds the length a snappy
-    /// header may declare, so a tiny body cannot drive a huge allocation.
+    /// The largest single request the tenant ingest quota must always be able
+    /// to admit: the token bucket's burst capacity is floored at this, or a
+    /// legal body larger than the bucket would be refused forever. The OTLP
+    /// body limit itself is `MAX_OTLP_REQUEST_BYTES`, a constant matched
+    /// across both transports.
     pub max_push_bytes: usize,
-    pub max_decompressed_push_bytes: usize,
     pub max_line_bytes: usize,
     pub max_label_names_per_stream: usize,
     pub max_label_name_bytes: usize,
@@ -193,7 +195,6 @@ impl Default for Config {
             max_batch_bytes: 1024 * 1024,
             max_batch_ms: 0,
             max_push_bytes: 16 * 1024 * 1024,
-            max_decompressed_push_bytes: 64 * 1024 * 1024,
             max_line_bytes: 256 * 1024,
             max_label_names_per_stream: 30,
             max_label_name_bytes: 1024,
@@ -356,10 +357,6 @@ impl Config {
             max_push_bytes: env_positive_usize(
                 "LOGGYTRACY_MAX_PUSH_BYTES",
                 defaults.max_push_bytes,
-            )?,
-            max_decompressed_push_bytes: env_positive_usize(
-                "LOGGYTRACY_MAX_DECOMPRESSED_PUSH_BYTES",
-                defaults.max_decompressed_push_bytes,
             )?,
             max_line_bytes: env_positive_usize(
                 "LOGGYTRACY_MAX_LINE_BYTES",
@@ -634,13 +631,6 @@ impl Config {
         // Zero is the default and means "do not linger", so this one is not a
         // positive-value knob.
         positive_usize("max_push_bytes", self.max_push_bytes)?;
-        positive_usize(
-            "max_decompressed_push_bytes",
-            self.max_decompressed_push_bytes,
-        )?;
-        if self.max_decompressed_push_bytes < self.max_push_bytes {
-            return Err("max_decompressed_push_bytes must not be below max_push_bytes".to_string());
-        }
         positive_usize("max_line_bytes", self.max_line_bytes)?;
         positive_usize(
             "max_label_names_per_stream",

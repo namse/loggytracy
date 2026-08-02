@@ -196,7 +196,7 @@ async fn m6_draining_rejects_new_ingest_and_readiness() {
         .unwrap_err();
     assert_eq!(ready_error.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
 
-    let push_error = crate::ingest::push(
+    let push_error = crate::otlp_http::logs(
         axum::extract::State(state.clone()),
         axum::http::HeaderMap::new(),
         axum::body::Bytes::new(),
@@ -476,9 +476,7 @@ async fn m6_a_fenced_writer_stops_instead_of_retrying_forever() {
     crate::journal::replay(
         journal.wal_path(),
         journal.ckpt_path(),
-        &replayed,
-        &config.default_tenant,
-    )
+        &replayed)
     .unwrap();
     assert!(!replayed.is_empty(), "the WAL must still hold the records");
 }

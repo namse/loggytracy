@@ -252,7 +252,7 @@ fn parse_grouping(input: &str) -> Result<Vec<String>, String> {
         if label.is_empty() {
             return Err("empty label in by grouping".to_string());
         }
-        crate::proto::validate_field_name(label)?;
+        crate::label_name::validate_field_name(label)?;
         labels.push(label.to_string());
     }
     labels.sort();
@@ -310,7 +310,7 @@ fn parse_matchers(input: &str) -> Result<Vec<LabelMatcher>, String> {
     while pos < input.len() {
         skip_space(input, &mut pos);
         let name = parse_identifier(input, &mut pos)?;
-        crate::proto::validate_label_name(&name)?;
+        crate::label_name::validate_label_name(&name)?;
         skip_space(input, &mut pos);
         let op = parse_matcher_op(input, &mut pos)?;
         skip_space(input, &mut pos);

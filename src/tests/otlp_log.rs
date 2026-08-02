@@ -167,30 +167,54 @@
         assert_eq!(error, OtlpLogError::EmptyRequest);
     }
 
-    /// The journal stores every log record as a Loki `PushRequest` whatever
-    /// protocol it arrived on, so replay has one decoder. That only holds if
-    /// the label rendering round-trips — a value with a quote in it would
-    /// otherwise write a record the WAL cannot read back.
+    /// The journal stores the export as it arrived and replay re-normalizes,
+    /// so what must round-trip is normalization itself — the same bytes must
+    /// normalize to the same streams before and after a crash, awkward label
+    /// values included.
     #[test]
-    fn normalized_labels_round_trip_through_the_journal_encoding() {
-        let awkward = normalize_request(&request(
+    fn an_awkward_export_normalizes_identically_after_a_wal_round_trip() {
+        let export = request(
             vec![attribute(
                 "service.name",
                 string_value(r#"say "hi"\ then a newline
 "#),
             )],
             vec![record(1_700_000_000_000_000_000, "line")],
-        ))
-        .unwrap();
-
-        let encoded = crate::proto::encode_push_request(&awkward);
-        let decoded = <crate::proto::PushRequest as prost::Message>::decode(encoded.as_slice())
-            .expect("the journal encoding decodes");
-        let labels = crate::proto::parse_labels(&decoded.streams[0].labels)
-            .expect("and its labels parse back");
-        assert_eq!(labels, awkward[0].0);
-        assert_eq!(
-            decoded.streams[0].entries[0].timestamp_ns().unwrap(),
-            1_700_000_000_000_000_000
         );
+        let before = normalize_request(&export).unwrap();
+
+        let encoded = prost014::Message::encode_to_vec(&export);
+        let decoded = <ExportLogsServiceRequest as prost014::Message>::decode(encoded.as_slice())
+            .expect("the WAL payload decodes");
+        let after = normalize_request(&decoded).expect("and normalizes again");
+        assert_eq!(before.len(), after.len());
+        for ((labels_before, entries_before), (labels_after, entries_after)) in
+            before.iter().zip(&after)
+        {
+            assert_eq!(labels_before, labels_after);
+            assert_eq!(entries_before.len(), entries_after.len());
+            for (entry_before, entry_after) in entries_before.iter().zip(entries_after) {
+                assert_eq!(entry_before.timestamp_ns, entry_after.timestamp_ns);
+                assert_eq!(entry_before.line, entry_after.line);
+                assert_eq!(
+                    entry_before.structured_metadata,
+                    entry_after.structured_metadata
+                );
+            }
+        }
+        assert_eq!(after[0].1[0].timestamp_ns, 1_700_000_000_000_000_000);
+    }
+
+    /// The OTLP path has no reserved-name check because it needs none: stream
+    /// labels come only from the fixed promotion list, and every sanitized
+    /// member of it must stay a valid, unreserved label name. If a name is
+    /// ever added for which this fails, the check has to move into
+    /// `split_resource_attributes` rather than this test being weakened.
+    #[test]
+    fn every_promoted_attribute_sanitizes_to_a_valid_unreserved_label_name() {
+        for name in PROMOTED_RESOURCE_ATTRIBUTES {
+            let sanitized = sanitize_label_name(name);
+            crate::label_name::validate_label_name(&sanitized)
+                .unwrap_or_else(|error| panic!("{name} -> {sanitized}: {error}"));
+        }
     }

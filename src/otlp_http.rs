@@ -115,7 +115,30 @@ pub async fn logs(
         parts: &state.parts,
         memtable: &state.memtable,
     };
+    // Ahead of the request counter as well as the body work, the accounting
+    // the push handler this replaces kept: a refusal at the gate is not an
+    // ingest the server attempted, so it is neither a request nor an error.
     ingest.admit_transport()?;
+    state
+        .metrics
+        .ingest_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let result = logs_inner(&state, &ingest, headers, body).await;
+    if result.is_err() {
+        state
+            .metrics
+            .ingest_errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+async fn logs_inner(
+    state: &Arc<AppState>,
+    ingest: &OtlpLogIngest<'_>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, IngestError> {
     let encoding = OtlpEncoding::from_headers(&headers)?;
     let tenant = crate::tenant::from_headers(&headers, &state.config)
         .map_err(crate::tenant::TenantError::into_http)?;

@@ -80,19 +80,6 @@ impl Journal {
         &self.memtable
     }
 
-    pub async fn append(
-        &self,
-        tenant: TenantId,
-        data: Vec<u8>,
-        streams: Vec<(Labels, Vec<LogEntry>)>,
-    ) -> Result<(), IoError> {
-        let framed = {
-            let _arena = crate::memprof::enter(crate::memprof::Arena::Wal);
-            frame_tenant_record(&tenant, TENANT_RECORD_KIND_LOGS, &data)
-        };
-        self.send_append(framed, tenant, streams, Vec::new()).await
-    }
-
     /// An OTLP log export: `data` is the encoded `ExportLogsServiceRequest`
     /// itself — for the HTTP protobuf transport the received body verbatim —
     /// and `streams` is what `otlp_log::normalize_request` already produced

@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use prost::Message;
 use prost014::Message as Prost014Message;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -15,7 +14,6 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use crate::config::Config;
 use crate::memtable::{Labels, LogEntry, MemTable, MemTableSnapshot};
-use crate::proto::{self, PushRequest};
 use crate::tenant::TenantId;
 use crate::trace::{ExportTraceServiceRequest, TraceMemTable, TraceSpan, normalize_request};
 
