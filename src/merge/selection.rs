@@ -111,6 +111,13 @@ fn group_for_merge(parts: &[Arc<PartReader>], config: &Config) -> Vec<Vec<Arc<Pa
     // 300k-row parts with a 1M target are split into groups of 3 and 1 and are
     // skipped forever by merge_min_part_count=4.
     let min_part_count = config.merge_min_part_count.max(2);
+    // Paging costs at least MIN_STREAM_PAGE_BYTES per input part, so a group
+    // larger than the paging budget can pay for is a group whose rewrite is
+    // over budget before it reads a row. A chunked flush produces several
+    // small parts per flush, which is exactly how groups grow past it.
+    let max_group_parts = (merge_paging_budget(config.merge_max_memory_bytes)
+        / MIN_STREAM_PAGE_BYTES)
+        .max(min_part_count as u64) as usize;
     for r in parts {
         if r.meta().row_count >= config.merge_max_part_rows {
             // Do not add an already-large part to a merge group.
@@ -137,7 +144,9 @@ fn group_for_merge(parts: &[Arc<PartReader>], config: &Config) -> Vec<Vec<Arc<Pa
         current_rows = current_rows.saturating_add(r.meta().row_count);
         current_bytes = current_bytes.saturating_add(estimated_part_bytes(r));
         current.push(r.clone());
-        if current.len() >= min_part_count && current_rows >= config.merge_target_part_rows {
+        if current.len() >= max_group_parts
+            || (current.len() >= min_part_count && current_rows >= config.merge_target_part_rows)
+        {
             groups.push(std::mem::take(&mut current));
             current_rows = 0;
             current_bytes = 0;
@@ -158,13 +167,27 @@ fn estimated_part_bytes(reader: &PartReader) -> u64 {
     reader.meta().materialized_bytes
 }
 
-/// Bytes of one part's rows a stream holds while paging.
+/// Most bytes of one part's rows a stream holds while paging.
 ///
-/// This is now the only thing that bounds a rewrite's liveness. It used to be
-/// `merge_max_memory_bytes` against the whole group, which is what
-/// `docs/MEMORY_ATTRIBUTION.md` measured at 829 MiB; a page is per stream and
-/// independent of how large the parts are.
+/// A page is per **input part**, so a group's paging liveness is this times
+/// its part count — which is why [`rewrite_group`] shrinks the page below
+/// this ceiling when `merge_max_memory_bytes / 2` divided by the group is
+/// smaller, and why [`group_for_merge`] caps the group's part count at what
+/// that budget can page at [`MIN_STREAM_PAGE_BYTES`]. Before either bound
+/// existed, a 55-part group paged 8 MiB each and the rewrite's liveness was
+/// whatever the backlog happened to be.
 const STREAM_PAGE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Floor under the adaptive page: below this a page is smaller than one row
+/// group's worth of rows for typical lines, and the stream re-reads the same
+/// group over and over.
+const MIN_STREAM_PAGE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Half of `merge_max_memory_bytes`: the input-paging share of the budget,
+/// the other half being the writer's row group, index and bloom state.
+fn merge_paging_budget(merge_max_memory_bytes: u64) -> u64 {
+    (merge_max_memory_bytes / 2).max(MIN_STREAM_PAGE_BYTES)
+}
 
 #[cfg(test)]
 fn read_all_rows(readers: &[Arc<PartReader>]) -> Result<Vec<part::Row>, String> {
@@ -199,6 +222,7 @@ pub fn rewrite_group(
     deletes: &crate::delete_requests::DeleteMasks,
     parts_root: &Path,
     row_group_size: usize,
+    merge_max_memory_bytes: u64,
     old_dirs: &[PathBuf],
 ) -> Result<GroupRewrite, String> {
     if readers.is_empty() {
@@ -258,7 +282,9 @@ pub fn rewrite_group(
         .map(|(key, _)| key)
         .collect();
 
-    let mut merged = part::MergedRows::new(readers, STREAM_PAGE_BYTES);
+    let page_bytes = (merge_paging_budget(merge_max_memory_bytes) / readers.len() as u64)
+        .clamp(MIN_STREAM_PAGE_BYTES, STREAM_PAGE_BYTES);
+    let mut merged = part::MergedRows::new(readers, page_bytes);
     let mut keep = |row: &part::Row| {
         if let Some(cutoffs) = cutoffs
             && cutoffs.is_expired(&row.tenant, row.timestamp_ns)

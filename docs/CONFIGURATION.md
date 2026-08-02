@@ -117,6 +117,7 @@ assumes clients back off on 429 and rely on their own WAL, so disabling them bre
 | `LOGGYTRACY_FLUSH_MAX_BYTES` | 1 MiB | Flush when the memtable reaches this size |
 | `LOGGYTRACY_FLUSH_MAX_INTERVAL` | `5s` | Flush at this interval even when the size threshold is not reached. **This value is the RPO for unexpected disk loss, and it is also the object-store bill** — see below |
 | `LOGGYTRACY_FLUSH_CHECK_INTERVAL` | `500ms` | Interval at which the flush loop checks conditions |
+| `LOGGYTRACY_FLUSH_CHUNK_BYTES` | 32 MiB (minimum 1 MiB) | Most a flush materializes at once. The snapshot is written in chunks of this many bytes, so the flush transient is bounded by the chunk rather than by how large the memtable grew while the previous flush ran |
 | `LOGGYTRACY_ROW_GROUP_SIZE` | 8192 (maximum 65536) | Parquet row group row count. Groups also stop at tenant boundaries, so **the number of tenants in a part is a lower bound for the actual row group count** |
 
 ## Merge

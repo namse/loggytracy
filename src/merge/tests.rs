@@ -499,6 +499,67 @@
         }
     }
 
+    /// Paging costs at least `MIN_STREAM_PAGE_BYTES` per input part, so group
+    /// selection must stop adding parts where the paging budget stops paying
+    /// for them. Before this cap a chunked flush's spray of small parts grew
+    /// groups without bound — 55 parts at 8 MiB each was measured as a
+    /// ~440 MiB rewrite transient.
+    #[test]
+    fn a_group_never_outgrows_what_the_paging_budget_can_page() {
+        let dir = tmp_dir("group-part-cap");
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let config = Config {
+            merge_min_part_count: 2,
+            // Paging budget 8 MiB at a 2 MiB floor: at most 4 parts a group.
+            merge_max_memory_bytes: 16 * 1024 * 1024,
+            ..Config::default()
+        };
+        let readers: Vec<Arc<PartReader>> = (0..10)
+            .map(|i| {
+                let parts = part::flush_rows(
+                    vec![tenant_row("cap", 1_000 + i)],
+                    &parts_root,
+                    config.row_group_size,
+                )
+                .unwrap();
+                Arc::new(PartReader::open(parts.into_iter().next().unwrap()).unwrap())
+            })
+            .collect();
+
+        let groups = group_for_merge(&readers, &config);
+        assert_eq!(
+            groups.iter().map(Vec::len).sum::<usize>(),
+            10,
+            "the cap must split groups, not drop parts"
+        );
+        for group in &groups {
+            assert!(
+                group.len() <= 4,
+                "a group of {} outgrew the paging budget",
+                group.len()
+            );
+        }
+        assert!(groups.len() >= 3);
+
+        // The rewrite of a capped group agrees with its inputs row for row,
+        // with the page shrunk to fit rather than the read over budget.
+        let old_dirs: Vec<std::path::PathBuf> =
+            groups[0].iter().map(|reader| reader.part().dir.clone()).collect();
+        let rewrite = rewrite_group(
+            &groups[0],
+            None,
+            &DeleteMasks::default(),
+            &parts_root,
+            config.row_group_size,
+            config.merge_max_memory_bytes,
+            &old_dirs,
+        )
+        .unwrap();
+        assert_eq!(rewrite.kept_rows, groups[0].len());
+        assert_eq!(rewrite.dropped_rows, 0);
+    }
+
     fn policy_with(entries: &[(&str, crate::tenant_policy::TenantRetention)]) -> TenantPolicy {
         let policy = TenantPolicy::enabled_for_test();
         policy.install_for_test(

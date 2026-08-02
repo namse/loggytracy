@@ -23,6 +23,106 @@ pub fn rows_from_snapshot(snapshot: &MemTableSnapshot) -> Vec<Row> {
     rows
 }
 
+/// Flush a snapshot through the batch writer in chunks of at most roughly
+/// `chunk_bytes` materialized, instead of copying the whole snapshot into one
+/// `Vec<Row>` first.
+///
+/// The whole-snapshot copy was the largest flush transient:
+/// `docs/MEMORY_ATTRIBUTION.md` measured the flush arena at ~3.3x the memtable
+/// it was writing, because the copy, the per-partition parsed-field maps and
+/// the part-wide index buffers were all alive at once. Every one of those is
+/// sized by its input, so bounding the input bounds them all.
+///
+/// Order and dedup are [`sort_rows`]'s, reproduced without a global sort:
+/// streams are visited in `(tenant, labels)` order — the prefix of
+/// [`Row::sort_key`] — and each stream's entries are emitted in
+/// `(timestamp, line, metadata)` order, the suffix. The snapshot is shared
+/// with concurrent queries, so entries are ordered through a side index
+/// rather than sorted in place. A duplicate pair always shares a stream, so
+/// skipping an entry equal to the stream's previously emitted one is the same
+/// dedup even when a chunk cut falls between the two.
+///
+/// A chunk that fails rolls back every part this call already committed, so
+/// the caller sees the all-or-nothing flush it always had.
+pub fn flush_snapshot_chunked(
+    snapshot: &MemTableSnapshot,
+    parts_root: &Path,
+    row_group_size: usize,
+    chunk_bytes: u64,
+) -> io::Result<Vec<Part>> {
+    let mut streams: Vec<(&TenantId, &SharedLabels, &Vec<LogEntry>)> = Vec::new();
+    for (tenant, tenant_streams) in snapshot {
+        for (labels, entries) in tenant_streams {
+            if !entries.is_empty() {
+                streams.push((tenant, labels, entries));
+            }
+        }
+    }
+    streams.sort_by(|a, b| (a.0.as_str(), a.1.as_ref()).cmp(&(b.0.as_str(), b.1.as_ref())));
+
+    let mut parts: Vec<Part> = Vec::new();
+    let mut chunk: Vec<Row> = Vec::new();
+    let mut chunk_used: u64 = 0;
+
+    fn cut(
+        chunk: &mut Vec<Row>,
+        parts: &mut Vec<Part>,
+        parts_root: &Path,
+        row_group_size: usize,
+    ) -> io::Result<()> {
+        let rows = std::mem::take(chunk);
+        match flush_rows(rows, parts_root, row_group_size) {
+            Ok(new_parts) => {
+                parts.extend(new_parts);
+                Ok(())
+            }
+            Err(error) => {
+                let committed: Vec<PathBuf> = parts.iter().map(|part| part.dir.clone()).collect();
+                rollback_committed(&committed);
+                Err(error)
+            }
+        }
+    }
+
+    for (tenant, labels, entries) in streams {
+        let mut order: Vec<u32> = (0..entries.len() as u32).collect();
+        order.sort_by(|&a, &b| {
+            let ea = &entries[a as usize];
+            let eb = &entries[b as usize];
+            (ea.timestamp_ns, &ea.line, &ea.structured_metadata).cmp(&(
+                eb.timestamp_ns,
+                &eb.line,
+                &eb.structured_metadata,
+            ))
+        });
+        let mut prev: Option<u32> = None;
+        for &i in &order {
+            let entry = &entries[i as usize];
+            if let Some(p) = prev {
+                let previous = &entries[p as usize];
+                if previous.timestamp_ns == entry.timestamp_ns
+                    && previous.line == entry.line
+                    && previous.structured_metadata == entry.structured_metadata
+                {
+                    continue;
+                }
+            }
+            prev = Some(i);
+            let row = Row::from_entry(tenant, labels, entry);
+            chunk_used = chunk_used.saturating_add(row.materialized_bytes());
+            chunk.push(row);
+            if chunk_used >= chunk_bytes {
+                cut(&mut chunk, &mut parts, parts_root, row_group_size)?;
+                chunk_used = 0;
+            }
+        }
+    }
+    if !chunk.is_empty() {
+        cut(&mut chunk, &mut parts, parts_root, row_group_size)?;
+    }
+    Ok(parts)
+}
+
 /// Sorts into layout order and drops entries that are copies of one another.
 ///
 /// Delivery is at-least-once. A push that was durably written but whose

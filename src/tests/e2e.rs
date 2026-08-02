@@ -464,6 +464,27 @@
                 // preserve both copies according to the documented
                 // at-least-once flush-boundary semantics.
             }
+            "chunked_flush_before_checkpoint" => {
+                // The same window as flush_before_checkpoint, but through the
+                // chunked path with a one-byte budget so *several* parts are
+                // committed before the checkpoint that never comes. The replay
+                // semantics must not depend on how many parts a flush left.
+                let memtable = Arc::new(MemTable::new());
+                let journal = Journal::spawn(&config, memtable).unwrap();
+                let raw = build_push_req();
+                ingest_once(&journal, &raw).await;
+                let checkpoint = journal.checkpoint().await.unwrap();
+                let parts_root = dir.join("parts");
+                std::fs::create_dir_all(&parts_root).unwrap();
+                let parts = part::flush_snapshot_chunked(
+                    &checkpoint.snapshot,
+                    &parts_root,
+                    config.row_group_size,
+                    1,
+                )
+                .unwrap();
+                assert!(parts.len() > 1, "the crash must leave several parts");
+            }
             "merge_before_cleanup" => {
                 let parts_root = dir.join("parts");
                 std::fs::create_dir_all(&parts_root).unwrap();
@@ -557,6 +578,35 @@
             .iter()
             .map(|stream| stream.entries.len())
             .sum();
+        assert_eq!((memory_rows, part_rows), (3, 3));
+    }
+
+    #[test]
+    fn process_crash_between_chunked_parts_and_checkpoint_is_at_least_once() {
+        let dir = run_crash_helper("chunked_flush_before_checkpoint");
+        let config = Config {
+            data_dir: dir,
+            ..Config::default()
+        };
+        let recovered = MemTable::new();
+
+        recover(&config, &recovered).expect("recover pre-checkpoint crash");
+        let registry = PartRegistry::load_from_disk(&config.data_dir.join("parts")).unwrap();
+        assert!(registry.part_count() > 1, "the crash left several parts");
+
+        let memory_rows: usize = recovered
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
+            .iter()
+            .map(|stream| stream.entries.len())
+            .sum();
+        let part_rows: usize = registry
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
+            .unwrap()
+            .iter()
+            .map(|stream| stream.entries.len())
+            .sum();
+        // Both copies exist — at-least-once at the flush boundary — and each
+        // side holds every row exactly once regardless of the part count.
         assert_eq!((memory_rows, part_rows), (3, 3));
     }
 

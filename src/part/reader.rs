@@ -892,14 +892,24 @@ impl PartReader {
         // loose and the per-group skip below unable to reject anything. Sorting
         // the selected groups by the end the scan reaches first tightens it as
         // fast as the old layout did.
-        sorted_selected.sort_unstable_by_key(|&row_group| {
-            let rgu = row_group as usize;
-            if forward {
-                (self.part.meta.row_group_min_ts[rgu], row_group)
-            } else {
-                (-self.part.meta.row_group_max_ts[rgu], row_group)
-            }
-        });
+        //
+        // A windowed read is the exception: it is a rewrite reading the part
+        // in layout order, and `MergedRows` k-way-merges what it returns on
+        // the promise that each page arrives in `Row::sort_key` order. Time
+        // order is not that order once a row group straddles two streams —
+        // its `min_ts` reaches back to the younger stream's start, and the
+        // time sort visits it early, handing the merge (and therefore the
+        // parts it writes) rows that have left layout order.
+        if row_group_window.is_none() {
+            sorted_selected.sort_unstable_by_key(|&row_group| {
+                let rgu = row_group as usize;
+                if forward {
+                    (self.part.meta.row_group_min_ts[rgu], row_group)
+                } else {
+                    (-self.part.meta.row_group_max_ts[rgu], row_group)
+                }
+            });
+        }
 
         // Outside the row-group loop: a stream spans row groups, so a cache per
         // group would rebuild every label set once per group.

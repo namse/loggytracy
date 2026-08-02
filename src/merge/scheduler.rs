@@ -195,6 +195,7 @@ async fn merge_once(
                 let cutoffs = cutoffs.clone();
                 let deletes = deletes.clone();
                 let row_group_size = config.row_group_size;
+                let merge_max_memory_bytes = config.merge_max_memory_bytes;
                 move || {
                     let _arena = crate::memprof::enter(crate::memprof::Arena::Merge);
                     rewrite_group(
@@ -203,6 +204,7 @@ async fn merge_once(
                         &deletes,
                         &parts_root,
                         row_group_size,
+                        merge_max_memory_bytes,
                         &old_dirs,
                     )
                 }

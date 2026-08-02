@@ -230,15 +230,15 @@ async fn flush_once(
         }
         return Ok(());
     }
-    let rows = {
-        let _arena = crate::memprof::enter(crate::memprof::Arena::Flush);
-        part::rows_from_snapshot(&ckpt.snapshot)
-    };
-    let trace_spans = ckpt.trace_snapshot;
     // An `Arc` clone: the flush reads the buffer the memtable still holds for
-    // the abort path, rather than being handed a copy of it.
+    // the abort path, rather than being handed a copy of it. Materializing
+    // rows happens inside the blocking task, in bounded chunks — the
+    // whole-snapshot copy and its global sort used to run right here on a
+    // runtime worker, which cost both a memtable-sized transient and a stalled
+    // task queue.
+    let snapshot_for_flush = ckpt.snapshot.clone();
+    let trace_spans = ckpt.trace_snapshot;
     let trace_spans_for_flush = trace_spans.clone();
-    let total_rows = rows.len().saturating_add(trace_spans.len());
     // Prevent eviction from observing a freshly committed directory before
     // it has been published and installed in the registry.
     let cache_guard = match remote_cache {
@@ -253,12 +253,18 @@ async fn flush_once(
     }
 
     let row_group_size = config.row_group_size;
+    let flush_chunk_bytes = config.flush_chunk_bytes;
     let result = match tokio::task::spawn_blocking({
         let parts_root = parts_root.clone();
         let traces_root = config.data_dir.join("traces");
         move || {
             let _arena = crate::memprof::enter(crate::memprof::Arena::Flush);
-            let log_parts = part::flush_rows(rows, &parts_root, row_group_size)?;
+            let log_parts = part::flush_snapshot_chunked(
+                &snapshot_for_flush,
+                &parts_root,
+                row_group_size,
+                flush_chunk_bytes,
+            )?;
             let trace_parts = match trace_part::flush_trace_spans(
                 &trace_spans_for_flush,
                 &traces_root,
@@ -292,6 +298,11 @@ async fn flush_once(
     match result {
         Ok((new_parts, new_trace_parts)) => {
             let n = new_parts.len();
+            let total_rows = new_parts
+                .iter()
+                .map(|part| part.meta.row_count)
+                .sum::<u64>()
+                .saturating_add(trace_spans.len() as u64);
             let new_part_dirs: Vec<_> = new_parts.iter().map(|part| part.dir.clone()).collect();
             let new_trace_part_dirs: Vec<_> = new_trace_parts
                 .iter()

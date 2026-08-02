@@ -1906,3 +1906,283 @@ resident {:.0} B",
         );
         assert!(PartReader::open(part).is_ok());
     }
+
+    /// A snapshot for the chunked-flush tests: several tenants, several
+    /// streams, entries deliberately in arrival order rather than time order,
+    /// JSON lines so the `_pf:` columns are exercised.
+    fn chunked_test_snapshot() -> MemTableSnapshot {
+        let base = 1_700_000_000_000_000_000i64;
+        let mut snapshot: MemTableSnapshot = HashMap::new();
+        for tenant_name in ["tenant-a", "tenant-b"] {
+            let tenant = TenantId::parse(tenant_name).expect("valid");
+            let mut streams: HashMap<SharedLabels, Vec<LogEntry>> = HashMap::new();
+            for app in ["api", "worker", "web"] {
+                let labels: SharedLabels = std::sync::Arc::new(
+                    [
+                        ("app".to_string(), app.to_string()),
+                        ("host".to_string(), tenant_name.to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+                // Reversed timestamps: arrival order is not time order.
+                let entries: Vec<LogEntry> = (0..37i64)
+                    .rev()
+                    .map(|i| LogEntry {
+                        timestamp_ns: base + i * 1_000,
+                        line: format!("{{\"status\":\"{}\",\"msg\":\"{app} row {i}\"}}", 200 + i % 5),
+                        structured_metadata: vec![("trace_id".to_string(), format!("t{i}"))],
+                    })
+                    .collect();
+                streams.insert(labels, entries);
+            }
+            snapshot.insert(tenant, streams);
+        }
+        snapshot
+    }
+
+    fn read_sorted_rows(parts: &[Part]) -> Vec<Row> {
+        let readers: Vec<Arc<PartReader>> = parts
+            .iter()
+            .map(|part| Arc::new(PartReader::open(part.clone()).expect("open")))
+            .collect();
+        drain(&mut MergedRows::new(&readers, u64::MAX))
+    }
+
+    /// The chunked flush is the batch flush with a bounded transient: forced
+    /// through cuts small enough to land mid-stream, it must yield the same
+    /// rows in the same order, and every part it writes must be internally
+    /// sorted — otherwise the bound was bought with a different on-disk truth.
+    #[test]
+    fn chunked_flush_equals_batch_flush() {
+        let snapshot = chunked_test_snapshot();
+
+        let batch_dir = tempfile_dir();
+        let batch_parts =
+            flush_rows(rows_from_snapshot(&snapshot), &batch_dir, 8).expect("batch flush");
+
+        let chunked_dir = tempfile_dir();
+        // A one-byte budget cuts after every row: the most hostile chunking.
+        let chunked_parts =
+            flush_snapshot_chunked(&snapshot, &chunked_dir, 8, 1).expect("chunked flush");
+        assert!(
+            chunked_parts.len() > batch_parts.len(),
+            "a one-byte budget must actually produce more parts"
+        );
+
+        let batch_rows = read_sorted_rows(&batch_parts);
+        let chunked_rows = read_sorted_rows(&chunked_parts);
+        assert_eq!(batch_rows.len(), chunked_rows.len());
+        for (index, (batch, chunked)) in batch_rows.iter().zip(&chunked_rows).enumerate() {
+            assert_eq!(batch.tenant, chunked.tenant, "row {index}");
+            assert_eq!(batch.labels, chunked.labels, "row {index}");
+            assert_eq!(
+                batch.timestamp_ns, chunked.timestamp_ns,
+                "row {index}: batch line {:?}, chunked line {:?}",
+                batch.line, chunked.line
+            );
+            assert_eq!(batch.line, chunked.line, "row {index}");
+            assert_eq!(batch.structured_metadata, chunked.structured_metadata, "row {index}");
+        }
+
+        // A generous budget takes the single-chunk path and must agree too.
+        let single_dir = tempfile_dir();
+        let single_parts =
+            flush_snapshot_chunked(&snapshot, &single_dir, 8, u64::MAX).expect("single chunk");
+        let single_rows = read_sorted_rows(&single_parts);
+        assert_eq!(single_rows.len(), batch_rows.len());
+    }
+
+    /// A stream that crosses midnight lands in two partition directories no
+    /// matter where the chunk cuts fall, and a scan over all parts returns
+    /// every row exactly once.
+    #[test]
+    fn chunked_flush_splits_a_midnight_stream_across_partitions() {
+        let labels: SharedLabels = std::sync::Arc::new(
+            [("app".to_string(), "night".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        // 2023-11-14T22:13:20Z; the next day starts 6400 seconds later.
+        let base = 1_700_000_000_000_000_000i64;
+        let day = partition_of(base);
+        let entries: Vec<LogEntry> = (0..20i64)
+            .map(|i| LogEntry {
+                timestamp_ns: base + i * 700 * 1_000_000_000,
+                line: format!("line {i}"),
+                structured_metadata: vec![],
+            })
+            .collect();
+        assert_ne!(
+            partition_of(entries.last().unwrap().timestamp_ns),
+            day,
+            "the stream must actually cross midnight"
+        );
+        let mut snapshot: MemTableSnapshot = HashMap::new();
+        snapshot.insert(test_tenant(), [(labels, entries)].into_iter().collect());
+
+        let dir = tempfile_dir();
+        let parts = flush_snapshot_chunked(&snapshot, &dir, 4, 1).expect("chunked flush");
+        let partitions: BTreeSet<&str> =
+            parts.iter().map(|part| part.meta.partition.as_str()).collect();
+        assert_eq!(partitions.len(), 2, "two days, two partition directories");
+        for part in &parts {
+            assert_eq!(
+                part.dir.parent().and_then(|p| p.file_name()),
+                Some(std::ffi::OsStr::new(part.meta.partition.as_str())),
+                "a part must live under its own partition directory"
+            );
+        }
+        assert_eq!(read_sorted_rows(&parts).len(), 20);
+    }
+
+    /// The batch path deduplicated identical `(stream, ts, line, metadata)`
+    /// rows in one global pass. The chunked path deduplicates per stream at
+    /// emission, so a duplicate pair must collapse even when the chunk cut
+    /// falls exactly between the two copies.
+    #[test]
+    fn chunked_flush_dedups_across_a_chunk_cut() {
+        let labels: SharedLabels = std::sync::Arc::new(
+            [("app".to_string(), "dup".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let base = 1_700_000_000_000_000_000i64;
+        let entry = |ts: i64, line: &str| LogEntry {
+            timestamp_ns: base + ts,
+            line: line.to_string(),
+            structured_metadata: vec![],
+        };
+        // Shuffled arrival order; the duplicate pair sorts adjacent, and the
+        // one-byte budget guarantees a cut lands between them.
+        let entries = vec![
+            entry(3, "c"),
+            entry(1, "twin"),
+            entry(2, "b"),
+            entry(1, "twin"),
+            entry(1, "a"),
+        ];
+        let mut snapshot: MemTableSnapshot = HashMap::new();
+        snapshot.insert(test_tenant(), [(labels, entries)].into_iter().collect());
+
+        let dir = tempfile_dir();
+        let parts = flush_snapshot_chunked(&snapshot, &dir, 4, 1).expect("chunked flush");
+        let rows = read_sorted_rows(&parts);
+        assert_eq!(rows.len(), 4, "one twin must survive, not both");
+        assert_eq!(
+            rows_from_snapshot(&snapshot).len(),
+            4,
+            "the batch path agrees on what a duplicate is"
+        );
+    }
+
+    /// A later chunk that fails must take every part the earlier chunks
+    /// committed with it: the caller aborts the whole flush and retries the
+    /// whole snapshot, so a survivor would come back as a duplicate part.
+    #[test]
+    fn a_failed_chunk_rolls_back_every_committed_part() {
+        let labels: SharedLabels = std::sync::Arc::new(
+            [("app".to_string(), "rollback".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let base = 1_700_000_000_000_000_000i64;
+        let entries: Vec<LogEntry> = (0..4i64)
+            .map(|i| LogEntry {
+                // Two rows today, two tomorrow.
+                timestamp_ns: base + i * 50_000 * 1_000_000_000,
+                line: format!("line {i}"),
+                structured_metadata: vec![],
+            })
+            .collect();
+        let second_day = partition_of(entries[2].timestamp_ns);
+        assert_ne!(partition_of(base), second_day);
+        let mut snapshot: MemTableSnapshot = HashMap::new();
+        snapshot.insert(test_tenant(), [(labels, entries)].into_iter().collect());
+
+        let dir = tempfile_dir();
+        // A regular file where the second day's partition directory must go:
+        // the first chunk (first day) commits, the later one fails.
+        fs::write(dir.join(&second_day), b"not a directory").unwrap();
+
+        let result = flush_snapshot_chunked(&snapshot, &dir, 8, 1);
+        assert!(result.is_err(), "the flush must report the failure");
+        // `.tmp` staging leftovers are invisible to discovery and startup
+        // sweeps them; what must not survive is a *visible* part.
+        let leftover_parts: Vec<PathBuf> = walk_meta_dirs(&dir)
+            .into_iter()
+            .filter(|path| !path.starts_with(dir.join(".tmp")))
+            .collect();
+        assert!(
+            leftover_parts.is_empty(),
+            "committed chunk parts survived the rollback: {leftover_parts:?}"
+        );
+    }
+
+    /// A rewrite read must return the part in layout (`Row::sort_key`) order,
+    /// because `MergedRows` k-way-merges its pages on that promise and writes
+    /// what comes out. The query scan visits row groups by time instead —
+    /// and once a row group straddles two streams, its `min_ts` reaches back
+    /// to the younger stream's start and time order leaves layout order. This
+    /// is what a windowed read used to inherit: a two-stream part whose
+    /// groups straddle came back interleaved, and every streamed merge wrote
+    /// that interleaving into the part it produced.
+    #[test]
+    fn a_rewrite_read_returns_layout_order_not_query_order() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let mut rows: Vec<Row> = Vec::new();
+        for app in ["early", "late"] {
+            let labels: SharedLabels = std::sync::Arc::new(
+                [("app".to_string(), app.to_string())].into_iter().collect(),
+            );
+            for i in 0..21i64 {
+                rows.push(Row {
+                    tenant: test_tenant(),
+                    timestamp_ns: base + i * 1_000,
+                    labels: labels.clone(),
+                    line: format!("{app} row {i}"),
+                    structured_metadata: vec![],
+                });
+            }
+        }
+        // Groups of 8 over 42 rows: the third group holds the end of "early"
+        // and the start of "late", so its min_ts is older than the second
+        // group's and a time-ordered visit would hoist it.
+        let part = flush_rows(rows.clone(), &tmp, 8).expect("flush").remove(0);
+        let reader = Arc::new(PartReader::open(part).expect("open"));
+        assert!(reader.row_group_count() > 2);
+
+        sort_rows(&mut rows);
+        let read = reader.read_all_rows(None).expect("read");
+        assert_eq!(read.len(), rows.len());
+        for (got, want) in read.iter().zip(&rows) {
+            assert_eq!(
+                (got.labels.get("app"), got.timestamp_ns, got.line.as_str()),
+                (want.labels.get("app"), want.timestamp_ns, want.line.as_str()),
+                "a rewrite read left layout order"
+            );
+        }
+    }
+
+    fn walk_meta_dirs(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read_dir) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.join(META_FILE).exists() {
+                        found.push(path);
+                    } else {
+                        stack.push(path);
+                    }
+                }
+            }
+        }
+        found
+    }
+

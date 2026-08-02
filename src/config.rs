@@ -65,6 +65,13 @@ pub struct Config {
     pub flush_max_bytes: u64,
     pub flush_max_interval: Duration,
     pub flush_check_interval: Duration,
+    /// Most a flush materializes as `Vec<Row>` at once. The snapshot is
+    /// written through the batch writer in chunks of this many bytes, so the
+    /// flush transient is bounded by the chunk rather than by however large
+    /// the memtable had grown while the previous flush ran —
+    /// `docs/MEMORY_ATTRIBUTION.md` measured the unchunked copy at ~3.3x its
+    /// memtable inside a 2 GiB container.
+    pub flush_chunk_bytes: u64,
     pub row_group_size: usize,
     pub merge_min_part_count: usize,
     pub merge_target_part_rows: u64,
@@ -207,6 +214,7 @@ impl Default for Config {
             flush_max_bytes: 1024 * 1024,
             flush_max_interval: Duration::from_secs(5),
             flush_check_interval: Duration::from_millis(500),
+            flush_chunk_bytes: 32 * 1024 * 1024,
             row_group_size: 8192,
             merge_min_part_count: 4,
             merge_target_part_rows: 1_000_000,
@@ -405,6 +413,10 @@ impl Config {
             flush_check_interval: env_required_duration(
                 "LOGGYTRACY_FLUSH_CHECK_INTERVAL",
                 defaults.flush_check_interval,
+            )?,
+            flush_chunk_bytes: env_positive_u64(
+                "LOGGYTRACY_FLUSH_CHUNK_BYTES",
+                defaults.flush_chunk_bytes,
             )?,
             row_group_size: env_positive_usize(
                 "LOGGYTRACY_ROW_GROUP_SIZE",
@@ -614,6 +626,7 @@ impl Config {
             max_query_memory_bytes = self.max_query_memory_bytes,
             merge_max_memory_bytes = self.merge_max_memory_bytes,
             merge_max_input_bytes = self.merge_max_input_bytes,
+            flush_chunk_bytes = self.flush_chunk_bytes,
             // The merge budget is derived unless it was set, so without this an
             // operator cannot learn what the process chose or what it read to
             // choose it.
@@ -658,6 +671,14 @@ impl Config {
             ));
         }
         positive_duration("flush_check_interval", self.flush_check_interval)?;
+        // A chunk is also a part: chunks much smaller than a row group's
+        // worth of rows would turn every flush into a spray of tiny parts.
+        if self.flush_chunk_bytes < 1024 * 1024 {
+            return Err(format!(
+                "flush_chunk_bytes ({}) must be at least 1 MiB",
+                self.flush_chunk_bytes
+            ));
+        }
         positive_usize("row_group_size", self.row_group_size)?;
         if self.row_group_size > 65_536 {
             return Err("row_group_size must not exceed 65536".to_string());
@@ -957,6 +978,19 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.tenant_policy_token = None;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn the_flush_chunk_must_be_at_least_a_mebibyte() {
+        let mut config = Config::default();
+        assert_eq!(config.flush_chunk_bytes, 32 * 1024 * 1024);
+        assert!(config.validate().is_ok());
+
+        // A sub-mebibyte chunk turns every flush into a spray of tiny parts.
+        config.flush_chunk_bytes = 1024 * 1024 - 1;
+        assert!(config.validate().is_err());
+        config.flush_chunk_bytes = 1024 * 1024;
         assert!(config.validate().is_ok());
     }
 
