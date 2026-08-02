@@ -617,7 +617,10 @@ async fn push_worker(
             Ok(response) => {
                 *outcome.statuses.entry(response.status).or_default() += 1;
                 match response.status {
-                    204 => {
+                    // Loki's OTLP endpoint answers 204; loggytracy and
+                    // VictoriaLogs answer 200 with a response body, as the
+                    // OTLP/HTTP specification prescribes.
+                    200 | 204 => {
                         if steady {
                             outcome.steady.record(queueing_ms, service_ms);
                         } else {
