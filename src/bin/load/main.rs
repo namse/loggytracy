@@ -508,18 +508,27 @@ async fn wait_for_ready(cfg: &Config) -> Result<(), String> {
     Err(last)
 }
 
+/// Two attempts, because the second is what survives an idle keep-alive.
+/// This client sits unused for the whole run between the start and end
+/// scrapes, VictoriaLogs' server closes idle connections, and the first
+/// request on a dead socket fails before the client notices — measured as a
+/// behavioral gate reading zero rows from an engine that ingested millions.
 async fn scrape(client: &mut Client) -> Option<probe::Metrics> {
-    let response = client
-        .request(&Request {
+    for _ in 0..2 {
+        let request = Request {
             method: "GET",
             path: "/metrics",
             body: &[],
             content_type: "",
             tenant: None,
-        })
-        .await
-        .ok()?;
-    (response.status == 200).then(|| probe::parse_metrics(&response.body))
+        };
+        if let Ok(response) = client.request(&request).await
+            && response.status == 200
+        {
+            return Some(probe::parse_metrics(&response.body));
+        }
+    }
+    None
 }
 
 /// Issues on the nominal schedule regardless of how far behind the workers

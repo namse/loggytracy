@@ -712,6 +712,29 @@ wins *before* deleting the one being dropped — removing code is the irreversib
         `service.name`, queried as `service_name`), the reduced digest canonicalizes keys through the same
         sanitizer so `service.name` = `service_name`, and `service_name` left `DERIVED_LABELS` — it is pushed
         data now.
+
+      **First OTLP bed run (2026-08-02), what actually broke and what did not:**
+      * Five of seven shapes agreed across all three pairs on the first try; `metadata_rare`, `trace_window`
+        and `rate` at 24/24 everywhere. The two that did not were both the bed's own defects, not engines':
+        the harness counted OTLP's 200 as an error (the Loki-push arm accepted only 204), a bare
+        `unpack_json` let the corpus's inner `_msg` JSON field clobber VictoriaLogs' message column
+        (fixed with `unpack_json fields (...)`), and Loki's `label_only` at limit 20000 hit its own
+        internal 4 MiB querier→frontend gRPC frame default — the answer was 4,233,058 bytes, 1% over,
+        because the semconv label names repeat per structured-metadata-combination stream. Raised in
+        `loki-config.yaml` with the measurement in the comment.
+      * The loggytracy load verdict failed on flush backlog and query queueing — and the same failure
+        reproduces **with the pre-migration engine and pre-migration harness on the same host the same
+        day** (worktree A/B at 84ea2e2, 20k eps: memtable waves to ~700k entries either way). The morning
+        bed's loggytracy ingest phase also shared its 12 cores with this session's own `cargo build/test`
+        of P2 — the bed's fairness note exists precisely because the harness assumes the machine is its
+        own. Not attributable to the OTLP migration; rerun on a quiet machine before reading those rows.
+      * Wire bytes per entry rose 157.7 → 426.6 (snappy left with the Loki push client; OTLP protobuf is
+        sent uncompressed). The WAL is unchanged: the old path stored the *decompressed* PushRequest at
+        ~415 B/entry and the OTLP export measures ~418 B/entry on the same corpus.
+      * VictoriaLogs' behavioral gate read zero rows from an engine that ingested millions: the probe
+        client's only two uses are separated by the whole run, VictoriaLogs closes idle keep-alives, and
+        the first request on the dead socket was the scrape. `scrape()` now retries once on a fresh
+        connection.
 - [ ] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
       parser, and `proto.rs`'s encode side
 - [ ] **Then stop re-encoding into a Loki `PushRequest` for the WAL.** It exists so replay has one decoder

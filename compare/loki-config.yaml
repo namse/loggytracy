@@ -23,6 +23,18 @@ server:
   # request and turns the log into a second workload. loggytracy is at its own
   # default here, which is quiet.
   log_level: warn
+  # Compatibility, measured on 2026-08-02: at limit 20000 a `label_only`
+  # answer's internal querier-to-frontend result frame is 4,233,058 bytes —
+  # 1% over the 4 MiB default — and Loki's querier then cannot deliver a
+  # query it has already finished ("received message larger than max"), so
+  # the client sees a 504 at the HTTP timeout. The OTLP migration pushed the
+  # frame over the line because the promoted semconv label names
+  # (`service_name`, `deployment_environment`, ...) are repeated per stream
+  # in the response, and one stream per structured-metadata combination
+  # means thousands of repetitions. Raised so Loki can answer at all; this
+  # helps Loki, not its competitors.
+  grpc_server_max_recv_msg_size: 104857600
+  grpc_server_max_send_msg_size: 104857600
 
 common:
   path_prefix: /loki

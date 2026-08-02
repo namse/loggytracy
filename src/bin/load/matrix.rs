@@ -619,13 +619,22 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
         // on now exists only after a query-time unpack — the same stage the
         // LogQL side pays as `| json`, which makes this pair like-for-like
         // for the first time.
+        // `fields (...)` and not a bare `unpack_json`, for a reason the first
+        // OTLP run measured: the corpus's JSON lines carry an inner `_msg`
+        // field, a bare unpack overwrites VictoriaLogs' own `_msg` column with
+        // it, and a row whose inner value is empty comes back without `_msg`
+        // at all — which the digest correctly refuses to read as a log row.
+        // Unpacking only the queried field asks the same question `| json |
+        // field="v"` asks while leaving the message column alone.
         Shape::JsonField => {
             let (field, value) = if variant.is_multiple_of(2) {
                 ("status", STATUSES[variant % STATUSES.len()].to_string())
             } else {
                 ("level", LEVELS[variant % LEVELS.len()].to_string())
             };
-            format!("{selector} | unpack_json | filter {field}:\"{value}\" | {newest}")
+            format!(
+                "{selector} | unpack_json fields ({field}) | filter {field}:\"{value}\" | {newest}"
+            )
         }
         // No app selector, matching the LogQL side: the point is a predicate
         // that is the only selective thing in the query.
@@ -638,7 +647,9 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
         // stay identical because every row carries the attribute and the JSON
         // rows carry the same value inside the line.
         Shape::JsonFieldRare => {
-            format!("* | unpack_json | filter trace_id:\"{rare_trace_id}\" | {newest}")
+            format!(
+                "* | unpack_json fields (trace_id) | filter trace_id:\"{rare_trace_id}\" | {newest}"
+            )
         }
         Shape::MetadataRare | Shape::TraceWindow => {
             format!("trace_id:\"{rare_trace_id}\" | {newest}")

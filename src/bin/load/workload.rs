@@ -315,7 +315,9 @@ impl QueryGenerator {
                     // the same stage `| json` is on the LogQL side.
                     QueryShape::JsonField => {
                         let (field, value) = &json_field;
-                        format!("{selector} | unpack_json | filter {field}:\"{value}\" | {cut}")
+                        format!(
+                            "{selector} | unpack_json fields ({field}) | filter {field}:\"{value}\" | {cut}"
+                        )
                     }
                     QueryShape::Rate => {
                         format!("{selector} | stats by (_time:1m) rate() as value")
