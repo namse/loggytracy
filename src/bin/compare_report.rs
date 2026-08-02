@@ -31,12 +31,13 @@ const TARGETS: [&str; 3] = ["loggytracy", "loki", "victorialogs"];
 /// Which digest a pair of systems can be held to.
 ///
 /// The strict digest covers the timestamp, the line and every label with its
-/// placement; it exists between the two systems that keep lines. VictoriaLogs
-/// parses JSON at ingest and has no line for such a row, so any pair
-/// containing it is compared on the reduced basis — the timestamp plus the
-/// query-named fields (`matrix.rs`, `Query::basis_fields`). The report states
-/// which basis every agreement number is on, because the two are not the same
-/// strength of claim.
+/// placement; it exists between the two systems whose responses share the
+/// Loki shape. VictoriaLogs answers with every field it holds for a row
+/// rather than with what a pipeline produced, so any pair containing it is
+/// compared on the reduced basis — the timestamp plus the query-named fields
+/// (`matrix.rs`, `Query::basis_fields`). The report states which basis every
+/// agreement number is on, because the two are not the same strength of
+/// claim.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Basis {
     Strict,
@@ -445,19 +446,23 @@ fn what_was_compared(page: &mut String, bed: &Value, dir: &Path) {
 | image | built from `Dockerfile` at that revision | `{}` | `{}` |
 | storage | local filesystem, **no object store** | local filesystem (`common.storage.filesystem`) | local filesystem (`-storageDataPath`) |
 | index | Parquet parts plus `index.bin` sidecars | TSDB, schema `v13`, 24h period | per-block columns plus its own indexdb |
-| data model | stores the line, parses at query time | stores the line, parses at query time | **parses JSON at ingest, does not keep the line** |
+| data model | stores the line, parses at query time | stores the line, parses at query time | stores the line, parses at query time (its ingest-time JSON parse is a property of its Loki push endpoint, which this bed no longer uses) |
 | memory limit | {} | identical | identical (`mem_limit` and `memswap_limit`) |
 | CPU limit | none | none | none |
 | volume | `loggytracy-data` | `loki-data` | `victorialogs-data` |
 
 Machine: {}. Docker {}, Compose {}.
 
-The data-model row is not a footnote; it is the axis this comparison exists to
-measure. Schema-on-write means a field the other two reach through a `| json`
-stage is already a column in VictoriaLogs, so its `json_field` and
-`json_field_rare` numbers are the same work as its `metadata_rare` number — and
-it also means there is no line to hold its answers to, which is why every pair
-containing it is compared on the reduced basis below.
+The data-model row changed with the ingest protocol. Under Loki push,
+VictoriaLogs parsed a JSON line into fields at write time and did not keep the
+line; under OTLP it stores the body as `_msg` unparsed (measured, v1.52.0), so
+a field the other two reach through `| json` it now reaches through
+`| unpack_json` — the parser stage is paid at query time on all three, and the
+`json_field` / `metadata_rare` pair separates parsed-line from attribute
+storage on every system. What still differs is what a row *is*: VictoriaLogs
+answers with every field it holds where the other two answer with what the
+pipeline produced, which is why every pair containing it is compared on the
+reduced basis below.
 
 **Why loggytracy runs with no object store.** Loki's filesystem backend keeps
 exactly one durable copy of a chunk on local disk, and so does VictoriaLogs.
@@ -508,8 +513,9 @@ fn ingest_table(page: &mut String, load: &BTreeMap<&str, Value>) {
         r#"## Ingest
 
 Same corpus, same seed, same offered rate, same number of connections, same
-wire format — the push endpoint is Loki's on all three (VictoriaLogs accepts
-Loki push in protobuf+snappy), so these are the same bytes sent three times.
+wire format — every system ingests the identical OTLP protobuf body at its own
+`/v1/logs` spelling, so these are the same bytes sent three times, and they are
+the bytes the one intended consumer sends.
 The runs are **sequential**, not concurrent, so no system's throughput is a
 function of what the others were doing with the same twelve cores; the cost of
 that choice is that a later run starts with a warmer page cache, and it is the
@@ -565,7 +571,7 @@ achieved rate a sixth of the offered one.
     ));
     page.push_str(&row("latency samples", "/push_latency_ms/service/count"));
     page.push_str(&row("line bytes offered", "/ingest/line_bytes"));
-    page.push_str(&row("wire bytes (snappy)", "/ingest/wire_bytes"));
+    page.push_str(&row("wire bytes (OTLP protobuf)", "/ingest/wire_bytes"));
     page.push_str(&row(
         "TCP connections opened",
         "/ingest/tcp_connections_opened",
@@ -769,17 +775,18 @@ hide — plus one per sample, compared at six decimals.
 
 Any pair containing VictoriaLogs is compared on the **reduced** basis: each
 row's nanosecond timestamp plus the values of the fields the query itself
-named. VictoriaLogs parses JSON at ingest and does not keep the line, so there
-is no line to compare; and the whole field set cannot be the basis either,
-because schema-on-write answers `{{app="x"}}` with every field it parsed where
-schema-on-read answers with what the pipeline produced — a basis of "all
-fields" compares the storage models and disagrees always and everywhere, which
-an earlier checker did, reporting 0/24 zeros that were its own. What every
-system returns for the same row is the row's time and the fields the query
+named. VictoriaLogs returns every field it holds for a row where the other two
+answer with what the pipeline produced, so a basis of "all fields" compares
+the storage models and disagrees always and everywhere — an earlier checker
+did exactly that, reporting 0/24 zeros that were its own. What every system
+returns for the same row is the row's time and the fields the query
 constrained, so that is the basis, and it is deliberately the weaker claim of
-the two. A metric answer's remaining representation difference — LogsQL labels
-a `_time` bucket by its start where LogQL labels the sample by its evaluation
-point — is converted with the query's own step, not exempted.
+the two. Field names are canonicalized the way the promoting systems sanitize
+them — VictoriaLogs answers under the dotted `service.name` it was sent while
+loggytracy and Loki answer under the promoted `service_name` — and a metric
+answer's remaining representation difference — LogsQL labels a `_time` bucket
+by its start where LogQL labels the sample by its evaluation point — is
+converted with the query's own step, not exempted.
 
 The digest was over `(timestamp, line)` pairs alone until this run, which is how
 a `| json` label difference was once reported as 24 of 24 agreed (`todo.md`,
@@ -792,9 +799,10 @@ rather than declared, so both sides now answer with one flat stream label set an
 a two-element tuple, and a regression back into that slot is a disagreement here.
 
 Two exemptions remain, both by name rather than by placement, both reported
-below with counts rather than left implicit. `detected_level` and
-`service_name` are **dropped**, because Loki derives them at ingest from the
-line and the stream and nothing in this bed pushes either. And
+below with counts rather than left implicit. `detected_level` is **dropped**,
+because Loki derives it at ingest from the line and nothing in this bed pushes
+one; `service_name` is no longer exempt — the OTLP encoder pushes the corpus's
+`app` as `service.name`, so it is data every system is held to. And
 `__error_details__` is compared by **presence with its value normalized**: an
 answer missing the label is a disagreement — 16 of 24 `json_field_rare`
 answers once were exactly that — while its wording is each engine's own parser

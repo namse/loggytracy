@@ -187,11 +187,8 @@ fn seed_bodies(corpus: &Corpus, entries_per_push: usize) -> Vec<SeedBody> {
             let line_bytes: usize = chunk.iter().map(|entry| entry.line.len()).sum();
             let batch: Vec<(loggytracy::memtable::Labels, Vec<LogEntry>)> =
                 vec![((*stream.labels).clone(), chunk.to_vec())];
-            let encoded = loggytracy::proto::encode_push_request(&batch);
             bodies.push(SeedBody {
-                bytes: snap::raw::Encoder::new()
-                    .compress_vec(&encoded)
-                    .expect("snappy encoding must work"),
+                bytes: crate::otlp::encode_export_logs(&batch),
                 rows: chunk.len(),
                 line_bytes,
             });
@@ -445,21 +442,26 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                 } else {
                     (start_ns, end_ns)
                 };
-                let selector = format!("{{app=\"{app}\"}}");
+                // The corpus's `app`, promoted from the `service.name` the
+                // OTLP encoder sends it as.
+                let selector = format!("{{service_name=\"{app}\"}}");
                 let expression = match shape {
                     // No app selector: a trace is drawn independently of the
                     // app, so pinning one would empty the answer for seven apps
                     // in eight, and the point is a predicate that is the only
                     // selective thing in the query.
                     Shape::JsonFieldRare => {
-                        format!("{{app=~\".+\"}} | json | trace_id=\"{}\"", rare.trace_id)
+                        format!(
+                            "{{service_name=~\".+\"}} | json | trace_id=\"{}\"",
+                            rare.trace_id
+                        )
                     }
                     // The same value with no parser stage: the corpus pushes
                     // this `trace_id` as structured metadata as well as writing
                     // it into the line, so the pair separates what the parser
                     // costs from what the storage costs.
                     Shape::MetadataRare | Shape::TraceWindow => {
-                        format!("{{app=~\".+\"}} | trace_id=\"{}\"", rare.trace_id)
+                        format!("{{service_name=~\".+\"}} | trace_id=\"{}\"", rare.trace_id)
                     }
                     Shape::LabelOnly => selector,
                     Shape::LineFilter => {
@@ -532,17 +534,17 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                     }
                 };
                 let basis_fields: Vec<String> = match shape {
-                    Shape::LabelOnly | Shape::LineFilter => vec!["app".to_string()],
+                    Shape::LabelOnly | Shape::LineFilter => vec!["service_name".to_string()],
                     Shape::JsonField => {
                         let field = if variant.is_multiple_of(2) {
                             "status"
                         } else {
                             "level"
                         };
-                        vec!["app".to_string(), field.to_string()]
+                        vec!["service_name".to_string(), field.to_string()]
                     }
                     Shape::JsonFieldRare | Shape::MetadataRare | Shape::TraceWindow => {
-                        vec!["app".to_string(), "trace_id".to_string()]
+                        vec!["service_name".to_string(), "trace_id".to_string()]
                     }
                     // `sum()` strips every label, so the series identity is
                     // empty on both sides and the samples are the basis.
@@ -566,13 +568,13 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
 
 /// The same question in LogsQL, and where the two languages do not line up.
 ///
-/// VictoriaLogs parses JSON at ingest, so a field the other two reach through a
-/// `| json` stage is already a column here — `json_field` and `json_field_rare`
-/// translate to the *same* thing as `metadata_rare`, because VictoriaLogs does
-/// not distinguish a field that arrived as an attribute from one it extracted
-/// from the message. That is not a translation shortcut; it is the difference
-/// the comparison exists to measure, and it is why those three rows should be
-/// read together rather than as three independent results.
+/// Under OTLP ingest VictoriaLogs stores the body as `_msg` without parsing it
+/// (measured, v1.52.0 — its ingest-time JSON parse was a property of its Loki
+/// push endpoint, not of the engine), so a field the other two reach through
+/// `| json` is reached through `| unpack_json` here: the parser stage is paid
+/// at query time on all three systems now, and `metadata_rare` against
+/// `json_field_rare` separates the attribute column from the parsed line on
+/// this side too.
 ///
 /// Two places the languages' defaults differ and the translation has to take a
 /// side, stated so a ratio is not mistaken for a like-for-like:
@@ -587,7 +589,10 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
 ///   labeling (bucket start there, evaluation point here), which the digest
 ///   converts rather than exempts.
 fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: usize) -> String {
-    let selector = format!("app:\"{app}\"");
+    // The dotted resource-attribute name: VictoriaLogs keeps it as sent where
+    // the other two promote-and-sanitize, and its LogsQL accepts it unquoted
+    // (measured, v1.52.0).
+    let selector = format!("service.name:\"{app}\"");
     // `sort by (_time) desc` before every `limit`, because the LogQL side asks
     // `direction=backward`: a bound that binds must cut the *newest* N rows.
     // A bare LogsQL `limit` has no order contract and returns whichever rows
@@ -607,17 +612,35 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
             "{selector} AND ~\"{}\" | {newest}",
             PHRASES[variant % PHRASES.len()],
         ),
+        // `| unpack_json` first, and the reason is what OTLP changed at
+        // ingest: a Loki-push JSON line used to be parsed into fields by
+        // VictoriaLogs at write time, but an OTLP body is a string it stores
+        // as `_msg` unparsed (measured, v1.52.0). The field the query filters
+        // on now exists only after a query-time unpack — the same stage the
+        // LogQL side pays as `| json`, which makes this pair like-for-like
+        // for the first time.
         Shape::JsonField => {
             let (field, value) = if variant.is_multiple_of(2) {
                 ("status", STATUSES[variant % STATUSES.len()].to_string())
             } else {
                 ("level", LEVELS[variant % LEVELS.len()].to_string())
             };
-            format!("{selector} AND {field}:\"{value}\" | {newest}")
+            format!("{selector} | unpack_json | filter {field}:\"{value}\" | {newest}")
         }
         // No app selector, matching the LogQL side: the point is a predicate
         // that is the only selective thing in the query.
-        Shape::JsonFieldRare | Shape::MetadataRare | Shape::TraceWindow => {
+        //
+        // The rare pair is now genuinely distinguishable here too. Under Loki
+        // push, VictoriaLogs parsed the line at ingest and these two shapes
+        // collapsed into the same query; under OTLP the line stays unparsed,
+        // so `json_field_rare` pays the unpack stage the way `| json` does and
+        // `metadata_rare` reads the attribute column without it. The row sets
+        // stay identical because every row carries the attribute and the JSON
+        // rows carry the same value inside the line.
+        Shape::JsonFieldRare => {
+            format!("* | unpack_json | filter trace_id:\"{rare_trace_id}\" | {newest}")
+        }
+        Shape::MetadataRare | Shape::TraceWindow => {
             format!("trace_id:\"{rare_trace_id}\" | {newest}")
         }
         // `rate()` and not `count()`. LogsQL's `rate()` divides by the bucket
@@ -693,13 +716,14 @@ pub struct Answer {
 
 /// Labels a system derives for itself rather than being given.
 ///
-/// Loki computes `detected_level` from the line and `service_name` from the
-/// stream at ingest. Nothing in this bed pushes either — `corpus::json_line`
-/// emits no `service_name` field — so neither can be a row an engine got wrong,
-/// and both are dropped from the digest. Dropped rather than ignored: every
-/// answer records which of them it carried, and the document states the
-/// exemption beside the result.
-const DERIVED_LABELS: [&str; 2] = ["detected_level", "service_name"];
+/// Loki computes `detected_level` from the line at ingest; nothing in this bed
+/// pushes one, so it cannot be a row an engine got wrong and it is dropped
+/// from the digest. Dropped rather than ignored: every answer records that it
+/// carried the label, and the document states the exemption beside the result.
+/// `service_name` used to be exempt for the same reason and no longer can be:
+/// the OTLP encoder sends the corpus's `app` as `service.name`, so the label
+/// is now pushed data the digest must hold every system to.
+const DERIVED_LABELS: [&str; 1] = ["detected_level"];
 
 /// Labels whose *presence* is comparable and whose *wording* is not.
 ///
@@ -1058,8 +1082,15 @@ pub fn digest_logsql_response(
                     } else {
                         text
                     };
+                    // The canonical key form. VictoriaLogs returns a resource
+                    // attribute under its dotted name where the other two
+                    // promote-and-sanitize, so `service.name` here and
+                    // `service_name` there are the same key — leaving both
+                    // spellings in play would make the reduced digest disagree
+                    // over the checker's own naming, not the rows.
+                    let name = crate::otlp::sanitize_key(name);
                     label_keys.insert(name.clone());
-                    fields.insert(name.clone(), text);
+                    fields.insert(name, text);
                 }
             }
         }
@@ -1505,6 +1536,27 @@ mod tests {
         );
     }
 
+    /// The promoted-name boundary: loggytracy and Loki answer under the
+    /// sanitized `service_name` while VictoriaLogs keeps the dotted
+    /// `service.name` it was sent. The reduced digest canonicalizes the key,
+    /// so the same row agrees — and a genuinely different value still does
+    /// not.
+    #[test]
+    fn a_dotted_field_name_and_its_promoted_form_are_the_same_reduced_key() {
+        let basis = vec!["service_name".to_string()];
+        let loki = br#"{"data":{"resultType":"streams","result":[
+            {"stream":{"service_name":"api-gateway"},
+             "values":[["1700000000123000000","boom"]]}]}}"#;
+        let logsql = br#"{"_time":"2023-11-14T22:13:20.123Z","_msg":"boom","service.name":"api-gateway","_stream":"{}"}"#;
+        let other_app = br#"{"_time":"2023-11-14T22:13:20.123Z","_msg":"boom","service.name":"checkout","_stream":"{}"}"#;
+
+        let loki = digest_response(loki, &basis).expect("valid");
+        let logsql = digest_logsql_response(logsql, &basis, 0).expect("valid");
+        let other_app = digest_logsql_response(other_app, &basis, 0).expect("valid");
+        assert_eq!(loki.reduced_digest, logsql.reduced_digest);
+        assert_ne!(loki.reduced_digest, other_app.reduced_digest);
+    }
+
     /// A metric answer crosses too: LogsQL labels a bucket by its start,
     /// LogQL by its evaluation point — the end — and the digest converts with
     /// the query's step. Values meet at six decimals.
@@ -1572,10 +1624,7 @@ mod tests {
         );
         assert_eq!(
             promoted.dropped_label_keys,
-            vec![
-                "stream:detected_level".to_string(),
-                "stream:service_name".to_string()
-            ],
+            vec!["stream:detected_level".to_string()],
             "an exempted label is recorded as dropped, not silently ignored"
         );
         assert!(in_the_triple.dropped_label_keys.is_empty());
@@ -1733,7 +1782,11 @@ different one"
         assert_eq!(tag("app", "stream"), Some("stream"));
         assert_eq!(tag("level", "entry"), Some("entry"));
         assert_eq!(tag("detected_level", "stream"), None);
-        assert_eq!(tag("service_name", "metric"), None);
+        assert_eq!(
+            tag("service_name", "metric"),
+            Some("metric"),
+            "service_name is pushed data under OTLP, not a derived label"
+        );
     }
 
     #[test]

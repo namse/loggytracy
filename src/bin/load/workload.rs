@@ -9,7 +9,6 @@
 
 use loggytracy::corpus::{Corpus, LEVELS, PHRASES, Rng, STATUSES};
 use loggytracy::memtable::LogEntry;
-use loggytracy::proto;
 
 /// One push, ready for the wire.
 pub struct PushBody {
@@ -128,13 +127,9 @@ impl PushGenerator {
             batch.push(((*stream.labels).clone(), entries));
         }
 
-        // The library's own encoder, so the bytes on the wire are the bytes
-        // the WAL stores rather than a second implementation of the same
-        // message.
-        let encoded = proto::encode_push_request(&batch);
-        let bytes = snap::raw::Encoder::new()
-            .compress_vec(&encoded)
-            .expect("snappy encoding must work");
+        // The OTLP body every target ingests — see `otlp::encode_export_logs`
+        // for the label mapping it applies.
+        let bytes = crate::otlp::encode_export_logs(&batch);
         PushBody {
             tenant: self
                 .target
@@ -142,7 +137,7 @@ impl PushGenerator {
             entries: batch.iter().map(|(_, entries)| entries.len()).sum(),
             streams: batch.len(),
             line_bytes,
-            encoded_bytes: encoded.len(),
+            encoded_bytes: bytes.len(),
             out_of_order_entries,
             max_lateness_ms,
             bytes,
@@ -269,7 +264,10 @@ impl QueryGenerator {
         };
         let (expression, path) = match self.target {
             crate::config::Target::Loggytracy | crate::config::Target::Loki => {
-                let selector = format!("{{app=\"{app}\"}}");
+                // The OTLP encoder sends `app` as `service.name`, so the
+                // promoted stream label both systems answer under is
+                // `service_name`.
+                let selector = format!("{{service_name=\"{app}\"}}");
                 let expression = match shape {
                     QueryShape::LabelOnly | QueryShape::RestoreProbe => selector,
                     QueryShape::LineFilter => format!("{selector} |= \"{phrase}\""),
@@ -294,7 +292,8 @@ impl QueryGenerator {
             // equality, so the languages' bucket-labeling difference does not
             // matter here; sending Loki paths would 404 and measure nothing.
             crate::config::Target::VictoriaLogs => {
-                let selector = format!("app:\"{app}\"");
+                // VictoriaLogs keeps the resource attribute's dotted name.
+                let selector = format!("service.name:\"{app}\"");
                 // `sort by (_time)` before a `limit`, matching the direction
                 // the Loki-path query asks for: a bare LogsQL `limit` has no
                 // order contract, and a bound that binds must cut the same
@@ -310,9 +309,13 @@ impl QueryGenerator {
                     QueryShape::LineFilter => {
                         format!("{selector} AND ~\"{phrase}\" | {cut}")
                     }
+                    // `unpack_json` before the field filter: an OTLP body is a
+                    // string VictoriaLogs stores as `_msg` without parsing, so
+                    // the JSON fields exist only after a query-time unpack —
+                    // the same stage `| json` is on the LogQL side.
                     QueryShape::JsonField => {
                         let (field, value) = &json_field;
-                        format!("{selector} AND {field}:\"{value}\" | {cut}")
+                        format!("{selector} | unpack_json | filter {field}:\"{value}\" | {cut}")
                     }
                     QueryShape::Rate => {
                         format!("{selector} | stats by (_time:1m) rate() as value")
@@ -510,10 +513,10 @@ mod tests {
             );
             let app = plan
                 .expression
-                .split_once("app=\"")
+                .split_once("service_name=\"")
                 .and_then(|(_, rest)| rest.split_once('"'))
                 .map(|(value, _)| value.to_string())
-                .expect("every shape selects on app");
+                .expect("every shape selects on service_name");
             assert!(
                 corpus
                     .streams
@@ -545,7 +548,7 @@ mod tests {
             let plan = generator.next_plan(1_772_000_000);
             seen.insert(plan.shape.name());
             assert!(plan.path.starts_with("/select/logsql/query?query="));
-            assert!(plan.expression.starts_with("app:\""));
+            assert!(plan.expression.starts_with("service.name:\""));
         }
         assert_eq!(seen.len(), QUERY_SHAPES.len(), "every shape must be drawn");
     }

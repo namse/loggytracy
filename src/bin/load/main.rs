@@ -27,6 +27,7 @@
 mod config;
 mod http;
 mod matrix;
+mod otlp;
 mod probe;
 mod stats;
 mod workload;

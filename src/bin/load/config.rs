@@ -90,10 +90,15 @@ impl Target {
         }
     }
 
+    /// Where OTLP logs are POSTed. Three spellings of the same endpoint:
+    /// loggytracy serves the collector path bare, Loki nests it under `/otlp`,
+    /// VictoriaLogs under `/insert/opentelemetry` — all measured accepting the
+    /// identical protobuf body (2026-08-02, Loki 3.3.2 / VictoriaLogs v1.52.0).
     pub fn push_path(self) -> &'static str {
         match self {
-            Target::Loggytracy | Target::Loki => "/loki/api/v1/push",
-            Target::VictoriaLogs => "/insert/loki/api/v1/push",
+            Target::Loggytracy => "/v1/logs",
+            Target::Loki => "/otlp/v1/logs",
+            Target::VictoriaLogs => "/insert/opentelemetry/v1/logs",
         }
     }
 

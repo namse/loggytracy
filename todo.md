@@ -682,13 +682,36 @@ by the collector.
 **Order matters here and is the opposite of the tempting one.** Measure that the shape being kept actually
 wins *before* deleting the one being dropped — removing code is the irreversible half.
 
-- [ ] **Add the structured-metadata shape to the comparison.** `| trace_id="x"` with no parser stage, which is
+- [x] **Add the structured-metadata shape to the comparison.** `| trace_id="x"` with no parser stage, which is
       what an OTLP attribute produces. This is where the three genuinely differ: loggytracy indexes structured
       metadata into a per-row-group bloom, Loki stores it and does **not** index it, VictoriaLogs turns it into
-      a column. **Never measured, by anyone, here.**
+      a column. Done as `metadata_rare` (and its narrow-window sibling `trace_window`); it is the shape the
+      claim now rests on.
 - [ ] **Move the bed's ingest to OTLP** so all three receive the same records the consumer sends. Loki accepts
       OTLP at `/otlp/v1/logs`, VictoriaLogs at `/insert/opentelemetry/v1/logs`; both need checking rather than
       assuming. This also removes the bed's dependence on the endpoint being deleted
+
+      **Probed 2026-08-02** (Loki 3.3.2, VictoriaLogs v1.52.0, identical hand-built
+      `ExportLogsServiceRequest` to both plus loggytracy's own `/v1/logs`):
+      * Loki `/otlp/v1/logs` answers 204 with `X-Scope-OrgID`; the six semconv resource attributes
+        (`service.name`, `deployment.environment`, `k8s.{cluster,namespace,container}.name`, `cloud.region`)
+        all promote to stream labels with dots sanitized to underscores — byte-identical to what loggytracy's
+        own promotion produces. Record attributes and the record `trace_id` (32-hex) land in structured
+        metadata; nanosecond timestamps survive exactly; `detected_level` still appears (already exempt).
+      * VictoriaLogs `/insert/opentelemetry/v1/logs` answers 200, takes `X-Scope-OrgID: 0`, keeps the
+        **dotted** attribute names as fields (`service.name`), puts all resource attributes into `_stream`,
+        and always adds `severity_text:"Unspecified"`/`severity_number:"0"` (outside every basis, harmless).
+        LogsQL accepts the dotted name unquoted: `service.name:"x"`, `"service.name":"x"` and
+        `{service.name="x"}` all answer the same rows.
+      * **VictoriaLogs does not parse a JSON body arriving via OTLP.** `_msg` holds the raw line and no
+        fields are extracted — its famous ingest-time parse was a property of its Loki push endpoint, not of
+        the engine. `| unpack_json | filter field:"v"` supplies the parser stage at query time, so under OTLP
+        all three pay the parse at read time and the `json_field`/`metadata_rare` pair separates parsed-line
+        from attribute storage on every system, VictoriaLogs included.
+      * Consequences carried into the harness: corpus labels ride as the semconv names above (`app` →
+        `service.name`, queried as `service_name`), the reduced digest canonicalizes keys through the same
+        sanitizer so `service.name` = `service_name`, and `service_name` left `DERIVED_LABELS` — it is pushed
+        data now.
 - [ ] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
       parser, and `proto.rs`'s encode side
 - [ ] **Then stop re-encoding into a Loki `PushRequest` for the WAL.** It exists so replay has one decoder
