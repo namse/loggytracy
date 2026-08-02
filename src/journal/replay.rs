@@ -172,6 +172,9 @@ fn replay_from(
                 TENANT_RECORD_KIND_TRACES => {
                     replay_trace_record(&tenant, payload, offset, trace_memtable)?;
                 }
+                TENANT_RECORD_KIND_OTLP_LOGS => {
+                    report.entries += replay_otlp_log_record(&tenant, payload, offset, memtable)?;
+                }
                 other => {
                     return Err(format!(
                         "unsupported tenant journal record kind {other} at offset {offset}"
@@ -223,6 +226,36 @@ fn replay_log_record(
                 })
             })
             .collect::<Result<Vec<LogEntry>, String>>()?;
+        replayed_entries += entries.len() as u64;
+        memtable.insert(tenant.clone(), labels, entries);
+    }
+    Ok(replayed_entries)
+}
+
+/// The OTLP counterpart of `replay_log_record`: the payload is the export as
+/// it arrived, normalized here exactly as ingest normalized it before the
+/// crash. An `EmptyRequest` is skipped rather than fatal — a record was only
+/// appended after normalizing non-empty, so hitting one here is a bug to log,
+/// not a reason to refuse startup — while any other normalization failure is
+/// the same hard error a corrupt kind-0 record is.
+fn replay_otlp_log_record(
+    tenant: &TenantId,
+    payload: &[u8],
+    offset: u64,
+    memtable: &MemTable,
+) -> Result<u64, String> {
+    let request = ExportLogsServiceRequest::decode(payload)
+        .map_err(|e| format!("OTLP log protobuf decode failed at offset {offset}: {e}"))?;
+    let streams = match crate::otlp_log::normalize_request(&request) {
+        Ok(streams) => streams,
+        Err(crate::otlp_log::OtlpLogError::EmptyRequest) => {
+            tracing::warn!(offset, "empty OTLP log record in journal, skipping");
+            return Ok(0);
+        }
+        Err(e) => return Err(format!("OTLP log record invalid at offset {offset}: {e}")),
+    };
+    let mut replayed_entries = 0u64;
+    for (labels, entries) in streams {
         replayed_entries += entries.len() as u64;
         memtable.insert(tenant.clone(), labels, entries);
     }

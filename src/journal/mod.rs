@@ -11,6 +11,8 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+
 use crate::config::Config;
 use crate::memtable::{Labels, LogEntry, MemTable, MemTableSnapshot};
 use crate::proto::{self, PushRequest};
@@ -26,6 +28,10 @@ const COMPACTION_STATE_FILE: &str = "journal.wal.compact.state";
 const TENANT_RECORD_MAGIC: &[u8; 4] = b"LGY3";
 const TENANT_RECORD_KIND_LOGS: u8 = 0;
 const TENANT_RECORD_KIND_TRACES: u8 = 1;
+/// The payload is the OTLP `ExportLogsServiceRequest` as it arrived, the same
+/// pattern traces have used from the start: replay re-normalizes instead of
+/// the ingest path materializing a second message just so the WAL can hold it.
+const TENANT_RECORD_KIND_OTLP_LOGS: u8 = 2;
 const TENANT_RECORD_PREFIX_SIZE: usize = TENANT_RECORD_MAGIC.len() + 2;
 
 /// Where a compaction crash is simulated.

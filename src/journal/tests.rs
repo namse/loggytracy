@@ -106,6 +106,76 @@
         assert_eq!(end, ckpt.offset);
     }
 
+    /// The WAL holds the OTLP export as it arrived, so replay must produce
+    /// exactly what ingest's own normalization produced before the crash —
+    /// promoted labels, structured metadata and all.
+    #[tokio::test]
+    async fn an_otlp_log_record_replays_by_its_own_kind() {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let attr = |key: &str, value: &str| KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value.to_string())),
+            }),
+            ..Default::default()
+        };
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![attr("service.name", "api")],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 100,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("hello".to_string())),
+                        }),
+                        attributes: vec![attr("trace_id", "abc123")],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let streams = crate::otlp_log::normalize_request(&request).unwrap();
+        let encoded = Prost014Message::encode_to_vec(&request);
+
+        let h = harness("otlp_replay").await;
+        h.journal
+            .append_otlp_logs(test_tenant(), encoded, streams)
+            .await
+            .unwrap();
+
+        let restored = MemTable::new();
+        replay(
+            h.journal.wal_path(),
+            h.journal.ckpt_path(),
+            &restored,
+            &test_tenant(),
+        )
+        .unwrap();
+        let results = restored.query(
+            &test_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            10,
+            true,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].labels.get("service_name").unwrap(), "api");
+        assert_eq!(results[0].entries[0].line, "hello");
+        assert_eq!(
+            results[0].entries[0].structured_metadata,
+            vec![("trace_id".to_string(), "abc123".to_string())]
+        );
+    }
+
     #[tokio::test]
     async fn compact_checkpoint_retains_appends_after_snapshot() {
         let h = harness("compact_retains_suffix").await;

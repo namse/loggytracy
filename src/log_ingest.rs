@@ -126,10 +126,15 @@ impl OtlpLogIngest<'_> {
         Ok(())
     }
 
+    /// `wire` is the encoded request when the transport still has it — the
+    /// HTTP protobuf body arrives as exactly the bytes the WAL wants, so they
+    /// are passed through instead of being re-encoded. gRPC and JSON hand
+    /// over a decoded message only, and those re-encode it here.
     pub async fn accept(
         &self,
         tenant: crate::tenant::TenantId,
         request: ExportLogsServiceRequest,
+        wire: Option<Vec<u8>>,
     ) -> Result<(), IngestError> {
         let record_count = request
             .resource_logs
@@ -181,13 +186,18 @@ impl OtlpLogIngest<'_> {
             }
         }
 
-        // The journal keeps one encoding for a log record whatever protocol it
-        // arrived on, so replay has one decoder rather than a kind byte and two
-        // paths that can drift apart. The normalization above is therefore
-        // done once, here, and not again after a crash.
-        let encoded = crate::proto::encode_push_request(&streams);
+        // The WAL stores the export itself. This used to materialize a Loki
+        // `PushRequest` — a second message with a clone per line and per
+        // label, serialized just so replay had one decoder — measured as the
+        // largest remaining term of `docs/VISION.md` invariant II's copy
+        // count. Replay decodes by the record's kind instead, the way traces
+        // always have.
+        let encoded = match wire {
+            Some(bytes) => bytes,
+            None => request.encode_to_vec(),
+        };
         self.journal
-            .append(tenant, encoded, streams)
+            .append_otlp_logs(tenant, encoded, streams)
             .await
             .map_err(|error| {
                 (
@@ -239,7 +249,7 @@ impl LogsService for LogIngestService {
             .admit_tenant(&tenant, request.encoded_len())
             .map_err(ingest_error_to_status)?;
         ingest
-            .accept(tenant, request)
+            .accept(tenant, request, None)
             .await
             .map_err(ingest_error_to_status)?;
         Ok(Response::new(ExportLogsServiceResponse::default()))

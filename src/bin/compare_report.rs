@@ -1231,8 +1231,8 @@ loggytracy compacts its write-ahead log only when an object store is
 configured — `flush.rs:219` passes `remote_cache.is_some()` as the `compact`
 flag, so in the local-only mode this bed runs it in, the checkpoint offset
 advances and the file never shrinks. Everything ever ingested is still in it,
-uncompressed, because the WAL stores the decompressed protobuf rather than the
-client's snappy (`todo.md`, M11). Loki truncates its ingester WAL on flush, so
+uncompressed — the WAL stores each OTLP export as it arrived, and OTLP bodies
+are not compressed on this wire. Loki truncates its ingester WAL on flush, so
 its WAL row is kilobytes.
 
 That difference is a **property of the configuration this bed chose**, not of

@@ -125,7 +125,13 @@ pub async fn logs(
     // this instance's CPU on a body that will not be accepted.
     ingest.admit_tenant(&tenant, body.len())?;
     let request: ExportLogsServiceRequest = encoding.decode(&body)?;
-    ingest.accept(tenant, request).await?;
+    // A protobuf body is already the WAL's encoding of choice, so it rides
+    // through untouched; a JSON body has no protobuf bytes to keep.
+    let wire = match encoding {
+        OtlpEncoding::Protobuf => Some(body.to_vec()),
+        OtlpEncoding::Json => None,
+    };
+    ingest.accept(tenant, request, wire).await?;
     Ok(encoding.encode(&ExportLogsServiceResponse::default()))
 }
 

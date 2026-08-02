@@ -192,6 +192,69 @@
         assert_eq!(total, 3);
     }
 
+    /// A WAL holding both record kinds — a Loki push and an OTLP export —
+    /// restores both through the production `recover`, because a restart does
+    /// not get to choose which protocol yesterday's traffic used.
+    #[tokio::test]
+    async fn e2e_inflight_otlp_logs_restored_alongside_push_records() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+
+        let dir = tmp_data_dir("inflight_otlp");
+        let config = Config {
+            data_dir: dir.clone(),
+            ..Config::default()
+        };
+
+        let memtable = Arc::new(MemTable::new());
+        let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+        ingest_once(&journal, &build_push_req()).await;
+
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 4_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("via otlp".to_string())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let streams = crate::otlp_log::normalize_request(&request).unwrap();
+        let encoded = prost014::Message::encode_to_vec(&request);
+        journal
+            .append_otlp_logs(test_tenant(), encoded, streams)
+            .await
+            .unwrap();
+        // No checkpoint, no flush — crash with both kinds in flight.
+        drop(journal);
+        drop(memtable);
+
+        let recovered = MemTable::new();
+        recover(&config, &recovered).unwrap();
+        let results = recovered.query(
+            &test_tenant(),
+            &[],
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            100,
+            true,
+        );
+        let mut lines: Vec<&str> = results
+            .iter()
+            .flat_map(|stream| stream.entries.iter().map(|entry| entry.line.as_str()))
+            .collect();
+        lines.sort_unstable();
+        assert!(lines.contains(&"via otlp"), "OTLP record must replay");
+        assert_eq!(lines.len(), 4, "three push lines plus the OTLP one");
+    }
+
     #[tokio::test]
     async fn e2e_recovery_truncates_crc_corrupt_wal_tail() {
         let dir = tmp_data_dir("crc_tail");
