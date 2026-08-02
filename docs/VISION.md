@@ -69,8 +69,8 @@ the earlier table here was a guess and every one of its numbers moved:
 | Arena | Share | Measured high-water at 2 GiB | Holds | On overflow |
 |---|---|---|---|---|
 | ingest | 20% | 378 MiB | memtable, trace memtable, in-flight push bodies | `429` + `Retry-After` (already the mechanism) |
-| flush | 25% | **721 MiB** (build `50190cf`; not re-measured since the label sets were shared) | materialized rows, Parquet writer buffers | defer the flush; ingest backs up into its own arena and refuses there |
-| merge | 25% | **771 MiB** | one merge group | split the group; skip the tick |
+| flush | 25% | 96.1 MiB (`f7d9a36`, chunked; was 721 MiB on `50190cf` and 513.7 MiB re-measured on `761999a`) | one chunk of materialized rows (`LOGGYTRACY_FLUSH_CHUNK_BYTES`), Parquet writer buffers | defer the flush; ingest backs up into its own arena and refuses there |
+| merge | 25% | **771 MiB** (`50190cf`; 326.5 MiB re-measured on `761999a`/`c0fd93c`) | one merge group's paging (`merge_max_memory_bytes / 2`, per-part pages clamped 2–8 MiB) | split the group; skip the tick |
 | query | 25% | 242 MiB + 203 MiB untagged | every concurrent scan, pipeline stage and metric evaluation | queue, then `429` |
 | sidecar | 5% | 17 MiB | blooms, stream index, part metadata | evict least-recently-used sidecars; reload from `index.bin` |
 
@@ -83,6 +83,11 @@ snapshot at 3.3× its accounted size, and one merge group reached 771 MiB agains
 a `merge_max_memory_bytes` default of 1 GiB — half the container. Their shares
 are targets the code must be made to meet (invariant II's `Arc<Labels>` and a
 chunked flush; a group split sized from the budget), not descriptions of it.
+Both have since been made to meet them: the chunked flush (`f7d9a36`) bounds
+the flush transient at the chunk (96.1 MiB measured against a 25% share of
+512 MiB), and `merge_max_memory_bytes` actually bounds a rewrite's paging
+again. `memory_gate --budget 2GiB` reads UNDER_BUDGET at 39.8% with the settle
+included, and todo.md's stall section has the run-by-run record.
 
 **`Arc<Labels>` has landed and the table has not been re-measured, so every
 figure in it is build `50190cf`'s.** The flush arena's 721 MiB was a *copy* of the

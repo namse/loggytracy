@@ -772,6 +772,62 @@ the flush transient can stop being ~4x its input (rows_from_snapshot copies plus
 per JSON row plus arrow plus parquet buffers, all live at once); whether query-under-ingest deserves
 its own budget the way scans have permits; and whether the load verdict's 2s query-p95 target was ever
 passed by any revision — no retained artifact says it was.
+
+**Resolved 2026-08-03** (`c0fd93c`..`f7d9a36`), in three measured moves; every leg is the memprof rig
+(2 GiB `systemd-run`, real disk, 20 k eps + 5 qps, seed 1592598566), baselined the same day because the
+stale-figure warning at "flush cannot be sized independently of ingest" was right — the fresh baseline
+at `761999a` read flush **513.7 MiB** against a 157 MiB memtable, merge 328.2 MiB, and the server dead
+at t≈56 s with anon 2002.5 MiB.
+
+1. **The flush is chunked** (`part::flush_snapshot_chunked`, `LOGGYTRACY_FLUSH_CHUNK_BYTES`, default
+   32 MiB): streams walked in `(tenant, labels)` order, entries ordered through a side index because
+   the snapshot is shared with queries, per-stream adjacent dedup so a cut between twins is safe, all
+   inside `spawn_blocking`, all-or-nothing rollback kept. The whole-snapshot copy, the global sort on
+   an async worker, the partition-wide `parse_rows`, and the part-wide index buffers are all bounded by
+   the chunk now. Flush arena peak: **513.7 → 96.1 MiB**; the run stopped dying. Companion:
+   `merge_max_memory_bytes` is no longer dead — half of it is the paging budget, pages shrink from
+   8 MiB toward a 2 MiB floor as the group widens, and `group_for_merge` caps a group's part count at
+   what that budget can page, because a chunked flush feeds merge more, smaller parts.
+2. **Memory alone did not move the stall.** With flush at 96 MiB the queries still served p99 at
+   13.9 s, all five shapes alike, and the sampler said why: at every merge tick (t=30.6 exactly) parts,
+   flushes and `query_success` froze together for the length of the rewrite. The 56-part group's
+   rewrite held the fair `operation_lock`'s read half for ~13 s, the next flush queued its write, and
+   every query arriving after queued behind the flush. Shrinking the flush writer's own section
+   (readers opened on the blocking thread, checkpoint moved after the lock — `719e60b`) was correct
+   but not sufficient: the holder was merge.
+3. **Merge now reads under a `deletion_lock`** (`f7d9a36`): the rewrite only ever needed "nobody
+   deletes these files", never visibility, so that guarantee is its own lock; deleters (retention
+   retirement, cache eviction) take operation-then-deletion, and merge commit installs readers it
+   opened before the operation write lock (`replace_opened`). Same rig after: **query response p95
+   12,530 → 229 ms, service p99 13,880 → 327 ms, max 345 ms**, achieved 19,949 of 20,000 eps, WAL
+   backlog trend negative over the run, `q_ok` incrementing straight through both merge ticks —
+   verdict **PASS**, the first load-phase PASS any retained artifact shows, 2 s target included.
+
+Found in the equality gate on the way and worth more than the feature: **every streamed merge since
+"the merge streams" has been reading its inputs in query order, not layout order.**
+`read_rows_in_row_groups` inherited `scan_into`'s visit-groups-by-`min_ts` sort, and once a row group
+straddles two streams its `min_ts` reaches back to the younger stream's start — so a windowed rewrite
+page left `Row::sort_key` order, `MergedRows` k-way-merged a broken promise, and the parts merge wrote
+carried the interleaving (weaker stream contiguity, dedup adjacency not guaranteed, the reader's
+within-tenant time-order assumption violated). A windowed read now keeps ordinal order
+(`a_rewrite_read_returns_layout_order_not_query_order` holds it). The `metadata_rare` matrix rows
+moving from 4.78x/4.98x slower than VictoriaLogs to **1.61x/1.83x** in the same bed is consistent with
+merged parts pruning properly again, though the two changes landed together so the split is not
+isolated.
+
+Gates, all on `f7d9a36`: cargo test 452+39 green, clippy 0; `memory_gate --budget 2GiB`
+**UNDER_BUDGET at 39.8%** (anon peak 814.8 MiB, settle included, memtable peak 5.4 MiB — the waves are
+gone, ingest and settle peaks 792/815); full bed run with **agreement 168/168 on all three pairs,
+every shape**, ingest 19,810 eps against Loki's 19,870 and VictoriaLogs' 19,932, all three systems
+surviving the first 2 g attempt, loggytracy's bed-phase query response p95 **98.5 ms** against Loki's
+429 ms. The bed's anon-during-ingest peak fell 1278.4 → **832.0 MiB**, now below Loki's 1123.
+
+What the run gave back to the open list: disk settled at **0.60x Loki / 1.28x VictoriaLogs** against
+0.56x/1.18x before — the chunked flush leaves more, smaller parts at the settle and the per-part
+overhead is visible; if it matters, the lever is `flush_chunk_bytes` up or merge appetite, measured,
+not assumed. Query-under-ingest still has no *budget* (open question 2 stands, now with a passing
+baseline to regress against). And `anon/live` in the memprof legs still reads ~5–8 — the allocator
+retention item at M10's "honest metering" is untouched by any of this.
 - [x] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
       parser, and `proto.rs`'s encode side
 
@@ -1077,11 +1133,14 @@ Write path:
 - [ ] Remove the two free memcpys: the line clone at `ingest.rs:247` (the source is separately owned and could
       be consumed), and the whole-payload copy in `frame_tenant_record` (`journal/mod.rs:90-101`) whose 7-byte
       prefix belongs in `writer_loop`'s batch buffer
-- [ ] One sort — `sort_rows` runs globally (`part/format.rs:22`) and again per partition (`:91`)
+- [x] One sort — the chunked flush (2026-08-03, below) emits streams in `(tenant, labels)` order with
+      per-stream entry ordering, so the global sort is gone; the per-partition `sort_rows` stays as the
+      dedup and as a near-O(n) safety net over already-sorted input
 - [ ] One parse — `encode_blooms` runs the JSON and logfmt parsers over every line twice, to size the filter
       and then to fill it (`part/format.rs:335-341`, `:360-366`)
-- [ ] Move `rows_from_snapshot` and the global sort inside `spawn_blocking` (`flush.rs:233` is outside the one
-      at `:253`), so an O(n log n) pass over a full snapshot stops blocking an async worker
+- [x] Move `rows_from_snapshot` and the global sort inside `spawn_blocking` — done by the chunked flush
+      (2026-08-03, below): materialization happens per chunk inside the blocking task, and
+      `rows_from_snapshot` is no longer on the production path at all
 - [ ] Cap the exact-field bloom. `exact_capacity` is the raw token count for the row group
       (`part/format.rs:329-347`), so a wide-JSON tenant can make `index.bin` larger than `data.parquet`
 - [ ] Consider compressing the WAL payload. It stores the decompressed protobuf, discarding the client's
