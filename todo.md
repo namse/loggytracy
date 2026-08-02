@@ -790,6 +790,14 @@ passed by any revision — no retained artifact says it was.
       overflow, the disabled window, and the full flush-loop-through-restart pipeline, all speaking OTLP.
       `bench_encode_push_request` retired with the thing it measured; `wal/append` now appends the bytes
       the WAL actually stores.
+
+      **Gated on its own full bed run (2026-08-02): 168/168 on all three pairs, every shape, with the push
+      surface gone.** Ingest 19,639 eps of 20,000 offered (Loki 19,872, VictoriaLogs 19,931); disk 0.56x
+      Loki / 1.18x VictoriaLogs WAL-excluded; `memory_gate --budget 2GiB` UNDER_BUDGET on the same
+      revision. One number moved between back-to-back runs without a cause in either engine:
+      VictoriaLogs' `metadata_rare`/`trace_window` p50 swung 0.5–1.6 ms, taking the lt/VL ratio from
+      1.49x to 4.78x — at millisecond scale that column is variance, and `docs/VISION.md` now quotes the
+      range instead of whichever run flattered.
 - [x] **Then stop re-encoding into a Loki `PushRequest` for the WAL.** It exists so replay has one decoder
       while two protocols converge, and it costs a whole second message materialized with a clone per line and
       per label, then serialized, framed and batched — five copies for the WAL alone, on the consumer's own

@@ -396,8 +396,11 @@ bed ingests OTLP on all three systems since 2026-08-02 — the same protobuf
 body at each engine's own `/v1/logs` spelling — and every ratio below printed
 only after all three pairs agreed on all 168 queries of every shape. The Loki
 half **holds** — `metadata_rare` at **0.03x**, 2.4 ms against 78.8 — and the
-VictoriaLogs half **does not yet** — **1.49x cold / 1.54x warm**, 2.4 ms
-against 1.6. It began at 12.6x when `structured_metadata` was a JSON blob
+VictoriaLogs half **does not yet** — 2.4–2.5 ms of loggytracy against 0.5–1.6
+ms of VictoriaLogs across back-to-back runs of the same bed, a ratio between
+**1.5x and 5x** that swings on VictoriaLogs' sub-millisecond constant rather
+than on anything either engine changed between runs. It began at 12.6x when
+`structured_metadata` was a JSON blob
 parsed per row; columnizing it, then the page-level time selection and the
 1024-row pages, brought it to 1.5x, and what remains is millisecond-scale
 constant work against a purpose-built column store. An earlier short run had
