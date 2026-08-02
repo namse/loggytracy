@@ -94,7 +94,10 @@ impl TraceRegistry {
         Ok(registry)
     }
 
-    pub fn register(&self, parts: Vec<TracePart>) -> Result<Vec<String>, String> {
+    /// Open readers for freshly written trace parts, without touching the
+    /// registry — the same open-outside-the-lock split as
+    /// [`crate::part_registry::PartRegistry::open_parts`].
+    pub fn open_parts(parts: Vec<TracePart>) -> Result<Vec<(String, Arc<TracePartReader>)>, String> {
         let mut readers = Vec::with_capacity(parts.len());
         for part in parts {
             let id = part.meta.id.clone();
@@ -102,9 +105,20 @@ impl TraceRegistry {
                 .map_err(|error| format!("failed to open trace part {id}: {error}"))?;
             readers.push((id, Arc::new(reader)));
         }
+        Ok(readers)
+    }
+
+    pub fn register(&self, parts: Vec<TracePart>) -> Result<Vec<String>, String> {
+        Ok(self.register_opened(Self::open_parts(parts)?))
+    }
+
+    pub fn register_opened(
+        &self,
+        readers: Vec<(String, Arc<TracePartReader>)>,
+    ) -> Vec<String> {
         let ids = readers.iter().map(|(id, _)| id.clone()).collect();
         self.inner.write().unwrap().extend(readers);
-        Ok(ids)
+        ids
     }
 
     pub fn unregister(&self, ids: &[String]) {

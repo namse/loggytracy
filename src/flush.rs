@@ -282,7 +282,32 @@ async fn flush_once(
                     });
                 }
             };
-            Ok::<_, std::io::Error>((log_parts, trace_parts))
+            // Open the readers here, on the blocking thread, while nothing is
+            // locked: opening validates checksums over everything just
+            // written, and a chunked flush leaves many parts. Under the
+            // exclusive lifecycle lock that I/O was a stall every queued
+            // query paid for.
+            let rollback = |error: String,
+                            log_parts: &[part::Part],
+                            trace_parts: &[trace_part::TracePart]| {
+                let log_dirs = part_dirs(log_parts);
+                let trace_dirs: Vec<_> = trace_parts.iter().map(|p| p.dir.clone()).collect();
+                match cleanup_part_directories(&log_dirs, &trace_dirs) {
+                    Ok(()) => std::io::Error::other(error),
+                    Err(cleanup_error) => std::io::Error::other(format!(
+                        "{error}; part rollback failed: {cleanup_error}"
+                    )),
+                }
+            };
+            let opened_log = match PartRegistry::open_parts(log_parts.clone()) {
+                Ok(opened) => opened,
+                Err(error) => return Err(rollback(error, &log_parts, &trace_parts)),
+            };
+            let opened_traces = match TraceRegistry::open_parts(trace_parts.clone()) {
+                Ok(opened) => opened,
+                Err(error) => return Err(rollback(error, &log_parts, &trace_parts)),
+            };
+            Ok::<_, std::io::Error>((log_parts, trace_parts, opened_log, opened_traces))
         }
     })
     .await
@@ -296,7 +321,7 @@ async fn flush_once(
     };
 
     match result {
-        Ok((new_parts, new_trace_parts)) => {
+        Ok((new_parts, new_trace_parts, opened_log, opened_traces)) => {
             let n = new_parts.len();
             let total_rows = new_parts
                 .iter()
@@ -399,45 +424,20 @@ async fn flush_once(
             // but registry installation and memtable commit must be one
             // write-locked visibility transition; otherwise a query can see
             // the flushing snapshot and its newly registered part together.
+            //
+            // That transition is all the write lock covers. The readers were
+            // opened — checksums validated, footers parsed — on the blocking
+            // thread before it, and the checkpoint advances after it: the
+            // checkpoint is invisible to queries, and the lock is fair, so
+            // every millisecond of I/O spent under it was a millisecond every
+            // queued query waited.
             drop(cache_guard);
-            let _visibility_guard = registry.operation_lock().write_owned().await;
-            let registered_log_ids = match registry.register(new_parts) {
-                Ok(ids) => ids,
-                Err(error) => {
-                    // Once a remote manifest has made these parts visible it is
-                    // unsafe to delete them. Recovery will reopen them from the
-                    // manifest; reinserting the snapshot preserves at-least-once
-                    // semantics until then.
-                    let cleanup_error = if remote_cache.is_none() {
-                        cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).err()
-                    } else {
-                        None
-                    };
-                    memtable.abort_flush(ckpt.snapshot);
-                    trace_memtable.abort_flush(trace_spans);
-                    return Err(match cleanup_error {
-                        Some(cleanup_error) => {
-                            format!("{error}; failed to clean rejected parts: {cleanup_error}")
-                        }
-                        None => error,
-                    });
-                }
-            };
-            if let Err(error) = trace_registry.register(new_trace_parts) {
-                registry.unregister(&registered_log_ids);
-                let cleanup_error = if remote_cache.is_none() {
-                    cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).err()
-                } else {
-                    None
-                };
-                memtable.abort_flush(ckpt.snapshot);
-                trace_memtable.abort_flush(trace_spans);
-                return Err(match cleanup_error {
-                    Some(cleanup_error) => {
-                        format!("{error}; failed to clean rejected parts: {cleanup_error}")
-                    }
-                    None => error,
-                });
+            {
+                let _visibility_guard = registry.operation_lock().write_owned().await;
+                registry.register_opened(opened_log);
+                trace_registry.register_opened(opened_traces);
+                memtable.commit_flush();
+                trace_memtable.commit_flush();
             }
             if let Err(error) =
                 advance_checkpoint(journal, ckpt.offset, remote_cache.is_some()).await
@@ -447,10 +447,9 @@ async fn flush_once(
                 // fsync failed. Rolling the part back could therefore lose
                 // data on restart, while leaving the flushing snapshot in
                 // memory would make every retry write it into another part.
-                // Commit the in-memory side and retain this offset for the
-                // flush loop to retry before it attempts any later flush.
-                memtable.commit_flush();
-                trace_memtable.commit_flush();
+                // The in-memory side is already committed; retain this offset
+                // for the flush loop to retry before it attempts any later
+                // flush.
                 *pending_checkpoint = Some(ckpt.offset);
                 return Err(format!(
                     "parts were committed but journal checkpoint could not be advanced: {error}"
@@ -464,8 +463,6 @@ async fn flush_once(
                 // committed checkpoint.
                 tracing::warn!(%error, "failed to clear committed flush transaction");
             }
-            memtable.commit_flush();
-            trace_memtable.commit_flush();
             tracing::info!(
                 offset = ckpt.offset,
                 rows = total_rows,

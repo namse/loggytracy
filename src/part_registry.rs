@@ -295,7 +295,14 @@ impl PartRegistry {
             .collect()
     }
 
-    pub fn register(&self, parts: Vec<Part>) -> Result<Vec<String>, String> {
+    /// Open readers for freshly written parts, without touching the registry.
+    ///
+    /// Opening validates sidecar checksums and parses the Parquet footer —
+    /// file I/O proportional to the flush — so it belongs on a blocking
+    /// thread *before* the exclusive lifecycle lock is taken, not under it.
+    /// A chunked flush registers many parts at once, which is exactly when
+    /// paying that I/O inside the lock stalls every queued query.
+    pub fn open_parts(parts: Vec<Part>) -> Result<Vec<(String, Arc<PartReader>)>, String> {
         let mut opened = Vec::with_capacity(parts.len());
         for part in parts {
             let id = part.meta.id.clone();
@@ -303,6 +310,17 @@ impl PartRegistry {
                 .map_err(|e| format!("failed to open freshly written part {id}: {e}"))?;
             opened.push((id, Arc::new(reader)));
         }
+        Ok(opened)
+    }
+
+    pub fn register(&self, parts: Vec<Part>) -> Result<Vec<String>, String> {
+        Ok(self.register_opened(Self::open_parts(parts)?))
+    }
+
+    /// Install already-opened readers: map inserts and derived-index updates
+    /// only, so the caller can hold the write half of the lifecycle lock for
+    /// exactly the visibility transition and nothing else.
+    pub fn register_opened(&self, opened: Vec<(String, Arc<PartReader>)>) -> Vec<String> {
         let ids = opened.iter().map(|(id, _)| id.clone()).collect();
         let mut inner = self.inner.write().unwrap();
         let mut layout = self.layout.write().unwrap();
@@ -321,7 +339,7 @@ impl PartRegistry {
                 census.add(&tenant, keys);
             }
         }
-        Ok(ids)
+        ids
     }
 
     pub fn unregister(&self, ids: &[String]) {
