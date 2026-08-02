@@ -363,6 +363,41 @@ pub struct CountingSink<'a> {
 }
 
 impl RowSink for CountingSink<'_> {
+    fn accept_timestamps(
+        &mut self,
+        labels: &SharedLabels,
+        timestamps: &[i64],
+        time_range: QueryTimeRange,
+    ) -> Result<bool, String> {
+        // Bare timestamps carry nothing a deletion mask, a pipeline stage or
+        // a byte count could read, so this path exists only when none do.
+        if self.hidden.is_some() || !self.query.stages.is_empty() || self.bytes {
+            return Ok(false);
+        }
+        let _ = labels;
+        if self
+            .cancellation
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err("query timed out".to_string());
+        }
+        for &timestamp_ns in timestamps {
+            if !time_range.contains(timestamp_ns) {
+                continue;
+            }
+            let start = self.times.partition_point(|&t| t < timestamp_ns);
+            let end = self
+                .times
+                .partition_point(|&t| t < timestamp_ns.saturating_add(self.range_ns));
+            if start < end {
+                self.diff[start] += 1.0;
+                self.diff[end] -= 1.0;
+            }
+            self.rows += 1;
+        }
+        Ok(true)
+    }
+
     fn accept_extracted(
         &mut self,
         labels: &SharedLabels,
