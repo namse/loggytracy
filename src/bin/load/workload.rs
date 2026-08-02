@@ -316,7 +316,7 @@ impl QueryGenerator {
                     QueryShape::JsonField => {
                         let (field, value) = &json_field;
                         format!(
-                            "{selector} | unpack_json fields ({field}) | filter {field}:\"{value}\" | {cut}"
+                            "{selector} | unpack_json fields ({field}) keep_original_fields | filter {field}:\"{value}\" | {cut}"
                         )
                     }
                     QueryShape::Rate => {

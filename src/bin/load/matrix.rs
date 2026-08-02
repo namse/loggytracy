@@ -626,6 +626,15 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
         // at all — which the digest correctly refuses to read as a log row.
         // Unpacking only the queried field asks the same question `| json |
         // field="v"` asks while leaving the message column alone.
+        //
+        // `keep_original_fields` is LogQL's shadowing rule spelled in LogsQL:
+        // on the other side a label that already exists — structured metadata
+        // included — wins over what `| json` extracts. Without it, an unpack
+        // that finds nothing *erases* the attribute the row already carried,
+        // and a logfmt row whose attribute matches the predicate answers on
+        // loggytracy and Loki but not here — measured as `json_field_rare`
+        // 8/24 with every disagreement a `1 against 0 rows` in the windows
+        // where the rare trace's row is not a JSON line.
         Shape::JsonField => {
             let (field, value) = if variant.is_multiple_of(2) {
                 ("status", STATUSES[variant % STATUSES.len()].to_string())
@@ -633,7 +642,7 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
                 ("level", LEVELS[variant % LEVELS.len()].to_string())
             };
             format!(
-                "{selector} | unpack_json fields ({field}) | filter {field}:\"{value}\" | {newest}"
+                "{selector} | unpack_json fields ({field}) keep_original_fields | filter {field}:\"{value}\" | {newest}"
             )
         }
         // No app selector, matching the LogQL side: the point is a predicate
@@ -648,7 +657,7 @@ fn logsql(shape: Shape, app: &str, cfg: &Config, rare_trace_id: &str, variant: u
         // rows carry the same value inside the line.
         Shape::JsonFieldRare => {
             format!(
-                "* | unpack_json fields (trace_id) | filter trace_id:\"{rare_trace_id}\" | {newest}"
+                "* | unpack_json fields (trace_id) keep_original_fields | filter trace_id:\"{rare_trace_id}\" | {newest}"
             )
         }
         Shape::MetadataRare | Shape::TraceWindow => {

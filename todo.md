@@ -735,6 +735,32 @@ wins *before* deleting the one being dropped — removing code is the irreversib
         client's only two uses are separated by the whole run, VictoriaLogs closes idle keep-alives, and
         the first request on the dead socket was the scrape. `scrape()` now retries once on a fresh
         connection.
+
+      **Second run (quiet machine): 168/168 strict with Loki; VictoriaLogs pairs 160/168, and the last
+      eight were the shadowing rule.** Every `json_field_rare` disagreement was `1 against 0 rows` in a
+      window where the rare trace's row is not a JSON line: loggytracy answers it because the structured-
+      metadata label shadows the failed extraction, VictoriaLogs' `unpack_json` *erased* the attribute
+      when the unpack found nothing. `keep_original_fields` is that shadowing rule spelled in LogsQL —
+      verified live on the failing window before the fix went in.
+
+## Queries during heavy ingest stall for tens of seconds, and it predates OTLP
+
+Found by the OTLP bed runs and then measured against the pre-migration engine, so it is not the
+migration's: under a 2 GiB cgroup on real disk at 20k eps offered with 5 qps of live-window queries,
+**the 84ea2e2 engine driven by the 84ea2e2 harness over Loki push fails the same way the OTLP pair
+does** — query service max 16.3s (old) vs 14.7s (new), response p95 ~12–13s both, anon peak riding the
+container limit at ~2.1 GiB both, and a repeat load round OOM-killed the bed container (137). The
+morning-bed FAIL rows that looked like a migration regression were this, plus this session's own
+`cargo build` sharing the twelve cores during the first run's ingest phase.
+
+What the local memprof legs showed while the waves ran: `flush` arena spikes to ~530 MB and `merge` to
+~320 MB against a ~130 MB memtable — the flush pipeline materializes several times its input — and the
+allocator keeps the high-water mark resident afterwards. In 2 GiB that reads as reclaim pressure,
+20-second queries, and a WAL backlog that nets upward. Open questions, in measurement order: whether
+the flush transient can stop being ~4x its input (rows_from_snapshot copies plus `serde_json::Value`
+per JSON row plus arrow plus parquet buffers, all live at once); whether query-under-ingest deserves
+its own budget the way scans have permits; and whether the load verdict's 2s query-p95 target was ever
+passed by any revision — no retained artifact says it was.
 - [ ] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
       parser, and `proto.rs`'s encode side
 - [ ] **Then stop re-encoding into a Loki `PushRequest` for the WAL.** It exists so replay has one decoder

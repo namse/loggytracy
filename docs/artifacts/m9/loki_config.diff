@@ -1,8 +1,13 @@
---- /dev/fd/63	2026-08-02 16:23:05.465740404 +0900
-+++ /dev/fd/62	2026-08-02 16:23:05.465740404 +0900
+--- /dev/fd/63	2026-08-02 19:11:30.046350124 +0900
++++ /dev/fd/62	2026-08-02 19:11:30.046350124 +0900
 @@ -7 +7 @@
 -  http_listen_address: ""
 +  http_listen_address: 0.0.0.0
+@@ -41,2 +41,2 @@
+-  grpc_server_max_recv_msg_size: 4194304
+-  grpc_server_max_send_msg_size: 4194304
++  grpc_server_max_recv_msg_size: 104857600
++  grpc_server_max_send_msg_size: 104857600
 @@ -55 +55 @@
 -  log_level: info
 +  log_level: warn
@@ -97,7 +102,7 @@
 -    ingestername: ""
 -    mode: ""
 -    ingesterdbretainperiod: 0s
-+    ingestername: 784dcfdf1ef4
++    ingestername: 82de55df6a93
 +    mode: RW
 +    ingesterdbretainperiod: 20m0s
 @@ -1774,2 +1787,2 @@
@@ -109,7 +114,7 @@
 -    ingestername: ""
 -    mode: ""
 -    ingesterdbretainperiod: 0s
-+    ingestername: 784dcfdf1ef4
++    ingestername: 82de55df6a93
 +    mode: RW
 +    ingesterdbretainperiod: 20m0s
 @@ -1809 +1822 @@
