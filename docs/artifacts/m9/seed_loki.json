@@ -1,6 +1,6 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-08235586e6d053a26e4ad1e2b37bfcfc86292508cc7d38e1ef10ec8fc2588b3b.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-b691717f3a6efd3e7fc372859dec32abf88117fc6d759f74f8aede2a45fd13b6.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
@@ -52,7 +52,7 @@
     "tenants": 4,
     "tier": "B",
     "verify": {
-      "anchor_ns": 1785650680000000000,
+      "anchor_ns": 1785651740000000000,
       "entries_per_push": 100,
       "labels_per_stream": 6,
       "limit": 20000,
@@ -68,24 +68,24 @@
     "warmup_seconds": 10
   },
   "memory": {
-    "anon_bytes_end": 905986048,
-    "anon_peak_bytes": 1170771968,
-    "current_bytes": 1876070400,
+    "anon_bytes_end": 994070528,
+    "anon_peak_bytes": 1171017728,
+    "current_bytes": 1997053952,
     "error": null,
-    "file_bytes_end": 328421376,
-    "peak_bytes": 2147569664,
-    "peak_bytes_before": 2147569664,
-    "source": "/sys/fs/cgroup/system.slice/docker-08235586e6d053a26e4ad1e2b37bfcfc86292508cc7d38e1ef10ec8fc2588b3b.scope/memory.peak"
+    "file_bytes_end": 356139008,
+    "peak_bytes": 2147557376,
+    "peak_bytes_before": 2147532800,
+    "source": "/sys/fs/cgroup/system.slice/docker-b691717f3a6efd3e7fc372859dec32abf88117fc6d759f74f8aede2a45fd13b6.scope/memory.peak"
   },
   "phase": "seed",
   "run": {
-    "build_revision": "68f3b98",
+    "build_revision": "144c852",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "seed": 1592598566
   },
   "seed": {
     "complete": true,
-    "elapsed_seconds": 0.836983451,
+    "elapsed_seconds": 0.817907639,
     "errors": 0,
     "first_error": null,
     "line_bytes": 49029829,
@@ -95,12 +95,12 @@
     "statuses": {
       "204": 1504
     },
-    "wire_bytes": 23456776
+    "wire_bytes": 23457484
   },
   "target": "loki",
   "verdict": "PASS",
   "verify": {
-    "anchor_ns": 1785650680000000000,
+    "anchor_ns": 1785651740000000000,
     "line_bytes": 49029829,
     "rows": 150000,
     "span_ns": 150000000000,
