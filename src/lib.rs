@@ -15,6 +15,7 @@ pub mod label_name;
 mod log_ingest;
 pub mod log_scan;
 pub mod logql;
+pub mod malloc_tuning;
 pub mod memprof;
 pub mod memtable;
 mod merge;
