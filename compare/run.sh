@@ -209,6 +209,14 @@ run_load() {
     "$LOAD_BIN" >/dev/null || echo "  (load verdict was not PASS for $target; the result file says why)" >&2
 }
 
+# The verdict the surviving limit's run recorded for a target, straight from
+# its result file — `run_load` deliberately keeps the bed running on a FAIL so
+# every artifact still gets produced; the gate at the end reads this instead.
+load_verdict_of() {
+  grep -o '"verdict": *"[A-Z_]*"' "$OUT/load_$1.json" 2>/dev/null \
+    | head -1 | grep -o '[A-Z_]*' | tail -1
+}
+
 run_verify() {
   local phase=$1 target=$2 limit=${3:-20000} suffix=${4:-}
   say "$phase: $target${suffix:+ (limit $limit)}"
@@ -414,3 +422,20 @@ done
 cp "$OUT"/load_*_*g.json "$ARTIFACTS/" 2>/dev/null || true
 echo "results: $OUT" >&2
 echo "document: $DOC" >&2
+
+# The load verdict is a gate, not a footnote. Every revision failed it until
+# the flush was chunked and merge left the operation lock, so a regression
+# here is exactly the kind that used to ship unnoticed for months. The gate
+# runs last, after the document and artifacts exist, so a FAIL still leaves
+# everything needed to diagnose it. Loki and VictoriaLogs are judged on their
+# own behavioral gates and are not required here by default.
+for TARGET in ${COMPARE_REQUIRE_PASS:-loggytracy}; do
+  [ "$TARGET" = "off" ] && break
+  VERDICT="$(load_verdict_of "$TARGET")"
+  if [ "$VERDICT" != "PASS" ]; then
+    echo "load verdict for $TARGET at ${SURVIVED} is '${VERDICT:-missing}', not PASS; failing the bed" >&2
+    echo "(set COMPARE_REQUIRE_PASS=off to record a known-failing run without gating)" >&2
+    exit 1
+  fi
+  say "load verdict gate: $TARGET PASS at $SURVIVED"
+done
