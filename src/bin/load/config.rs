@@ -186,8 +186,10 @@ pub struct Config {
     pub query_eps: f64,
     pub query_window_seconds: i64,
     pub query_limit: usize,
+    pub heavy_window_seconds: i64,
+    pub heavy_limit: usize,
     pub restore_lookback_seconds: i64,
-    pub query_weights: [u32; 5],
+    pub query_weights: [u32; 6],
 
     pub otlp_eps: f64,
 
@@ -283,7 +285,12 @@ impl Config {
                 env_u64("LOGGYTRACY_LOAD_QUERY_WEIGHT_JSON_FIELD", 3) as u32,
                 env_u64("LOGGYTRACY_LOAD_QUERY_WEIGHT_RATE", 2) as u32,
                 env_u64("LOGGYTRACY_LOAD_QUERY_WEIGHT_RESTORE_PROBE", 1) as u32,
+                // Zero: the heavy shape is an instrument for measuring what a
+                // slow query does to everyone else, opted into per run.
+                env_u64("LOGGYTRACY_LOAD_QUERY_WEIGHT_HEAVY", 0) as u32,
             ],
+            heavy_window_seconds: env_u64("LOGGYTRACY_LOAD_HEAVY_WINDOW_SECONDS", 3600) as i64,
+            heavy_limit: env_usize("LOGGYTRACY_LOAD_HEAVY_LIMIT", 20000).max(1),
 
             otlp_eps: env_f64("LOGGYTRACY_LOAD_OTLP_EPS", 5.0).max(0.0),
 

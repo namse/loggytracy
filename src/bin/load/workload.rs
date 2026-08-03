@@ -167,14 +167,20 @@ pub enum QueryShape {
     /// An old window, so a part evicted from the local cache has to be
     /// restored from the object store on the measured path.
     RestoreProbe,
+    /// A deliberately expensive scan: every stream, a wide window, a large
+    /// limit. Weighted **zero by default** — it exists to measure what one
+    /// slow query does to every other query's latency (the fair
+    /// operation-lock queue), not to be part of the standard mix.
+    Heavy,
 }
 
-pub const QUERY_SHAPES: [QueryShape; 5] = [
+pub const QUERY_SHAPES: [QueryShape; 6] = [
     QueryShape::LabelOnly,
     QueryShape::LineFilter,
     QueryShape::JsonField,
     QueryShape::Rate,
     QueryShape::RestoreProbe,
+    QueryShape::Heavy,
 ];
 
 impl QueryShape {
@@ -185,6 +191,7 @@ impl QueryShape {
             QueryShape::JsonField => "json_field",
             QueryShape::Rate => "rate",
             QueryShape::RestoreProbe => "restore_probe",
+            QueryShape::Heavy => "heavy",
         }
     }
 }
@@ -200,21 +207,26 @@ pub struct QueryGenerator {
     corpus: std::sync::Arc<Corpus>,
     rng: Rng,
     target: crate::config::Target,
-    weights: [u32; 5],
+    weights: [u32; 6],
     window_seconds: i64,
     restore_lookback_seconds: i64,
     limit: usize,
+    heavy_window_seconds: i64,
+    heavy_limit: usize,
 }
 
 impl QueryGenerator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         corpus: std::sync::Arc<Corpus>,
         seed: u64,
         target: crate::config::Target,
-        weights: [u32; 5],
+        weights: [u32; 6],
         window_seconds: i64,
         restore_lookback_seconds: i64,
         limit: usize,
+        heavy_window_seconds: i64,
+        heavy_limit: usize,
     ) -> Self {
         Self {
             corpus,
@@ -224,6 +236,8 @@ impl QueryGenerator {
             window_seconds,
             restore_lookback_seconds,
             limit,
+            heavy_window_seconds,
+            heavy_limit,
         }
     }
 
@@ -255,12 +269,22 @@ impl QueryGenerator {
                 let start = now_seconds - self.restore_lookback_seconds;
                 (start, start + self.window_seconds, 60, "forward")
             }
+            QueryShape::Heavy => (
+                now_seconds - self.heavy_window_seconds,
+                now_seconds,
+                60,
+                "backward",
+            ),
             _ => (
                 now_seconds - self.window_seconds,
                 now_seconds,
                 10,
                 "backward",
             ),
+        };
+        let limit = match shape {
+            QueryShape::Heavy => self.heavy_limit,
+            _ => self.limit,
         };
         let (expression, path) = match self.target {
             crate::config::Target::Loggytracy | crate::config::Target::Loki => {
@@ -276,13 +300,19 @@ impl QueryGenerator {
                         format!("{selector} | json | {field}=\"{value}\"")
                     }
                     QueryShape::Rate => format!("rate({selector}[1m])"),
+                    // Every stream, so no index prunes it; a line filter over
+                    // a phrase the corpus actually contains, so the scan
+                    // decodes lines instead of counting.
+                    QueryShape::Heavy => {
+                        format!("{{service_name=~\".+\"}} |= \"{phrase}\"")
+                    }
                 };
                 let query = url::form_urlencoded::Serializer::new(String::new())
                     .append_pair("query", &expression)
                     .append_pair("start", &start.to_string())
                     .append_pair("end", &end.to_string())
                     .append_pair("step", &step.to_string())
-                    .append_pair("limit", &self.limit.to_string())
+                    .append_pair("limit", &limit.to_string())
                     .append_pair("direction", direction)
                     .finish();
                 (expression, format!("/loki/api/v1/query_range?{query}"))
@@ -299,8 +329,8 @@ impl QueryGenerator {
                 // order contract, and a bound that binds must cut the same
                 // end of the window on every target.
                 let cut = match direction {
-                    "backward" => format!("sort by (_time) desc | limit {}", self.limit),
-                    _ => format!("sort by (_time) | limit {}", self.limit),
+                    "backward" => format!("sort by (_time) desc | limit {limit}"),
+                    _ => format!("sort by (_time) | limit {limit}"),
                 };
                 let expression = match shape {
                     QueryShape::LabelOnly | QueryShape::RestoreProbe => {
@@ -308,6 +338,11 @@ impl QueryGenerator {
                     }
                     QueryShape::LineFilter => {
                         format!("{selector} AND ~\"{phrase}\" | {cut}")
+                    }
+                    // `*` is LogsQL's match-all, the translation the matrix
+                    // uses for the selector-less rare shapes.
+                    QueryShape::Heavy => {
+                        format!("* AND ~\"{phrase}\" | {cut}")
                     }
                     // `unpack_json` before the field filter: an OTLP body is a
                     // string VictoriaLogs stores as `_msg` without parsing, so
@@ -497,10 +532,12 @@ mod tests {
             corpus.clone(),
             11,
             crate::config::Target::Loggytracy,
-            [1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1],
             300,
             600,
             100,
+            3600,
+            20000,
         );
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..400 {
@@ -513,6 +550,13 @@ mod tests {
                     .iter()
                     .any(|id| id.as_str() == plan.tenant)
             );
+            if plan.shape == QueryShape::Heavy {
+                // The heavy shape deliberately selects every stream and asks
+                // for its own, larger limit.
+                assert!(plan.expression.starts_with("{service_name=~\".+\"}"));
+                assert!(plan.path.contains("limit=20000"));
+                continue;
+            }
             let app = plan
                 .expression
                 .split_once("service_name=\"")
@@ -540,16 +584,22 @@ mod tests {
             corpus.clone(),
             11,
             crate::config::Target::VictoriaLogs,
-            [1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1],
             300,
             600,
             100,
+            3600,
+            20000,
         );
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..400 {
             let plan = generator.next_plan(1_772_000_000);
             seen.insert(plan.shape.name());
             assert!(plan.path.starts_with("/select/logsql/query?query="));
+            if plan.shape == QueryShape::Heavy {
+                assert!(plan.expression.starts_with("* AND "));
+                continue;
+            }
             assert!(plan.expression.starts_with("service.name:\""));
         }
         assert_eq!(seen.len(), QUERY_SHAPES.len(), "every shape must be drawn");

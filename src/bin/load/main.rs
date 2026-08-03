@@ -693,6 +693,8 @@ async fn query_pacer(
         cfg.query_window_seconds,
         cfg.restore_lookback_seconds,
         cfg.query_limit,
+        cfg.heavy_window_seconds,
+        cfg.heavy_limit,
     );
     let mut intended = Instant::now();
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
