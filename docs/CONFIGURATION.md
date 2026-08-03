@@ -118,6 +118,7 @@ assumes clients back off on 429 and rely on their own WAL, so disabling them bre
 | `LOGGYTRACY_FLUSH_MAX_INTERVAL` | `5s` | Flush at this interval even when the size threshold is not reached. **This value is the RPO for unexpected disk loss, and it is also the object-store bill** — see below |
 | `LOGGYTRACY_FLUSH_CHECK_INTERVAL` | `500ms` | Interval at which the flush loop checks conditions |
 | `LOGGYTRACY_FLUSH_CHUNK_BYTES` | 32 MiB (minimum 1 MiB) | Most a flush materializes at once. The snapshot is written in chunks of this many bytes, so the flush transient is bounded by the chunk rather than by how large the memtable grew while the previous flush ran |
+| `LOGGYTRACY_WAL_COMPACT_MIN_BYTES` | 64 MiB, `off` disables | Local-only mode truncates the WAL's dead prefix (the bytes before the checkpoint, which no recovery path reads) once it exceeds both this floor and the live suffix. `off` restores the old behaviour where `journal.wal` keeps everything ever ingested. With an object store configured the WAL always compacts and this knob is ignored |
 | `LOGGYTRACY_ROW_GROUP_SIZE` | 8192 (maximum 65536) | Parquet row group row count. Groups also stop at tenant boundaries, so **the number of tenants in a part is a lower bound for the actual row group count** |
 
 ## Merge
@@ -229,6 +230,12 @@ There is nothing to configure in production. It is still useful to understand ho
 ## Logging
 
 The process follows `RUST_LOG` directly. When unset, it uses `loggytracy=info,warn`.
+
+## Allocator
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOGGYTRACY_MALLOC_TUNING` | on | On glibc the process sets `M_ARENA_MAX=1` and a fixed 128 KiB trim threshold before any thread exists — `docs/MEMORY_ATTRIBUTION.md` measured 44–69% of the cgroup's anonymous memory as freed-but-retained heap without it, and anon/live falling 2.5–4.1 → 1.34 with it. `off` restores glibc's defaults for an A/B or if a throughput regression is suspected |
 
 ---
 

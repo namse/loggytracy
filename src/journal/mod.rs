@@ -177,6 +177,13 @@ impl WalBacklog {
             .load(Ordering::Acquire)
             .saturating_sub(self.checkpoint_bytes.load(Ordering::Acquire))
     }
+
+    /// The WAL file's durable length — dead prefix and live suffix together.
+    /// The compaction policy reads this: the backlog alone cannot see a file
+    /// whose checkpoint keeps up while its prefix grows without bound.
+    pub fn wal_bytes(&self) -> u64 {
+        self.wal_bytes.load(Ordering::Acquire)
+    }
 }
 
 include!("writer.rs");

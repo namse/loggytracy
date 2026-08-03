@@ -57,6 +57,7 @@ pub async fn flush_loop(
                 &journal,
                 &mut pending_checkpoint,
                 remote_cache.is_some(),
+                config.wal_compact_min_bytes,
             )
             .await
             {
@@ -155,9 +156,14 @@ pub async fn force_flush_pass(pass: ForceFlush<'_>) -> Result<bool, String> {
     } = pass;
 
     if pending_checkpoint.is_some() {
-        retry_pending_checkpoint(journal, pending_checkpoint, remote_cache.is_some())
-            .await
-            .map_err(|error| format!("failed to retry pending journal checkpoint: {error}"))?;
+        retry_pending_checkpoint(
+            journal,
+            pending_checkpoint,
+            remote_cache.is_some(),
+            config.wal_compact_min_bytes,
+        )
+        .await
+        .map_err(|error| format!("failed to retry pending journal checkpoint: {error}"))?;
         if remote_cache.is_some()
             && let Err(error) = clear_flush_transaction(&config.data_dir)
         {
@@ -183,20 +189,16 @@ pub async fn force_flush_pass(pass: ForceFlush<'_>) -> Result<bool, String> {
 async fn retry_pending_checkpoint(
     journal: &Journal,
     pending_checkpoint: &mut Option<u64>,
-    compact: bool,
+    remote: bool,
+    wal_compact_min_bytes: Option<u64>,
 ) -> Result<u64, String> {
     let offset = pending_checkpoint
         .as_ref()
         .copied()
         .ok_or_else(|| "no journal checkpoint is pending".to_string())?;
-    if compact {
-        journal
-            .compact_checkpoint(offset)
-            .await
-            .map_err(|e| e.to_string())?;
-    } else {
-        journal.set_checkpoint(offset).map_err(|e| e.to_string())?;
-    }
+    advance_checkpoint(journal, offset, remote, wal_compact_min_bytes)
+        .await
+        .map_err(|e| e.to_string())?;
     *pending_checkpoint = None;
     Ok(offset)
 }
@@ -216,7 +218,14 @@ async fn flush_once(
     if ckpt.snapshot.is_empty() && ckpt.trace_snapshot.is_empty() {
         memtable.commit_flush();
         trace_memtable.commit_flush();
-        if let Err(error) = advance_checkpoint(journal, ckpt.offset, remote_cache.is_some()).await {
+        if let Err(error) = advance_checkpoint(
+            journal,
+            ckpt.offset,
+            remote_cache.is_some(),
+            config.wal_compact_min_bytes,
+        )
+        .await
+        {
             // The part/WAL boundary is ambiguous for both local checkpoint
             // writes and remote WAL compaction. Retain the offset so a
             // transient failure is retried even when no new ingest arrives.
@@ -439,8 +448,13 @@ async fn flush_once(
                 memtable.commit_flush();
                 trace_memtable.commit_flush();
             }
-            if let Err(error) =
-                advance_checkpoint(journal, ckpt.offset, remote_cache.is_some()).await
+            if let Err(error) = advance_checkpoint(
+                journal,
+                ckpt.offset,
+                remote_cache.is_some(),
+                config.wal_compact_min_bytes,
+            )
+            .await
             {
                 // The part is already durable and visible. A checkpoint error
                 // is ambiguous: rename may have succeeded before a directory
@@ -483,13 +497,45 @@ async fn flush_once(
 async fn advance_checkpoint(
     journal: &Journal,
     offset: u64,
-    compact: bool,
+    remote: bool,
+    wal_compact_min_bytes: Option<u64>,
 ) -> Result<(), std::io::Error> {
-    if compact {
+    if should_compact_wal(journal.wal_bytes(), offset, remote, wal_compact_min_bytes) {
         journal.compact_checkpoint(offset).await
     } else {
         journal.set_checkpoint(offset)
     }
+}
+
+/// Whether advancing the checkpoint should also truncate the WAL.
+///
+/// Remote mode always compacts: the manifest CAS made the parts durable
+/// off-box and keeping the retired range would store everything twice. Local
+/// mode used to never compact, which meant `journal.wal` kept every byte ever
+/// ingested — 89% of the comparison bed's disk total — even though the bytes
+/// before the checkpoint are dead: replay seeks straight past them and no
+/// other recovery path reads them, so truncation costs no durability.
+///
+/// Compaction rewrites the live suffix (it blocks appends while it runs), so
+/// local mode cuts only when the dead prefix has outgrown both the suffix and
+/// a floor: the first bound makes the rewrite cost O(1) amortized per logged
+/// byte, the second keeps a quiet instance from re-copying a small file on
+/// every flush. `None` (the knob's `off`) restores the old never-compact
+/// behaviour.
+fn should_compact_wal(
+    wal_bytes: u64,
+    offset: u64,
+    remote: bool,
+    wal_compact_min_bytes: Option<u64>,
+) -> bool {
+    if remote {
+        return true;
+    }
+    let Some(min_bytes) = wal_compact_min_bytes else {
+        return false;
+    };
+    let live_suffix = wal_bytes.saturating_sub(offset);
+    offset >= min_bytes.max(live_suffix)
 }
 
 fn part_dirs(parts: &[part::Part]) -> Vec<std::path::PathBuf> {
@@ -571,9 +617,10 @@ mod tests {
         let failed_offset = pending_checkpoint.expect("checkpoint retry must be retained");
 
         std::fs::remove_dir(data_dir.join("journal.ckpt.tmp")).unwrap();
-        let retried_offset = retry_pending_checkpoint(&journal, &mut pending_checkpoint, false)
-            .await
-            .unwrap();
+        let retried_offset =
+            retry_pending_checkpoint(&journal, &mut pending_checkpoint, false, None)
+                .await
+                .unwrap();
 
         assert_eq!(registry.part_count(), 1);
         assert_eq!(retried_offset, failed_offset);
@@ -593,5 +640,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(results.iter().map(|r| r.entries.len()).sum::<usize>(), 1);
+    }
+
+    /// The local compaction policy: cut only when the dead prefix has
+    /// outgrown both the floor and the live suffix, never when the knob is
+    /// off, always in remote mode.
+    #[test]
+    fn wal_compaction_waits_for_the_prefix_to_outgrow_the_suffix() {
+        const MIB: u64 = 1024 * 1024;
+        let floor = Some(64 * MIB);
+
+        // Remote compacts regardless of the knob or the sizes.
+        assert!(should_compact_wal(10 * MIB, MIB, true, None));
+
+        // Off means never, however large the prefix.
+        assert!(!should_compact_wal(10_000 * MIB, 9_999 * MIB, false, None));
+
+        // Below the floor: a quiet instance is not rewritten over kilobytes.
+        assert!(!should_compact_wal(80 * MIB, 63 * MIB, false, floor));
+
+        // Above the floor but the suffix is larger than the prefix: cutting
+        // now would rewrite more than it reclaims.
+        assert!(!should_compact_wal(300 * MIB, 100 * MIB, false, floor));
+
+        // Prefix past both bounds: cut.
+        assert!(should_compact_wal(150 * MIB, 100 * MIB, false, floor));
+        assert!(should_compact_wal(128 * MIB, 64 * MIB, false, floor));
     }
 }

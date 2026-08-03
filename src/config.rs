@@ -61,6 +61,14 @@ pub struct Config {
     /// `off` disables a threshold, which restores the unbounded behaviour.
     pub max_memtable_bytes: Option<u64>,
     pub max_wal_backlog_bytes: Option<u64>,
+    /// Floor for truncating the WAL's dead prefix in local-only mode. The
+    /// bytes before the checkpoint are unreadable by every recovery path;
+    /// without truncation `journal.wal` keeps everything ever ingested. The
+    /// prefix is cut when it exceeds both this floor and the live suffix
+    /// (which bounds the rewrite at O(1) amortized per logged byte). `off`
+    /// restores the never-compact behaviour. Remote mode always compacts,
+    /// regardless of this knob.
+    pub wal_compact_min_bytes: Option<u64>,
     pub backpressure_retry_after: Duration,
     pub flush_max_bytes: u64,
     pub flush_max_interval: Duration,
@@ -210,6 +218,7 @@ impl Default for Config {
             max_timestamp_skew: Some(Duration::from_secs(60 * 60)),
             max_memtable_bytes: Some(256 * 1024 * 1024),
             max_wal_backlog_bytes: Some(1024 * 1024 * 1024),
+            wal_compact_min_bytes: Some(64 * 1024 * 1024),
             backpressure_retry_after: Duration::from_secs(1),
             flush_max_bytes: 1024 * 1024,
             flush_max_interval: Duration::from_secs(5),
@@ -393,6 +402,10 @@ impl Config {
             max_wal_backlog_bytes: env_optional_u64(
                 "LOGGYTRACY_MAX_WAL_BACKLOG_BYTES",
                 defaults.max_wal_backlog_bytes,
+            )?,
+            wal_compact_min_bytes: env_optional_u64(
+                "LOGGYTRACY_WAL_COMPACT_MIN_BYTES",
+                defaults.wal_compact_min_bytes,
             )?,
             backpressure_retry_after: env_required_duration(
                 "LOGGYTRACY_BACKPRESSURE_RETRY_AFTER",
@@ -671,6 +684,9 @@ impl Config {
             ));
         }
         positive_duration("flush_check_interval", self.flush_check_interval)?;
+        if let Some(bytes) = self.wal_compact_min_bytes {
+            positive_u64("wal_compact_min_bytes", bytes)?;
+        }
         // A chunk is also a part: chunks much smaller than a row group's
         // worth of rows would turn every flush into a spray of tiny parts.
         if self.flush_chunk_bytes < 1024 * 1024 {

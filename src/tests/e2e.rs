@@ -464,6 +464,28 @@
                 // preserve both copies according to the documented
                 // at-least-once flush-boundary semantics.
             }
+            "flush_then_wal_compaction" => {
+                // The local-compaction path end to end: flush, compact the
+                // checkpoint (truncating the dead prefix), ingest more, then
+                // crash. Recovery must replay only the retained suffix — the
+                // flushed rows live in parts and nowhere else now.
+                let memtable = Arc::new(MemTable::new());
+                let journal = Journal::spawn(&config, memtable).unwrap();
+                let raw = build_push_req();
+                ingest_once(&journal, &raw).await;
+                let checkpoint = journal.checkpoint().await.unwrap();
+                let parts_root = dir.join("parts");
+                std::fs::create_dir_all(&parts_root).unwrap();
+                part::flush_snapshot_chunked(
+                    &checkpoint.snapshot,
+                    &parts_root,
+                    config.row_group_size,
+                    u64::MAX,
+                )
+                .unwrap();
+                journal.compact_checkpoint(checkpoint.offset).await.unwrap();
+                ingest_once(&journal, &raw).await;
+            }
             "chunked_flush_before_checkpoint" => {
                 // The same window as flush_before_checkpoint, but through the
                 // chunked path with a one-byte budget so *several* parts are
@@ -578,6 +600,34 @@
             .iter()
             .map(|stream| stream.entries.len())
             .sum();
+        assert_eq!((memory_rows, part_rows), (3, 3));
+    }
+
+    #[test]
+    fn process_crash_after_local_wal_compaction_loses_nothing() {
+        let dir = run_crash_helper("flush_then_wal_compaction");
+        let config = Config {
+            data_dir: dir,
+            ..Config::default()
+        };
+        let recovered = MemTable::new();
+
+        recover(&config, &recovered).expect("recover after compaction crash");
+        let registry = PartRegistry::load_from_disk(&config.data_dir.join("parts")).unwrap();
+
+        let memory_rows: usize = recovered
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
+            .iter()
+            .map(|stream| stream.entries.len())
+            .sum();
+        let part_rows: usize = registry
+            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
+            .unwrap()
+            .iter()
+            .map(|stream| stream.entries.len())
+            .sum();
+        // The flushed rows come back from parts only; the post-compaction
+        // ingest comes back from the retained WAL suffix.
         assert_eq!((memory_rows, part_rows), (3, 3));
     }
 

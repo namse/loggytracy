@@ -73,6 +73,10 @@ impl Journal {
         self.backlog.bytes()
     }
 
+    pub fn wal_bytes(&self) -> u64 {
+        self.backlog.wal_bytes()
+    }
+
     /// The memtable this journal feeds. Held so the ingest gate can size both
     /// buffers from the journal alone, rather than every caller having to
     /// thread the log memtable in beside it.
