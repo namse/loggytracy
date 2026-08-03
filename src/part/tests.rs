@@ -529,31 +529,57 @@
 
     #[test]
     fn the_bloom_container_rejects_invalid_framing() {
-        // One row group: a line bloom, then a zero-length exact-field slot.
+        // One 2000-row group: a line bloom, then two exact-field windows —
+        // one real filter, one zero-length (token-less) slot.
+        let rows: &[u32] = &[2000];
         let mut valid = Vec::new();
         valid.extend_from_slice(BLOOM_MAGIC);
         valid.extend_from_slice(&1u32.to_le_bytes());
         let encoded = BloomFilter::with_capacity(1, 0.01).encode();
         valid.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
         valid.extend_from_slice(&encoded);
+        valid.extend_from_slice(&2u32.to_le_bytes());
+        valid.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        valid.extend_from_slice(&encoded);
         valid.extend_from_slice(&0u32.to_le_bytes());
 
-        let decoded = decode_blooms(&valid, 1).unwrap();
+        let decoded = decode_blooms(&valid, rows).unwrap();
         assert_eq!(decoded.line.len(), 1);
         assert_eq!(decoded.exact_fields.len(), 1);
-        assert!(decoded.exact_fields[0].is_none());
+        assert_eq!(decoded.exact_fields[0].len(), 2);
+        assert!(decoded.exact_fields[0][0].is_some());
+        assert!(decoded.exact_fields[0][1].is_none());
+
+        // A token-less group writes a window count of zero, whatever its
+        // row count.
+        let mut empty = Vec::new();
+        empty.extend_from_slice(BLOOM_MAGIC);
+        empty.extend_from_slice(&1u32.to_le_bytes());
+        empty.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        empty.extend_from_slice(&encoded);
+        empty.extend_from_slice(&0u32.to_le_bytes());
+        let decoded = decode_blooms(&empty, rows).unwrap();
+        assert!(decoded.exact_fields[0].is_empty());
 
         assert!(
-            decode_blooms(&valid, 2)
+            decode_blooms(&valid, &[2000, 2000])
                 .err()
                 .unwrap()
                 .contains("row group count mismatch")
         );
 
+        // A non-zero window count must match what the row count implies.
+        assert!(
+            decode_blooms(&valid, &[5000])
+                .err()
+                .unwrap()
+                .contains("bloom window count mismatch")
+        );
+
         let mut trailing = valid.clone();
         trailing.push(0);
         assert!(
-            decode_blooms(&trailing, 1)
+            decode_blooms(&trailing, rows)
                 .err()
                 .unwrap()
                 .contains("trailing bytes")
@@ -562,14 +588,26 @@
         let mut unknown = valid.clone();
         unknown[..4].copy_from_slice(b"XXXX");
         assert!(
-            decode_blooms(&unknown, 1)
+            decode_blooms(&unknown, rows)
                 .err()
                 .unwrap()
                 .contains("magic mismatch")
         );
 
         let truncated = &valid[..valid.len() - 2];
-        assert!(decode_blooms(truncated, 1).is_err());
+        assert!(decode_blooms(truncated, rows).is_err());
+
+        // The previous on-disk generation fails loudly rather than decoding
+        // wrong: a stale data directory is deleted and re-ingested, per the
+        // no-versioning policy.
+        let mut old = valid.clone();
+        old[..4].copy_from_slice(b"BTF4");
+        assert!(
+            decode_blooms(&old, rows)
+                .err()
+                .unwrap()
+                .contains("magic mismatch")
+        );
     }
 
     #[test]
@@ -2163,6 +2201,297 @@ resident {:.0} B",
                 "a rewrite read left layout order"
             );
         }
+    }
+
+    fn window_row(ts: i64, metadata: Vec<(String, String)>) -> Row {
+        let mut labels: Labels = BTreeMap::new();
+        labels.insert("app".to_string(), "windows".to_string());
+        Row {
+            tenant: test_tenant(),
+            timestamp_ns: ts,
+            labels: std::sync::Arc::new(labels),
+            // No '=', no '{': the line must contribute no exact-field token.
+            line: format!("plain text row at {ts}"),
+            structured_metadata: metadata,
+        }
+    }
+
+    /// Window-level exact-field pruning must refine the decode, never the
+    /// answer: for a needle planted at every window boundary of a multi-window
+    /// group, the pruned query returns exactly what a brute-force filter does,
+    /// in both directions, with and without a time window in play.
+    #[test]
+    fn exact_field_window_pruning_never_drops_a_row() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let planted = [0i64, 1023, 1024, 2047, 2048, 2500];
+        let rows: Vec<Row> = (0..3000i64)
+            .map(|i| {
+                let metadata = if planted.contains(&i) {
+                    vec![("needle".to_string(), format!("v{i}"))]
+                } else {
+                    vec![]
+                };
+                window_row(base + i, metadata)
+            })
+            .collect();
+        // One 3000-row group: three windows, the last one short.
+        let part = flush_rows(rows, &tmp, 4096).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+
+        for target in planted {
+            for forward in [true, false] {
+                let predicate = [ExactFieldPredicate::new("needle", format!("v{target}"))];
+                let results = reader
+                    .query_with_exact_field_pruning_and_scan_limit(
+                        &test_tenant(),
+                        &[],
+                        ExactFieldPruning::new(&[], &predicate),
+                        QueryTimeRange::closed(i64::MIN, i64::MAX),
+                        100,
+                        forward,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                let found: Vec<i64> = results
+                    .results
+                    .iter()
+                    .flat_map(|stream| stream.entries.iter().map(|entry| entry.timestamp_ns))
+                    .collect();
+                assert_eq!(found, vec![base + target], "target {target} forward {forward}");
+            }
+        }
+
+        // The time∩window intersection path: a range holding the window-1
+        // needle finds it, and the same range excludes the window-2 one.
+        let range = QueryTimeRange::closed(base + 1000, base + 1500);
+        for (target, expect) in [(1024i64, 1usize), (2048, 0)] {
+            let predicate = [ExactFieldPredicate::new("needle", format!("v{target}"))];
+            let results = reader
+                .query_with_exact_field_pruning_and_scan_limit(
+                    &test_tenant(),
+                    &[],
+                    ExactFieldPruning::new(&[], &predicate),
+                    range,
+                    100,
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let found: usize = results.results.iter().map(|s| s.entries.len()).sum();
+            assert_eq!(found, expect, "target {target} in a bounded window");
+        }
+    }
+
+    /// The same value on the last row of one window and the first row of the
+    /// next: both windows index it, both rows come back.
+    #[test]
+    fn a_value_straddling_a_window_boundary_returns_both_rows() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let rows: Vec<Row> = (0..2048i64)
+            .map(|i| {
+                let metadata = if i == 1023 || i == 1024 {
+                    vec![("twin".to_string(), "both".to_string())]
+                } else {
+                    vec![]
+                };
+                window_row(base + i, metadata)
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 4096).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let predicate = [ExactFieldPredicate::new("twin", "both")];
+        let results = reader
+            .query_with_exact_field_pruning_and_scan_limit(
+                &test_tenant(),
+                &[],
+                ExactFieldPruning::new(&[], &predicate),
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
+                100,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let found: Vec<i64> = results
+            .results
+            .iter()
+            .flat_map(|stream| stream.entries.iter().map(|entry| entry.timestamp_ns))
+            .collect();
+        assert_eq!(found, vec![base + 1023, base + 1024]);
+    }
+
+    /// The window selection is what the narrow pass decodes: a token confined
+    /// to one window of an 8192-row group must cost at most that window's
+    /// rows, not the group's.
+    #[test]
+    fn a_windowed_narrow_pass_examines_one_window_not_the_group() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let rows: Vec<Row> = (0..8192i64)
+            .map(|i| {
+                let metadata = if i == 2050 {
+                    vec![("rare".to_string(), "here".to_string())]
+                } else {
+                    vec![]
+                };
+                window_row(base + i, metadata)
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 8192).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+        let predicate = [ExactFieldPredicate::new("rare", "here")];
+        let results = reader
+            .query_with_exact_field_pruning_and_scan_limit(
+                &test_tenant(),
+                &[],
+                ExactFieldPruning::new(&[], &predicate),
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
+                100,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            results.results.iter().map(|s| s.entries.len()).sum::<usize>(),
+            1
+        );
+        assert!(
+            results.scanned_rows <= crate::part::BLOOM_WINDOW_ROWS,
+            "the narrow pass examined {} rows; the window is {}",
+            results.scanned_rows,
+            crate::part::BLOOM_WINDOW_ROWS
+        );
+    }
+
+    /// Masks AND across predicates: two tokens that never share a window
+    /// prune the whole group, and one row carrying both admits it again.
+    #[test]
+    fn cross_predicate_window_masks_intersect() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let build = |joint: bool| -> Vec<Row> {
+            (0..2048i64)
+                .map(|i| {
+                    let metadata = if i == 5 {
+                        vec![("a".to_string(), "x".to_string())]
+                    } else if i == 1035 {
+                        if joint {
+                            vec![
+                                ("a".to_string(), "x".to_string()),
+                                ("b".to_string(), "y".to_string()),
+                            ]
+                        } else {
+                            vec![("b".to_string(), "y".to_string())]
+                        }
+                    } else {
+                        vec![]
+                    };
+                    window_row(base + i, metadata)
+                })
+                .collect()
+        };
+        let predicates = [
+            ExactFieldPredicate::new("a", "x"),
+            ExactFieldPredicate::new("b", "y"),
+        ];
+
+        let disjoint = flush_rows(build(false), &tmp, 4096).unwrap().remove(0);
+        let reader = PartReader::open(disjoint).unwrap();
+        assert_eq!(
+            reader.select_row_groups_with_exact_fields(
+                &test_tenant(),
+                &[],
+                &[],
+                &predicates,
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
+            ),
+            Vec::<u32>::new(),
+            "tokens in disjoint windows cannot share a row"
+        );
+
+        let tmp2 = tempfile_dir();
+        let joint = flush_rows(build(true), &tmp2, 4096).unwrap().remove(0);
+        let reader = PartReader::open(joint).unwrap();
+        let results = reader
+            .query_with_exact_field_pruning_and_scan_limit(
+                &test_tenant(),
+                &[],
+                ExactFieldPruning::new(&[], &predicates),
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
+                100,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let found: Vec<i64> = results
+            .results
+            .iter()
+            .flat_map(|stream| stream.entries.iter().map(|entry| entry.timestamp_ns))
+            .collect();
+        assert_eq!(found, vec![base + 1035]);
+    }
+
+    /// The byte-identity guarantee extended to multi-window groups: both
+    /// writers must window their exact-field filters identically, short last
+    /// window included.
+    #[test]
+    fn the_streaming_writer_windows_its_blooms_identically() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let rows: Vec<Row> = (0..2500i64)
+            .map(|i| {
+                window_row(
+                    base + i,
+                    vec![("trace_id".to_string(), format!("t{}", i % 700))],
+                )
+            })
+            .collect();
+
+        let batch = flush_rows(rows.clone(), &tmp, 4096).expect("flush").remove(0);
+        let streamed_dir = tmp
+            .join("streamed")
+            .join(&batch.meta.partition)
+            .join(&batch.meta.id);
+        std::fs::create_dir_all(&streamed_dir).expect("mkdir");
+        let stream_labels = collect_stream_labels(&rows);
+        let metadata_keys: Vec<String> = select_metadata_columns(metadata_column_counts(&rows))
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let parsed_keys: Vec<String> =
+            select_metadata_columns(parsed_column_counts(&parse_rows(&rows)))
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+        let mut writer = StreamingPartWriter::create(
+            &streamed_dir,
+            stream_labels,
+            metadata_keys,
+            parsed_keys,
+            4096,
+        )
+        .expect("create");
+        let mut sorted = rows;
+        sort_rows(&mut sorted);
+        for row in sorted {
+            writer.push(row).expect("push");
+        }
+        writer
+            .finish(&streamed_dir, &batch.meta.id, &batch.meta.partition)
+            .expect("finish");
+
+        let batch_index = std::fs::read(batch.dir.join(INDEX_FILE)).expect("batch index");
+        let streamed_index = std::fs::read(streamed_dir.join(INDEX_FILE)).expect("streamed index");
+        assert_eq!(
+            batch_index, streamed_index,
+            "multi-window blooms must be byte-identical across writers"
+        );
     }
 
     fn walk_meta_dirs(root: &Path) -> Vec<PathBuf> {

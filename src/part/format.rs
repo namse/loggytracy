@@ -658,7 +658,7 @@ fn part_writer_properties(row_group_size: usize) -> WriterProperties {
         // rows a page, a stream's run inside a group carries usefully tight
         // per-page time bounds; the cost is more pages everywhere, which the
         // write bench and the disk axis price.
-        .set_data_page_row_count_limit(1024)
+        .set_data_page_row_count_limit(crate::part::BLOOM_WINDOW_ROWS)
         .build()
 }
 
@@ -722,8 +722,21 @@ fn encode_blooms(
     Ok(buf)
 }
 
-/// One row group's two filters, length-prefixed, exactly as they sit in the
-/// `BTF4` section.
+/// One row group's filters, length-prefixed, exactly as they sit in the
+/// `BTF5` section: the group's line/trigram bloom, then one exact-field
+/// sub-bloom per [`BLOOM_WINDOW_ROWS`]-row window.
+///
+/// Windows are what turned an admitted group from an 8192-row decode into a
+/// ~1024-row one: `docs/COMPARISON.md`'s `metadata_rare` decomposed to
+/// ~0.28 ms of fixed cost plus ~1.7 ms per admitted group, all of it the
+/// narrow pass over rows the per-group filter could not exclude. The bits
+/// are linear in the token count, so splitting one filter into eight costs
+/// only headers — the pruning granularity is close to free.
+///
+/// A group with no exact token anywhere writes a window count of zero — the
+/// absent-section semantics the reader prunes on — and a token-less window
+/// inside a token-bearing group writes a zero length, which prunes that
+/// window the same way.
 ///
 /// Split out of [`encode_blooms`] so a writer that never holds the whole part
 /// can produce the same bytes a row group at a time. The batch path above still
@@ -734,20 +747,21 @@ fn encode_group_blooms(
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut unique_trigrams: BTreeSet<[u8; 3]> = BTreeSet::new();
-    // One pass. Sizing the filter needs the token count and filling it needs
-    // the tokens, and this used to be two passes that each ran the JSON and
-    // logfmt parsers over every line — the whole parse, twice, for a count.
-    // The tokens are collected once instead; the scratch lives for one row
-    // group and its capacity is exactly the count the two-pass version
-    // computed, so the encoded filter is byte-identical.
-    let mut exact_tokens: Vec<Vec<u8>> = Vec::new();
-    for (row, parsed) in rows.iter().zip(parsed_rows) {
+    // One pass. Sizing the filters needs the token counts and filling them
+    // needs the tokens, and this used to be two passes that each ran the JSON
+    // and logfmt parsers over every line — the whole parse, twice, for a
+    // count. The tokens are collected once instead, into their windows; the
+    // scratch lives for one row group.
+    let window_count = rows.len().div_ceil(crate::part::BLOOM_WINDOW_ROWS);
+    let mut window_tokens: Vec<Vec<Vec<u8>>> = vec![Vec::new(); window_count];
+    for (index, (row, parsed)) in rows.iter().zip(parsed_rows).enumerate() {
+        let window = &mut window_tokens[index / crate::part::BLOOM_WINDOW_ROWS];
         for tri in crate::bloom::trigrams(&row.line) {
             unique_trigrams.insert(tri);
         }
         for (name, value) in &row.structured_metadata {
             for value in crate::logql::canonical_index_values(value) {
-                exact_tokens.push(encode_exact_field_token(name, &value)?);
+                window.push(encode_exact_field_token(name, &value)?);
             }
         }
         // The `| json` half of the parser-visible fields comes off the parse
@@ -758,27 +772,16 @@ fn encode_group_blooms(
         if let Some(parsed) = parsed {
             for (name, value) in parsed {
                 for value in crate::logql::canonical_index_values(value) {
-                    exact_tokens.push(encode_exact_field_token(name, &value)?);
+                    window.push(encode_exact_field_token(name, &value)?);
                 }
             }
         }
         for (name, values) in crate::logql::indexed_logfmt_fields(&row.line) {
             for value in values {
                 for value in crate::logql::canonical_index_values(&value) {
-                    exact_tokens.push(encode_exact_field_token(&name, &value)?);
+                    window.push(encode_exact_field_token(&name, &value)?);
                 }
             }
-        }
-    }
-    // No token to index means no filter. A filter built for zero items
-    // still costs the `optimal_bits` floor, and an all-zero filter and an
-    // absent one prune identically — the absent one just does it without
-    // occupying 140 bytes in every row group of every part.
-    let mut exact_fields =
-        (!exact_tokens.is_empty()).then(|| BloomFilter::with_capacity(exact_tokens.len(), 0.01));
-    if let Some(exact_fields) = &mut exact_fields {
-        for token in &exact_tokens {
-            exact_fields.insert(token);
         }
     }
     let estimated_items = unique_trigrams.len().max(1);
@@ -789,10 +792,26 @@ fn encode_group_blooms(
     let bytes = bloom.encode();
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(&bytes);
-    let bytes = exact_fields
-        .map(|exact_fields| exact_fields.encode())
-        .unwrap_or_default();
-    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&bytes);
+    // No token to index means no filters at all — a zero window count. A
+    // filter built for zero items still costs the `optimal_bits` floor, and
+    // an all-zero filter and an absent one prune identically.
+    if window_tokens.iter().all(Vec::is_empty) {
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        return Ok(buf);
+    }
+    buf.extend_from_slice(&(window_count as u32).to_le_bytes());
+    for tokens in &window_tokens {
+        if tokens.is_empty() {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            continue;
+        }
+        let mut filter = BloomFilter::with_capacity(tokens.len(), 0.01);
+        for token in tokens {
+            filter.insert(token);
+        }
+        let bytes = filter.encode();
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&bytes);
+    }
     Ok(buf)
 }

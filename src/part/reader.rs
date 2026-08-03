@@ -62,11 +62,11 @@ impl Read for PreadCursor {
 pub struct PartReader {
     part: Part,
     bloom: Vec<BloomFilter>,
-    /// `None` when the part predates exact-field filters, so nothing is known
-    /// and nothing may be pruned. `Some` with a `None` entry means the row
-    /// group is known to have indexed no exact-field token at all, which is a
-    /// stronger statement: no exact-field predicate can match it.
-    exact_field_bloom: Vec<Option<BloomFilter>>,
+    /// Per row group, one exact-field sub-bloom per [`BLOOM_WINDOW_ROWS`]-row
+    /// window. An empty outer `Vec` means the group indexed no exact-field
+    /// token at all — no exact-field predicate can match it. A `None` window
+    /// says the same about that window alone.
+    exact_field_bloom: Vec<Vec<Option<BloomFilter>>>,
     stream_index: StreamMap,
     stream_labels: Vec<String>,
     /// The keys stored as `_sm:` columns, in schema (sorted) order.
@@ -96,7 +96,8 @@ pub struct PartReader {
 
 struct DecodedBlooms {
     line: Vec<BloomFilter>,
-    exact_fields: Vec<Option<BloomFilter>>,
+    /// Outer: row group. Inner: one optional filter per window.
+    exact_fields: Vec<Vec<Option<BloomFilter>>>,
 }
 
 /// The distinct label sets one scan has already decoded, so a part holding a
@@ -230,6 +231,23 @@ fn time_page_selection(
     ))
 }
 
+/// The rows of one group inside the windows an exact-field mask admitted.
+///
+/// Padded to `group_rows` by `from_consecutive_ranges`, and that padding is
+/// load-bearing: `RowSelection::intersection` passes the longer operand's
+/// tail through when the other is exhausted, so every selection combined for
+/// one group must span the group's full row count.
+fn window_row_selection(mask: u64, group_rows: usize) -> RowSelection {
+    let windows = group_rows.div_ceil(crate::part::BLOOM_WINDOW_ROWS);
+    RowSelection::from_consecutive_ranges(
+        (0..windows).filter(|window| mask & (1u64 << window) != 0).map(|window| {
+            let start = window * crate::part::BLOOM_WINDOW_ROWS;
+            start..((start + crate::part::BLOOM_WINDOW_ROWS).min(group_rows))
+        }),
+        group_rows,
+    )
+}
+
 fn open_part_data(
     part: &Part,
     validate_checksum: bool,
@@ -361,7 +379,7 @@ impl PartReader {
         }
         let index_bytes = fs::read(part.index_path()).map_err(|e| e.to_string())?;
         let (bloom_bytes, stream_bytes) = split_index(&index_bytes)?;
-        let decoded_blooms = decode_blooms(bloom_bytes, part.meta.row_group_count as usize)?;
+        let decoded_blooms = decode_blooms(bloom_bytes, &part.meta.row_group_rows)?;
         let stream_index = decode_stream_index(stream_bytes)?;
         validate_stream_index(&part, &stream_index)?;
         let stream_labels = part.meta.stream_labels.clone();
@@ -958,6 +976,27 @@ impl PartReader {
             {
                 continue;
             }
+            // Sub-group exact-field pruning: the per-window blooms restrict a
+            // match to the windows whose filters admit every predicate's
+            // token, and the selection makes both passes decode only those
+            // windows. Both operands are padded to the group's full row count
+            // (`from_consecutive_ranges` pads the tail), which `intersection`
+            // requires — a shorter operand's missing tail would pass the
+            // longer one's rows through unfiltered.
+            let group_rows = part_metadata.metadata().row_group(rgu).num_rows() as usize;
+            let window_selection = (!exact_fields.is_empty())
+                .then(|| self.exact_field_window_mask(rgu, exact_fields))
+                .flatten()
+                .map(|mask| window_row_selection(mask, group_rows));
+            let base_selection = match (time_selection, window_selection) {
+                (Some(time), Some(window)) => Some(time.intersection(&window)),
+                (time, window) => time.or(window),
+            };
+            if let Some(base_selection) = &base_selection
+                && !base_selection.selects_any()
+            {
+                continue;
+            }
             let mut selection = if definitive.is_empty() {
                 None
             } else {
@@ -967,7 +1006,7 @@ impl PartReader {
                     rgu,
                     &definitive,
                     time_range,
-                    time_selection.as_ref(),
+                    base_selection.as_ref(),
                     &mut stats,
                 )? {
                     Some(selection) => Some(selection),
@@ -984,9 +1023,9 @@ impl PartReader {
                 _ => &projection,
             };
             if selection.is_none()
-                && let Some(time_selection) = time_selection
+                && let Some(base_selection) = base_selection
             {
-                selection = Some(time_selection);
+                selection = Some(base_selection);
             }
             if forward {
                 // Forwards, Parquet's own order is the query's order, so one
@@ -1158,7 +1197,7 @@ impl PartReader {
         rgu: usize,
         definitive: &[DefinitiveColumn],
         time_range: QueryTimeRange,
-        time_selection: Option<&RowSelection>,
+        base_selection: Option<&RowSelection>,
         stats: &mut ScanStats,
     ) -> Result<Option<RowSelection>, String> {
         let labels = self.stream_labels.len();
@@ -1182,8 +1221,8 @@ impl PartReader {
         ))
         .with_batch_size(8192)
         .with_row_groups(vec![rgu]);
-        let reader = match time_selection {
-            Some(time_selection) => reader.with_row_selection(time_selection.clone()),
+        let reader = match base_selection {
+            Some(base_selection) => reader.with_row_selection(base_selection.clone()),
             None => reader,
         }
         .build()
@@ -1192,11 +1231,11 @@ impl PartReader {
         // the running index must walk the selection to stay group-absolute —
         // the returned `RowSelection` addresses the group, not the pass.
         let group_rows = part_metadata.metadata().row_group(rgu).num_rows().max(0) as usize;
-        let mut absolute: Box<dyn Iterator<Item = usize>> = match time_selection {
-            Some(time_selection) => {
+        let mut absolute: Box<dyn Iterator<Item = usize>> = match base_selection {
+            Some(base_selection) => {
                 let mut at = 0usize;
                 let mut indices = Vec::new();
-                for selector in time_selection.iter() {
+                for selector in base_selection.iter() {
                     if !selector.skip {
                         indices.extend(at..at + selector.row_count);
                     }
@@ -1654,52 +1693,99 @@ impl PartReader {
     }
 
     fn exact_field_bloom_prune(&self, rg: usize, exact_fields: &[ExactFieldPredicate]) -> bool {
-        let blooms = &self.exact_field_bloom;
-        exact_fields.iter().all(|predicate| {
-            // A stream label is not in the exact-field bloom, but it is in the
-            // stream index — so the predicate is answerable, just from the
-            // other side. This used to scan unconditionally, which made
-            // `| app="x"` on a stream label the one equality that could not
-            // prune, even though the index knows exactly which row groups hold
-            // it.
-            //
-            // The label is what the filter sees even when a parser extracted
-            // the same name, because the label is canonical and the extraction
-            // is renamed to `<name>_extracted`. So the index is authoritative
-            // here rather than merely a hint.
-            if self
-                .stream_labels
-                .iter()
-                .any(|name| name == &predicate.name)
-            {
-                // An empty value means "absent or empty", and absence is not
-                // an entry in the index.
-                if predicate.value.is_empty() {
-                    return true;
-                }
-                return self
-                    .stream_index
-                    .get(&predicate.name)
-                    .and_then(|values| values.get(&predicate.value))
-                    .is_some_and(|bitmap| bitmap.contains(rg as u32));
-            }
-            // Field-filter execution may treat an absent field as an empty
-            // string. Absence is not represented in the bloom, so an empty
-            // equality cannot safely reject a row group.
-            if predicate.value.is_empty() {
-                return true;
-            }
-            // No filter here means the row group indexed no exact-field token,
-            // so this predicate cannot match. That is the same answer the
-            // all-zero filter this used to store would have given.
-            let Some(bloom) = &blooms[rg] else {
-                return false;
+        self.exact_field_window_mask(rg, exact_fields) != Some(0)
+    }
+
+    /// Which of the row group's [`BLOOM_WINDOW_ROWS`]-row windows may hold a
+    /// row matching *every* predicate.
+    ///
+    /// `None` means the blooms constrain nothing — every predicate was in a
+    /// class the filters cannot answer (stream label already proven by the
+    /// index, empty value, unrepresentable token). `Some(mask)` restricts a
+    /// match to the set windows; `Some(0)` prunes the group. Masks AND across
+    /// predicates, which is sound because a row matching all of them carries
+    /// all of their tokens in its *own* window — strictly stronger than the
+    /// old any-window-per-predicate admission and just as free of false
+    /// negatives.
+    fn exact_field_window_mask(
+        &self,
+        rg: usize,
+        exact_fields: &[ExactFieldPredicate],
+    ) -> Option<u64> {
+        let mut combined: Option<u64> = None;
+        for predicate in exact_fields {
+            let Some(mask) = self.predicate_window_mask(rg, predicate) else {
+                continue;
             };
-            encode_exact_field_token(&predicate.name, &predicate.value)
-                .map(|token| bloom.contains(&token))
-                // An unrepresentable predicate must conservatively scan.
-                .unwrap_or(true)
-        })
+            let mask = match combined {
+                Some(existing) => existing & mask,
+                None => mask,
+            };
+            if mask == 0 {
+                return Some(0);
+            }
+            combined = Some(mask);
+        }
+        combined
+    }
+
+    fn predicate_window_mask(&self, rg: usize, predicate: &ExactFieldPredicate) -> Option<u64> {
+        // A stream label is not in the exact-field bloom, but it is in the
+        // stream index — so the predicate is answerable, just from the
+        // other side. This used to scan unconditionally, which made
+        // `| app="x"` on a stream label the one equality that could not
+        // prune, even though the index knows exactly which row groups hold
+        // it.
+        //
+        // The label is what the filter sees even when a parser extracted
+        // the same name, because the label is canonical and the extraction
+        // is renamed to `<name>_extracted`. So the index is authoritative
+        // here rather than merely a hint. It speaks at group granularity:
+        // admit every window or none.
+        if self
+            .stream_labels
+            .iter()
+            .any(|name| name == &predicate.name)
+        {
+            // An empty value means "absent or empty", and absence is not
+            // an entry in the index.
+            if predicate.value.is_empty() {
+                return None;
+            }
+            let admitted = self
+                .stream_index
+                .get(&predicate.name)
+                .and_then(|values| values.get(&predicate.value))
+                .is_some_and(|bitmap| bitmap.contains(rg as u32));
+            return if admitted { None } else { Some(0) };
+        }
+        // Field-filter execution may treat an absent field as an empty
+        // string. Absence is not represented in the bloom, so an empty
+        // equality cannot safely reject anything.
+        if predicate.value.is_empty() {
+            return None;
+        }
+        // No windows at all means the row group indexed no exact-field
+        // token, so this predicate cannot match. That is the same answer
+        // the all-zero filter this used to store would have given.
+        let windows = &self.exact_field_bloom[rg];
+        if windows.is_empty() {
+            return Some(0);
+        }
+        let Ok(token) = encode_exact_field_token(&predicate.name, &predicate.value) else {
+            // An unrepresentable predicate must conservatively scan.
+            return None;
+        };
+        let mut mask = 0u64;
+        for (window, bloom) in windows.iter().enumerate() {
+            if bloom
+                .as_ref()
+                .is_some_and(|bloom| bloom.contains(&token))
+            {
+                mask |= 1u64 << window;
+            }
+        }
+        Some(mask)
     }
 }
 
@@ -1742,7 +1828,7 @@ fn resident_bytes(blooms: &DecodedBlooms, stream_index: &StreamMap) -> u64 {
     for bloom in &blooms.line {
         total = total.saturating_add(bloom.resident_bytes() as u64);
     }
-    for bloom in blooms.exact_fields.iter().flatten() {
+    for bloom in blooms.exact_fields.iter().flatten().flatten() {
         total = total.saturating_add(bloom.resident_bytes() as u64);
     }
     for (name, values) in stream_index {
@@ -1755,7 +1841,8 @@ fn resident_bytes(blooms: &DecodedBlooms, stream_index: &StreamMap) -> u64 {
     total
 }
 
-fn decode_blooms(buf: &[u8], expected_count: usize) -> Result<DecodedBlooms, String> {
+fn decode_blooms(buf: &[u8], row_group_rows: &[u32]) -> Result<DecodedBlooms, String> {
+    let expected_count = row_group_rows.len();
     if buf.len() < 8 {
         return Err("bloom file too short".to_string());
     }
@@ -1771,9 +1858,38 @@ fn decode_blooms(buf: &[u8], expected_count: usize) -> Result<DecodedBlooms, Str
     let mut pos = 8;
     let mut line = Vec::with_capacity(count);
     let mut exact_fields = Vec::with_capacity(count);
-    for _ in 0..count {
+    for (group, rows) in row_group_rows.iter().enumerate() {
         line.push(decode_length_prefixed_bloom(buf, &mut pos)?);
-        exact_fields.push(decode_optional_length_prefixed_bloom(buf, &mut pos)?);
+        let window_count = {
+            let end = pos
+                .checked_add(4)
+                .ok_or_else(|| "bloom window count overflow".to_string())?;
+            let bytes: [u8; 4] = buf
+                .get(pos..end)
+                .ok_or_else(|| "bloom window count truncated".to_string())?
+                .try_into()
+                .expect("length checked");
+            pos = end;
+            u32::from_le_bytes(bytes) as usize
+        };
+        let rows = *rows as usize;
+        let expected_windows = rows.div_ceil(crate::part::BLOOM_WINDOW_ROWS);
+        if window_count != 0 && window_count != expected_windows {
+            return Err(format!(
+                "bloom window count mismatch: group {group} has {rows} rows, \
+expected {expected_windows} windows, found {window_count}"
+            ));
+        }
+        if window_count > 64 {
+            return Err(format!(
+                "bloom window count {window_count} exceeds the 64-window limit"
+            ));
+        }
+        let mut windows = Vec::with_capacity(window_count);
+        for _ in 0..window_count {
+            windows.push(decode_optional_length_prefixed_bloom(buf, &mut pos)?);
+        }
+        exact_fields.push(windows);
     }
     if pos != buf.len() {
         return Err("bloom file has trailing bytes".to_string());
@@ -1784,9 +1900,9 @@ fn decode_blooms(buf: &[u8], expected_count: usize) -> Result<DecodedBlooms, Str
     })
 }
 
-/// A filter slot that a V4 writer is allowed to leave empty.
+/// A window slot the writer is allowed to leave empty.
 ///
-/// A zero length says the row group indexed no exact-field token, which is a
+/// A zero length says the window indexed no exact-field token, which is a
 /// fact the reader can prune on. Any other length decodes as an ordinary
 /// filter.
 fn decode_optional_length_prefixed_bloom(

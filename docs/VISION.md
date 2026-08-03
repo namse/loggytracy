@@ -313,11 +313,13 @@ on the shape the claim rests on.
 
 What is already right and must not regress: row groups aligned to tenant
 boundaries (`format.rs:221-238`), which is what makes every row-group-granular
-structure selective in a shared part; the exact-field bloom with canonical
-numeric forms, a `label_format` barrier, and BTF4's zero-length filter used as a
-*positive* prune (`ast.rs:154-189`, `part/mod.rs:52-60`); and the single read
-funnel that `volume`, `patterns`, `detected_fields` and `tail` are all expressed
-in terms of rather than given private scans.
+structure selective in a shared part; the exact-field blooms with canonical
+numeric forms, a `label_format` barrier, and absence used as a *positive*
+prune — since BTF5 one sub-bloom per 1024-row window, so an admitted group
+decodes only the windows whose filters admit the token (`ast.rs:154-189`,
+`part/mod.rs`); and the single read funnel that `volume`, `patterns`,
+`detected_fields` and `tail` are all expressed in terms of rather than given
+private scans.
 
 ---
 

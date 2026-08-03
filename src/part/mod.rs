@@ -45,8 +45,18 @@ pub const INDEX_FILE: &str = "index.bin";
 pub const INDEX_MAGIC: &[u8; 5] = b"LTIX1";
 pub const META_FILE: &str = "meta.json";
 pub const MERGE_TOMBSTONE_FILE: &str = ".merge.tombstone";
-const BLOOM_MAGIC: &[u8; 4] = b"BTF4";
+const BLOOM_MAGIC: &[u8; 4] = b"BTF5";
 const STREAM_MAGIC: &[u8; 4] = b"SIX1";
+
+/// Rows per exact-field sub-bloom window inside a row group.
+///
+/// Two couplings pin this value. It equals `part_writer_properties`'
+/// `set_data_page_row_count_limit`, so a `RowSelection` built from admitted
+/// windows skips whole Parquet pages through the offset index instead of
+/// decoding into the middle of one. And `row_group_size` is capped at 65,536
+/// (`config::validate`), so a group never holds more than 64 windows and a
+/// window set fits a `u64` mask.
+pub(crate) const BLOOM_WINDOW_ROWS: usize = 1024;
 
 const EXACT_FIELD_TOKEN_MAGIC: &[u8; 4] = b"FEQ1";
 const EXACT_FIELD_SCALAR_SCOPE: u8 = 0;
