@@ -294,10 +294,15 @@ that never contend with writes. Optimizing against those numbers reproduces them
       (771 MiB) and the flush's whole-snapshot `Vec<Row>` (721 MiB). The query path is implicated through the
       allocation traffic it generates rather than through what it holds. The bed sweeps limits and reports the
       sweep, so the published run is at 8 GiB and says so
-- [ ] **In local-only mode the WAL is never compacted.** `flush.rs:219` passes `remote_cache.is_some()` as the
+- [x] **In local-only mode the WAL is never compacted.** `flush.rs:219` passes `remote_cache.is_some()` as the
       `compact` flag, so without an object store the checkpoint offset advances and `journal.wal` keeps every
       byte ever ingested, uncompressed. It was 541 MiB against 143 MiB of parts — 79% of the disk footprint.
       Either local-only should compact too, or the mode should be documented as not for retention
+
+      Local-only compacts too now (`0f24a97`, 2026-08-03): the prefix is cut when it outgrows both the live
+      suffix and a 64 MiB floor (`LOGGYTRACY_WAL_COMPACT_MIN_BYTES`, `off` restores this item's behaviour).
+      Measured: `data_dir` 1137 → ~240 MB steady on the 2 GiB rig, push latency unchanged. The W-series
+      section below has the run-by-run record.
 - [x] **cgroup `memory.peak` includes the cgroup's own page cache**, so it is not a footprint on its own; both
       systems write a WAL and then large data files. The harness now samples `anon` out of `memory.stat` and
       reports the anonymous high-water mark beside the cgroup peak, because the anonymous figure is what an OOM
@@ -327,10 +332,14 @@ there is no point sizing arenas against a measurement that stops before the larg
       2 GiB container — from no number the operator gave, and
       [`docs/MEMORY_ATTRIBUTION.md`](docs/MEMORY_ATTRIBUTION.md) already measured one merge group's rewrite as
       the **largest single live term at 771 MiB**. That measurement predicted this kill and nothing acted on it
-- [ ] **Query latency under ingest has no gate.** In the load phase — queries concurrent with 20 k eps — p95
+- [x] **Query latency under ingest has no gate.** In the load phase — queries concurrent with 20 k eps — p95
       was 22.9 s today at 2 GiB, and 5.7 s at 2 GiB / 27.2 s at 8 GiB in the M9 artifacts. The published
       comparison never showed it: its query columns come from the matrix phase, which is one connection over a
       small dataset with no ingest running. Three axes are now measured and two of them are ungated
+
+      Gated now, twice over: the stall fix took load-phase response p95 to 98.5 ms in the bed (the 2 s
+      numeric target passes inside the load verdict), and `compare/run.sh` fails unless loggytracy's load
+      verdict is PASS (`eeae4a2`, `COMPARE_REQUIRE_PASS`).
 - [ ] Re-run `compare/run.sh` once the above lands. The matrix limit sweep is already in place (`5f1e9a2`), so
       the run will report both the published limit of 20000 and Grafana's default of 100
 
@@ -828,6 +837,79 @@ overhead is visible; if it matters, the lever is `flush_chunk_bytes` up or merge
 not assumed. Query-under-ingest still has no *budget* (open question 2 stands, now with a passing
 baseline to regress against). And `anon/live` in the memprof legs still reads ~5–8 — the allocator
 retention item at M10's "honest metering" is untouched by any of this.
+
+## The day after the PASS: the roadmap items, each measured (2026-08-03, `eeae4a2`..)
+
+Six workstreams off the back of the stall fix, every one gated on the 2 GiB rig (release,
+`systemd-run`, real disk, 20 k eps + 5 qps, 120 s legs) unless said otherwise.
+
+**Bed gate (W1, `eeae4a2`).** `compare/run.sh` used to swallow the load verdict with `|| echo`; it
+now reads the surviving limit's verdict out of the result file after the document and artifacts are
+written, and fails the bed unless it is PASS. `COMPARE_REQUIRE_PASS` names the targets held to it
+(default `loggytracy`, `off` records a known-failing run). Gating last on purpose: a FAIL still
+leaves everything needed to diagnose it.
+
+**Allocator (W2, `b4a28de` then re-judged in `4a630d8`).** mallopt at startup, before the runtime
+spawns a thread. The measured `MALLOC_ARENA_MAX=1` + 128 KiB trim was tried first and **rejected by
+its own A/B**: anon peak 1726/1746 → 478/479 MiB (3.6x) with eps unchanged, but the allocation-heavy
+flush path halved its cadence against the single arena — 241 → 113/117 flushes per leg, steady WAL
+backlog 8 → 50 MiB — and that, not the WAL compaction it was blamed on, is what pushed the first W4
+leg over the backlog-drain heuristic. **Arena cap 4** is the adopted compromise
+(`LOGGYTRACY_MALLOC_ARENA_MAX`, 0 = glibc's own scaling): 241 flushes (full cadence), anon peak
+1726 → **1017.6 MiB**, backlog peak 8.0 MiB, q p95 246.8 ms, PASS. Trim-only (arenas uncapped)
+measured 1348.5 MiB — worse than the cap, kept as the record of why 4.
+
+**The slow-query hole (W3, `81e5322`).** The load harness grew a `heavy` shape — every stream, an
+hour's window, limit 20 000, weight **0 by default** — to measure what one slow query does to
+everyone else through the fair operation lock. Answer, on this corpus: nothing. Heavy served at
+280–400 ms (the scan budgets — 5 M rows / 2 GiB — cap a scan's duration long before
+`max_query_runtime`), and every other shape's p99 stayed ≤ 85 ms with the run PASS. The hole is
+real in the design (a slow query queues the flush writer and the fair queue behind it) but **this
+engine's own scan budgets seal it at this scale**, so the superversion/immutable-snapshot rework
+stays un-opened, with these numbers as the reason. Re-open it if a workload ever holds a scan for
+tens of seconds — the harness knob to reproduce is `LOGGYTRACY_LOAD_QUERY_WEIGHT_HEAVY`.
+
+**Local WAL compaction (W4, `0f24a97`).** The dead prefix — bytes before the checkpoint, which
+replay seeks straight past — was 89% of the bed's disk total and never truncated in local mode.
+`compact_wal` was never remote-specific; the change is the policy: remote always compacts, local
+cuts when the prefix outgrows both the live suffix (O(1) amortized rewrite per logged byte) and a
+64 MiB floor (`LOGGYTRACY_WAL_COMPACT_MIN_BYTES`, `off` = old behaviour). Measured on the rig:
+`data_dir` 1137 → **~240–245 MB** steady, push p95 unchanged, backlog drains normal once W2's
+arena=4 restored the flush cadence. New e2e crash arm: flush → compact → ingest → crash; parts
+serve the flushed rows, the retained suffix serves the rest.
+
+**Query byte pool (W5, `4a630d8`).** The 8 × 512 MiB = 4 GiB product `peak_materialized_bytes()`
+documented as unenforced is now a pool: every log scan reserves from
+`LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES` (512 MiB) in 8 MiB chunks as rows survive the pipeline,
+the reservation rides inside `QueryExecution` until the results drop, exhaustion is a refusal
+naming the pool, and the metric path builds its entries **inside** the blocking task and the query
+arena (the loop used to run on an async worker, untagged — the "eighth term"). Per-query
+`max_query_memory_bytes` unchanged. `peak_materialized_bytes` now reports pool + merge = 1.5 GiB
+where the same defaults used to imply five. Final attribution run: query arena peak 63.7 MiB
+under load, pool untouched at the margins — the budget is headroom, not a squeeze.
+
+**metadata_rare decomposition (W6, measurement only).** Subtraction probes on the seeded matrix
+corpus (verify tenant, 60 reps/variant): an absent token — bloom prunes every group — answers in
+**0.28 ms**; the real rare token answers in **5.49 ms** with 3 row groups admitted and 24 576 rows
+decoded. The whole VictoriaLogs gap is therefore the **predicate-column decode of admitted row
+groups** (~1.7 ms per group, ~0.21 µs/row), not part opens, sidecars or planning. The lever for the
+<1.1x claim is row-level postings (or page-level pruning) for exact fields inside an admitted
+group; shrinking `row_group_size` is the anti-lever — cutting groups finer was already measured
+worse for the broad shapes. Implementation is the next arc.
+
+Final gates on `4a630d8`+: cargo test 456+39, clippy 0; memprof attribution — flush arena peak
+**34.7 MiB** (was 513.7 at the baseline, 96.1 after chunking), merge 368.2, query 63.7, memtable
+peak 6.6 MiB, backlog peak 8.8 MiB; `memory_gate --budget 2GiB` **UNDER_BUDGET at 42.7%** (874.2
+MiB, ingest and settle phases equal).
+
+The bed run with all of it in, W1's gate live and printing `load verdict gate: loggytracy PASS at
+2g`: agreement **168/168 on all three pairs, every shape**; loggytracy PASS at 19,771 eps with
+query response p95 101.0 ms (Loki 452.6, VictoriaLogs 19.0). The WAL compaction rewrote the disk
+story the bed's own caveat used to apologize for: **total on disk 619.0 → 96.5 MiB** (WAL 548.7 →
+26.2), which puts loggytracy's *total* below Loki's 117.7 for the first time — 218 vs 266 MiB/GB
+ingested — while the settled-data ratio stays 0.60x/1.28x. Anon-during-ingest fell again, 832.0 →
+**674.6 MiB** against Loki's 1138.8. `metadata_rare` reads 1.77x/1.84x slower than VictoriaLogs —
+the claim still does not hold, and W6 above says exactly which decode to shrink next.
 - [x] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
       parser, and `proto.rs`'s encode side
 
@@ -1072,10 +1154,16 @@ only thing that can say whether a fix worked, so it landed before them and it la
       are now shared with the memtable rather than copied out of it, so the copy is the lines and the
       metadata; the multiple is no longer 3.3 and has not been measured in situ. Either the flush share is
       expressed as a multiple of the ingest share, or the flush streams the snapshot in bounded chunks
-- [ ] **Query admission by budget, not by slot.** Replace `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES`
+- [x] **Query admission by budget, not by slot.** Replace `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES`
       (8 × 512 MiB = 4 GiB, admitted in a comment at `config.rs:522`) with a shared arena. Same ceiling, and a
       burst of cheap queries no longer queues behind a slot count. The arena must include the metric path's
       materialization, which is outside it today
+
+      Done as the shared pool (`4a630d8`, 2026-08-03): `LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES` (512 MiB),
+      reserved in 8 MiB chunks as rows survive the pipeline, held with the results, refusal on exhaustion;
+      the metric path's entries loop moved inside the blocking task and the query arena with it. The slot
+      semaphores still exist as *concurrency* bounds — what changed is that bytes are no longer implied by
+      slots. `peak_materialized_bytes` reports pool + merge.
 - [ ] **`merge_max_memory_bytes` must come from the budget.** Its 1 GiB default is half a 2 GiB container and
       is derived from nothing the operator set; one group reached 771 MiB live
 - [ ] **Sidecars inside the budget.** They are outside it on purpose today (`part/reader.rs:77-81`), so resident
