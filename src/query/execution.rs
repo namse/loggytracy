@@ -16,6 +16,11 @@ struct QueryExecution {
     results: Vec<StreamResult>,
     scanned_rows: u64,
     scanned_bytes: u64,
+    /// The pool slice backing `results`. Held for as long as the results are
+    /// — the reservation returning to the pool while the rows it paid for
+    /// are still being aggregated or serialized would let the pool admit
+    /// memory that is very much still resident.
+    memory_reservation: Option<crate::query_memory::QueryMemoryReservation>,
 }
 
 #[cfg(test)]
@@ -64,6 +69,7 @@ fn unified_query_with_stats_cancellable(
         cancellation,
         None,
         None,
+        None,
         part::ColumnSet::all(),
     )
 }
@@ -80,6 +86,7 @@ fn unified_query_with_stats_cancellable_with_memory(
     cancellation: Option<&AtomicBool>,
     max_memory_bytes: Option<u64>,
     max_scan_bytes: Option<u64>,
+    memory_reservation: Option<&crate::query_memory::QueryMemoryReservation>,
     columns: part::ColumnSet,
 ) -> Result<QueryExecution, String> {
     // The one place every read path meets its rows, which is why the deletion
@@ -100,6 +107,7 @@ fn unified_query_with_stats_cancellable_with_memory(
         .scan_budget(scan_budget)
         .max_scan_bytes(max_scan_bytes)
         .max_memory_bytes(max_memory_bytes)
+        .memory_reservation(memory_reservation)
         .cancellation(cancellation)
         .hidden(&hidden);
     let result = scan.run(&state.memtable, &state.parts)?;
@@ -107,6 +115,7 @@ fn unified_query_with_stats_cancellable_with_memory(
         results: result.results,
         scanned_rows: result.scanned_rows,
         scanned_bytes: result.scanned_bytes,
+        memory_reservation: None,
     })
 }
 
@@ -252,6 +261,15 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
     .await
     .map_err(|_| "query timed out".to_string())?
     .map_err(|_| "query scan scheduler is closed".to_string())?;
+    // Admission to the shared byte pool, after the scan slot for the same
+    // reason the slot comes after the pin: each stage of admission should
+    // hold only what the previous stages granted while it waits.
+    let memory_reservation = tokio::time::timeout(
+        max_runtime,
+        state.query_memory_pool.reserve(),
+    )
+    .await
+    .map_err(|_| "query timed out".to_string())??;
     let task_cancellation = cancellation.clone();
     let max_query_runtime = max_runtime;
     let max_query_memory_bytes = state.config.max_query_memory_bytes;
@@ -262,7 +280,7 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
         let _scan_permit = scan_permit;
         let _part_guard = part_guard;
         let _arena = crate::memprof::enter(crate::memprof::Arena::Query);
-        unified_query_with_stats_cancellable_with_memory(
+        let mut execution = unified_query_with_stats_cancellable_with_memory(
             &state,
             &tenant,
             &parsed,
@@ -273,8 +291,12 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
             Some(task_cancellation.as_ref()),
             Some(max_query_memory_bytes),
             Some(state.config.max_query_scan_bytes),
+            Some(&memory_reservation),
             columns,
-        )
+        )?;
+        // The reservation leaves with the results it paid for.
+        execution.memory_reservation = Some(memory_reservation);
+        Ok::<_, String>(execution)
     });
     let execution = match tokio::time::timeout(max_query_runtime, &mut task).await {
         Ok(result) => result.map_err(|error| format!("query task failed: {error}"))?,

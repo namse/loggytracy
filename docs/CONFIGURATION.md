@@ -169,7 +169,8 @@ becomes disk usage that cannot be evicted**.
 | `LOGGYTRACY_MAX_QUERY_RANGE` | unset | Maximum requested time range |
 | `LOGGYTRACY_MAX_QUERY_SCAN_ROWS` | 5,000,000 | |
 | `LOGGYTRACY_MAX_QUERY_SCAN_BYTES` | 2 GiB | |
-| `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES` | 512 MiB | |
+| `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES` | 512 MiB | One query's own materialization cap |
+| `LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES` | 512 MiB (minimum 8 MiB) | The shared pool **all** queries together materialize from, reserved incrementally as rows survive the pipeline. A query refused here gets an error naming the pool; before this the aggregate was `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES` and nothing enforced it |
 | `LOGGYTRACY_MAX_LOG_LIMIT` | 100,000 | Maximum `limit` parameter |
 | `LOGGYTRACY_MAX_QUERY_RUNTIME` | `30s` | Also the timeout for metadata endpoints |
 | `LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS` | 8 | Shared with metadata endpoints |
@@ -235,7 +236,8 @@ The process follows `RUST_LOG` directly. When unset, it uses `loggytracy=info,wa
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_MALLOC_TUNING` | on | On glibc the process sets `M_ARENA_MAX=1` and a fixed 128 KiB trim threshold before any thread exists — `docs/MEMORY_ATTRIBUTION.md` measured 44–69% of the cgroup's anonymous memory as freed-but-retained heap without it, and anon/live falling 2.5–4.1 → 1.34 with it. `off` restores glibc's defaults for an A/B or if a throughput regression is suspected |
+| `LOGGYTRACY_MALLOC_TUNING` | on | On glibc the process caps malloc arenas and fixes a 128 KiB trim threshold before any thread exists — `docs/MEMORY_ATTRIBUTION.md` measured 44–69% of the cgroup's anonymous memory as freed-but-retained heap without it. `off` restores glibc's defaults for an A/B or if a throughput regression is suspected |
+| `LOGGYTRACY_MALLOC_ARENA_MAX` | 4 | The arena cap the tuning applies. 1 was measured first and rejected: anon fell 3.6x but the allocation-heavy flush path halved its cadence contending for the single arena. 0 leaves glibc's own arena scaling in place (trim threshold still applied) |
 
 ---
 
@@ -301,24 +303,25 @@ number for a real workload; the rates above will change and the counts will not.
 
 ## Sizing an instance
 
-Every limit in this document is enforced on its own, and none of them is
-enforced against the machine. The largest term in the footprint is a product of
-two knobs that never appear next to each other:
+The query term used to be `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES`
+— 8 × 512 MiB, four gigabytes no single knob mentioned and nothing enforced.
+Queries now reserve from one shared pool, so the table is budgets rather than
+products:
 
-| term | default | worst case |
-|---|---|---|
-| `MAX_CONCURRENT_QUERY_SCANS` × `MAX_QUERY_MEMORY_BYTES` | 8 × 512 MiB | **4 GiB** |
-| `MERGE_MAX_MEMORY_BYTES` (one merge at a time) | 1 GiB | **1 GiB** |
-| **Peak materialized** | | **5 GiB** |
+| term | default |
+|---|---|
+| `QUERY_MEMORY_BUDGET_BYTES` (every query together) | 512 MiB |
+| `MERGE_MAX_MEMORY_BYTES` (one merge at a time) | 1 GiB |
+| **Peak materialized** | **1.5 GiB** |
 
 The process logs this number once at startup (`peak_materialized_bytes`), because
-there is nowhere else to learn it.
+there is nowhere else to learn it. Trace scans still sit outside it
+(`MAX_TRACE_SPANS` is a count, not bytes), and so do the memtable and the flush
+chunk — the startup log names what is excluded.
 
-It is an upper bound, not an estimate: reaching it needs every scan slot full
-and each one at its cap. What matters is that nothing prevents it, and that an
-instance sized from its idle footprint is sized **far** too small: peak RSS is
-reached within about a minute of load starting and returns to idle when load
-stops, so a quiet screenshot describes nothing.
+An instance sized from its idle footprint is still sized **far** too small: peak
+RSS is reached within about a minute of load starting and returns to idle when
+load stops, so a quiet screenshot describes nothing.
 
 **This bound is the only sizing figure here that is not retired**, because it is
 arithmetic on the configured limits rather than a measurement. The multiple

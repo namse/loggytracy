@@ -212,42 +212,48 @@ async fn run_metric_query_with_stats_cancellable(
         ));
     }
     let input_memory = estimated_query_memory_bytes(&execution.results);
-    let streams = execution.results;
     let scanned_rows = execution.scanned_rows;
     let scanned_bytes = execution.scanned_bytes;
     let grouping_fields = expr.grouping_fields();
-    let mut entries = Vec::new();
-    for stream in streams {
-        for entry in stream.entries {
-            if cancellation.load(Ordering::Acquire) {
-                return Err("metric query timed out".to_string());
-            }
-            // Shared with the stream unless a grouping field actually has to be
-            // promoted into it. This clone was the whole `BTreeMap` per row, on
-            // an async worker thread and outside every arena — 203 MiB at its
-            // high-water (`docs/MEMORY_ATTRIBUTION.md`, "an eighth term nobody
-            // proposed").
-            let mut labels = stream.labels.clone();
-            // Pipeline-extracted fields are query-local structured metadata
-            // at this point. Promote them into the metric label set so range
-            // functions and aggregations can distinguish entries such as
-            // `level=info` and `level=error` from the same stream.
-            for (name, value) in &entry.structured_metadata {
-                // Pipeline fields must not replace original stream labels.
-                // A colliding extraction has already been renamed by
-                // process_entry_with_labels.
-                if grouping_fields.contains(name) && !labels.contains_key(name) {
-                    SharedLabels::make_mut(&mut labels).insert(name.clone(), value.clone());
-                }
-            }
-            entries.push((labels, entry));
-        }
-    }
 
     let task_cancellation = cancellation.clone();
     let mut task = tokio::task::spawn_blocking(move || {
         let _evaluation_permit = evaluation_permit;
         let _arena = crate::memprof::enter(crate::memprof::Arena::Query);
+        // The scan's pool reservation rides in `execution` and stays held
+        // through the evaluation: `entries` below moves the same rows the
+        // reservation paid for.
+        let streams = execution.results;
+        let _memory_reservation = execution.memory_reservation;
+        let mut entries = Vec::new();
+        for stream in streams {
+            for entry in stream.entries {
+                if task_cancellation.load(Ordering::Acquire) {
+                    return Err("metric query timed out".to_string());
+                }
+                // Shared with the stream unless a grouping field actually has
+                // to be promoted into it. This clone was the whole `BTreeMap`
+                // per row — and this whole loop used to run on an async
+                // worker thread, outside every arena, before the blocking
+                // task it now lives in (`docs/MEMORY_ATTRIBUTION.md`, "an
+                // eighth term nobody proposed": 203 MiB at its high-water).
+                let mut labels = stream.labels.clone();
+                // Pipeline-extracted fields are query-local structured
+                // metadata at this point. Promote them into the metric label
+                // set so range functions and aggregations can distinguish
+                // entries such as `level=info` and `level=error` from the
+                // same stream.
+                for (name, value) in &entry.structured_metadata {
+                    // Pipeline fields must not replace original stream
+                    // labels. A colliding extraction has already been renamed
+                    // by process_entry_with_labels.
+                    if grouping_fields.contains(name) && !labels.contains_key(name) {
+                        SharedLabels::make_mut(&mut labels).insert(name.clone(), value.clone());
+                    }
+                }
+                entries.push((labels, entry));
+            }
+        }
         evaluate_metric_stream_with_limits(
             &expr,
             &entries,

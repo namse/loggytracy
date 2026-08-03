@@ -168,6 +168,12 @@ pub struct Config {
     pub max_query_scan_rows: usize,
     pub max_query_scan_bytes: u64,
     pub max_query_memory_bytes: u64,
+    /// The shared byte budget every query materialization draws from,
+    /// replacing the unenforced `max_concurrent_query_scans ×
+    /// max_query_memory_bytes` product as the aggregate bound. A query still
+    /// carries its own `max_query_memory_bytes` cap; this is what all of them
+    /// together may hold.
+    pub query_memory_budget_bytes: u64,
     pub max_log_limit: usize,
     pub max_metric_evaluation_points: usize,
     pub max_metric_rows: usize,
@@ -253,6 +259,7 @@ impl Default for Config {
             max_query_scan_rows: 5_000_000,
             max_query_scan_bytes: 2 * 1024 * 1024 * 1024,
             max_query_memory_bytes: 512 * 1024 * 1024,
+            query_memory_budget_bytes: 512 * 1024 * 1024,
             max_log_limit: 100_000,
             max_metric_evaluation_points: 10_000,
             max_metric_rows: 1_000_000,
@@ -535,6 +542,10 @@ impl Config {
                 "LOGGYTRACY_MAX_QUERY_SCAN_BYTES",
                 defaults.max_query_scan_bytes,
             )?,
+            query_memory_budget_bytes: env_positive_u64(
+                "LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES",
+                defaults.query_memory_budget_bytes,
+            )?,
             max_query_memory_bytes: env_positive_u64(
                 "LOGGYTRACY_MAX_QUERY_MEMORY_BYTES",
                 defaults.max_query_memory_bytes,
@@ -611,23 +622,19 @@ impl Config {
 
     /// The most this configuration can have materialized at once, in bytes.
     ///
-    /// Every limit here is enforced on its own and none of them is enforced
-    /// against the machine. Eight concurrent scans at 512 MiB is four gigabytes
-    /// that no single knob mentions, and an operator sizing an instance from
-    /// its idle footprint — measured at fifty times below its peak — has no way
-    /// to arrive at that number by reading the configuration.
+    /// The query term used to be `max_concurrent_query_scans ×
+    /// max_query_memory_bytes` — 8 × 512 MiB, four gigabytes no single knob
+    /// mentioned and nothing enforced. It is now the shared pool every scan
+    /// and metric evaluation reserves from, so the term is a budget the
+    /// process actually holds itself to rather than a product it hopes never
+    /// multiplies out.
     ///
-    /// Deliberately an upper bound rather than an estimate. Reaching it needs
-    /// every scan slot full and each one at its cap, which a real workload will
-    /// not do; the point is that nothing prevents it.
+    /// Still an upper bound rather than an estimate for the whole: trace
+    /// scans carry no byte budget of their own (`max_trace_spans` is a
+    /// count), and the log says so.
     pub fn peak_materialized_bytes(&self) -> u64 {
-        let queries =
-            (self.max_concurrent_query_scans as u64).saturating_mul(self.max_query_memory_bytes);
-        // Trace scans have no byte budget of their own — `max_trace_spans` is a
-        // count — so this is the honest floor rather than the true term, and
-        // the log says so.
-        let merge = self.merge_max_memory_bytes;
-        queries.saturating_add(merge)
+        self.query_memory_budget_bytes
+            .saturating_add(self.merge_max_memory_bytes)
     }
 
     /// Logged once at startup. There is nowhere else an operator learns this.
@@ -635,6 +642,7 @@ impl Config {
         let host = HostMemory::detect();
         tracing::info!(
             peak_materialized_bytes = self.peak_materialized_bytes(),
+            query_memory_budget_bytes = self.query_memory_budget_bytes,
             concurrent_query_scans = self.max_concurrent_query_scans,
             max_query_memory_bytes = self.max_query_memory_bytes,
             merge_max_memory_bytes = self.merge_max_memory_bytes,
@@ -762,6 +770,16 @@ exclusive: per-tenant retention replaces the global period"
         positive_usize("max_query_scan_rows", self.max_query_scan_rows)?;
         positive_u64("max_query_scan_bytes", self.max_query_scan_bytes)?;
         positive_u64("max_query_memory_bytes", self.max_query_memory_bytes)?;
+        positive_u64("query_memory_budget_bytes", self.query_memory_budget_bytes)?;
+        // Smaller than one reservation chunk and the very first admission
+        // fails: the pool would refuse every query at any load.
+        if self.query_memory_budget_bytes < crate::query_memory::RESERVATION_CHUNK_BYTES {
+            return Err(format!(
+                "query_memory_budget_bytes ({}) must be at least one reservation chunk ({})",
+                self.query_memory_budget_bytes,
+                crate::query_memory::RESERVATION_CHUNK_BYTES
+            ));
+        }
         positive_usize("max_log_limit", self.max_log_limit)?;
         positive_usize(
             "max_metric_evaluation_points",
@@ -1052,31 +1070,30 @@ mod tests {
         );
     }
 
-    /// The largest term in this engine's memory footprint is a product of two
-    /// knobs that never appear together, and an instance sized from its idle
-    /// footprint is sized about fifty times too small (LOAD_RESULTS.md §7). So
-    /// the product is computed and logged rather than left to be discovered.
+    /// The query term used to be `max_concurrent_query_scans ×
+    /// max_query_memory_bytes` — a product no knob mentioned and nothing
+    /// enforced. It is the shared pool now, so the reported peak is a budget
+    /// the process holds itself to, and the scan concurrency no longer
+    /// multiplies into it.
     #[test]
-    fn the_peak_memory_budget_is_the_product_nobody_reads() {
+    fn the_peak_memory_budget_is_the_pool_plus_the_merge() {
         let config = Config {
-            max_concurrent_query_scans: 8,
-            max_query_memory_bytes: 512 * 1024 * 1024,
+            query_memory_budget_bytes: 512 * 1024 * 1024,
             merge_max_memory_bytes: 1024 * 1024 * 1024,
             ..Config::default()
         };
         assert_eq!(
             config.peak_materialized_bytes(),
-            5 * 1024 * 1024 * 1024,
-            "eight scans at half a gigabyte plus one merge at a gigabyte"
+            1536 * 1024 * 1024,
+            "the shared query pool plus one merge"
         );
 
-        // Halving the concurrency halves the term, which is the point: the
-        // knob an operator reaches for is the one that moves the number.
-        let halved = Config {
-            max_concurrent_query_scans: 4,
+        // Concurrency does not move the number any more — that was the hole.
+        let more_concurrent = Config {
+            max_concurrent_query_scans: 16,
             ..config
         };
-        assert_eq!(halved.peak_materialized_bytes(), 3 * 1024 * 1024 * 1024);
+        assert_eq!(more_concurrent.peak_materialized_bytes(), 1536 * 1024 * 1024);
     }
 
     #[test]

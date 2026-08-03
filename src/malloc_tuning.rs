@@ -16,12 +16,14 @@
 //! `LOGGYTRACY_MALLOC_TUNING=off` restores glibc's defaults — the knob an
 //! A/B measurement or an unexpected throughput regression reaches for.
 
-/// One arena: every thread shares it, so freed memory consolidates where
-/// `M_TRIM_THRESHOLD` can actually return it. The measured cost on this
-/// engine's ingest path was within noise (the hot allocation sites are
-/// batch-scoped, not per-row), but it is a cost class worth re-measuring on
-/// any workload change — which is why the override exists.
-const ARENA_MAX: libc_shim::c_int = 1;
+/// Few arenas: freed memory consolidates where `M_TRIM_THRESHOLD` can
+/// actually return it. One arena was measured first and rejected: anon fell
+/// 3.6× but the flush path — allocation-heavy by design — halved its cadence
+/// contending with the query and ingest threads for the single arena, and
+/// the steady WAL backlog rose 8 → 50 MiB. The default is the measured
+/// compromise; `LOGGYTRACY_MALLOC_ARENA_MAX` overrides it (0 leaves glibc's
+/// own scaling in place, trim threshold still applied).
+const DEFAULT_ARENA_MAX: libc_shim::c_int = 4;
 
 /// Fixed 128 KiB, matching the measured `MALLOC_TRIM_THRESHOLD_=131072`.
 /// Setting it also disables glibc's dynamic threshold, which only ever
@@ -52,21 +54,27 @@ pub fn apply_from_env() -> bool {
     {
         return false;
     }
-    apply()
+    let arena_max = std::env::var("LOGGYTRACY_MALLOC_ARENA_MAX")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(DEFAULT_ARENA_MAX);
+    apply(arena_max)
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn apply() -> bool {
+fn apply(arena_max: i32) -> bool {
     // SAFETY: mallopt only writes allocator parameters; called before any
     // other thread exists.
     unsafe {
-        libc_shim::mallopt(libc_shim::M_ARENA_MAX, ARENA_MAX);
+        if arena_max > 0 {
+            libc_shim::mallopt(libc_shim::M_ARENA_MAX, arena_max);
+        }
         libc_shim::mallopt(libc_shim::M_TRIM_THRESHOLD, TRIM_THRESHOLD);
     }
     true
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn apply() -> bool {
+fn apply(_arena_max: i32) -> bool {
     false
 }
