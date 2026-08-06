@@ -83,11 +83,68 @@ pub(crate) fn selection_key(
     runs.into_boxed_slice()
 }
 
+/// Rebuild the `RowSelection` a key describes, padded back out to the
+/// group. Round-tripping through `selection_key` is lossless on the row
+/// set, which is what makes a cached narrow outcome equal to running the
+/// pass.
+pub(crate) fn selection_of(key: &SelectionKey, group_rows: usize) -> RowSelection {
+    use parquet::arrow::arrow_reader::RowSelector;
+    let mut selectors: Vec<RowSelector> = Vec::with_capacity(key.len() + 1);
+    let mut described = 0usize;
+    for &(skip, rows) in key.iter() {
+        described += rows as usize;
+        selectors.push(if skip {
+            RowSelector::skip(rows as usize)
+        } else {
+            RowSelector::select(rows as usize)
+        });
+    }
+    if described < group_rows {
+        selectors.push(RowSelector::skip(group_rows - described));
+    }
+    RowSelection::from(selectors)
+}
+
 pub(crate) fn selected_rows_of(key: &SelectionKey) -> usize {
     key.iter()
         .filter(|(skip, _)| !skip)
         .map(|(_, rows)| *rows as usize)
         .sum()
+}
+
+/// The narrow pass's inputs, all deterministic per immutable part: the
+/// group, the query window, the base selection it examined, and the
+/// definitive predicates as (sm column, pf column, extracted, value) — the
+/// column indices are schema positions, stable for the reader's lifetime.
+/// The cached outcome is the selection the pass produced, or `None` for a
+/// group it rejected — rejections are half the value, since a repeated
+/// rare query pays the narrow pass mostly on groups holding nothing.
+/// One definitive predicate's identity: (sm column, pf column, extracted,
+/// value).
+pub(crate) type NarrowPredicate = (Option<usize>, Option<usize>, bool, String);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct NarrowQuery {
+    pub rgu: u32,
+    pub time: (i64, i64, bool),
+    pub base: SelectionKey,
+    pub defs: Box<[NarrowPredicate]>,
+}
+
+struct NarrowEntry {
+    outcome: Option<SelectionKey>,
+    bytes: u64,
+    last_touch: u64,
+}
+
+fn narrow_entry_bytes(query: &NarrowQuery, outcome: &Option<SelectionKey>) -> u64 {
+    let defs: usize = query
+        .defs
+        .iter()
+        .map(|(_, _, _, value)| value.len() + 24)
+        .sum();
+    let runs = query.base.len() + outcome.as_ref().map_or(0, |key| key.len());
+    (64 + defs + runs * 8) as u64
 }
 
 pub(crate) struct GroupCache {
@@ -99,6 +156,7 @@ pub(crate) struct GroupCache {
 #[derive(Default)]
 struct GroupCacheInner {
     groups: HashMap<(u32, SelectionKey), CachedGroup>,
+    narrows: HashMap<NarrowQuery, NarrowEntry>,
     /// Monotonic touch counter; smallest = least recently used.
     clock: u64,
 }
@@ -145,13 +203,9 @@ impl GroupCache {
 
     #[cfg(test)]
     pub(crate) fn resident_bytes_for_test(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("group cache poisoned")
-            .groups
-            .values()
-            .map(|group| group.bytes)
-            .sum()
+        let inner = self.inner.lock().expect("group cache poisoned");
+        inner.groups.values().map(|group| group.bytes).sum::<u64>()
+            + inner.narrows.values().map(|entry| entry.bytes).sum::<u64>()
     }
 
     /// The whole-group entry, the one kind that can serve *any* selection
@@ -167,6 +221,59 @@ impl GroupCache {
         let group = inner.groups.get_mut(&(rgu, key.clone()))?;
         group.last_touch = clock;
         Some(read_of(group))
+    }
+
+    /// A remembered narrow-pass run. `Some(outcome)` is a hit; the inner
+    /// `None` means the pass rejected the group outright.
+    pub(crate) fn get_narrow(&self, query: &NarrowQuery) -> Option<Option<SelectionKey>> {
+        let mut inner = self.inner.lock().expect("group cache poisoned");
+        inner.clock += 1;
+        let clock = inner.clock;
+        let entry = inner.narrows.get_mut(query)?;
+        entry.last_touch = clock;
+        Some(entry.outcome.clone())
+    }
+
+    pub(crate) fn insert_narrow(&self, query: NarrowQuery, outcome: Option<SelectionKey>) {
+        let Some(budget) = self.budget_bytes else {
+            return;
+        };
+        let mut inner = self.inner.lock().expect("group cache poisoned");
+        if inner.narrows.contains_key(&query) {
+            return;
+        }
+        inner.clock += 1;
+        let clock = inner.clock;
+        let bytes = narrow_entry_bytes(&query, &outcome);
+        inner.narrows.insert(
+            query,
+            NarrowEntry {
+                outcome,
+                bytes,
+                last_touch: clock,
+            },
+        );
+        let mut total = self
+            .shared_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(bytes);
+        // Entries are ~100 bytes, so pressure here almost always means the
+        // batch entries hold the budget; still, narrow results evict their
+        // own kind oldest-first rather than growing without bound.
+        while total > budget && inner.narrows.len() > 1 {
+            let Some(victim) = inner
+                .narrows
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_touch)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            let removed = inner.narrows.remove(&victim).expect("chosen from the map");
+            self.shared_bytes
+                .fetch_sub(removed.bytes, std::sync::atomic::Ordering::AcqRel);
+            total = total.saturating_sub(removed.bytes);
+        }
     }
 
     /// Insert a completed decode. The batches must hold exactly the key's
@@ -231,7 +338,10 @@ impl Drop for GroupCache {
         let held: u64 = self
             .inner
             .get_mut()
-            .map(|inner| inner.groups.values().map(|group| group.bytes).sum())
+            .map(|inner| {
+                inner.groups.values().map(|group| group.bytes).sum::<u64>()
+                    + inner.narrows.values().map(|entry| entry.bytes).sum::<u64>()
+            })
             .unwrap_or(0);
         if held > 0 {
             self.shared_bytes

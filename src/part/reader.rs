@@ -1017,29 +1017,59 @@ impl PartReader {
             // builder path, whose two-column read is cheap).
             let cache_covers_definitive =
                 !definitive.is_empty() && definitive.iter().all(|def| def.pf_key.is_none());
+            // The narrow pass is deterministic in (group, window, base
+            // selection, predicates), so its outcome — a selection or a
+            // rejection — is remembered too: a repeated rare query then
+            // pays two map lookups instead of a builder per group.
+            let narrow_query = (self.group_cache.enabled() && !definitive.is_empty())
+                .then(|| crate::part::NarrowQuery {
+                    rgu: row_group,
+                    time: time_range.cache_identity(),
+                    base: crate::part::selection_key(base_selection.as_ref(), group_rows),
+                    defs: definitive
+                        .iter()
+                        .map(|def| (def.sm_key, def.pf_key, def.extracted, def.value.clone()))
+                        .collect(),
+                });
+            let remembered_narrow = narrow_query
+                .as_ref()
+                .and_then(|query| self.group_cache.get_narrow(query));
             let mut selection = if definitive.is_empty() {
                 None
-            } else if let (Some(cached), true) = (&cached, cache_covers_definitive) {
-                match self.select_rows_in_cached_group(
-                    cached,
-                    &definitive,
-                    time_range,
-                    base_selection.as_ref(),
-                    &mut stats,
-                )? {
-                    Some(selection) => Some(selection),
+            } else if let Some(outcome) = remembered_narrow {
+                match outcome {
+                    Some(key) => Some(crate::part::selection_of(&key, group_rows)),
                     None => continue,
                 }
             } else {
-                match self.select_rows_in_group(
-                    &data_file,
-                    &part_metadata,
-                    rgu,
-                    &definitive,
-                    time_range,
-                    base_selection.as_ref(),
-                    &mut stats,
-                )? {
+                let outcome = if let (Some(cached), true) = (&cached, cache_covers_definitive) {
+                    self.select_rows_in_cached_group(
+                        cached,
+                        &definitive,
+                        time_range,
+                        base_selection.as_ref(),
+                        &mut stats,
+                    )?
+                } else {
+                    self.select_rows_in_group(
+                        &data_file,
+                        &part_metadata,
+                        rgu,
+                        &definitive,
+                        time_range,
+                        base_selection.as_ref(),
+                        &mut stats,
+                    )?
+                };
+                if let Some(query) = narrow_query {
+                    self.group_cache.insert_narrow(
+                        query,
+                        outcome
+                            .as_ref()
+                            .map(|selection| crate::part::selection_key(Some(selection), group_rows)),
+                    );
+                }
+                match outcome {
                     Some(selection) => Some(selection),
                     None => continue,
                 }

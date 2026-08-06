@@ -233,6 +233,12 @@ pub struct QueryTimeRange {
 }
 
 impl QueryTimeRange {
+    /// The window's identity for cache keys — an opaque tuple, not bounds to
+    /// compare against; the privacy rationale above still holds.
+    pub(crate) fn cache_identity(self) -> (i64, i64, bool) {
+        (self.start_ns, self.end_ns, self.include_end)
+    }
+
     /// `[start_ns, end_ns)` — what a Loki log query asks for. Both `query` and
     /// `query_range` include `start` and exclude `end`.
     pub fn half_open(start_ns: i64, end_ns: i64) -> Self {

@@ -2975,6 +2975,31 @@ selection, or warm rare shapes never hit"
         for forward in [true, false] {
             assert_eq!(answer(&cached, forward), answer(&plain, forward));
         }
+
+        // The narrow pass is remembered too: a repeat examines no rows —
+        // both the selection and the rejections replay from the cache.
+        let scanned = |reader: &PartReader| {
+            reader
+                .query_with_exact_field_pruning_and_scan_limit(
+                    &test_tenant(),
+                    &[],
+                    ExactFieldPruning::new(&[], &predicate),
+                    full,
+                    100,
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .scanned_rows
+        };
+        let repeat = scanned(&cached);
+        let uncached = scanned(&plain);
+        assert!(
+            repeat < uncached,
+            "a repeated rare query must replay the narrow pass \
+(repeat scanned {repeat}, uncached scans {uncached})"
+        );
     }
 
     /// A scan that stops early leaves nothing behind: only a completed
