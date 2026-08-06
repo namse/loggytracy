@@ -64,9 +64,8 @@ pub struct PartReader {
     bloom: Vec<BloomFilter>,
     /// Per row group, one exact-field sub-bloom per [`BLOOM_WINDOW_ROWS`]-row
     /// window. An empty outer `Vec` means the group indexed no exact-field
-    /// token at all — no exact-field predicate can match it. A `None` window
-    /// says the same about that window alone.
-    exact_field_bloom: Vec<Vec<Option<BloomFilter>>>,
+    /// token at all — no exact-field predicate can match it.
+    exact_field_bloom: Vec<Vec<WindowBloom>>,
     stream_index: StreamMap,
     stream_labels: Vec<String>,
     /// The keys stored as `_sm:` columns, in schema (sorted) order.
@@ -94,10 +93,20 @@ pub struct PartReader {
     data_metadata: std::sync::OnceLock<ArrowReaderMetadata>,
 }
 
+/// One window's exact-field state, decoded.
+enum WindowBloom {
+    /// The window indexed no token: no exact-field predicate can match here.
+    Absent,
+    /// The window held more tokens than a filter is allowed to be sized for;
+    /// everything is admitted, nothing is pruned.
+    Saturated,
+    Filter(BloomFilter),
+}
+
 struct DecodedBlooms {
     line: Vec<BloomFilter>,
-    /// Outer: row group. Inner: one optional filter per window.
-    exact_fields: Vec<Vec<Option<BloomFilter>>>,
+    /// Outer: row group. Inner: one state per window.
+    exact_fields: Vec<Vec<WindowBloom>>,
 }
 
 /// The distinct label sets one scan has already decoded, so a part holding a
@@ -1778,10 +1787,12 @@ impl PartReader {
         };
         let mut mask = 0u64;
         for (window, bloom) in windows.iter().enumerate() {
-            if bloom
-                .as_ref()
-                .is_some_and(|bloom| bloom.contains(&token))
-            {
+            let admitted = match bloom {
+                WindowBloom::Absent => false,
+                WindowBloom::Saturated => true,
+                WindowBloom::Filter(filter) => filter.contains(&token),
+            };
+            if admitted {
                 mask |= 1u64 << window;
             }
         }
@@ -1828,8 +1839,10 @@ fn resident_bytes(blooms: &DecodedBlooms, stream_index: &StreamMap) -> u64 {
     for bloom in &blooms.line {
         total = total.saturating_add(bloom.resident_bytes() as u64);
     }
-    for bloom in blooms.exact_fields.iter().flatten().flatten() {
-        total = total.saturating_add(bloom.resident_bytes() as u64);
+    for window in blooms.exact_fields.iter().flatten() {
+        if let WindowBloom::Filter(filter) = window {
+            total = total.saturating_add(filter.resident_bytes() as u64);
+        }
     }
     for (name, values) in stream_index {
         total = total.saturating_add(name.len() as u64);
@@ -1887,7 +1900,7 @@ expected {expected_windows} windows, found {window_count}"
         }
         let mut windows = Vec::with_capacity(window_count);
         for _ in 0..window_count {
-            windows.push(decode_optional_length_prefixed_bloom(buf, &mut pos)?);
+            windows.push(decode_window_bloom(buf, &mut pos)?);
         }
         exact_fields.push(windows);
     }
@@ -1900,20 +1913,24 @@ expected {expected_windows} windows, found {window_count}"
     })
 }
 
-/// A window slot the writer is allowed to leave empty.
-///
-/// A zero length says the window indexed no exact-field token, which is a
-/// fact the reader can prune on. Any other length decodes as an ordinary
-/// filter.
-fn decode_optional_length_prefixed_bloom(
-    buf: &[u8],
-    pos: &mut usize,
-) -> Result<Option<BloomFilter>, String> {
-    if buf.get(*pos..*pos + 4) == Some(&[0, 0, 0, 0]) {
-        *pos += 4;
-        return Ok(None);
+/// One window slot: a zero length says the window indexed no exact-field
+/// token — a fact the reader prunes on; the saturation sentinel says the
+/// window held more tokens than a filter may be sized for — nothing is
+/// pruned; any other length decodes as an ordinary filter.
+fn decode_window_bloom(buf: &[u8], pos: &mut usize) -> Result<WindowBloom, String> {
+    match buf.get(*pos..*pos + 4) {
+        Some(&[0, 0, 0, 0]) => {
+            *pos += 4;
+            Ok(WindowBloom::Absent)
+        }
+        Some(bytes)
+            if bytes == crate::part::SATURATED_WINDOW_SENTINEL.to_le_bytes() =>
+        {
+            *pos += 4;
+            Ok(WindowBloom::Saturated)
+        }
+        _ => decode_length_prefixed_bloom(buf, pos).map(WindowBloom::Filter),
     }
-    decode_length_prefixed_bloom(buf, pos).map(Some)
 }
 
 fn decode_length_prefixed_bloom(buf: &[u8], pos: &mut usize) -> Result<BloomFilter, String> {

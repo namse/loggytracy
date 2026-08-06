@@ -1296,8 +1296,14 @@ Write path:
 - [x] Move `rows_from_snapshot` and the global sort inside `spawn_blocking` — done by the chunked flush
       (2026-08-03, below): materialization happens per chunk inside the blocking task, and
       `rows_from_snapshot` is no longer on the production path at all
-- [ ] Cap the exact-field bloom. `exact_capacity` is the raw token count for the row group
+- [x] Cap the exact-field bloom. `exact_capacity` is the raw token count for the row group
       (`part/format.rs:329-347`), so a wide-JSON tenant can make `index.bin` larger than `data.parquet`
+
+      Done 2026-08-06: a window holding more than 65,536 tokens is stored **saturated** — a sentinel
+      length that decodes as admit-everything, distinct from the zero length that means prune — so the
+      filter caps near 79 KB per window and an attack degrades pruning for its own window instead of
+      growing the sidecar. A 130-field-per-row flood test pins `index.bin < data.parquet`, that saturation
+      admits both present and absent values, and that the query still answers exactly.
 - [x] Consider compressing the WAL payload. It stores the decompressed protobuf, discarding the client's
       snappy, which makes the WAL the dominant term in write amplification
 

@@ -547,8 +547,8 @@
         assert_eq!(decoded.line.len(), 1);
         assert_eq!(decoded.exact_fields.len(), 1);
         assert_eq!(decoded.exact_fields[0].len(), 2);
-        assert!(decoded.exact_fields[0][0].is_some());
-        assert!(decoded.exact_fields[0][1].is_none());
+        assert!(matches!(decoded.exact_fields[0][0], WindowBloom::Filter(_)));
+        assert!(matches!(decoded.exact_fields[0][1], WindowBloom::Absent));
 
         // A token-less group writes a window count of zero, whatever its
         // row count.
@@ -607,6 +607,77 @@
                 .err()
                 .unwrap()
                 .contains("magic mismatch")
+        );
+
+        // The saturation sentinel decodes as admit-everything: distinct from
+        // the zero length, which prunes.
+        let mut saturated = Vec::new();
+        saturated.extend_from_slice(BLOOM_MAGIC);
+        saturated.extend_from_slice(&1u32.to_le_bytes());
+        saturated.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        saturated.extend_from_slice(&encoded);
+        saturated.extend_from_slice(&2u32.to_le_bytes());
+        saturated.extend_from_slice(&crate::part::SATURATED_WINDOW_SENTINEL.to_le_bytes());
+        saturated.extend_from_slice(&0u32.to_le_bytes());
+        let decoded = decode_blooms(&saturated, rows).unwrap();
+        assert!(matches!(decoded.exact_fields[0][0], WindowBloom::Saturated));
+        assert!(matches!(decoded.exact_fields[0][1], WindowBloom::Absent));
+    }
+
+    /// A wide-JSON window past the token cap is stored saturated: the index
+    /// stops growing with the attack, and the window admits every predicate
+    /// instead of false-negativing any.
+    #[test]
+    fn a_token_flooded_window_saturates_instead_of_outgrowing_the_data() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        // ~130 metadata tokens per row × 1024 rows ≈ 133k tokens — past the
+        // 65,536 cap in the very first window.
+        let rows: Vec<Row> = (0..1100i64)
+            .map(|i| {
+                let metadata = (0..130)
+                    .map(|k| (format!("k{k:03}"), format!("v{i}-{k}")))
+                    .collect();
+                window_row(base + i, metadata)
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 4096).unwrap().remove(0);
+        let index_bytes = fs::metadata(part.index_path()).unwrap().len();
+        let data_bytes = fs::metadata(part.data_path()).unwrap().len();
+        assert!(
+            index_bytes < data_bytes,
+            "index ({index_bytes}) must not outgrow data ({data_bytes})"
+        );
+        let reader = PartReader::open(part).unwrap();
+
+        // Present and absent values both admit — saturation prunes nothing —
+        // and the present one still answers correctly end to end.
+        for value in ["v5-7", "not-there-at-all"] {
+            let predicate = [ExactFieldPredicate::new("k007", value)];
+            assert!(reader.may_match_exact_fields(
+                &test_tenant(),
+                &[],
+                &[],
+                &predicate,
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
+            ));
+        }
+        let predicate = [ExactFieldPredicate::new("k007", "v5-7")];
+        let results = reader
+            .query_with_exact_field_pruning_and_scan_limit(
+                &test_tenant(),
+                &[],
+                ExactFieldPruning::new(&[], &predicate),
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
+                100,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            results.results.iter().map(|s| s.entries.len()).sum::<usize>(),
+            1
         );
     }
 

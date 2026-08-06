@@ -805,6 +805,17 @@ fn encode_group_blooms(
             buf.extend_from_slice(&0u32.to_le_bytes());
             continue;
         }
+        // A filter is sized by its token count, and the token count is
+        // attacker-shaped: a wide-JSON row contributes a token per field per
+        // canonical variant, so an adversarial tenant could make `index.bin`
+        // outweigh `data.parquet`. Past the cap the window is written as
+        // *saturated* — admit everything, prune nothing — which is the
+        // conservative direction; absence (the zero length above) keeps
+        // meaning the opposite.
+        if tokens.len() > crate::part::MAX_EXACT_TOKENS_PER_WINDOW {
+            buf.extend_from_slice(&crate::part::SATURATED_WINDOW_SENTINEL.to_le_bytes());
+            continue;
+        }
         let mut filter = BloomFilter::with_capacity(tokens.len(), 0.01);
         for token in tokens {
             filter.insert(token);

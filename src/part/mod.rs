@@ -58,6 +58,18 @@ const STREAM_MAGIC: &[u8; 4] = b"SIX1";
 /// window set fits a `u64` mask.
 pub(crate) const BLOOM_WINDOW_ROWS: usize = 1024;
 
+/// Most exact-field tokens one window's bloom is sized for. The count is
+/// attacker-shaped (a token per field per canonical variant per row), so past
+/// this the window is stored saturated — admit-everything — instead of
+/// letting an adversarial tenant size `index.bin` past `data.parquet`. At
+/// ~9.6 bits per token this caps a window's filter near 79 KB; the bed
+/// corpus runs at ~7k tokens per window.
+pub(crate) const MAX_EXACT_TOKENS_PER_WINDOW: usize = 65_536;
+
+/// The window-slot length that encodes a saturated window in the `BTF5`
+/// section. Distinct from 0, which means "no tokens — prune".
+pub(crate) const SATURATED_WINDOW_SENTINEL: u32 = u32::MAX;
+
 const EXACT_FIELD_TOKEN_MAGIC: &[u8; 4] = b"FEQ1";
 const EXACT_FIELD_SCALAR_SCOPE: u8 = 0;
 
