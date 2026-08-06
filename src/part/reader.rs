@@ -1009,7 +1009,7 @@ impl PartReader {
             let cached = self
                 .group_cache
                 .enabled()
-                .then(|| self.group_cache.get(row_group))
+                .then(|| self.group_cache.get_full(row_group, group_rows))
                 .flatten();
             // The narrow pass answers from the cache when every definitive
             // column lives in it (`_sm:`; the full projection carries no
@@ -1045,27 +1045,20 @@ impl PartReader {
                 }
             };
             let count_scanned_rows = selection.is_none();
-            // Cacheable = this decode will cover the whole group: no narrow
-            // pass ran, and the base selection (if any) keeps every row — a
-            // full-range query's time page selection selects everything and
-            // must not disqualify the group.
-            let fill_group = self.group_cache.enabled()
-                && cached.is_none()
-                && selection.is_none()
-                && projection.leaves == self.cache_projection.leaves
-                && base_selection.as_ref().is_none_or(|selection| {
-                    selection
-                        .iter()
-                        .filter(|selector| !selector.skip)
-                        .map(|selector| selector.row_count)
-                        .sum::<usize>()
-                        == group_rows
-                });
             if selection.is_none()
                 && let Some(base_selection) = base_selection
             {
                 selection = Some(base_selection);
             }
+            // The effective selection is this decode's identity in the
+            // cache. A repeated window resolves to the same page selection,
+            // and a different predicate resolving to the same rows —
+            // `metadata_rare` after `json_field_rare` — to the same narrow
+            // result; both replay the decode below without touching Parquet.
+            let cache_eligible = self.group_cache.enabled()
+                && projection.leaves == self.cache_projection.leaves;
+            let selection_key = cache_eligible
+                .then(|| crate::part::selection_key(selection.as_ref(), group_rows));
             if let Some(cached) = cached {
                 // Serve the group from memory: slice the selected ranges
                 // (zero-copy) and walk them through the same scan_batch the
@@ -1116,6 +1109,41 @@ impl PartReader {
                 }
                 continue;
             }
+            // An exact match on the effective selection replays the decode:
+            // the batches are the very ones a miss would produce, so they go
+            // through the same scan_batch with the same accounting.
+            if let Some(key) = &selection_key
+                && let Some(replay) = self.group_cache.get(row_group, key)
+            {
+                let mut batches: Vec<&RecordBatch> = replay.batches.iter().collect();
+                if !forward {
+                    batches.reverse();
+                }
+                for batch in batches {
+                    match self.scan_batch(
+                        batch,
+                        tenant,
+                        line_filters,
+                        time_range,
+                        forward,
+                        row_group,
+                        scan_limit,
+                        scan_bytes_limit,
+                        cancellation,
+                        &self.cache_projection,
+                        true,
+                        count_scanned_rows,
+                        &stream_matches,
+                        &mut stats,
+                        sink,
+                    ) {
+                        Ok(ScanStep::Continue) => {}
+                        Ok(ScanStep::Stop) => break 'row_groups,
+                        Err(error) => return Err(error),
+                    }
+                }
+                continue;
+            }
             let projection = &projection;
             if forward {
                 // Forwards, Parquet's own order is the query's order, so one
@@ -1134,7 +1162,7 @@ impl PartReader {
                     builder = builder.with_row_selection(selection);
                 }
                 let reader = builder.build().map_err(|e| e.to_string())?;
-                let mut fill: Option<Vec<RecordBatch>> = fill_group.then(Vec::new);
+                let mut fill: Option<Vec<RecordBatch>> = selection_key.is_some().then(Vec::new);
                 for batch in reader {
                     let batch = batch.map_err(|e| e.to_string())?;
                     if let Some(fill) = &mut fill {
@@ -1165,10 +1193,11 @@ impl PartReader {
                         Err(error) => return Err(error),
                     }
                 }
-                if let Some(fill) = fill
-                    && fill.iter().map(RecordBatch::num_rows).sum::<usize>() == group_rows
+                if let (Some(fill), Some(key)) = (fill, selection_key)
+                    && fill.iter().map(RecordBatch::num_rows).sum::<usize>()
+                        == crate::part::selected_rows_of(&key)
                 {
-                    self.group_cache.insert(row_group, fill);
+                    self.group_cache.insert(row_group, key, fill);
                 }
                 continue;
             }
@@ -1203,13 +1232,14 @@ impl PartReader {
             let mut batches: Vec<_> = reader
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
-            // Backwards decodes the group whole before scanning, so the
+            // Backwards decodes its selection whole before scanning, so the
             // batches are cacheable right here — `RecordBatch` clones are
             // refcounts, not copies.
-            if fill_group
-                && batches.iter().map(RecordBatch::num_rows).sum::<usize>() == group_rows
+            if let Some(key) = selection_key
+                && batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+                    == crate::part::selected_rows_of(&key)
             {
-                self.group_cache.insert(row_group, batches.clone());
+                self.group_cache.insert(row_group, key, batches.clone());
             }
             batches.reverse();
             for batch in &batches {

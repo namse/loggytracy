@@ -283,23 +283,11 @@ fn bench_scan_filters(c: &mut Criterion) {
         });
     }
 
-    // The comparison bed's rare-shape "cold" runs after the broad shapes
-    // already decoded these groups. This is that case locally: the reader is
-    // opened with the row-group cache on, one broad backward scan is the fill
-    // traffic, and the exact-field query is then served from cached batches.
+    // The comparison bed's warm pass: the same rare query repeated. The
+    // first issue fills the cache under its narrow-pass selection; the
+    // repeats replay the decode (criterion's warmup is the fill traffic).
     loggytracy::part::configure_row_group_cache(Some(1 << 30));
     let cached = write_part(&corpus, "part-filters-cached");
-    cached
-        .reader
-        .query(
-            &tenant,
-            &[],
-            &[],
-            loggytracy::part::QueryTimeRange::closed(start, end),
-            usize::MAX,
-            false,
-        )
-        .expect("fill scan succeeds");
     let predicates = [present];
     group.bench_function("exact_field_hit_cached", |b| {
         b.iter(|| {

@@ -2902,6 +2902,81 @@ or every equality below is vacuous"
         assert_eq!(fill.len(), 120);
     }
 
+    /// The comparison bed's shape: a sub-window query whose time page
+    /// selection keeps only part of each group. The decode is cached under
+    /// that selection and an identical repeat replays it — this is the warm
+    /// pass — with the same answer as an uncached reader.
+    #[test]
+    fn a_repeated_sub_window_query_replays_its_cached_decode() {
+        let tmp = tempfile_dir();
+        let (part, _) = ordinal_fixture(&tmp);
+        let plain = PartReader::open(part.clone()).unwrap();
+        let cached = cache_enabled(part, 1 << 30);
+
+        let base = 1_700_000_000_000_000_000i64;
+        let window = QueryTimeRange::closed(base + 10, base + 2010);
+        let answer = |reader: &PartReader, forward: bool| {
+            reader
+                .query(&test_tenant(), &[], &[], window, 1000, forward)
+                .unwrap()
+                .iter()
+                .flat_map(|s| s.entries.iter().map(|e| (e.timestamp_ns, e.line.clone())))
+                .collect::<Vec<_>>()
+        };
+        let first = answer(&cached, false);
+        assert!(
+            cached.group_cache.resident_bytes_for_test() > 0,
+            "a sub-window decode must fill the cache — the bed's queries \
+are all sub-windows, and a whole-group-only fill never fires there"
+        );
+        for forward in [true, false] {
+            assert_eq!(answer(&cached, forward), answer(&plain, forward));
+        }
+        assert_eq!(first, answer(&plain, false));
+    }
+
+    /// A rare-shape query's narrow pass produces a row-exact selection; the
+    /// wide decode of those rows is cached under it and an identical repeat
+    /// replays it without touching Parquet.
+    #[test]
+    fn a_repeated_exact_field_query_replays_its_cached_decode() {
+        let tmp = tempfile_dir();
+        let (part, _) = ordinal_fixture(&tmp);
+        let plain = PartReader::open(part.clone()).unwrap();
+        let cached = cache_enabled(part, 1 << 30);
+
+        let full = QueryTimeRange::closed(i64::MIN, i64::MAX);
+        let predicate = [ExactFieldPredicate::new("trace_id", "bb-7")];
+        let answer = |reader: &PartReader, forward: bool| {
+            reader
+                .query_with_exact_field_pruning_and_scan_limit(
+                    &test_tenant(),
+                    &[],
+                    ExactFieldPruning::new(&[], &predicate),
+                    full,
+                    100,
+                    forward,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .results
+                .iter()
+                .flat_map(|s| s.entries.iter().map(|e| (e.timestamp_ns, e.line.clone())))
+                .collect::<Vec<_>>()
+        };
+        let first = answer(&cached, false);
+        assert_eq!(first.len(), 1, "the fixture holds exactly one bb-7 row");
+        assert!(
+            cached.group_cache.resident_bytes_for_test() > 0,
+            "a selection-narrowed decode must fill the cache under its \
+selection, or warm rare shapes never hit"
+        );
+        for forward in [true, false] {
+            assert_eq!(answer(&cached, forward), answer(&plain, forward));
+        }
+    }
+
     /// A scan that stops early leaves nothing behind: only a completed
     /// whole-group decode is cacheable.
     #[test]
