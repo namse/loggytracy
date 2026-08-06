@@ -579,6 +579,9 @@ loggytracy_part_tenant_segments {}\n\
 # HELP loggytracy_part_sidecar_resident_bytes Bloom and stream-index bytes held resident by open parts. Not covered by the local cache budget.\n\
 # TYPE loggytracy_part_sidecar_resident_bytes gauge\n\
 loggytracy_part_sidecar_resident_bytes {}\n\
+# HELP loggytracy_row_group_cache_bytes Decoded row groups held for reuse across scans, bounded by row_group_cache_max_bytes.\n\
+# TYPE loggytracy_row_group_cache_bytes gauge\n\
+loggytracy_row_group_cache_bytes {}\n\
 # HELP loggytracy_part_meta_bytes Total meta.json across parts, which startup parses before serving.\n\
 # TYPE loggytracy_part_meta_bytes gauge\n\
 loggytracy_part_meta_bytes {}\n\
@@ -691,6 +694,7 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         merge_debt_parts,
         layout.tenant_segments,
         layout.sidecar_resident_bytes,
+        crate::part::row_group_cache_bytes(),
         layout.meta_bytes,
         m.ingest_requests.load(Ordering::Relaxed),
         m.ingest_errors.load(Ordering::Relaxed),

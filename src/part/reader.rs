@@ -84,6 +84,13 @@ pub struct PartReader {
     /// so a scan resolves a row's label set with an `Arc` clone instead of
     /// rebuilding a map from label columns.
     stream_table: Vec<SharedLabels>,
+    /// Whole row groups decoded by earlier scans, kept under the process-wide
+    /// budget; dies with this reader.
+    group_cache: GroupCache,
+    /// The projection every cached batch was decoded with — `ColumnSet::all`
+    /// over this part's keys — built once so cache hits from narrower callers
+    /// read the right column positions.
+    cache_projection: ScanProjection,
     /// The parsed Parquet footer plus the timestamp column's page index,
     /// cached for the reader's lifetime after the first scan loads it.
     ///
@@ -172,6 +179,42 @@ fn time_page_selection(
         ranges.into_iter(),
         group_rows,
     ))
+}
+
+/// Zero-copy slices of a cached group covering the selection's kept ranges,
+/// in group order. No selection means the batches themselves.
+fn slice_cached_group(
+    cached: &CachedGroupRead,
+    selection: Option<&RowSelection>,
+) -> Vec<RecordBatch> {
+    let Some(selection) = selection else {
+        return cached.batches.iter().cloned().collect();
+    };
+    let mut slices = Vec::new();
+    let mut at = 0usize;
+    for selector in selection.iter() {
+        if !selector.skip {
+            let mut start = at;
+            let end = at + selector.row_count;
+            // A kept range may span cached batch boundaries; emit one slice
+            // per overlapped batch.
+            for (batch, offset) in cached.batches.iter().zip(&cached.offsets) {
+                let batch_end = offset + batch.num_rows();
+                if start >= end {
+                    break;
+                }
+                if start >= batch_end || end <= *offset {
+                    continue;
+                }
+                let slice_start = start - offset;
+                let slice_len = end.min(batch_end) - start;
+                slices.push(batch.slice(slice_start, slice_len));
+                start += slice_len;
+            }
+        }
+        at += selector.row_count;
+    }
+    slices
 }
 
 /// The rows of one group inside the windows an exact-field mask admitted.
@@ -366,6 +409,8 @@ impl PartReader {
             open_part_data(&part, true, false)?;
         }
         let index_resident_bytes = resident_bytes(&decoded_blooms, &stream_index);
+                let cache_projection =
+            ScanProjection::build(&metadata_keys, &parsed_keys, &ColumnSet::all());
         Ok(Self {
             part,
             bloom: decoded_blooms.line,
@@ -376,6 +421,8 @@ impl PartReader {
             parsed_keys,
             index_resident_bytes,
             stream_table,
+            group_cache: GroupCache::from_global(),
+            cache_projection,
             data_metadata: std::sync::OnceLock::new(),
         })
     }
@@ -953,8 +1000,36 @@ impl PartReader {
             {
                 continue;
             }
+            // A group decoded whole by an earlier scan serves this one from
+            // memory: the per-group constant — reader build, dictionary
+            // pages, page decompression for every projected column — is what
+            // the cache exists to not pay twice. Selections are applied by
+            // zero-copy slicing, and the batches carry the full projection,
+            // so a narrower caller reads them through `cache_projection`.
+            let cached = self
+                .group_cache
+                .enabled()
+                .then(|| self.group_cache.get(row_group))
+                .flatten();
+            // The narrow pass answers from the cache when every definitive
+            // column lives in it (`_sm:`; the full projection carries no
+            // `_pf:` columns, so extraction-backed predicates keep the
+            // builder path, whose two-column read is cheap).
+            let cache_covers_definitive =
+                !definitive.is_empty() && definitive.iter().all(|def| def.pf_key.is_none());
             let mut selection = if definitive.is_empty() {
                 None
+            } else if let (Some(cached), true) = (&cached, cache_covers_definitive) {
+                match self.select_rows_in_cached_group(
+                    cached,
+                    &definitive,
+                    time_range,
+                    base_selection.as_ref(),
+                    &mut stats,
+                )? {
+                    Some(selection) => Some(selection),
+                    None => continue,
+                }
             } else {
                 match self.select_rows_in_group(
                     &data_file,
@@ -970,12 +1045,78 @@ impl PartReader {
                 }
             };
             let count_scanned_rows = selection.is_none();
-            let projection = &projection;
+            // Cacheable = this decode will cover the whole group: no narrow
+            // pass ran, and the base selection (if any) keeps every row — a
+            // full-range query's time page selection selects everything and
+            // must not disqualify the group.
+            let fill_group = self.group_cache.enabled()
+                && cached.is_none()
+                && selection.is_none()
+                && projection.leaves == self.cache_projection.leaves
+                && base_selection.as_ref().is_none_or(|selection| {
+                    selection
+                        .iter()
+                        .filter(|selector| !selector.skip)
+                        .map(|selector| selector.row_count)
+                        .sum::<usize>()
+                        == group_rows
+                });
             if selection.is_none()
                 && let Some(base_selection) = base_selection
             {
                 selection = Some(base_selection);
             }
+            if let Some(cached) = cached {
+                // Serve the group from memory: slice the selected ranges
+                // (zero-copy) and walk them through the same scan_batch the
+                // decode path uses, under the cache's own full projection.
+                let mut slices = slice_cached_group(&cached, selection.as_ref());
+                let selected_rows: usize = slices.iter().map(RecordBatch::num_rows).sum();
+                if !forward {
+                    slices.reverse();
+                }
+                // Proportional, not measured: a slice reports its underlying
+                // buffers' full capacity, and the decode path would have
+                // charged only the selected rows' batches. Approximate what a
+                // miss would have reported rather than the cache's residency.
+                stats.scanned_bytes = stats.scanned_bytes.saturating_add(
+                    (cached.bytes as u128 * selected_rows as u128
+                        / cached.total_rows.max(1) as u128) as u64,
+                );
+                if scan_bytes_limit.is_some_and(|limit| stats.scanned_bytes > limit) {
+                    return Err(format!(
+                        "query exceeds the maximum of {} scanned bytes",
+                        scan_bytes_limit.unwrap_or_default()
+                    ));
+                }
+                for batch in &slices {
+                    match self.scan_batch(
+                        batch,
+                        tenant,
+                        line_filters,
+                        time_range,
+                        forward,
+                        row_group,
+                        scan_limit,
+                        // Bytes were charged proportionally above; None keeps
+                        // scan_batch from re-measuring slice capacities.
+                        None,
+                        cancellation,
+                        &self.cache_projection,
+                        false,
+                        count_scanned_rows,
+                        &stream_matches,
+                        &mut stats,
+                        sink,
+                    ) {
+                        Ok(ScanStep::Continue) => {}
+                        Ok(ScanStep::Stop) => break 'row_groups,
+                        Err(error) => return Err(error),
+                    }
+                }
+                continue;
+            }
+            let projection = &projection;
             if forward {
                 // Forwards, Parquet's own order is the query's order, so one
                 // reader streams the group and the sink's frontier ends it.
@@ -993,8 +1134,12 @@ impl PartReader {
                     builder = builder.with_row_selection(selection);
                 }
                 let reader = builder.build().map_err(|e| e.to_string())?;
+                let mut fill: Option<Vec<RecordBatch>> = fill_group.then(Vec::new);
                 for batch in reader {
                     let batch = batch.map_err(|e| e.to_string())?;
+                    if let Some(fill) = &mut fill {
+                        fill.push(batch.clone());
+                    }
                     match self.scan_batch(
                         &batch,
                         tenant,
@@ -1006,15 +1151,24 @@ impl PartReader {
                         scan_bytes_limit,
                         cancellation,
                         projection,
+                        true,
                         count_scanned_rows,
                         &stream_matches,
                         &mut stats,
                         sink,
                     ) {
                         Ok(ScanStep::Continue) => {}
+                        // A stop exits the whole scan, which also skips the
+                        // fill below: a stopped group may be partially
+                        // decoded, and only a completed decode is cacheable.
                         Ok(ScanStep::Stop) => break 'row_groups,
                         Err(error) => return Err(error),
                     }
+                }
+                if let Some(fill) = fill
+                    && fill.iter().map(RecordBatch::num_rows).sum::<usize>() == group_rows
+                {
+                    self.group_cache.insert(row_group, fill);
                 }
                 continue;
             }
@@ -1049,6 +1203,14 @@ impl PartReader {
             let mut batches: Vec<_> = reader
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
+            // Backwards decodes the group whole before scanning, so the
+            // batches are cacheable right here — `RecordBatch` clones are
+            // refcounts, not copies.
+            if fill_group
+                && batches.iter().map(RecordBatch::num_rows).sum::<usize>() == group_rows
+            {
+                self.group_cache.insert(row_group, batches.clone());
+            }
             batches.reverse();
             for batch in &batches {
                 match self.scan_batch(
@@ -1062,6 +1224,7 @@ impl PartReader {
                     scan_bytes_limit,
                     cancellation,
                     projection,
+                    true,
                     count_scanned_rows,
                     &stream_matches,
                     &mut stats,
@@ -1094,6 +1257,92 @@ impl PartReader {
             .get_or_init(|| part_metadata.clone())
             .clone();
         Ok((data_file, part_metadata))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// The narrow pass served from a cached group: the same keep logic as
+    /// [`select_rows_in_group`](Self::select_rows_in_group), evaluated over
+    /// the in-memory batches instead of a second reader build. Only called
+    /// when every definitive column is `_sm:`-backed — the cached full
+    /// projection carries no `_pf:` columns.
+    fn select_rows_in_cached_group(
+        &self,
+        cached: &CachedGroupRead,
+        definitive: &[DefinitiveColumn],
+        time_range: QueryTimeRange,
+        base_selection: Option<&RowSelection>,
+        stats: &mut ScanStats,
+    ) -> Result<Option<RowSelection>, String> {
+        let sm_position = |key: usize| -> Result<usize, String> {
+            self.cache_projection
+                .metadata
+                .iter()
+                .find(|&&(key_index, _)| key_index == key)
+                .map(|&(_, position)| position)
+                .ok_or_else(|| "cached projection is missing a metadata column".to_string())
+        };
+        let columns: Vec<usize> = definitive
+            .iter()
+            .map(|def| sm_position(def.sm_key.expect("caller checked sm-only definitive")))
+            .collect::<Result<_, _>>()?;
+
+        let mut kept: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut examined = 0usize;
+        let mut visit = |start: usize, end: usize| {
+            let mut row = start;
+            for (batch, offset) in cached.batches.iter().zip(&cached.offsets) {
+                let batch_end = offset + batch.num_rows();
+                if row >= end {
+                    break;
+                }
+                if row >= batch_end || end <= *offset {
+                    continue;
+                }
+                let ts = batch.column(1).as_primitive::<Int64Type>();
+                let sm: Vec<&StringArray> = columns
+                    .iter()
+                    .map(|&position| batch.column(position).as_string::<i32>())
+                    .collect();
+                while row < end.min(batch_end) {
+                    let i = row - offset;
+                    examined += 1;
+                    let keep = time_range.contains(ts.value(i))
+                        && definitive.iter().zip(&sm).all(|(def, column)| {
+                            !column.is_null(i) && column.value(i) == def.value
+                        });
+                    if keep {
+                        match kept.last_mut() {
+                            Some(range) if range.end == row => range.end = row + 1,
+                            _ => kept.push(row..row + 1),
+                        }
+                    }
+                    row += 1;
+                }
+            }
+        };
+        match base_selection {
+            Some(selection) => {
+                let mut at = 0usize;
+                for selector in selection.iter() {
+                    if !selector.skip {
+                        visit(at, at + selector.row_count);
+                    }
+                    at += selector.row_count;
+                }
+            }
+            None => visit(0, cached.total_rows),
+        }
+        stats.scanned_rows = stats.scanned_rows.saturating_add(examined);
+        stats.scanned_bytes = stats.scanned_bytes.saturating_add(
+            (cached.bytes as u128 * examined as u128 / cached.total_rows.max(1) as u128) as u64,
+        );
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(RowSelection::from_consecutive_ranges(
+            kept.into_iter(),
+            cached.total_rows,
+        )))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1225,6 +1474,10 @@ impl PartReader {
         scan_bytes_limit: Option<u64>,
         cancellation: Option<&AtomicBool>,
         projection: &ScanProjection,
+        // A cache-served slice reports its underlying buffers' full capacity,
+        // so the hit path charges bytes proportionally itself and turns this
+        // off.
+        charge_batch_bytes: bool,
         count_scanned_rows: bool,
         stream_matches: &[bool],
         stats: &mut ScanStats,
@@ -1233,9 +1486,11 @@ impl PartReader {
         if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return Ok(ScanStep::Stop);
         }
-        stats.scanned_bytes = stats
-            .scanned_bytes
-            .saturating_add(batch.get_array_memory_size() as u64);
+        if charge_batch_bytes {
+            stats.scanned_bytes = stats
+                .scanned_bytes
+                .saturating_add(batch.get_array_memory_size() as u64);
+        }
         if scan_bytes_limit.is_some_and(|limit| stats.scanned_bytes > limit) {
             return Err(format!(
                 "query exceeds the maximum of {} scanned bytes",

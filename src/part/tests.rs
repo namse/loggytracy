@@ -2797,6 +2797,198 @@ resident {:.0} B",
         assert!(series.iter().any(|labels| labels.is_empty()));
     }
 
+    fn cache_enabled(part: Part, budget: u64) -> PartReader {
+        let mut reader = PartReader::open(part).unwrap();
+        reader.group_cache = GroupCache::new(
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Some(budget),
+        );
+        reader
+    }
+
+    fn ordinal_fixture(tmp: &Path) -> (Part, Vec<Row>) {
+        let base = 1_700_000_000_000_000_000i64;
+        let make = |app: &str| -> SharedLabels {
+            std::sync::Arc::new([("app".to_string(), app.to_string())].into_iter().collect())
+        };
+        let mut rows = Vec::new();
+        for (index, app) in ["aa", "bb", "cc"].iter().enumerate() {
+            let labels = make(app);
+            for i in 0..40i64 {
+                rows.push(Row {
+                    tenant: test_tenant(),
+                    timestamp_ns: base + index as i64 * 1000 + i,
+                    labels: labels.clone(),
+                    line: format!("{app} row {i}"),
+                    structured_metadata: vec![(
+                        "trace_id".to_string(),
+                        format!("{app}-{i}"),
+                    )],
+                });
+            }
+        }
+        let part = flush_rows(rows.clone(), tmp, 16).unwrap().remove(0);
+        (part, rows)
+    }
+
+    /// A cache hit is invisible in the answer: the same queries return the
+    /// same rows in the same order before and after the group is cached, in
+    /// both directions, matchers and exact-field predicates included.
+    #[test]
+    fn a_cached_group_answers_identically_to_a_decoded_one() {
+        let tmp = tempfile_dir();
+        let (part, _) = ordinal_fixture(&tmp);
+        let plain = PartReader::open(part.clone()).unwrap();
+        let cached = cache_enabled(part, 1 << 30);
+
+        let full = QueryTimeRange::closed(i64::MIN, i64::MAX);
+        let broad = |reader: &PartReader, forward: bool| {
+            reader
+                .query(&test_tenant(), &[], &[], full, 1000, forward)
+                .unwrap()
+                .iter()
+                .flat_map(|s| s.entries.iter().map(|e| (e.timestamp_ns, e.line.clone())))
+                .collect::<Vec<_>>()
+        };
+        // First scan fills (backward decodes groups whole), later scans hit.
+        let fill = broad(&cached, false);
+        assert!(
+            cached.group_cache.resident_bytes_for_test() > 0,
+            "the fill scan must actually populate the cache, \
+or every equality below is vacuous"
+        );
+        assert!(
+            crate::part::row_group_cache_bytes() == 0,
+            "the test cache must not touch the global counter"
+        );
+        for forward in [true, false] {
+            assert_eq!(broad(&cached, forward), broad(&plain, forward));
+        }
+
+        // Exact-field predicate served through the cached narrow pass.
+        let predicate = [ExactFieldPredicate::new("trace_id", "bb-7")];
+        for forward in [true, false] {
+            let answer = |reader: &PartReader| {
+                reader
+                    .query_with_exact_field_pruning_and_scan_limit(
+                        &test_tenant(),
+                        &[],
+                        ExactFieldPruning::new(&[], &predicate),
+                        full,
+                        100,
+                        forward,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .results
+                    .iter()
+                    .flat_map(|s| s.entries.iter().map(|e| e.timestamp_ns))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(answer(&cached), answer(&plain), "forward {forward}");
+        }
+
+        // Matchers evaluate identically through the hit path.
+        let matcher =
+            LabelMatcher::new("app".to_string(), MatcherOp::Eq, "cc".to_string()).unwrap();
+        let matched = cached
+            .query(&test_tenant(), std::slice::from_ref(&matcher), &[], full, 1000, true)
+            .unwrap()
+            .iter()
+            .map(|s| s.entries.len())
+            .sum::<usize>();
+        assert_eq!(matched, 40);
+        assert_eq!(fill.len(), 120);
+    }
+
+    /// A scan that stops early leaves nothing behind: only a completed
+    /// whole-group decode is cacheable.
+    #[test]
+    fn a_stopped_scan_does_not_cache_a_partial_group() {
+        let tmp = tempfile_dir();
+        let (part, _) = ordinal_fixture(&tmp);
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut reader = PartReader::open(part).unwrap();
+        reader.group_cache = GroupCache::new(counter.clone(), Some(1 << 30));
+        // A query limit alone does not stop the scan mid-group — a full sink
+        // raises the frontier and the remaining rows are *skipped*, so the
+        // group still decodes whole (and is then legitimately cacheable). The
+        // scanned-rows quota is the lever that stops inside a group.
+        reader
+            .query_with_exact_field_pruning_and_scan_limit(
+                &test_tenant(),
+                &[],
+                ExactFieldPruning::new(&[], &[]),
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
+                1000,
+                true,
+                Some(4),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a partial decode must not be cached"
+        );
+    }
+
+    /// The budget evicts least-recently-used groups and the shared counter
+    /// follows every insert, eviction and drop.
+    #[test]
+    fn the_group_cache_budget_evicts_and_the_counter_balances() {
+        let tmp = tempfile_dir();
+        let (part, _) = ordinal_fixture(&tmp);
+        let plain = PartReader::open(part.clone()).unwrap();
+        let group_count = plain.row_group_count();
+        assert!(group_count >= 3, "fixture must span several groups");
+
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Budget sized to roughly one group so inserts evict predecessors.
+        let one_group = {
+            let mut reader = PartReader::open(part.clone()).unwrap();
+            reader.group_cache =
+                GroupCache::new(Arc::new(std::sync::atomic::AtomicU64::new(0)), Some(1 << 30));
+            reader
+                .query(
+                    &test_tenant(),
+                    &[],
+                    &[],
+                    QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    1000,
+                    false,
+                )
+                .unwrap();
+            reader.group_cache.resident_bytes_for_test() / group_count as u64
+        };
+        let mut reader = PartReader::open(part).unwrap();
+        reader.group_cache = GroupCache::new(counter.clone(), Some(one_group * 2));
+        reader
+            .query(
+                &test_tenant(),
+                &[],
+                &[],
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
+                1000,
+                false,
+            )
+            .unwrap();
+        let held = counter.load(std::sync::atomic::Ordering::Acquire);
+        assert!(held > 0, "something must stay cached (one_group={one_group}, groups={group_count})");
+        assert!(
+            held <= one_group * 2,
+            "held {held} exceeds the {} budget",
+            one_group * 2
+        );
+        drop(reader);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "dropping the reader must return every byte"
+        );
+    }
+
     fn walk_meta_dirs(root: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let mut stack = vec![root.to_path_buf()];

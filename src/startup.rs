@@ -137,6 +137,9 @@ pub async fn run(config: Arc<Config>) {
     if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
         panic!("failed to create data dir: {}", e);
     }
+    // Before any part opens: the budget is read at reader open, and the
+    // startup discovery below opens every part on disk.
+    crate::part::configure_row_group_cache(config.row_group_cache_max_bytes);
 
     let startup_budget = config.startup_retry_budget;
     let clock = crate::clock::Clock::system();

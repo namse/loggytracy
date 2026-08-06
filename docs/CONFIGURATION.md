@@ -171,6 +171,7 @@ becomes disk usage that cannot be evicted**.
 | `LOGGYTRACY_MAX_QUERY_SCAN_BYTES` | 2 GiB | |
 | `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES` | 512 MiB | One query's own materialization cap |
 | `LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES` | 512 MiB (minimum 8 MiB) | The shared pool **all** queries together materialize from, reserved incrementally as rows survive the pipeline. A query refused here gets an error naming the pool; before this the aggregate was `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES` and nothing enforced it |
+| `LOGGYTRACY_ROW_GROUP_CACHE_MAX_BYTES` | 256 MiB, `off` disables | Decoded row groups kept across scans. A part is immutable, so a group decoded whole by one scan serves every later scan without paying the reader build again; the budget bounds what stays resident (`loggytracy_row_group_cache_bytes` reports it). Entries die with their part on merge or retirement |
 | `LOGGYTRACY_MAX_LOG_LIMIT` | 100,000 | Maximum `limit` parameter |
 | `LOGGYTRACY_MAX_QUERY_RUNTIME` | `30s` | Also the timeout for metadata endpoints |
 | `LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS` | 8 | Shared with metadata endpoints |

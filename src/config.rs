@@ -174,6 +174,13 @@ pub struct Config {
     /// carries its own `max_query_memory_bytes` cap; this is what all of them
     /// together may hold.
     pub query_memory_budget_bytes: u64,
+    /// Byte budget for decoded row groups kept in memory across scans
+    /// (`off` disables). A part is immutable, so a group decoded once can
+    /// serve every later scan without paying the reader build again; this is
+    /// what the budget bounds. All three systems in the comparison bed run
+    /// their own caches — Loki's result cache, VictoriaLogs' caches — so
+    /// this is the same class of speedup, sized explicitly.
+    pub row_group_cache_max_bytes: Option<u64>,
     pub max_log_limit: usize,
     pub max_metric_evaluation_points: usize,
     pub max_metric_rows: usize,
@@ -260,6 +267,7 @@ impl Default for Config {
             max_query_scan_bytes: 2 * 1024 * 1024 * 1024,
             max_query_memory_bytes: 512 * 1024 * 1024,
             query_memory_budget_bytes: 512 * 1024 * 1024,
+            row_group_cache_max_bytes: Some(256 * 1024 * 1024),
             max_log_limit: 100_000,
             max_metric_evaluation_points: 10_000,
             max_metric_rows: 1_000_000,
@@ -546,6 +554,10 @@ impl Config {
                 "LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES",
                 defaults.query_memory_budget_bytes,
             )?,
+            row_group_cache_max_bytes: env_optional_u64(
+                "LOGGYTRACY_ROW_GROUP_CACHE_MAX_BYTES",
+                defaults.row_group_cache_max_bytes,
+            )?,
             max_query_memory_bytes: env_positive_u64(
                 "LOGGYTRACY_MAX_QUERY_MEMORY_BYTES",
                 defaults.max_query_memory_bytes,
@@ -643,6 +655,7 @@ impl Config {
         tracing::info!(
             peak_materialized_bytes = self.peak_materialized_bytes(),
             query_memory_budget_bytes = self.query_memory_budget_bytes,
+            row_group_cache_max_bytes = self.row_group_cache_max_bytes,
             concurrent_query_scans = self.max_concurrent_query_scans,
             max_query_memory_bytes = self.max_query_memory_bytes,
             merge_max_memory_bytes = self.merge_max_memory_bytes,
@@ -771,6 +784,9 @@ exclusive: per-tenant retention replaces the global period"
         positive_u64("max_query_scan_bytes", self.max_query_scan_bytes)?;
         positive_u64("max_query_memory_bytes", self.max_query_memory_bytes)?;
         positive_u64("query_memory_budget_bytes", self.query_memory_budget_bytes)?;
+        if let Some(bytes) = self.row_group_cache_max_bytes {
+            positive_u64("row_group_cache_max_bytes", bytes)?;
+        }
         // Smaller than one reservation chunk and the very first admission
         // fails: the pool would refuse every query at any load.
         if self.query_memory_budget_bytes < crate::query_memory::RESERVATION_CHUNK_BYTES {
@@ -1079,6 +1095,7 @@ mod tests {
     fn the_peak_memory_budget_is_the_pool_plus_the_merge() {
         let config = Config {
             query_memory_budget_bytes: 512 * 1024 * 1024,
+            row_group_cache_max_bytes: Some(256 * 1024 * 1024),
             merge_max_memory_bytes: 1024 * 1024 * 1024,
             ..Config::default()
         };

@@ -48,10 +48,13 @@ pub enum Arena {
     Sidecar = 6,
     /// `meta.json` parsing and the `PartMeta` a registry entry keeps.
     PartMeta = 7,
+    /// Decoded row groups a `PartReader` keeps for later scans, bounded by
+    /// `row_group_cache_max_bytes`.
+    RowGroupCache = 8,
 }
 
 impl Arena {
-    pub const ALL: [Arena; 8] = [
+    pub const ALL: [Arena; 9] = [
         Arena::Other,
         Arena::Ingest,
         Arena::Wal,
@@ -60,6 +63,7 @@ impl Arena {
         Arena::Query,
         Arena::Sidecar,
         Arena::PartMeta,
+        Arena::RowGroupCache,
     ];
 
     pub fn name(self) -> &'static str {
@@ -72,6 +76,7 @@ impl Arena {
             Arena::Query => "query",
             Arena::Sidecar => "sidecar",
             Arena::PartMeta => "part_meta",
+            Arena::RowGroupCache => "row_group_cache",
         }
     }
 }
