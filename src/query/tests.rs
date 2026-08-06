@@ -1394,6 +1394,57 @@
         }
     }
 
+    /// The pipeline is the correctness fence the advisory serve leans on:
+    /// with the row-group cache live, a common-value field filter is served
+    /// from a broad query\'s cached decode with no narrow pass, and the
+    /// stages must still reject every non-matching row. Runs through the
+    /// real scan path with the global cache configured.
+    #[tokio::test]
+    async fn a_common_value_filter_answers_exactly_through_the_cached_serve() {
+        crate::part::configure_row_group_cache(Some(1 << 30));
+        let labels: Labels = [("app".to_string(), "api".to_string())]
+            .into_iter()
+            .collect();
+        let data_dir = temp_dir();
+        let rows: Vec<Row> = (0..60i64)
+            .map(|i| Row {
+                tenant: test_tenant(),
+                timestamp_ns: 1_000 + i,
+                labels: std::sync::Arc::new(labels.clone()),
+                line: format!("line-{i}"),
+                structured_metadata: vec![
+                    ("env".to_string(), if i % 3 == 0 { "prod" } else { "dev" }.to_string()),
+                    ("trace_id".to_string(), format!("t{i}")),
+                ],
+            })
+            .collect();
+        let parts = Arc::new(PartRegistry::new());
+        parts
+            .register(part::flush_rows(rows, &data_dir.join("parts"), 16).unwrap())
+            .unwrap();
+        let state = test_state(&data_dir, Arc::new(MemTable::new()), parts, None);
+
+        let range = crate::part::QueryTimeRange::closed(0, 10_000);
+        let broad = logql::parse(r#"{app="api"}"#).unwrap();
+        run_unified_query(state.clone(), test_tenant(), broad, range, 1000, false)
+            .await
+            .unwrap();
+
+        let filtered = logql::parse(r#"{app="api"} | env="prod""#).unwrap();
+        let results =
+            run_unified_query(state.clone(), test_tenant(), filtered, range, 1000, false)
+                .await
+                .unwrap();
+        let mut times: Vec<i64> = results
+            .into_iter()
+            .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.timestamp_ns))
+            .collect();
+        times.sort_unstable();
+        let wanted: Vec<i64> = (0..60i64).filter(|i| i % 3 == 0).map(|i| 1_000 + i).collect();
+        assert_eq!(times, wanted, "the pipeline must reject every env=dev row");
+        crate::part::configure_row_group_cache(None);
+    }
+
     /// The counting fast path against the general evaluator, on the same
     /// state: `sum(...)` takes the sink accumulator and `sum by (app) (...)`
     /// takes the general path, and over a single `app` value their samples

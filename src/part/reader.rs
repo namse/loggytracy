@@ -647,6 +647,7 @@ impl PartReader {
                 &[],
                 &[],
                 &[],
+                false,
                 QueryTimeRange::unbounded(),
                 true,
                 None,
@@ -767,6 +768,7 @@ impl PartReader {
             matchers,
             line_filters,
             exact_fields,
+            false,
             time_range,
             forward,
             scan_limit,
@@ -798,12 +800,14 @@ impl PartReader {
     /// `part::tests::a_parts_rows_come_back_in_timestamp_order_within_a_tenant`
     /// is what holds it.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn scan_into(
         &self,
         tenant: &TenantId,
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
+        sink_rechecks_exact_fields: bool,
         time_range: QueryTimeRange,
         forward: bool,
         scan_limit: Option<usize>,
@@ -1026,11 +1030,34 @@ impl PartReader {
             // builder path, whose two-column read is cheap).
             let cache_covers_definitive =
                 !definitive.is_empty() && definitive.iter().all(|def| def.pf_key.is_none());
+            // A definitive predicate normally earns a narrow pass. But when
+            // the base selection's own decode is already cached — a common
+            // value's window mask admits everything, so its base collapses
+            // to the same time-page selection a broad query filled — the
+            // narrow pass would cost a builder to shrink a decode this scan
+            // gets for free. The sink's pipeline is the correctness fence
+            // for these predicates (the narrow pass only pre-shrinks), so
+            // the group is served like a predicate-less scan instead. A
+            // rare value's base folds in its sparse window mask, which no
+            // fill ever keys, so rare shapes miss here and keep the narrow
+            // pass they profit from.
+            let base_replay_available = sink_rechecks_exact_fields
+                && !definitive.is_empty()
+                && cache_view.is_some()
+                && self
+                    .group_cache
+                    .get(
+                        row_group,
+                        &crate::part::selection_key(base_selection.as_ref(), group_rows),
+                    )
+                    .is_some();
             // The narrow pass is deterministic in (group, window, base
             // selection, predicates), so its outcome — a selection or a
             // rejection — is remembered too: a repeated rare query then
             // pays two map lookups instead of a builder per group.
-            let narrow_query = (self.group_cache.enabled() && !definitive.is_empty())
+            let narrow_query = (self.group_cache.enabled()
+                && !definitive.is_empty()
+                && !base_replay_available)
                 .then(|| crate::part::NarrowQuery {
                     rgu: row_group,
                     time: time_range.cache_identity(),
@@ -1043,7 +1070,7 @@ impl PartReader {
             let remembered_narrow = narrow_query
                 .as_ref()
                 .and_then(|query| self.group_cache.get_narrow(query));
-            let mut selection = if definitive.is_empty() {
+            let mut selection = if definitive.is_empty() || base_replay_available {
                 None
             } else if let Some(outcome) = remembered_narrow {
                 match outcome {

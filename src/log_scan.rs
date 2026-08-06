@@ -194,7 +194,7 @@ impl<'a> LogScan<'a> {
         let part_stats = parts.scan_into(
             self.tenant,
             &self.query.matchers,
-            ExactFieldPruning::new(&self.query.line_filters, &exact_fields),
+            ExactFieldPruning::new(&self.query.line_filters, &exact_fields).sink_rechecks(),
             self.range,
             self.forward,
             part_scan_limit,
