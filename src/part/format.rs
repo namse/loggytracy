@@ -876,7 +876,8 @@ fn encode_group_blooms(
             buf.extend_from_slice(&crate::part::SATURATED_WINDOW_SENTINEL.to_le_bytes());
             continue;
         }
-        let mut filter = BloomFilter::with_capacity(tokens.len(), 0.01);
+        let mut filter =
+            BloomFilter::with_capacity(tokens.len(), crate::part::EXACT_FIELD_WINDOW_FPP);
         for token in tokens {
             filter.insert(token);
         }

@@ -58,12 +58,22 @@ const STREAM_MAGIC: &[u8; 4] = b"SIX1";
 /// window set fits a `u64` mask.
 pub(crate) const BLOOM_WINDOW_ROWS: usize = 1024;
 
+/// Per-window exact-field bloom false-positive rate. At 1% a unique token —
+/// the rare-shape case — was admitted by ~1.5 windows it is not in across a
+/// 150-window dataset, and each false window costs a ~0.5 ms narrow-pass
+/// examination: the comparison bed measured `metadata_rare` cold reading
+/// 2-3 windows for a one-row answer. At 0.1% the expected false admission
+/// per query drops to ~0.15 window for ~1.5x the filter bytes (~14.4 vs
+/// ~9.6 bits per token), which the sidecar budget absorbs. The filter
+/// encodes its own bit count, so parts written at either rate read fine.
+pub(crate) const EXACT_FIELD_WINDOW_FPP: f64 = 0.001;
+
 /// Most exact-field tokens one window's bloom is sized for. The count is
 /// attacker-shaped (a token per field per canonical variant per row), so past
 /// this the window is stored saturated — admit-everything — instead of
 /// letting an adversarial tenant size `index.bin` past `data.parquet`. At
-/// ~9.6 bits per token this caps a window's filter near 79 KB; the bed
-/// corpus runs at ~7k tokens per window.
+/// [`EXACT_FIELD_WINDOW_FPP`]'s ~14.4 bits per token this caps a window's
+/// filter near 118 KB; the bed corpus runs at ~7k tokens per window.
 pub(crate) const MAX_EXACT_TOKENS_PER_WINDOW: usize = 65_536;
 
 /// The window-slot length that encodes a saturated window in the `BTF5`
