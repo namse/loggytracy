@@ -3002,6 +3002,78 @@ selection, or warm rare shapes never hit"
         );
     }
 
+    /// A narrowed selection is a subset of the base a broad query cached, so
+    /// the wide pass is served by slicing that entry — no builder — and the
+    /// answer equals the decode path's exactly.
+    #[test]
+    fn a_narrowed_wide_pass_is_served_by_slicing_the_cached_base_entry() {
+        let tmp = tempfile_dir();
+        // The subset serve needs what the bed's json_field has: a base
+        // selection that trims pages (a sub-window over a group larger than
+        // one page), a predicate whose value sits in every window (dense
+        // mask, so its base equals the broad query's), and a narrow result
+        // that keeps a proper subset. 4000 rows in one 4096-row group give
+        // four 1024-row pages; `env` alternates so half of every page
+        // matches.
+        let base = 1_700_000_000_000_000_000i64;
+        let labels: SharedLabels =
+            std::sync::Arc::new([("app".to_string(), "aa".to_string())].into_iter().collect());
+        let rows: Vec<Row> = (0..4000i64)
+            .map(|i| Row {
+                tenant: test_tenant(),
+                timestamp_ns: base + i,
+                labels: labels.clone(),
+                line: format!("row {i}"),
+                structured_metadata: vec![(
+                    "env".to_string(),
+                    if i % 2 == 0 { "prod" } else { "dev" }.to_string(),
+                )],
+            })
+            .collect();
+        let part = flush_rows(rows, &tmp, 4096).unwrap().remove(0);
+        let plain = PartReader::open(part.clone()).unwrap();
+        let cached = cache_enabled(part, 1 << 30);
+
+        let window = QueryTimeRange::closed(base + 100, base + 1900);
+        // Broad fill under the window's base key.
+        cached
+            .query(&test_tenant(), &[], &[], window, 5000, false)
+            .unwrap();
+        assert!(cached.group_cache.resident_bytes_for_test() > 0);
+
+        let predicate = [ExactFieldPredicate::new("env", "prod")];
+        let answer = |reader: &PartReader, forward: bool| {
+            reader
+                .query_with_exact_field_pruning_and_scan_limit(
+                    &test_tenant(),
+                    &[],
+                    ExactFieldPruning::new(&[], &predicate),
+                    window,
+                    5000,
+                    forward,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .results
+                .iter()
+                .flat_map(|s| s.entries.iter().map(|e| (e.timestamp_ns, e.line.clone())))
+                .collect::<Vec<_>>()
+        };
+        for forward in [true, false] {
+            assert_eq!(answer(&cached, forward), answer(&plain, forward));
+        }
+        assert!(
+            cached
+                .group_cache
+                .subset_serves
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0,
+            "the narrowed wide pass must have been served by slicing, \
+not by the decode fallback"
+        );
+    }
+
     /// A metric scan — named columns, no line — reads the cache through a
     /// re-addressed view of the full-projection batches, and answers exactly
     /// what its own narrow decode answers. A named decode must not fill: its

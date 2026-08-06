@@ -151,6 +151,10 @@ pub(crate) struct GroupCache {
     inner: std::sync::Mutex<GroupCacheInner>,
     shared_bytes: Arc<std::sync::atomic::AtomicU64>,
     budget_bytes: Option<u64>,
+    /// Test-only proof that a serve came from subset slicing rather than a
+    /// decode fallback, which answers identically and would pass equality.
+    #[cfg(test)]
+    pub(crate) subset_serves: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -187,6 +191,8 @@ impl GroupCache {
             inner: std::sync::Mutex::new(GroupCacheInner::default()),
             shared_bytes,
             budget_bytes,
+            #[cfg(test)]
+            subset_serves: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

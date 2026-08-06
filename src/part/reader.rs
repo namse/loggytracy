@@ -190,31 +190,81 @@ fn slice_cached_group(
     let Some(selection) = selection else {
         return cached.batches.iter().cloned().collect();
     };
-    let mut slices = Vec::new();
+    let mut ranges = Vec::new();
     let mut at = 0usize;
     for selector in selection.iter() {
-        if !selector.skip {
-            let mut start = at;
-            let end = at + selector.row_count;
-            // A kept range may span cached batch boundaries; emit one slice
-            // per overlapped batch.
-            for (batch, offset) in cached.batches.iter().zip(&cached.offsets) {
-                let batch_end = offset + batch.num_rows();
-                if start >= end {
-                    break;
-                }
-                if start >= batch_end || end <= *offset {
-                    continue;
-                }
-                let slice_start = start - offset;
-                let slice_len = end.min(batch_end) - start;
-                slices.push(batch.slice(slice_start, slice_len));
-                start += slice_len;
-            }
+        if !selector.skip && selector.row_count > 0 {
+            ranges.push(at..at + selector.row_count);
         }
         at += selector.row_count;
     }
+    slice_entry_ranges(cached, &ranges)
+}
+
+/// Slices for row ranges given in the entry's own row space; a range may
+/// span cached batch boundaries, emitting one slice per overlapped batch.
+fn slice_entry_ranges(
+    cached: &CachedGroupRead,
+    ranges: &[std::ops::Range<usize>],
+) -> Vec<RecordBatch> {
+    let mut slices = Vec::new();
+    for range in ranges {
+        let mut start = range.start;
+        let end = range.end;
+        for (batch, offset) in cached.batches.iter().zip(&cached.offsets) {
+            let batch_end = offset + batch.num_rows();
+            if start >= end {
+                break;
+            }
+            if start >= batch_end || end <= *offset {
+                continue;
+            }
+            let slice_start = start - offset;
+            let slice_len = end.min(batch_end) - start;
+            slices.push(batch.slice(slice_start, slice_len));
+            start += slice_len;
+        }
+    }
     slices
+}
+
+/// The subset's rows sliced out of an entry holding a superset: every kept
+/// range is translated from group-absolute rows into the entry's row space
+/// through the entry's selection key. `None` when the subset needs a row
+/// the entry does not hold — the caller decodes instead. A narrow-pass
+/// selection is always a subset of the base selection the pass examined,
+/// so for that caller this only misses when the base entry itself is gone.
+fn slice_cached_subset(
+    cached: &CachedGroupRead,
+    entry_key: &crate::part::SelectionKey,
+    subset: &RowSelection,
+) -> Option<Vec<RecordBatch>> {
+    // The entry's select runs as (group-space start, entry-space start, len).
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    let (mut group_at, mut entry_at) = (0usize, 0usize);
+    for &(skip, rows) in entry_key.iter() {
+        let rows = rows as usize;
+        if !skip {
+            runs.push((group_at, entry_at, rows));
+            entry_at += rows;
+        }
+        group_at += rows;
+    }
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut at = 0usize;
+    for selector in subset.iter() {
+        if !selector.skip && selector.row_count > 0 {
+            let (start, end) = (at, at + selector.row_count);
+            let index = runs.partition_point(|&(gs, _, len)| gs + len <= start);
+            let &(gs, es, len) = runs.get(index)?;
+            if start < gs || end > gs + len {
+                return None;
+            }
+            ranges.push(es + (start - gs)..es + (end - gs));
+        }
+        at += selector.row_count;
+    }
+    Some(slice_entry_ranges(cached, &ranges))
 }
 
 /// The rows of one group inside the windows an exact-field mask admitted.
@@ -1084,6 +1134,13 @@ impl PartReader {
                 }
             };
             let count_scanned_rows = selection.is_none();
+            // The base's identity, taken before the fold consumes it: it is
+            // both the effective key when no narrow pass ran, and the key a
+            // broad query's fill sits under when one did — which is what
+            // the subset serve below slices from.
+            let base_key = cache_view
+                .is_some()
+                .then(|| crate::part::selection_key(base_selection.as_ref(), group_rows));
             if selection.is_none()
                 && let Some(base_selection) = base_selection
             {
@@ -1097,9 +1154,13 @@ impl PartReader {
             // Any viewable scan looks up; only a decode in the cache's own
             // layout fills, because a narrower decode cannot serve later
             // callers.
-            let selection_key = cache_view
-                .is_some()
-                .then(|| crate::part::selection_key(selection.as_ref(), group_rows));
+            let selection_key = if count_scanned_rows {
+                base_key.clone()
+            } else {
+                cache_view
+                    .is_some()
+                    .then(|| crate::part::selection_key(selection.as_ref(), group_rows))
+            };
             let fill_layout = projection.leaves == self.cache_projection.leaves;
             if let Some(cached) = cached {
                 // Serve the group from memory: slice the selected ranges
@@ -1174,6 +1235,65 @@ impl PartReader {
                         cancellation,
                         cache_view.as_ref().expect("a cached serve implies a view"),
                         true,
+                        count_scanned_rows,
+                        &stream_matches,
+                        &mut stats,
+                        sink,
+                    ) {
+                        Ok(ScanStep::Continue) => {}
+                        Ok(ScanStep::Stop) => break 'row_groups,
+                        Err(error) => return Err(error),
+                    }
+                }
+                continue;
+            }
+            // A narrowed selection is a subset of the base selection the
+            // pass examined, and a broad query cached the base's decode
+            // under exactly that key — `json_field` after `label_only` in
+            // the bed. Slicing the needed rows out of that entry serves
+            // the wide pass without a builder, and the parse still runs
+            // only on the narrow survivors, which is what the narrow pass
+            // is for.
+            if !count_scanned_rows
+                && let (Some(view), Some(base_key)) = (cache_view.as_ref(), &base_key)
+                && let Some(entry) = self.group_cache.get(row_group, base_key)
+                && let Some(mut slices) = slice_cached_subset(
+                    &entry,
+                    base_key,
+                    selection.as_ref().expect("a narrow pass produced a selection"),
+                )
+            {
+                #[cfg(test)]
+                self.group_cache
+                    .subset_serves
+                    .fetch_add(1, Ordering::AcqRel);
+                let selected_rows: usize = slices.iter().map(RecordBatch::num_rows).sum();
+                if !forward {
+                    slices.reverse();
+                }
+                stats.scanned_bytes = stats.scanned_bytes.saturating_add(
+                    (entry.bytes as u128 * selected_rows as u128
+                        / entry.total_rows.max(1) as u128) as u64,
+                );
+                if scan_bytes_limit.is_some_and(|limit| stats.scanned_bytes > limit) {
+                    return Err(format!(
+                        "query exceeds the maximum of {} scanned bytes",
+                        scan_bytes_limit.unwrap_or_default()
+                    ));
+                }
+                for batch in &slices {
+                    match self.scan_batch(
+                        batch,
+                        tenant,
+                        line_filters,
+                        time_range,
+                        forward,
+                        row_group,
+                        scan_limit,
+                        None,
+                        cancellation,
+                        view,
+                        false,
                         count_scanned_rows,
                         &stream_matches,
                         &mut stats,
