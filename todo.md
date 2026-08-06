@@ -1298,8 +1298,17 @@ Write path:
       `rows_from_snapshot` is no longer on the production path at all
 - [ ] Cap the exact-field bloom. `exact_capacity` is the raw token count for the row group
       (`part/format.rs:329-347`), so a wide-JSON tenant can make `index.bin` larger than `data.parquet`
-- [ ] Consider compressing the WAL payload. It stores the decompressed protobuf, discarding the client's
+- [x] Consider compressing the WAL payload. It stores the decompressed protobuf, discarding the client's
       snappy, which makes the WAL the dominant term in write amplification
+
+      Done 2026-08-06 (`927e222`): kind 1/2 payloads are zstd-1 frames, compressed on the ingest task
+      (parallel with connections, not behind the writer), decompressed at replay under the record-size cap.
+      Measured: the bed's WAL-on-disk 26.2 → **9.2 MiB** and total disk 95.9 → **79.5 MiB** (Loki 117.8);
+      eps 19.8k held, agreement 168/168 × 3 held, gate UNDER_BUDGET. A pre-compression WAL refuses replay
+      with the delete-and-re-ingest message, pinned by a test. Fallout fixed in the same arc: the harness's
+      backlog-drain heuristic was scale-free and read the now-2 MB-peak sawtooth as "never fell below half
+      its peak" — a 16 MiB trivially-healthy floor makes a backlog a falling-behind flush would dwarf pass
+      on its size, with tests for both sides.
 
 Read path:
 

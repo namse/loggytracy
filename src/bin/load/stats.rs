@@ -260,6 +260,23 @@ pub fn wal_backlog_drains(
             ),
         };
     }
+    // A peak this small is the sawtooth of a flush loop that never fell
+    // behind at all: at 20k eps the compressed WAL accrues megabytes per
+    // second, so a run whose worst backlog is under this floor was drained
+    // continuously. The halving test below is scale-free and flips on such a
+    // flat sawtooth — the verdict that rejected the run whose backlog peaked
+    // at 2 MB while accepting the one that peaked at 200 was reading noise.
+    const TRIVIALLY_HEALTHY_BYTES: u64 = 16 * 1024 * 1024;
+    if peak < TRIVIALLY_HEALTHY_BYTES {
+        return DrainVerdict {
+            decided: true,
+            drained: true,
+            reason: format!(
+                "backlog never exceeded {peak} bytes, below the {TRIVIALLY_HEALTHY_BYTES}-byte \
+floor a falling-behind flush would dwarf"
+            ),
+        };
+    }
     let slope = series.slope_per_second();
     let post_peak_min = series.post_peak_min();
     // Halving is the evidence that a flush cycle completed against this
@@ -361,18 +378,31 @@ mod tests {
 
     #[test]
     fn a_backlog_that_only_grows_does_not_drain() {
-        let growing = series_of(&(0..40).map(|step| step * 1_000).collect::<Vec<_>>());
+        // Megabyte-scale values: a peak under the trivially-healthy floor is
+        // a flush loop that never fell behind, not a climb worth failing.
+        let growing = series_of(&(0..40).map(|step| step * 1_000_000).collect::<Vec<_>>());
         let verdict = wal_backlog_drains(&growing, u64::MAX, 8);
         assert!(verdict.decided);
         assert!(!verdict.drained, "{}", verdict.reason);
+    }
+
+    /// The compressed WAL made a healthy run's whole sawtooth fit under two
+    /// megabytes, and the scale-free halving test read that noise as a
+    /// failure. Below the floor the backlog is trivially healthy.
+    #[test]
+    fn a_tiny_backlog_is_healthy_whatever_its_shape() {
+        let flat = series_of(&(0..40).map(|step| 1_000_000 + (step % 3) * 400_000).collect::<Vec<_>>());
+        let verdict = wal_backlog_drains(&flat, u64::MAX, 8);
+        assert!(verdict.decided);
+        assert!(verdict.drained, "{}", verdict.reason);
     }
 
     /// The failure the ratio check could not see: one early dip satisfies
     /// `trough <= peak * 0.5` for the whole rest of a monotone climb.
     #[test]
     fn an_early_dip_does_not_excuse_a_climb() {
-        let mut values = vec![50_000, 1];
-        values.extend((0..40).map(|step| 10_000 + step * 5_000));
+        let mut values = vec![50_000_000, 1];
+        values.extend((0..40).map(|step| 10_000_000 + step * 5_000_000));
         let dipping = series_of(&values);
         assert!(
             dipping.trough() * 2 <= dipping.peak(),
