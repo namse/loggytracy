@@ -53,14 +53,36 @@ pub struct LokiResponse<T: Serialize> {
 pub struct QueryRangeData {
     #[serde(rename = "resultType")]
     pub result_type: &'static str,
-    pub result: serde_json::Value,
+    pub result: ResultPayload,
     pub stats: Stats,
+}
+
+/// The log path's result serializes straight from the structs; routing it
+/// through a `serde_json::Value` tree first cost a second full pass over
+/// megabytes of response — `label_only` returns thousands of rows and the
+/// tree was ~40% of its latency. Metric results are small; they keep the
+/// `Value` convenience.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum ResultPayload {
+    Streams(Vec<StreamData>),
+    Value(serde_json::Value),
+}
+
+impl ResultPayload {
+    /// The tree form, for tests that inspect rather than serialize; the
+    /// response path never goes through this.
+    #[cfg(test)]
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("result payloads serialize")
+    }
 }
 
 #[derive(Serialize)]
 pub struct StreamData {
     pub stream: HashMap<String, String>,
-    pub values: Vec<serde_json::Value>,
+    /// `(timestamp, line)`, serialized as the wire's two-string array.
+    pub values: Vec<(String, String)>,
 }
 
 #[derive(Serialize)]
@@ -199,12 +221,7 @@ fn build_stream_data(results: Vec<StreamResult>, forward: bool) -> Vec<StreamDat
                     .collect(),
                 values: rows
                     .into_iter()
-                    .map(|(timestamp_ns, line)| {
-                        serde_json::Value::Array(vec![
-                            serde_json::Value::String(timestamp_ns.to_string()),
-                            serde_json::Value::String(line),
-                        ])
-                    })
+                    .map(|(timestamp_ns, line)| (timestamp_ns.to_string(), line))
                     .collect(),
             }
         })

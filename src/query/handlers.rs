@@ -75,7 +75,7 @@ pub async fn query_range(
             .map_err(|e| (metric_error_status(&e), e))?;
             (
                 "streams",
-                serde_json::to_value(build_stream_data(execution.results, forward)).unwrap(),
+                crate::query::ResultPayload::Streams(build_stream_data(execution.results, forward)),
                 execution.scanned_rows,
             )
         }
@@ -103,7 +103,7 @@ pub async fn query_range(
                     .map_err(|e| (metric_error_status(&e), e))?;
             (
                 "matrix",
-                metric_series_json(execution.series, false),
+                crate::query::ResultPayload::Value(metric_series_json(execution.series, false)),
                 execution.scanned_rows,
             )
         }
@@ -183,7 +183,7 @@ pub async fn query(
             .map_err(|e| (metric_error_status(&e), e))?;
             (
                 "streams",
-                serde_json::to_value(build_stream_data(execution.results, forward)).unwrap(),
+                crate::query::ResultPayload::Streams(build_stream_data(execution.results, forward)),
                 execution.scanned_rows,
             )
         }
@@ -201,7 +201,7 @@ pub async fn query(
             .map_err(|e| (metric_error_status(&e), e))?;
             (
                 "vector",
-                metric_series_json(execution.series, true),
+                crate::query::ResultPayload::Value(metric_series_json(execution.series, true)),
                 execution.scanned_rows,
             )
         }
@@ -251,7 +251,7 @@ fn empty_response(result_type: &'static str) -> LokiResponse<QueryRangeData> {
         status: "success",
         data: QueryRangeData {
             result_type,
-            result: serde_json::Value::Array(Vec::new()),
+            result: crate::query::ResultPayload::Value(serde_json::Value::Array(Vec::new())),
             stats: Stats {
                 summary: StatsSummary {
                     total_lines_processed: 0,

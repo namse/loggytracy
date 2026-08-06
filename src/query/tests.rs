@@ -175,6 +175,7 @@
         let mut lines: Vec<String> = response
             .data
             .result
+            .to_value()
             .as_array()
             .unwrap()
             .iter()
@@ -204,6 +205,7 @@
         let lines: usize = response
             .data
             .result
+            .to_value()
             .as_array()
             .unwrap()
             .iter()
@@ -264,7 +266,8 @@
         .await
         .unwrap()
         .0;
-        let samples = response.data.result[0]["values"].as_array().unwrap();
+        let result = response.data.result.to_value();
+        let samples = result[0]["values"].as_array().unwrap();
         let last = samples.last().unwrap();
         assert_eq!(last[0], AT_NS / 1_000_000_000);
         assert_eq!(last[1], "1");
@@ -304,8 +307,8 @@
         .unwrap()
         .0;
 
-        assert_eq!(response.data.result[0]["values"][0][0], 40);
-        assert_eq!(response.data.result[0]["values"][0][1], "1");
+        assert_eq!(response.data.result.to_value()[0]["values"][0][0], 40);
+        assert_eq!(response.data.result.to_value()[0]["values"][0][1], "1");
     }
 
     /// The output limit bounds the physical scan.
@@ -1282,7 +1285,7 @@
         .unwrap()
         .0;
         assert_eq!(range.data.result_type, "matrix");
-        assert_eq!(range.data.result[0]["values"][0][1], "6");
+        assert_eq!(range.data.result.to_value()[0]["values"][0][1], "6");
 
         let instant = query(
             State(state),
@@ -1298,7 +1301,7 @@
         .unwrap()
         .0;
         assert_eq!(instant.data.result_type, "vector");
-        assert_eq!(instant.data.result[0]["value"][1], "3");
+        assert_eq!(instant.data.result.to_value()[0]["value"][1], "3");
     }
 
     /// `| trace_id="x"` with no parser stage — the shape the claim rests on —
@@ -2010,6 +2013,7 @@
         response
             .data
             .result
+            .to_value()
             .as_array()
             .unwrap()
             .iter()
@@ -2335,7 +2339,7 @@
         .0;
 
         assert!(
-            response.data.result.as_array().unwrap().is_empty(),
+            response.data.result.to_value().as_array().unwrap().is_empty(),
             "an expired row must not reach the metric evaluator through the lookback window"
         );
     }
@@ -3519,7 +3523,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         );
         assert_eq!(
             data[0].values,
-            vec![serde_json::json!(["20", "alpha"])],
+            vec![("20".to_string(), "alpha".to_string())],
             "a values tuple carries the timestamp and the line and nothing else"
         );
     }
@@ -3564,7 +3568,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         names.sort_unstable();
         assert_eq!(names, vec!["app", "level", "status", "trace_id"]);
         assert_eq!(data[0].stream["level"], "error");
-        assert_eq!(data[0].values[0].as_array().unwrap().len(), 2);
+        assert_eq!(data[0].values[0], ("10".to_string(), "{\"level\":\"error\",\"status\":\"500\"}".to_string()));
     }
 
     /// The comparison corpus names its JSON free-text key `_msg` so that
@@ -3672,10 +3676,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             .expect("t1 stream");
         assert_eq!(
             t1.values,
-            vec![
-                serde_json::json!(["30", "c"]),
-                serde_json::json!(["20", "b"])
-            ],
+            vec![("30".to_string(), "c".to_string()), ("20".to_string(), "b".to_string())],
             "backward: descending time even though the two rows came from two inputs"
         );
         let forward = build_stream_data(
@@ -3688,8 +3689,8 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         assert_eq!(
             forward[0].values,
             vec![
-                serde_json::json!(["10", "a"]),
-                serde_json::json!(["30", "c"])
+                ("10".to_string(), "a".to_string()),
+                ("30".to_string(), "c".to_string())
             ]
         );
     }
@@ -3730,5 +3731,5 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         let data = build_stream_data(results, false);
         assert_eq!(data[0].stream["level"], "rewritten");
         assert_eq!(data[0].stream["status"], "500");
-        assert_eq!(data[0].values, vec![serde_json::json!(["10", "500"])]);
+        assert_eq!(data[0].values, vec![("10".to_string(), "500".to_string())]);
     }
