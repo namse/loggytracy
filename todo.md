@@ -907,6 +907,37 @@ vs VictoriaLogs: `label_only` 1.66x (42-48 ms, decode already cache-served, the 
 serialize per returned row) and `json_field` cold 3.25x (the per-row `| json` parse; warm is 0.96x via
 replay).
 
+**The sweep, 2026-08-06 evening: every log shape faster than VictoriaLogs on both passes.** Four
+measured steps after the `rate` view (beds 6-9, agreement 168/168 x 3 and load PASS on every one):
+
+* *The single-pass serializer* — the log result went struct -> `serde_json::Value` tree -> bytes, a
+  second full pass over a 4 MB response. A typed payload enum serializes `Vec<StreamData>` straight
+  to bytes. `label_only` 42-49 -> 29-30 ms same-data A/B; bed six: 1.66x -> 1.33x/1.19x vs VL.
+* *The advisory serve, tried and reverted* — letting a common-value predicate skip the narrow pass
+  and ride the base entry (the pipeline as its only filter) bought `json_field` cold 41.3 -> 29.6 but
+  sold warm 10.3 -> 29.7: the parse ran on 6250 rows where the narrow selection kept it to ~1000.
+  The narrow pass's value on a common predicate is the parses it prevents, every pass. Reverted on
+  bed seven's numbers.
+* *The subset serve* — the keeper: the narrow pass stays, and its wide decode is sliced out of the
+  base entry a broad query cached (a narrow selection is a subset of the base it examined, translated
+  through the entry's own selection key, zero-copy). Bed eight: `json_field` **0.98x cold / 0.91x
+  warm** (13.3/11.8 ms from 41.3/29.7), everything else unchanged.
+* *`StreamKey`* — the response's label union was built per returned row (deep-cloned label map, a
+  `BTreeMap` keyed by full label-set comparison — `trace_id` unique per row and last alphabetically
+  made every probe walk every label, ~4.4 us per returned row, the whole of `label_only`'s residue).
+  The union is now never materialized: equality, hashing and the wire all read one sorted merge with
+  metadata shadowing. Streams emit in first-occurrence order (the bed's digest is order-independent;
+  its ordering check is per stream). Same-data A/B 28-36 -> 14-15 ms, response bytes identical.
+
+Bed nine, the sweep: `label_only` **0.90x/0.61x**, `line_filter` 0.49x/0.50x, `json_field`
+0.88x/0.81x, rare shapes 0.00-0.26x, `trace_window` 0.26x/0.17x — every log shape under 1.0x vs
+VictoriaLogs cold and warm; vs Loki 0.00x-0.22x everywhere. The one ratio above water is `rate`
+1.07x/1.06x — 0.44 vs 0.42 ms, a 0.02 ms gap at the HTTP jitter floor, recorded rather than chased.
+memory_gate 2 GiB after the sweep: UNDER_BUDGET, anon peak 1187.1 MiB at 19,769 eps — up 139 MiB from
+the first cache build's gate (wider blooms, narrow entries, and both caches warmer under query load),
+at 58% of the declared budget.
+
+
 ## The claim arc, round three: labels leave the schema (`4bcd01c`, 2026-08-06)
 
 The structural change the fold-rejection named, user-approved: the L per-row label columns became one
