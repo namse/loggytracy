@@ -822,6 +822,16 @@ impl PartReader {
             "a scan that skips the line column cannot evaluate line filters"
         );
         let projection = ScanProjection::build(&self.metadata_keys, &self.parsed_keys, columns);
+        // This scan's fields re-addressed into the cache's batch layout.
+        // `Some` for every projection the cache can serve — the full log
+        // projection (identical layout) and the metric path's named columns
+        // alike; a metric scan then reads a cached decode some broad query
+        // paid for, materializing only the columns it names.
+        let cache_view = self
+            .group_cache
+            .enabled()
+            .then(|| projection.view_in(&self.cache_projection))
+            .flatten();
         // Matchers are evaluated once per stream, not once per row: the
         // `_stream` ordinal names the row's label set, so the per-row check
         // is one boolean lookup. This is also what retired the blind-count
@@ -1006,9 +1016,8 @@ impl PartReader {
             // the cache exists to not pay twice. Selections are applied by
             // zero-copy slicing, and the batches carry the full projection,
             // so a narrower caller reads them through `cache_projection`.
-            let cached = self
-                .group_cache
-                .enabled()
+            let cached = cache_view
+                .is_some()
                 .then(|| self.group_cache.get_full(row_group, group_rows))
                 .flatten();
             // The narrow pass answers from the cache when every definitive
@@ -1085,10 +1094,13 @@ impl PartReader {
             // and a different predicate resolving to the same rows —
             // `metadata_rare` after `json_field_rare` — to the same narrow
             // result; both replay the decode below without touching Parquet.
-            let cache_eligible = self.group_cache.enabled()
-                && projection.leaves == self.cache_projection.leaves;
-            let selection_key = cache_eligible
+            // Any viewable scan looks up; only a decode in the cache's own
+            // layout fills, because a narrower decode cannot serve later
+            // callers.
+            let selection_key = cache_view
+                .is_some()
                 .then(|| crate::part::selection_key(selection.as_ref(), group_rows));
+            let fill_layout = projection.leaves == self.cache_projection.leaves;
             if let Some(cached) = cached {
                 // Serve the group from memory: slice the selected ranges
                 // (zero-copy) and walk them through the same scan_batch the
@@ -1125,7 +1137,7 @@ impl PartReader {
                         // scan_batch from re-measuring slice capacities.
                         None,
                         cancellation,
-                        &self.cache_projection,
+                        cache_view.as_ref().expect("a cached serve implies a view"),
                         false,
                         count_scanned_rows,
                         &stream_matches,
@@ -1160,7 +1172,7 @@ impl PartReader {
                         scan_limit,
                         scan_bytes_limit,
                         cancellation,
-                        &self.cache_projection,
+                        cache_view.as_ref().expect("a cached serve implies a view"),
                         true,
                         count_scanned_rows,
                         &stream_matches,
@@ -1192,7 +1204,8 @@ impl PartReader {
                     builder = builder.with_row_selection(selection);
                 }
                 let reader = builder.build().map_err(|e| e.to_string())?;
-                let mut fill: Option<Vec<RecordBatch>> = selection_key.is_some().then(Vec::new);
+                let mut fill: Option<Vec<RecordBatch>> =
+                    (selection_key.is_some() && fill_layout).then(Vec::new);
                 for batch in reader {
                     let batch = batch.map_err(|e| e.to_string())?;
                     if let Some(fill) = &mut fill {
@@ -1266,6 +1279,7 @@ impl PartReader {
             // batches are cacheable right here — `RecordBatch` clones are
             // refcounts, not copies.
             if let Some(key) = selection_key
+                && fill_layout
                 && batches.iter().map(RecordBatch::num_rows).sum::<usize>()
                     == crate::part::selected_rows_of(&key)
             {
@@ -1841,6 +1855,41 @@ impl ScanProjection {
             residual: include_residual.then(|| rank(residual_leaf)),
             leaves,
         }
+    }
+
+    /// This projection's fields re-addressed into another decode's batch
+    /// layout — how a narrower scan reads batches the cache decoded under
+    /// the full projection. `None` when the layout is missing a leaf this
+    /// projection needs (the cache's `all()` never carries `_pf:` columns).
+    /// The per-row work is the narrow scan's own: a field the view does not
+    /// name is never materialized, however many columns the batch holds.
+    fn view_in(&self, layout: &ScanProjection) -> Option<ScanProjection> {
+        let rank_of = |position_in_self: usize| -> Option<usize> {
+            let leaf = self.leaves[position_in_self];
+            layout.leaves.binary_search(&leaf).ok()
+        };
+        Some(ScanProjection {
+            msg: match self.msg {
+                Some(position) => Some(rank_of(position)?),
+                None => None,
+            },
+            stream: rank_of(self.stream)?,
+            metadata: self
+                .metadata
+                .iter()
+                .map(|&(key, position)| Some((key, rank_of(position)?)))
+                .collect::<Option<_>>()?,
+            parsed: self
+                .parsed
+                .iter()
+                .map(|&(key, position)| Some((key, rank_of(position)?)))
+                .collect::<Option<_>>()?,
+            residual: match self.residual {
+                Some(position) => Some(rank_of(position)?),
+                None => None,
+            },
+            leaves: layout.leaves.clone(),
+        })
     }
 }
 

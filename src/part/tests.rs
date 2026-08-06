@@ -3002,6 +3002,67 @@ selection, or warm rare shapes never hit"
         );
     }
 
+    /// A metric scan — named columns, no line — reads the cache through a
+    /// re-addressed view of the full-projection batches, and answers exactly
+    /// what its own narrow decode answers. A named decode must not fill: its
+    /// batches cannot serve later full-projection callers.
+    #[test]
+    fn a_named_scan_is_served_from_the_cache_through_a_view() {
+        let tmp = tempfile_dir();
+        let (part, _) = ordinal_fixture(&tmp);
+        let plain = PartReader::open(part.clone()).unwrap();
+        let cached = cache_enabled(part, 1 << 30);
+
+        let base = 1_700_000_000_000_000_000i64;
+        let window = QueryTimeRange::closed(base + 10, base + 2010);
+        let metric_columns = ColumnSet {
+            line: false,
+            metadata: crate::part::MetadataProjection::Named(Default::default()),
+            parsed_fields: false,
+        };
+        let tenant = test_tenant();
+        let named_rows = |reader: &PartReader| {
+            let mut collector = RowCollector::new(&tenant);
+            reader
+                .scan_into(
+                    &tenant,
+                    &[],
+                    &[],
+                    &[],
+                    window,
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &metric_columns,
+                    &mut collector,
+                )
+                .unwrap();
+            collector
+                .into_rows()
+                .iter()
+                .map(|row| (row.timestamp_ns, row.labels.clone()))
+                .collect::<Vec<_>>()
+        };
+        // A named decode alone fills nothing.
+        let uncached = named_rows(&cached);
+        assert_eq!(
+            cached.group_cache.resident_bytes_for_test(),
+            0,
+            "a named decode must not fill the cache"
+        );
+        // A broad query fills; the named scan then reads the same batches
+        // through the view.
+        cached
+            .query(&test_tenant(), &[], &[], window, 1000, false)
+            .unwrap();
+        assert!(cached.group_cache.resident_bytes_for_test() > 0);
+        let served = named_rows(&cached);
+        assert_eq!(served, uncached);
+        assert_eq!(served, named_rows(&plain));
+    }
+
     /// A scan that stops early leaves nothing behind: only a completed
     /// whole-group decode is cacheable.
     #[test]
