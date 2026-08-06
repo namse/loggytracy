@@ -838,6 +838,63 @@ not assumed. Query-under-ingest still has no *budget* (open question 2 stands, n
 baseline to regress against). And `anon/live` in the memprof legs still reads ~5–8 — the allocator
 retention item at M10's "honest metering" is untouched by any of this.
 
+## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
+
+The user's bar for this round: "VL보다 빠르지 않으면 의미가 없습니다" — `metadata_rare` must beat
+VictoriaLogs, not sit within 1.1x of it. Three changes, each forced by a measurement the previous one
+produced:
+
+**1. The decoded row-group cache, selection-keyed.** The per-admitted-group constant is the wide
+reader's build; a part is immutable, so a decode can serve every later scan. The first wiring cached
+only whole-group decodes and measured **zero effect in the bed** — live replay against the running bed
+showed the gauge frozen through three identical `label_only` queries, because every matrix query is a
+sub-window, streams span the whole window and groups hold whole streams, so the time page selection
+keeps part of every group and the whole-group fill condition was unsatisfiable. (The unit tests had
+passed vacuously around the same defect — the fill-eligibility check sat *after* the selection fold, so
+two tests now anchor on the cache actually holding bytes.) The fix keys entries by
+`(row group, normalized selection)`: a repeated window resolves to the same page selection and replays
+the decode; a different predicate resolving to the same rows replays it too. Replay feeds the very
+batches a miss would produce through the same `scan_batch` — the answer cannot change, which agreement
+then confirmed. Local: repeat serves at **115 µs** against the 2.84 ms miss, miss path unchanged
+(p=0.62). 256 MiB budget (`LOGGYTRACY_ROW_GROUP_CACHE_MAX_BYTES`), one global byte counter, per-reader
+LRU, bytes returned on reader drop, gauge `loggytracy_row_group_cache_bytes`, memprof arena
+`row_group_cache`.
+
+**2. Window bloom FPP 1% → 0.1%.** With the cache in, the bed read cold 0.67x — but warm 1.10x in the
+same run after 0.57x the run before, and the miss tier showed why the margin was thin: a genuinely
+cold `metadata_rare` read 3072 rows for a one-row answer, ~150 windows at 1% admitting 2-3 windows the
+token is not in, each a ~0.5 ms narrow-pass examination. At 0.1% the expected false admission is ~0.15
+window for ~1.5x the filter bytes (14.4 vs 9.6 bits/token, self-describing encoding, no compat break).
+
+**3. The narrow pass is remembered.** The warm wobble (run 3 read every sub-2 ms shape's warm — `rate`
+included, which the cache never touches — ~+0.6 ms over its own cold, monotonically rising through the
+five repeats; a standalone matrix rerun minutes later showed none of it) was machine state, but it
+exposed that warm still paid a narrow-pass builder per group per repeat. The pass is a pure function
+of (group, window, base selection, definitive predicates) on an immutable part, so its outcome — the
+selection, or the rejection, which is most of what repeats pay — is cached beside the batches.
+
+**The bed with all three** (`compare/run.sh`, agreement **168/168 on all three pairs**, load PASS at
+2 g, memory_gate 2 GiB UNDER_BUDGET at anon peak 1048.5 MiB / 19,765 eps — the wider blooms and both
+caches cost +32 MiB over the first cache build's 1016.2): `metadata_rare` cold
+**0.17x**, warm **0.17x** vs VictoriaLogs (0.23 ms against 1.36/1.30) — the claim holds on both
+passes, and not narrowly. Collateral: `line_filter` 1.87x → **0.54x/0.64x**, `trace_window`
+**0.17x/0.18x**, `json_field` warm 1.98x → **0.97x**, `json_field_rare` **0.25 ms** flat.
+
+Read honestly, the bed's rare-shape "cold" p50 contains duplicate issues: the matrix builds the rare
+shapes' windows from the window index alone, so the 8 apps × 3 windows are **3 distinct queries
+issued 8 times each**, and 21 of 24 "cold" issues replay a decode some earlier duplicate filled. All
+three systems face the identical sequence — Loki's result cache gets the same gift and still answers
+at 79 ms — but the per-tier truth is recorded here: first issues 1.97/1.50/0.99 ms (w0/w1/w2) against
+VictoriaLogs' 1.95/1.64/0.74 — parity, 1.01x/0.91x/1.34x — and every repeat ~0.23 ms against its flat
+~1.4. The engine wins the bed's definition of cold/warm outright; on a query nobody has asked before
+it is at VictoriaLogs parity, and the remaining constant there is the narrow+wide builder pair, still
+the round-one item (dictionary/page reuse inside the parquet crate) if it is ever worth parquet
+internals.
+
+What this round rejected: filling the cache from whole-group decodes only (measured no-op in the bed,
+above), and treating run-3's warm 1.10x as an engine regression (falsified by the standalone rerun;
+recorded instead as the thin-margin signal that motivated change 3).
+
 ## The claim arc, round three: labels leave the schema (`4bcd01c`, 2026-08-06)
 
 The structural change the fold-rejection named, user-approved: the L per-row label columns became one
