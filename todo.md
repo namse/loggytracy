@@ -951,6 +951,21 @@ moved 2.6 → **2.3 ms** while VictoriaLogs' own number moved 1.4 → 1.2 ms, so
 is now the whole remaining gap: at one admitted group per bed query, 2.3 ms ≈ 0.3 fixed +
 ~2.0 constant, and ≤1.3 ms (1.1 × 1.2 ms) needs that constant at ≤ ~1.0 ms — the one-read fold is
 the next arc, with the decompressed-page reuse behind it.
+
+**The one-read fold was built, measured, and rejected (2026-08-06, not committed).** Skipping the
+narrow pass when the window selection was already ≤2 windows — the definitive check moved into the
+wide batch scan, answers proven identical by the test suite — made the one-group bed shape *worse*:
+2.28 → 3.27 ms. The subtraction that explains it: the bare all-streams probe prices the wide decode
+at ~1.7 ms per 1024 rows (arrow string materialization across the ~25-column projection), so the
+fold traded a ~0.15 ms two-column narrow scan for a ~1.7 ms twenty-five-column wide scan of the
+same rows. Which sharpens the constant's name again: the per-admitted-group ~1.7–2.0 ms is
+dominated by the **wide reader's per-build cost across the full projection** — dictionary pages
+and column-chunk setup for every projected column, paid once per group regardless of how few rows
+the selection keeps — plus the second build the narrow pass adds. The levers that would actually
+move it are a leaner wide projection (labels reconstructed from stream identity instead of label
+columns — a real arc, the reader currently rebuilds label sets from columns) or reusing dictionary
+state across the two builds inside one group (parquet-crate internals). Both are open; neither is
+a quick fix, and the two-pass scan stays as the measured optimum of the shapes tried.
 - [x] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
       parser, and `proto.rs`'s encode side
 
