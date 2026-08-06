@@ -838,6 +838,35 @@ not assumed. Query-under-ingest still has no *budget* (open question 2 stands, n
 baseline to regress against). And `anon/live` in the memprof legs still reads ~5–8 — the allocator
 retention item at M10's "honest metering" is untouched by any of this.
 
+## The claim arc, round three: labels leave the schema (`4bcd01c`, 2026-08-06)
+
+The structural change the fold-rejection named, user-approved: the L per-row label columns became one
+`_stream` UInt32 ordinal indexing `meta.streams` — now the load-bearing ordinal table, assigned in
+**first-occurrence order over the sorted row stream** by a fold both writers share, so the two cannot
+disagree (the byte-identity test still pins them; a new cross-tenant shared-set test pins the dedup).
+The scan resolves labels by `Arc` clone, evaluates matchers once per stream, and the per-row run test
+is a u32 compare; LabelSetCache, the per-row label memcmps, the blind second projection with its
+uniform-match proof, and `ColumnSet.labels` are deleted. The merge writer derives `stream_labels` from
+what survived instead of taking a superset — retiring the latent hazard where a label whose last rows
+retention dropped failed the merged part's own `validate_meta_file` exactness check. Old parts fail at
+open naming delete-and-re-ingest before any downcast can panic; a truncated ordinal table is refused
+by the stream-index cross-check, with a scan-time bound check as the second fence. 467+40 tests,
+clippy 0.
+
+A measurement lesson paid for on the way: the local matrix probe read **2x worse across every shape**
+after the change, which same-machine A/B (HEAD vs parent, same minute) refuted — ordinal build
+10.77 ms vs parent 12.43 ms on the pure-scan bench, a **13% improvement**; the "regression" was the
+machine's clock state between measurement days. Absolute local numbers across days are not
+comparable; the bed's ratios are, because all three systems share the machine's state.
+
+The bed with it in: agreement **168/168 on all three pairs** (the proof no answer changed), load PASS
+at 19,771 eps with q p95 96.4 ms, and the claim shape moved: `metadata_rare` **2.3 → 2.02/2.07 ms**,
+ratio vs VictoriaLogs **1.93x → 1.46x/1.47x** cold/warm (Loki side widened to ~39x faster).
+`exact_field_hit` bench 3.01 → 2.77 ms. The claim (<1.1x) still does not hold: VictoriaLogs answers
+at ~1.4 ms and ours needs ≤ ~1.55 — about half a millisecond of per-group constant remains, and the
+named follower is round four: dictionary/decompressed-page reuse between the narrow and wide passes
+(parquet-crate internals), for which this round's narrower projection was the prerequisite.
+
 ## The day after the PASS: the roadmap items, each measured (2026-08-03, `eeae4a2`..)
 
 Six workstreams off the back of the stall fix, every one gated on the 2 GiB rig (release,
