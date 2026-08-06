@@ -95,11 +95,8 @@ impl Journal {
         data: Vec<u8>,
         streams: Vec<(Labels, Vec<LogEntry>)>,
     ) -> Result<(), IoError> {
-        let framed = {
-            let _arena = crate::memprof::enter(crate::memprof::Arena::Wal);
-            frame_tenant_record(&tenant, TENANT_RECORD_KIND_OTLP_LOGS, &data)
-        };
-        self.send_append(framed, tenant, streams, Vec::new()).await
+        self.send_append(TENANT_RECORD_KIND_OTLP_LOGS, data, tenant, streams, Vec::new())
+            .await
     }
 
     pub async fn append_trace(
@@ -108,34 +105,33 @@ impl Journal {
         data: Vec<u8>,
         spans: Vec<TraceSpan>,
     ) -> Result<(), IoError> {
-        let framed = {
-            let _arena = crate::memprof::enter(crate::memprof::Arena::Wal);
-            frame_tenant_record(&tenant, TENANT_RECORD_KIND_TRACES, &data)
-        };
-        self.send_append(framed, tenant, Vec::new(), spans).await
+        self.send_append(TENANT_RECORD_KIND_TRACES, data, tenant, Vec::new(), spans)
+            .await
     }
 
     async fn send_append(
         &self,
-        data: Vec<u8>,
+        kind: u8,
+        payload: Vec<u8>,
         tenant: TenantId,
         streams: Vec<(Labels, Vec<LogEntry>)>,
         traces: Vec<TraceSpan>,
     ) -> Result<(), IoError> {
-        if data.len() > MAX_RECORD_BYTES {
+        let framed_len =
+            TENANT_RECORD_PREFIX_SIZE + tenant.as_str().len() + payload.len();
+        if framed_len > MAX_RECORD_BYTES {
             return Err(IoError::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "journal record is too large: {} bytes (maximum {})",
-                    data.len(),
-                    MAX_RECORD_BYTES
+                    "journal record is too large: {framed_len} bytes (maximum {MAX_RECORD_BYTES})"
                 ),
             ));
         }
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
             .send(JournalCmd::Append {
-                data,
+                kind,
+                payload,
                 tenant,
                 streams,
                 traces,
@@ -247,14 +243,15 @@ async fn writer_loop(
 
         match first {
             JournalCmd::Append {
-                data,
+                kind,
+                payload,
                 tenant,
                 streams,
                 traces,
                 done,
             } => {
-                batch_bytes += data.len();
-                batch.push((data, tenant, streams, traces, done));
+                batch_bytes += framed_record_len(&tenant, &payload);
+                batch.push((kind, payload, tenant, streams, traces, done));
                 // Take what has already arrived and write it. Waiting for more
                 // charged every push the full linger even when the channel was
                 // empty, which fixed single-connection throughput at
@@ -282,14 +279,15 @@ async fn writer_loop(
                     };
                     match next {
                         Ok(Some(JournalCmd::Append {
-                            data,
+                            kind,
+                            payload,
                             tenant,
                             streams,
                             traces,
                             done,
                         })) => {
-                            batch_bytes += data.len();
-                            batch.push((data, tenant, streams, traces, done));
+                            batch_bytes += framed_record_len(&tenant, &payload);
+                            batch.push((kind, payload, tenant, streams, traces, done));
                         }
                         Ok(Some(JournalCmd::Checkpoint { done })) => {
                             pending_checkpoint = Some(done);
@@ -318,17 +316,33 @@ async fn writer_loop(
         if !batch.is_empty() {
             let wal_arena = crate::memprof::enter(crate::memprof::Arena::Wal);
             let mut buf = Vec::with_capacity(batch_bytes + batch.len() * RECORD_HEADER_SIZE);
-            for (data, _, _, _, _) in &batch {
-                let len = u32::try_from(data.len()).map_err(|_| {
+            for (kind, payload, tenant, _, _, _) in &batch {
+                // Framed here, straight into the batch buffer. The frame used
+                // to be its own prefix+tenant+payload Vec built on the ingest
+                // task, which copied every export once more than the write
+                // needed; the CRC covers exactly the framed bytes, computed
+                // over the pieces in the order they land.
+                let tenant_bytes = tenant.as_str().as_bytes();
+                let framed_len = framed_record_len(tenant, payload);
+                let len = u32::try_from(framed_len).map_err(|_| {
                     IoError::new(
                         std::io::ErrorKind::InvalidInput,
                         "journal record exceeds u32",
                     )
                 })?;
-                let crc = crc32fast::hash(data);
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(TENANT_RECORD_MAGIC);
+                hasher.update(&[*kind, tenant_bytes.len() as u8]);
+                hasher.update(tenant_bytes);
+                hasher.update(payload);
+                let crc = hasher.finalize();
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&crc.to_le_bytes());
-                buf.extend_from_slice(data);
+                buf.extend_from_slice(TENANT_RECORD_MAGIC);
+                buf.push(*kind);
+                buf.push(tenant_bytes.len() as u8);
+                buf.extend_from_slice(tenant_bytes);
+                buf.extend_from_slice(payload);
             }
 
             drop(wal_arena);
@@ -350,7 +364,7 @@ async fn writer_loop(
                     // are moved, not copied, so the memtable's own nodes are
                     // charged to the same arena its contents already are.
                     let _arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
-                    for (_, tenant, streams, traces, done) in batch.drain(..) {
+                    for (_, _, tenant, streams, traces, done) in batch.drain(..) {
                         for (labels, entries) in streams {
                             memtable.insert(tenant.clone(), labels, entries);
                         }
@@ -360,7 +374,7 @@ async fn writer_loop(
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "journal write failed, truncating partial record");
-                    for (_, _, _, _, done) in batch.drain(..) {
+                    for (_, _, _, _, _, done) in batch.drain(..) {
                         let _ = done.send(Err(IoError::new(e.kind(), e.to_string())));
                     }
                     let recovered = async {

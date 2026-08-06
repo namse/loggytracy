@@ -215,7 +215,7 @@ fn replay_otlp_log_record(
 ) -> Result<u64, String> {
     let request = ExportLogsServiceRequest::decode(payload)
         .map_err(|e| format!("OTLP log protobuf decode failed at offset {offset}: {e}"))?;
-    let streams = match crate::otlp_log::normalize_request(&request) {
+    let streams = match crate::otlp_log::normalize_request(request) {
         Ok(streams) => streams,
         Err(crate::otlp_log::OtlpLogError::EmptyRequest) => {
             tracing::warn!(offset, "empty OTLP log record in journal, skipping");

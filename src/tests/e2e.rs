@@ -81,7 +81,7 @@
 
     async fn ingest_once(journal: &Journal, raw: &[u8]) {
         let request = ExportLogsServiceRequest::decode(raw).unwrap();
-        let streams = crate::otlp_log::normalize_request(&request).unwrap();
+        let streams = crate::otlp_log::normalize_request(request).unwrap();
         journal
             .append_otlp_logs(test_tenant(), raw.to_vec(), streams)
             .await
@@ -221,8 +221,8 @@
                 ..Default::default()
             }],
         };
-        let streams = crate::otlp_log::normalize_request(&request).unwrap();
         let encoded = prost014::Message::encode_to_vec(&request);
+        let streams = crate::otlp_log::normalize_request(request).unwrap();
         journal
             .append_otlp_logs(test_tenant(), encoded, streams)
             .await

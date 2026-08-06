@@ -84,6 +84,14 @@ type TenantRecord<'a> = (TenantId, u8, &'a [u8]);
 /// The tenant is written into the WAL rather than derived at replay because
 /// the header it came from is gone by then, and mis-attributing a replayed
 /// record would breach isolation after a crash.
+fn framed_record_len(tenant: &TenantId, payload: &[u8]) -> usize {
+    TENANT_RECORD_PREFIX_SIZE + tenant.as_str().len() + payload.len()
+}
+
+/// The framed form as one buffer. Production writes the frame straight into
+/// the writer loop's batch buffer; this remains as the reference encoding the
+/// journal tests build WAL bytes with.
+#[cfg(test)]
 fn frame_tenant_record(tenant: &TenantId, kind: u8, payload: &[u8]) -> Vec<u8> {
     let tenant_bytes = tenant.as_str().as_bytes();
     let mut framed =
@@ -117,7 +125,12 @@ fn decode_tenant_record(data: &[u8]) -> Result<Option<TenantRecord<'_>>, String>
 
 enum JournalCmd {
     Append {
-        data: Vec<u8>,
+        /// Record kind byte, framed by the writer loop. The payload travels
+        /// unframed: framing it here built a prefix+tenant+payload copy of
+        /// every export just to copy it again into the batch buffer —
+        /// invariant II's "WAL write buffer" copy paid twice.
+        kind: u8,
+        payload: Vec<u8>,
         tenant: TenantId,
         streams: Vec<(Labels, Vec<LogEntry>)>,
         traces: Vec<TraceSpan>,
@@ -133,6 +146,7 @@ enum JournalCmd {
 }
 
 type AppendBatchItem = (
+    u8,
     Vec<u8>,
     TenantId,
     Vec<(Labels, Vec<LogEntry>)>,

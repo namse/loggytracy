@@ -156,7 +156,14 @@ impl OtlpLogIngest<'_> {
                 .into());
         }
 
-        let streams = normalize_request(&request)
+        // The WAL bytes are settled before normalization consumes the message:
+        // the HTTP protobuf body arrives as exactly the bytes the WAL wants,
+        // and the other transports re-encode the message they decoded.
+        let encoded = match wire {
+            Some(bytes) => bytes,
+            None => request.encode_to_vec(),
+        };
+        let streams = normalize_request(request)
             .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
         // The same input limits the Loki path applies. A record that arrives
         // over OTLP is not exempt from the bounds that keep a label set from
@@ -186,16 +193,12 @@ impl OtlpLogIngest<'_> {
             }
         }
 
-        // The WAL stores the export itself. This used to materialize a Loki
-        // `PushRequest` — a second message with a clone per line and per
-        // label, serialized just so replay had one decoder — measured as the
-        // largest remaining term of `docs/VISION.md` invariant II's copy
-        // count. Replay decodes by the record's kind instead, the way traces
-        // always have.
-        let encoded = match wire {
-            Some(bytes) => bytes,
-            None => request.encode_to_vec(),
-        };
+        // The WAL stores the export itself (`encoded` above). This used to
+        // materialize a Loki `PushRequest` — a second message with a clone
+        // per line and per label, serialized just so replay had one decoder —
+        // measured as the largest remaining term of `docs/VISION.md`
+        // invariant II's copy count. Replay decodes by the record's kind
+        // instead, the way traces always have.
         self.journal
             .append_otlp_logs(tenant, encoded, streams)
             .await

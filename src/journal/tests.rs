@@ -78,7 +78,7 @@
 
     async fn push(h: &Harness, raw: Vec<u8>) {
         let request = ExportLogsServiceRequest::decode(raw.as_slice()).unwrap();
-        let streams = crate::otlp_log::normalize_request(&request).unwrap();
+        let streams = crate::otlp_log::normalize_request(request).unwrap();
         h.journal
             .append_otlp_logs(test_tenant(), raw, streams)
             .await
@@ -143,8 +143,8 @@
                 ..Default::default()
             }],
         };
-        let streams = crate::otlp_log::normalize_request(&request).unwrap();
         let encoded = Prost014Message::encode_to_vec(&request);
+        let streams = crate::otlp_log::normalize_request(request).unwrap();
 
         let h = harness("otlp_replay").await;
         h.journal

@@ -59,25 +59,27 @@ impl std::fmt::Display for OtlpLogError {
 /// Records that share a label set are grouped, because a stream is what the
 /// storage layer keys on and one export usually carries many records from the
 /// same resource.
+/// Consumes the request: the decoded protobuf serves nothing after this — the
+/// WAL stores the received bytes, not the message — so every body string,
+/// attribute key and value moves into its `LogEntry` instead of being cloned
+/// per row on the ingest hot path.
 pub fn normalize_request(
-    request: &ExportLogsServiceRequest,
+    request: ExportLogsServiceRequest,
 ) -> Result<Vec<(Labels, Vec<LogEntry>)>, OtlpLogError> {
     let mut streams: BTreeMap<Labels, Vec<LogEntry>> = BTreeMap::new();
-    for resource_logs in &request.resource_logs {
+    for resource_logs in request.resource_logs {
         let resource_attributes = resource_logs
             .resource
-            .as_ref()
-            .map(|resource| resource.attributes.as_slice())
+            .map(|resource| resource.attributes)
             .unwrap_or_default();
         let (labels, resource_metadata) = split_resource_attributes(resource_attributes);
-        for scope_logs in &resource_logs.scope_logs {
+        for scope_logs in resource_logs.scope_logs {
             let scope_name = scope_logs
                 .scope
-                .as_ref()
-                .map(|scope| scope.name.as_str())
-                .unwrap_or("");
-            for record in &scope_logs.log_records {
-                let entry = normalize_record(record, &resource_metadata, scope_name)?;
+                .map(|scope| scope.name)
+                .unwrap_or_default();
+            for record in scope_logs.log_records {
+                let entry = normalize_record(record, &resource_metadata, &scope_name)?;
                 streams.entry(labels.clone()).or_default().push(entry);
             }
         }
@@ -88,30 +90,34 @@ pub fn normalize_request(
     Ok(streams.into_iter().collect())
 }
 
-fn split_resource_attributes(attributes: &[KeyValue]) -> (Labels, Vec<(String, String)>) {
+fn split_resource_attributes(attributes: Vec<KeyValue>) -> (Labels, Vec<(String, String)>) {
     let mut labels: Labels = BTreeMap::new();
     let mut metadata = Vec::new();
     for attribute in attributes {
-        let Some(value) = attribute.value.as_ref().and_then(scalar_string) else {
+        let Some(value) = attribute.value else {
+            continue;
+        };
+        let value = match scalar_string_owned(value) {
+            Ok(value) => value,
             // A non-scalar resource attribute is never a label: a label value
             // is a string, and flattening a map into one would invent a format
             // that queries would then have to guess at.
-            if let Some(value) = attribute.value.as_ref() {
-                metadata.push((attribute.key.clone(), value_json(value)));
+            Err(value) => {
+                metadata.push((attribute.key, value_json(&value)));
+                continue;
             }
-            continue;
         };
         if PROMOTED_RESOURCE_ATTRIBUTES.contains(&attribute.key.as_str()) {
             labels.insert(sanitize_label_name(&attribute.key), value);
         } else {
-            metadata.push((attribute.key.clone(), value));
+            metadata.push((attribute.key, value));
         }
     }
     (labels, metadata)
 }
 
 fn normalize_record(
-    record: &LogRecord,
+    record: LogRecord,
     resource_metadata: &[(String, String)],
     scope_name: &str,
 ) -> Result<LogEntry, OtlpLogError> {
@@ -126,19 +132,17 @@ fn normalize_record(
     let timestamp_ns =
         i64::try_from(raw_timestamp).map_err(|_| OtlpLogError::TimestampOutOfRange)?;
 
-    let line = record
-        .body
-        .as_ref()
-        .and_then(scalar_string)
-        .or_else(|| record.body.as_ref().map(value_json))
-        .unwrap_or_default();
+    let line = match record.body {
+        Some(body) => scalar_string_owned(body).unwrap_or_else(|value| value_json(&value)),
+        None => String::new(),
+    };
 
     let mut structured_metadata: Vec<(String, String)> = resource_metadata.to_vec();
     if !scope_name.is_empty() {
         structured_metadata.push(("scope_name".to_string(), scope_name.to_string()));
     }
     if !record.severity_text.is_empty() {
-        structured_metadata.push(("severity_text".to_string(), record.severity_text.clone()));
+        structured_metadata.push(("severity_text".to_string(), record.severity_text));
     }
     if record.severity_number != 0 {
         structured_metadata.push((
@@ -155,11 +159,11 @@ fn normalize_record(
     if !record.span_id.is_empty() {
         structured_metadata.push(("span_id".to_string(), hex(&record.span_id)));
     }
-    for attribute in &record.attributes {
-        if let Some(value) = attribute.value.as_ref() {
+    for attribute in record.attributes {
+        if let Some(value) = attribute.value {
             structured_metadata.push((
-                attribute.key.clone(),
-                scalar_string(value).unwrap_or_else(|| value_json(value)),
+                attribute.key,
+                scalar_string_owned(value).unwrap_or_else(|value| value_json(&value)),
             ));
         }
     }
@@ -186,13 +190,16 @@ fn sanitize_label_name(name: &str) -> String {
         .collect()
 }
 
-fn scalar_string(value: &AnyValue) -> Option<String> {
-    match value.value.as_ref()? {
-        any_value::Value::StringValue(value) => Some(value.clone()),
-        any_value::Value::BoolValue(value) => Some(value.to_string()),
-        any_value::Value::IntValue(value) => Some(value.to_string()),
-        any_value::Value::DoubleValue(value) => Some(value.to_string()),
-        _ => None,
+/// The moving form of the scalar check: a string body or attribute is the
+/// common case and the bytes are handed over rather than cloned. A non-scalar
+/// comes back whole so the caller can render it as JSON.
+fn scalar_string_owned(value: AnyValue) -> Result<String, AnyValue> {
+    match value.value {
+        Some(any_value::Value::StringValue(value)) => Ok(value),
+        Some(any_value::Value::BoolValue(value)) => Ok(value.to_string()),
+        Some(any_value::Value::IntValue(value)) => Ok(value.to_string()),
+        Some(any_value::Value::DoubleValue(value)) => Ok(value.to_string()),
+        _ => Err(value),
     }
 }
 

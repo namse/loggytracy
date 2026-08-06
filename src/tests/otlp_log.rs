@@ -56,7 +56,7 @@
     /// number of.
     #[test]
     fn only_the_promoted_resource_attributes_become_labels() {
-        let normalized = normalize_request(&request(
+        let normalized = normalize_request(request(
             vec![
                 attribute("service.name", string_value("checkout")),
                 attribute("k8s.namespace.name", string_value("prod")),
@@ -94,7 +94,7 @@
     /// the grouping the storage layer is built on.
     #[test]
     fn records_from_one_resource_are_grouped_into_one_stream() {
-        let normalized = normalize_request(&request(
+        let normalized = normalize_request(request(
             vec![attribute("service.name", string_value("checkout"))],
             vec![
                 record(1_700_000_000_000_000_000, "first"),
@@ -116,7 +116,7 @@
     fn a_record_without_a_timestamp_falls_back_to_when_it_was_observed() {
         let mut without_time = record(0, "no timestamp at the source");
         without_time.observed_time_unix_nano = 1_700_000_005_000_000_000;
-        let normalized = normalize_request(&request(
+        let normalized = normalize_request(request(
             vec![attribute("service.name", string_value("checkout"))],
             vec![without_time],
         ))
@@ -131,7 +131,7 @@
         let mut correlated = record(1_700_000_000_000_000_000, "handled");
         correlated.trace_id = vec![0x0a; 16];
         correlated.span_id = vec![0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
-        let normalized = normalize_request(&request(Vec::new(), vec![correlated])).unwrap();
+        let normalized = normalize_request(request(Vec::new(), vec![correlated])).unwrap();
         let metadata: BTreeMap<&str, &str> = normalized[0].1[0]
             .structured_metadata
             .iter()
@@ -154,14 +154,14 @@
                 },
             )),
         });
-        let normalized = normalize_request(&request(Vec::new(), vec![structured])).unwrap();
+        let normalized = normalize_request(request(Vec::new(), vec![structured])).unwrap();
         let line = &normalized[0].1[0].line;
         assert!(line.contains("checkout.completed"), "{line}");
     }
 
     #[test]
     fn an_export_with_no_records_is_rejected_rather_than_silently_accepted() {
-        let error = normalize_request(&ExportLogsServiceRequest::default())
+        let error = normalize_request(ExportLogsServiceRequest::default())
             .err()
             .expect("an export with no records is an error");
         assert_eq!(error, OtlpLogError::EmptyRequest);
@@ -181,12 +181,12 @@
             )],
             vec![record(1_700_000_000_000_000_000, "line")],
         );
-        let before = normalize_request(&export).unwrap();
-
         let encoded = prost014::Message::encode_to_vec(&export);
+        let before = normalize_request(export).unwrap();
+
         let decoded = <ExportLogsServiceRequest as prost014::Message>::decode(encoded.as_slice())
             .expect("the WAL payload decodes");
-        let after = normalize_request(&decoded).expect("and normalizes again");
+        let after = normalize_request(decoded).expect("and normalizes again");
         assert_eq!(before.len(), after.len());
         for ((labels_before, entries_before), (labels_after, entries_after)) in
             before.iter().zip(&after)
