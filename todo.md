@@ -1274,9 +1274,20 @@ Write path:
         label bytes it shares, so merge group sizing and `max_query_memory_bytes` are stricter than the
         memory that is really held. Neither was loosened here: that changes a limit and belongs with
         M10's honest metering
-- [ ] Remove the two free memcpys: the line clone at `ingest.rs:247` (the source is separately owned and could
+- [x] Remove the two free memcpys: the line clone at `ingest.rs:247` (the source is separately owned and could
       be consumed), and the whole-payload copy in `frame_tenant_record` (`journal/mod.rs:90-101`) whose 7-byte
       prefix belongs in `writer_loop`'s batch buffer
+
+      Done 2026-08-06 (`9ae6893`), in its modern form — the cited line clone died with the push surface, and
+      its OTLP equivalent was the per-record clones in `normalize_request`, which now **consumes** the decoded
+      message (body string, severity text, attribute keys and scalar values all move; callers settle the WAL
+      bytes first). The frame copy is gone the way the item said: the command carries kind+payload unframed
+      and `writer_loop` lays the frame straight into the batch buffer, CRC computed over the pieces.
+      Measured on the memprof rig: **WAL-arena allocation traffic 2,046 → 1,023 MB per run (halved, exactly
+      the frame), allocations 44.8k → 15.7k**, eps unchanged at 19.9k. Gated: memory_gate UNDER_BUDGET at
+      44.0% (900.3 MiB), bed PASS at 19,769 eps with agreement 168/168 × 3 held, push response p95 5.21 ms —
+      the lowest any bed run has recorded, though push p95 has been noisy across runs and the halved
+      allocator traffic is the claim, not the tail.
 - [x] One sort — the chunked flush (2026-08-03, below) emits streams in `(tenant, labels)` order with
       per-stream entry ordering, so the global sort is gone; the per-partition `sort_rows` stays as the
       dedup and as a near-O(n) safety net over already-sorted input
