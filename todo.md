@@ -895,6 +895,18 @@ What this round rejected: filling the cache from whole-group decodes only (measu
 above), and treating run-3's warm 1.10x as an engine regression (falsified by the standalone rerun;
 recorded instead as the thin-margin signal that motivated change 3).
 
+**Round-four follower, same day: the metric path joins the cache.** `rate` was the one shape the cache
+could not touch — its named projection failed the exact-layout serve gate — and the round-four bed
+priced that at 2.92x/3.11x vs VictoriaLogs, the worst ratio left. `ScanProjection::view_in`
+re-addresses a scan's fields into the cache's batch layout, so any scan with a complete view is served
+from cached batches while materializing only the columns it names (per-row work identical to its own
+narrow decode; fills stay exact-layout, pinned by test). The bed with it: `rate` **1.31 -> 0.46 ms,
+2.92x -> 1.06x cold / 1.09x warm** — parity on a sub-millisecond shape — with agreement 168/168 x 3 and
+load PASS unchanged, and `metadata_rare`/`trace_window` drifting further down (0.12-0.15x). Remaining
+vs VictoriaLogs: `label_only` 1.66x (42-48 ms, decode already cache-served, the residue is sink+
+serialize per returned row) and `json_field` cold 3.25x (the per-row `| json` parse; warm is 0.96x via
+replay).
+
 ## The claim arc, round three: labels leave the schema (`4bcd01c`, 2026-08-06)
 
 The structural change the fold-rejection named, user-approved: the L per-row label columns became one
