@@ -3135,6 +3135,53 @@ not by the decode fallback"
         assert_eq!(served, named_rows(&plain));
     }
 
+    /// Two readers share one byte budget; a reader whose own cache is empty
+    /// cannot evict the other's entries, so when the budget is already
+    /// spent it retracts its own insert instead of holding the total over.
+    #[test]
+    fn a_reader_retracts_its_insert_rather_than_exceed_the_shared_budget() {
+        let tmp = tempfile_dir();
+        let (part, _) = ordinal_fixture(&tmp);
+
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // First reader fills whatever the broad query decodes.
+        let mut first = PartReader::open(part.clone()).unwrap();
+        first.group_cache = GroupCache::new(counter.clone(), Some(1 << 30));
+        first
+            .query(
+                &test_tenant(),
+                &[],
+                &[],
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
+                1000,
+                false,
+            )
+            .unwrap();
+        let held = counter.load(std::sync::atomic::Ordering::Acquire);
+        assert!(held > 0);
+
+        // Second reader under the same counter, with a budget the first
+        // reader's residency already exhausts.
+        let mut second = PartReader::open(part).unwrap();
+        second.group_cache = GroupCache::new(counter.clone(), Some(held));
+        second
+            .query(
+                &test_tenant(),
+                &[],
+                &[],
+                QueryTimeRange::closed(i64::MIN, i64::MAX),
+                1000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Acquire),
+            held,
+            "the shared total must not exceed the budget the first reader filled"
+        );
+        assert_eq!(second.group_cache.resident_bytes_for_test(), 0);
+    }
+
     /// A scan that stops early leaves nothing behind: only a completed
     /// whole-group decode is cacheable.
     #[test]

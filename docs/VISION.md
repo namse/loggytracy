@@ -66,13 +66,14 @@ with its own accounted allocation and its own refusal when full. The shares
 below are the ones [`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) measured;
 the earlier table here was a guess and every one of its numbers moved:
 
-| Arena | Share | Measured high-water at 2 GiB | Holds | On overflow |
+| Arena | Share | Measured high-water at 2 GiB (2026-08-07, sweep build) | Holds | On overflow |
 |---|---|---|---|---|
-| ingest | 20% | 378 MiB | memtable, trace memtable, in-flight push bodies | `429` + `Retry-After` (already the mechanism) |
-| flush | 25% | 96.1 MiB (`f7d9a36`, chunked; was 721 MiB on `50190cf` and 513.7 MiB re-measured on `761999a`) | one chunk of materialized rows (`LOGGYTRACY_FLUSH_CHUNK_BYTES`), Parquet writer buffers | defer the flush; ingest backs up into its own arena and refuses there |
-| merge | 25% | **771 MiB** (`50190cf`; 326.5 MiB re-measured on `761999a`/`c0fd93c`) | one merge group's paging (`merge_max_memory_bytes / 2`, per-part pages clamped 2–8 MiB) | split the group; skip the tick |
-| query | 25% | 242 MiB + 203 MiB untagged | every concurrent scan, pipeline stage and metric evaluation | queue, then `429` |
-| sidecar | 5% | 17 MiB | blooms, stream index, part metadata | evict least-recently-used sidecars; reload from `index.bin` |
+| ingest | 20% | ~0 (memtable gauge peak 5.2 MiB — the chunked flush drains it at cadence; 378 MiB on `50190cf`) | memtable, trace memtable, in-flight push bodies | `429` + `Retry-After` (already the mechanism) |
+| flush | 25% | 30.9 MiB (was 96.1 on `f7d9a36`, 721 on `50190cf`) | one chunk of materialized rows (`LOGGYTRACY_FLUSH_CHUNK_BYTES`), Parquet writer buffers | defer the flush; ingest backs up into its own arena and refuses there |
+| merge | 25% | **442.4 MiB** — the dominant arena, 86% of a 25% share of 2 GiB (771 on `50190cf`; 326.5 on `761999a`) | one merge group's paging (`merge_max_memory_bytes / 2`, per-part pages clamped 2–8 MiB) | split the group; skip the tick |
+| query | 25% | 298.4 MiB tagged, **of which ~284 MiB is the row-group cache's retained batches** — decoded under the query tag, held by the cache, separated by the `loggytracy_row_group_cache_bytes` gauge; the scan transient itself is tens of MiB | every concurrent scan, pipeline stage and metric evaluation | queue, then `429` |
+| row-group cache | (256 MiB knob) | 284.7 MiB gauge peak before the retraction fence; the fence now keeps the shared counter at its budget | decoded row groups and narrow-pass outcomes, evicted LRU per reader | retract the insert |
+| sidecar | 5% | 34.9 MiB (17 before the 0.1% window blooms) | blooms, stream index, part metadata | evict least-recently-used sidecars; reload from `index.bin` |
 
 Shares are defaults, individually overridable. What is not overridable is that
 they sum to the budget.
@@ -89,14 +90,18 @@ the flush transient at the chunk (96.1 MiB measured against a 25% share of
 again. `memory_gate --budget 2GiB` reads UNDER_BUDGET at 39.8% with the settle
 included, and todo.md's stall section has the run-by-run record.
 
-**`Arc<Labels>` has landed and the table has not been re-measured, so every
-figure in it is build `50190cf`'s.** The flush arena's 721 MiB was a *copy* of the
-memtable — that copy is now a refcount — and the bench that agreed with it to
-1.4% has moved from 1 345 to 823 bytes per row and from 26–28 MB of peak live to
-13.85 MB. The right response is to re-run
-[`MEMORY_ATTRIBUTION.md`](MEMORY_ATTRIBUTION.md) rather than to scale these
-numbers by the bench's factor, because the whole point of that document is that
-the in-situ composition was not what anyone predicted.
+**Re-measured 2026-08-07** (`scripts/run_memprof_local.sh`, 2 GiB cgroup,
+20k eps + 5 qps, the bed's seed): anon peak 951–1245 MiB across two legs
+(the spread is the row-group cache filling under the query mix),
+**anon/live 1.34–1.69** where `50190cf` measured 5–8 — the allocator-retention
+multiplier the plan said to measure and publish is now this, mostly retired
+by the arena cap (4), the trim threshold and invariant II's copy removals.
+What the re-measurement surfaced beyond the table: the ingest arena has
+effectively dissolved (the flush cadence keeps the memtable at single-digit
+MiB), and the row-group cache's bytes ride the *query* tag because memprof
+attributes at allocation — the gauge is the separator, and the cache's own
+budget was measured 11% over under concurrent readers, which is what the
+insert-retraction fence fixed.
 
 **Two consequences that are architectural, not tuning.**
 

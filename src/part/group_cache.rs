@@ -252,7 +252,7 @@ impl GroupCache {
         let clock = inner.clock;
         let bytes = narrow_entry_bytes(&query, &outcome);
         inner.narrows.insert(
-            query,
+            query.clone(),
             NarrowEntry {
                 outcome,
                 bytes,
@@ -270,6 +270,7 @@ impl GroupCache {
             let Some(victim) = inner
                 .narrows
                 .iter()
+                .filter(|(key, _)| **key != query)
                 .min_by_key(|(_, entry)| entry.last_touch)
                 .map(|(key, _)| key.clone())
             else {
@@ -279,6 +280,13 @@ impl GroupCache {
             self.shared_bytes
                 .fetch_sub(removed.bytes, std::sync::atomic::Ordering::AcqRel);
             total = total.saturating_sub(removed.bytes);
+        }
+        // Same fence as the batch map: never leave the shared total over
+        // budget on this reader's account.
+        if total > budget {
+            let removed = inner.narrows.remove(&query).expect("inserted above");
+            self.shared_bytes
+                .fetch_sub(removed.bytes, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
@@ -317,24 +325,32 @@ impl GroupCache {
             .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel)
             .saturating_add(bytes);
         // Over budget: this reader gives back its own least-recently-used
-        // entries. Another reader may hold the bulk of the total; it will do
-        // the same the next time it inserts.
+        // entries, newest-inserted excluded until it is the only one left.
         while total > budget && inner.groups.len() > 1 {
             let Some(victim) = inner
                 .groups
                 .iter()
+                .filter(|(key, _)| **key != entry)
                 .min_by_key(|(_, group)| group.last_touch)
                 .map(|(key, _)| key.clone())
             else {
                 break;
             };
-            if victim == entry && inner.groups.len() == 1 {
-                break;
-            }
             let removed = inner.groups.remove(&victim).expect("chosen from the map");
             self.shared_bytes
                 .fetch_sub(removed.bytes, std::sync::atomic::Ordering::AcqRel);
             total = total.saturating_sub(removed.bytes);
+        }
+        // Still over: the bulk is held by other readers, whose entries this
+        // one cannot touch. Retract the insert rather than hold the total
+        // over its budget — measured live at 284.7 MiB against a 256 MiB
+        // budget before this fence, an 11% overshoot under concurrent
+        // readers. What remains possible is the transient of inserts racing
+        // the counter, bounded by the concurrent-scan cap times one entry.
+        if total > budget {
+            let removed = inner.groups.remove(&entry).expect("inserted above");
+            self.shared_bytes
+                .fetch_sub(removed.bytes, std::sync::atomic::Ordering::AcqRel);
         }
     }
 }

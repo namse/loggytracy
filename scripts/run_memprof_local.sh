@@ -92,7 +92,7 @@ echo "cgroup=$CG memory.max=$(cat "$CG/memory.max") swap.max=$(cat "$CG/memory.s
 # gauges: a gap between them is then visible in one row rather than inferred
 # across two files.
 (
-  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free"
+  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free"
   T0=$(date +%s.%N)
   while [ -d "$CG" ]; do
     now=$(date +%s.%N)
@@ -112,17 +112,18 @@ echo "cgroup=$CG memory.max=$(cat "$CG/memory.max") swap.max=$(cat "$CG/memory.s
       $1=="loggytracy_part_count"{pc=$2}
       $1=="loggytracy_part_sidecar_resident_bytes"{sc=$2}
       $1=="loggytracy_part_meta_bytes"{pm=$2}
+      $1=="loggytracy_row_group_cache_bytes"{rc=$2}
       $1=="loggytracy_query_success_total"{qs=$2}
       $1=="loggytracy_query_errors_total"{qe=$2}
-      END{printf "%d,%d,%d,%d,%d,%d,%d,%d,%d", mt, mb, pf, wb, pc, sc, pm, qs, qe}')
+      END{printf "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", mt, mb, pf, wb, pc, sc, pm, rc, qs, qe}')
     threads=$(awk '/^Threads:/{print $2}' "/proc/$(head -1 "$CG/cgroup.procs" 2>/dev/null)/status" 2>/dev/null)
     mp=$(echo "$m" | awk -F'[{}" ]+' '
       /^loggytracy_memprof_live_bytes\{/{v[$3]=$NF}
       /^loggytracy_memprof_malloc_bytes\{/{i[$3]=$NF}
       /^loggytracy_memprof_header_bytes /{h=$2}
-      END{printf "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+      END{printf "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
           v["other"], v["ingest"], v["wal"], v["flush"], v["merge"],
-          v["query"], v["sidecar"], v["part_meta"], h,
+          v["query"], v["sidecar"], v["part_meta"], v["row_group_cache"], h,
           i["arena"], i["mmapped"], i["in_use"], i["free"]}')
     printf '%s,%s,%s,%s,%s,%s,%s\n' \
       "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
@@ -179,20 +180,20 @@ kill -0 "$SERVER_PID" 2>/dev/null && ALIVE=true
   echo "run=$NAME limit=$LIMIT alive=$ALIVE harness_status=$HARNESS_STATUS"
   echo "data_dir_bytes=$(du -sb "$DATA" 2>/dev/null | cut -f1)"
   awk -F, 'NR>1 && $4+0>best { best=$4+0; for (i=1;i<=NF;i++) r[i]=$i }
-           NR>1 && $29+0>0 && $4+0>bestm { bestm=$4+0; for (i=1;i<=NF;i++) s[i]=$i }
+           NR>1 && $30+0>0 && $4+0>bestm { bestm=$4+0; for (i=1;i<=NF;i++) s[i]=$i }
     END {
       m = 1048576.0
       printf "duration_s=%s\nanon_peak_mib=%.1f\nfile_at_peak_mib=%.1f\n", r[1], r[4]/m, r[5]/m
       if (bestm > 0) {
-        live = (s[20]+s[21]+s[22]+s[23]+s[24]+s[25]+s[26]+s[27])/m
+        live = (s[21]+s[22]+s[23]+s[24]+s[25]+s[26]+s[27]+s[28]+s[29])/m
         printf "at_last_scrape_t=%s\n", s[1]
-        printf "  cgroup   anon=%.1f file=%.1f threads=%s\n", s[4]/m, s[5]/m, s[19]
-        printf "  glibc    arena=%.1f mmapped=%.1f in_use=%.1f free=%.1f\n", s[29]/m, s[30]/m, s[31]/m, s[32]/m
-        printf "  arenas   other=%.1f ingest=%.1f wal=%.1f flush=%.1f merge=%.1f query=%.1f sidecar=%.1f part_meta=%.1f\n", \
-               s[20]/m, s[21]/m, s[22]/m, s[23]/m, s[24]/m, s[25]/m, s[26]/m, s[27]/m
-        printf "  live=%.1f instrument_header=%.1f anon/live=%.2f free/anon=%.2f\n", live, s[28]/m, s[4]/m/live, s[32]/s[4]
-        printf "  gauges   memtable=%.1f wal_backlog=%.1f parts=%s ingest_live/memtable=%.2f\n", \
-               s[10]/m, s[13]/m, s[14], s[21]/(s[10]+1)
+        printf "  cgroup   anon=%.1f file=%.1f threads=%s\n", s[4]/m, s[5]/m, s[20]
+        printf "  glibc    arena=%.1f mmapped=%.1f in_use=%.1f free=%.1f\n", s[31]/m, s[32]/m, s[33]/m, s[34]/m
+        printf "  arenas   other=%.1f ingest=%.1f wal=%.1f flush=%.1f merge=%.1f query=%.1f sidecar=%.1f part_meta=%.1f rg_cache=%.1f\n", \
+               s[21]/m, s[22]/m, s[23]/m, s[24]/m, s[25]/m, s[26]/m, s[27]/m, s[28]/m, s[29]/m
+        printf "  live=%.1f instrument_header=%.1f anon/live=%.2f free/anon=%.2f\n", live, s[30]/m, s[4]/m/live, s[34]/s[4]
+        printf "  gauges   memtable=%.1f wal_backlog=%.1f parts=%s rg_cache_gauge=%.1f ingest_live/memtable=%.2f\n", \
+               s[10]/m, s[13]/m, s[14], s[17]/m, s[22]/(s[10]+1)
       }
     }' "$OUT/mem.csv"
   echo "server_log_tail:"; sed 's/\x1b\[[0-9;]*m//g' "$SERVER_LOG" | tail -3
