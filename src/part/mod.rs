@@ -353,13 +353,6 @@ impl ExactFieldPredicate {
 pub struct ExactFieldPruning<'a> {
     pub line_filters: &'a [LineFilter],
     pub exact_fields: &'a [ExactFieldPredicate],
-    /// The caller's sink re-evaluates every exact-field predicate per row —
-    /// true of the query pipeline, whose `| field="v"` stages run in the
-    /// sink. Under this promise the scan may skip the narrow pass when the
-    /// base selection's decode is already cached and hand the sink the
-    /// unfiltered rows; without it the narrow pass is what makes the part
-    /// API's answers exact, and it always runs.
-    pub sink_rechecks_exact_fields: bool,
 }
 
 impl<'a> ExactFieldPruning<'a> {
@@ -367,15 +360,7 @@ impl<'a> ExactFieldPruning<'a> {
         Self {
             line_filters,
             exact_fields,
-            sink_rechecks_exact_fields: false,
         }
-    }
-
-    /// See [`ExactFieldPruning::sink_rechecks_exact_fields`]; only a caller
-    /// whose sink runs the predicates may say this.
-    pub fn sink_rechecks(mut self) -> Self {
-        self.sink_rechecks_exact_fields = true;
-        self
     }
 }
 

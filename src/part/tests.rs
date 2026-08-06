@@ -748,7 +748,6 @@
                         &[],
                         &[],
                         &[],
-                        false,
                         QueryTimeRange::unbounded(),
                         forward,
                         None,
@@ -879,7 +878,6 @@
                 &[],
                 &[],
                 &[],
-                false,
                 QueryTimeRange::unbounded(),
                 true,
                 None,
@@ -3004,65 +3002,6 @@ selection, or warm rare shapes never hit"
         );
     }
 
-    /// Under the sink-rechecks promise, a predicate whose base selection is
-    /// already cached is served unfiltered — the sink is the filter — and no
-    /// narrow pass runs. The part-level query API never makes that promise,
-    /// so its answers stay exact (the equality test above pins that).
-    #[test]
-    fn the_sink_rechecks_promise_serves_the_base_replay_without_a_narrow_pass() {
-        let tmp = tempfile_dir();
-        let (part, _) = ordinal_fixture(&tmp);
-        let cached = cache_enabled(part, 1 << 30);
-
-        let full = QueryTimeRange::closed(i64::MIN, i64::MAX);
-        cached
-            .query(&test_tenant(), &[], &[], full, 1000, false)
-            .unwrap();
-        let filled = cached.group_cache.resident_bytes_for_test();
-        assert!(filled > 0);
-
-        let tenant = test_tenant();
-        let predicate = [ExactFieldPredicate::new("trace_id", "bb-7")];
-        let mut collector = RowCollector::new(&tenant);
-        cached
-            .scan_into(
-                &tenant,
-                &[],
-                &[],
-                &predicate,
-                true,
-                full,
-                true,
-                None,
-                None,
-                None,
-                None,
-                &ColumnSet::all(),
-                &mut collector,
-            )
-            .unwrap();
-        let rows = collector.into_rows();
-        // The bloom admits the one group holding bb-7; the serve hands the
-        // sink that group's cached rows whole, filtering nothing itself.
-        assert!(
-            rows.len() > 1,
-            "the advisory serve must hand the sink unfiltered rows, got {}",
-            rows.len()
-        );
-        assert!(
-            rows.iter().any(|row| row
-                .structured_metadata
-                .iter()
-                .any(|(k, v)| k == "trace_id" && v == "bb-7")),
-            "the matching row must be among them"
-        );
-        assert_eq!(
-            cached.group_cache.resident_bytes_for_test(),
-            filled,
-            "a base-replay serve runs no narrow pass and fills nothing"
-        );
-    }
-
     /// A metric scan — named columns, no line — reads the cache through a
     /// re-addressed view of the full-projection batches, and answers exactly
     /// what its own narrow decode answers. A named decode must not fill: its
@@ -3090,7 +3029,6 @@ selection, or warm rare shapes never hit"
                     &[],
                     &[],
                     &[],
-                    false,
                     window,
                     true,
                     None,

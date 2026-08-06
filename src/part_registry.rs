@@ -687,7 +687,6 @@ impl PartRegistry {
                     matchers,
                     pruning.line_filters,
                     pruning.exact_fields,
-                    pruning.sink_rechecks_exact_fields,
                     range,
                     forward,
                     part_scan_limit,
