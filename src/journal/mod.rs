@@ -88,6 +88,41 @@ fn framed_record_len(tenant: &TenantId, payload: &[u8]) -> usize {
     TENANT_RECORD_PREFIX_SIZE + tenant.as_str().len() + payload.len()
 }
 
+/// The WAL stores the export zstd-compressed. Uncompressed it was the
+/// dominant write-amplification term — ~418 bytes per entry of protobuf the
+/// client's own compression had already been stripped from — and every one of
+/// those bytes was written, fsynced, and rewritten again by each local
+/// compaction. Level 1: the ingest tasks pay the compression in parallel, and
+/// at this level zstd moves data far faster than the disk the WAL is
+/// protecting.
+///
+/// Runs on the caller's task, not the writer loop, so compression scales with
+/// connections instead of serializing behind the single writer.
+fn compress_payload(data: &[u8]) -> Result<Vec<u8>, IoError> {
+    let _arena = crate::memprof::enter(crate::memprof::Arena::Wal);
+    zstd::encode_all(data, 1)
+}
+
+/// The inverse, bounded: a frame header is attacker-writable bytes on disk,
+/// so the decompressed size is capped at [`MAX_RECORD_BYTES`] rather than
+/// trusted.
+fn decompress_payload(payload: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let decoder = zstd::Decoder::new(payload)
+        .map_err(|e| format!("journal payload zstd header invalid: {e}"))?;
+    let mut out = Vec::new();
+    decoder
+        .take(MAX_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("journal payload zstd decode failed: {e}"))?;
+    if out.len() > MAX_RECORD_BYTES {
+        return Err(format!(
+            "journal payload decompresses past the {MAX_RECORD_BYTES}-byte record limit"
+        ));
+    }
+    Ok(out)
+}
+
 /// The framed form as one buffer. Production writes the frame straight into
 /// the writer loop's batch buffer; this remains as the reference encoding the
 /// journal tests build WAL bytes with.

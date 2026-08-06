@@ -107,6 +107,30 @@
         assert_eq!(end, ckpt.offset);
     }
 
+    /// A WAL written before journal compression carries raw protobuf where a
+    /// zstd frame now belongs. This engine versions nothing, so the failure
+    /// must be loud and say what to do — not decode garbage.
+    #[tokio::test]
+    async fn an_uncompressed_record_refuses_replay_with_instructions() {
+        let dir = tmp_dir("uncompressed-wal");
+        let wal_path = dir.join("journal.wal");
+        let ckpt_path = dir.join("journal.ckpt");
+        let payload = frame_tenant_record(
+            &test_tenant(),
+            TENANT_RECORD_KIND_OTLP_LOGS,
+            &make_otlp_req(&[("a", vec![("x", 1)])]),
+        );
+        let mut wal = Vec::new();
+        wal.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        wal.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        wal.extend_from_slice(&payload);
+        std::fs::write(&wal_path, &wal).unwrap();
+
+        let error = replay(&wal_path, &ckpt_path, &MemTable::new())
+            .expect_err("a raw-protobuf record must refuse replay");
+        assert!(error.contains("delete the data directory"), "{error}");
+    }
+
     /// The WAL holds the OTLP export as it arrived, so replay must produce
     /// exactly what ingest's own normalization produced before the crash —
     /// promoted labels, structured metadata and all.

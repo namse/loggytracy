@@ -173,10 +173,26 @@ and re-ingest"
                     ));
                 }
                 TENANT_RECORD_KIND_TRACES => {
-                    replay_trace_record(&tenant, payload, offset, trace_memtable)?;
+                    // Stored zstd-compressed; a payload that fails the zstd
+                    // header is a WAL from before compression, and this
+                    // engine versions nothing.
+                    let payload = decompress_payload(payload).map_err(|e| {
+                        format!(
+                            "{e} at offset {offset}; if this WAL predates journal \
+compression, delete the data directory and re-ingest"
+                        )
+                    })?;
+                    replay_trace_record(&tenant, &payload, offset, trace_memtable)?;
                 }
                 TENANT_RECORD_KIND_OTLP_LOGS => {
-                    report.entries += replay_otlp_log_record(&tenant, payload, offset, memtable)?;
+                    let payload = decompress_payload(payload).map_err(|e| {
+                        format!(
+                            "{e} at offset {offset}; if this WAL predates journal \
+compression, delete the data directory and re-ingest"
+                        )
+                    })?;
+                    report.entries +=
+                        replay_otlp_log_record(&tenant, &payload, offset, memtable)?;
                 }
                 other => {
                     return Err(format!(

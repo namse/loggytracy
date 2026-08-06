@@ -95,7 +95,8 @@ impl Journal {
         data: Vec<u8>,
         streams: Vec<(Labels, Vec<LogEntry>)>,
     ) -> Result<(), IoError> {
-        self.send_append(TENANT_RECORD_KIND_OTLP_LOGS, data, tenant, streams, Vec::new())
+        let payload = compress_payload(&data)?;
+        self.send_append(TENANT_RECORD_KIND_OTLP_LOGS, payload, tenant, streams, Vec::new())
             .await
     }
 
@@ -105,7 +106,8 @@ impl Journal {
         data: Vec<u8>,
         spans: Vec<TraceSpan>,
     ) -> Result<(), IoError> {
-        self.send_append(TENANT_RECORD_KIND_TRACES, data, tenant, Vec::new(), spans)
+        let payload = compress_payload(&data)?;
+        self.send_append(TENANT_RECORD_KIND_TRACES, payload, tenant, Vec::new(), spans)
             .await
     }
 
