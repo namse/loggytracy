@@ -1482,8 +1482,8 @@
         .await
         .unwrap();
         let data = build_stream_data(results, false);
-        assert_eq!(data[0].stream["app"], "api", "the label must win");
-        assert_eq!(data[0].stream["trace_id"], "t1");
+        assert_eq!(data[0].stream.get("app"), Some("api"), "the label must win");
+        assert_eq!(data[0].stream.get("trace_id"), Some("t1"));
     }
 
     /// `| json | field="x"` — `json_field_rare`'s shape — now takes the
@@ -3511,7 +3511,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         );
         assert_eq!(data.len(), 1);
         assert_eq!(
-            data[0].stream,
+            data[0].stream.to_map(),
             [
                 ("app", "api"),
                 ("trace_id", "t1"),
@@ -3519,7 +3519,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             ]
             .into_iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect::<HashMap<_, _>>()
+            .collect::<std::collections::BTreeMap<_, _>>()
         );
         assert_eq!(
             data[0].values,
@@ -3564,10 +3564,11 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
 
         let data = build_stream_data(results, false);
         assert_eq!(data.len(), 1);
-        let mut names: Vec<&str> = data[0].stream.keys().map(String::as_str).collect();
+        let map = data[0].stream.to_map();
+        let mut names: Vec<&str> = map.keys().map(String::as_str).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["app", "level", "status", "trace_id"]);
-        assert_eq!(data[0].stream["level"], "error");
+        assert_eq!(data[0].stream.get("level"), Some("error"));
         assert_eq!(data[0].values[0], ("10".to_string(), "{\"level\":\"error\",\"status\":\"500\"}".to_string()));
     }
 
@@ -3606,7 +3607,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
 
         let data = build_stream_data(results, false);
         assert_eq!(data.len(), 1);
-        assert_eq!(data[0].stream["_msg"], "boom");
+        assert_eq!(data[0].stream.get("_msg"), Some("boom"));
         assert_eq!(data[0].values.len(), 1);
     }
 
@@ -3643,8 +3644,8 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         .unwrap();
 
         let data = build_stream_data(results, false);
-        assert_eq!(data[0].stream["trace_id"], "from-the-push");
-        assert!(!data[0].stream.contains_key("trace_id_extracted"));
+        assert_eq!(data[0].stream.get("trace_id"), Some("from-the-push"));
+        assert!(data[0].stream.get("trace_id_extracted").is_none());
     }
 
     /// Rows whose promoted label sets differ are different streams, which is how
@@ -3672,7 +3673,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         assert_eq!(data.len(), 2, "one stream per distinct promoted label set");
         let t1 = data
             .iter()
-            .find(|stream| stream.stream["trace_id"] == "t1")
+            .find(|stream| stream.stream.get("trace_id") == Some("t1"))
             .expect("t1 stream");
         assert_eq!(
             t1.values,
@@ -3729,7 +3730,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         .unwrap();
 
         let data = build_stream_data(results, false);
-        assert_eq!(data[0].stream["level"], "rewritten");
-        assert_eq!(data[0].stream["status"], "500");
+        assert_eq!(data[0].stream.get("level"), Some("rewritten"));
+        assert_eq!(data[0].stream.get("status"), Some("500"));
         assert_eq!(data[0].values, vec![("10".to_string(), "500".to_string())]);
     }

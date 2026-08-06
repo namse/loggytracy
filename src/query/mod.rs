@@ -80,9 +80,128 @@ impl ResultPayload {
 
 #[derive(Serialize)]
 pub struct StreamData {
-    pub stream: HashMap<String, String>,
+    pub stream: StreamKey,
     /// `(timestamp, line)`, serialized as the wire's two-string array.
     pub values: Vec<(String, String)>,
+}
+
+/// A stream's label set on the wire, never materialized as one map.
+///
+/// The union of a row's stream labels and its structured metadata used to be
+/// built per row — a deep clone of the label map, a `BTreeMap` insert per
+/// metadata pair, then a second map for serialization — and grouped under a
+/// `BTreeMap` whose key comparison walked the label pairs; with `trace_id`
+/// both unique per row and last alphabetically, that walk compared every
+/// label of every row against every probe. At thousands of returned rows
+/// this was the response's dominant cost. The key now holds the label `Arc`
+/// and the row's metadata as they are, and every consumer — equality,
+/// hashing, serialization — reads the union through one sorted merge with
+/// metadata shadowing same-named labels, which is the semantic the built
+/// map had.
+#[derive(Debug)]
+pub struct StreamKey {
+    labels: SharedLabels,
+    /// Sorted by key, one entry per key (the row's last duplicate wins),
+    /// pairs that merely repeat the label's own value dropped — so two rows
+    /// whose unions are equal always compare equal however the union was
+    /// split between labels and metadata.
+    metadata: Vec<(String, String)>,
+}
+
+impl StreamKey {
+    fn new(labels: SharedLabels, metadata: Vec<(String, String)>) -> Self {
+        let mut normalized: Vec<(String, String)> = Vec::with_capacity(metadata.len());
+        for (name, value) in metadata {
+            match normalized.iter_mut().find(|(existing, _)| *existing == name) {
+                Some((_, slot)) => *slot = value,
+                None => normalized.push((name, value)),
+            }
+        }
+        normalized.sort_by(|a, b| a.0.cmp(&b.0));
+        normalized.retain(|(name, value)| labels.get(name) != Some(value));
+        Self {
+            labels,
+            metadata: normalized,
+        }
+    }
+
+    /// The union, sorted by key, metadata shadowing labels.
+    fn merged(&self) -> impl Iterator<Item = (&str, &str)> {
+        let mut labels = self.labels.iter().peekable();
+        let mut metadata = self.metadata.iter().peekable();
+        std::iter::from_fn(move || {
+            match (labels.peek(), metadata.peek()) {
+                (Some((ln, lv)), Some((mn, mv))) => match ln.as_str().cmp(mn.as_str()) {
+                    std::cmp::Ordering::Less => {
+                        let out = (ln.as_str(), lv.as_str());
+                        labels.next();
+                        Some(out)
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let out = (mn.as_str(), mv.as_str());
+                        metadata.next();
+                        Some(out)
+                    }
+                    std::cmp::Ordering::Equal => {
+                        labels.next();
+                        let out = (mn.as_str(), mv.as_str());
+                        metadata.next();
+                        Some(out)
+                    }
+                },
+                (Some((ln, lv)), None) => {
+                    let out = (ln.as_str(), lv.as_str());
+                    labels.next();
+                    Some(out)
+                }
+                (None, Some((mn, mv))) => {
+                    let out = (mn.as_str(), mv.as_str());
+                    metadata.next();
+                    Some(out)
+                }
+                (None, None) => None,
+            }
+        })
+    }
+
+    fn union_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (name, value) in self.merged() {
+            name.hash(&mut hasher);
+            value.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn union_eq(&self, other: &StreamKey) -> bool {
+        self.merged().eq(other.merged())
+    }
+
+    #[cfg(test)]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.merged()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value)
+    }
+
+    #[cfg(test)]
+    pub fn to_map(&self) -> BTreeMap<String, String> {
+        self.merged()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+}
+
+impl Serialize for StreamKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        for (name, value) in self.merged() {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Serialize)]
@@ -186,27 +305,35 @@ pub(crate) fn parse_time_ns(s: &str) -> Result<i64, String> {
 /// direction has to be passed in because merging two inputs into one group
 /// interleaves their rows, and the response order is part of the contract.
 fn build_stream_data(results: Vec<StreamResult>, forward: bool) -> Vec<StreamData> {
-    let mut grouped: BTreeMap<SharedLabels, Vec<(i64, String)>> = BTreeMap::new();
+    // Streams come out in first-occurrence order — the scan's order — rather
+    // than sorted by label set as they once were. Nothing reads the stream
+    // order: the comparison bed's digest is order-independent and its
+    // ordering check is per stream, over the values. What *is* still the
+    // contract is the grouping (one output stream per distinct union — two
+    // input streams a `label_format` collapsed are one stream to Loki) and
+    // each stream's values in query direction, timestamp-sorted, stable.
+    let mut streams: Vec<(StreamKey, Vec<(i64, String)>)> = Vec::new();
+    let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
     for result in results {
         for entry in result.entries {
-            // A row that carries nothing to merge in shares the stream's label
-            // set; only one that does pays for a copy of it.
-            let mut labels = result.labels.clone();
-            if !entry.structured_metadata.is_empty() {
-                let fields = SharedLabels::make_mut(&mut labels);
-                for (name, value) in entry.structured_metadata {
-                    fields.insert(name, value);
+            let key = StreamKey::new(result.labels.clone(), entry.structured_metadata);
+            let candidates = index.entry(key.union_hash()).or_default();
+            match candidates
+                .iter()
+                .copied()
+                .find(|&at| streams[at].0.union_eq(&key))
+            {
+                Some(at) => streams[at].1.push((entry.timestamp_ns, entry.line)),
+                None => {
+                    candidates.push(streams.len());
+                    streams.push((key, vec![(entry.timestamp_ns, entry.line)]));
                 }
             }
-            grouped
-                .entry(labels)
-                .or_default()
-                .push((entry.timestamp_ns, entry.line));
         }
     }
-    grouped
+    streams
         .into_iter()
-        .map(|(labels, mut rows)| {
+        .map(|(stream, mut rows)| {
             // Stable, so rows sharing a timestamp keep the order the scan
             // produced them in rather than being reshuffled by the grouping.
             if forward {
@@ -215,10 +342,7 @@ fn build_stream_data(results: Vec<StreamResult>, forward: bool) -> Vec<StreamDat
                 rows.sort_by_key(|(timestamp_ns, _)| std::cmp::Reverse(*timestamp_ns));
             }
             StreamData {
-                stream: SharedLabels::try_unwrap(labels)
-                    .unwrap_or_else(|shared| (*shared).clone())
-                    .into_iter()
-                    .collect(),
+                stream,
                 values: rows
                     .into_iter()
                     .map(|(timestamp_ns, line)| (timestamp_ns.to_string(), line))
