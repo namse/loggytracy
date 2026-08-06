@@ -1,6 +1,6 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-94a99da54b16f6543cad36c07cb55cb541f7a7b87430fd0ac9a9912694fd0fe1.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-8a6967d15411e79807e9bedfa8b4010afbe2ad1e932858986eb8494d08c63dc3.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
@@ -55,7 +55,7 @@
     "tenants": 4,
     "tier": "B",
     "verify": {
-      "anchor_ns": 1785720090000000000,
+      "anchor_ns": 1785996930000000000,
       "entries_per_push": 100,
       "labels_per_stream": 6,
       "limit": 20000,
@@ -71,24 +71,24 @@
     "warmup_seconds": 10
   },
   "memory": {
-    "anon_bytes_end": 570335232,
-    "anon_peak_bytes": 535154688,
-    "current_bytes": 699219968,
+    "anon_bytes_end": 583004160,
+    "anon_peak_bytes": 558698496,
+    "current_bytes": 653512704,
     "error": null,
-    "file_bytes_end": 42098688,
-    "peak_bytes": 700055552,
-    "peak_bytes_before": 604413952,
-    "source": "/sys/fs/cgroup/system.slice/docker-94a99da54b16f6543cad36c07cb55cb541f7a7b87430fd0ac9a9912694fd0fe1.scope/memory.peak"
+    "file_bytes_end": 41209856,
+    "peak_bytes": 653766656,
+    "peak_bytes_before": 574210048,
+    "source": "/sys/fs/cgroup/system.slice/docker-8a6967d15411e79807e9bedfa8b4010afbe2ad1e932858986eb8494d08c63dc3.scope/memory.peak"
   },
   "phase": "seed",
   "run": {
-    "build_revision": "4a630d8",
+    "build_revision": "f849e7c",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "seed": 1592598566
   },
   "seed": {
     "complete": true,
-    "elapsed_seconds": 0.221089953,
+    "elapsed_seconds": 0.229776731,
     "errors": 0,
     "first_error": null,
     "line_bytes": 49029829,
@@ -103,7 +103,7 @@
   "target": "victorialogs",
   "verdict": "PASS",
   "verify": {
-    "anchor_ns": 1785720090000000000,
+    "anchor_ns": 1785996930000000000,
     "line_bytes": 49029829,
     "rows": 150000,
     "span_ns": 150000000000,

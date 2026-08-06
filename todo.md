@@ -910,6 +910,47 @@ story the bed's own caveat used to apologize for: **total on disk 619.0 → 96.5
 ingested — while the settled-data ratio stays 0.60x/1.28x. Anon-during-ingest fell again, 832.0 →
 **674.6 MiB** against Loki's 1138.8. `metadata_rare` reads 1.77x/1.84x slower than VictoriaLogs —
 the claim still does not hold, and W6 above says exactly which decode to shrink next.
+
+## The claim arc, round one: the blooms window, and the constant is named (`f849e7c`)
+
+W6's lever landed: **BTF5** stores one exact-field sub-bloom per 1024-row window (the same row
+count the writer already cuts data pages at), admission ANDs per-predicate window masks — strictly
+stronger than per-group admission, same no-false-negative obligation, since a matching row carries
+every predicate's token in its own window — and the mask becomes a `RowSelection` that bounds the
+narrow pass and, when pass one is skipped, the wide one. Bits are linear in token count, so eight
+filters cost one filter plus headers. 461+39 tests green (five new window tests: never-drops-a-row
+across boundaries with the time∩window path, boundary straddle, one-window narrow pass
+`scanned_rows ≤ 1024`, cross-predicate mask intersection, multi-window byte-identity across both
+writers), clippy 0.
+
+What it measurably did: decode volume for the rare shapes fell **24,576 → 4,096 lines/query**
+(machine-independent, from the matrix artifacts' own counters; `trace_window` 9,344 → 2,176), and
+the decode-bound bench geometry (`part/scan_filters/exact_field_hit`) fell **7.38 → 3.01 ms**.
+The fully-pruned probe rose 733 ns → 3.1 µs (≤64 window probes instead of one) — absolute noise
+against the 280 µs fixed floor.
+
+What it did **not** do: move the bed-shape latency. The subtraction probes on the seeded corpus,
+quiet machine, before/after: absent token 0.28 → 0.29 ms, one-occurrence (one-group) query 2.62 →
+**2.28 ms**, three-group query 5.49 → 5.48 ms. Cutting decoded rows 6x left the time flat, which
+falsifies W6's "the gap is the decode volume" at this corpus scale and names the real term:
+**~1.7–2.0 ms of per-admitted-group constant cost** — two `ParquetRecordBatchReader` builds (the
+narrow pass and the wide one) and a whole-page zstd decompression for every projected column,
+paid even when the selection keeps four rows, because a page decompresses wholly to serve any row
+and the wide projection spans the full schema. The claim needs per-group ≤ ~1.2 ms; the next
+levers, in order: fold the two passes into one read (one builder, one set of pages), then a
+decompressed-page reuse between the passes if folding alone is short. Windowing stays: its decode
+bound is what keeps those levers meaningful at real part sizes, and it is what scales when groups
+hold more than this corpus's rows.
+
+Gates on `f849e7c`: isolation PASS (19,870 eps, q response p95 249.3 ms), `memory_gate` UNDER_BUDGET
+at 44.4% (910.2 MiB), data_dir bounded at 244 MB. The bed run: verdict gate PASS at 19,779 eps with
+query p95 105.1 ms, agreement **168/168 on all three pairs, every shape** — the strongest possible
+statement that windowed pruning changed no answer — and the claim verdict, honestly: `metadata_rare`
+moved 2.6 → **2.3 ms** while VictoriaLogs' own number moved 1.4 → 1.2 ms, so the ratio reads
+**1.93x/1.92x, does not hold**. Loki's side widened to 34.2x faster. The per-group constant above
+is now the whole remaining gap: at one admitted group per bed query, 2.3 ms ≈ 0.3 fixed +
+~2.0 constant, and ≤1.3 ms (1.1 × 1.2 ms) needs that constant at ≤ ~1.0 ms — the one-read fold is
+the next arc, with the decompressed-page reuse behind it.
 - [x] **Then remove Loki push ingest** — the protobuf and JSON variants, the snappy path, the Loki label-text
       parser, and `proto.rs`'s encode side
 
