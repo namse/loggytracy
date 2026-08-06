@@ -398,12 +398,18 @@ The claim is therefore stated as a falsifiable one:
 > index it, and not materially worse than VictoriaLogs, which columnizes it,
 > without giving up ingest throughput or disk footprint.
 
-**Both halves hold now, on the wire the claim was always about.** The bed
-ingests OTLP on all three systems since 2026-08-02 — the same protobuf body at
-each engine's own `/v1/logs` spelling — and every ratio below printed only
-after all three pairs agreed on all 168 queries of every shape. The Loki half
-at **0.00x–0.02x** (0.23 ms against 78.9), and the VictoriaLogs half at
-**0.17x cold and 0.17x warm** (0.23 ms against 1.36/1.30) as of 2026-08-06.
+**Both halves hold now, on the wire the claim was always about — and the
+VictoriaLogs half holds past its own wording.** The bed ingests OTLP on all
+three systems since 2026-08-02 — the same protobuf body at each engine's own
+`/v1/logs` spelling — and every ratio below printed only after all three
+pairs agreed on all 168 queries of every shape. The claim shape: Loki at
+**0.00x** (0.22 ms against 78.8), VictoriaLogs at **0.23x cold / 0.16x warm**
+as of 2026-08-06. "Not materially worse" undersells the evening's state:
+every log shape — broad selector, line filter, parsed field, both rare
+lookups, the trace window — answers under VictoriaLogs' time on both the
+cold and the warm pass (`label_only` 0.90x/0.61x is the closest race;
+the rest sit 0.00x–0.88x), with `sum(rate(...))` at 1.06x, a 0.02 ms gap at
+the HTTP jitter floor.
 It began at 12.6x when `structured_metadata` was a JSON blob parsed per row;
 columnizing it, then page-level time selection, then the `_stream` ordinal
 table brought it to 1.46x; what closed it was keeping the decode — a
