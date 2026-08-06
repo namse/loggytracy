@@ -80,6 +80,10 @@ pub struct PartReader {
     /// `data.parquet` and leaves the sidecars resident — so this is the part of
     /// a part that a growing part count charges to RSS.
     index_resident_bytes: u64,
+    /// The `_stream` ordinal table: `meta.streams` shared out once at open,
+    /// so a scan resolves a row's label set with an `Arc` clone instead of
+    /// rebuilding a map from label columns.
+    stream_table: Vec<SharedLabels>,
     /// The parsed Parquet footer plus the timestamp column's page index,
     /// cached for the reader's lifetime after the first scan loads it.
     ///
@@ -109,76 +113,6 @@ struct DecodedBlooms {
     exact_fields: Vec<Vec<WindowBloom>>,
 }
 
-/// The distinct label sets one scan has already decoded, so a part holding a
-/// hundred streams materializes a hundred label sets and not one per row.
-///
-/// The rows of a part are sorted by `(tenant, timestamp)`, so consecutive rows
-/// belong to different streams and comparing against the previous row would
-/// almost always miss. Keyed instead on a hash of the row's label column
-/// values, with every candidate in the bucket verified against the columns —
-/// a hash collision therefore costs a comparison and cannot return the wrong
-/// label set.
-struct LabelSetCache {
-    buckets: HashMap<u64, Vec<SharedLabels>>,
-}
-
-impl LabelSetCache {
-    fn new() -> Self {
-        Self {
-            buckets: HashMap::new(),
-        }
-    }
-
-    fn labels_for(
-        &mut self,
-        names: &[String],
-        columns: &[&StringArray],
-        row: usize,
-    ) -> SharedLabels {
-        let mut hasher = std::hash::DefaultHasher::new();
-        for (index, name) in names.iter().enumerate() {
-            if !columns[index].is_null(row) {
-                name.hash(&mut hasher);
-                columns[index].value(row).hash(&mut hasher);
-            }
-        }
-        let bucket = self.buckets.entry(hasher.finish()).or_default();
-        if let Some(hit) = bucket
-            .iter()
-            .find(|labels| label_set_matches_row(labels, names, columns, row))
-        {
-            return hit.clone();
-        }
-        let mut labels = Labels::new();
-        for (index, name) in names.iter().enumerate() {
-            if !columns[index].is_null(row) {
-                labels.insert(name.clone(), columns[index].value(row).to_string());
-            }
-        }
-        let labels: SharedLabels = Arc::new(labels);
-        bucket.push(labels.clone());
-        labels
-    }
-}
-
-fn label_set_matches_row(
-    labels: &Labels,
-    names: &[String],
-    columns: &[&StringArray],
-    row: usize,
-) -> bool {
-    let mut present = 0usize;
-    for (index, name) in names.iter().enumerate() {
-        if columns[index].is_null(row) {
-            continue;
-        }
-        present += 1;
-        if labels.get(name).map(String::as_str) != Some(columns[index].value(row)) {
-            return false;
-        }
-    }
-    present == labels.len()
-}
 
 fn validate_sidecar_files(part: &Part) -> Result<(), String> {
     let expected = part.meta.integrity.index_crc32;
@@ -316,7 +250,25 @@ fn open_part_data(
         .iter()
         .map(|(key, _)| key.clone())
         .collect();
-    let expected_schema = part_schema(&part.meta.stream_labels, &metadata_keys, &parsed_keys);
+    // Before the generic comparison: a part from before the `_stream` ordinal
+    // has label columns where column 3 now lives, and the failure has to name
+    // its own remedy rather than read as corruption. Checked here so it also
+    // fires before any arrow downcast could panic on a Utf8 column.
+    let stream_field_ok = arrow_reader_metadata
+        .schema()
+        .fields()
+        .get(3)
+        .is_some_and(|field| {
+            field.name() == STREAM_COLUMN && field.data_type() == &DataType::UInt32
+        });
+    if !stream_field_ok {
+        return Err(format!(
+            "part {} was written before the {STREAM_COLUMN} ordinal column; this engine \
+versions nothing, so delete the data directory and re-ingest",
+            part.meta.id
+        ));
+    }
+    let expected_schema = part_schema(&metadata_keys, &parsed_keys);
     if arrow_reader_metadata.schema().fields() != expected_schema.fields() {
         return Err(format!(
             "parquet schema does not match metadata for part {}: expected {:?}, got {:?}",
@@ -392,6 +344,12 @@ impl PartReader {
         let stream_index = decode_stream_index(stream_bytes)?;
         validate_stream_index(&part, &stream_index)?;
         let stream_labels = part.meta.stream_labels.clone();
+        let stream_table: Vec<SharedLabels> = part
+            .meta
+            .streams
+            .iter()
+            .map(|labels| Arc::new(labels.clone()))
+            .collect();
         let metadata_keys: Vec<String> = part
             .meta
             .metadata_columns
@@ -417,6 +375,7 @@ impl PartReader {
             metadata_keys,
             parsed_keys,
             index_resident_bytes,
+            stream_table,
             data_metadata: std::sync::OnceLock::new(),
         })
     }
@@ -815,28 +774,17 @@ impl PartReader {
             columns.line || line_filters.is_empty(),
             "a scan that skips the line column cannot evaluate line filters"
         );
-        // Two projections when the caller does not read labels: the full one
-        // for groups where matches must be checked row by row, and a blind one
-        // — no label columns at all — for groups the stream index proves
-        // match uniformly. Uniform means: every matcher is a non-empty
-        // equality, every stream in the part carries the label, and no other
-        // value of it touches the group; the group was already admitted, so
-        // its rows then all match and counting them needs only timestamps.
-        let projection = ScanProjection::build(
-            &self.stream_labels,
-            &self.metadata_keys,
-            &self.parsed_keys,
-            &ColumnSet {
-                labels: true,
-                ..columns.clone()
-            },
-        );
-        let blind = (!columns.labels).then(|| {
-            (
-                ScanProjection::build(&self.stream_labels, &self.metadata_keys, &self.parsed_keys, columns),
-                self.uniform_match_precondition(matchers),
-            )
-        });
+        let projection = ScanProjection::build(&self.metadata_keys, &self.parsed_keys, columns);
+        // Matchers are evaluated once per stream, not once per row: the
+        // `_stream` ordinal names the row's label set, so the per-row check
+        // is one boolean lookup. This is also what retired the blind-count
+        // second projection — reading the ordinal costs a u32 per row, which
+        // is cheaper than proving a group uniform used to be.
+        let stream_matches: Vec<bool> = self
+            .stream_table
+            .iter()
+            .map(|labels| matchers.iter().all(|matcher| matcher.matches(labels)))
+            .collect();
         // The predicates the part's own columns answer *exactly*: a string
         // equality on a field that is not one of this part's stream labels,
         // read from the `_sm:` column (pushed metadata) and — when the only
@@ -940,7 +888,6 @@ impl PartReader {
 
         // Outside the row-group loop: a stream spans row groups, so a cache per
         // group would rebuild every label set once per group.
-        let mut label_sets = LabelSetCache::new();
         // One footer parse for the whole scan. This used to re-open the file and
         // re-run `ArrowReaderMetadata::load` inside the loop, so two hundred
         // selected row groups were two hundred footer parses
@@ -1023,14 +970,7 @@ impl PartReader {
                 }
             };
             let count_scanned_rows = selection.is_none();
-            let projection = match &blind {
-                Some((blind_projection, precondition))
-                    if *precondition && self.group_matches_uniformly(row_group, matchers) =>
-                {
-                    blind_projection
-                }
-                _ => &projection,
-            };
+            let projection = &projection;
             if selection.is_none()
                 && let Some(base_selection) = base_selection
             {
@@ -1058,7 +998,6 @@ impl PartReader {
                     match self.scan_batch(
                         &batch,
                         tenant,
-                        matchers,
                         line_filters,
                         time_range,
                         forward,
@@ -1068,7 +1007,7 @@ impl PartReader {
                         cancellation,
                         projection,
                         count_scanned_rows,
-                        &mut label_sets,
+                        &stream_matches,
                         &mut stats,
                         sink,
                     ) {
@@ -1115,7 +1054,6 @@ impl PartReader {
                 match self.scan_batch(
                     batch,
                     tenant,
-                    matchers,
                     line_filters,
                     time_range,
                     forward,
@@ -1125,7 +1063,7 @@ impl PartReader {
                     cancellation,
                     projection,
                     count_scanned_rows,
-                    &mut label_sets,
+                    &stream_matches,
                     &mut stats,
                     sink,
                 ) {
@@ -1139,46 +1077,6 @@ impl PartReader {
         Ok(stats)
     }
 
-    /// The narrow first pass of a two-pass scan: the timestamp column plus the
-    /// definitive predicates' `_sm:` columns, one row group, no strings
-    /// materialized. Returns `None` when no row qualifies, so the caller skips
-    /// the group without a wide decode.
-    ///
-    /// Hand-rolled rather than parquet's `RowFilter`, so the engine keeps its
-    /// own accounting — the rows examined here are the rows
-    /// `totalLinesProcessed` reports — and its own frontier semantics in the
-    /// pass that follows.
-    /// Part-wide half of the uniform-match proof: every matcher is a
-    /// non-empty equality on a label every stream of this part carries. A
-    /// stream without the label could put a non-matching row into any group,
-    /// so nothing group-level can be proven without this.
-    fn uniform_match_precondition(&self, matchers: &[LabelMatcher]) -> bool {
-        matchers.iter().all(|matcher| {
-            matches!(matcher.op, MatcherOp::Eq)
-                && !matcher.value.is_empty()
-                && self
-                    .part
-                    .meta
-                    .streams
-                    .iter()
-                    .all(|stream| stream.contains_key(&matcher.name))
-        })
-    }
-
-    /// Group-level half: no *other* value of any matched label touches this
-    /// group. The group was admitted, so the wanted value does; if it is the
-    /// only one, every row of the group matches every matcher.
-    fn group_matches_uniformly(&self, row_group: u32, matchers: &[LabelMatcher]) -> bool {
-        matchers.iter().all(|matcher| {
-            self.stream_index
-                .get(&matcher.name)
-                .is_some_and(|values| {
-                    values.iter().all(|(value, bitmap)| {
-                        value == &matcher.value || !bitmap.contains(row_group)
-                    })
-                })
-        })
-    }
 
     /// The scan path's handle pair: a fresh descriptor (so eviction can still
     /// reclaim the bytes once no scan holds one) and the cached footer.
@@ -1209,9 +1107,8 @@ impl PartReader {
         base_selection: Option<&RowSelection>,
         stats: &mut ScanStats,
     ) -> Result<Option<RowSelection>, String> {
-        let labels = self.stream_labels.len();
-        let sm_leaf = |key: usize| 3 + labels + key;
-        let pf_leaf = |key: usize| 3 + labels + self.metadata_keys.len() + key;
+        let sm_leaf = |key: usize| 4 + key;
+        let pf_leaf = |key: usize| 4 + self.metadata_keys.len() + key;
         let mut leaves = vec![1usize];
         for def in definitive {
             leaves.extend(def.sm_key.map(sm_leaf));
@@ -1320,7 +1217,6 @@ impl PartReader {
         &self,
         batch: &RecordBatch,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         time_range: QueryTimeRange,
         forward: bool,
@@ -1330,7 +1226,7 @@ impl PartReader {
         cancellation: Option<&AtomicBool>,
         projection: &ScanProjection,
         count_scanned_rows: bool,
-        label_sets: &mut LabelSetCache,
+        stream_matches: &[bool],
         stats: &mut ScanStats,
         sink: &mut dyn RowSink,
     ) -> Result<ScanStep, String> {
@@ -1368,17 +1264,7 @@ impl PartReader {
         let sm = projection
             .residual
             .map(|index| batch.column(index).as_string::<i32>());
-        let label_cols: Vec<&StringArray> = if projection.labels_projected {
-            (0..self.stream_labels.len())
-                .map(|label_index| {
-                    batch
-                        .column(projection.labels_start + label_index)
-                        .as_string::<i32>()
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let stream = batch.column(projection.stream).as_primitive::<UInt32Type>();
 
         let row_indices: Box<dyn Iterator<Item = usize>> = if forward {
             Box::new(0..batch.num_rows())
@@ -1386,17 +1272,10 @@ impl PartReader {
             Box::new((0..batch.num_rows()).rev())
         };
         // Rows are sorted by stream inside a group, so consecutive rows almost
-        // always share a label set — one *run* per stream. Hashing into the
-        // label cache and re-evaluating every matcher per row charged every
-        // row for work that only changes at a run boundary; comparing the
-        // label columns against the previous row is a handful of memcmps, and
-        // only a boundary pays the full lookup.
-        let mut run: Option<(usize, SharedLabels, bool)> = None;
-        // The blind-count projection carries no label columns: the stream
-        // index already proved every row of this group matches, so the sink
-        // gets one shared empty label set and no per-row label work at all.
-        let blind_labels: Option<SharedLabels> =
-            (!projection.labels_projected).then(|| Arc::new(Labels::new()));
+        // always share an ordinal — one *run* per stream. The run test is a
+        // single u32 compare; a boundary pays one table index and one
+        // precomputed-match lookup, which is the whole label machinery now.
+        let mut run: Option<(u32, SharedLabels, bool)> = None;
         for i in row_indices {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Ok(ScanStep::Stop);
@@ -1438,27 +1317,27 @@ impl PartReader {
             if !time_range.contains(ts_val) {
                 continue;
             }
-            let (labels, matched) = if let Some(blind) = &blind_labels {
-                (blind.clone(), true)
-            } else {
-                match &run {
-                Some((previous, labels, matched))
-                    if label_cols.iter().all(|column| {
-                        column.is_null(i) == column.is_null(*previous)
-                            && (column.is_null(i) || column.value(i) == column.value(*previous))
-                    }) =>
-                {
+            let ordinal = stream.value(i);
+            let (labels, matched) = match &run {
+                Some((previous, labels, matched)) if *previous == ordinal => {
                     (labels.clone(), *matched)
                 }
                 _ => {
-                    let labels = label_sets.labels_for(&self.stream_labels, &label_cols, i);
-                    let matched = matchers.iter().all(|m| m.matches(&labels));
-                    run = Some((i, labels.clone(), matched));
+                    let index = ordinal as usize;
+                    if index >= self.stream_table.len() || index >= stream_matches.len() {
+                        return Err(format!(
+                            "part {} row group {row_group} references stream ordinal \
+{ordinal} beyond the {}-entry stream table",
+                            self.part.meta.id,
+                            self.stream_table.len()
+                        ));
+                    }
+                    let labels = self.stream_table[index].clone();
+                    let matched = stream_matches[index];
+                    run = Some((ordinal, labels.clone(), matched));
                     (labels, matched)
                 }
-                }
             };
-            run = run.map(|(_, labels, matched)| (i, labels, matched));
             if !matched {
                 continue;
             }
@@ -1561,11 +1440,9 @@ struct ScanProjection {
     leaves: Vec<usize>,
     /// Projected index of `_msg`, when the line is read at all.
     msg: Option<usize>,
-    /// Projected index of the first label column; labels are contiguous.
-    labels_start: usize,
-    /// Whether the label columns are in the mask at all. `false` only for the
-    /// blind-count projection, used on groups the stream index proved uniform.
-    labels_projected: bool,
+    /// Projected index of the `_stream` ordinal column — always in the mask;
+    /// it is one u32 per row and it is how every row names its label set.
+    stream: usize,
     /// `(index into metadata_keys, projected index)` per projected `_sm:`.
     metadata: Vec<(usize, usize)>,
     /// `(index into parsed_keys, projected index)` per projected `_pf:` —
@@ -1579,34 +1456,27 @@ struct ScanProjection {
 
 impl ScanProjection {
     fn build(
-        stream_labels: &[String],
         metadata_keys: &[String],
         parsed_keys: &[String],
         columns: &ColumnSet,
     ) -> Self {
-        let labels = stream_labels.len();
-        let residual_leaf = 3 + labels + metadata_keys.len() + parsed_keys.len();
-        let mut leaves = vec![0usize, 1];
+        let residual_leaf = 4 + metadata_keys.len() + parsed_keys.len();
+        let mut leaves = vec![0usize, 1, 3];
         if columns.line {
             leaves.push(2);
-        }
-        if columns.labels {
-            for label in 0..labels {
-                leaves.push(3 + label);
-            }
         }
         let mut metadata_leaves: Vec<(usize, usize)> = Vec::new();
         let include_residual = match &columns.metadata {
             MetadataProjection::All => {
                 for key in 0..metadata_keys.len() {
-                    metadata_leaves.push((key, 3 + labels + key));
+                    metadata_leaves.push((key, 4 + key));
                 }
                 true
             }
             MetadataProjection::Named(names) => {
                 for (key_index, key) in metadata_keys.iter().enumerate() {
                     if names.contains(key) {
-                        metadata_leaves.push((key_index, 3 + labels + key_index));
+                        metadata_leaves.push((key_index, 4 + key_index));
                     }
                 }
                 // The residual is read only when a named field might live in
@@ -1624,7 +1494,7 @@ impl ScanProjection {
         // shortcut is offered only when every extracted key has a column.
         if columns.parsed_fields && parsed_keys.len() < MAX_METADATA_COLUMNS {
             for key in 0..parsed_keys.len() {
-                parsed_leaves.push((key, 3 + labels + metadata_keys.len() + key));
+                parsed_leaves.push((key, 4 + metadata_keys.len() + key));
             }
         }
         leaves.extend(metadata_leaves.iter().map(|&(_, leaf)| leaf));
@@ -1644,12 +1514,7 @@ impl ScanProjection {
         };
         Self {
             msg: columns.line.then(|| rank(2)),
-            labels_start: if columns.labels && labels > 0 {
-                rank(3)
-            } else {
-                leaves.len()
-            },
-            labels_projected: columns.labels,
+            stream: rank(3),
             metadata: metadata_leaves
                 .iter()
                 .map(|&(key, leaf)| (key, rank(leaf)))

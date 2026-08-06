@@ -250,10 +250,6 @@ pub fn rewrite_group(
             other.meta().partition
         ));
     }
-    let mut stream_labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for reader in readers {
-        stream_labels.extend(reader.meta().stream_labels.iter().cloned());
-    }
     // The metadata columns the same way: sum the inputs' recorded per-key row
     // counts and take the same top-N the batch writer takes. Deterministic
     // without reading a row — and it is why the counts are in `meta.json` at
@@ -306,7 +302,6 @@ pub fn rewrite_group(
         &mut keep,
         parts_root,
         &partition,
-        stream_labels.into_iter().collect(),
         metadata_keys,
         parsed_keys,
         row_group_size,

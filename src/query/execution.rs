@@ -363,11 +363,6 @@ async fn run_metric_count_scan(
         };
         let hidden: Option<crate::log_scan::HiddenRow> =
             (!deleted.is_empty()).then_some(&hidden);
-        // Nothing in a stage-less counting scan reads a label once no
-        // deletion mask needs one — which licenses the reader to count
-        // stream-index-proven groups blind, without their label columns.
-        let mut columns = columns;
-        columns.labels = hidden.is_some() || !parsed.stages.is_empty();
         let mut sink = crate::log_scan::CountingSink {
             query: &parsed,
             hidden,

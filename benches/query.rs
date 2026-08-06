@@ -240,11 +240,7 @@ fn bench_rate(c: &mut Criterion, bed: &Bed) {
             logql::QueryExpr::Metric(expr) => expr,
             _ => unreachable!(),
         };
-        let mut columns = expr.required_columns();
-        // The execution layer clears this when nothing reads labels — no
-        // deletion mask, no stages — which is exactly this bench's setup.
-        columns.labels = false;
-        columns
+        expr.required_columns()
     };
     let times: Vec<i64> = (1..=20)
         .map(|step| 1_772_000_000_000_000_000i64 + step * 10_000_000_000)

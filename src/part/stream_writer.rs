@@ -26,7 +26,6 @@ pub struct StreamingPartWriter {
     schema: Arc<Schema>,
     writer: ArrowWriter<fs::File>,
     data_path: PathBuf,
-    stream_labels: Vec<String>,
     /// The keys this part stores as `_sm:` columns, chosen before the first
     /// row: a merge sums its inputs' recorded per-key row counts and takes the
     /// same top-N `select_metadata_columns` takes — deterministic without
@@ -45,7 +44,10 @@ pub struct StreamingPartWriter {
 
     bloom_sections: Vec<Vec<u8>>,
     index: BTreeMap<String, BTreeMap<String, RoaringBitmap>>,
-    streams: BTreeSet<SharedLabels>,
+    /// First-occurrence ordinal assignment, shared with the batch path so the
+    /// two writers cannot disagree on a part's stream table.
+    ordinals: StreamOrdinals,
+    group_ordinals: Vec<u32>,
 
     row_count: u64,
     min_ts_ns: i64,
@@ -61,12 +63,11 @@ pub struct StreamingPartWriter {
 impl StreamingPartWriter {
     pub fn create(
         dir: &Path,
-        stream_labels: Vec<String>,
         metadata_keys: Vec<String>,
         parsed_keys: Vec<String>,
         row_group_size: usize,
     ) -> io::Result<Self> {
-        let schema = part_schema(&stream_labels, &metadata_keys, &parsed_keys);
+        let schema = part_schema(&metadata_keys, &parsed_keys);
         let data_path = dir.join(DATA_FILE);
         let file = fs::File::create(&data_path)?;
         let props = part_writer_properties(row_group_size);
@@ -76,7 +77,6 @@ impl StreamingPartWriter {
             schema,
             writer,
             data_path,
-            stream_labels,
             metadata_keys,
             metadata_counts: BTreeMap::new(),
             parsed_keys,
@@ -86,7 +86,8 @@ impl StreamingPartWriter {
             group_parsed: Vec::new(),
             bloom_sections: Vec::new(),
             index: BTreeMap::new(),
-            streams: BTreeSet::new(),
+            ordinals: StreamOrdinals::new(),
+            group_ordinals: Vec::new(),
             row_count: 0,
             min_ts_ns: i64::MAX,
             max_ts_ns: i64::MIN,
@@ -117,9 +118,8 @@ impl StreamingPartWriter {
         self.materialized_bytes = self
             .materialized_bytes
             .saturating_add(row.materialized_bytes());
-        if !self.streams.contains(&row.labels) {
-            self.streams.insert(row.labels.clone());
-        }
+        let ordinal = self.ordinals.ordinal_of(&row.labels)?;
+        self.group_ordinals.push(ordinal);
         for (name, _) in &row.structured_metadata {
             if self.metadata_keys.binary_search(name).is_ok() {
                 *self.metadata_counts.entry(name.clone()).or_default() += 1;
@@ -150,8 +150,8 @@ impl StreamingPartWriter {
         let batch = row_group_batch(
             &self.schema,
             &self.group,
+            &self.group_ordinals,
             &self.group_parsed,
-            &self.stream_labels,
             &self.metadata_keys,
             &self.parsed_keys,
         )?;
@@ -164,10 +164,7 @@ impl StreamingPartWriter {
             .push(encode_group_blooms(&self.group, &self.group_parsed)?);
 
         for row in &self.group {
-            for label in &self.stream_labels {
-                let Some(value) = row.labels.get(label) else {
-                    continue;
-                };
+            for (label, value) in row.labels.iter() {
                 // Owned keys, unlike the batch path, because the rows are gone
                 // after this call. Cloned only when a name or value is seen for
                 // the first time, so the cost is per distinct stream rather
@@ -238,6 +235,7 @@ impl StreamingPartWriter {
 
         self.group.clear();
         self.group_parsed.clear();
+        self.group_ordinals.clear();
         Ok(())
     }
 
@@ -273,6 +271,22 @@ impl StreamingPartWriter {
             .collect::<Vec<_>>();
         let streams = serialize_stream_index(entry_count, entries)?;
         write_index_sections(&dir.join(INDEX_FILE), &blooms, &streams)?;
+
+        // The ordinal table in assignment order — `meta.streams` IS the
+        // ordinal table now — and the label-name union derived from what
+        // actually survived, which is what `validate_meta_file`'s exactness
+        // check always demanded. Deriving it here (instead of accepting a
+        // superset from the merge inputs) is what retired the hazard where a
+        // label whose last rows retention dropped failed the merged part's
+        // own validation.
+        let stream_table = std::mem::replace(&mut self.ordinals, StreamOrdinals::new()).into_table();
+        let stream_labels: Vec<String> = {
+            let mut names: BTreeSet<&str> = BTreeSet::new();
+            for labels in &stream_table {
+                names.extend(labels.keys().map(String::as_str));
+            }
+            names.into_iter().map(str::to_string).collect()
+        };
 
         let integrity = PartIntegrity {
             data_crc32: file_crc32(&self.data_path)?,
@@ -320,9 +334,8 @@ impl StreamingPartWriter {
                 .iter()
                 .map(|key| (key.clone(), self.parsed_counts.get(key).copied().unwrap_or(0)))
                 .collect(),
-            stream_labels: self.stream_labels,
-            streams: self
-                .streams
+            stream_labels,
+            streams: stream_table
                 .iter()
                 .map(|labels| {
                     labels

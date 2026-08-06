@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::fs;
-use std::hash::{Hash, Hasher};
+
 use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Int64Type, Schema};
+use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Int64Type, Schema, UInt32Type};
 use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
@@ -77,6 +77,11 @@ const EXACT_FIELD_SCALAR_SCOPE: u8 = 0;
 /// is also the leading column.
 pub const TENANT_COLUMN: &str = "_tenant";
 
+/// Parquet column holding the row's stream ordinal — the index into
+/// `PartMeta::streams`, which is the part's label-set table. Column 3 in
+/// every part schema.
+pub const STREAM_COLUMN: &str = "_stream";
+
 /// The most metadata keys one part stores as `_sm:` columns; the rest of a
 /// row's pairs stay in the residual `structured_metadata` blob.
 ///
@@ -113,13 +118,6 @@ pub enum MetadataProjection {
 pub struct ColumnSet {
     pub line: bool,
     pub metadata: MetadataProjection,
-    /// Whether any consumer of this scan reads the label set. A counting sink
-    /// under a stage-less pipeline with no deletion mask does not — and for a
-    /// row group the stream index *proves* matches uniformly, the reader may
-    /// then skip the label columns entirely and count timestamps blind.
-    /// `false` is a permission, not a promise: mixed groups still decode and
-    /// check labels row by row.
-    pub labels: bool,
     /// Also decode the `_pf:` columns so the scan can hand the pipeline its
     /// `| json` extraction precomputed. Only worth asking for when the query
     /// has a `Json` stage; the columns are otherwise dead weight.
@@ -131,7 +129,6 @@ impl ColumnSet {
         Self {
             line: true,
             metadata: MetadataProjection::All,
-            labels: true,
             parsed_fields: false,
         }
     }

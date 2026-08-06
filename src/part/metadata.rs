@@ -5,6 +5,7 @@ fn write_meta(
     partition: &str,
     rows: &[Row],
     row_group_size: usize,
+    stream_table: &[SharedLabels],
     stream_labels: &[String],
     metadata_columns: &[(String, u64)],
     parsed_columns: &[(String, u64)],
@@ -56,15 +57,11 @@ fn write_meta(
         .collect();
     let tenants = tenant_segments(rows, &bounds);
 
-    // Borrowed, so the distinct label sets are found without copying one per
-    // row. The copy into `Vec<(String, String)>` below is per *stream* and is
-    // what `meta.json` serializes.
-    let mut stream_set: BTreeSet<&Labels> = BTreeSet::new();
-    for r in rows {
-        stream_set.insert(r.labels.as_ref());
-    }
-    let streams: Vec<Vec<(String, String)>> = stream_set
-        .into_iter()
+    // The ordinal table, in assignment order: `meta.streams` is what the
+    // `_stream` column indexes into, so its order is load-bearing now and
+    // comes from the writer's own fold rather than a sorted re-collection.
+    let streams: Vec<Vec<(String, String)>> = stream_table
+        .iter()
         .map(|m| {
             m.iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
@@ -326,6 +323,13 @@ fn validate_meta_file(dir: &Path, meta: &MetaFile) -> Result<(), String> {
     let actual_labels: BTreeSet<_> = meta.stream_labels.iter().cloned().collect();
     if actual_labels.len() != meta.stream_labels.len() || actual_labels != expected_labels {
         return Err("part stream label metadata is inconsistent".to_string());
+    }
+    // The streams list is the `_stream` ordinal table, so a duplicate entry
+    // would silently split one stream across two ordinals — corruption, not a
+    // cosmetic redundancy.
+    let distinct: BTreeSet<&Vec<(String, String)>> = meta.streams.iter().collect();
+    if distinct.len() != meta.streams.len() {
+        return Err("part stream metadata contains duplicate streams".to_string());
     }
     Ok(())
 }

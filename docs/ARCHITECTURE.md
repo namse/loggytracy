@@ -172,10 +172,11 @@ Alloy ──▶ Ingest API
 
 A part is one immutable directory:
 
-- `data.parquet` — Schema built from fields actually present in the part (dynamic per-part schema): one
-  column per stream label, one `_sm:<key>` column per structured-metadata key up to a cap of 128 chosen by
-  row count, and a residual JSON column for the rare keys past the cap — null for every row whose keys all
-  made columns, which is every row the intended consumer sends.
+- `data.parquet` — Schema built from fields actually present in the part (dynamic per-part schema): a
+  `_stream` u32 ordinal naming the row's label set (the sets themselves live once in `meta.json`'s
+  stream table, in ordinal order), one `_sm:<key>` column per structured-metadata key up to a cap of 128
+  chosen by row count, and a residual JSON column for the rare keys past the cap — null for every row
+  whose keys all made columns, which is every row the intended consumer sends.
 - Trigram bloom-filter sidecar — Per row group. Three-grams from text columns such as `_msg`, used to prune substring searches (`|=`). Word queries are also covered by trigrams.
 - Stream-index sidecar — Stream fields → row-group postings (roaring bitmap).
 - Metadata file — Time range, row count, field list, min/max, and CRC32 for each part file. Metadata itself is also checked with CRC32; inconsistent parts are not loaded.

@@ -695,7 +695,6 @@ impl MetricExpr {
         crate::part::ColumnSet {
             line,
             metadata: crate::part::MetadataProjection::Named(named),
-            labels: true,
             parsed_fields: false,
         }
     }

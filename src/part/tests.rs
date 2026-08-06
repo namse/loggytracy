@@ -156,7 +156,7 @@
             .join(&batch.meta.partition)
             .join(&batch.meta.id);
         std::fs::create_dir_all(&streamed_dir).expect("mkdir");
-        let stream_labels = collect_stream_labels(&rows);
+        let _ = collect_stream_labels(&rows);
         let metadata_keys: Vec<String> = select_metadata_columns(metadata_column_counts(&rows))
             .into_iter()
             .map(|(key, _)| key)
@@ -167,7 +167,7 @@
                 .map(|(key, _)| key)
                 .collect();
         let mut writer =
-            StreamingPartWriter::create(&streamed_dir, stream_labels, metadata_keys, parsed_keys, 7)
+            StreamingPartWriter::create(&streamed_dir, metadata_keys, parsed_keys, 7)
                 .expect("create");
         // The batch path sorts; the streaming path is promised sorted input,
         // which is MergedRows' job. Sorting here is standing in for it.
@@ -2530,7 +2530,7 @@ resident {:.0} B",
             .join(&batch.meta.partition)
             .join(&batch.meta.id);
         std::fs::create_dir_all(&streamed_dir).expect("mkdir");
-        let stream_labels = collect_stream_labels(&rows);
+        let _ = collect_stream_labels(&rows);
         let metadata_keys: Vec<String> = select_metadata_columns(metadata_column_counts(&rows))
             .into_iter()
             .map(|(key, _)| key)
@@ -2542,7 +2542,6 @@ resident {:.0} B",
                 .collect();
         let mut writer = StreamingPartWriter::create(
             &streamed_dir,
-            stream_labels,
             metadata_keys,
             parsed_keys,
             4096,
@@ -2563,6 +2562,239 @@ resident {:.0} B",
             batch_index, streamed_index,
             "multi-window blooms must be byte-identical across writers"
         );
+    }
+
+    /// Cross-tenant dedup in the ordinal table: a label set two tenants share
+    /// is one table entry, both tenants' rows carry its ordinal, and tenancy
+    /// still isolates — the ordinal names a label set, never a tenant.
+    #[test]
+    fn two_tenants_sharing_a_label_set_share_one_stream_ordinal() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let shared: SharedLabels = std::sync::Arc::new(
+            [("app".to_string(), "shared".to_string())].into_iter().collect(),
+        );
+        let solo: SharedLabels = std::sync::Arc::new(
+            [("app".to_string(), "solo".to_string())].into_iter().collect(),
+        );
+        let mut rows = Vec::new();
+        for (tenant, labels, count) in [
+            ("tenant-a", &shared, 3i64),
+            ("tenant-b", &shared, 2),
+            ("tenant-b", &solo, 1),
+        ] {
+            for i in 0..count {
+                rows.push(Row {
+                    tenant: TenantId::parse(tenant).expect("valid"),
+                    timestamp_ns: base + i,
+                    labels: labels.clone(),
+                    line: format!("{tenant} row {i}"),
+                    structured_metadata: vec![],
+                });
+            }
+        }
+        let part = flush_rows(rows, &tmp, 8192).unwrap().remove(0);
+        assert_eq!(
+            part.meta.streams.len(),
+            2,
+            "the shared set must appear once in the ordinal table"
+        );
+        let reader = PartReader::open(part).unwrap();
+        for (tenant, expected) in [("tenant-a", 3usize), ("tenant-b", 3)] {
+            let results = reader
+                .query(
+                    &TenantId::parse(tenant).expect("valid"),
+                    &[],
+                    &[],
+                    QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    100,
+                    true,
+                )
+                .unwrap();
+            let total: usize = results.iter().map(|s| s.entries.len()).sum();
+            assert_eq!(total, expected, "tenant {tenant} sees only its own rows");
+        }
+    }
+
+    /// A truncated ordinal table is corruption the part must refuse at open:
+    /// the stream index cross-check catches it before any scan could index
+    /// out of bounds (the scan keeps its own bound check as a second fence).
+    #[test]
+    fn a_truncated_stream_table_is_rejected_at_open() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let stream = |app: &str| -> SharedLabels {
+            std::sync::Arc::new([("app".to_string(), app.to_string())].into_iter().collect())
+        };
+        let mut rows = Vec::new();
+        for (app, offset) in [("aa", 0i64), ("bb", 10)] {
+            let labels = stream(app);
+            for i in 0..3 {
+                rows.push(Row {
+                    tenant: test_tenant(),
+                    timestamp_ns: base + offset + i,
+                    labels: labels.clone(),
+                    line: format!("{app} {i}"),
+                    structured_metadata: vec![],
+                });
+            }
+        }
+        let part = flush_rows(rows, &tmp, 8192).unwrap().remove(0);
+
+        // Truncate the ordinal table to one entry, keeping the label-name
+        // union (and therefore validation) intact, and re-checksum so only
+        // the scan-time bound check can catch it.
+        let meta_path = part.dir.join(META_FILE);
+        let mut meta: MetaFile =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.streams.truncate(1);
+        meta.integrity.metadata_crc32 = 0;
+        meta.integrity.metadata_crc32 = metadata_crc32(&meta).unwrap();
+        fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let reloaded = load_part(&part.dir).unwrap();
+        let error = match PartReader::open(reloaded) {
+            Ok(_) => panic!("a truncated stream table must refuse to open"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("stream index labels do not match metadata"),
+            "{error}"
+        );
+    }
+
+    /// A part written before the `_stream` column fails at open with the
+    /// remedy in the message, before any arrow downcast could panic.
+    #[test]
+    fn an_old_format_part_fails_loudly_naming_reingest() {
+        let tmp = tempfile_dir();
+        let rows = vec![window_row(1_700_000_000_000_000_000, vec![])];
+        let part = flush_rows(rows, &tmp, 8192).unwrap().remove(0);
+
+        // Rewrite data.parquet with the pre-ordinal schema: a label column
+        // where `_stream` now lives.
+        let old_schema = Arc::new(Schema::new(vec![
+            Field::new(TENANT_COLUMN, DataType::Utf8, false),
+            Field::new("timestamp_ns", DataType::Int64, false),
+            Field::new("_msg", DataType::Utf8, false),
+            Field::new("app", DataType::Utf8, true),
+            Field::new("structured_metadata", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            old_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![test_tenant().as_str().to_string()])),
+                Arc::new(Int64Array::from(vec![1_700_000_000_000_000_000i64])),
+                Arc::new(StringArray::from(vec!["old row"])),
+                Arc::new(StringArray::from(vec![Some("windows")])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+            ],
+        )
+        .unwrap();
+        let file = fs::File::create(part.dir.join(DATA_FILE)).unwrap();
+        let mut writer = ArrowWriter::try_new(file, old_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Refresh the data checksum so the ordinal gate — not the CRC — is
+        // what fires.
+        let meta_path = part.dir.join(META_FILE);
+        let mut meta: MetaFile =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.integrity.data_crc32 = file_crc32(&part.dir.join(DATA_FILE)).unwrap();
+        meta.integrity.metadata_crc32 = 0;
+        meta.integrity.metadata_crc32 = metadata_crc32(&meta).unwrap();
+        fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let reloaded = load_part(&part.dir).unwrap();
+        let error = match PartReader::open(reloaded) {
+            Ok(_) => panic!("old schema must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("delete the data directory and re-ingest"),
+            "{error}"
+        );
+    }
+
+    /// The ordinal path answers every matcher class exactly as a brute-force
+    /// filter over the raw rows does — including `{label=""}` on streams
+    /// missing the label, negations and regexes.
+    #[test]
+    fn ordinal_matching_equals_brute_force_across_matcher_classes() {
+        let tmp = tempfile_dir();
+        let base = 1_700_000_000_000_000_000i64;
+        let make = |pairs: &[(&str, &str)]| -> SharedLabels {
+            std::sync::Arc::new(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        let streams = [
+            make(&[("app", "api"), ("env", "prod")]),
+            make(&[("app", "web")]),
+            make(&[("app", "api")]),
+            make(&[]),
+        ];
+        let mut rows = Vec::new();
+        for (index, labels) in streams.iter().enumerate() {
+            for i in 0..5i64 {
+                rows.push(Row {
+                    tenant: test_tenant(),
+                    timestamp_ns: base + index as i64 * 100 + i,
+                    labels: labels.clone(),
+                    line: format!("s{index} r{i}"),
+                    structured_metadata: vec![],
+                });
+            }
+        }
+        let part = flush_rows(rows.clone(), &tmp, 4).unwrap().remove(0);
+        let reader = PartReader::open(part).unwrap();
+
+        let matcher = |name: &str, op: MatcherOp, value: &str| {
+            LabelMatcher::new(name.to_string(), op, value.to_string()).unwrap()
+        };
+        let cases: Vec<Vec<LabelMatcher>> = vec![
+            vec![matcher("app", MatcherOp::Eq, "api")],
+            vec![matcher("app", MatcherOp::Neq, "api")],
+            vec![matcher("env", MatcherOp::Eq, "")],
+            vec![matcher("app", MatcherOp::Re, "a.+")],
+            vec![matcher("app", MatcherOp::NRe, "w.b")],
+            vec![
+                matcher("app", MatcherOp::Eq, "api"),
+                matcher("env", MatcherOp::Eq, "prod"),
+            ],
+        ];
+        for matchers in cases {
+            let results = reader
+                .query(
+                    &test_tenant(),
+                    &matchers,
+                    &[],
+                    QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    1000,
+                    true,
+                )
+                .unwrap();
+            let mut got: Vec<i64> = results
+                .iter()
+                .flat_map(|s| s.entries.iter().map(|e| e.timestamp_ns))
+                .collect();
+            got.sort_unstable();
+            let mut want: Vec<i64> = rows
+                .iter()
+                .filter(|row| matchers.iter().all(|m| m.matches(&row.labels)))
+                .map(|row| row.timestamp_ns)
+                .collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "matchers {matchers:?}");
+        }
+        // The empty label set is a stream like any other: it has an ordinal
+        // and turns up in series.
+        let series = reader.series(&test_tenant(), &[]);
+        assert!(series.iter().any(|labels| labels.is_empty()));
     }
 
     fn walk_meta_dirs(root: &Path) -> Vec<PathBuf> {

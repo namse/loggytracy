@@ -174,13 +174,14 @@ pub fn flush_rows_with_merge_tombstone(
 /// `Vec<Row>` first, which `docs/MEMORY_ATTRIBUTION.md` measured at 829 of 847
 /// live megabytes at the settle peak.
 ///
-/// `stream_labels` and `partition` come from the inputs' `meta.json`, not from
-/// the rows, because the schema names a column per stream label and has to
-/// exist before the first row group. That makes the label set a **superset**:
-/// a label whose only rows were dropped by retention or a delete request still
-/// gets a column, all null. It costs a compressed empty column rather than a
-/// second pass over the rows to find out, and no read path can see the
-/// difference — an absent value prunes exactly as a missing column does.
+/// `metadata_keys`/`parsed_keys` and `partition` come from the inputs'
+/// `meta.json`, not from the rows, because the schema names those columns and
+/// has to exist before the first row group. Labels stopped being schema when
+/// the `_stream` ordinal landed: the writer assigns ordinals as rows arrive
+/// and derives `meta.streams` and `stream_labels` from what actually
+/// survived — which also retired the superset hazard where a label whose
+/// last rows retention dropped would fail the merged part's own metadata
+/// validation.
 ///
 /// A stream that turns out to be empty leaves no part and no tombstone, the
 /// same as flushing an empty `Vec`.
@@ -190,7 +191,6 @@ pub fn flush_row_stream_with_merge_tombstone(
     keep: &mut dyn FnMut(&Row) -> bool,
     parts_root: &Path,
     partition: &str,
-    stream_labels: Vec<String>,
     metadata_keys: Vec<String>,
     parsed_keys: Vec<String>,
     row_group_size: usize,
@@ -205,7 +205,7 @@ pub fn flush_row_stream_with_merge_tombstone(
     fs::create_dir_all(&staging)?;
 
     let mut writer =
-        StreamingPartWriter::create(&staging, stream_labels, metadata_keys, parsed_keys, row_group_size)?;
+        StreamingPartWriter::create(&staging, metadata_keys, parsed_keys, row_group_size)?;
     let mut dropped = 0u64;
     let mut kept = 0u64;
     loop {
@@ -458,11 +458,12 @@ fn write_part_files(
     parsed_columns: &[(String, u64)],
     row_group_size: usize,
 ) -> io::Result<()> {
+    let (ordinals, stream_table) = assign_stream_ordinals(rows)?;
     write_parquet(
         &dir.join(DATA_FILE),
         rows,
+        &ordinals,
         parsed_rows,
-        stream_labels,
         metadata_columns,
         parsed_columns,
         row_group_size,
@@ -480,6 +481,7 @@ fn write_part_files(
         partition,
         rows,
         row_group_size,
+        &stream_table,
         stream_labels,
         metadata_columns,
         parsed_columns,
@@ -519,9 +521,74 @@ fn row_group_bounds(rows: &[Row], row_group_size: usize) -> Vec<(usize, usize)> 
     out
 }
 
+/// First-occurrence stream ordinals over a sorted, deduplicated row stream.
+///
+/// Both writers fold the identical `(tenant, labels, ts, …)`-sorted sequence
+/// through this, so the assignment is a pure function of the rows and the two
+/// cannot disagree — which is what lets the streaming writer emit ordinals a
+/// row group at a time without ever seeing the whole part.
+///
+/// Dedup crosses tenants on purpose, matching what `meta.streams` always
+/// stored: a label set two tenants share is one table entry with two runs in
+/// the row order. Tenancy is enforced by row groups and the `_tenant` column,
+/// never by the ordinal.
+pub(crate) struct StreamOrdinals {
+    by_labels: HashMap<SharedLabels, u32>,
+    table: Vec<SharedLabels>,
+    /// The run fast path: consecutive rows almost always share a stream, and
+    /// `Arc::ptr_eq` answers without hashing the map.
+    last: Option<(SharedLabels, u32)>,
+}
+
+impl StreamOrdinals {
+    pub(crate) fn new() -> Self {
+        Self {
+            by_labels: HashMap::new(),
+            table: Vec::new(),
+            last: None,
+        }
+    }
+
+    pub(crate) fn ordinal_of(&mut self, labels: &SharedLabels) -> io::Result<u32> {
+        if let Some((last_labels, ordinal)) = &self.last
+            && (Arc::ptr_eq(last_labels, labels) || last_labels == labels)
+        {
+            return Ok(*ordinal);
+        }
+        let ordinal = match self.by_labels.get(labels) {
+            Some(ordinal) => *ordinal,
+            None => {
+                let ordinal = u32::try_from(self.table.len()).map_err(|_| {
+                    io::Error::other("part stream table exceeds u32 ordinals")
+                })?;
+                self.by_labels.insert(labels.clone(), ordinal);
+                self.table.push(labels.clone());
+                ordinal
+            }
+        };
+        self.last = Some((labels.clone(), ordinal));
+        Ok(ordinal)
+    }
+
+    pub(crate) fn into_table(self) -> Vec<SharedLabels> {
+        self.table
+    }
+}
+
+/// The batch path's fold: one ordinal per row, plus the table the rows
+/// defined, in assignment order.
+fn assign_stream_ordinals(rows: &[Row]) -> io::Result<(Vec<u32>, Vec<SharedLabels>)> {
+    let mut ordinals = StreamOrdinals::new();
+    let mut per_row = Vec::with_capacity(rows.len());
+    for row in rows {
+        per_row.push(ordinals.ordinal_of(&row.labels)?);
+    }
+    Ok((per_row, ordinals.into_table()))
+}
+
 /// The Parquet column a metadata key is stored in.
 ///
-/// The `_sm:` prefix keeps the metadata namespace disjoint from the label
+/// The `_sm:` prefix keeps the metadata namespace disjoint from the reserved
 /// columns that precede it in the schema: `:` cannot appear in a validated
 /// label name, and metadata keys are arbitrary strings (OTLP attributes keep
 /// their dots), so the mapping is injective in both directions.
@@ -535,19 +602,18 @@ fn parsed_column_name(key: &str) -> String {
     format!("_pf:{key}")
 }
 
-fn part_schema(
-    stream_labels: &[String],
-    metadata_keys: &[String],
-    parsed_keys: &[String],
-) -> Arc<Schema> {
+fn part_schema(metadata_keys: &[String], parsed_keys: &[String]) -> Arc<Schema> {
     let mut fields = vec![
         Field::new(TENANT_COLUMN, DataType::Utf8, false),
         Field::new("timestamp_ns", DataType::Int64, false),
         Field::new("_msg", DataType::Utf8, false),
+        // One ordinal instead of a column per stream label: the label sets
+        // live once in `meta.streams` and every row names its set by index.
+        // The wide projection stops paying a per-label column build, and the
+        // scan resolves labels with an `Arc` clone instead of rebuilding maps
+        // from columns.
+        Field::new(STREAM_COLUMN, DataType::UInt32, false),
     ];
-    for label in stream_labels {
-        fields.push(Field::new(label, DataType::Utf8, true));
-    }
     for key in metadata_keys {
         fields.push(Field::new(metadata_column_name(key), DataType::Utf8, true));
     }
@@ -561,8 +627,8 @@ fn part_schema(
 fn row_group_batch(
     schema: &Arc<Schema>,
     rows: &[Row],
+    ordinals: &[u32],
     parsed_rows: &[Option<BTreeMap<String, String>>],
-    stream_labels: &[String],
     metadata_keys: &[String],
     parsed_keys: &[String],
 ) -> io::Result<RecordBatch> {
@@ -599,14 +665,8 @@ fn row_group_batch(
         Arc::new(StringArray::from(tenants)),
         Arc::new(Int64Array::from(ts)),
         Arc::new(StringArray::from(msg)),
+        Arc::new(UInt32Array::from(ordinals.to_vec())),
     ];
-    for label in stream_labels {
-        let vals: Vec<Option<&str>> = rows
-            .iter()
-            .map(|r| r.labels.get(label).map(|s| s.as_str()))
-            .collect();
-        columns.push(Arc::new(StringArray::from(vals)));
-    }
     for key in metadata_keys {
         let vals: Vec<Option<&str>> = rows
             .iter()
@@ -666,8 +726,8 @@ fn part_writer_properties(row_group_size: usize) -> WriterProperties {
 fn write_parquet(
     path: &Path,
     rows: &[Row],
+    ordinals: &[u32],
     parsed_rows: &[Option<BTreeMap<String, String>>],
-    stream_labels: &[String],
     metadata_columns: &[(String, u64)],
     parsed_columns: &[(String, u64)],
     row_group_size: usize,
@@ -677,7 +737,7 @@ fn write_parquet(
         .map(|(key, _)| key.clone())
         .collect();
     let parsed_keys: Vec<String> = parsed_columns.iter().map(|(key, _)| key.clone()).collect();
-    let schema = part_schema(stream_labels, &metadata_keys, &parsed_keys);
+    let schema = part_schema(&metadata_keys, &parsed_keys);
     let bounds = row_group_bounds(rows, row_group_size);
 
     let file = fs::File::create(path)?;
@@ -691,8 +751,8 @@ fn write_parquet(
         let batch = row_group_batch(
             &schema,
             &rows[*start..*end],
+            &ordinals[*start..*end],
             &parsed_rows[*start..*end],
-            stream_labels,
             &metadata_keys,
             &parsed_keys,
         )?;
