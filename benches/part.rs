@@ -261,7 +261,10 @@ fn bench_scan_filters(c: &mut Criterion) {
         "ffffffffffffffffffffffffffffffff".to_string(),
         true,
     );
-    for (name, predicate) in [("exact_field_hit", present), ("exact_field_pruned", absent)] {
+    for (name, predicate) in [
+        ("exact_field_hit", present.clone()),
+        ("exact_field_pruned", absent),
+    ] {
         let predicates = [predicate];
         group.bench_function(name, |b| {
             b.iter(|| {
@@ -279,6 +282,41 @@ fn bench_scan_filters(c: &mut Criterion) {
             });
         });
     }
+
+    // The comparison bed's rare-shape "cold" runs after the broad shapes
+    // already decoded these groups. This is that case locally: the reader is
+    // opened with the row-group cache on, one broad backward scan is the fill
+    // traffic, and the exact-field query is then served from cached batches.
+    loggytracy::part::configure_row_group_cache(Some(1 << 30));
+    let cached = write_part(&corpus, "part-filters-cached");
+    cached
+        .reader
+        .query(
+            &tenant,
+            &[],
+            &[],
+            loggytracy::part::QueryTimeRange::closed(start, end),
+            usize::MAX,
+            false,
+        )
+        .expect("fill scan succeeds");
+    let predicates = [present];
+    group.bench_function("exact_field_hit_cached", |b| {
+        b.iter(|| {
+            cached
+                .reader
+                .query_with_exact_field_pruning(
+                    &tenant,
+                    &[],
+                    ExactFieldPruning::new(&[], &predicates),
+                    loggytracy::part::QueryTimeRange::closed(start, end),
+                    100,
+                    false,
+                )
+                .expect("scan succeeds")
+        });
+    });
+    loggytracy::part::configure_row_group_cache(None);
     group.finish();
 }
 
