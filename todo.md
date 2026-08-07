@@ -838,6 +838,41 @@ not assumed. Query-under-ingest still has no *budget* (open question 2 stands, n
 baseline to regress against). And `anon/live` in the memprof legs still reads ~5–8 — the allocator
 retention item at M10's "honest metering" is untouched by any of this.
 
+## Next: production polish, not more speed (decided 2026-08-07)
+
+The performance arc is frozen where it stands: every log shape under VictoriaLogs on both passes,
+`rate` at the 0.03 ms jitter floor, everything gated and recorded below. The user's direction after
+the sweep: wrap toward production readiness rather than extend the bench. The reasoning, recorded so
+the next session does not relitigate it: the claim is proven and sealed; further hot-path caching
+widens the answer-risk surface for diminishing returns (the advisory serve lived one day); and the
+next real bottleneck will come from running long, not from benching bigger. The one measured
+rejection standing guard: **do not build the memory-budget arena derivation** — deriving knob
+defaults from a memory limit was tried and made the engine worse (config.rs `HostMemory` doc,
+docs/MEMORY_BUDGET_GATE.md), and it stays out until a budget-point measurement campaign says
+otherwise.
+
+The polish order, each item a measurement or a bound, none a feature:
+
+1. **Soak leg** — hours-to-a-day of ingest + query + merge + retention on the 2 GiB rig. Every gate
+   so far is minutes long. What only a soak can show: part-count growth against the unevictable
+   sidecars, WAL behavior under the local-compaction policy (compacts only with an object store
+   configured), merge cascade pacing, row-group-cache counter drift over thousands of
+   evictions/retractions, allocator retention over hours (the 1.34-1.69 anon/live was measured at
+   60 s). Deliverable: a `run_memprof_local.sh`-style script with an hours cap, and its verdict in
+   this file.
+2. **The unbounded residents** — sidecar + `PartMeta::streams` grow with part count and nothing
+   evicts them (~380 KB/part measured; VISION already scopes the fix: sidecars are durable in
+   `index.bin`, so eviction is a re-read; stream identity can be a fingerprint). The in-flight push
+   body bound is in the same class (recorded, unimplemented). These become the first production
+   incident the day retention is long.
+3. **One large-corpus bed run** — 10-100x the 150k-row dataset, as claim-scope validation rather
+   than tuning: does the 1.4 ms-constant race hold when parts multiply and the cache's working set
+   overflows 256 MiB? Published win or lose, per house rule.
+4. **The review gate list** — docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md worked through;
+   CONFIGURATION/ARCHITECTURE re-checked against behavior (the cache, the narrow memo, StreamKey
+   and the fence are all newer than the docs); refusal-path messages (429s, limit errors)
+   consistent.
+
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
 The user's bar for this round: "VL보다 빠르지 않으면 의미가 없습니다" — `metadata_rare` must beat
