@@ -910,7 +910,12 @@ found four things first, three of them the soak's own questions answering early.
   12 M events, zero errors, verdict PASS, anon flat between 420 and 554 MiB** — no ratchet at
   all. So the condition is not inherently beyond a 2 GiB container: an engine of this class holds
   it in half a gigabyte. loggytracy outlives Loki and the allocator ratchet is the distance to
-  VictoriaLogs.
+  VictoriaLogs. Why each, measured rather than guessed: VictoriaLogs reads the cgroup limit at
+  startup and declares 60 % of it as its own budget (`vm_available_memory_bytes` 2147483648,
+  `vm_allowed_memory_bytes` 1288490188 under a 2 g container) — M10's "declared memory budget",
+  built in and automatic — while Loki, also Go and therefore without the glibc layer, died of a
+  live working set whose defaults derive from no limit at all (anon 579 → 1632 MiB in 80 s).
+  loggytracy shares Loki's problem and adds glibc's on top.
 - [ ] **Retention and merge race on part files.** Merge selects a group, retention whole-part
   deletes an input, and `rewrite_group` fails with ENOENT — surfaced as an ERROR-level "merge
   iteration failed", four times in twenty minutes at the aggressive 5 m retention. The outcome is
