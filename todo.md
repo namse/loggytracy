@@ -964,6 +964,13 @@ found four things first, three of them the soak's own questions answering early.
   sidecar in a 2 GiB container: **the soak cannot run a day at any real retention until the sidecars
   are evictable** — M10's "Sidecars inside the budget", VISION's scoping (durable in `index.bin`,
   eviction is a re-read), promoted from deferred to blocking by this run.
+- **The second 24-hour attempt died at t≈8653 s with every gauged resident flat and anon creeping
+  ~130 MiB/hour, and the 90-minute memprof diagnosis named the creep**: live oscillates 514–740 MiB
+  with no trend while glibc-retained free climbs 846 → 1042 MiB (anon/live 2.94 at the end) — the
+  middle-of-heap chunks the fixed trim threshold cannot release, accumulating across hours. Answered
+  with `malloc_trim(0)` on a timer (`48fc971`, `LOGGYTRACY_MALLOC_TRIM_INTERVAL`, 60 s default, `off`
+  disables): the one glibc call that `MADV_DONTNEED`s free pages wherever they sit in an arena. The
+  relaunched 24-hour run is its verification.
 - [ ] **The read tail under sustained churn — mostly explained, one residue left.** The collapse
   (p95 33.3 s at 2 GiB budgeted / 78.0 s at 8 GiB default, in every long pre-eviction run) was
   substantially the unbounded part/sidecar backlog: with the blooms evictable and parts steady
