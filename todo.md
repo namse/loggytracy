@@ -873,6 +873,49 @@ The polish order, each item a measurement or a bound, none a feature:
    and the fence are all newer than the docs); refusal-path messages (429s, limit errors)
    consistent.
 
+### The soak rig is built, and its first four minutes contradicted the gates (2026-08-08)
+
+`scripts/run_soak_local.sh` is the deliverable: the memprof rig pointed at hours — a native
+cgroup v2 scope at 2 GiB, the bed's corpus at 20 k eps with queries at 5 eps, retention **on**
+(30 m period / 60 s interval / 5 m grace by default; the probes below shortened it to 5 m so it
+would fire inside a smoke), the data directory on disk rather than tmpfs (tmpfs pages are charged
+to the writing cgroup as shmem and, with swap off, hours of parts would manufacture an OOM the
+disk engine does not have), a disk-space guard, and a verdict of quarter-by-quarter trends per
+resident rather than one peak. The 24-hour run it was built for has not run yet: the smoke runs
+found four things first, three of them the soak's own questions answering early.
+
+- **Sustained load does not fit 2 GiB: OOM-killed at t≈150 s (memprof build) and t≈255 s
+  (production build), retention never having fired.** Every green 2 GiB gate measured a ~60 s
+  ingest burst plus a settle; the soak's anon passes those gates' 1817–1832 MiB passing peaks at
+  about the moment their workload would have ended, and keeps climbing (quarter means 496 → 1147 →
+  1308 → 1526 MiB, peak 1921) until the kill. "Survives ingest" was never "fits a container" —
+  [`docs/MEMORY_BUDGET_GATE.md`](docs/MEMORY_BUDGET_GATE.md) said exactly that — and the soak
+  measured the difference in its first four minutes.
+- **It is a ratchet, not a leak.** The 25-minute memprof run at 8 GiB: the live sum oscillates
+  450–1500 MiB with no trend — merge saws 0↔600 MiB, query stays ≤300 MiB, the row-group cache
+  sits flat at ~250 MiB, sidecars at ~100–200 MiB with retention deleting parts — while
+  glibc-retained free ratchets 915 → 1078 → 1627 → 2628 MiB and never comes back down. anon steps
+  1710 → 2525 → 3157 → 3295 MiB with shrinking increments: it converges on the historical maximum
+  of *coincident* live spikes times fragmentation, ~3.4 GiB on this workload, which is why 8 GiB
+  survives and 2 GiB cannot. Final anon/live **5.30**, against the 1.34–1.69 the attribution doc
+  measured over 60 s — the tuning's trim threshold returns nothing here because the retained bytes
+  are not at the top of any arena.
+- **`MALLOC_ARENA_MAX=1` survives ten minutes at 2 GiB** (anon peak 1322 MiB, queries 2507/0
+  errors) and re-inflicts exactly the cost that made it non-default: the WAL backlog climbs
+  2.9 → 50.7 MiB and is still rising where the default's stayed near 1.4 MiB.
+- [ ] **Retention and merge race on part files.** Merge selects a group, retention whole-part
+  deletes an input, and `rewrite_group` fails with ENOENT — surfaced as an ERROR-level "merge
+  iteration failed", four times in twenty minutes at the aggressive 5 m retention. The outcome is
+  benign (the group is skipped and the next tick re-lists) but it is wasted work wearing an
+  incident's log level, and it fires at any retention setting given enough hours.
+- [ ] **~1 % of queries 504 under sustained 20 k eps with merge and retention active** (48/4,926
+  at 8 GiB; first: `| json | level="debug"` timed out). The load gate's p95 passes in minutes-long
+  runs; the sustained tail is a different number.
+- [ ] **The 24-hour run needs a configuration that can survive it, and that is a decision rather
+  than a default**: 2 GiB with `MALLOC_ARENA_MAX=1` (the declared rig with the one measured knob;
+  the WAL-backlog trend is the risk it would be testing), or a limit the ratchet fits (≥4–6 GiB,
+  which tests everything else the soak exists to watch). Undecided as of this entry.
+
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
 The user's bar for this round: "VL보다 빠르지 않으면 의미가 없습니다" — `metadata_rare` must beat
