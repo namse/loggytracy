@@ -940,6 +940,20 @@ found four things first, three of them the soak's own questions answering early.
   record). The 2 GiB / 20 k eps / retention-on configuration that died at 150–255 s **survives its
   600 s probe at anon peak 1480 MiB**, `memory_gate --budget 2GiB` is UNDER_BUDGET, and 8 GiB
   throughput is unchanged. The 24-hour run itself is still owed.
+- [x] **The sidecars are evictable now, and the hour that used to be impossible passes whole.**
+  `part/bloom_cache.rs` (`6615a04`): the bloom half of every sidecar — the megabytes — lives under
+  one process-wide LRU byte budget (`LOGGYTRACY_SIDECAR_CACHE_MAX_BYTES`, derived at 10% of the
+  declared budget, unbounded when budgeting is off), evicted across parts and re-read from
+  `index.bin` on the next pruning query; the stream index — the kilobytes — stays resident so the
+  infallible metadata paths stay infallible, and a matchers-only query still never touches blooms
+  at all. Answer equality under eviction is pinned by test (a one-byte budget forces every open to
+  evict every other part; the filtered answer must not change), and byte accounting survives
+  reinstall races and reader drops by construction. Verified on the killing configuration —
+  2 GiB, 20 k eps, retention 30 m, one hour: **survived with verdict PASS, zero query errors in
+  14,998**, sidecar 630-and-climbing → **120 MiB flat**, parts steady at ~330 after the retention
+  peak, anon peak 1730 MiB (84%). And the read tail moved with it: overall query response p95
+  **33.3 s → 651 ms** over the hour — most of the "collapse under churn" below was the unbounded
+  part/sidecar backlog. p99 16.9 s remains, which is the stall item's shape, not this one's.
 - **The 24-hour run was launched on that configuration and died at t≈1834 s, and the verdict table
   names the killer in one line: the sidecars.** At the real 30 m retention (the probes above ran 5 m,
   which is why they passed), no part is deleted for the first ~35 minutes, the part count reaches 320
@@ -950,14 +964,12 @@ found four things first, three of them the soak's own questions answering early.
   sidecar in a 2 GiB container: **the soak cannot run a day at any real retention until the sidecars
   are evictable** — M10's "Sidecars inside the budget", VISION's scoping (durable in `index.bin`,
   eviction is a re-read), promoted from deferred to blocking by this run.
-- [ ] **The read tail collapses under sustained churn in every configuration, and the budget is not
-  the cause.** Overall query response p95 across the long probes: 33.3 s (2 GiB budgeted, 600 s),
-  11.2 s (2 GiB arena-1, 600 s), **78.0 s (8 GiB, default pools, 20 min)** — while every 240 s run
-  reads ~300 ms and PASSes. Whatever degrades is a function of runtime — part count under
-  retention churn, the observed ~20 s query-counter stalls beside merge, or both — and it is why
-  every long run's load verdict is `PASS_BEHAVIORAL_ONLY`. This is the soak's next defect to
-  chase, separate from memory: the 2 s p95 gate passes in minutes-long beds and is off by an
-  order of magnitude an hour in.
+- [ ] **The read tail under sustained churn — mostly explained, one residue left.** The collapse
+  (p95 33.3 s at 2 GiB budgeted / 78.0 s at 8 GiB default, in every long pre-eviction run) was
+  substantially the unbounded part/sidecar backlog: with the blooms evictable and parts steady
+  under retention, the same hour reads p95 **651 ms** and the load verdict is a full PASS. What
+  remains is the tail's tail: **p99 16.9 s, max 26.6 s** — the ~20 s query-counter stalls observed
+  beside merge in the memprof run. That is a scheduling/stall question now, not a growth one.
 
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
