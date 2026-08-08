@@ -971,6 +971,17 @@ found four things first, three of them the soak's own questions answering early.
   with `malloc_trim(0)` on a timer (`48fc971`, `LOGGYTRACY_MALLOC_TRIM_INTERVAL`, 60 s default, `off`
   disables): the one glibc call that `MADV_DONTNEED`s free pages wherever they sit in an arena. The
   relaunched 24-hour run is its verification.
+- **Third attempt: t≈14,568 s (4.05 h), the trim halved the creep and the residue still kills.**
+  Every gauge flat again (sidecar 120, parts ~315, cache 153, disk 2.40 GB, wal_backlog 4.7 MB,
+  queries 0 errors in 60,654), anon slope ~130 → ~68 MiB/hour between the two attempts — the timer
+  works — and the peak still reached 2015 MiB in four hours. What trim cannot return is a free chunk
+  on a page it shares with a live one, and with four arenas the free space stays scattered across
+  four heaps. The next and last glibc lever is `MALLOC_ARENA_MAX=1` — consolidation is what makes
+  whole pages free — whose measured cost (flush cadence, WAL backlog 8 → 50 MiB) predates the budget
+  and the streaming merge, so the fourth attempt runs with it and the backlog column is the thing to
+  read. If the residue survives one arena too, the remaining option is the one the M10 item named:
+  an allocator whose heap decays (jemalloc/mimalloc), which is a dependency decision to bring to the
+  user, not a knob.
 - [ ] **The read tail under sustained churn — mostly explained, one residue left.** The collapse
   (p95 33.3 s at 2 GiB budgeted / 78.0 s at 8 GiB default, in every long pre-eviction run) was
   substantially the unbounded part/sidecar backlog: with the blooms evictable and parts steady
