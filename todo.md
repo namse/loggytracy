@@ -903,6 +903,14 @@ found four things first, three of them the soak's own questions answering early.
 - **`MALLOC_ARENA_MAX=1` survives ten minutes at 2 GiB** (anon peak 1322 MiB, queries 2507/0
   errors) and re-inflicts exactly the cost that made it non-default: the WAL backlog climbs
   2.9 → 50.7 MiB and is still rising where the default's stayed near 1.4 MiB.
+- **The same sustained workload was then pointed at the other two engines, same 2 GiB, same
+  corpus, seed, rates and duration, containerized from `compare/docker-compose.yml`.** Loki was
+  OOM-killed at **t≈112 s** — before loggytracy's production build's 255 s — having delivered
+  3.7 k of the offered 20 k eps overall. VictoriaLogs delivered **19,973 eps for the full 600 s,
+  12 M events, zero errors, verdict PASS, anon flat between 420 and 554 MiB** — no ratchet at
+  all. So the condition is not inherently beyond a 2 GiB container: an engine of this class holds
+  it in half a gigabyte. loggytracy outlives Loki and the allocator ratchet is the distance to
+  VictoriaLogs.
 - [ ] **Retention and merge race on part files.** Merge selects a group, retention whole-part
   deletes an input, and `rewrite_group` fails with ENOENT — surfaced as an ERROR-level "merge
   iteration failed", four times in twenty minutes at the aggressive 5 m retention. The outcome is
