@@ -940,6 +940,16 @@ found four things first, three of them the soak's own questions answering early.
   record). The 2 GiB / 20 k eps / retention-on configuration that died at 150–255 s **survives its
   600 s probe at anon peak 1480 MiB**, `memory_gate --budget 2GiB` is UNDER_BUDGET, and 8 GiB
   throughput is unchanged. The 24-hour run itself is still owed.
+- **The 24-hour run was launched on that configuration and died at t≈1834 s, and the verdict table
+  names the killer in one line: the sidecars.** At the real 30 m retention (the probes above ran 5 m,
+  which is why they passed), no part is deleted for the first ~35 minutes, the part count reaches 320
+  and `loggytracy_part_sidecar_resident_bytes` climbs monotonically 87.6 → 266.5 → 447.4 →
+  **630.2 MiB** — ~2 MiB per part now, not the ~240 KB the old attribution measured, the 0.1% blooms
+  having widened them — while every budgeted term holds (cache flat at 153 MiB, wal_backlog 2 MiB,
+  anon peak 2009). Steady state at 30 m retention would be ~600+ live parts, which is ~1.2 GiB of
+  sidecar in a 2 GiB container: **the soak cannot run a day at any real retention until the sidecars
+  are evictable** — M10's "Sidecars inside the budget", VISION's scoping (durable in `index.bin`,
+  eviction is a re-read), promoted from deferred to blocking by this run.
 - [ ] **The read tail collapses under sustained churn in every configuration, and the budget is not
   the cause.** Overall query response p95 across the long probes: 33.3 s (2 GiB budgeted, 600 s),
   11.2 s (2 GiB arena-1, 600 s), **78.0 s (8 GiB, default pools, 20 min)** — while every 240 s run
