@@ -54,6 +54,7 @@ mod libc_shim {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe extern "C" {
         pub fn mallopt(param: c_int, value: c_int) -> c_int;
+        pub fn malloc_trim(pad: usize) -> c_int;
     }
 }
 
@@ -98,5 +99,38 @@ fn apply(arena_max: i32, mmap_threshold: i32) -> bool {
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn apply(_arena_max: i32, _mmap_threshold: i32) -> bool {
+    false
+}
+
+/// Return glibc's free-but-retained pages to the kernel, from the middle of
+/// every arena and not just the top.
+///
+/// The trim threshold set above only releases the top of each heap; a chunk
+/// freed *under* live allocations stays resident, and the second 24-hour soak
+/// measured exactly that shape: every gauged resident flat — sidecars,
+/// cache, parts, disk — while anon crept ~130 MiB/hour until the 2 GiB kill
+/// at t≈8653 s (todo.md). `malloc_trim(0)` walks the arenas and
+/// `MADV_DONTNEED`s whole free pages wherever they sit, which is the one
+/// glibc call that reaches the middle-of-heap creep. Called periodically by
+/// the loop `LOGGYTRACY_MALLOC_TRIM_INTERVAL` configures.
+///
+/// Returns whether anything could be released at all (false on non-glibc,
+/// where the loop never starts).
+pub fn trim() -> bool {
+    trim_impl()
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_impl() -> bool {
+    // SAFETY: malloc_trim only consolidates and releases free memory; it is
+    // documented as callable at any time and takes the arena locks itself.
+    unsafe {
+        libc_shim::malloc_trim(0);
+    }
+    true
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_impl() -> bool {
     false
 }

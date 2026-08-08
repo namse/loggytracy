@@ -215,6 +215,13 @@ pub struct Config {
     /// would replace a visible crash with an invisible hang, and past this the
     /// orchestrator's own restart backoff is the better place to escalate.
     pub startup_retry_budget: Duration,
+    /// How often the background loop calls glibc's `malloc_trim(0)`, which
+    /// returns free pages from the *middle* of every arena to the kernel —
+    /// the fixed trim threshold only releases heap tops, and the second
+    /// 24-hour soak measured the difference as an ~130 MiB/hour anonymous
+    /// creep with every gauged resident flat (todo.md). `off` disables the
+    /// loop; non-glibc builds never start it.
+    pub malloc_trim_interval: Option<Duration>,
     /// The declared memory budget the derived ceilings are computed from, or
     /// `None` when budgeting is off. Resolved once in [`Config::from_env`]:
     /// explicit `LOGGYTRACY_MEMORY_BUDGET` bytes, `off`, or — unset — 60% of
@@ -304,6 +311,7 @@ impl Default for Config {
             max_trace_restore_runtime: Duration::from_secs(25),
             shutdown_flush_warn_after: Duration::from_secs(30),
             startup_retry_budget: Duration::from_secs(300),
+            malloc_trim_interval: Some(Duration::from_secs(60)),
             memory_budget_bytes: None,
             memory_budget_source: "off (Config::default)".to_string(),
         }
@@ -464,6 +472,10 @@ impl Config {
             derive_defaults_from_budget(&mut defaults, budget);
         }
         let config = Self {
+            malloc_trim_interval: env_duration(
+                "LOGGYTRACY_MALLOC_TRIM_INTERVAL",
+                defaults.malloc_trim_interval,
+            )?,
             memory_budget_bytes,
             memory_budget_source,
             listen_addr: env_string("LOGGYTRACY_LISTEN_ADDR", defaults.listen_addr),

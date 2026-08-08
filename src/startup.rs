@@ -473,6 +473,26 @@ pub async fn run(config: Arc<Config>) {
         }));
     }
 
+    if let Some(interval) = config.malloc_trim_interval {
+        // Not joined on drain: a trim between two ticks of a draining server
+        // changes nothing, and the runtime reaps the task at exit. Blocking
+        // pool because malloc_trim takes every arena lock while it walks.
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The immediate first tick is startup, where there is nothing to
+            // trim yet.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let supported = tokio::task::spawn_blocking(crate::malloc_tuning::trim).await;
+                if !matches!(supported, Ok(true)) {
+                    break;
+                }
+            }
+        });
+    }
+
     let otlp_journal = journal.clone();
     let otlp_healthy = Arc::new(AtomicBool::new(true));
     let state = Arc::new(AppState::from_config(
