@@ -391,7 +391,11 @@ mod tests {
     /// failure. Below the floor the backlog is trivially healthy.
     #[test]
     fn a_tiny_backlog_is_healthy_whatever_its_shape() {
-        let flat = series_of(&(0..40).map(|step| 1_000_000 + (step % 3) * 400_000).collect::<Vec<_>>());
+        let flat = series_of(
+            &(0..40)
+                .map(|step| 1_000_000 + (step % 3) * 400_000)
+                .collect::<Vec<_>>(),
+        );
         let verdict = wal_backlog_drains(&flat, u64::MAX, 8);
         assert!(verdict.decided);
         assert!(verdict.drained, "{}", verdict.reason);

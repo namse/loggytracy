@@ -112,7 +112,10 @@ impl StreamKey {
     fn new(labels: SharedLabels, metadata: Vec<(String, String)>) -> Self {
         let mut normalized: Vec<(String, String)> = Vec::with_capacity(metadata.len());
         for (name, value) in metadata {
-            match normalized.iter_mut().find(|(existing, _)| *existing == name) {
+            match normalized
+                .iter_mut()
+                .find(|(existing, _)| *existing == name)
+            {
                 Some((_, slot)) => *slot = value,
                 None => normalized.push((name, value)),
             }
@@ -129,38 +132,36 @@ impl StreamKey {
     fn merged(&self) -> impl Iterator<Item = (&str, &str)> {
         let mut labels = self.labels.iter().peekable();
         let mut metadata = self.metadata.iter().peekable();
-        std::iter::from_fn(move || {
-            match (labels.peek(), metadata.peek()) {
-                (Some((ln, lv)), Some((mn, mv))) => match ln.as_str().cmp(mn.as_str()) {
-                    std::cmp::Ordering::Less => {
-                        let out = (ln.as_str(), lv.as_str());
-                        labels.next();
-                        Some(out)
-                    }
-                    std::cmp::Ordering::Greater => {
-                        let out = (mn.as_str(), mv.as_str());
-                        metadata.next();
-                        Some(out)
-                    }
-                    std::cmp::Ordering::Equal => {
-                        labels.next();
-                        let out = (mn.as_str(), mv.as_str());
-                        metadata.next();
-                        Some(out)
-                    }
-                },
-                (Some((ln, lv)), None) => {
+        std::iter::from_fn(move || match (labels.peek(), metadata.peek()) {
+            (Some((ln, lv)), Some((mn, mv))) => match ln.as_str().cmp(mn.as_str()) {
+                std::cmp::Ordering::Less => {
                     let out = (ln.as_str(), lv.as_str());
                     labels.next();
                     Some(out)
                 }
-                (None, Some((mn, mv))) => {
+                std::cmp::Ordering::Greater => {
                     let out = (mn.as_str(), mv.as_str());
                     metadata.next();
                     Some(out)
                 }
-                (None, None) => None,
+                std::cmp::Ordering::Equal => {
+                    labels.next();
+                    let out = (mn.as_str(), mv.as_str());
+                    metadata.next();
+                    Some(out)
+                }
+            },
+            (Some((ln, lv)), None) => {
+                let out = (ln.as_str(), lv.as_str());
+                labels.next();
+                Some(out)
             }
+            (None, Some((mn, mv))) => {
+                let out = (mn.as_str(), mv.as_str());
+                metadata.next();
+                Some(out)
+            }
+            (None, None) => None,
         })
     }
 

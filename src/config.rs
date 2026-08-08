@@ -208,6 +208,17 @@ pub struct Config {
     /// would replace a visible crash with an invisible hang, and past this the
     /// orchestrator's own restart backoff is the better place to escalate.
     pub startup_retry_budget: Duration,
+    /// The declared memory budget the derived ceilings are computed from, or
+    /// `None` when budgeting is off. Resolved once in [`Config::from_env`]:
+    /// explicit `LOGGYTRACY_MEMORY_BUDGET` bytes, `off`, or — unset — 60% of
+    /// the detected limit, which is VictoriaLogs' contract measured to hold
+    /// this same workload in half a gigabyte where this engine and Loki were
+    /// both OOM-killed.
+    pub memory_budget_bytes: Option<u64>,
+    /// Where the budget came from, for the startup log — an operator
+    /// comparing runs needs to know whether a number was declared, derived,
+    /// or absent.
+    pub memory_budget_source: String,
 }
 
 impl Default for Config {
@@ -285,28 +296,34 @@ impl Default for Config {
             max_trace_restore_runtime: Duration::from_secs(25),
             shutdown_flush_warn_after: Duration::from_secs(30),
             startup_retry_budget: Duration::from_secs(300),
+            memory_budget_bytes: None,
+            memory_budget_source: "off (Config::default)".to_string(),
         }
     }
 }
 
 /// What this process is actually allowed to use, and where that came from.
 ///
-/// **Observability only. Nothing derives a default from this**, and that is a
-/// measured decision rather than an omission.
+/// This fed observability alone for a month, and the history matters because it
+/// was a measured rejection: deriving `merge_max_memory_bytes` — that knob only,
+/// at 25% of the container, on the pre-streaming-merge build — moved the kill
+/// *earlier* and raised the ingest-phase peak by ~290 MiB
+/// (`docs/MEMORY_BUDGET_GATE.md`). Smaller groups then meant more merges
+/// overlapping ingest, because a group's rewrite materialized it whole.
 ///
-/// `merge_max_memory_bytes` defaults to 1 GiB, which in a 2 GiB container is
-/// half the machine handed to one background task from no number the operator
-/// gave, and `docs/MEMORY_ATTRIBUTION.md` had measured one merge group's rewrite
-/// as the largest single live term at 771 MiB. Deriving the default from this
-/// limit was the obvious fix and it was tried: at 25% of the container it made
-/// the engine **worse**, moving the kill from the settle into ingest and raising
-/// the ingest-phase peak by about 290 MiB across two runs each. Smaller groups
-/// mean more merges, and more merges overlap ingest — the contention the
-/// previous review recorded as N8. `docs/MEMORY_BUDGET_GATE.md` has the runs.
+/// Two measurements reopened it (2026-08-08, both in `todo.md`'s soak section
+/// and `docs/MEMORY_ATTRIBUTION.md`'s re-measurement). The soak rig showed
+/// sustained load OOM-killing this engine *and Loki* at 2 GiB while
+/// VictoriaLogs finishes the same workload in 554 MiB — because it detects the
+/// cgroup limit and declares 60% of it as its own budget
+/// (`vm_allowed_memory_bytes`), which every internal ceiling then fits. And
+/// the streaming merge changed what the merge budget bounds: pages and writer
+/// state rather than group size, so shrinking it no longer multiplies merges —
+/// the failure mode the rejection was about.
 ///
-/// So the limit is read and logged, because an operator has nowhere else to
-/// learn what the process is inside, and the default stays put until a
-/// measurement says what to move it to.
+/// So the detected limit now seeds `LOGGYTRACY_MEMORY_BUDGET`'s default (60%,
+/// resolved in [`Config::from_env`]) and the derived ceilings are printed at
+/// startup; every explicit knob still overrides its derived value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostMemory {
     pub limit_bytes: Option<u64>,
@@ -360,10 +377,86 @@ fn meminfo_total_bytes() -> Option<u64> {
     kib.checked_mul(1024)
 }
 
+/// The fraction of the detected limit the engine budgets for itself when no
+/// explicit budget is given — VictoriaLogs' number, kept for the same reason
+/// it works there: the other 40% absorbs what a live-byte budget cannot see
+/// (page cache, allocator retention — anon/live 1.60 with the fixed mmap
+/// threshold — thread stacks, and the kernel's own accounting).
+const MEMORY_BUDGET_FRACTION_PERCENT: u64 = 60;
+
+/// `LOGGYTRACY_MEMORY_BUDGET` resolved: explicit bytes, or `off`, or — unset —
+/// [`MEMORY_BUDGET_FRACTION_PERCENT`] of the detected limit. Pure so the
+/// precedence is testable without touching the process environment.
+fn resolve_memory_budget(
+    env_value: Option<&str>,
+    detected: HostMemory,
+) -> Result<(Option<u64>, String), String> {
+    match env_value {
+        Some(raw) => {
+            let value = raw.trim();
+            if value.is_empty() || value.eq_ignore_ascii_case("off") {
+                return Ok((None, "off (LOGGYTRACY_MEMORY_BUDGET)".to_string()));
+            }
+            let bytes: u64 = value
+                .parse()
+                .map_err(|error| format!("invalid LOGGYTRACY_MEMORY_BUDGET {value:?}: {error}"))?;
+            if bytes == 0 {
+                return Err("LOGGYTRACY_MEMORY_BUDGET must be positive, or `off`".to_string());
+            }
+            Ok((Some(bytes), "LOGGYTRACY_MEMORY_BUDGET".to_string()))
+        }
+        None => match detected.limit_bytes {
+            Some(limit) => Ok((
+                Some(limit * MEMORY_BUDGET_FRACTION_PERCENT / 100),
+                format!(
+                    "{MEMORY_BUDGET_FRACTION_PERCENT}% of {} ({})",
+                    limit, detected.source
+                ),
+            )),
+            None => Ok((None, detected.source.to_string())),
+        },
+    }
+}
+
+/// The budgeted ceilings, as the *defaults* the env knobs fall back to — an
+/// explicit knob overrides its derived value by construction, because the
+/// derivation runs before the environment is read.
+///
+/// The shares are the re-measured attribution
+/// (`docs/MEMORY_ATTRIBUTION.md`, build `b9165b0`): at the coincident live
+/// peak merge held 607 MiB, the memtable's real cost 441 (accounted × ~1.73),
+/// query + the row-group cache ~490, flush 111, sidecars 128. Nominal shares
+/// below sum to 72.5% of the budget; the rest is flush (which rides ingest),
+/// the sidecars (unbounded until their eviction lands), and slack for the
+/// metering gap. Floors keep a tiny budget from deriving ceilings below what
+/// [`Config::validate`] or one reservation chunk requires.
+fn derive_defaults_from_budget(defaults: &mut Config, budget_bytes: u64) {
+    const MIB: u64 = 1024 * 1024;
+    let merge = (budget_bytes / 4).max(64 * MIB);
+    defaults.merge_max_memory_bytes = merge;
+    defaults.merge_max_input_bytes = (merge / 2).max(32 * MIB);
+    let query_pool = (budget_bytes / 4).max(crate::query_memory::RESERVATION_CHUNK_BYTES);
+    defaults.query_memory_budget_bytes = query_pool;
+    defaults.max_query_memory_bytes = query_pool;
+    defaults.row_group_cache_max_bytes = Some((budget_bytes / 8).max(16 * MIB));
+    // Accounted bytes; the memtable's resident cost is ~1.73× this
+    // (`docs/MEMORY_ATTRIBUTION.md`), so 10% accounted is ~17% real.
+    defaults.max_memtable_bytes = Some((budget_bytes / 10).max(32 * MIB));
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        let defaults = Self::default();
+        let mut defaults = Self::default();
+        let host = HostMemory::detect();
+        let budget_env = std::env::var("LOGGYTRACY_MEMORY_BUDGET").ok();
+        let (memory_budget_bytes, memory_budget_source) =
+            resolve_memory_budget(budget_env.as_deref(), host)?;
+        if let Some(budget) = memory_budget_bytes {
+            derive_defaults_from_budget(&mut defaults, budget);
+        }
         let config = Self {
+            memory_budget_bytes,
+            memory_budget_source,
             listen_addr: env_string("LOGGYTRACY_LISTEN_ADDR", defaults.listen_addr),
             otlp_grpc_addr: env_string("LOGGYTRACY_OTLP_GRPC_ADDR", defaults.otlp_grpc_addr),
             data_dir: std::env::var("LOGGYTRACY_DATA_DIR")
@@ -653,20 +746,23 @@ impl Config {
     pub fn log_memory_budget(&self) {
         let host = HostMemory::detect();
         tracing::info!(
+            memory_budget_bytes = self.memory_budget_bytes,
+            memory_budget_source = %self.memory_budget_source,
             peak_materialized_bytes = self.peak_materialized_bytes(),
             query_memory_budget_bytes = self.query_memory_budget_bytes,
             row_group_cache_max_bytes = self.row_group_cache_max_bytes,
+            max_memtable_bytes = self.max_memtable_bytes,
             concurrent_query_scans = self.max_concurrent_query_scans,
             max_query_memory_bytes = self.max_query_memory_bytes,
             merge_max_memory_bytes = self.merge_max_memory_bytes,
             merge_max_input_bytes = self.merge_max_input_bytes,
             flush_chunk_bytes = self.flush_chunk_bytes,
-            // The merge budget is derived unless it was set, so without this an
-            // operator cannot learn what the process chose or what it read to
-            // choose it.
+            // Every ceiling above is derived from the budget unless its own
+            // knob was set, so without this an operator cannot learn what the
+            // process chose or what it read to choose it.
             detected_memory_limit_bytes = host.limit_bytes,
             detected_memory_source = host.source,
-            "configured peak materialized memory, excluding trace scans, the memtable and allocator retention"
+            "configured peak materialized memory, excluding trace scans and allocator retention"
         );
     }
 
@@ -984,6 +1080,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_budget_resolves_env_then_detection_then_off() {
+        let detected = HostMemory {
+            limit_bytes: Some(2 * 1024 * 1024 * 1024),
+            source: "cgroup v2 memory.max",
+        };
+        // Unset: 60% of the detected limit, source naming what was read.
+        let (bytes, source) = resolve_memory_budget(None, detected).unwrap();
+        assert_eq!(bytes, Some(2 * 1024 * 1024 * 1024 * 60 / 100));
+        assert!(
+            source.contains("60%") && source.contains("cgroup"),
+            "{source}"
+        );
+        // Explicit bytes win over detection.
+        let (bytes, source) = resolve_memory_budget(Some("1073741824"), detected).unwrap();
+        assert_eq!(bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(source, "LOGGYTRACY_MEMORY_BUDGET");
+        // `off` is off even when a limit was detectable.
+        let (bytes, _) = resolve_memory_budget(Some("off"), detected).unwrap();
+        assert_eq!(bytes, None);
+        // Nothing detected and nothing declared is off, not an error.
+        let undetected = HostMemory {
+            limit_bytes: None,
+            source: "undetected",
+        };
+        let (bytes, source) = resolve_memory_budget(None, undetected).unwrap();
+        assert_eq!(bytes, None);
+        assert_eq!(source, "undetected");
+        // Zero and garbage are startup errors, not silent defaults.
+        assert!(resolve_memory_budget(Some("0"), detected).is_err());
+        assert!(resolve_memory_budget(Some("2GiB"), detected).is_err());
+    }
+
+    #[test]
+    fn the_derived_ceilings_follow_the_measured_shares_and_validate() {
+        let mut config = Config::default();
+        let budget = 2u64 * 1024 * 1024 * 1024 * 60 / 100;
+        derive_defaults_from_budget(&mut config, budget);
+        assert_eq!(config.merge_max_memory_bytes, budget / 4);
+        assert_eq!(config.merge_max_input_bytes, budget / 8);
+        assert_eq!(config.query_memory_budget_bytes, budget / 4);
+        assert_eq!(config.max_query_memory_bytes, budget / 4);
+        assert_eq!(config.row_group_cache_max_bytes, Some(budget / 8));
+        assert_eq!(config.max_memtable_bytes, Some(budget / 10));
+        config.memory_budget_bytes = Some(budget);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_tiny_budget_derives_floors_a_running_engine_can_live_with() {
+        let mut config = Config::default();
+        derive_defaults_from_budget(&mut config, 1);
+        assert_eq!(config.merge_max_memory_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.merge_max_input_bytes, 32 * 1024 * 1024);
+        assert_eq!(
+            config.query_memory_budget_bytes,
+            crate::query_memory::RESERVATION_CHUNK_BYTES
+        );
+        assert_eq!(config.row_group_cache_max_bytes, Some(16 * 1024 * 1024));
+        assert_eq!(config.max_memtable_bytes, Some(32 * 1024 * 1024));
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn parses_duration_suffixes_and_disabled_values() {
         assert_eq!(
             parse_duration_text("TEST", "5ms").unwrap(),
@@ -1110,19 +1269,26 @@ mod tests {
             max_concurrent_query_scans: 16,
             ..config
         };
-        assert_eq!(more_concurrent.peak_materialized_bytes(), 1536 * 1024 * 1024);
+        assert_eq!(
+            more_concurrent.peak_materialized_bytes(),
+            1536 * 1024 * 1024
+        );
     }
 
     #[test]
-    fn the_host_memory_limit_is_detected_and_never_changes_a_default() {
-        let host = HostMemory::detect();
-        // Whatever it reads, it must not have moved the merge defaults: an
-        // earlier attempt to derive them from it measured worse, and this test
-        // is what keeps the revert honest rather than a comment.
+    fn the_type_default_is_budget_off_and_detection_is_sane() {
+        // `Config::default()` is what every test and fixture builds on, so it
+        // must not depend on the machine it runs on: the budget derivation
+        // lives in `from_env` alone. (The old form of this test pinned "the
+        // detected limit never changes a default" — that contract was
+        // reopened by measurement and by decision, todo.md's soak section,
+        // 2026-08-08.)
         let config = Config::default();
+        assert_eq!(config.memory_budget_bytes, None);
         assert_eq!(config.merge_max_memory_bytes, 1024 * 1024 * 1024);
         assert_eq!(config.merge_max_input_bytes, 512 * 1024 * 1024);
         // Detection itself must be sane where it works at all.
+        let host = HostMemory::detect();
         if let Some(limit) = host.limit_bytes {
             assert!(limit > 0, "a detected limit of zero is a misread");
             assert_ne!(host.source, "undetected");

@@ -90,7 +90,11 @@ impl QueryMemoryReservation {
     /// row.
     pub fn ensure(&self, needed_bytes: u64) -> Result<(), String> {
         while self.granted_bytes.load(Ordering::Acquire) < needed_bytes {
-            match self.semaphore.clone().try_acquire_many_owned(chunk_permits()) {
+            match self
+                .semaphore
+                .clone()
+                .try_acquire_many_owned(chunk_permits())
+            {
                 Ok(permit) => {
                     let mut permits = self.permits.lock().expect("query memory pool poisoned");
                     permits.push(permit);
@@ -142,7 +146,9 @@ mod tests {
         let reservation = pool.reserve().await.expect("admission");
         // Within the initial chunk: no growth, no refusal, however often.
         for _ in 0..3 {
-            reservation.ensure(RESERVATION_CHUNK_BYTES).expect("granted");
+            reservation
+                .ensure(RESERVATION_CHUNK_BYTES)
+                .expect("granted");
         }
     }
 }

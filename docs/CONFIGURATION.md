@@ -94,11 +94,34 @@ All limits are checked **before** writing to the journal, so rejected requests l
 
 Set both timestamp knobs to `off` only when bulk-loading historical data.
 
+## Memory budget
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOGGYTRACY_MEMORY_BUDGET` | 60% of the detected limit (`off` disables) | Bytes the engine budgets for itself. Unset, the process reads cgroup v2 `memory.max` (falling back to `/proc/meminfo` `MemTotal`) and takes 60% — VictoriaLogs' own contract, and the one measured surviving the sustained 2 GiB workload that OOM-killed both this engine and Loki (`todo.md`, soak section, 2026-08-08). The budget re-seeds the **defaults** of the ceilings below; every explicit knob still overrides its derived value |
+
+When the budget is active the following defaults are computed from it, with the
+shares taken from the re-measured attribution (`docs/MEMORY_ATTRIBUTION.md`,
+build `b9165b0`) rather than guessed. The startup log prints every derived
+value beside the budget and its source.
+
+| Derived knob | Share of budget | Floor |
+|---|---|---|
+| `MERGE_MAX_MEMORY_BYTES` | 25% | 64 MiB |
+| `MERGE_MAX_INPUT_BYTES` | half the merge budget | 32 MiB |
+| `QUERY_MEMORY_BUDGET_BYTES` and `MAX_QUERY_MEMORY_BYTES` | 25% | 8 MiB |
+| `ROW_GROUP_CACHE_MAX_BYTES` | 12.5% | 16 MiB |
+| `MAX_MEMTABLE_BYTES` | 10% (accounted bytes; resident cost measured ~1.73×) | 32 MiB |
+
+The nominal shares sum to 72.5%: the remainder covers flush (which rides
+ingest), the sidecars (unbounded until their eviction lands), and the metering
+gap above.
+
 ## Backpressure
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_MAX_MEMTABLE_BYTES` | 256 MiB (`off` allowed) | Return 429 when the two memtables exceed this combined size |
+| `LOGGYTRACY_MAX_MEMTABLE_BYTES` | 256 MiB (`off` allowed; budget-derived) | Return 429 when the two memtables exceed this combined size |
 | `LOGGYTRACY_MAX_WAL_BACKLOG_BYTES` | 1 GiB (`off` allowed) | Return 429 when unflushed WAL exceeds this size |
 | `LOGGYTRACY_BACKPRESSURE_RETRY_AFTER` | `1s` | `Retry-After` value included in 429 responses |
 
@@ -129,8 +152,8 @@ assumes clients back off on 429 and rely on their own WAL, so disabling them bre
 | `LOGGYTRACY_MERGE_MIN_PART_COUNT` | 4 (minimum 2) | Do not perform a normal merge below this count |
 | `LOGGYTRACY_MERGE_TARGET_PART_ROWS` | 1,000,000 | Target output row count (soft) |
 | `LOGGYTRACY_MERGE_MAX_PART_ROWS` | 4,000,000 | Maximum output row count (hard) |
-| `LOGGYTRACY_MERGE_MAX_INPUT_BYTES` | 512 MiB | Input limit for one group. **Uncompressed (materialized) bytes** |
-| `LOGGYTRACY_MERGE_MAX_MEMORY_BYTES` | 1 GiB | Hard limit that one read can materialize |
+| `LOGGYTRACY_MERGE_MAX_INPUT_BYTES` | 512 MiB (budget-derived) | Input limit for one group. **Uncompressed (materialized) bytes** |
+| `LOGGYTRACY_MERGE_MAX_MEMORY_BYTES` | 1 GiB (budget-derived) | Hard limit that one read can materialize |
 | `LOGGYTRACY_MERGE_MAX_GROUPS_PER_TICK` | 16 | |
 
 **Constraint:** `MERGE_MAX_INPUT_BYTES <= MERGE_MAX_MEMORY_BYTES`. Both values are compared with
@@ -169,9 +192,9 @@ becomes disk usage that cannot be evicted**.
 | `LOGGYTRACY_MAX_QUERY_RANGE` | unset | Maximum requested time range |
 | `LOGGYTRACY_MAX_QUERY_SCAN_ROWS` | 5,000,000 | |
 | `LOGGYTRACY_MAX_QUERY_SCAN_BYTES` | 2 GiB | |
-| `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES` | 512 MiB | One query's own materialization cap |
-| `LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES` | 512 MiB (minimum 8 MiB) | The shared pool **all** queries together materialize from, reserved incrementally as rows survive the pipeline. A query refused here gets an error naming the pool; before this the aggregate was `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES` and nothing enforced it |
-| `LOGGYTRACY_ROW_GROUP_CACHE_MAX_BYTES` | 256 MiB, `off` disables | Decoded row groups kept across scans. A part is immutable, so a group decoded whole by one scan serves every later scan without paying the reader build again; the budget bounds what stays resident (`loggytracy_row_group_cache_bytes` reports it). Entries die with their part on merge or retirement |
+| `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES` | 512 MiB (budget-derived) | One query's own materialization cap |
+| `LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES` | 512 MiB (minimum 8 MiB; budget-derived) | The shared pool **all** queries together materialize from, reserved incrementally as rows survive the pipeline. A query refused here gets an error naming the pool; before this the aggregate was `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES` and nothing enforced it |
+| `LOGGYTRACY_ROW_GROUP_CACHE_MAX_BYTES` | 256 MiB, `off` disables (budget-derived) | Decoded row groups kept across scans. A part is immutable, so a group decoded whole by one scan serves every later scan without paying the reader build again; the budget bounds what stays resident (`loggytracy_row_group_cache_bytes` reports it). Entries die with their part on merge or retirement |
 | `LOGGYTRACY_MAX_LOG_LIMIT` | 100,000 | Maximum `limit` parameter |
 | `LOGGYTRACY_MAX_QUERY_RUNTIME` | `30s` | Also the timeout for metadata endpoints |
 | `LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS` | 8 | Shared with metadata endpoints |

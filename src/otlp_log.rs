@@ -74,10 +74,7 @@ pub fn normalize_request(
             .unwrap_or_default();
         let (labels, resource_metadata) = split_resource_attributes(resource_attributes);
         for scope_logs in resource_logs.scope_logs {
-            let scope_name = scope_logs
-                .scope
-                .map(|scope| scope.name)
-                .unwrap_or_default();
+            let scope_name = scope_logs.scope.map(|scope| scope.name).unwrap_or_default();
             for record in scope_logs.log_records {
                 let entry = normalize_record(record, &resource_metadata, &scope_name)?;
                 streams.entry(labels.clone()).or_default().push(entry);

@@ -296,18 +296,17 @@ async fn flush_once(
             // written, and a chunked flush leaves many parts. Under the
             // exclusive lifecycle lock that I/O was a stall every queued
             // query paid for.
-            let rollback = |error: String,
-                            log_parts: &[part::Part],
-                            trace_parts: &[trace_part::TracePart]| {
-                let log_dirs = part_dirs(log_parts);
-                let trace_dirs: Vec<_> = trace_parts.iter().map(|p| p.dir.clone()).collect();
-                match cleanup_part_directories(&log_dirs, &trace_dirs) {
-                    Ok(()) => std::io::Error::other(error),
-                    Err(cleanup_error) => std::io::Error::other(format!(
-                        "{error}; part rollback failed: {cleanup_error}"
-                    )),
-                }
-            };
+            let rollback =
+                |error: String, log_parts: &[part::Part], trace_parts: &[trace_part::TracePart]| {
+                    let log_dirs = part_dirs(log_parts);
+                    let trace_dirs: Vec<_> = trace_parts.iter().map(|p| p.dir.clone()).collect();
+                    match cleanup_part_directories(&log_dirs, &trace_dirs) {
+                        Ok(()) => std::io::Error::other(error),
+                        Err(cleanup_error) => std::io::Error::other(format!(
+                            "{error}; part rollback failed: {cleanup_error}"
+                        )),
+                    }
+                };
             let opened_log = match PartRegistry::open_parts(log_parts.clone()) {
                 Ok(opened) => opened,
                 Err(error) => return Err(rollback(error, &log_parts, &trace_parts)),
