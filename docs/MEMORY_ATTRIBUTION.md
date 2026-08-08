@@ -583,3 +583,49 @@ merge group's rewrite at 771 MiB and the flush's whole-snapshot `Vec<Row>` at
 721 MiB — 3.3× the memtable it copies. The sidecars, the in-flight push bodies
 and the placement of the global sort are all real defects and all noise against
 this.
+
+## Re-measured on build `b9165b0` (2026-08-08), before sizing the declared budget
+
+The shares below supersede every figure above for sizing purposes: 721 and
+771 MiB were measured on a build that no longer exists (pre-streaming-merge,
+pre-`Arc<Labels>`, pre-row-group-cache). The instrument is
+`scripts/run_soak_local.sh` — the same offered 20 k eps and 5 qps, retention on
+at 5 m, memprof build, 8 GiB cgroup so the run completes, 25 minutes, sampled
+once a second (`target/soak/probe-8g-memprof`). Two layers, separated by the
+same run:
+
+**Live, bounded, oscillating — no arena trends upward over 25 minutes:**
+
+| term | high-water | at the coincident live peak (1524 MiB, t=509 s) |
+|---|---|---|
+| merge | 689 MiB | 607 MiB |
+| ingest accumulation (mis-binned, see below) | 445 MiB | 441 MiB |
+| query (pool + decodes) | 429 MiB | 236 MiB |
+| sidecar | 241 MiB | 128 MiB |
+| flush | 112 MiB | 111 MiB |
+| row-group cache (gauge; arena inert, see below) | ~250 MiB | ~250 MiB |
+
+**Retained by glibc on top of that:** free ratchets 915 → 2628 MiB across the
+run and never returns; anon steps 1710 → 2525 → 3157 → 3295 with shrinking
+increments — the high-water of *coincident* live spikes times fragmentation.
+Final anon/live **5.30**. Fixing `MALLOC_MMAP_THRESHOLD_=131072` (arenas left
+at 4) collapses that to **1.60** and moves the 2 GiB kill from t≈150 s to
+t≈502 s — the allocator layer is real but second; the live coincidence is
+first.
+
+Two attribution gaps the run itself exposed, so the table is read correctly:
+
+* **The `ingest` arena reads 0.1 MiB and the memtable lands in `other`.** The
+  `other` series tracks `loggytracy_memtable_buffered_bytes` at **~1.73×**
+  point for point (444 MiB against a saturated 256 MiB cap) — the in-situ
+  confirmation of the metering item's 1.70–1.79× undercount. The Ingest guard
+  sits in the journal writer; the memtable's own allocations happen outside
+  any guard.
+* **The `row_group_cache` arena reads ~0 while the cache gauge holds
+  ~250 MiB.** Decodes are allocated under the scanning thread's Query guard
+  and only *retained* by the cache, so `query`'s high-water includes the
+  cache's bytes.
+
+Also observed, recorded rather than diagnosed: between t≈445 and t≈465 the
+query success counter froze for ~20 s while merge ran and the WAL backlog
+climbed — the shape of the run's 1 % query 504 rate (48/4,926).
