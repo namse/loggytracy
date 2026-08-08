@@ -58,10 +58,13 @@
 //! `cargo test` both build this target — so it cannot rot, and running it
 //! anywhere without a usable cgroup exits 4 rather than passing.
 //!
-//! The budget is this program's own input because `LOGGYTRACY_MEMORY_BUDGET`
-//! does not exist yet; it is the last step of M10, not this one. When it lands,
-//! it must satisfy exactly the contract asserted here, and it can be handed to
-//! the same run with `--server-env LOGGYTRACY_MEMORY_BUDGET=...`.
+//! `LOGGYTRACY_MEMORY_BUDGET` exists now (2026-08-08), and the two numbers
+//! meet by construction rather than by being repeated: this gate creates the
+//! cgroup scope at `--limit`, and the server inside detects that same scope's
+//! `memory.max` and declares 60% of it as its budget, deriving its ceilings
+//! from that. `--server-env LOGGYTRACY_MEMORY_BUDGET=...` still overrides for
+//! an A/B, and `--server-env LOGGYTRACY_MEMORY_BUDGET=off` measures the
+//! pre-budget behaviour.
 
 use std::fs;
 use std::io::{Read, Write};

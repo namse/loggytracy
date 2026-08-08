@@ -934,10 +934,20 @@ found four things first, three of them the soak's own questions answering early.
   2 GiB hold this workload while the live spikes are allowed to coincide. That is
   [`merge_max_memory_bytes` must derive from the declared budget] and its M10 siblings, now with
   the measurement that makes them urgent rather than pending.
-- [ ] **The 24-hour run needs a configuration that can survive it, and that is a decision rather
-  than a default**: 2 GiB with `MALLOC_ARENA_MAX=1` (the declared rig with the one measured knob;
-  the WAL-backlog trend is the risk it would be testing), or a limit the ratchet fits (≥4–6 GiB,
-  which tests everything else the soak exists to watch). Undecided as of this entry.
+- [x] **The 24-hour run needs a configuration that can survive it** — it has one now, and it is the
+  declared rig itself: the user chose to build the VictoriaLogs answer rather than pick a bigger
+  container, and `LOGGYTRACY_MEMORY_BUDGET` landed the same day (`dcdd418`, M10 Phase B has the
+  record). The 2 GiB / 20 k eps / retention-on configuration that died at 150–255 s **survives its
+  600 s probe at anon peak 1480 MiB**, `memory_gate --budget 2GiB` is UNDER_BUDGET, and 8 GiB
+  throughput is unchanged. The 24-hour run itself is still owed.
+- [ ] **The read tail collapses under sustained churn in every configuration, and the budget is not
+  the cause.** Overall query response p95 across the long probes: 33.3 s (2 GiB budgeted, 600 s),
+  11.2 s (2 GiB arena-1, 600 s), **78.0 s (8 GiB, default pools, 20 min)** — while every 240 s run
+  reads ~300 ms and PASSes. Whatever degrades is a function of runtime — part count under
+  retention churn, the observed ~20 s query-counter stalls beside merge, or both — and it is why
+  every long run's load verdict is `PASS_BEHAVIORAL_ONLY`. This is the soak's next defect to
+  chase, separate from memory: the 2 s p95 gate passes in minutes-long beds and is off by an
+  order of magnitude an hour in.
 
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
@@ -1413,9 +1423,11 @@ only thing that can say whether a fix worked, so it landed before them and it la
       0.93x rather than 2.24x when given 8 GiB of room.** Not in CI: it needs a cgroup scope and minutes per run,
       and a peak-memory number off a shared runner is the kind this repository has already retired.
       CI compiles it, so it cannot rot the way a script and a document did
-- [ ] **The gate should read the budget from the server once the knob exists**, rather than being
-      told the same number twice. Until then `--server-env LOGGYTRACY_MEMORY_BUDGET=...` reaches the
-      server without touching the gate
+- [x] **The gate should read the budget from the server once the knob exists**, rather than being
+      told the same number twice. Resolved by construction rather than by plumbing: the gate creates
+      the cgroup scope, and the server inside now detects that same scope's `memory.max` and declares
+      60% of it — one number, read where it lives. `--server-env LOGGYTRACY_MEMORY_BUDGET=off`
+      measures the pre-budget behaviour for an A/B
 - [ ] **A killed run loses the harness's own numbers.** The harness is killed three seconds after
       the server dies and writes its report only at the end, so the ingest and query columns of
       every OOM row in `docs/MEMORY_BUDGET_GATE.md` are empty. A periodic partial write, or a
@@ -1436,7 +1448,7 @@ only thing that can say whether a fix worked, so it landed before them and it la
 - [ ] **Honest metering.** `entries_bytes` (`memtable.rs:69-81`) counts line and label lengths only — not the
       56-byte `LogEntry`, the 48-byte slot per metadata pair, malloc headers, or `Vec` slack. Measured
       **1.70–1.79x under** in situ on the comparison corpus, so `MAX_MEMTABLE_BYTES=256 MiB` is really ~440 MiB
-- [ ] `LOGGYTRACY_MEMORY_BUDGET` divided into ingest 20% / flush 25% / merge 25% / query 25% / sidecar 5% —
+- [x] `LOGGYTRACY_MEMORY_BUDGET` divided into ingest 20% / flush 25% / merge 25% / query 25% / sidecar 5% —
       the measured shares, not the guessed ones. Existing knobs become overrides; what is not overridable is
       that they sum. **Flush and merge did not fit their shares** (721 MiB and 771 MiB measured against
       512 MiB each at a 2 GiB budget), which is the work, not a reason to raise the shares. Flush's share is
@@ -1444,6 +1456,18 @@ only thing that can say whether a fix worked, so it landed before them and it la
       per row and its peak live from 26–28 MB to 13.85 MB on the bench — but the arena was never
       re-measured in situ, so **721 MiB is a figure for a build that no longer exists and the number for
       this one is not known.** Re-run the attribution before sizing anything from it
+
+      Landed (`dcdd418`, 2026-08-08), in the order this item demanded: the attribution was re-run first
+      (`docs/MEMORY_ATTRIBUTION.md`, build `b9165b0`) and the shares that shipped are that measurement's,
+      not this item's guesses — merge 25%, query pool (and the per-query cap) 25%, row-group cache 12.5%,
+      memtable 10% accounted (~17% resident at the measured ×1.73), floors under each, nominal sum 72.5%
+      with the rest for flush-rides-ingest, the still-unbounded sidecars and the metering gap. Unset, the
+      budget is 60% of the detected cgroup limit — VictoriaLogs' contract, adopted after it was measured
+      holding this exact workload in half a gigabyte ([`docs/CONFIGURATION.md`](docs/CONFIGURATION.md),
+      "Memory budget"). Every knob still overrides its derived default. Verified in the order the plan
+      named: the 2 GiB / 20 k eps / retention-on soak that killed the engine at 255 s now **runs its full
+      600 s at anon peak 1480 MiB**; `memory_gate --budget 2GiB` reads **UNDER_BUDGET**; and 8 GiB delivers
+      19,961 eps at push service p99 57 ms against 19,956–19,985 and 57.6–82.9 before — no cost
 - [ ] **Flush cannot be sized independently of ingest.** `rows_from_snapshot` held a copy of the memtable at
       **3.3x its accounted size** and 1 326–1 345 bytes per row, and the two peaked together. The label sets
       are now shared with the memtable rather than copied out of it, so the copy is the lines and the
@@ -1459,8 +1483,15 @@ only thing that can say whether a fix worked, so it landed before them and it la
       the metric path's entries loop moved inside the blocking task and the query arena with it. The slot
       semaphores still exist as *concurrency* bounds — what changed is that bytes are no longer implied by
       slots. `peak_materialized_bytes` reports pool + merge.
-- [ ] **`merge_max_memory_bytes` must come from the budget.** Its 1 GiB default is half a 2 GiB container and
+- [x] **`merge_max_memory_bytes` must come from the budget.** Its 1 GiB default is half a 2 GiB container and
       is derived from nothing the operator set; one group reached 771 MiB live
+
+      Derived now (25% of the budget, `dcdd418`) — and the reason this is not the change the
+      `HostMemory` doc recorded as measured-worse is that the streaming merge changed what the knob
+      bounds: pages and writer state rather than group materialization, so a smaller budget pages
+      smaller instead of merging oftener. At 2 GiB the derived cap is 322 MiB and the engine survived
+      the workload that killed it, anon peak 1480 MiB; the merge arena under the cap was not itself
+      re-measured (the surviving run is a production build), which a memprof soak can still do
 - [ ] **Sidecars inside the budget.** They are outside it on purpose today (`part/reader.rs:77-81`), so resident
       memory grows with part count unbounded. Make them LRU-evictable — they are already durable in `index.bin`.
       Sized from the measured ~240 kB per part, not from a share
