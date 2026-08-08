@@ -181,6 +181,13 @@ pub struct Config {
     /// their own caches — Loki's result cache, VictoriaLogs' caches — so
     /// this is the same class of speedup, sized explicitly.
     pub row_group_cache_max_bytes: Option<u64>,
+    /// Byte budget for the resident bloom half of part sidecars (`off` =
+    /// unbounded, the pre-eviction behaviour). The blooms are durable in
+    /// `index.bin`, so an evicted part's next pruning query pays one re-read;
+    /// without a bound the resident total is ~2 MiB per live part and the
+    /// live part count scales with ingest rate × retention window — the term
+    /// that killed the first 24-hour soak at t≈1834 s (todo.md).
+    pub sidecar_cache_max_bytes: Option<u64>,
     pub max_log_limit: usize,
     pub max_metric_evaluation_points: usize,
     pub max_metric_rows: usize,
@@ -279,6 +286,7 @@ impl Default for Config {
             max_query_memory_bytes: 512 * 1024 * 1024,
             query_memory_budget_bytes: 512 * 1024 * 1024,
             row_group_cache_max_bytes: Some(256 * 1024 * 1024),
+            sidecar_cache_max_bytes: None,
             max_log_limit: 100_000,
             max_metric_evaluation_points: 10_000,
             max_metric_rows: 1_000_000,
@@ -439,6 +447,7 @@ fn derive_defaults_from_budget(defaults: &mut Config, budget_bytes: u64) {
     defaults.query_memory_budget_bytes = query_pool;
     defaults.max_query_memory_bytes = query_pool;
     defaults.row_group_cache_max_bytes = Some((budget_bytes / 8).max(16 * MIB));
+    defaults.sidecar_cache_max_bytes = Some((budget_bytes / 10).max(32 * MIB));
     // Accounted bytes; the memtable's resident cost is ~1.73× this
     // (`docs/MEMORY_ATTRIBUTION.md`), so 10% accounted is ~17% real.
     defaults.max_memtable_bytes = Some((budget_bytes / 10).max(32 * MIB));
@@ -651,6 +660,10 @@ impl Config {
                 "LOGGYTRACY_ROW_GROUP_CACHE_MAX_BYTES",
                 defaults.row_group_cache_max_bytes,
             )?,
+            sidecar_cache_max_bytes: env_optional_u64(
+                "LOGGYTRACY_SIDECAR_CACHE_MAX_BYTES",
+                defaults.sidecar_cache_max_bytes,
+            )?,
             max_query_memory_bytes: env_positive_u64(
                 "LOGGYTRACY_MAX_QUERY_MEMORY_BYTES",
                 defaults.max_query_memory_bytes,
@@ -751,6 +764,7 @@ impl Config {
             peak_materialized_bytes = self.peak_materialized_bytes(),
             query_memory_budget_bytes = self.query_memory_budget_bytes,
             row_group_cache_max_bytes = self.row_group_cache_max_bytes,
+            sidecar_cache_max_bytes = self.sidecar_cache_max_bytes,
             max_memtable_bytes = self.max_memtable_bytes,
             concurrent_query_scans = self.max_concurrent_query_scans,
             max_query_memory_bytes = self.max_query_memory_bytes,
@@ -882,6 +896,9 @@ exclusive: per-tenant retention replaces the global period"
         positive_u64("query_memory_budget_bytes", self.query_memory_budget_bytes)?;
         if let Some(bytes) = self.row_group_cache_max_bytes {
             positive_u64("row_group_cache_max_bytes", bytes)?;
+        }
+        if let Some(bytes) = self.sidecar_cache_max_bytes {
+            positive_u64("sidecar_cache_max_bytes", bytes)?;
         }
         // Smaller than one reservation chunk and the very first admission
         // fails: the pool would refuse every query at any load.
@@ -1122,6 +1139,7 @@ mod tests {
         assert_eq!(config.query_memory_budget_bytes, budget / 4);
         assert_eq!(config.max_query_memory_bytes, budget / 4);
         assert_eq!(config.row_group_cache_max_bytes, Some(budget / 8));
+        assert_eq!(config.sidecar_cache_max_bytes, Some(budget / 10));
         assert_eq!(config.max_memtable_bytes, Some(budget / 10));
         config.memory_budget_bytes = Some(budget);
         config.validate().unwrap();
@@ -1138,6 +1156,7 @@ mod tests {
             crate::query_memory::RESERVATION_CHUNK_BYTES
         );
         assert_eq!(config.row_group_cache_max_bytes, Some(16 * 1024 * 1024));
+        assert_eq!(config.sidecar_cache_max_bytes, Some(32 * 1024 * 1024));
         assert_eq!(config.max_memtable_bytes, Some(32 * 1024 * 1024));
         config.validate().unwrap();
     }

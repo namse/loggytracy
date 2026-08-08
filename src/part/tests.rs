@@ -287,7 +287,7 @@
                     &[],
                     std::slice::from_ref(&f),
                     QueryTimeRange::closed(i64::MIN, i64::MAX),
-                )
+                ).unwrap()
                 .is_empty(),
             "bloom miss must avoid selecting the parquet row group"
         );
@@ -316,7 +316,7 @@
             &[],
             &[ExactFieldPredicate::new("trace_id", "second")],
             QueryTimeRange::closed(i64::MIN, i64::MAX),
-        );
+        ).unwrap();
         // Row group 2, not 1: rows are ordered by stream before time now, and
         // `labels2` (`app="other"`) sorts before `labels1` (`app="test"`), so
         // the two rows sharing `labels1` land in groups 1 and 2. What the test
@@ -334,7 +334,7 @@
                 &[],
                 &[ExactFieldPredicate::new("app", "test")],
                 QueryTimeRange::closed(i64::MIN, i64::MAX),
-            ),
+            ).unwrap(),
             // The two groups holding `labels1`, which are 1 and 2 under
             // stream-before-time ordering.
             vec![1, 2]
@@ -398,7 +398,7 @@
                     &[],
                     &[ExactFieldPredicate::new("trace_id", "abc")],
                     QueryTimeRange::closed(i64::MIN, i64::MAX),
-                )
+                ).unwrap()
                 .is_empty(),
             "no token indexed means no exact-field predicate can match"
         );
@@ -412,7 +412,7 @@
                 &[],
                 &[ExactFieldPredicate::new("app", "test")],
                 QueryTimeRange::closed(i64::MIN, i64::MAX),
-            )
+            ).unwrap()
             .is_empty());
         assert!(reader.may_match_exact_fields(
             &test_tenant(),
@@ -441,7 +441,7 @@
                     "user", "alice", true,
                 )],
                 time_range,
-            ),
+            ).unwrap(),
             // Groups 1 and 2, not 0 and 1: `labels2` sorts before `labels1`
             // now that rows are ordered by stream before time, so the row group
             // holding the third row comes first. The property under test — one
@@ -457,7 +457,7 @@
                     "user", "bob", true,
                 )],
                 time_range,
-            ),
+            ).unwrap(),
             vec![2]
         );
         assert_eq!(
@@ -471,7 +471,7 @@
                     true,
                 )],
                 time_range,
-            ),
+            ).unwrap(),
             // The first row's own group. It is 1 rather than 0 because
             // `labels2` sorts ahead of `labels1` under stream-before-time
             // ordering, not because the bloom selected differently.
@@ -510,7 +510,7 @@
                 &[],
                 &numeric.exact_field_predicates(),
                 range,
-            ),
+            ).unwrap(),
             vec![1]
         );
 
@@ -522,7 +522,7 @@
                 &[],
                 &duration.exact_field_predicates(),
                 range,
-            ),
+            ).unwrap(),
             vec![0, 1]
         );
     }
@@ -1001,7 +1001,7 @@
             seen.sort_unstable();
             seen
         };
-        let selected = |range| reader.select_row_groups(&test_tenant(), &[], &[], range);
+        let selected = |range| reader.select_row_groups(&test_tenant(), &[], &[], range).unwrap();
 
         assert_eq!(timestamps(QueryTimeRange::closed(100, 200)), vec![100, 200]);
         assert_eq!(timestamps(QueryTimeRange::half_open(100, 200)), vec![100]);
@@ -1066,7 +1066,7 @@
                     std::slice::from_ref(&m),
                     &[],
                     QueryTimeRange::closed(i64::MIN, i64::MAX),
-                )
+                ).unwrap()
                 .is_empty(),
             "stream-index miss must avoid selecting the parquet row group"
         );
@@ -1889,7 +1889,7 @@ resident {:.0} B",
             &[],
             &[ExactFieldPredicate::new("app", "other")],
             range,
-        );
+        ).unwrap();
         assert_eq!(
             selected.len(),
             1,
@@ -1905,7 +1905,7 @@ resident {:.0} B",
                     &[],
                     &[ExactFieldPredicate::new("app", "absent")],
                     range,
-                )
+                ).unwrap()
                 .is_empty()
         );
 
@@ -1919,7 +1919,7 @@ resident {:.0} B",
                     &[],
                     &[ExactFieldPredicate::new("app", "")],
                     range,
-                )
+                ).unwrap()
                 .is_empty(),
             "an empty equality cannot be answered by the index"
         );
@@ -2480,7 +2480,7 @@ resident {:.0} B",
                 &[],
                 &predicates,
                 QueryTimeRange::closed(i64::MIN, i64::MAX),
-            ),
+            ).unwrap(),
             Vec::<u32>::new(),
             "tokens in disjoint windows cannot share a row"
         );
@@ -3290,3 +3290,102 @@ not by the decode fallback"
         found
     }
 
+
+    /// A struct so a panicking assertion still restores the unbounded
+    /// default: a leaked budget of one byte would evict every other test's
+    /// blooms — correct but slow, and confusing in an unrelated failure.
+    struct BloomBudgetGuard;
+    impl Drop for BloomBudgetGuard {
+        fn drop(&mut self) {
+            configure_bloom_cache(None);
+        }
+    }
+
+    #[test]
+    fn evicted_blooms_reload_and_the_answer_does_not_change() {
+        let tmp_a = tempfile_dir();
+        let tmp_b = tempfile_dir();
+        let part_a = flush_rows(make_rows(), &tmp_a, 100).unwrap().remove(0);
+        let part_b = flush_rows(make_rows(), &tmp_b, 100).unwrap().remove(0);
+
+        let filter = LineFilter::Contains("error connecting".to_string());
+        let ask = |reader: &PartReader| -> Vec<String> {
+            reader
+                .query(
+                    &test_tenant(),
+                    &[],
+                    std::slice::from_ref(&filter),
+                    QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    100,
+                    true,
+                )
+                .expect("query")
+                .iter()
+                .flat_map(|stream| stream.entries.iter().map(|entry| entry.line.clone()))
+                .collect()
+        };
+
+        // One byte: any install pushes the total over budget, so every open
+        // evicts every other slot. Answers must not change under that.
+        let _guard = BloomBudgetGuard;
+        configure_bloom_cache(Some(1));
+
+        let reader_a = PartReader::open(part_a).expect("open a");
+        let resident = ask(&reader_a);
+        assert_eq!(
+            resident,
+            vec!["error connecting to database".to_string()],
+            "the filter must match exactly the one seeded line"
+        );
+
+        let _reader_b = PartReader::open(part_b).expect("open b");
+        assert!(
+            reader_a.blooms.get().is_none(),
+            "the second install must evict the first reader's blooms"
+        );
+
+        let evicted = ask(&reader_a);
+        assert_eq!(
+            evicted, resident,
+            "a query over evicted blooms must re-read index.bin and answer identically"
+        );
+    }
+
+    #[test]
+    fn bloom_bytes_are_returned_on_eviction_and_on_drop() {
+        // Deltas against the global total race with parallel tests, so the
+        // probe bytes are absurdly large: nothing else in the suite reaches
+        // a terabyte of accounted blooms.
+        const PROBE: u64 = 1 << 40;
+        let tmp = tempfile_dir();
+        let part = flush_rows(make_rows(), &tmp, 100).unwrap().remove(0);
+        let index_bytes = fs::read(part.index_path()).unwrap();
+        let (bloom_bytes, _) = split_index(&index_bytes).unwrap();
+        let decoded =
+            std::sync::Arc::new(decode_blooms(bloom_bytes, &part.meta.row_group_rows).unwrap());
+
+        let slot = BloomSlot::new();
+        slot.install(decoded.clone(), PROBE);
+        assert!(
+            bloom_cache_bytes() >= PROBE,
+            "an installed slot's bytes must be in the global total"
+        );
+        // A reinstall replaces the old accounting rather than adding to it.
+        slot.install(decoded.clone(), PROBE);
+        assert!(
+            bloom_cache_bytes() < 2 * PROBE,
+            "a reinstall must not double-count the slot"
+        );
+        slot.remove();
+        assert!(
+            bloom_cache_bytes() < PROBE,
+            "removal must give the bytes back"
+        );
+
+        // Drop without an explicit remove is the reader's own path.
+        let slot = BloomSlot::new();
+        slot.install(decoded, PROBE);
+        assert!(bloom_cache_bytes() >= PROBE);
+        slot.remove();
+        assert!(bloom_cache_bytes() < PROBE);
+    }

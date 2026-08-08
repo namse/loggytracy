@@ -526,6 +526,7 @@ impl Row {
 
 include!("sink.rs");
 include!("group_cache.rs");
+include!("bloom_cache.rs");
 include!("format.rs");
 include!("indexes.rs");
 include!("metadata.rs");

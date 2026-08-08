@@ -61,24 +61,24 @@ impl Read for PreadCursor {
 
 pub struct PartReader {
     part: Part,
-    bloom: Vec<BloomFilter>,
-    /// Per row group, one exact-field sub-bloom per [`BLOOM_WINDOW_ROWS`]-row
-    /// window. An empty outer `Vec` means the group indexed no exact-field
-    /// token at all — no exact-field predicate can match it.
-    exact_field_bloom: Vec<Vec<WindowBloom>>,
+    /// The line and exact-field window blooms, resident while the global
+    /// bloom-cache budget admits them and re-decoded from `index.bin` when a
+    /// pruning query needs them back. The 24-hour soak measured the
+    /// always-resident form at ~2 MiB per part, growing with the retention
+    /// window; see the bloom cache (`bloom_cache.rs`).
+    blooms: Arc<BloomSlot>,
     stream_index: StreamMap,
     stream_labels: Vec<String>,
     /// The keys stored as `_sm:` columns, in schema (sorted) order.
     metadata_keys: Vec<String>,
     /// The `| json`-extracted fields stored as `_pf:` columns, sorted.
     parsed_keys: Vec<String>,
-    /// Bytes the blooms and the stream index occupy for as long as this reader
-    /// lives. Recorded at open because that is the only moment the sizes are
-    /// free: recomputing it per scrape would walk every filter of every part.
-    ///
-    /// These are not covered by the local cache budget — eviction reclaims
-    /// `data.parquet` and leaves the sidecars resident — so this is the part of
-    /// a part that a growing part count charges to RSS.
+    /// Bytes the stream index occupies for as long as this reader lives —
+    /// the half of the sidecar that stays resident unconditionally, because
+    /// the infallible metadata paths read it and it is tens of kilobytes
+    /// against the blooms' megabytes. Recorded at open because that is the
+    /// only moment the size is free. The blooms report through
+    /// [`bloom_cache_bytes`] instead.
     index_resident_bytes: u64,
     /// The `_stream` ordinal table: `meta.streams` shared out once at open,
     /// so a scan resolves a row's label set with an `Arc` clone instead of
@@ -105,7 +105,7 @@ pub struct PartReader {
 }
 
 /// One window's exact-field state, decoded.
-enum WindowBloom {
+pub(crate) enum WindowBloom {
     /// The window indexed no token: no exact-field predicate can match here.
     Absent,
     /// The window held more tokens than a filter is allowed to be sized for;
@@ -114,9 +114,13 @@ enum WindowBloom {
     Filter(BloomFilter),
 }
 
-struct DecodedBlooms {
+/// The evictable half of a part's sidecar: what the bloom cache (`bloom_cache.rs`) holds
+/// under its budget and what a re-read of `index.bin` reproduces.
+pub(crate) struct DecodedBlooms {
     line: Vec<BloomFilter>,
-    /// Outer: row group. Inner: one state per window.
+    /// Per row group, one exact-field sub-bloom per [`BLOOM_WINDOW_ROWS`]-row
+    /// window. An empty outer `Vec` means the group indexed no exact-field
+    /// token at all — no exact-field predicate can match it.
     exact_fields: Vec<Vec<WindowBloom>>,
 }
 
@@ -433,7 +437,7 @@ impl PartReader {
         }
         let index_bytes = fs::read(part.index_path()).map_err(|e| e.to_string())?;
         let (bloom_bytes, stream_bytes) = split_index(&index_bytes)?;
-        let decoded_blooms = decode_blooms(bloom_bytes, &part.meta.row_group_rows)?;
+        let decoded_blooms = Arc::new(decode_blooms(bloom_bytes, &part.meta.row_group_rows)?);
         let stream_index = decode_stream_index(stream_bytes)?;
         validate_stream_index(&part, &stream_index)?;
         let stream_labels = part.meta.stream_labels.clone();
@@ -458,13 +462,17 @@ impl PartReader {
         if require_data || part.data_path().exists() {
             open_part_data(&part, true, false)?;
         }
-        let index_resident_bytes = resident_bytes(&decoded_blooms, &stream_index);
-                let cache_projection =
+        let index_resident_bytes = stream_index_resident_bytes(&stream_index);
+        let cache_projection =
             ScanProjection::build(&metadata_keys, &parsed_keys, &ColumnSet::all());
+        let blooms = BloomSlot::new();
+        blooms.install(
+            decoded_blooms.clone(),
+            bloom_resident_bytes(&decoded_blooms),
+        );
         Ok(Self {
             part,
-            bloom: decoded_blooms.line,
-            exact_field_bloom: decoded_blooms.exact_fields,
+            blooms,
             stream_index,
             stream_labels,
             metadata_keys,
@@ -480,6 +488,30 @@ impl PartReader {
     /// See [`PartReader::index_resident_bytes`].
     pub fn index_resident_bytes(&self) -> u64 {
         self.index_resident_bytes
+    }
+
+    /// The blooms, resident or re-read: a cache hit touches the LRU, a miss
+    /// re-reads `index.bin` — the same bytes `open` validated by checksum —
+    /// and reinstalls them under the global budget, evicting other parts'
+    /// least-recently-used blooms if the total is over it.
+    fn decoded_blooms(&self) -> Result<Arc<DecodedBlooms>, String> {
+        if let Some(blooms) = self.blooms.get() {
+            return Ok(blooms);
+        }
+        // Charged to the sidecar arena, not to the faulting query: the
+        // blooms outlive it.
+        let _arena = crate::memprof::enter(crate::memprof::Arena::Sidecar);
+        let index_bytes = fs::read(self.part.index_path()).map_err(|e| {
+            format!(
+                "failed to re-read {INDEX_FILE} for part {}: {e}",
+                self.part.meta.id
+            )
+        })?;
+        let (bloom_bytes, _) = split_index(&index_bytes)?;
+        let decoded = Arc::new(decode_blooms(bloom_bytes, &self.part.meta.row_group_rows)?);
+        self.blooms
+            .install(decoded.clone(), bloom_resident_bytes(&decoded));
+        Ok(decoded)
     }
 
     pub fn part(&self) -> &Part {
@@ -721,7 +753,7 @@ impl PartReader {
         matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         time_range: QueryTimeRange,
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>, String> {
         self.select_row_groups_with_exact_fields(tenant, matchers, line_filters, &[], time_range)
     }
 
@@ -732,9 +764,9 @@ impl PartReader {
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
         time_range: QueryTimeRange,
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>, String> {
         let Some(groups) = self.tenant_row_groups(tenant) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         // Once per scan, not per row group: a `|=` needle is a literal as it
         // stands, and a `|~` contributes the literals every match must
@@ -751,6 +783,14 @@ impl PartReader {
                 LineFilter::NotContains(_) | LineFilter::NotRegex(_) => Vec::new(),
             })
             .collect();
+        // Fetched only when a filter can actually consult them, so a
+        // matchers-only query never faults evicted blooms back in — it never
+        // read them before eviction existed either.
+        let blooms = if prune_literals.is_empty() && exact_fields.is_empty() {
+            None
+        } else {
+            Some(self.decoded_blooms()?)
+        };
         let mut selected = Vec::with_capacity(groups.len());
         for rg in groups {
             let rgu = rg as usize;
@@ -763,15 +803,17 @@ impl PartReader {
             if !row_group_matches_index(rg, matchers, &self.stream_index) {
                 continue;
             }
-            if !self.bloom_prune(rgu, &prune_literals) {
-                continue;
-            }
-            if !self.exact_field_bloom_prune(rgu, exact_fields) {
-                continue;
+            if let Some(blooms) = &blooms {
+                if !self.bloom_prune(blooms, rgu, &prune_literals) {
+                    continue;
+                }
+                if !self.exact_field_bloom_prune(blooms, rgu, exact_fields) {
+                    continue;
+                }
             }
             selected.push(rg);
         }
-        selected
+        Ok(selected)
     }
 
     /// Returns whether any row group can satisfy the catalog-visible portion
@@ -785,15 +827,12 @@ impl PartReader {
         exact_fields: &[ExactFieldPredicate],
         range: QueryTimeRange,
     ) -> bool {
-        !self
-            .select_row_groups_with_exact_fields(
-                tenant,
-                matchers,
-                line_filters,
-                exact_fields,
-                range,
-            )
-            .is_empty()
+        // A bloom re-read that fails must answer "may match": skipping a
+        // part on an I/O error would silently drop rows, where admitting it
+        // surfaces the error on the scan that follows.
+        self.select_row_groups_with_exact_fields(tenant, matchers, line_filters, exact_fields, range)
+            .map(|groups| !groups.is_empty())
+            .unwrap_or(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -864,7 +903,7 @@ impl PartReader {
         sink: &mut dyn RowSink,
     ) -> Result<ScanStats, String> {
         let mut stats = ScanStats::default();
-        if self.bloom.is_empty() || sink.is_closed() {
+        if self.part.meta.row_group_count == 0 || sink.is_closed() {
             return Ok(stats);
         }
         debug_assert!(
@@ -951,7 +990,7 @@ impl PartReader {
         }
 
         let selected = if exact_fields.is_empty() {
-            self.select_row_groups(tenant, matchers, line_filters, time_range)
+            self.select_row_groups(tenant, matchers, line_filters, time_range)?
         } else {
             self.select_row_groups_with_exact_fields(
                 tenant,
@@ -959,7 +998,7 @@ impl PartReader {
                 line_filters,
                 exact_fields,
                 time_range,
-            )
+            )?
         };
         let mut sorted_selected = selected;
         if let Some(window) = &row_group_window {
@@ -1002,6 +1041,14 @@ impl PartReader {
         // behind an `Arc` and an `Arc<ParquetMetaData>` — which is what makes a
         // reader per row group, and per window inside one, affordable.
         let (data_file, part_metadata) = self.scan_part_data()?;
+        // Fetched once for the whole scan when the window masks below will
+        // consult them; the selection above already faulted them in, so this
+        // is an LRU touch, not a read.
+        let scan_blooms = if exact_fields.is_empty() {
+            None
+        } else {
+            Some(self.decoded_blooms()?)
+        };
 
         'row_groups: for &row_group in &sorted_selected {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -1047,9 +1094,9 @@ impl PartReader {
             // requires — a shorter operand's missing tail would pass the
             // longer one's rows through unfiltered.
             let group_rows = part_metadata.metadata().row_group(rgu).num_rows() as usize;
-            let window_selection = (!exact_fields.is_empty())
-                .then(|| self.exact_field_window_mask(rgu, exact_fields))
-                .flatten()
+            let window_selection = scan_blooms
+                .as_ref()
+                .and_then(|blooms| self.exact_field_window_mask(blooms, rgu, exact_fields))
                 .map(|mask| window_row_selection(mask, group_rows));
             let base_selection = match (time_selection, window_selection) {
                 (Some(time), Some(window)) => Some(time.intersection(&window)),
@@ -2044,14 +2091,19 @@ fn window_rows(scan_limit: Option<usize>, scanned_rows: usize, sink: &dyn RowSin
 }
 
 impl PartReader {
-    fn bloom_prune(&self, rg: usize, literals: &[String]) -> bool {
+    fn bloom_prune(&self, blooms: &DecodedBlooms, rg: usize, literals: &[String]) -> bool {
         literals
             .iter()
-            .all(|literal| self.bloom[rg].might_contain_substr(literal))
+            .all(|literal| blooms.line[rg].might_contain_substr(literal))
     }
 
-    fn exact_field_bloom_prune(&self, rg: usize, exact_fields: &[ExactFieldPredicate]) -> bool {
-        self.exact_field_window_mask(rg, exact_fields) != Some(0)
+    fn exact_field_bloom_prune(
+        &self,
+        blooms: &DecodedBlooms,
+        rg: usize,
+        exact_fields: &[ExactFieldPredicate],
+    ) -> bool {
+        self.exact_field_window_mask(blooms, rg, exact_fields) != Some(0)
     }
 
     /// Which of the row group's [`BLOOM_WINDOW_ROWS`]-row windows may hold a
@@ -2067,12 +2119,13 @@ impl PartReader {
     /// negatives.
     fn exact_field_window_mask(
         &self,
+        blooms: &DecodedBlooms,
         rg: usize,
         exact_fields: &[ExactFieldPredicate],
     ) -> Option<u64> {
         let mut combined: Option<u64> = None;
         for predicate in exact_fields {
-            let Some(mask) = self.predicate_window_mask(rg, predicate) else {
+            let Some(mask) = self.predicate_window_mask(blooms, rg, predicate) else {
                 continue;
             };
             let mask = match combined {
@@ -2087,7 +2140,12 @@ impl PartReader {
         combined
     }
 
-    fn predicate_window_mask(&self, rg: usize, predicate: &ExactFieldPredicate) -> Option<u64> {
+    fn predicate_window_mask(
+        &self,
+        blooms: &DecodedBlooms,
+        rg: usize,
+        predicate: &ExactFieldPredicate,
+    ) -> Option<u64> {
         // A stream label is not in the exact-field bloom, but it is in the
         // stream index — so the predicate is answerable, just from the
         // other side. This used to scan unconditionally, which made
@@ -2126,7 +2184,7 @@ impl PartReader {
         // No windows at all means the row group indexed no exact-field
         // token, so this predicate cannot match. That is the same answer
         // the all-zero filter this used to store would have given.
-        let windows = &self.exact_field_bloom[rg];
+        let windows = &blooms.exact_fields[rg];
         if windows.is_empty() {
             return Some(0);
         }
@@ -2177,13 +2235,13 @@ fn row_group_matches_index(rg: u32, matchers: &[LabelMatcher], index: &StreamMap
     true
 }
 
-/// What the decoded sidecars cost in memory.
+/// What the decoded blooms cost in memory — the evictable half of the
+/// sidecar, charged to the global bloom-cache budget.
 ///
-/// Counts the payloads a reader keeps alive — filter bit vectors, index keys
-/// and posting lists — rather than the encoded file sizes, because the encoded
-/// form is not what stays resident. Container and allocator overhead is not
-/// modelled; this is a floor, and it is the term that scales with part count.
-fn resident_bytes(blooms: &DecodedBlooms, stream_index: &StreamMap) -> u64 {
+/// Counts the payloads kept alive — filter bit vectors — rather than the
+/// encoded file sizes, because the encoded form is not what stays resident.
+/// Container and allocator overhead is not modelled; this is a floor.
+fn bloom_resident_bytes(blooms: &DecodedBlooms) -> u64 {
     let mut total: u64 = 0;
     for bloom in &blooms.line {
         total = total.saturating_add(bloom.resident_bytes() as u64);
@@ -2193,6 +2251,13 @@ fn resident_bytes(blooms: &DecodedBlooms, stream_index: &StreamMap) -> u64 {
             total = total.saturating_add(filter.resident_bytes() as u64);
         }
     }
+    total
+}
+
+/// What the stream index costs in memory — the half that stays resident for
+/// the reader's lifetime, because the infallible metadata paths read it.
+fn stream_index_resident_bytes(stream_index: &StreamMap) -> u64 {
+    let mut total: u64 = 0;
     for (name, values) in stream_index {
         total = total.saturating_add(name.len() as u64);
         for (value, bitmap) in values {
@@ -2201,6 +2266,14 @@ fn resident_bytes(blooms: &DecodedBlooms, stream_index: &StreamMap) -> u64 {
         }
     }
     total
+}
+
+impl Drop for PartReader {
+    fn drop(&mut self) {
+        // A merged-away or retention-deleted part gives its bloom bytes back
+        // now rather than waiting to be chosen as an eviction victim.
+        self.blooms.remove();
+    }
 }
 
 fn decode_blooms(buf: &[u8], row_group_rows: &[u32]) -> Result<DecodedBlooms, String> {

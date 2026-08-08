@@ -112,6 +112,7 @@ value beside the budget and its source.
 | `QUERY_MEMORY_BUDGET_BYTES` and `MAX_QUERY_MEMORY_BYTES` | 25% | 8 MiB |
 | `ROW_GROUP_CACHE_MAX_BYTES` | 12.5% | 16 MiB |
 | `MAX_MEMTABLE_BYTES` | 10% (accounted bytes; resident cost measured ~1.73×) | 32 MiB |
+| `SIDECAR_CACHE_MAX_BYTES` | 10% | 32 MiB |
 
 The nominal shares sum to 72.5%: the remainder covers flush (which rides
 ingest), the sidecars (unbounded until their eviction lands), and the metering
@@ -195,6 +196,7 @@ becomes disk usage that cannot be evicted**.
 | `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES` | 512 MiB (budget-derived) | One query's own materialization cap |
 | `LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES` | 512 MiB (minimum 8 MiB; budget-derived) | The shared pool **all** queries together materialize from, reserved incrementally as rows survive the pipeline. A query refused here gets an error naming the pool; before this the aggregate was `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES` and nothing enforced it |
 | `LOGGYTRACY_ROW_GROUP_CACHE_MAX_BYTES` | 256 MiB, `off` disables (budget-derived) | Decoded row groups kept across scans. A part is immutable, so a group decoded whole by one scan serves every later scan without paying the reader build again; the budget bounds what stays resident (`loggytracy_row_group_cache_bytes` reports it). Entries die with their part on merge or retirement |
+| `LOGGYTRACY_SIDECAR_CACHE_MAX_BYTES` | unbounded (`off`; budget-derived) | Byte cap on the resident bloom half of part sidecars, evicted LRU across parts. The blooms are durable in `index.bin`, so an evicted part's next pruning query pays one re-read; the stream-index half stays resident (tens of KB per part). Unbounded, residency is ~2 MiB per live part and grows with ingest rate × retention window — the term that killed the first 24-hour soak (`todo.md`) |
 | `LOGGYTRACY_MAX_LOG_LIMIT` | 100,000 | Maximum `limit` parameter |
 | `LOGGYTRACY_MAX_QUERY_RUNTIME` | `30s` | Also the timeout for metadata endpoints |
 | `LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS` | 8 | Shared with metadata endpoints |
