@@ -919,6 +919,16 @@ found four things first, three of them the soak's own questions answering early.
 - [ ] **~1 % of queries 504 under sustained 20 k eps with merge and retention active** (48/4,926
   at 8 GiB; first: `| json | level="debug"` timed out). The load gate's p95 passes in minutes-long
   runs; the sustained tail is a different number.
+- **Fixing the mmap threshold (`MALLOC_MMAP_THRESHOLD_=131072`, arenas left at 4) collapses the
+  ratchet and still loses**: anon/live 5.30 → **1.60**, survival 150 → 502 s, then killed anyway.
+  With retention mostly gone the remaining arithmetic is plain: the live sum's spikes reach
+  1.1–1.5 GiB (merge saws to ~600 MiB, the cache holds 256 MiB, query ~300 MiB, sidecars
+  100–165 MiB before retention's steady state) and glibc still retains 0.65–1.2 GiB of
+  small-chunk heap, and the two together brush 2 GiB. The old rejection of this knob dated from
+  the pre-streaming-merge regime and did not survive remeasurement — but no allocator knob makes
+  2 GiB hold this workload while the live spikes are allowed to coincide. That is
+  [`merge_max_memory_bytes` must derive from the declared budget] and its M10 siblings, now with
+  the measurement that makes them urgent rather than pending.
 - [ ] **The 24-hour run needs a configuration that can survive it, and that is a decision rather
   than a default**: 2 GiB with `MALLOC_ARENA_MAX=1` (the declared rig with the one measured knob;
   the WAL-backlog trend is the risk it would be testing), or a limit the ratchet fits (≥4–6 GiB,
