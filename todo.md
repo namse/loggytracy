@@ -1420,10 +1420,19 @@ only thing that can say whether a fix worked, so it landed before them and it la
       the server dies and writes its report only at the end, so the ingest and query columns of
       every OOM row in `docs/MEMORY_BUDGET_GATE.md` are empty. A periodic partial write, or a
       result written on signal, would make a failing run as informative as a passing one
-- [ ] **Make the anonymous footprint track live bytes first.** Measured precondition, not a tuning note: with
+- [x] **Make the anonymous footprint track live bytes first.** Measured precondition, not a tuning note: with
       the default glibc configuration no live-byte budget can be honest. `mallopt` at startup, or an allocator
       whose heap decays, or the arena-tagging allocator promoted into production. Whichever is chosen, the
       `anon / live` ratio it achieves must be published beside the budget
+
+      Done by fixing the mmap threshold (`malloc_tuning.rs`, `M_MMAP_THRESHOLD` 128 KiB beside the trim
+      threshold, `LOGGYTRACY_MALLOC_MMAP_THRESHOLD` overrides, 0 restores the dynamic ratchet). The ratio it
+      achieves: **anon/live 5.30 → 1.60** on the soak rig, time-to-OOM at 2 GiB 150 → 502 s. The cost,
+      measured before defaulting it on — two 240 s runs per arm at 8 GiB, sustained 20 k eps: eps
+      19,956–19,985 against 19,972–19,981, push service p99 57.6/82.9 ms against 81.7/87.8, all four
+      verdicts PASS — nothing. The glibc parameter is the same shape as the trim threshold's story: a
+      threshold that only ratchets upward, fixed once at startup. The earlier rejection of this knob was
+      measured on the pre-streaming-merge build, whose kill was live spikes rather than retention
 - [ ] **Honest metering.** `entries_bytes` (`memtable.rs:69-81`) counts line and label lengths only — not the
       56-byte `LogEntry`, the 48-byte slot per metadata pair, malloc headers, or `Vec` slack. Measured
       **1.70–1.79x under** in situ on the comparison corpus, so `MAX_MEMTABLE_BYTES=256 MiB` is really ~440 MiB

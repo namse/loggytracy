@@ -30,11 +30,26 @@ const DEFAULT_ARENA_MAX: libc_shim::c_int = 4;
 /// ratchets upward and is how the high-water mark became permanent.
 const TRIM_THRESHOLD: libc_shim::c_int = 131072;
 
+/// Fixed 128 KiB, same number and same reasoning as the trim threshold: the
+/// mmap threshold is the *other* glibc parameter that only ratchets upward —
+/// every free of an mmapped chunk raises it toward 32 MiB, after which large
+/// allocations land on the heap and their frees join the retained high-water
+/// the trim threshold cannot reach. Fixing it sends every allocation over
+/// 128 KiB through mmap, whose free is an munmap the kernel gets back
+/// immediately. Measured on the soak rig (2 GiB, sustained 20 k eps):
+/// anon/live 5.30 → 1.60 and time-to-OOM 150 → 502 s with arenas left at 4.
+/// The earlier rejection of this knob dated from the pre-streaming-merge
+/// build, whose kill was live spikes rather than retention.
+/// `LOGGYTRACY_MALLOC_MMAP_THRESHOLD` overrides; 0 leaves glibc's dynamic
+/// ratchet in place.
+const MMAP_THRESHOLD: libc_shim::c_int = 131072;
+
 mod libc_shim {
     #![allow(non_camel_case_types)]
     pub type c_int = i32;
     // glibc `malloc.h` values; stable ABI.
     pub const M_TRIM_THRESHOLD: c_int = -1;
+    pub const M_MMAP_THRESHOLD: c_int = -3;
     pub const M_ARENA_MAX: c_int = -8;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe extern "C" {
@@ -58,11 +73,15 @@ pub fn apply_from_env() -> bool {
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(DEFAULT_ARENA_MAX);
-    apply(arena_max)
+    let mmap_threshold = std::env::var("LOGGYTRACY_MALLOC_MMAP_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(MMAP_THRESHOLD);
+    apply(arena_max, mmap_threshold)
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn apply(arena_max: i32) -> bool {
+fn apply(arena_max: i32, mmap_threshold: i32) -> bool {
     // SAFETY: mallopt only writes allocator parameters; called before any
     // other thread exists.
     unsafe {
@@ -70,11 +89,14 @@ fn apply(arena_max: i32) -> bool {
             libc_shim::mallopt(libc_shim::M_ARENA_MAX, arena_max);
         }
         libc_shim::mallopt(libc_shim::M_TRIM_THRESHOLD, TRIM_THRESHOLD);
+        if mmap_threshold > 0 {
+            libc_shim::mallopt(libc_shim::M_MMAP_THRESHOLD, mmap_threshold);
+        }
     }
     true
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn apply(_arena_max: i32) -> bool {
+fn apply(_arena_max: i32, _mmap_threshold: i32) -> bool {
     false
 }
