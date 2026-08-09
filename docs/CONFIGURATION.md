@@ -266,6 +266,9 @@ The production binary's global allocator is **jemalloc** (`src/main.rs`), adopte
 measured glibc's retained-free creep killing 2 GiB in hours with every gauged resident flat and
 every glibc knob below already applied. The three `MALLOC_*` knobs and the trim loop therefore act
 only in `--features memprof` builds, whose instrumented allocator still goes through glibc.
+jemalloc runs at its defaults — a five-way A/B on the soak rig found no setting that beat them —
+and an operator override goes through `_RJEM_MALLOC_CONF` (this build is symbol-prefixed, so the
+plain `MALLOC_CONF` name is not consulted).
 
 | `LOGGYTRACY_MALLOC_TUNING` | on | On glibc the process caps malloc arenas and fixes a 128 KiB trim threshold before any thread exists — `docs/MEMORY_ATTRIBUTION.md` measured 44–69% of the cgroup's anonymous memory as freed-but-retained heap without it. `off` restores glibc's defaults for an A/B or if a throughput regression is suspected |
 | `LOGGYTRACY_MALLOC_ARENA_MAX` | 4 | The arena cap the tuning applies. 1 was measured first and rejected: anon fell 3.6x but the allocation-heavy flush path halved its cadence contending for the single arena. 0 leaves glibc's own arena scaling in place (trim threshold still applied) |

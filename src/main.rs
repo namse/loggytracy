@@ -19,6 +19,15 @@ static ALLOCATOR: loggytracy::memprof::ProfilingAllocator = loggytracy::memprof:
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// jemalloc runs at its own defaults, and that is a measured choice: a
+// five-way 600 s sweep on the soak rig (todo.md, 2026-08-09) read
+// `background_thread:true` and `dirty_decay_ms:30000` inside the defaults'
+// run-to-run spread on every axis, and the apparent throughput gap against
+// glibc dissolved once 600 s runs were compared with 600 s runs — both
+// allocators throttle ~7% in the cold-start transient and recover by the
+// hour mark. An operator A/B reaches jemalloc through `_RJEM_MALLOC_CONF`
+// (the `MALLOC_CONF` name is not consulted in this prefixed build).
+
 fn main() {
     // Before the runtime exists: M_ARENA_MAX only bounds arenas not yet
     // created, and tokio's workers each create one on first contention.
