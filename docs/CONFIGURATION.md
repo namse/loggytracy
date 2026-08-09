@@ -262,6 +262,11 @@ The process follows `RUST_LOG` directly. When unset, it uses `loggytracy=info,wa
 
 | Variable | Default | Description |
 |---|---|---|
+The production binary's global allocator is **jemalloc** (`src/main.rs`), adopted after the soak
+measured glibc's retained-free creep killing 2 GiB in hours with every gauged resident flat and
+every glibc knob below already applied. The three `MALLOC_*` knobs and the trim loop therefore act
+only in `--features memprof` builds, whose instrumented allocator still goes through glibc.
+
 | `LOGGYTRACY_MALLOC_TUNING` | on | On glibc the process caps malloc arenas and fixes a 128 KiB trim threshold before any thread exists — `docs/MEMORY_ATTRIBUTION.md` measured 44–69% of the cgroup's anonymous memory as freed-but-retained heap without it. `off` restores glibc's defaults for an A/B or if a throughput regression is suspected |
 | `LOGGYTRACY_MALLOC_ARENA_MAX` | 4 | The arena cap the tuning applies. 1 was measured first and rejected: anon fell 3.6x but the allocation-heavy flush path halved its cadence contending for the single arena. 0 leaves glibc's own arena scaling in place (trim threshold still applied) |
 | `LOGGYTRACY_MALLOC_TRIM_INTERVAL` | `60s` (`off` disables) | How often a background loop calls glibc's `malloc_trim(0)`, returning free pages from the middle of every arena to the kernel. The fixed trim threshold only releases heap tops; without this the second 24-hour soak measured an ~130 MiB/hour anonymous creep with every gauged resident flat, reaching a 2 GiB kill at t≈8653 s. No-op on non-glibc builds |

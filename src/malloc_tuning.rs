@@ -28,6 +28,7 @@ const DEFAULT_ARENA_MAX: libc_shim::c_int = 4;
 /// Fixed 128 KiB, matching the measured `MALLOC_TRIM_THRESHOLD_=131072`.
 /// Setting it also disables glibc's dynamic threshold, which only ever
 /// ratchets upward and is how the high-water mark became permanent.
+#[cfg(all(target_os = "linux", target_env = "gnu", feature = "memprof"))]
 const TRIM_THRESHOLD: libc_shim::c_int = 131072;
 
 /// Fixed 128 KiB, same number and same reasoning as the trim threshold: the
@@ -48,10 +49,13 @@ mod libc_shim {
     #![allow(non_camel_case_types)]
     pub type c_int = i32;
     // glibc `malloc.h` values; stable ABI.
+    #[cfg(all(target_os = "linux", target_env = "gnu", feature = "memprof"))]
     pub const M_TRIM_THRESHOLD: c_int = -1;
+    #[cfg(all(target_os = "linux", target_env = "gnu", feature = "memprof"))]
     pub const M_MMAP_THRESHOLD: c_int = -3;
+    #[cfg(all(target_os = "linux", target_env = "gnu", feature = "memprof"))]
     pub const M_ARENA_MAX: c_int = -8;
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(target_os = "linux", target_env = "gnu", feature = "memprof"))]
     unsafe extern "C" {
         pub fn mallopt(param: c_int, value: c_int) -> c_int;
         pub fn malloc_trim(pad: usize) -> c_int;
@@ -81,7 +85,10 @@ pub fn apply_from_env() -> bool {
     apply(arena_max, mmap_threshold)
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+// The production binary's allocator is jemalloc (`src/main.rs`), so glibc
+// tuning targets a heap nothing uses: it applies only in the memprof build,
+// whose instrumented wrapper still allocates through glibc.
+#[cfg(all(target_os = "linux", target_env = "gnu", feature = "memprof"))]
 fn apply(arena_max: i32, mmap_threshold: i32) -> bool {
     // SAFETY: mallopt only writes allocator parameters; called before any
     // other thread exists.
@@ -97,7 +104,7 @@ fn apply(arena_max: i32, mmap_threshold: i32) -> bool {
     true
 }
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu", feature = "memprof")))]
 fn apply(_arena_max: i32, _mmap_threshold: i32) -> bool {
     false
 }
@@ -120,7 +127,7 @@ pub fn trim() -> bool {
     trim_impl()
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(target_os = "linux", target_env = "gnu", feature = "memprof"))]
 fn trim_impl() -> bool {
     // SAFETY: malloc_trim only consolidates and releases free memory; it is
     // documented as callable at any time and takes the arena locks itself.
@@ -130,7 +137,7 @@ fn trim_impl() -> bool {
     true
 }
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu", feature = "memprof")))]
 fn trim_impl() -> bool {
     false
 }
