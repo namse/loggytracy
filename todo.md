@@ -860,6 +860,19 @@ The polish order, each item a measurement or a bound, none a feature:
    evictions/retractions, allocator retention over hours (the 1.34-1.69 anon/live was measured at
    60 s). Deliverable: a `run_memprof_local.sh`-style script with an hours cap, and its verdict in
    this file.
+
+   **Done, on the fifth attempt, and the four failures were the deliverable** (2026-08-10, the
+   run-by-run record is in "The soak rig is built" below): the 24-hour run at 2 GiB / offered
+   20 k eps / retention 30 m completed with anon quarter-means 1330 → 1367 → 1270 → **1112 MiB**
+   (peak 1967), sidecars flat at 118–122 MiB, parts flat at ~320, disk oscillating 2.2–3.5 GB,
+   WAL bounded, row-group-cache gauge pinned at 153 MiB through a day of evictions, and 568,721
+   queries at 12 errors (0.002%) with response p95 633 ms. What it took: the sidecar bloom
+   eviction, the declared budget, and jemalloc — each forced by the previous attempt's corpse.
+   Two honest numbers out of the verdict (`PASS_BEHAVIORAL_ONLY`): the engine's sustained
+   capacity at 2 GiB is **~18.6 k eps** — 6.9% of the offered 20 k was throttled with 429s, which
+   is backpressure working, and the push p95 target is missed in the same breath — and
+   `part_meta` is the one remaining GROWING row, 8.1 → 13.0 MiB over the day, which is
+   `PartMeta::streams` (polish item 2's residue) presenting its bill in slow motion.
 2. **The unbounded residents** — sidecar + `PartMeta::streams` grow with part count and nothing
    evicts them (~380 KB/part measured; VISION already scopes the fix: sidecars are durable in
    `index.bin`, so eviction is a re-read; stream identity can be a fingerprint). The in-flight push
