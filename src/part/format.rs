@@ -761,6 +761,7 @@ fn write_parquet(
     }
     writer.close().map_err(io::Error::other)?;
     sync_file(path)?;
+    crate::page_cache::drop_cache(path);
     Ok(())
 }
 

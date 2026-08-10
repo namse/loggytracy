@@ -47,6 +47,7 @@ fn write_index_sections(path: &Path, bloom: &[u8], streams: &[u8]) -> io::Result
     }
     fs::write(path, &buf)?;
     sync_file(path)?;
+    crate::page_cache::drop_cache(path);
     Ok(())
 }
 

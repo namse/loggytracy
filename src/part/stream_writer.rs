@@ -252,6 +252,11 @@ impl StreamingPartWriter {
         self.flush_group()?;
         self.writer.close().map_err(io::Error::other)?;
         sync_file(&self.data_path)?;
+        // Synced, therefore clean — and dropped from the page cache on
+        // purpose, so the write stream cannot ride `memory.current` into
+        // `memory.max`'s reclaim stall (see `crate::page_cache`). A query
+        // that wants this part re-reads it once.
+        crate::page_cache::drop_cache(&self.data_path);
 
         let mut blooms = Vec::new();
         blooms.extend_from_slice(BLOOM_MAGIC);
