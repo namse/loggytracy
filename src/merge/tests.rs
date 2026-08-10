@@ -1461,3 +1461,37 @@
             "the request alone made the part eligible, and only its rows went"
         );
     }
+
+    #[tokio::test]
+    async fn an_input_deleted_mid_merge_is_a_skip_and_not_an_error() {
+        let dir = tmp_dir("vanished-input");
+        let config = Config {
+            data_dir: dir.clone(),
+            merge_min_part_count: 2,
+            merge_target_part_rows: 1000,
+            merge_max_part_rows: 10000,
+            ..Config::default()
+        };
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        for batch in 0..3u64 {
+            let rows = make_rows(10, (batch * 1000) as i64, &format!("b{}", batch));
+            let parts = part::flush_rows(rows, &parts_root, config.row_group_size).unwrap();
+            registry.register(parts).unwrap();
+        }
+
+        // Retention's whole-part deletion, landing between group selection
+        // and the rewrite's reads: the part directory is gone, files first.
+        let victim_dir = {
+            let victims = registry.snapshot();
+            victims[0].part().dir.clone()
+        };
+        std::fs::remove_dir_all(&victim_dir).unwrap();
+
+        // The rewrite fails on the vanished input, and that must be a benign
+        // skip: no Err from the iteration, and the surviving parts untouched.
+        merge_once_without_retention(&registry, None, &config)
+            .await
+            .expect("a retention-deleted input is a skip, not a merge error");
+    }

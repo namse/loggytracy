@@ -219,6 +219,27 @@ async fn merge_once(
             let rewrite = match merge_result {
                 Ok(rewrite) => rewrite,
                 Err(error) => {
+                    // Retention deletes whole parts between this tick's group
+                    // selection and the rewrite's reads, and a group whose
+                    // input vanished mid-rewrite is not an incident: the next
+                    // tick re-lists and never selects it again. The soak hit
+                    // this four times in twenty minutes at a 5 m retention and
+                    // each one wore an ERROR (todo.md). Distinguished from
+                    // real I/O trouble by looking, not by matching the error
+                    // text — and by the file only retention removes: cache
+                    // eviction legitimately reclaims `data.parquet`, so a
+                    // missing body alone must stay loud, while a missing
+                    // `index.bin` means the whole part was deleted.
+                    let input_vanished = group
+                        .iter()
+                        .any(|reader| !reader.part().index_path().exists());
+                    if input_vanished {
+                        tracing::debug!(
+                            partition = %partition,
+                            "merge input deleted mid-rewrite (retention); the next tick re-lists"
+                        );
+                        continue;
+                    }
                     tracing::warn!(%error, partition = %partition, "merge rewrite failed, skipping group");
                     if retention_only {
                         // A rewrite streams now, so it cannot fail for want

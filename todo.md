@@ -929,11 +929,17 @@ found four things first, three of them the soak's own questions answering early.
   built in and automatic — while Loki, also Go and therefore without the glibc layer, died of a
   live working set whose defaults derive from no limit at all (anon 579 → 1632 MiB in 80 s).
   loggytracy shares Loki's problem and adds glibc's on top.
-- [ ] **Retention and merge race on part files.** Merge selects a group, retention whole-part
+- [x] **Retention and merge race on part files.** Merge selects a group, retention whole-part
   deletes an input, and `rewrite_group` fails with ENOENT — surfaced as an ERROR-level "merge
   iteration failed", four times in twenty minutes at the aggressive 5 m retention. The outcome is
   benign (the group is skipped and the next tick re-lists) but it is wasted work wearing an
   incident's log level, and it fires at any retention setting given enough hours.
+
+  Fixed: the error path now looks at the inputs before deciding the log level — a missing
+  `index.bin` is the file only retention removes (cache eviction legitimately reclaims
+  `data.parquet` alone, so a missing body stays loud), and that case is a DEBUG skip with no error
+  recorded. Pinned red-before/green-after by
+  `merge::tests::an_input_deleted_mid_merge_is_a_skip_and_not_an_error`.
 - [ ] **~1 % of queries 504 under sustained 20 k eps with merge and retention active** (48/4,926
   at 8 GiB; first: `| json | level="debug"` timed out). The load gate's p95 passes in minutes-long
   runs; the sustained tail is a different number.
