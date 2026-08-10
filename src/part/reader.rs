@@ -80,10 +80,6 @@ pub struct PartReader {
     /// only moment the size is free. The blooms report through
     /// [`bloom_cache_bytes`] instead.
     index_resident_bytes: u64,
-    /// The `_stream` ordinal table: `meta.streams` shared out once at open,
-    /// so a scan resolves a row's label set with an `Arc` clone instead of
-    /// rebuilding a map from label columns.
-    stream_table: Vec<SharedLabels>,
     /// Whole row groups decoded by earlier scans, kept under the process-wide
     /// budget; dies with this reader.
     group_cache: GroupCache,
@@ -441,12 +437,6 @@ impl PartReader {
         let stream_index = decode_stream_index(stream_bytes)?;
         validate_stream_index(&part, &stream_index)?;
         let stream_labels = part.meta.stream_labels.clone();
-        let stream_table: Vec<SharedLabels> = part
-            .meta
-            .streams
-            .iter()
-            .map(|labels| Arc::new(labels.clone()))
-            .collect();
         let metadata_keys: Vec<String> = part
             .meta
             .metadata_columns
@@ -478,7 +468,6 @@ impl PartReader {
             metadata_keys,
             parsed_keys,
             index_resident_bytes,
-            stream_table,
             group_cache: GroupCache::from_global(),
             cache_projection,
             data_metadata: std::sync::OnceLock::new(),
@@ -580,9 +569,9 @@ impl PartReader {
             .meta
             .streams
             .iter()
-            .filter(|labels| matchers.iter().all(|m| m.matches(labels)))
+            .filter(|labels| matchers.iter().all(|m| m.matches(labels.as_ref())))
             .filter(|labels| self.stream_occurs_in(labels, &groups))
-            .cloned()
+            .map(|labels| (**labels).clone())
             .collect()
     }
 
@@ -927,7 +916,9 @@ impl PartReader {
         // second projection — reading the ordinal costs a u32 per row, which
         // is cheaper than proving a group uniform used to be.
         let stream_matches: Vec<bool> = self
-            .stream_table
+            .part
+            .meta
+            .streams
             .iter()
             .map(|labels| matchers.iter().all(|matcher| matcher.matches(labels)))
             .collect();
@@ -1820,15 +1811,16 @@ impl PartReader {
                 }
                 _ => {
                     let index = ordinal as usize;
-                    if index >= self.stream_table.len() || index >= stream_matches.len() {
+                    let streams = &self.part.meta.streams;
+                    if index >= streams.len() || index >= stream_matches.len() {
                         return Err(format!(
                             "part {} row group {row_group} references stream ordinal \
 {ordinal} beyond the {}-entry stream table",
                             self.part.meta.id,
-                            self.stream_table.len()
+                            streams.len()
                         ));
                     }
-                    let labels = self.stream_table[index].clone();
+                    let labels = streams[index].clone();
                     let matched = stream_matches[index];
                     run = Some((ordinal, labels.clone(), matched));
                     (labels, matched)

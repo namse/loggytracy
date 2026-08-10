@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::logql::{LabelMatcher, LineFilter};
-use crate::memtable::{IndexStats, Labels, QueryResult, StreamResult};
+use crate::memtable::{IndexStats, Labels, QueryResult, SharedLabels, StreamResult};
 use crate::object_storage::Manifest;
 use crate::part::{
     ExactFieldPredicate, ExactFieldPruning, MetadataWindow, Part, PartReader, QueryTimeRange,
@@ -775,7 +775,7 @@ impl PartRegistry {
 
     /// Process-wide totals for the operator metrics endpoint.
     pub fn global_stats(&self) -> IndexStats {
-        let mut stream_set: BTreeSet<Labels> = BTreeSet::new();
+        let mut stream_set: BTreeSet<SharedLabels> = BTreeSet::new();
         let mut entries = 0usize;
         let mut bytes = 0u64;
         for reader in self.snapshot() {

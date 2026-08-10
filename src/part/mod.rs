@@ -412,7 +412,10 @@ pub struct PartMeta {
     /// the query-time parser would produce, exact by construction because the
     /// writer runs the same extraction.
     pub parsed_columns: Vec<(String, u64)>,
-    pub streams: Vec<Labels>,
+    /// One entry per distinct label set, interned across parts at open —
+    /// see `intern_stream_labels`. This is also the `_stream` ordinal table
+    /// the reader resolves rows through; there is no separate copy.
+    pub streams: Vec<SharedLabels>,
     /// Size of `meta.json` on disk, recorded when it was read.
     ///
     /// Startup parses this file for every part before serving anything, and

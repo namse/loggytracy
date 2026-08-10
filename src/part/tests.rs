@@ -3389,3 +3389,25 @@ not by the decode fallback"
         slot.remove();
         assert!(bloom_cache_bytes() < PROBE);
     }
+
+    #[test]
+    fn identical_streams_across_parts_share_one_interned_label_set() {
+        // Two parts, same corpus: under a steady stream population this is
+        // every part after the first, and the memory question is whether the
+        // second part's `meta.streams` re-allocates the label sets or shares
+        // the first's. `Arc::ptr_eq` is the whole assertion — equality would
+        // also pass on duplicates, and duplicates are the bug.
+        let tmp_a = tempfile_dir();
+        let tmp_b = tempfile_dir();
+        let part_a = flush_rows(make_rows(), &tmp_a, 100).unwrap().remove(0);
+        let part_b = flush_rows(make_rows(), &tmp_b, 100).unwrap().remove(0);
+        assert_eq!(part_a.meta.streams.len(), part_b.meta.streams.len());
+        assert!(!part_a.meta.streams.is_empty());
+        for (a, b) in part_a.meta.streams.iter().zip(part_b.meta.streams.iter()) {
+            assert_eq!(a, b, "same corpus must produce the same stream table");
+            assert!(
+                std::sync::Arc::ptr_eq(a, b),
+                "equal label sets in different parts must be one interned allocation"
+            );
+        }
+    }

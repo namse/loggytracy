@@ -1554,8 +1554,23 @@ only thing that can say whether a fix worked, so it landed before them and it la
 - [ ] **Sidecars inside the budget.** They are outside it on purpose today (`part/reader.rs:77-81`), so resident
       memory grows with part count unbounded. Make them LRU-evictable — they are already durable in `index.bin`.
       Sized from the measured ~240 kB per part, not from a share
-- [ ] **Stop materializing `PartMeta::streams`** (`part/mod.rs:231`, `part/metadata.rs:172-176`) — every distinct
+- [x] **Stop materializing `PartMeta::streams`** (`part/mod.rs:231`, `part/metadata.rs:172-176`) — every distinct
       label set in every open part, held as live `String`s. Measured ~140 kB per part
+
+      Done by interning rather than by not materializing: `PartMeta::streams` is `Vec<SharedLabels>`
+      now, each set resolved through a `Weak`-entried table at part open (`intern_stream_labels`),
+      so a label set costs one allocation across every part that holds it and dies with the last
+      one — and the reader's separate `stream_table` copy is deleted outright, because the interned
+      `meta.streams` *is* the ordinal table. This is not the intern table the `SharedLabels` doc
+      rejects: that was per-row on the ingest path; this is per-stream at part open, on the cold
+      path, with no eviction policy to invent. Cross-part sharing is pinned by `Arc::ptr_eq` in
+      `identical_streams_across_parts_share_one_interned_label_set` — equality would pass on
+      duplicates, and duplicates are the bug. The 24-hour soak's GROWING `part_meta` gauge is a
+      different quantity — `meta.json` bytes on disk, which grow as merge matures parts and cap by
+      construction at (streams per part × labels) + (row groups per part × the min/max/rows
+      arrays), both bounded by the corpus and `merge_max_part_rows` — so the gauge plateaus near
+      ~25 MB at the soak's part count and the next long run carries the arena number for the
+      resident side
 - [ ] **Bound in-flight push bodies.** The ingest gate is checked once at request entry and nothing limits
       concurrency, so (in-flight requests x 64 MiB) sits outside the accounting. Measured at 0.3 MiB on the bed,
       so this is closing a hole rather than recovering memory

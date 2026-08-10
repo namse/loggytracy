@@ -200,6 +200,49 @@ struct MergeTombstone {
     old_dirs: Vec<PathBuf>,
 }
 
+/// One `Arc<Labels>` per distinct label set across every open part.
+///
+/// A part's `meta.streams` repeats the label sets of every other part that
+/// holds the same streams — under a steady corpus that is the *same* few
+/// hundred sets duplicated per part, and the 24-hour soak read `part_meta`
+/// as its one remaining GROWING row (todo.md, 2026-08-10). Interning at
+/// part-open collapses the duplication to one allocation per distinct set,
+/// and `stream_table` disappears as a separate copy because `meta.streams`
+/// *is* the shared table now.
+///
+/// This is not the intern table `SharedLabels`' doc rejects: that rejection
+/// is about the ingest path, where a global lock would sit under every row
+/// and an eviction policy would have to exist. This one is consulted at
+/// part open only — hundreds of lookups per part, on the cold path — and
+/// entries are `Weak`, so a set's lifetime is exactly the parts that hold
+/// it and nothing ever decides to evict.
+fn intern_stream_labels(labels: Labels) -> SharedLabels {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    static INTERN: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<u64, Vec<std::sync::Weak<Labels>>>>,
+    > = std::sync::OnceLock::new();
+    let mut hasher = DefaultHasher::new();
+    labels.hash(&mut hasher);
+    let key = hasher.finish();
+    let mut table = INTERN
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("stream intern table poisoned");
+    let bucket = table.entry(key).or_default();
+    bucket.retain(|weak| weak.strong_count() > 0);
+    for weak in bucket.iter() {
+        if let Some(shared) = weak.upgrade()
+            && *shared == labels
+        {
+            return shared;
+        }
+    }
+    let shared = Arc::new(labels);
+    bucket.push(Arc::downgrade(&shared));
+    shared
+}
+
 pub fn load_part(dir: &Path) -> Result<Part, String> {
     let _arena = crate::memprof::enter(crate::memprof::Arena::PartMeta);
     let meta_str = fs::read_to_string(dir.join(META_FILE)).map_err(|e| e.to_string())?;
@@ -212,10 +255,10 @@ pub fn load_part(dir: &Path) -> Result<Part, String> {
         ));
     }
     validate_meta_file(dir, &meta_file)?;
-    let streams: Vec<Labels> = meta_file
+    let streams: Vec<SharedLabels> = meta_file
         .streams
         .iter()
-        .map(|pairs| pairs.iter().cloned().collect())
+        .map(|pairs| intern_stream_labels(pairs.iter().cloned().collect()))
         .collect();
     let meta = PartMeta {
         id: meta_file.id,
