@@ -441,7 +441,10 @@ async fn flush_once(
             // queued query waited.
             drop(cache_guard);
             {
-                let _visibility_guard = registry.operation_lock().write_owned().await;
+                let _visibility_guard = crate::part_registry::PartRegistry::write_without_convoy(
+                    registry.operation_lock(),
+                )
+                .await;
                 registry.register_opened(opened_log);
                 trace_registry.register_opened(opened_traces);
                 memtable.commit_flush();

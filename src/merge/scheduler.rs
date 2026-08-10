@@ -382,7 +382,9 @@ async fn merge_once(
                 }
             };
             drop(part_guard);
-            let _visibility_guard = registry.operation_lock().write_owned().await;
+            let _visibility_guard =
+                crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
+                    .await;
             // Only re-check while the replacement is still abandonable.
             // A successful publish is the commit point: the manifest
             // already lists the output and no longer lists the inputs,

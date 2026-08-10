@@ -189,6 +189,44 @@ impl PartRegistry {
         self.deletion_lock.clone()
     }
 
+    /// A write acquisition that never convoys the readers.
+    ///
+    /// The merge story above repeated itself with the roles recast: queries
+    /// hold `operation_lock`'s read half for their whole scan, and the lock
+    /// is fair — so the moment retention (or a flush or merge visibility
+    /// transition) *queued* a parked write, every query arriving after
+    /// queued behind it, for as long as the slowest in-flight scan. The
+    /// 24-hour soak read that as ~20 s query-counter freezes and a 9.4 s
+    /// query p99 whose maximum sat just under `max_query_runtime` (todo.md).
+    ///
+    /// So writers poll `try_write` instead of parking: between attempts no
+    /// writer is queued and readers flow freely. The price is honest and
+    /// paid by the writer — a commit's visibility or a retention tick waits
+    /// for a moment with no scan in flight, bounded by the slowest query —
+    /// and the deadline caps starvation under a saturated read side by
+    /// falling back to one parked (convoying) acquisition rather than
+    /// waiting forever.
+    pub async fn write_without_convoy(
+        lock: Arc<tokio::sync::RwLock<()>>,
+    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            match lock.clone().try_write_owned() {
+                Ok(guard) => return guard,
+                Err(_) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            "a lifecycle write waited two minutes for a reader-free moment; \
+falling back to a parked acquisition, which briefly convoys new readers"
+                        );
+                        return lock.write_owned().await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+    }
+
     /// Every tenant that owns a segment in some part. Visits under the read
     /// guard instead of going through `snapshot`, which would clone one `Arc`
     /// per part; `/metrics` asks for this on every scrape.
@@ -1129,5 +1167,52 @@ mod tests {
                 .is_empty(),
             "a field value in a later row group must not force restoration"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_polite_writer_does_not_convoy_new_readers() {
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+
+        // The scenario the 24-hour soak measured: a slow query holds the
+        // read half while a lifecycle writer wants the write half.
+        let long_scan = lock.clone().read_owned().await;
+
+        let writer = tokio::spawn(PartRegistry::write_without_convoy(lock.clone()));
+        // Let the writer reach its polling loop.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // A new query arriving now must not queue behind the waiting writer —
+        // this is the assertion the parked acquisition fails.
+        let new_scan = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            lock.clone().read_owned(),
+        )
+        .await
+        .expect("a polite writer must leave new readers unblocked");
+
+        drop(long_scan);
+        drop(new_scan);
+        drop(writer.await.expect("writer task"));
+
+        // The contrast that makes the helper worth existing: a parked
+        // writer convoys the same new reader, because the lock is fair.
+        let long_scan = lock.clone().read_owned().await;
+        let parked = tokio::spawn({
+            let lock = lock.clone();
+            async move { lock.write_owned().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            lock.clone().read_owned(),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a parked writer convoys new readers; if this ever passes, the \
+             fairness premise changed and write_without_convoy can be retired"
+        );
+        drop(long_scan);
+        drop(parked.await.expect("parked writer task"));
     }
 }

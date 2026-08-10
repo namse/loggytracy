@@ -241,11 +241,15 @@ async fn retention_once_at(
     let mut removed_log_ids = Vec::new();
     let mut removed_trace_ids = Vec::new();
     {
-        let _guard = registry.operation_lock().write_owned().await;
+        let _guard =
+            crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
+                .await;
         // Deleting part files, so the deletion lock too — a merge rewrite
         // reads its inputs under only that lock now. Operation first, then
         // deletion, the one order every double acquisition uses.
-        let _deletion_guard = registry.deletion_lock().write_owned().await;
+        let _deletion_guard =
+            crate::part_registry::PartRegistry::write_without_convoy(registry.deletion_lock())
+                .await;
         // One snapshot per registry, not one per candidate. This runs under the
         // exclusive lifecycle lock, so a scan per candidate stalls flush, merge
         // and queries for as long as the whole batch takes.
@@ -305,7 +309,9 @@ async fn retention_once_at(
             // still advertised by the registry: once the grace period passes,
             // the orphan collector removes its objects and the restore path
             // has nothing left to serve.
-            let _guard = registry.operation_lock().write_owned().await;
+            let _guard =
+                crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
+                    .await;
             registry.unregister(&removed_log_ids);
         }
         if !removed_trace_ids.is_empty() {
@@ -330,7 +336,9 @@ async fn retention_once_at(
                     return Err("trace object-store retention timed out".to_string());
                 }
             }
-            let _guard = registry.operation_lock().write_owned().await;
+            let _guard =
+                crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
+                    .await;
             trace_registry.unregister(&removed_trace_ids);
         }
     }
