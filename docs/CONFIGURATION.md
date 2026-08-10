@@ -115,8 +115,14 @@ value beside the budget and its source.
 | `SIDECAR_CACHE_MAX_BYTES` | 10% | 32 MiB |
 
 The nominal shares sum to 72.5%: the remainder covers flush (which rides
-ingest), the sidecars (unbounded until their eviction lands), and the metering
-gap above.
+ingest), the sidecar stream indexes, and the metering gap above.
+
+**Measured capacity at this budget** (24-hour soak, 2 GiB container, retention
+30 m, 2026-08-10): sustained ingest is **~18.6 k eps** of an offered 20 k —
+6.9% answered `429` by backpressure — with anon flat between 1.1 and 1.4 GiB,
+query response p95 633 ms and a 0.002% query error rate. Offer this engine
+more than ~18 k eps in 2 GiB and the surplus is refused, not buffered;
+`todo.md`'s soak section holds the full verdict and the run-by-run history.
 
 ## Backpressure
 

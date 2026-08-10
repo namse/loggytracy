@@ -78,6 +78,21 @@ the earlier table here was a guess and every one of its numbers moved:
 Shares are defaults, individually overridable. What is not overridable is that
 they sum to the budget.
 
+**`LOGGYTRACY_MEMORY_BUDGET` exists now (2026-08-08)** — unset, the engine
+reads the cgroup limit and declares 60% of it, deriving the merge, query,
+row-group-cache, sidecar-cache and memtable ceilings from the measured shares
+(`docs/CONFIGURATION.md`, "Memory budget"). These are derived *ceilings*, not
+yet the per-arena accounted refusal this section sketches — the shares above
+remain the target shape. The allocator-retention multiplier this section said
+to measure and publish was measured, published, and then retired outright:
+the 24-hour soak showed glibc's retained-free creep killing 2 GiB in hours
+with every knob applied, and the production allocator is **jemalloc** since
+`8592094`. And the number an operator actually asks this invariant for, from
+the completed 24-hour soak at a 2 GiB container (2026-08-10): **sustained
+capacity ~18.6 k eps** of an offered 20 k — 6.9% throttled with 429s, which
+is backpressure doing its job — with anon flat between 1.1 and 1.4 GiB,
+query response p95 633 ms and 12 errors in 568,721.
+
 **Two of the five did not fit their share when this was measured**, and that is
 the finding rather than a sizing problem: flush materialized a whole memtable
 snapshot at 3.3× its accounted size, and one merge group reached 771 MiB against
