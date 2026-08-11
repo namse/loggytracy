@@ -1008,6 +1008,49 @@ found four things first, three of them the soak's own questions answering early.
   remains is the tail's tail: **p99 16.9 s, max 26.6 s** — the ~20 s query-counter stalls observed
   beside merge in the memprof run. That is a scheduling/stall question now, not a growth one.
 
+  **It was not scheduling. It was the page cache against the cgroup limit, and the first guess cost
+  a fix that stays anyway** (2026-08-10, `ad40a5d` and `7b7f6be`). The diagnosis in the order it
+  happened, because the order is the lesson:
+
+  1. The lock-convoy hypothesis was half right. Lifecycle writers did park behind the query tail on
+     the fair lock, and `write_without_convoy` fixes a real hazard — kept, pinned by test — but the
+     freeze did not move.
+  2. The server log said it was not a query problem at all: through the freeze the **whole server is
+     silent for 52 s**, flush lines included, and what ends the silence is retention deleting files.
+  3. `mem.csv` named the mechanism. The freeze begins in the second that `memory.current` reaches
+     2048 MiB (the limit) and ends in the second that the deletion drops `file` from 1099 to
+     677 MiB. It is the kernel's direct-reclaim stall at a full cgroup, not a lock.
+
+  The fix: `posix_fadvise(DONTNEED)` on `data.parquet` and `index.bin` right after the fsync that
+  makes them durable — pages already clean, dropped deliberately so the write stream cannot ride
+  `current` into the wall. The WAL carries durability, the first query on that part pays one extra
+  read, and repeat access is the row-group cache's job, which has a budget. Same
+  no-dependency-shim shape as `malloc_tuning`.
+
+  **Verified over the hour, and it is half a fix.** `convoy-1h` → `fadvise-1h`, judged on the
+  server's own query counter rather than client latency: freeze total **111.1 s → 50.1 s**, longest
+  **51.6 s → 20.9 s**, query errors **4 → 0**, anon peak **1465 → 1170 MiB**. But five freezes
+  remain and `memory.current` still reaches the limit, and the second-by-second window says why:
+  the write side is dropped, and **queries scanning parts refill `file` to ~1.0 GiB** anyway. With
+  anon's steady state ~750 MiB that is 1.85 of 2 GiB, so any burst hits the wall. The anon climb
+  *inside* a freeze (718 → 924 MiB) is the memtable backlogging while flush is stalled — a
+  consequence, and the `rows=325500 parts=6` flush right after the silence is that backlog draining.
+  The structural cause is that the declared budget takes 60% of the limit while treating the page
+  cache as free.
+- [ ] **The stall's remaining half, and the sampler now measures it instead of inferring it.**
+  `run_soak_local.sh` carries five more columns, all cumulative: PSI `some`/`full` stall
+  microseconds, `pgscan_direct`/`pgsteal_direct` (direct reclaim, as against kswapd's, which costs
+  the workload nothing) and `workingset_refault_file`. The verdict grew a stall table — every
+  freeze the query counter shows, longest first, each with the reclaim deltas for its own window —
+  so a run judges itself on the quantity this item is about. Episode detection reproduces the
+  hand-computed numbers on both existing runs exactly. `SOAK_MEMORY_HIGH` is new beside it: set it
+  and reclaim is throttled and gradual below the hard limit instead of a cliff at it.
+
+  The next two runs are the free ones, no code, one variable each: ① the declared budget at 50%
+  rather than 60% (`LOGGYTRACY_MEMORY_BUDGET=1G`) — is headroom the mechanism? ② `memory.high` at
+  1800M — is the freeze the cliff, or the reclaim itself? A run is an hour because the freezes only
+  appear after t≈1980 s, once the disk is past ~2 GB and retention is deleting.
+
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
 The user's bar for this round: "VL보다 빠르지 않으면 의미가 없습니다" — `metadata_rare` must beat
