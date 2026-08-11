@@ -91,7 +91,11 @@ with every knob applied, and the production allocator is **jemalloc** since
 the completed 24-hour soak at a 2 GiB container (2026-08-10): **sustained
 capacity ~18.6 k eps** of an offered 20 k — 6.9% throttled with 429s, which
 is backpressure doing its job — with anon flat between 1.1 and 1.4 GiB,
-query response p95 633 ms and 12 errors in 568,721.
+query response p95 633 ms and 12 errors in 568,721. That run carried a
+retention/merge lock-order stall that froze the flush thread for up to 52 s at a
+time, which is where much of the throttling came from; fixed 2026-08-11, the
+same configuration takes 19,994.6 eps with zero throttling over an hour, and the
+figure here stands until a relaunched 24-hour soak replaces it.
 
 **Two of the five did not fit their share when this was measured**, and that is
 the finding rather than a sizing problem: flush materialized a whole memtable

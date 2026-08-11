@@ -1125,6 +1125,45 @@ found four things first, three of them the soak's own questions answering early.
   rewrites finish sooner, which shortens the wait it never addressed. Both stay; neither was
   treating this.
 
+  **Fixed and verified: the deleters wait on the deletion lock now** (`ca32ee5`). Deletion lock
+  first, so the wait happens against the lock this work actually contends for; then the operation
+  lock for the deletes and the retirement, which stay atomic together so no query can see a part
+  registered with its files already gone. That is merge's order too, so the cycle is gone rather
+  than survived by spinning. Cache eviction had the identical order with a *parked* acquisition,
+  convoying new readers on top of it, and is reversed the same way. Pinned by
+  `retention::tests::a_retention_pass_waiting_for_a_merge_does_not_stop_queries`, red before and
+  green after.
+
+  The hour on the killing configuration, against `fadvise-1h` as the baseline:
+
+  | | `fadvise-1h` | `lockorder-1h` |
+  |---|---|---|
+  | freezes / total | 5 / 50.1 s | **0 / 0.0 s** |
+  | query response p99 | 2804 ms | **525.6 ms** |
+  | query response max | 20,803 ms | **1268.5 ms** |
+  | 504s / 500s | 0 (`convoy-1h` had 4 × 504) | **0** |
+  | throttled pushes | 3,322 | **0** |
+  | achieved ingest | 19,903 eps | **19,994.6 of 20,000** |
+  | push response max | 2435 ms | **988.3 ms** |
+
+  Service and response percentiles now converge (524.9 against 525.6 ms), which is the arithmetic
+  way of saying there is no queueing delay left to find. The 191 remaining query errors are all
+  `400`s of one kind — `query exceeds the maximum of 1000000 scanned rows` — which is a refusal
+  working, not a failure, and every run had them.
+
+  **The throttling went with it, and that was not predicted.** 3,322 → 0 pushes answered `429`,
+  offered rate finally achieved. The mechanism is the same one: through a 20–50 s world-stop the
+  flush thread is frozen with everything else, the memtable fills, and backpressure refuses the
+  clients — so "sustained capacity" was partly a measurement of the freeze. The one numeric target
+  still missing is `push_response_p95_ms` at 255.7 ms against a 250 ms target, over by 5.7 ms.
+- [ ] **The published capacity number is now stale, and only the 24-hour run may replace it.**
+  `docs/CONFIGURATION.md` and `docs/VISION.md` both carry "~18.6 k eps of an offered 20 k, 6.9%
+  throttled with 429s", measured on the 2026-08-10 day-long soak — with this stall in it. One hour
+  at 19,994.6 eps and zero throttling says the number understates the engine, but an hour is not a
+  day and replacing a day's measurement with an hour's would repeat exactly the mistake that
+  published it. Both documents carry a caveat pointing here until the relaunched 24-hour soak
+  settles it.
+
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
 The user's bar for this round: "VL보다 빠르지 않으면 의미가 없습니다" — `metadata_rare` must beat

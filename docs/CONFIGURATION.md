@@ -124,6 +124,14 @@ query response p95 633 ms and a 0.002% query error rate. Offer this engine
 more than ~18 k eps in 2 GiB and the surplus is refused, not buffered;
 `todo.md`'s soak section holds the full verdict and the run-by-run history.
 
+**This number is under re-measurement and expected to rise.** The run it comes
+from contained a retention/merge lock-order stall that stopped the server for up
+to 52 s at a time, freezing the flush thread and so provoking the backpressure
+that refused 6.9% of the offer. With that fixed (2026-08-11), the same
+configuration takes **19,994.6 eps of the offered 20,000 with zero throttling**
+over an hour. An hour is not a day, so the figure above stands until the
+relaunched 24-hour soak replaces it.
+
 ## Backpressure
 
 | Variable | Default | Description |
