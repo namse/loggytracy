@@ -878,6 +878,21 @@ The polish order, each item a measurement or a bound, none a feature:
    `index.bin`, so eviction is a re-read; stream identity can be a fingerprint). The in-flight push
    body bound is in the same class (recorded, unimplemented). These become the first production
    incident the day retention is long.
+
+   **The `streams` half of this may already be done, and its evidence is stale by nine hours.** The
+   finding that promoted it — `part_meta` the one GROWING row of the 24-hour soak, 8.1 → 13.0 MiB
+   with the part count flat — was measured on the run that ended 08-10 13:13. `00f9799` landed at
+   08-10 21:41 and interns one `SharedLabels` per distinct label set across every part
+   (`intern_stream_labels`), so a part's per-stream cost is now one pointer into a table shared
+   process-wide, and the reader's second copy is gone. The hours since read consistently with that
+   and not with a leak: in `lockorder-1h`, `part_meta` Q2 → Q4 is 12.4 → 14.5 MiB, ×1.17, while the
+   part count goes 270 → 310, ×1.15 — the gauge is tracking parts, which is what it should do.
+
+   So this item is gated on the relaunched 24-hour soak, where the part count is flat and a real
+   growth term would have nowhere to hide. Building the fingerprint before that reads is building on
+   a measurement the code has already moved past. The sidecar half was separately fixed and verified
+   (`6615a04`, flat at 118–122 MiB through a day), and the push-body bound is untouched by any of
+   this and still owed.
 3. **One large-corpus bed run** — 10-100x the 150k-row dataset, as claim-scope validation rather
    than tuning: does the 1.4 ms-constant race hold when parts multiply and the cache's working set
    overflows 256 MiB? Published win or lose, per house rule.
