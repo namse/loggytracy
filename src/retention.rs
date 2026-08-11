@@ -241,14 +241,33 @@ async fn retention_once_at(
     let mut removed_log_ids = Vec::new();
     let mut removed_trace_ids = Vec::new();
     {
-        let _guard =
-            crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
-                .await;
-        // Deleting part files, so the deletion lock too — a merge rewrite
-        // reads its inputs under only that lock now. Operation first, then
-        // deletion, the one order every double acquisition uses.
+        // Deletion lock first, and the wait for it happens here rather than one
+        // line later. This pass has to wait: a merge rewrite holds the deletion
+        // lock's read half for as long as its group takes, deliberately, so its
+        // inputs cannot be deleted under it. What the wait must not do is hold
+        // `operation_lock` while it happens — that is the lock a query holds
+        // for its whole scan and a flush takes to commit, and the measured cost
+        // of taking it first was the whole server stopping for the rest of the
+        // rewrite: 39 of 39 soak freezes began on a retention tick, the longest
+        // 52 s, one of them to delete a single part. Worse, merge's own commit
+        // wants `operation_lock` after taking the deletion lock, so the old
+        // order had the two spinning against each other until retention's
+        // `try_write` won the gap between merge's rewrite guard and its commit
+        // guard, which is why the freezes were unpredictable as well as long.
+        //
+        // Deletion-then-operation is also merge's order (`merge/scheduler.rs`
+        // reads the deletion lock, then takes the operation lock to install the
+        // replacement), so this is now the one order both double acquisitions
+        // use, and the cycle is gone rather than survived by spinning.
         let _deletion_guard =
             crate::part_registry::PartRegistry::write_without_convoy(registry.deletion_lock())
+                .await;
+        // Then the operation lock, for the deletes and the retirement only. A
+        // query must not be able to observe a part that is registered but whose
+        // files are already gone, so these stay atomic together — it is the
+        // waiting that moved out, not the work.
+        let _guard =
+            crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
                 .await;
         // One snapshot per registry, not one per candidate. This runs under the
         // exclusive lifecycle lock, so a scan per candidate stalls flush, merge
@@ -842,6 +861,76 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(registry.part_count(), 0);
+        assert!(!parts[0].dir.exists());
+    }
+
+    /// A retention pass waiting for a merge rewrite must not stop the queries.
+    ///
+    /// The rewrite is represented by the only thing it actually holds — the
+    /// deletion lock's read half — and the query by the only thing it needs, the
+    /// operation lock's read half. With the acquisition order reversed, the pass
+    /// holds the query's lock for the whole length of the rewrite; the soak
+    /// measured that as freezes up to 52 s, every one starting on a retention
+    /// tick.
+    #[tokio::test]
+    async fn a_retention_pass_waiting_for_a_merge_does_not_stop_queries() {
+        let root = std::env::temp_dir().join(format!(
+            "loggytracy-retention-wait-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let parts_root = root.join("parts");
+        let labels: Labels = [("app".to_string(), "retention".to_string())]
+            .into_iter()
+            .collect();
+        let parts = part::flush_rows(
+            vec![Row {
+                tenant: crate::tenant::test_tenant(),
+                timestamp_ns: 1_000,
+                labels: std::sync::Arc::new(labels),
+                line: "expired".to_string(),
+                structured_metadata: vec![],
+            }],
+            &parts_root,
+            100,
+        )
+        .unwrap();
+        let registry = Arc::new(PartRegistry::new());
+        registry.register(parts.clone()).unwrap();
+        let trace_registry = Arc::new(TraceRegistry::standalone());
+        let config = Config {
+            data_dir: root,
+            retention_period: Some(Duration::from_secs(1)),
+            ..Config::default()
+        };
+        let policy = TenantPolicy::disabled();
+
+        // The merge rewrite, holding its inputs against deletion.
+        let rewrite_guard = registry.deletion_lock().read_owned().await;
+
+        let (pass, query_served) = tokio::join!(
+            retention_once(&registry, &trace_registry, None, &config, &policy),
+            async {
+                // Long enough for the pass to reach its wait, short enough that
+                // the test stays fast.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let served = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    registry.operation_lock().read_owned(),
+                )
+                .await
+                .is_ok();
+                // Release the rewrite so the pass finishes either way, and the
+                // assertions below read the same on both branches.
+                drop(rewrite_guard);
+                served
+            }
+        );
+        pass.unwrap();
+        assert!(
+            query_served,
+            "a query could not take the operation lock while retention waited for the deletion lock"
+        );
         assert_eq!(registry.part_count(), 0);
         assert!(!parts[0].dir.exists());
     }

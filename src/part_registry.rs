@@ -181,10 +181,19 @@ impl PartRegistry {
     /// fair, so the moment a flush queued its write, every query arriving
     /// after queued too: the whole 13 seconds became query tail latency, at
     /// every merge tick. But the rewrite never cared about visibility — only
-    /// that nobody deletes the files under it. That is this lock. Deleters
-    /// (retention retirement, cache eviction) take both, `operation_lock`
-    /// first, then this; long readers of part files that do not need the
-    /// visibility lock take only this one.
+    /// that nobody deletes the files under it. That is this lock. Long readers
+    /// of part files that do not need the visibility lock take only this one.
+    ///
+    /// **Deleters take both, and this one first.** Retention retirement and
+    /// cache eviction used to take `operation_lock` first, and the soak measured
+    /// what that costs: a deleter's wait for this lock is a wait for a whole
+    /// merge rewrite, and holding the visibility lock through it stops every
+    /// query and every flush for the duration. All 39 freezes in four one-hour
+    /// runs began on a retention tick, the longest 52 s, one of them to delete a
+    /// single part — and because merge's commit wants `operation_lock` while
+    /// holding this one's read half, the old order also had the two spinning
+    /// against each other until the deleter's `try_write` won a gap. This order
+    /// is merge's order too, so there is no cycle left to survive.
     pub fn deletion_lock(&self) -> Arc<tokio::sync::RwLock<()>> {
         self.deletion_lock.clone()
     }

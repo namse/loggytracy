@@ -381,11 +381,18 @@ pub async fn run(config: Arc<Config>) {
                     _ = ticker.tick() => {}
                     _ = crate::shutdown::wait_for_drain(&mut drain_rx) => return,
                 }
-                let guard = registry.operation_lock().write_owned().await;
                 // Eviction deletes part bodies, and a merge rewrite reads its
-                // inputs — and opens its unregistered outputs — under only
-                // the deletion lock. Operation first, then deletion.
+                // inputs — and opens its unregistered outputs — under only the
+                // deletion lock, for as long as its group takes. So the
+                // deletion lock is taken first and this tick's waiting happens
+                // against it, not against the lock queries hold for their whole
+                // scan: taking the operation lock first is what made retention
+                // stop the entire server for the rest of a merge rewrite, and
+                // this loop had the same order with a parked acquisition, which
+                // convoys new readers on top of it. Deletion, then operation,
+                // the order merge's own double acquisition uses.
                 let deletion_guard = registry.deletion_lock().write_owned().await;
+                let guard = registry.operation_lock().write_owned().await;
                 let eligible = registry.part_dirs();
                 let trace_eligible = trace_registry.part_dirs();
                 // Eviction walks the whole parts tree with `read_dir` and a
