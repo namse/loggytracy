@@ -117,15 +117,17 @@ echo "out=$OUT data=$DATA seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
 # available space, which trips the guard. `anon` is what an OOM kill is
 # decided on; `file` is the page cache the cgroup peak also includes.
 #
-# The last five columns are the reclaim evidence, all cumulative: PSI's `some`
-# and `full` stall microseconds (`full` = every thread in the cgroup stalled on
-# memory at once, which is what a whole-server freeze looks like from the
+# The last eight columns are the stall evidence, all cumulative. Memory: PSI's
+# `some` and `full` stall microseconds (`full` = every thread in the cgroup
+# stalled at once, which is what a whole-server freeze looks like from the
 # kernel's side), direct reclaim's scanned and stolen pages (as against
 # kswapd's, which costs the workload nothing), and file refaults, which say a
-# reclaimed page was wanted again. Without these a freeze beside a full
-# `memory.current` is an inference; with them it is a measurement.
+# reclaimed page was wanted again. Then the same `some`/`full` for I/O and
+# `some` for CPU, because the first instrumented hour ruled memory out — a
+# freeze with zero direct reclaim in it is not a reclaim stall, and the next
+# question is which resource the threads were actually waiting on.
 (
-  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file"
+  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us"
   T0=$(date +%s.%N)
   i=0; du_bytes=0; wal_bytes=0
   while [ -d "$CG" ]; do
@@ -134,6 +136,8 @@ echo "out=$OUT data=$DATA seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
     peak=$(cat "$CG/memory.peak" 2>/dev/null)
     st=$(cat "$CG/memory.stat" 2>/dev/null)
     psi=$(cat "$CG/memory.pressure" 2>/dev/null)
+    psi_io=$(cat "$CG/io.pressure" 2>/dev/null)
+    psi_cpu=$(cat "$CG/cpu.pressure" 2>/dev/null)
     m=$(curl -fsS --max-time 2 "http://127.0.0.1:$PORT/metrics" 2>/dev/null)
     if [ $((i % 60)) -eq 0 ]; then
       du_bytes=$(du -sb "$DATA" 2>/dev/null | cut -f1)
@@ -155,6 +159,9 @@ echo "out=$OUT data=$DATA seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
       $1=="pgscan_direct"{sc=$2} $1=="pgsteal_direct"{stl=$2}
       $1=="workingset_refault_file"{rf=$2}
       END{printf "%d,%d,%d", sc, stl, rf}')"
+    rcl="$rcl,$(echo "$psi_io" | awk -F'total=' '
+      /^some /{s=$2+0} /^full /{f=$2+0} END{printf "%d,%d", s, f}')"
+    rcl="$rcl,$(echo "$psi_cpu" | awk -F'total=' '/^some /{printf "%d", $2+0}')"
     gg=$(echo "$m" | awk '
       $1=="loggytracy_memtable_bytes"{mt=$2}
       $1=="loggytracy_memtable_buffered_bytes"{mb=$2}
@@ -276,6 +283,7 @@ GUARD=ok
     NR>1 && ($10+0>0 || $14+0>0) { n++
       t[n]=$1+0; qs[n]=$18+0; cur[n]=$2+0; file[n]=$5+0
       psf[n]=$39+0; stl[n]=$41+0; rf[n]=$42+0
+      iof[n]=$44+0; cps[n]=$45+0
     }
     END {
       if (n < 8) { print "too few samples for stalls: " n; exit }
@@ -296,11 +304,15 @@ GUARD=ok
       for (a = 1; a <= ne; a++) for (b = a+1; b <= ne; b++)
         if (ed[ord[b]] > ed[ord[a]]) { tmp = ord[a]; ord[a] = ord[b]; ord[b] = tmp }
       for (r = 1; r <= ne && r <= 5; r++) { e = ord[r]; s = es[e]; f = ee[e]
-        printf "  t=%-7.1f %6.1fs  psi_full=+%.1fs pgsteal_direct=+%d refault_file=+%d cur=%.0f file=%.0f\n", \
-               t[s], ed[e], (psf[f]-psf[s])/1e6, stl[f]-stl[s], rf[f]-rf[s], cur[f]/m, file[f]/m
+        printf "  t=%-7.1f %6.1fs  mem_full=+%.1fs io_full=+%.1fs cpu_some=+%.1fs pgsteal_direct=+%d refault=+%d cur=%.0f file=%.0f\n", \
+               t[s], ed[e], (psf[f]-psf[s])/1e6, (iof[f]-iof[s])/1e6, (cps[f]-cps[s])/1e6, \
+               stl[f]-stl[s], rf[f]-rf[s], cur[f]/m, file[f]/m
       }
-      printf "psi_full_total=%.1fs (%.2f%% of run) pgsteal_direct=%d refault_file=%d\n", \
-             (psf[n]-psf[1])/1e6, 100.0*(psf[n]-psf[1])/1e6/(t[n]-t[1]), stl[n]-stl[1], rf[n]-rf[1]
+      d = t[n] - t[1]
+      printf "run totals: mem_full=%.1fs (%.2f%%) io_full=%.1fs (%.2f%%) cpu_some=%.1fs (%.2f%%) pgsteal_direct=%d refault=%d\n", \
+             (psf[n]-psf[1])/1e6, 100.0*(psf[n]-psf[1])/1e6/d, \
+             (iof[n]-iof[1])/1e6, 100.0*(iof[n]-iof[1])/1e6/d, \
+             (cps[n]-cps[1])/1e6, 100.0*(cps[n]-cps[1])/1e6/d, stl[n]-stl[1], rf[n]-rf[1]
     }' "$OUT/mem.csv"
   echo "server_log_tail:"; sed 's/\x1b\[[0-9;]*m//g' "$SERVER_LOG" | tail -3
 } | tee "$OUT/verdict.txt"

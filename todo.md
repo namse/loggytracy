@@ -1051,6 +1051,36 @@ found four things first, three of them the soak's own questions answering early.
   1800M — is the freeze the cliff, or the reclaim itself? A run is an hour because the freezes only
   appear after t≈1980 s, once the disk is past ~2 GB and retention is deleting.
 
+  **① answered no twice over, and the second no is the bigger one** (`budget-50pct`, 2026-08-11).
+  Headroom is not the mechanism: at 50% the freezes get *worse*, 5 episodes / 50.1 s → **15
+  episodes / 134.0 s**, and anon rises rather than falls (quarter means 923 → 1307 MiB, peak 1548
+  against 1170). The reason is visible in the same run: the smaller row-group cache makes queries
+  re-read, 1.93 M file refaults over the hour ≈ 7.5 GB, and the allocator churns for it. A budget
+  fraction is a trade, not a free win, and this direction stops here per the measurement gate.
+
+  And the new columns overturned the diagnosis the fadvise fix was built on: **inside a 23-second
+  freeze there are zero direct-reclaim pages and zero memory-PSI microseconds.** Over the whole run
+  direct reclaim steals 4.2 M pages — that is just life at a full `memory.current` — but during the
+  freezes, none. Nothing in the cgroup is asking for memory while it is frozen. Yesterday's "the
+  freeze begins in the second `current` reaches the limit" was a correlation with a shared cause,
+  not the cause. (The fadvise fix still earns its place — it halved the freezes and took anon peak
+  down 295 MiB — but it was not treating what it was thought to treat.)
+
+  What the freeze actually looks like, counted per second in the server log: from t=2701 to t=2722
+  **not one line of any kind** — flush, merge, query, all of it — and the line that breaks the
+  silence is retention deleting files. Logging stops too, and `server.log` is on the same
+  filesystem as the data directory, which is the shape of a stall below the process: everything
+  that touches the filesystem waits, including the log writer. The rig's disk is an SSD
+  (`mq-deadline`) with 12.6 GB free, so it is not space — but the root filesystem it shares is 93%
+  full, and ext4 at that fill level is a candidate on its own.
+- [ ] **So the question is now which resource the threads wait on, and the sampler asks it
+  directly.** Three more columns: `io.pressure` some/full and `cpu.pressure` some, and the stall
+  table prints `mem_full` / `io_full` / `cpu_some` side by side for each freeze's own window. ② is
+  running with them (`memhigh-1800m`, `MemoryHigh=1800M`), so it answers both its original question
+  and the one ① created. Note from the first samples: `io_full` tracks `io_some` almost exactly on
+  this rig — when I/O stalls here, it stalls everyone at once, which is exactly the signature a
+  whole-server silence would have.
+
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
 The user's bar for this round: "VL보다 빠르지 않으면 의미가 없습니다" — `metadata_rare` must beat
