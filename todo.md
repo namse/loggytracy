@@ -1073,13 +1073,57 @@ found four things first, three of them the soak's own questions answering early.
   that touches the filesystem waits, including the log writer. The rig's disk is an SSD
   (`mq-deadline`) with 12.6 GB free, so it is not space — but the root filesystem it shares is 93%
   full, and ext4 at that fill level is a candidate on its own.
-- [ ] **So the question is now which resource the threads wait on, and the sampler asks it
+- [x] **So the question is now which resource the threads wait on, and the sampler asks it
   directly.** Three more columns: `io.pressure` some/full and `cpu.pressure` some, and the stall
-  table prints `mem_full` / `io_full` / `cpu_some` side by side for each freeze's own window. ② is
-  running with them (`memhigh-1800m`, `MemoryHigh=1800M`), so it answers both its original question
-  and the one ① created. Note from the first samples: `io_full` tracks `io_some` almost exactly on
-  this rig — when I/O stalls here, it stalls everyone at once, which is exactly the signature a
-  whole-server silence would have.
+  table prints `mem_full` / `io_full` / `cpu_some` side by side for each freeze's own window.
+
+  **② answered by eliminating all three, and then the clock gave it away** (`memhigh-1800m`,
+  2026-08-11). `MemoryHigh=1800M` did what it says — `cgroup_peak` 1801 MiB, the hard limit never
+  touched — and the freezes got *worse*: 13 episodes / **138.2 s**, longest 27.9 s. So the limit
+  cliff was never the mechanism either. Inside the 27.9 s freeze: `mem_full=+0.0s`, `io_full=+0.7s`,
+  `cpu_some=+0.0s`. Not memory, not disk, not CPU. The kernel says those threads were not waiting on
+  any resource it accounts for, which leaves a lock.
+
+  Then the arithmetic that should have been done on day one. **Every freeze in all four runs — 39
+  of 39 — starts within ±0.5 s of a 60-second boundary**, and `SOAK_RETENTION_INTERVAL` is 60 s.
+  The first freeze of every run lands at t≈1980–2100 s, which is when a 30 m period plus a 5 m grace
+  first has anything to delete; before that `retention_once_at` returns at its empty-candidates
+  check without ever taking an exclusive lock. And per-second in the log, **retention's own
+  completion line is the last event of the freeze**, with the blocked merge's commit landing
+  0.1–0.3 s after it. The freeze is not something retention interrupts. The freeze *is* retention's
+  pass.
+- [ ] **The stall, named: retention holds the lock every query needs while it spins for a lock a
+  merge rewrite is holding.** `retention.rs:243–285` takes `operation_lock` exclusively **first**,
+  then spins for `deletion_lock` exclusively. `merge/scheduler.rs:154` holds `deletion_lock`'s read
+  half for the whole rewrite of a group — deliberately, so a group's inputs cannot be deleted under
+  it, and by its own comment "for as long as the group takes". So the sequence every 60 s once
+  retention has work:
+
+  1. retention takes `operation_lock` (write) — the lock queries take to read and flush takes to
+     commit;
+  2. it then spins in `write_without_convoy` for `deletion_lock` (write), which the merge rewrite
+     holds;
+  3. every query and every flush is stopped for the rest of that rewrite;
+  4. and merge's own commit needs `operation_lock` (write), which retention is holding — so the two
+     spin against each other until retention's `try_write` happens to win the gap between merge
+     dropping its rewrite guard (`:154`) and taking its commit guard (`:310`). That gap is why the
+     duration is 3–52 s and unpredictable rather than merely long.
+
+  The measured cost of the world-stop: **28 seconds to delete one part.** The deletes themselves are
+  nothing (1, 7, 11, 12 parts across the four longest freezes); the entire time is waiting, while
+  holding the one lock that did not need to be held for it.
+
+  Note also that the acquisition order is not the invariant the comment claims. Retention takes
+  operation-then-deletion "the one order every double acquisition uses" — but merge takes
+  deletion-then-operation (`:310` reads `deletion_lock`, then the replacement takes
+  `operation_lock`). Retention is the odd one out, and the cycle is only survivable because
+  `write_without_convoy` spins instead of parking.
+
+  This also explains the two fixes that half-worked. `write_without_convoy` (`ad40a5d`) was the
+  right instinct in the wrong place — the convoy is real, but it is retention's, not the query
+  tail's. And `posix_fadvise` (`7b7f6be`) halved the freezes because less cache pressure makes merge
+  rewrites finish sooner, which shortens the wait it never addressed. Both stay; neither was
+  treating this.
 
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
