@@ -1,11 +1,13 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
     logs_service_server::{LogsService, LogsServiceServer},
 };
 use prost014::Message;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
+use tonic_types::{ErrorDetails, StatusExt};
 
 use crate::backpressure::IngestError;
 use crate::backpressure::IngestGate;
@@ -231,16 +233,37 @@ impl OtlpLogIngest<'_> {
 ///   tenant over its rate, too many bodies in flight — is temporary by
 ///   construction, and `RESOURCE_EXHAUSTED` is where it belongs.
 ///
-/// One gap is open and recorded rather than papered over (`todo.md`, the review
-/// gate list): the specification treats `RESOURCE_EXHAUSTED` as retryable *only*
-/// when the response carries `RetryInfo`, and this server does not attach it, so
-/// a strict collector may drop a batch this server meant to have held. The HTTP
-/// transport says it correctly with `Retry-After`; the two are not yet saying the
-/// same thing.
+/// And backpressure carries `RetryInfo`, because on this transport that is what
+/// makes it backpressure at all. The specification treats `RESOURCE_EXHAUSTED`
+/// as retryable *only* when the server signals recovery is possible — "a client
+/// SHOULD interpret it as retryable only if the server signals that recovery is
+/// possible", by attaching `RetryInfo` — and says a client SHOULD **drop** the
+/// telemetry otherwise. A bare `RESOURCE_EXHAUSTED` is therefore not a softer
+/// refusal than `INVALID_ARGUMENT`; it is the same instruction to discard,
+/// which would make the architecture's own premise false on one of its two
+/// transports: a client can only hold data back if the server declines it.
+///
+/// The delay is the refusal's own `retry_after` — the identical field the HTTP
+/// transport renders as `Retry-After` — in the identical whole-second
+/// granularity ([`crate::backpressure::retry_after_seconds`]), so the two
+/// transports carry one instruction rather than two compatible ones. A 429 that
+/// somehow carried no delay still gets one: every producer sets it today
+/// (`backpressure::overloaded`, `tenant_quota`'s two refusals), and the fallback
+/// is here so that a fourth one added later cannot silently return the transport
+/// to telling collectors to drop.
 pub fn ingest_error_to_status(error: IngestError) -> Status {
     match error.status {
         StatusCode::SERVICE_UNAVAILABLE => Status::unavailable(error.message),
-        StatusCode::TOO_MANY_REQUESTS => Status::resource_exhausted(error.message),
+        StatusCode::TOO_MANY_REQUESTS => {
+            let seconds = crate::backpressure::retry_after_seconds(
+                error.retry_after.unwrap_or(DEFAULT_RETRY_AFTER),
+            );
+            Status::with_error_details(
+                Code::ResourceExhausted,
+                error.message,
+                ErrorDetails::with_retry_info(Some(Duration::from_secs(seconds))),
+            )
+        }
         StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_REQUEST => {
             Status::invalid_argument(error.message)
         }
@@ -248,6 +271,12 @@ pub fn ingest_error_to_status(error: IngestError) -> Status {
         _ => Status::internal(error.message),
     }
 }
+
+/// The delay a throttled push is told to wait when its refusal named none.
+///
+/// Matches `Config::backpressure_retry_after`'s default rather than being a
+/// second number: this is a floor for a case that does not arise, not a policy.
+const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[tonic::async_trait]
 impl LogsService for LogIngestService {

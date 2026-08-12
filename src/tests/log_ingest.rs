@@ -192,6 +192,15 @@
             .await
             .expect_err("the tenant is over its rate");
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        // The delay this refusal computes from how far over the rate the tenant
+        // is used to be dropped on the way to the wire, which turned a
+        // "come back in n seconds" into a status a collector discards on.
+        assert!(
+            status
+                .get_details_retry_info()
+                .is_some_and(|info| info.retry_delay.is_some_and(|delay| !delay.is_zero())),
+            "a rate refusal must name a delay"
+        );
 
         assert!(
             memtable
@@ -235,6 +244,14 @@
             .await
             .expect_err("a full memtable must be refused");
         assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            refused
+                .get_details_retry_info()
+                .and_then(|info| info.retry_delay),
+            Some(config.backpressure_retry_after),
+            "backpressure must tell a gRPC client when to come back, or the \
+specification tells it to drop the batch"
+        );
 
         let checkpoint = journal.checkpoint().await.unwrap();
         memtable.commit_flush();
@@ -392,4 +409,87 @@
             results[0].labels["service_name"], "checkout",
             "replay reconstructs the stream, not just the line"
         );
+    }
+
+    /// The two transports carry one instruction, not two compatible ones.
+    ///
+    /// This is the property the mapping exists for. HTTP renders a refusal's
+    /// `retry_after` as `Retry-After`; gRPC renders the same field as
+    /// `RetryInfo`, and the OTLP specification makes that attachment the whole
+    /// difference between "hold this and come back" and "drop it" — a
+    /// `RESOURCE_EXHAUSTED` without one is retryable only if the server signals
+    /// recovery is possible, and a bare code signals nothing. So the test drives
+    /// one error down both renderings and compares the number, rather than
+    /// asserting each side in isolation and leaving the two free to drift.
+    #[test]
+    fn a_throttled_push_names_the_same_delay_on_both_transports() {
+        use axum::http::header;
+        use axum::response::IntoResponse;
+
+        for retry_after in [
+            std::time::Duration::from_secs(1),
+            // Sub-second and fractional: the header cannot express either, so
+            // both sides round up together. Truncating instead would send the
+            // client back before the server's own arithmetic says it may.
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(1700),
+        ] {
+            let http = IngestError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "flush is not keeping up".to_string(),
+                retry_after: Some(retry_after),
+            }
+            .into_response();
+            let header_seconds: u64 = http
+                .headers()
+                .get(header::RETRY_AFTER)
+                .expect("a throttled HTTP push carries Retry-After")
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+
+            let status = ingest_error_to_status(IngestError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "flush is not keeping up".to_string(),
+                retry_after: Some(retry_after),
+            });
+            let grpc_delay = status
+                .get_details_retry_info()
+                .expect("a throttled gRPC push carries RetryInfo")
+                .retry_delay
+                .expect("with a delay in it");
+
+            assert_eq!(
+                grpc_delay,
+                std::time::Duration::from_secs(header_seconds),
+                "{retry_after:?} became {header_seconds}s over HTTP and \
+{grpc_delay:?} over gRPC"
+            );
+            assert!(header_seconds >= 1, "Retry-After: 0 reads as retry now");
+        }
+    }
+
+    /// And the attachment stays on the retryable path only.
+    ///
+    /// A limit violation is permanent for that batch — retrying produces the
+    /// identical refusal forever — so it answers `INVALID_ARGUMENT` and must not
+    /// acquire a "come back later" on the way past. The two codes were one
+    /// before `7538367`; this pins the split from the other side.
+    #[test]
+    fn a_permanent_refusal_carries_no_invitation_to_retry() {
+        for status in [StatusCode::PAYLOAD_TOO_LARGE, StatusCode::BAD_REQUEST] {
+            let refused = ingest_error_to_status(IngestError {
+                status,
+                message: "OTLP request is too large".to_string(),
+                // Set deliberately: even if a producer attaches one, a
+                // non-retryable code must not carry it.
+                retry_after: Some(std::time::Duration::from_secs(1)),
+            });
+            assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+            assert!(
+                refused.get_details_retry_info().is_none(),
+                "a non-retryable refusal must not tell a collector to come back"
+            );
+        }
     }

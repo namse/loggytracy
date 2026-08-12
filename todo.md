@@ -1012,7 +1012,7 @@ The polish order, each item a measurement or a bound, none a feature:
    that batch, so it is `INVALID_ARGUMENT` now — the code the specification recommends for
    non-retryable, which tells a collector to split or drop rather than loop on identical bytes. Two
    tests moved with it.
-- [ ] **The other half of that finding: gRPC backpressure does not say "come back", it says "give
+- [x] **The other half of that finding: gRPC backpressure does not say "come back", it says "give
       up".** The specification is explicit — a client "SHOULD interpret `RESOURCE_EXHAUSTED` as
       retryable only if the server signals that recovery is possible", signalled by attaching
       `RetryInfo`; without it, non-retryable, and a client "SHOULD drop the telemetry data". This
@@ -1024,6 +1024,43 @@ The polish order, each item a measurement or a bound, none a feature:
       in the tree — **a dependency question to put to the user, not a call to make quietly.** Until
       then the two transports do not carry the same instruction, and that is written into
       `ingest_error_to_status`'s doc where the next reader of that mapping will find it.
+
+      **Fixed, on `tonic-types` — the user's call, and the reason for it is the failure mode, not the
+      line count** (2026-08-12). Hand-defining `google.rpc.Status`/`Any`/`RetryInfo` against the
+      `prost` already here is the same ~20 lines it was, but a wrong `type_url` or a mis-encoded
+      details field round-trips perfectly through a test that decodes with those same definitions —
+      it would pass green and only a real collector would notice. tonic's own sibling crate at
+      tonic's own version (`tonic-types = 0.14.6`, two new packages with `prost-types`) encodes it
+      the way the ecosystem decodes it. The no-dependency-shim precedents — `malloc_tuning`,
+      `posix_fadvise` — were syscalls, where the contract is checked by the kernel; a wire format
+      has no such witness in-process.
+
+      Three things it turned out to be, beyond the one line the item described:
+
+      1. **The delay was never missing, only dropped.** `IngestError::retry_after` already carried
+         it — `backpressure::overloaded` from config, `tenant_quota` computed from how far over the
+         rate the tenant is — and `ingest_error_to_status` matched on `error.status` alone. So the
+         fix is that the gRPC rendering stops discarding the field the HTTP rendering has always
+         used, not that a number was invented for it.
+      2. **Three more sites were building the same bare status by hand.** `IngestGate::check_grpc`,
+         `IngestGate::admit_body_grpc` and `TenantQuota::check_grpc` each called
+         `Status::resource_exhausted(error.message)` directly, so fixing only the mapping would have
+         left the in-flight-body ceiling and the tenant rate still telling collectors to drop. All
+         three now go through the one mapping.
+      3. **The two transports had to be made to say the same number, not merely both say one.**
+         `Retry-After` has whole seconds and nothing finer, so a `RetryInfo` of 1.7 s beside a header
+         of `1` is two answers. `backpressure::retry_after_seconds` is now the single conversion both
+         use, and it rounds **up** where the header used to truncate — 1.7 s truncated to 1 s sends
+         the client back before the server's own arithmetic says it may, which just spends another
+         refusal.
+
+      Pinned by four tests: the memtable and tenant-rate refusals each assert their `RetryInfo`
+      (`log_ingest`), the in-flight ceiling asserts its own (`backpressure`), and
+      `a_throttled_push_names_the_same_delay_on_both_transports` drives one error down both
+      renderings at 1 s / 0.3 s / 1.7 s and compares the number rather than asserting each side
+      alone. `a_permanent_refusal_carries_no_invitation_to_retry` pins the split from the other
+      side: `413`/`400` stay `INVALID_ARGUMENT` and acquire no `RetryInfo` even when a producer
+      attaches one.
 
 ### The soak rig is built, and its first four minutes contradicted the gates (2026-08-08)
 

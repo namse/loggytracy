@@ -35,10 +35,7 @@ impl IntoResponse for IngestError {
     fn into_response(self) -> Response {
         let mut response = (self.status, self.message).into_response();
         if let Some(retry_after) = self.retry_after {
-            // Whole seconds, and never zero: `Retry-After: 0` reads as "retry
-            // immediately", which is the opposite of what an overloaded server
-            // is asking for.
-            let seconds = retry_after.as_secs().max(1);
+            let seconds = retry_after_seconds(retry_after);
             if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
                 response.headers_mut().insert(header::RETRY_AFTER, value);
             }
@@ -46,6 +43,31 @@ impl IntoResponse for IngestError {
         response
     }
 }
+
+/// The delay a refusal promises, in the granularity both transports use.
+///
+/// `Retry-After` has whole seconds and nothing finer, and the two transports
+/// have to carry the *same* instruction rather than merely compatible ones — a
+/// gRPC `RetryInfo` of 1.7 s beside a header of 1 s is two answers to one
+/// question. So the header's granularity is the shared one and
+/// [`crate::log_ingest::ingest_error_to_status`] sends whole seconds too.
+///
+/// Rounded **up**, and never zero. `Retry-After: 0` reads as "retry
+/// immediately", which is the opposite of what an overloaded server is asking
+/// for; and truncating 1.7 s to 1 s sends the client back before the server's
+/// own arithmetic says it may, which just spends another refusal. The ceiling
+/// matches `tenant_quota`'s own clamp so a computed delay cannot become a
+/// client that never returns.
+pub fn retry_after_seconds(retry_after: Duration) -> u64 {
+    let seconds = retry_after.as_secs_f64().ceil();
+    if seconds.is_finite() {
+        (seconds as u64).clamp(1, MAX_RETRY_AFTER_SECONDS)
+    } else {
+        MAX_RETRY_AFTER_SECONDS
+    }
+}
+
+const MAX_RETRY_AFTER_SECONDS: u64 = 3600;
 
 /// Decides whether the durable path is far enough behind to stop accepting.
 ///
@@ -159,7 +181,7 @@ over the limit of {limit}; too many pushes are in flight at once"
     /// clothes.
     pub fn admit_body_grpc(&self, bytes: u64) -> Result<InflightBody, tonic::Status> {
         self.admit_body(bytes)
-            .map_err(|error| tonic::Status::resource_exhausted(error.message))
+            .map_err(crate::log_ingest::ingest_error_to_status)
     }
 
     fn charge(&self, bytes: u64) -> InflightBody {
@@ -206,11 +228,12 @@ flush is not keeping up"
     }
 
     /// The same decision for OTLP, whose exporters read a status code rather
-    /// than a header. `RESOURCE_EXHAUSTED` is what the OTLP specification tells
-    /// them to back off and retry on.
+    /// than a header. Rendered by the one mapping both gRPC services use, so
+    /// the refusal carries the `RetryInfo` that makes `RESOURCE_EXHAUSTED`
+    /// retryable instead of a bare code a collector is told to drop on.
     pub fn check_grpc(&self) -> Result<(), tonic::Status> {
         self.check()
-            .map_err(|error| tonic::Status::resource_exhausted(error.message))
+            .map_err(crate::log_ingest::ingest_error_to_status)
     }
 
     /// A gate over the given journal with its own metrics, for tests that are
@@ -307,14 +330,25 @@ mod tests {
         drop(permits);
     }
 
-    /// gRPC gets the OTLP specification's status rather than the HTTP one.
+    /// gRPC gets the OTLP specification's status rather than the HTTP one —
+    /// and the `RetryInfo` that makes that status mean "come back". Without it
+    /// the specification tells a collector to drop the batch, which would make
+    /// the in-flight ceiling a data-loss mechanism instead of a memory bound.
     #[tokio::test]
-    async fn the_grpc_refusal_is_resource_exhausted() {
+    async fn the_grpc_refusal_is_resource_exhausted_and_says_when_to_return() {
+        use tonic_types::StatusExt;
+
         let gate = gate(Some(1000));
         let _first = gate.admit_body(1000).expect("the first body fits");
         let status = gate
             .admit_body_grpc(1000)
             .expect_err("the second body is refused");
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            status
+                .get_details_retry_info()
+                .and_then(|info| info.retry_delay),
+            Some(Config::default().backpressure_retry_after),
+        );
     }
 }

@@ -396,10 +396,13 @@ this request needs {bytes} bytes of budget"
     }
 
     /// The same decision for OTLP, whose exporters read a status code rather
-    /// than a header.
+    /// than a header. Rendered by the one mapping both gRPC services use: this
+    /// refusal computes a delay from how far over the rate the tenant is, and
+    /// dropping it on the floor here would have told the collector the batch was
+    /// unrecoverable.
     pub fn check_grpc(&self, tenant: &TenantId, bytes: u64) -> Result<(), tonic::Status> {
         self.check(tenant, bytes)
-            .map_err(|error| tonic::Status::resource_exhausted(error.message))
+            .map_err(crate::log_ingest::ingest_error_to_status)
     }
 
     /// The rate in force for one tenant: what the control plane pushed, or the

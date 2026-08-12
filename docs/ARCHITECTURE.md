@@ -130,7 +130,12 @@ and query paths.
   [`docs/RETENTION_DESIGN.md`](RETENTION_DESIGN.md) for details.
 - **Throttle and quota targets**: ingest rate (bytes/s, events/s), active stream count (cardinality),
   storage capacity, concurrent query count, and query scan budget. When exceeded, ingest returns `429`
-  (Alloy backs off and relies on its own WAL), while queries return `429` or `422`.
+  (Alloy backs off and relies on its own WAL), while queries return `429` or `422`. Over gRPC the same
+  refusal is `RESOURCE_EXHAUSTED` **carrying `RetryInfo`**: the OTLP specification makes a bare
+  `RESOURCE_EXHAUSTED` non-retryable and tells the client to drop the telemetry, so the attachment is
+  what makes "the client holds its data because the server declined it" true on that transport rather
+  than only on HTTP. A *limit* violation is the opposite instruction — permanent for that batch — and
+  answers `INVALID_ARGUMENT` with no `RetryInfo`.
 - **Observability**: Expose every quota and rejection counter on `/metrics` with a tenant label. Operating
   quotas requires visibility into "who was blocked, where, and by how much."
 - **Current state**: Identification, validation, and isolation are implemented. `X-Scope-OrgID` is extracted
