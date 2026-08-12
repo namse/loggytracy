@@ -89,13 +89,15 @@ the 24-hour soak showed glibc's retained-free creep killing 2 GiB in hours
 with every knob applied, and the production allocator is **jemalloc** since
 `8592094`. And the number an operator actually asks this invariant for, from
 the completed 24-hour soak at a 2 GiB container (2026-08-10): **sustained
-capacity ~18.6 k eps** of an offered 20 k — 6.9% throttled with 429s, which
-is backpressure doing its job — with anon flat between 1.1 and 1.4 GiB,
-query response p95 633 ms and 12 errors in 568,721. That run carried a
-retention/merge lock-order stall that froze the flush thread for up to 52 s at a
-time, which is where much of the throttling came from; fixed 2026-08-11, the
-same configuration takes 19,994.6 eps with zero throttling over an hour, and the
-figure here stands until a relaunched 24-hour soak replaces it.
+capacity is the whole offered 20 k eps** — 19,999.8, nothing throttled — for
+24 hours and 1.73 billion events, with anon flat between 1.47 and 1.57 GiB,
+query response p95 428 ms / p99 640 ms and zero 5xx in 432,001 queries
+(`soak-24h-lockorder`, 2026-08-12). The ceiling above 20 k is unmeasured: this
+run got everything it offered. The predecessor read ~18.6 k eps with 6.9%
+throttled, and the difference was one lock-order defect — retention held the lock
+every query needs while it spun for one a merge rewrite was holding, stopping the
+server for up to 52 s at a time and starving the flush thread into backpressure
+(`ca32ee5`).
 
 **Two of the five did not fit their share when this was measured**, and that is
 the finding rather than a sizing problem: flush materialized a whole memtable

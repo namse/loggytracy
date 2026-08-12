@@ -118,19 +118,21 @@ The nominal shares sum to 72.5%: the remainder covers flush (which rides
 ingest), the sidecar stream indexes, and the metering gap above.
 
 **Measured capacity at this budget** (24-hour soak, 2 GiB container, retention
-30 m, 2026-08-10): sustained ingest is **~18.6 k eps** of an offered 20 k —
-6.9% answered `429` by backpressure — with anon flat between 1.1 and 1.4 GiB,
-query response p95 633 ms and a 0.002% query error rate. Offer this engine
-more than ~18 k eps in 2 GiB and the surplus is refused, not buffered;
-`todo.md`'s soak section holds the full verdict and the run-by-run history.
+30 m, 2026-08-12): the engine sustains **the full offered 20 k eps — 19,999.8,
+nothing throttled** — for 24 hours, 1.73 billion events, with anon flat between
+1.47 and 1.57 GiB (peak 1.84), query response p95 428 ms / p99 640 ms, and zero
+5xx in 432,001 queries. The residents that a day is run to watch are flat:
+sidecar 120 MiB, row-group cache 153 MiB, WAL file 34 MiB, WAL backlog 3 MiB
+against its 1 GiB bound.
 
-**This number is under re-measurement and expected to rise.** The run it comes
-from contained a retention/merge lock-order stall that stopped the server for up
-to 52 s at a time, freezing the flush thread and so provoking the backpressure
-that refused 6.9% of the offer. With that fixed (2026-08-11), the same
-configuration takes **19,994.6 eps of the offered 20,000 with zero throttling**
-over an hour. An hour is not a day, so the figure above stands until the
-relaunched 24-hour soak replaces it.
+**The ceiling above 20 k eps is unmeasured.** This run offered 20 k and got all
+of it, so capacity is *at least* that; naming a higher number honestly takes a
+run that offers more until backpressure refuses, and that run has not been done.
+The predecessor of this measurement read ~18.6 k eps with 6.9% answered `429`
+(2026-08-10) — that run carried a retention/merge lock-order stall that froze the
+flush thread for up to 52 s at a time, which is where the throttling came from;
+fixed in `ca32ee5`. `todo.md`'s soak section holds both verdicts and the
+run-by-run history.
 
 ## Backpressure
 

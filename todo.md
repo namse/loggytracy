@@ -1171,13 +1171,56 @@ found four things first, three of them the soak's own questions answering early.
   flush thread is frozen with everything else, the memtable fills, and backpressure refuses the
   clients — so "sustained capacity" was partly a measurement of the freeze. The one numeric target
   still missing is `push_response_p95_ms` at 255.7 ms against a 250 ms target, over by 5.7 ms.
-- [ ] **The published capacity number is now stale, and only the 24-hour run may replace it.**
-  `docs/CONFIGURATION.md` and `docs/VISION.md` both carry "~18.6 k eps of an offered 20 k, 6.9%
+- [x] **The published capacity number is now stale, and only the 24-hour run may replace it.**
+  `docs/CONFIGURATION.md` and `docs/VISION.md` both carried "~18.6 k eps of an offered 20 k, 6.9%
   throttled with 429s", measured on the 2026-08-10 day-long soak — with this stall in it. One hour
-  at 19,994.6 eps and zero throttling says the number understates the engine, but an hour is not a
+  at 19,994.6 eps and zero throttling said the number understates the engine, but an hour is not a
   day and replacing a day's measurement with an hour's would repeat exactly the mistake that
-  published it. Both documents carry a caveat pointing here until the relaunched 24-hour soak
-  settles it.
+  published it. So the day was re-run, and it settled it.
+
+### The day again, on the fixed lock order, and it is the run this project has been trying to get (2026-08-12)
+
+`soak-24h-lockorder`: 2 GiB, offered 20 k eps, retention 30 m, 24 h 00 m 05 s, `behavioral_pass`
+true, 1,728,000,100 events accepted, `disk_guard=ok`.
+
+| | `soak-24h` (2026-08-10) | `soak-24h-lockorder` |
+|---|---|---|
+| freezes | 5–8, longest 25–51 s | **1 × 3.2 s, and it is the run ending** |
+| achieved ingest | 18,616.2 eps | **19,999.8 of 20,000** |
+| throttled pushes | 1,195,480 | **0** |
+| query response p95 | 633.4 ms | **427.6 ms** |
+| query response p99 | 9425.5 ms | **639.5 ms** |
+| query response max | 59,035.7 ms | **3123.6 ms** |
+| push response max | 7966.5 ms | 5346.3 ms |
+| statuses | 400 × 46,041, 429 × 700, **500 × 856, 504 × 17** | 400 × 4,273 and nothing else |
+| answered `200` | 384,387 | 427,728 |
+
+The single stall the table reports starts at t=86,402.1 of an 86,400 s run: it is the harness
+stopping, not a freeze, and saying otherwise would be reading one's own instrument backwards. Every
+5xx is gone — 856 `500`s and 17 `504`s to **zero** — and so are the 429s. The residents are flat
+across the day the way a passing soak's should be: anon 1468 → 1574 MiB (peak 1841), sidecar
+119.8 → 120.4, row-group cache pinned at 152.8 through a day of evictions, WAL file 34.6 → 34.3,
+`wal_backlog` 2.9 → 3.2 MiB against a 1 GiB target.
+
+The `400`s fell tenfold, 46,041 → 4,273, and the likely reason is worth recording as a hypothesis
+rather than a finding: every one of them is `query exceeds the maximum of 1000000 scanned rows`, and
+through a world-stop merge stops too, so parts pile up unmerged and a window's scan crosses more of
+them. Fewer freezes, fewer oversized scans. Not proven here.
+
+**`part_meta` is answered, and the fingerprint is not needed.** Both `parts` and `part_meta` carry
+the GROWING flag, and they carry it *together* off the same Q4 bump: parts 294 → 337 is ×1.15,
+`part_meta` 14.0 → 16.1 MiB is ×1.15. The gauge tracks the part count, which is what a per-part
+structure should do — the interning of `00f9799` did the work the fingerprint was scoped for. Polish
+item 2 reduces to the in-flight push-body bound.
+
+**What still fails, and it is one number.** `push_response_p95_ms` 273.3 ms against a 250 ms target,
+over by 9.3%, which is why the verdict reads `PASS_BEHAVIORAL_ONLY` rather than a full pass. Every
+other target passes: error rate 0.0, push p99 538.3 against 1000, query p95 427.6 against 2000,
+throttled rate 0.0, RSS peak 2.0 GiB against 4, WAL backlog peak 21.2 MiB against 1 GiB.
+
+**And what this run does not measure: the ceiling.** It sustained everything offered, so capacity at
+2 GiB is now known to be *at least* 20 k eps and the upper bound is unmeasured. The honest way to
+publish a capacity is to offer more until something refuses; that run has not been done.
 
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
