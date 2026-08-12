@@ -68,7 +68,7 @@ the earlier table here was a guess and every one of its numbers moved:
 
 | Arena | Share | Measured high-water at 2 GiB (2026-08-07, sweep build) | Holds | On overflow |
 |---|---|---|---|---|
-| ingest | 20% | ~0 (memtable gauge peak 5.2 MiB — the chunked flush drains it at cadence; 378 MiB on `50190cf`) | memtable, trace memtable, in-flight push bodies | `429` + `Retry-After` (already the mechanism) |
+| ingest | 20% | ~0 (memtable gauge peak 5.2 MiB — the chunked flush drains it at cadence; 378 MiB on `50190cf`) | memtable, trace memtable, in-flight push bodies (bounded since 2026-08-12: `max_inflight_push_bytes`, HTTP charged on `Content-Length` before the body is collected; gRPC bounded by tonic's per-message cap × its concurrency) | `429` + `Retry-After` (already the mechanism) |
 | flush | 25% | 30.9 MiB (was 96.1 on `f7d9a36`, 721 on `50190cf`) | one chunk of materialized rows (`LOGGYTRACY_FLUSH_CHUNK_BYTES`), Parquet writer buffers | defer the flush; ingest backs up into its own arena and refuses there |
 | merge | 25% | **442.4 MiB** — the dominant arena, 86% of a 25% share of 2 GiB (771 on `50190cf`; 326.5 on `761999a`) | one merge group's paging (`merge_max_memory_bytes / 2`, per-part pages clamped 2–8 MiB) | split the group; skip the tick |
 | query | 25% | 298.4 MiB tagged, **of which ~284 MiB is the row-group cache's retained batches** — decoded under the query tag, held by the cache, separated by the `loggytracy_row_group_cache_bytes` gauge; the scan transient itself is tens of MiB | every concurrent scan, pipeline stage and metric evaluation | queue, then `429` |

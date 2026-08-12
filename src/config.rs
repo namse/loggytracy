@@ -61,6 +61,14 @@ pub struct Config {
     /// `off` disables a threshold, which restores the unbounded behaviour.
     pub max_memtable_bytes: Option<u64>,
     pub max_wal_backlog_bytes: Option<u64>,
+    /// Request bodies admitted at once, summed across in-flight pushes.
+    ///
+    /// The other two thresholds bound buffers the server owns; this one bounds
+    /// what its callers hand it, which was `concurrency × MAX_OTLP_REQUEST_BYTES`
+    /// with nothing limiting concurrency. `off` disables it. It cannot refuse a
+    /// request on an idle server whatever it is set to — see
+    /// `IngestGate::admit_body` — so it is safe at any value.
+    pub max_inflight_push_bytes: Option<u64>,
     /// Floor for truncating the WAL's dead prefix in local-only mode. The
     /// bytes before the checkpoint are unreadable by every recovery path;
     /// without truncation `journal.wal` keeps everything ever ingested. The
@@ -256,6 +264,11 @@ impl Default for Config {
             max_timestamp_skew: Some(Duration::from_secs(60 * 60)),
             max_memtable_bytes: Some(256 * 1024 * 1024),
             max_wal_backlog_bytes: Some(1024 * 1024 * 1024),
+            // Eight bodies at the OTLP ceiling. Generous on purpose: the
+            // measured in-flight total on the comparison bed was 0.3 MiB, so a
+            // tight value here would only refuse traffic no measurement has
+            // seen a need to refuse.
+            max_inflight_push_bytes: Some(128 * 1024 * 1024),
             wal_compact_min_bytes: Some(64 * 1024 * 1024),
             backpressure_retry_after: Duration::from_secs(1),
             flush_max_bytes: 1024 * 1024,
@@ -459,6 +472,14 @@ fn derive_defaults_from_budget(defaults: &mut Config, budget_bytes: u64) {
     // Accounted bytes; the memtable's resident cost is ~1.73× this
     // (`docs/MEMORY_ATTRIBUTION.md`), so 10% accounted is ~17% real.
     defaults.max_memtable_bytes = Some((budget_bytes / 10).max(32 * MIB));
+    // In-flight bodies are not in the 72.5% above: they were outside the
+    // accounting entirely until this bound existed, and the attribution
+    // measured them at 0.3 MiB. 5% is therefore a ceiling on an outlier rather
+    // than a share of anything, floored at one legal OTLP request so a small
+    // budget still admits a full-size push without waiting for the empty-server
+    // rule to carry it.
+    defaults.max_inflight_push_bytes =
+        Some((budget_bytes / 20).max(crate::trace_ingest::MAX_OTLP_REQUEST_BYTES as u64));
 }
 
 impl Config {
@@ -527,6 +548,10 @@ impl Config {
             max_memtable_bytes: env_optional_u64(
                 "LOGGYTRACY_MAX_MEMTABLE_BYTES",
                 defaults.max_memtable_bytes,
+            )?,
+            max_inflight_push_bytes: env_optional_u64(
+                "LOGGYTRACY_MAX_INFLIGHT_PUSH_BYTES",
+                defaults.max_inflight_push_bytes,
             )?,
             max_wal_backlog_bytes: env_optional_u64(
                 "LOGGYTRACY_MAX_WAL_BACKLOG_BYTES",

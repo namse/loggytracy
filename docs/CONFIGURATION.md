@@ -140,6 +140,7 @@ run-by-run history.
 |---|---|---|
 | `LOGGYTRACY_MAX_MEMTABLE_BYTES` | 256 MiB (`off` allowed; budget-derived) | Return 429 when the two memtables exceed this combined size |
 | `LOGGYTRACY_MAX_WAL_BACKLOG_BYTES` | 1 GiB (`off` allowed) | Return 429 when unflushed WAL exceeds this size |
+| `LOGGYTRACY_MAX_INFLIGHT_PUSH_BYTES` | 128 MiB (`off` allowed; budget-derived at 5%) | Return 429 when request bodies admitted and not yet answered exceed this size. The other two bound buffers this server owns; this one bounds what its callers hand it, which was otherwise `concurrency × 16 MiB` with nothing limiting concurrency. Safe at any value: an idle server always admits one body, so a ceiling below one legal push cannot refuse it forever. Measured in flight on the comparison bed: 0.3 MiB — this closes a hole rather than recovering memory. Read it live as `loggytracy_inflight_push_bytes`. **HTTP only**: gRPC has no `Content-Length` to charge and tonic decodes before the service is reached, so that transport stays bounded by `max_decoding_message_size` × its concurrency |
 | `LOGGYTRACY_BACKPRESSURE_RETRY_AFTER` | `1s` | `Retry-After` value included in 429 responses |
 
 **Constraint:** `MAX_MEMTABLE_BYTES` cannot be smaller than `FLUSH_MAX_BYTES`, or writes would be

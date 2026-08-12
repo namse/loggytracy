@@ -1868,9 +1868,33 @@ only thing that can say whether a fix worked, so it landed before them and it la
       arrays), both bounded by the corpus and `merge_max_part_rows` — so the gauge plateaus near
       ~25 MB at the soak's part count and the next long run carries the arena number for the
       resident side
-- [ ] **Bound in-flight push bodies.** The ingest gate is checked once at request entry and nothing limits
+- [x] **Bound in-flight push bodies.** The ingest gate is checked once at request entry and nothing limits
       concurrency, so (in-flight requests x 64 MiB) sits outside the accounting. Measured at 0.3 MiB on the bed,
-      so this is closing a hole rather than recovering memory
+      so this is closing a hole rather than recovering memory.
+
+      Done: `LOGGYTRACY_MAX_INFLIGHT_PUSH_BYTES`, 128 MiB static / 5% of a declared budget, `off` allowed,
+      counted at admission and released by an `InflightBody` guard's `Drop`, published as
+      `loggytracy_inflight_push_bytes`, refused with the 429 + `Retry-After` the other two thresholds
+      already use. Three things worth keeping in mind about the shape it took:
+
+      * **The check is a middleware, not a handler.** A handler takes `body: Bytes`, so by the time
+        handler code could look at anything axum has already put the whole body in the heap — an
+        admission check there would be counting memory it had already spent. The layer sits outside
+        `DefaultBodyLimit` so it runs before the body is collected, and reads only `Content-Length`.
+        A chunked body has no length until it has been read, which is the case a bound exists for, so
+        it is charged the ceiling one request may reach.
+      * **An idle server always admits one body, whatever the ceiling says.** Otherwise a ceiling set
+        below one legal push refuses it forever with nothing in flight to wait for — the trap
+        `max_push_bytes` flooring the token bucket's burst already avoids. That makes the knob safe at
+        any value, and `the_tightest_inflight_ceiling_still_serves_a_lone_push` pins it through the
+        router at a ceiling of one byte.
+      * **HTTP only, and that is a decision rather than an omission.** gRPC has no `Content-Length` —
+        the framing is streamed — and tonic hands the service an already-decoded message, so the wire
+        size is gone before any code here could read it. Charging a flat ceiling per gRPC push instead
+        would refuse four concurrent 100 KB batches on a 2 GiB container: a throughput regression
+        wearing a memory bound's clothes. That transport stays bounded by tonic's
+        `max_decoding_message_size` × its concurrency, recorded in `CONFIGURATION.md` beside the knob.
+        Closing it properly needs a decode-layer change and has no measurement asking for one.
 - [x] ~~**A test that runs at a declared budget and asserts peak RSS stays under it.**~~ Moved to the top of
       this phase and built there, because it is the gate the rest of these items are measured by rather than
       one of them: [`docs/MEMORY_BUDGET_GATE.md`](docs/MEMORY_BUDGET_GATE.md)

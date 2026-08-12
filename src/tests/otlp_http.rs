@@ -10,11 +10,17 @@
     use tower::ServiceExt;
 
     fn fixture() -> (Arc<MemTable>, Arc<AppState>) {
-        let config = Config {
+        fixture_with(|_| {})
+    }
+
+    fn fixture_with(edit: impl FnOnce(&mut Config)) -> (Arc<MemTable>, Arc<AppState>) {
+        let mut config = Config {
             data_dir: std::env::temp_dir()
                 .join(format!("loggytracy-otlp-http-{}", uuid::Uuid::new_v4())),
             ..Config::default()
         };
+        edit(&mut config);
+        let config = config;
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let memtable = Arc::new(MemTable::new());
         let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
@@ -129,6 +135,52 @@
         let mut delivered = lines(&memtable);
         delivered.sort();
         assert_eq!(delivered, vec!["over json", "over protobuf"]);
+    }
+
+    /// The in-flight bound must not be able to wedge a server that is idle.
+    ///
+    /// One byte is the tightest ceiling the knob accepts, and every legal push
+    /// is larger than it. If the middleware refused on arithmetic alone this
+    /// server would answer 429 forever with nothing in flight, which is why
+    /// `IngestGate::admit_body` always admits into an empty server — this is
+    /// that rule reached through the router, layer order and all.
+    #[tokio::test]
+    async fn the_tightest_inflight_ceiling_still_serves_a_lone_push() {
+        let (memtable, state) = fixture_with(|config| {
+            config.max_inflight_push_bytes = Some(1);
+        });
+        let (status, _, _) = post(
+            &state,
+            "/v1/logs",
+            "application/x-protobuf",
+            log_request("admitted into an empty server").encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(lines(&memtable), vec!["admitted into an empty server"]);
+        // And the charge was released rather than held by the answered request.
+        assert_eq!(state.ingest_gate.inflight_body_bytes(), 0);
+    }
+
+    /// The charge is the header, and it is released on the way out.
+    ///
+    /// A body that never arrives at a handler still has to be accounted for
+    /// while it is in the heap, so the accounting lives in the middleware; what
+    /// this pins is that it does not *leak* — a refused encoding returns early,
+    /// through a different path than the success case, and must still give the
+    /// bytes back.
+    #[tokio::test]
+    async fn a_refused_push_releases_its_inflight_charge() {
+        let (_, state) = fixture();
+        let (status, _, _) = post(
+            &state,
+            "/v1/logs",
+            "application/octet-stream",
+            log_request("never decoded").encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(state.ingest_gate.inflight_body_bytes(), 0);
     }
 
     /// A charset parameter is legal on `Content-Type` and collectors send one.

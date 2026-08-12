@@ -571,6 +571,9 @@ loggytracy_remote_consecutive_failures {}\n\
 loggytracy_cache_healthy {}\n\
 # TYPE loggytracy_wal_backlog_bytes gauge\n\
 loggytracy_wal_backlog_bytes {}\n\
+# HELP loggytracy_inflight_push_bytes Request bodies admitted and not yet answered, bounded by max_inflight_push_bytes. Counted at admission because a body is already resident by the time a handler sees it.\n\
+# TYPE loggytracy_inflight_push_bytes gauge\n\
+loggytracy_inflight_push_bytes {}\n\
 # TYPE loggytracy_merge_debt_parts gauge\n\
 loggytracy_merge_debt_parts {}\n\
 # HELP loggytracy_part_tenant_segments (tenant, part) pairs. The shared-part layout spends a row group, two blooms and a metadata segment per pair.\n\
@@ -691,6 +694,7 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
             .unwrap_or(0),
         cache_healthy as u8,
         wal_backlog_bytes,
+        state.ingest_gate.inflight_body_bytes(),
         merge_debt_parts,
         layout.tenant_segments,
         layout

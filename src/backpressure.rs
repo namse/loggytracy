@@ -56,6 +56,39 @@ pub struct IngestGate {
     journal: Arc<Journal>,
     config: Arc<Config>,
     metrics: Arc<RuntimeMetrics>,
+    /// Request bodies admitted and not yet answered.
+    ///
+    /// Every other term in this gate is a *buffer* the server owns and can
+    /// measure whenever it likes. This one is the bodies in flight, which no
+    /// gauge could see after the fact: by the time a handler runs, its body is
+    /// already a `Bytes` in the heap. So it is counted at admission and
+    /// released by the guard's `Drop`, and the sum is what a scrape reads.
+    inflight_body_bytes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// One admitted body's charge against the in-flight ceiling.
+///
+/// Held for the whole request — through decode, quota, journal append and the
+/// response — because that is how long the body is resident. Dropping it is
+/// the release, so an early `?` return cannot leak the charge.
+#[derive(Debug)]
+pub struct InflightBody {
+    counter: Arc<std::sync::atomic::AtomicU64>,
+    bytes: u64,
+}
+
+impl Drop for InflightBody {
+    fn drop(&mut self) {
+        // Saturating: a decrement that would go below zero means the counter
+        // was reset under a live request, and a wrapped counter would then
+        // refuse every future body forever. Losing the charge is the harmless
+        // direction.
+        let _ = self
+            .counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(self.bytes))
+            });
+    }
 }
 
 impl IngestGate {
@@ -64,6 +97,75 @@ impl IngestGate {
             journal,
             config,
             metrics,
+            inflight_body_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Bytes of request body admitted and not yet answered.
+    pub fn inflight_body_bytes(&self) -> u64 {
+        self.inflight_body_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Admit `bytes` of request body against the in-flight ceiling, or refuse.
+    ///
+    /// The hole this closes: every other ingest bound is checked once per
+    /// request and bounds a buffer, while the bodies themselves were
+    /// `concurrency × MAX_OTLP_REQUEST_BYTES` and nothing limited concurrency —
+    /// outside the accounting entirely (`todo.md`, M10). Measured at 0.3 MiB on
+    /// the comparison bed, so this closes a hole rather than recovering memory,
+    /// and the ceiling is deliberately generous.
+    ///
+    /// **An empty server always admits one body**, whatever the ceiling says.
+    /// Without that a ceiling set below one legal request would refuse it
+    /// forever with nothing in flight to wait for — the same trap
+    /// `max_push_bytes` flooring the token bucket's burst avoids. Progress is
+    /// the invariant; the ceiling only decides how many bodies share the server.
+    pub fn admit_body(&self, bytes: u64) -> Result<InflightBody, IngestError> {
+        let Some(limit) = self.config.max_inflight_push_bytes else {
+            return Ok(self.charge(0));
+        };
+        let admitted =
+            self.inflight_body_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    if current == 0 || current.saturating_add(bytes) <= limit {
+                        Some(current.saturating_add(bytes))
+                    } else {
+                        None
+                    }
+                });
+        match admitted {
+            Ok(_) => Ok(InflightBody {
+                counter: self.inflight_body_bytes.clone(),
+                bytes,
+            }),
+            Err(current) => Err(self.overloaded(format!(
+                "in-flight request bodies hold {current} bytes and this one is {bytes}, \
+over the limit of {limit}; too many pushes are in flight at once"
+            ))),
+        }
+    }
+
+    /// The same admission for OTLP over gRPC, in its own vocabulary.
+    ///
+    /// The gRPC transport is charged for what it can be charged for and no
+    /// more. There is no `Content-Length` on a gRPC request — the framing is
+    /// streamed — and tonic hands the service an already-decoded message, so
+    /// the wire size is gone by the time any code here could read it. What
+    /// bounds that path is tonic's own `max_decoding_message_size`
+    /// (`MAX_OTLP_REQUEST_BYTES`) times its concurrency, which is recorded as a
+    /// known limit rather than papered over: charging a flat ceiling per gRPC
+    /// push instead would refuse four concurrent 100 KB batches on a 2 GiB
+    /// container, which is a throughput regression wearing a memory bound's
+    /// clothes.
+    pub fn admit_body_grpc(&self, bytes: u64) -> Result<InflightBody, tonic::Status> {
+        self.admit_body(bytes)
+            .map_err(|error| tonic::Status::resource_exhausted(error.message))
+    }
+
+    fn charge(&self, bytes: u64) -> InflightBody {
+        InflightBody {
+            counter: self.inflight_body_bytes.clone(),
+            bytes,
         }
     }
 
@@ -131,5 +233,88 @@ flush is not keeping up"
             message,
             retry_after: Some(self.config.backpressure_retry_after),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gate(max_inflight_push_bytes: Option<u64>) -> Arc<IngestGate> {
+        let config = Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("loggytracy-inflight-{}", uuid::Uuid::new_v4())),
+            max_inflight_push_bytes,
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let journal = Arc::new(
+            crate::journal::Journal::spawn(&config, Arc::new(crate::memtable::MemTable::new()))
+                .unwrap(),
+        );
+        IngestGate::for_test(&journal, &config)
+    }
+
+    #[tokio::test]
+    async fn bodies_over_the_ceiling_are_refused_with_a_retry_after() {
+        let gate = gate(Some(1000));
+        let first = gate.admit_body(600).expect("the first body fits");
+        assert_eq!(gate.inflight_body_bytes(), 600);
+        let error = gate
+            .admit_body(600)
+            .expect_err("the second body would exceed the ceiling");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            error.retry_after.is_some(),
+            "a throttled client needs the header"
+        );
+        // The refusal charged nothing: a body that was never admitted must not
+        // hold the ceiling down for the ones behind it.
+        assert_eq!(gate.inflight_body_bytes(), 600);
+        drop(first);
+        assert_eq!(gate.inflight_body_bytes(), 0);
+        gate.admit_body(600).expect("the ceiling released");
+    }
+
+    /// The invariant that makes the knob safe at any value.
+    #[tokio::test]
+    async fn an_idle_server_admits_one_body_however_small_the_ceiling() {
+        let gate = gate(Some(1));
+        let permit = gate
+            .admit_body(16 * 1024 * 1024)
+            .expect("an empty server admits one body whatever the ceiling says");
+        // And exactly one: the next has something to wait for now.
+        gate.admit_body(16 * 1024 * 1024)
+            .expect_err("the second body is refused while the first is in flight");
+        drop(permit);
+        assert_eq!(gate.inflight_body_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn off_admits_everything_and_counts_nothing() {
+        let gate = gate(None);
+        let permits: Vec<_> = (0..64)
+            .map(|_| {
+                gate.admit_body(16 * 1024 * 1024)
+                    .expect("off never refuses")
+            })
+            .collect();
+        assert_eq!(
+            gate.inflight_body_bytes(),
+            0,
+            "with no ceiling there is nothing to account against"
+        );
+        drop(permits);
+    }
+
+    /// gRPC gets the OTLP specification's status rather than the HTTP one.
+    #[tokio::test]
+    async fn the_grpc_refusal_is_resource_exhausted() {
+        let gate = gate(Some(1000));
+        let _first = gate.admit_body(1000).expect("the first body fits");
+        let status = gate
+            .admit_body_grpc(1000)
+            .expect_err("the second body is refused");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 }
