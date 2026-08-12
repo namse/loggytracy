@@ -1454,6 +1454,53 @@ M/G/1 queue at high utilization looks like, and nothing in the process measures 
 line carries no duration, and there is no timing on the append path at all. That is the next
 measurement — phase attribution on the push path — and not a tuning change.
 
+### The server's own tail is one `sync_all`, and its tail is the merge writing beside it (2026-08-12)
+
+The writer task now times each of the four phases a push passes through and publishes them as
+histograms (`loggytracy_journal_{append_queue_wait,write,fsync,insert,checkpoint}_ms`, plus the batch
+and record counters that give the batch size); a batch over 250 ms also logs a line naming which
+phase it was, because a histogram cannot say which phase any *one* slow event was in and the tail is
+what the whole argument is about. The soak scrapes `/metrics` once while the server is still up and
+its verdict prints the table. `phase-1h`, an hour at 8 connections and 20 k eps:
+
+| phase | n | mean | p50 ≤ | p95 ≤ |
+|---|---|---|---|---|
+| append queue wait | 720,001 | 7.00 ms | 5 | 25 |
+| write (`write_all`+`flush`) | 453,779 | **0.00 ms** | 1 | 1 |
+| **fsync (`sync_all`)** | 453,779 | **7.62 ms** | 10 | 25 |
+| memtable insert | 453,779 | 0.16 ms | 1 | 1 |
+| checkpoint | 4,450 | 0.30 ms | 1 | 1 |
+
+**The service time is one fsync and nothing else.** Write, insert and checkpoint together are under
+0.5 ms of a 12 ms median. 453,779 batches in 3,600 s is 126 fsyncs a second at 7.62 ms each — the
+writer task is busy **96% of the time**, which is what the queue in front of it is made of, and
+`records/batch = 1.59` says each of those fsyncs is amortized over barely more than one push.
+
+**And the tail's tail is the merge.** Of the hour's slow batches, every one is at least 57% fsync by
+duration, and the largest is unambiguous: `records=1 bytes=10772 total_ms=4094.8` of which
+`fsync_ms=4094.6` — a single 10 KB record whose durability took four seconds. That is the same
+number the day-long run reported as its push service max (4690 ms) and its response max (5346 ms),
+so the 24-hour tail is now attributed rather than guessed. What it is waiting behind: **294 slow
+batches in the hour against exactly 294 merges, and 235 of the 294 fall within 5 s of a merge
+completing.** The 4.09-second one sits in a 4.2-second gap in the flush log with a merge completion
+0.98 s after it. The WAL's fsync is queued on the same device the merge is rewriting a part onto —
+`io_full` for the run is 135.5 s, 3.76% of it.
+
+So the failing gate's causal chain, end to end and each link measured: `push_response_p95` 273 ms =
+the client's 8 connections queueing (233 ms, which moves to 6.8 ms at 32 connections and reappears
+inside the server) in front of a writer task at 96% utilization, whose service time is one WAL
+`sync_all` averaging 7.6 ms, whose own excursions to seconds are merge I/O on the shared device.
+
+- [ ] **What to do about it is a decision, not a finding, and it is the user's.** Every candidate is a
+  trade the 2026-08-07 freeze exists to stop being made casually, and none of them is a defect being
+  fixed: `max_batch_ms` is 0, so a linger of a few ms would amortize each fsync over more pushes —
+  it raises the floor for a lightly loaded server to buy tail at a busy one, and the comment on that
+  knob records that a linger once capped a single connection's throughput outright. Giving merge its
+  own I/O priority, or pacing its writes, would address the excursions rather than the median. And
+  a second writer task is not available without giving up the single-file WAL's ordering. The
+  diagnosis is what this item owed; the measurements above are what any of those choices would have
+  to be judged against.
+
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
 The user's bar for this round: "VL보다 빠르지 않으면 의미가 없습니다" — `metadata_rare` must beat
