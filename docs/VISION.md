@@ -465,19 +465,28 @@ change, which is also why it is a companion rather than a replacement — the
 COMPARE_VERIFY_ROWS=1500000 \
 COMPARE_OUT=target/compare-10x \
 COMPARE_DOC=docs/COMPARISON_LARGE_CORPUS.md \
+COMPARE_ARTIFACTS=docs/artifacts/m9-10x \
   compare/run.sh
 ```
 
-Two things it reports that the reader should not skip. The Loki columns are
-**withheld** at this size: 32 of 168 answers disagreed, every one of them because
-Loki attached its own `__stream_shard__` to the stream labels once the streams
-were ten times larger, with identical row counts on both sides. That is Loki
-sharding its own writes, the same class of engine-internal label as
-`detected_level`, and it is a pending exemption decision rather than a
-correctness finding against either engine — but until it is decided there are no
-Loki ratios at 1.5 M rows. And `line_filter` degraded **super**-linearly, 3.5 →
-53 ms for ten times the data, which is the one number in the run that a scan
-cost alone does not explain.
+The artifacts directory is part of that command, not a detail: the first
+ten-times run left it at the default and wrote its JSON over the 150 k run's, so
+for a day the 150 k document cited a directory belonging to a different run. A
+second corpus takes a second directory, and each document now prints the one it
+read.
+
+Two things it reports that the reader should not skip. The Loki columns were
+**withheld** on the first pass at this size — 32 of 168 answers disagreed,
+every one because Loki attached its own `__stream_shard__` to the stream labels
+once the streams were ten times larger, with identical row counts on both sides
+— and that is now a **declared exemption by name**, the same class as
+`detected_level`, reported with its count in the document. The re-run agrees
+168 of 168 and the ratios print: loggytracy is faster than Loki on all seven
+shapes at 1.5 M rows, 0.00x–0.26x, and 1470x on the claim's own shape. And
+`line_filter` degraded **super**-linearly, 3.5 → 53 ms for ten times the data —
+which was the one number in the run a scan cost alone did not explain, and is
+now explained: ten of the fifteen was a ten-times-bigger *answer*, and the scan
+path's own scaling is 1.95x for 10x with the answer held fixed (`todo.md`).
 It began at 12.6x when `structured_metadata` was a JSON blob parsed per row;
 columnizing it, then page-level time selection, then the `_stream` ordinal
 table brought it to 1.46x; what closed it was keeping the decode — a
