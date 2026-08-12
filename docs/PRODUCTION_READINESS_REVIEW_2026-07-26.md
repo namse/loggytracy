@@ -17,6 +17,12 @@ then. It continues the previous review's item numbers (P0-1 and so on) and prefi
 Gate 1 (data safety), remained open, and the newly added multi-tenancy/retention code combined with P1-8
 (merge-limit unit mismatch) to **break even the physical guarantee of tenant deletion.**
 
+That verdict is this date's and stays as written. For where the gates actually
+stand, read ["Production-readiness gates"](#production-readiness-gates-updated)
+below, audited against the code on 2026-08-12: Gates 1 and 4 are closed, Gate 2
+is closed but for one open *decision*, Gate 3 holds two partials and one
+deliberate withdrawal, and Gate 5 is feature backlog tracked in `todo.md`.
+
 Changes since the previous review:
 
 | Item | Previous | Current |
@@ -373,6 +379,14 @@ The rest remains in `todo.md`.
 
 ## Production-readiness gates (updated)
 
+**Audited against the code on 2026-08-12**, item by item, because a gate list is
+only worth what its last check is worth and this one had drifted in *both*
+directions: five items were done and still marked open, and one marked done had
+since been deliberately undone. Each line below carries where to look, so the
+next audit starts from evidence rather than from this sentence. Two items are
+reframed rather than answered — an open question is not the same as unfinished
+work, and recording it as the latter is how a list stops being read.
+
 ### Gate 1 — data safety
 
 - [x] Fix P0-1 WAL-compaction wedge + consecutive-compaction/crash-injection tests
@@ -385,22 +399,59 @@ The rest remains in `todo.md`.
 ### Gate 2 — multi-tenancy completion
 
 - [x] N2 tenant allowlist
-- [ ] Per-tenant throttles/quotas/`max_streams_per_user`, tenant-labeled metrics
+- [x] Per-tenant throttles and quotas — `tenant_quota.rs` (a token bucket per
+      tenant, burst floored at `max_push_bytes` so a legal body is never refused
+      forever), `default_tenant_max_streams` for `max_streams_per_user`, and the
+      rate applies to both transports (`the_tenant_rate_applies_to_the_http_transport_too`)
+- [ ] **Tenant-labeled metrics — reframed as a decision, not a task.** The
+      original line bundled this with the quotas above, which are done. What is
+      not done is emitting one series per tenant, and it is not obvious it should
+      be: `/metrics` is unauthenticated (`metrics.rs`, the gauge doc), so
+      per-tenant series hand a scraper the tenant list and make cardinality a
+      function of the customer count. The aggregate shape shipped instead —
+      known / infinite / unknown tenant counts and the newest push age
+      (`tenant_policy_gauges`). Closing this needs a decision about the trust
+      boundary of that endpoint, not code
 - [x] P2-2 metadata endpoint resource guards + apply `start`/`end`
 - [x] N4 remove O(parts) work from `/metrics`
-- [ ] Adjust the default bind to the trust boundary
+- [x] Adjust the default bind to the trust boundary — the defaults are
+      `127.0.0.1:3100` and `127.0.0.1:4317`, and startup says so in one line
+      naming the variable that widens it (`startup.rs`, "bound to loopback only")
 
 ### Gate 3 — operability
 
-- [x] N5 part format version field
-- [ ] P1-10 retry transient failures at startup (remove crash loop)
-- [ ] P2-7 histograms + endpoint labels
-- [ ] P2-8 non-stdin abort path
-- [ ] P3 Dockerfile + configuration reference + runbook + alert rules
+- [ ] ~~N5 part format version field~~ **Withdrawn, and the withdrawal is the
+      decision.** The field was built for this gate and then removed on
+      2026-07-31 (`f0da5bd`): loggytracy is not deployed, so there is never older
+      data to read, and every compatibility path was code that could not run —
+      the bloom container had carried four formats, which forced the reader to
+      hold three capability flags. Recorded in `VISION.md` under "What is
+      deliberately not built" and in `ARCHITECTURE.md`'s decided-choices table.
+      Left visible rather than deleted, because a gate that was met and then
+      unmet on purpose is exactly what a later reader will otherwise re-open
+- [x] P1-10 retry transient failures at startup — `with_object_store_retry` in
+      `startup.rs`, 250 ms backoff against a budget, after which the process
+      exits and the orchestrator's own restart backoff takes over
+- [ ] **P2-7 — histograms done, endpoint labels not.** `LatencyHistogram` emits
+      cumulative `le` buckets, which is the only shape `histogram_quantile` can
+      read, and it replaced `*_latency_ns_total` counters that could only ever
+      yield a mean while every target in these documents is written as p95/p99.
+      What is still missing is a per-endpoint dimension: one histogram covers the
+      query path as a whole
+- [x] P2-8 non-stdin abort path — `SIGUSR1` forces termination during a drain
+      (`shutdown.rs`), alongside the `exit`-on-stdin path a terminal has
+- [ ] **P3 — three of four.** `Dockerfile`, `docs/CONFIGURATION.md` (with a test,
+      `every_configuration_knob_is_documented`, that fails the build when a knob
+      is added without a row) and `docs/RUNBOOK.md` all exist; the runbook's
+      "What to alert on" is prose, and machine-readable alert rules are not
+      shipped
 
 ### Gate 4 — scale validation
 
-- [ ] Measure row-group fragmentation with many tenants for N3
+- [x] Measure row-group fragmentation with many tenants for N3 —
+      `part::tests::tenant_breadth_sets_the_row_group_floor_and_what_that_costs`
+      builds parts across a tenant sweep and asserts the cost rather than
+      describing it
 - [x] N6 Tempo time pruning (search and both tag endpoints)
 
 ### Gate 5 — feature completeness
