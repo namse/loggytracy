@@ -743,7 +743,33 @@ pub struct Answer {
 /// `service_name` used to be exempt for the same reason and no longer can be:
 /// the OTLP encoder sends the corpus's `app` as `service.name`, so the label
 /// is now pushed data the digest must hold every system to.
-const DERIVED_LABELS: [&str; 1] = ["detected_level"];
+///
+/// `__stream_shard__` joined the list at the ten-times corpus, and the decision
+/// deserves its reasoning rather than its convenience. Loki splits a stream that
+/// grows past its shard rate and names the pieces with this label; at 150 k rows
+/// no stream was large enough and at 1.5 M rows 32 of 168 answers disagreed on
+/// nothing else — identical row counts on both sides, no label missing on the
+/// loggytracy side, this one name present on Loki's. So it is `detected_level`'s
+/// class exactly: derived by the engine from its own internals, never pushed by
+/// this bed, and impossible for either engine to have got *wrong*.
+///
+/// What the exemption cannot be allowed to hide, stated because a widened basis
+/// hides things quietly: this label is part of a **stream's identity**, so
+/// dropping it would also hide a real difference in an *unaggregated* metric
+/// answer's series set. It is not hidden here for two reasons — the matrix asks
+/// for `sum(rate(...))`, whose identity is what the query names rather than what
+/// the storage sharded, and every other check the digest runs stays in force
+/// beside this drop: the row counts, the label names only one side had, and the
+/// answer order. A shard label that arrived with a row-count change would still
+/// be a disagreement.
+///
+/// The alternative was to turn Loki's stream sharding off in
+/// `compare/loki-config.yaml` and make the difference not happen. Rejected on
+/// that file's own rule — every setting there is a compatibility requirement or
+/// a removal of a limit loggytracy does not apply either, and everything that is
+/// a tuning choice stays at Loki's default. Sharding is Loki's own tuning, and
+/// reaching into it to tidy a table is how a bed starts measuring its author.
+const DERIVED_LABELS: [&str; 2] = ["detected_level", "__stream_shard__"];
 
 /// Labels whose *presence* is comparable and whose *wording* is not.
 ///
@@ -1803,10 +1829,20 @@ different one"
         assert_eq!(tag("level", "entry"), Some("entry"));
         assert_eq!(tag("detected_level", "stream"), None);
         assert_eq!(
+            tag("__stream_shard__", "stream"),
+            None,
+            "Loki's shard label is its own sharding decision, not an answer"
+        );
+        assert_eq!(
             tag("service_name", "metric"),
             Some("metric"),
             "service_name is pushed data under OTLP, not a derived label"
         );
+        // The guard on the exemption: it is by name, and the neighbouring
+        // reserved names are not swept in with it. A prefix rule would have
+        // exempted whatever Loki adds next without anyone deciding to.
+        assert_eq!(tag("__error_details__", "entry"), Some("entry"));
+        assert_eq!(tag("__stream_shard", "stream"), Some("stream"));
     }
 
     #[test]

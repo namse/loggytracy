@@ -798,15 +798,32 @@ the same defect the `| json` shape was open as — the same slot — and it is f
 rather than declared, so both sides now answer with one flat stream label set and
 a two-element tuple, and a regression back into that slot is a disagreement here.
 
-Two exemptions remain, both by name rather than by placement, both reported
-below with counts rather than left implicit. `detected_level` is **dropped**,
-because Loki derives it at ingest from the line and nothing in this bed pushes
-one; `service_name` is no longer exempt — the OTLP encoder pushes the corpus's
-`app` as `service.name`, so it is data every system is held to. And
-`__error_details__` is compared by **presence with its value normalized**: an
-answer missing the label is a disagreement — 16 of 24 `json_field_rare`
-answers once were exactly that — while its wording is each engine's own parser
-internals and matching it would be matching Loki's JSON library.
+Three exemptions remain, every one of them by name rather than by placement, and
+every one reported below with counts rather than left implicit. Two are
+**dropped**, both being labels Loki derives from its own internals and neither
+being anything this bed pushes: `detected_level`, which Loki computes from the
+line at ingest, and `__stream_shard__`, which names the pieces Loki splits a
+stream into once it outgrows its shard rate. `service_name` is no longer exempt —
+the OTLP encoder pushes the corpus's `app` as `service.name`, so it is data every
+system is held to. And `__error_details__` is compared by **presence with its
+value normalized**: an answer missing the label is a disagreement — 16 of 24
+`json_field_rare` answers once were exactly that — while its wording is each
+engine's own parser internals and matching it would be matching Loki's JSON
+library.
+
+`__stream_shard__` is the newest of the three and the one a reader should be
+most suspicious of, because it was declared *after* it withheld a column: at
+1.5 M rows it disagreed 32 answers of 168 with identical row counts on both
+sides and no other label differing, and the timing ratios against Loki were
+withheld for every one of them. Two things make it a declaration rather than a
+convenience. It is part of a **stream's identity**, so it could hide a real
+difference in an *unaggregated* metric answer's series set — which is why the
+matrix asks for `sum(rate(...))`, whose identity is what the query names, and why
+every other check stays in force beside the drop: row counts, the labels only one
+side had, and the answer order. And the alternative — turning Loki's stream
+sharding off in `compare/loki-config.yaml` — was rejected on that file's own
+rule, that tuning choices stay at Loki's default; sharding is Loki's tuning, and
+reaching into it to complete a table would be measuring this bed's author.
 
 Two known differences are left, and neither is normalized away by the digest.
 The metric step grid is handled by the query: `align_to_step` snaps every window

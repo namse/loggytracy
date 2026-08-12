@@ -1416,6 +1416,44 @@ in-flight body bound (`3bde4d7`), which put a new counter on the HTTP push path,
 it would confound the connection count with a code change. The 8-connection arm is therefore also
 the check that the middleware cost nothing.
 
+**Neither prediction happened, and the third outcome is the more useful one** (`conn8-1h`,
+`conn32-1h`, one hour each, 2026-08-12). The control arm reproduces the day in an hour — response
+p95 266.4 against the day's 273.3 — so the middleware costs nothing and an hour is enough to ask the
+question. Then, at four times the connections and the identical offered rate:
+
+| | 8 connections | 32 connections | |
+|---|---|---|---|
+| push response p95 | 266.42 ms | **166.83 ms** | −37% |
+| push **service** p95 | 40.29 ms | **106.47 ms** | **×2.64** |
+| queueing delay p95 | 226.41 ms | **6.80 ms** | **÷33** |
+| push response p50 | 12.47 ms | 12.64 ms | unchanged |
+| pushes accepted / throttled | 720,001 / 0 | 720,001 / 0 | identical |
+
+The head-of-line waiting was real and it is gone: 226 ms of queueing becomes 6.8 ms. But **the wait
+did not disappear, it moved inside** — service p95 rose by 66 ms of the 220 that left the queue — and
+the response p95 landed at 167 ms rather than at the ~40 ms service floor the first prediction named.
+The unloaded cost is untouched (p50 12.5 ms both) and so is the throughput (720,001 pushes accepted
+in both, nothing throttled). That is the signature of a **serialization point inside the server**: at
+200 pushes/s the queue exists either way, and the connection count only decides which side of the
+socket it forms on.
+
+**So the gate stays on response, and the reasoning is the opposite of what it started as.** The
+temptation was to re-aim it at service on the grounds that service is the server's own number. It is
+not one: service p95 is 40 ms at 8 connections and 106 ms at 32, on an unchanged server at an
+unchanged rate — it varies 2.6x with the client's fan-out, and it varies in the flattering direction,
+reading *better* the thinner the client. A gate on it would have been more rig-dependent than the one
+it replaced, not less. Response is what a client experiences and it moves the honest way; what it
+needs is its **connection count named in its definition**, which is now recorded in the load config's
+target rather than left as an implicit property of the rig.
+
+What this promotes is the second question, which is now the only one left and has a prime suspect:
+every push funnels through **one journal writer task** (`journal/writer.rs`, an mpsc to a single loop
+that frames a batch, writes it, and `sync_all`s once for the batch), with `max_batch_ms=0` so a batch
+is only what already arrived. A p50 of 12 ms against a p95 of 40–106 ms at 200 pushes/s is what an
+M/G/1 queue at high utilization looks like, and nothing in the process measures it: the flush log
+line carries no duration, and there is no timing on the append path at all. That is the next
+measurement — phase attribution on the push path — and not a tuning change.
+
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
 The user's bar for this round: "VL보다 빠르지 않으면 의미가 없습니다" — `metadata_rare` must beat
