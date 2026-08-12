@@ -174,6 +174,10 @@ impl LatencyHistogram {
             .fetch_add(millis.round().max(0.0) as u64, Ordering::Relaxed);
     }
 
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
     /// `(le bound, cumulative count)` pairs plus the `+Inf` total and sum.
     pub fn render(&self, name: &str) -> String {
         let mut out = String::new();

@@ -85,6 +85,52 @@
             .unwrap();
     }
 
+    /// The push path's four phases are measured, and by the writer task rather
+    /// than by the caller.
+    ///
+    /// This is the instrument the push-tail argument was missing: a p50 of
+    /// 12 ms against a p95 that moved between 40 and 106 ms with nothing but
+    /// the client's connection count (`todo.md`, 2026-08-12) is a queue in
+    /// front of one writer, and no number in the process could say which phase
+    /// it was. A test that only asserted the histograms exist would not catch
+    /// the way this breaks — a phase wired to the wrong instant reads zero
+    /// forever — so every phase an append passes through must have observed it.
+    #[tokio::test]
+    async fn an_append_is_measured_in_each_phase_the_writer_puts_it_through() {
+        let h = harness("phase_metrics").await;
+        let metrics = h.journal.metrics().clone();
+        for phase in [
+            &metrics.append_queue_wait,
+            &metrics.batch_write,
+            &metrics.batch_fsync,
+            &metrics.batch_insert,
+            &metrics.checkpoint,
+        ] {
+            assert_eq!(phase.count(), 0, "nothing is measured before the push");
+        }
+
+        push(&h, make_otlp_req(&[("a", vec![("hi", 100)])])).await;
+        assert_eq!(metrics.append_queue_wait.count(), 1);
+        assert_eq!(metrics.batch_write.count(), 1);
+        assert_eq!(metrics.batch_fsync.count(), 1);
+        assert_eq!(metrics.batch_insert.count(), 1);
+        assert_eq!(
+            metrics.checkpoint.count(),
+            0,
+            "a checkpoint is the flush's ask, not the push's"
+        );
+        assert_eq!(metrics.batches.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.batched_records.load(Ordering::Relaxed), 1);
+
+        h.journal.checkpoint().await.unwrap();
+        assert_eq!(
+            metrics.checkpoint.count(),
+            1,
+            "a checkpoint runs in the same task, so its cost is time no push \
+can be written in"
+        );
+    }
+
     #[tokio::test]
     async fn append_and_checkpoint() {
         let h = harness("append_checkpoint").await;

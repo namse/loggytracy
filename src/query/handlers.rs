@@ -765,8 +765,52 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
     );
     body.push_str(&object_store_operation_metrics(&state));
     body.push_str(&delete_request_metrics(&state));
+    body.push_str(&journal_writer_metrics(&state));
     body.push_str(&crate::memprof::render());
     body
+}
+
+/// Where an accepted push's server-side time went.
+///
+/// Every push in the process is written by one task, so these four phases are
+/// the whole of it and they are additive: queue, write, fsync, insert. The
+/// question they exist to answer is which of them the push tail is made of —
+/// a p50 of 12 ms beside a p95 that moves between 40 and 106 ms with nothing
+/// but the client's connection count (`todo.md`, 2026-08-12) is a queue, and
+/// until these there was no number in the process that could say so.
+fn journal_writer_metrics(state: &AppState) -> String {
+    let metrics = state.journal.metrics();
+    let mut out = String::new();
+    out.push_str(
+        "# HELP loggytracy_journal_batches_total Batches the writer task wrote, one fsync each.\n\
+# TYPE loggytracy_journal_batches_total counter\n",
+    );
+    out.push_str(&format!(
+        "loggytracy_journal_batches_total {}\n",
+        metrics.batches.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP loggytracy_journal_batched_records_total Appends carried by those batches. Divided by the batches, the number of pushes sharing each fsync.\n\
+# TYPE loggytracy_journal_batched_records_total counter\n",
+    );
+    out.push_str(&format!(
+        "loggytracy_journal_batched_records_total {}\n",
+        metrics.batched_records.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        &metrics
+            .append_queue_wait
+            .render("loggytracy_journal_append_queue_wait_ms"),
+    );
+    out.push_str(&metrics.batch_write.render("loggytracy_journal_write_ms"));
+    out.push_str(&metrics.batch_fsync.render("loggytracy_journal_fsync_ms"));
+    out.push_str(&metrics.batch_insert.render("loggytracy_journal_insert_ms"));
+    out.push_str(
+        &metrics
+            .checkpoint
+            .render("loggytracy_journal_checkpoint_ms"),
+    );
+    out
 }
 
 /// Deletion is the one operation here that destroys data on request, so how

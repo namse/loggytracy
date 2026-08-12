@@ -30,6 +30,7 @@ impl Journal {
         let max_batch_bytes = config.max_batch_bytes;
         let max_batch_ms = config.max_batch_ms;
         let healthy = Arc::new(AtomicBool::new(true));
+        let metrics = Arc::new(JournalMetrics::default());
         let backlog = Arc::new(WalBacklog::default());
         backlog.set_wal_bytes(std::fs::metadata(&wal_path)?.len());
         backlog.set_checkpoint_bytes(read_checkpoint(&ckpt_path)?);
@@ -40,6 +41,7 @@ impl Journal {
         let trace_memtable_clone = trace_memtable.clone();
         let writer_backlog = backlog.clone();
         let writer_memtable = memtable.clone();
+        let writer_metrics = metrics.clone();
         tokio::spawn(async move {
             let result = writer_loop(
                 rx,
@@ -50,6 +52,7 @@ impl Journal {
                 max_batch_bytes,
                 max_batch_ms,
                 &writer_backlog,
+                &writer_metrics,
             )
             .await;
             writer_health.store(false, Ordering::Release);
@@ -63,10 +66,16 @@ impl Journal {
             wal_path,
             ckpt_path,
             healthy,
+            metrics,
             memtable,
             trace_memtable,
             backlog,
         })
+    }
+
+    /// Where the writer task's time went, for `/metrics` and for the soak.
+    pub fn metrics(&self) -> &Arc<JournalMetrics> {
+        &self.metrics
     }
 
     pub fn wal_backlog_bytes(&self) -> u64 {
@@ -130,6 +139,10 @@ impl Journal {
             ));
         }
         let (done_tx, done_rx) = oneshot::channel();
+        // Stamped before the send rather than inside the writer: a full channel
+        // makes `send` itself the wait, and a queue term that started after it
+        // would report zero for exactly the case it exists to catch.
+        let queued_at = Instant::now();
         self.tx
             .send(JournalCmd::Append {
                 kind,
@@ -137,6 +150,7 @@ impl Journal {
                 tenant,
                 streams,
                 traces,
+                queued_at,
                 done: done_tx,
             })
             .await
@@ -219,6 +233,7 @@ async fn writer_loop(
     max_batch_bytes: usize,
     max_batch_ms: u64,
     backlog: &WalBacklog,
+    metrics: &JournalMetrics,
 ) -> Result<(), IoError> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -250,10 +265,11 @@ async fn writer_loop(
                 tenant,
                 streams,
                 traces,
+                queued_at,
                 done,
             } => {
                 batch_bytes += framed_record_len(&tenant, &payload);
-                batch.push((kind, payload, tenant, streams, traces, done));
+                batch.push((kind, payload, tenant, streams, traces, queued_at, done));
                 // Take what has already arrived and write it. Waiting for more
                 // charged every push the full linger even when the channel was
                 // empty, which fixed single-connection throughput at
@@ -286,10 +302,11 @@ async fn writer_loop(
                             tenant,
                             streams,
                             traces,
+                            queued_at,
                             done,
                         })) => {
                             batch_bytes += framed_record_len(&tenant, &payload);
-                            batch.push((kind, payload, tenant, streams, traces, done));
+                            batch.push((kind, payload, tenant, streams, traces, queued_at, done));
                         }
                         Ok(Some(JournalCmd::Checkpoint { done })) => {
                             pending_checkpoint = Some(done);
@@ -316,9 +333,24 @@ async fn writer_loop(
         }
 
         if !batch.is_empty() {
+            // Taken before the framing so the queue term ends where the work on
+            // this batch begins, and every push in the batch is measured
+            // against the same instant.
+            let batch_started = Instant::now();
+            let mut oldest_queued = batch_started;
+            for (_, _, _, _, _, queued_at, _) in &batch {
+                metrics
+                    .append_queue_wait
+                    .observe(batch_started.saturating_duration_since(*queued_at));
+                oldest_queued = oldest_queued.min(*queued_at);
+            }
+            metrics.batches.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .batched_records
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
             let wal_arena = crate::memprof::enter(crate::memprof::Arena::Wal);
             let mut buf = Vec::with_capacity(batch_bytes + batch.len() * RECORD_HEADER_SIZE);
-            for (kind, payload, tenant, _, _, _) in &batch {
+            for (kind, payload, tenant, _, _, _, _) in &batch {
                 // Framed here, straight into the batch buffer. The frame used
                 // to be its own prefix+tenant+payload Vec built on the ingest
                 // task, which copied every export once more than the write
@@ -348,12 +380,22 @@ async fn writer_loop(
             }
 
             drop(wal_arena);
+            let framed = Instant::now();
+            let mut fsync_started = framed;
             let write_result = async {
                 file.write_all(&buf).await?;
                 file.flush().await?;
+                fsync_started = Instant::now();
                 file.sync_all().await
             }
             .await;
+            let fsynced = Instant::now();
+            metrics
+                .batch_write
+                .observe(fsync_started.saturating_duration_since(framed));
+            metrics
+                .batch_fsync
+                .observe(fsynced.saturating_duration_since(fsync_started));
 
             match write_result {
                 Ok(()) => {
@@ -366,17 +408,42 @@ async fn writer_loop(
                     // are moved, not copied, so the memtable's own nodes are
                     // charged to the same arena its contents already are.
                     let _arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
-                    for (_, _, tenant, streams, traces, done) in batch.drain(..) {
+                    let records = batch.len();
+                    for (_, _, tenant, streams, traces, _, done) in batch.drain(..) {
                         for (labels, entries) in streams {
                             memtable.insert(tenant.clone(), labels, entries);
                         }
                         trace_memtable.insert(traces);
                         let _ = done.send(Ok(()));
                     }
+                    let inserted = Instant::now();
+                    let insert = inserted.saturating_duration_since(fsynced);
+                    metrics.batch_insert.observe(insert);
+                    // Named per event, because a histogram cannot say which
+                    // phase any one slow batch was in and the tail is what the
+                    // push p95 argument is about.
+                    let total = inserted.saturating_duration_since(batch_started);
+                    if total >= SLOW_BATCH {
+                        tracing::warn!(
+                            records,
+                            bytes = buf.len(),
+                            total_ms = total.as_secs_f64() * 1e3,
+                            queue_ms = batch_started
+                                .saturating_duration_since(oldest_queued)
+                                .as_secs_f64()
+                                * 1e3,
+                            write_ms = fsync_started.saturating_duration_since(framed).as_secs_f64()
+                                * 1e3,
+                            fsync_ms = fsynced.saturating_duration_since(fsync_started).as_secs_f64()
+                                * 1e3,
+                            insert_ms = insert.as_secs_f64() * 1e3,
+                            "journal batch slow"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "journal write failed, truncating partial record");
-                    for (_, _, _, _, _, done) in batch.drain(..) {
+                    for (_, _, _, _, _, _, done) in batch.drain(..) {
                         let _ = done.send(Err(IoError::new(e.kind(), e.to_string())));
                     }
                     let recovered = async {
@@ -394,6 +461,7 @@ async fn writer_loop(
         }
 
         if let Some(done) = pending_checkpoint {
+            let checkpoint_started = Instant::now();
             if let Err(e) = file.sync_all().await {
                 let _ = done.send(Err(IoError::new(e.kind(), e.to_string())));
                 return Err(e);
@@ -401,6 +469,7 @@ async fn writer_loop(
             let offset = good_len;
             let snapshot = memtable.begin_flush();
             let trace_snapshot = trace_memtable.begin_flush();
+            metrics.checkpoint.observe(checkpoint_started.elapsed());
             let _ = done.send(Ok(CheckpointSnapshot {
                 offset,
                 snapshot,

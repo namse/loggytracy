@@ -1064,7 +1064,15 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         "push_response_p95_ms": target_row(
             push_response_p95,
             cfg.targets.push_response_p95_ms,
-            "from the intended send; the service percentiles are beside it in push_latency_ms",
+            &format!(
+                "from the intended send, over {} ingest connections; the service percentiles are \
+    beside it in push_latency_ms. The connection count is part of this target's definition rather than \
+    a property of the rig: measured on one unchanged server at one unchanged offered rate, service p95 \
+    was 40.3 ms over 8 connections and 106.5 ms over 32 while response p95 went 266.4 to 166.8 \
+    (todo.md, 2026-08-12). Neither number is the server alone; response is at least the one a client \
+    experiences, and it moves the honest way when the server gets slower",
+                cfg.ingest_connections
+            ),
         ),
         "push_response_p99_ms": target_row(
             push_response_p99,

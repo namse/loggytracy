@@ -3,7 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use prost014::Message as Prost014Message;
 use tokio::fs::OpenOptions;
@@ -14,6 +14,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use crate::config::Config;
 use crate::memtable::{Labels, LogEntry, MemTable, MemTableSnapshot};
+use crate::metrics::LatencyHistogram;
 use crate::tenant::TenantId;
 use crate::trace::{ExportTraceServiceRequest, TraceMemTable, TraceSpan, normalize_request};
 
@@ -169,6 +170,12 @@ enum JournalCmd {
         tenant: TenantId,
         streams: Vec<(Labels, Vec<LogEntry>)>,
         traces: Vec<TraceSpan>,
+        /// When the pushing task handed this to the channel. Every push in the
+        /// process funnels through one writer task, so the interval between
+        /// this and the batch that carries it is the queue in front of that
+        /// task — the term nothing measured while the push tail was being
+        /// argued about from the client's side (`todo.md`, 2026-08-12).
+        queued_at: Instant,
         done: oneshot::Sender<Result<(), IoError>>,
     },
     Checkpoint {
@@ -186,14 +193,61 @@ type AppendBatchItem = (
     TenantId,
     Vec<(Labels, Vec<LogEntry>)>,
     Vec<TraceSpan>,
+    Instant,
     oneshot::Sender<Result<(), IoError>>,
 );
+
+/// Where a push's time goes between the handler and its acknowledgement.
+///
+/// The whole of it is spent in one place: a single writer task that frames a
+/// batch, writes it, `sync_all`s once for the batch, and inserts the batch's
+/// entries into the memtable before answering any of it. A 12 ms median against
+/// a 40–106 ms p95 at 200 pushes/s is what a queue in front of one server looks
+/// like, and until these existed the process published no number that could tell
+/// the queue from the service — the flush log line carries no duration, and the
+/// append path carried no timing at all. The client-side percentiles could not
+/// settle it either: they move with the connection count in both directions
+/// (`todo.md`, "the connection count moved the queue instead of removing it").
+///
+/// Four histograms because there are four things a push can be waiting for, and
+/// naming which one it was is the entire point. The counters beside them give
+/// the batch size, which is what decides how many pushes share each `sync_all`.
+#[derive(Default)]
+pub struct JournalMetrics {
+    /// Channel time: handed to the writer, not yet part of a batch being
+    /// written. This is the queue itself.
+    pub append_queue_wait: LatencyHistogram,
+    /// `write_all` + `flush` for one batch.
+    pub batch_write: LatencyHistogram,
+    /// `sync_all` for one batch — the durability cost every push in the batch
+    /// shares, and the reason batching exists.
+    pub batch_fsync: LatencyHistogram,
+    /// Memtable and trace-memtable inserts for one batch, which happen in the
+    /// writer task after the fsync and before any of its pushes are answered,
+    /// and which take a lock the flush also wants.
+    pub batch_insert: LatencyHistogram,
+    /// A checkpoint runs in the same task, so its duration is time no push can
+    /// be written in. Flush asks for one about once a second.
+    pub checkpoint: LatencyHistogram,
+    pub batches: AtomicU64,
+    pub batched_records: AtomicU64,
+}
+
+/// A batch slower than this gets a line naming which phase it was.
+///
+/// Aggregates answer "where does the median go"; a p99 of 128 ms beside a max
+/// of 4.7 s is a question about individual events, and a histogram cannot say
+/// which phase any one of them was in. At the soak's 200 pushes/s a threshold
+/// this far above the median costs a line only when there is something to look
+/// at.
+const SLOW_BATCH: Duration = Duration::from_millis(250);
 
 pub struct Journal {
     tx: mpsc::Sender<JournalCmd>,
     wal_path: PathBuf,
     ckpt_path: PathBuf,
     healthy: Arc<AtomicBool>,
+    metrics: Arc<JournalMetrics>,
     memtable: Arc<MemTable>,
     trace_memtable: Arc<TraceMemTable>,
     backlog: Arc<WalBacklog>,

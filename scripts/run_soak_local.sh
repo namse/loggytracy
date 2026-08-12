@@ -225,6 +225,13 @@ LOGGYTRACY_LOAD_RESULT_PATH="$OUT/load.json" \
   "$ROOT/target/release/load" >"$OUT/harness.log" 2>&1
 HARNESS_STATUS=$?
 
+# Scraped while the server is still up, which is the only time it can be. The
+# journal writer's phase histograms are cumulative over the run, so one scrape
+# at the end is the whole distribution — and it is the only thing that says
+# which phase a slow push was in. mem.csv cannot carry them: they are buckets,
+# not a gauge.
+curl -fsS --max-time 5 "http://127.0.0.1:$PORT/metrics" >"$OUT/metrics-final.txt" 2>/dev/null || true
+
 kill "$WATCH_PID" 2>/dev/null; WATCH_PID=
 kill "$PROF_PID" 2>/dev/null; PROF_PID=
 sleep 2
@@ -314,5 +321,46 @@ GUARD=ok
              (iof[n]-iof[1])/1e6, 100.0*(iof[n]-iof[1])/1e6/d, \
              (cps[n]-cps[1])/1e6, 100.0*(cps[n]-cps[1])/1e6/d, stl[n]-stl[1], rf[n]-rf[1]
     }' "$OUT/mem.csv"
+  # Where an accepted push's server-side time went. Every push in the process
+  # is written by one task, so queue/write/fsync/insert are the whole of it.
+  # The percentiles are bucket bounds, not interpolations: the histogram is
+  # cumulative in `le`, so what this can honestly say is "p95 is at or below
+  # this bound", and saying more would be inventing resolution the buckets do
+  # not have.
+  awk '
+    /^loggytracy_journal_.*_bucket\{le="/ {
+      split($1, a, "_bucket"); name = a[1]
+      split($1, b, "\""); bound = b[2]
+      if (bound == "+Inf") next
+      if (!(name in seen)) { seen[name] = ++order; oname[order] = name }
+      k = name SUBSEP (bound + 0); cum[k] = $2 + 0
+      bounds[name SUBSEP (++nb[name])] = bound + 0
+    }
+    /^loggytracy_journal_.*_count / { split($1, a, "_count"); total[a[1]] = $2 + 0 }
+    /^loggytracy_journal_.*_sum / { split($1, a, "_sum"); sum[a[1]] = $2 + 0 }
+    /^loggytracy_journal_batches_total /{ batches = $2 + 0 }
+    /^loggytracy_journal_batched_records_total /{ records = $2 + 0 }
+    END {
+      if (!order) exit
+      printf "push phases (one writer task; ms, bucketed upper bounds):\n"
+      printf "  %-26s %10s %8s %8s %8s\n", "phase", "n", "mean", "p50<=", "p95<="
+      for (o = 1; o <= order; o++) {
+        name = oname[o]; n = total[name]; if (!n) continue
+        p50 = ""; p95 = ""
+        for (i = 1; i <= nb[name]; i++) {
+          bd = bounds[name SUBSEP i]; c = cum[name SUBSEP bd]
+          if (p50 == "" && c >= 0.50 * n) p50 = bd
+          if (p95 == "" && c >= 0.95 * n) p95 = bd
+        }
+        short = name; sub(/^loggytracy_journal_/, "", short); sub(/_ms$/, "", short)
+        printf "  %-26s %10d %8.2f %8s %8s\n", short, n, sum[name] / n, \
+               (p50 == "" ? ">30000" : p50), (p95 == "" ? ">30000" : p95)
+      }
+      if (batches) printf "  batches=%d records=%d records/batch=%.2f\n", \
+                          batches, records, records / batches
+    }' "$OUT/metrics-final.txt" 2>/dev/null
+  echo "slow batches (>=250 ms), longest first:"
+  sed 's/\x1b\[[0-9;]*m//g' "$SERVER_LOG" | grep "journal batch slow" \
+    | sed 's/.*records=/records=/' | sort -t= -k4 -rn | head -5
   echo "server_log_tail:"; sed 's/\x1b\[[0-9;]*m//g' "$SERVER_LOG" | tail -3
 } | tee "$OUT/verdict.txt"
