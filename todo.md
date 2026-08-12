@@ -971,7 +971,7 @@ The polish order, each item a measurement or a bound, none a feature:
   include the HTTP round trip, the LogQL parse and `data.stats`. Both are plausible and neither is
   measured. Worth an hour only if a real deployment reports it — the engine's scaling curve is the
   question this item existed to answer, and that one is answered.
-- [ ] **Loki's `__stream_shard__` needs an exemption decision, or there are no Loki ratios above
+- [x] **Loki's `__stream_shard__` needs an exemption decision, or there are no Loki ratios above
   150k rows.** 32 of 168 answers disagreed at 1.5 M rows, every one of them for the same reason: Loki
   attaches `stream:__stream_shard__` once a stream is large enough to shard, with identical row counts
   on both sides and no label missing on the loggytracy side. It is engine-internal, the same class as
@@ -979,6 +979,49 @@ The polish order, each item a measurement or a bound, none a feature:
   the run — which is the gate working. Declaring it by name, with counts, in
   `src/bin/load/matrix.rs`'s digest is the small change; deciding to is the judgement, and it should
   be made deliberately rather than to make a table look complete.
+
+  **Declared by name, and the run that followed reads 168 of 168** (2026-08-12, the bed re-run at
+  `COMPARE_VERIFY_ROWS=1500000`). The reasoning, recorded where the constant is: Loki derives the
+  label from its own sharding decision, this bed never pushes one, the row counts were already
+  identical on both sides and no other label differed — which is `detected_level`'s class exactly.
+  The exemption is reported with its count like the other two: `stream:__stream_shard__` on **58**
+  answers, `stream:detected_level` on 144.
+
+  Three guards against this being a table-completing exemption rather than a decision. It is by
+  **name**, not by prefix — pinned by a test that `__error_details__` and a lookalike
+  `__stream_shard` are still digested, so whatever Loki adds next is not swept in without anyone
+  deciding. The document states **what the drop could hide**: the label is part of a stream's
+  identity, so it would also hide a difference in an *unaggregated* metric answer's series set —
+  which is why the matrix asks for `sum(rate(...))`, and why row counts, the labels only one side
+  had, and answer order all stay in force beside the drop. And the alternative was rejected on the
+  bed's own rule rather than on taste: turning Loki's stream sharding off in `compare/loki-config.yaml`
+  would have made the difference not happen, but that file's rule is that tuning choices stay at
+  Loki's default, and sharding is Loki's tuning.
+
+  **What the withheld column turned out to be hiding: nothing bad, and that is worth saying.** With
+  the agreement gate satisfied, the Loki ratios print for all seven shapes and loggytracy wins every
+  one of them at 1.5 M rows — 0.00x–0.26x, `label_only` 0.12x, `line_filter` 0.26x, `json_field`
+  0.21x — and the claim's own shape reads **1470x faster than Loki** cold. The two shapes that lose
+  to VictoriaLogs still lose; withholding was never protecting a bad number, it was the gate refusing
+  to price answers it had not checked, which is what it is for.
+
+  The run also **reproduces the previous one** on the axis that matters, independently seeded from
+  the same seed but built five commits later: `metadata_rare` against VictoriaLogs 15.71x cold /
+  15.61x warm against the earlier 15.4x / 17.8x, `line_filter` 1.25x against 1.27x, `json_field`
+  1.20x against 1.33x, `rate` 3.59x against 3.66x. The scanned shapes' losses are not run-to-run
+  noise.
+- [ ] **A second corpus needed a second artifact directory, and for a day it did not have one.**
+  Found while setting the re-run up, not by looking for it. `compare/run.sh` copies its JSON to
+  `docs/artifacts/m9` by default and the generated document hardcoded that same path in its prose —
+  so the ten-times run of 2026-08-12 wrote its artifacts over the 150 k run's, and
+  `docs/COMPARISON.md`, which says on its own first line that it was generated on 2026-08-06 from
+  revision `9a5ad8e`, was citing a directory whose `bed.json` said `238e34e` and 2026-08-12. That is
+  the exact failure the header warns about — "one cited artifact did not exist and another disagreed
+  with the document citing it on both build revision and verdict" — reintroduced by the document
+  naming its own artifacts as a constant. The 150 k artifacts are restored from `3363d61^`, the link
+  is now passed in by the script that does the copying (`COMPARE_ARTIFACTS_REL`), and the ten-times
+  run has `docs/artifacts/m9-10x`. Left open only as a reminder that the copy-and-cite path has no
+  test: nothing fails if a document cites a directory that was written by a different run.
 4. **The review gate list** — worked through on 2026-08-12, in three passes with a finding in each.
 
    **The gates, audited item by item against the code.** The list had drifted *both* ways. Done and
