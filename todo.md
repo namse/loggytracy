@@ -979,10 +979,51 @@ The polish order, each item a measurement or a bound, none a feature:
   the run — which is the gate working. Declaring it by name, with counts, in
   `src/bin/load/matrix.rs`'s digest is the small change; deciding to is the judgement, and it should
   be made deliberately rather than to make a table look complete.
-4. **The review gate list** — docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md worked through;
-   CONFIGURATION/ARCHITECTURE re-checked against behavior (the cache, the narrow memo, StreamKey
-   and the fence are all newer than the docs); refusal-path messages (429s, limit errors)
-   consistent.
+4. **The review gate list** — worked through on 2026-08-12, in three passes with a finding in each.
+
+   **The gates, audited item by item against the code.** The list had drifted *both* ways. Done and
+   still marked open: per-tenant throttles and quotas (`tenant_quota.rs`, `default_tenant_max_streams`,
+   applied on both transports), the default bind to the trust boundary (loopback, with a startup line
+   naming the widening variable), startup retry for transient object-store failures
+   (`with_object_store_retry`), the non-stdin abort path (`SIGUSR1`), and N3's fragmentation
+   measurement, which exists as an asserting test. Ticked and since deliberately undone: **N5's part
+   format version field**, removed in `f0da5bd` — left in the list as a visible withdrawal, because a
+   gate met and then unmet on purpose is precisely what a later reader re-opens. Two reframed from
+   tasks into open *decisions*: tenant-labeled metrics would hand an unauthenticated endpoint the
+   tenant list and make cardinality a function of the customer count, and P2-7's histograms shipped
+   while its per-endpoint dimension did not. Every line now cites where to look.
+
+   **ARCHITECTURE.md against behavior.** Two statements were false rather than merely dated. It said
+   the differentiator "has never been measured against Loki" — there are two generated comparison
+   documents with a row-equality gate. And it said "with any pipeline stage the scan limit becomes
+   `usize::MAX`, which is invariant III's worst violation": the log path passes the request's own
+   `limit` now, beside a scan-row budget, a byte ceiling and a memory reservation. The one remaining
+   `usize::MAX` is the metric path, which has no `limit` to stop at because every matching row
+   contributes to a sample, and is bounded by `max_query_scan_rows`/`max_metric_rows` instead — a
+   different thing wearing the same constant. Added what was younger than the document: sidecar
+   eviction in halves, the row-group and narrow-pass caches with their budgets, the row group as the
+   decode unit with the 3.75x measurement and its 65 536-row ceiling, the `writer_epoch` fence, and
+   the two lifecycle locks with the order this week's stall taught them.
+
+   **The refusal paths, and one of them was losing data by design.** Consistent where it counts —
+   every 429 carries `Retry-After`, and limit messages all name what was exceeded and its number. But
+   `ingest_error_to_status` mapped both `429` and `413` to gRPC `RESOURCE_EXHAUSTED`, and the OTLP
+   specification's retry table makes those opposite instructions. A limit violation is permanent for
+   that batch, so it is `INVALID_ARGUMENT` now — the code the specification recommends for
+   non-retryable, which tells a collector to split or drop rather than loop on identical bytes. Two
+   tests moved with it.
+- [ ] **The other half of that finding: gRPC backpressure does not say "come back", it says "give
+      up".** The specification is explicit — a client "SHOULD interpret `RESOURCE_EXHAUSTED` as
+      retryable only if the server signals that recovery is possible", signalled by attaching
+      `RetryInfo`; without it, non-retryable, and a client "SHOULD drop the telemetry data". This
+      server attaches nothing. So on HTTP a throttled push is told `Retry-After: 1` and holds its
+      data, while the identical refusal over gRPC may be dropped — against the architecture's own
+      premise that a client can only hold data back if the server declines it. Fixing it means
+      attaching `RetryInfo` with `backpressure_retry_after`, which needs either the `tonic-types`
+      crate or ~20 lines defining `google.rpc.Status`/`Any`/`RetryInfo` against the `prost` already
+      in the tree — **a dependency question to put to the user, not a call to make quietly.** Until
+      then the two transports do not carry the same instruction, and that is written into
+      `ingest_error_to_status`'s doc where the next reader of that mapping will find it.
 
 ### The soak rig is built, and its first four minutes contradicted the gates (2026-08-08)
 

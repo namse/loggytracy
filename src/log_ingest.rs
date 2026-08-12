@@ -216,13 +216,34 @@ impl OtlpLogIngest<'_> {
 ///
 /// OTLP exporters read the code, not the message, so this mapping is what
 /// decides whether a collector retries or drops the batch.
+///
+/// The two refusals that share a status code over HTTP's cousin do **not** share
+/// one here, because the OTLP specification's retry table is what a collector
+/// acts on and they want opposite actions:
+///
+/// * A **limit violation** — a body over `MAX_OTLP_REQUEST_BYTES`, more spans
+///   than `MAX_OTLP_SPANS` — is permanent for that batch. Retrying it produces
+///   the identical refusal forever. The specification names `INVALID_ARGUMENT`
+///   for exactly this ("to indicate non-retryable errors, the server is
+///   recommended to use code InvalidArgument"), and a client MUST NOT retry it,
+///   so the collector splits or drops the batch instead of looping on it.
+/// * **Backpressure** — the memtable or WAL backlog over its threshold, a
+///   tenant over its rate, too many bodies in flight — is temporary by
+///   construction, and `RESOURCE_EXHAUSTED` is where it belongs.
+///
+/// One gap is open and recorded rather than papered over (`todo.md`, the review
+/// gate list): the specification treats `RESOURCE_EXHAUSTED` as retryable *only*
+/// when the response carries `RetryInfo`, and this server does not attach it, so
+/// a strict collector may drop a batch this server meant to have held. The HTTP
+/// transport says it correctly with `Retry-After`; the two are not yet saying the
+/// same thing.
 pub fn ingest_error_to_status(error: IngestError) -> Status {
     match error.status {
         StatusCode::SERVICE_UNAVAILABLE => Status::unavailable(error.message),
-        StatusCode::TOO_MANY_REQUESTS | StatusCode::PAYLOAD_TOO_LARGE => {
-            Status::resource_exhausted(error.message)
+        StatusCode::TOO_MANY_REQUESTS => Status::resource_exhausted(error.message),
+        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_REQUEST => {
+            Status::invalid_argument(error.message)
         }
-        StatusCode::BAD_REQUEST => Status::invalid_argument(error.message),
         StatusCode::FORBIDDEN => Status::permission_denied(error.message),
         _ => Status::internal(error.message),
     }

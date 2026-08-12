@@ -412,7 +412,10 @@ mod tests {
 
         let status = service.export(tenant_request(oversized)).await.unwrap_err();
 
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        // Non-retryable, and that is the point: this batch is over the ceiling
+        // permanently, so the OTLP retry table has to tell the collector to split
+        // or drop it rather than send the identical bytes again.
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(trace_memtable.is_empty());
     }
 
@@ -448,7 +451,9 @@ mod tests {
 
         let status = service.export(tenant_request(too_many)).await.unwrap_err();
 
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        // Same class as the oversized body: a span count over the cap cannot
+        // become acceptable by being retried.
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(trace_memtable.is_empty());
     }
 

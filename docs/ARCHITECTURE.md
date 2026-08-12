@@ -35,6 +35,8 @@ elsewhere in these docs.
 - **Recovery**: On startup, replay only `[checkpoint..replay_end]` from the WAL into the memtable and truncate a corrupt or partial tail at `replay_end`. Do not advance checkpoint during recovery — in-flight data exists only in the memtable, so checkpoint stays unchanged until the next flush's `checkpoint()` records the correct offset. Thus, in-flight data survives repeated "restart -> restart" cycles.
 - **At-least-once (flush boundary)**: If the process crashes after flush completes part disk writes but before `set_checkpoint`, the part and the next replay can both contain the same data. This is an intentional durability-over-correctness trade-off; duplicates can appear in query results and deduplication is deferred to a later milestone.
 - **Flush visibility boundary**: Queries hold the part/memtable operation read lock for the full scan, while flush performs part registration and flushing-buffer commit under the same operation write lock. A metric or log query overlapping a normal flush therefore does not count the same row in both memtable and part. At-least-once recovery duplicates remain possible when flush stops after part commit but before checkpoint, and durable deduplication is deferred to a later milestone.
+- **Single writer, enforced rather than assumed**: the manifest carries a `writer_epoch`. A starting writer takes the next one, and every subsequent manifest CAS re-checks the epoch it loaded (`object_storage/object_io.rs`, `check_epoch`), so a previous instance that is still running — the split-brain a "single writer" deployment note cannot prevent on its own — fails its next write instead of interleaving with the new one, and stops rather than retrying forever.
+- **Two lifecycle locks, and their order is load-bearing**: the *operation* lock is visibility — a query holds its read half for a whole scan, and flush, merge commit and part retirement take its write half. The *deletion* lock guards part files against removal, and nothing else: a merge rewrite holds its read half for as long as its group takes, because the rewrite needs its inputs to exist but does not care what is visible. **Deleters take both, deletion first.** Retention and cache eviction took the operation lock first until 2026-08-11, which meant a deleter's wait for a merge rewrite was served holding the lock every query needs: all 39 freezes across four one-hour soaks began on a retention tick, the longest 52 s, one of them to delete a single part. Deletion-then-operation is also merge's own order, so no cycle remains (`retention.rs`, `part_registry.rs`'s `deletion_lock` doc, and `a_retention_pass_waiting_for_a_merge_does_not_stop_queries`).
 - **Merge replacement invariant**: A merge tombstone is recorded before the new part directory is renamed from `.tmp` to its final location. Restart recovery deletes old parts only after successfully opening the new part; if validation fails, old parts are retained.
 - **Merge tombstone chain recovery**: On restart, collect all tombstone relationships first, follow them transitively through earlier generations, and then clean up old parts. Thus, even when merges across generations overlap after a failed deletion, deleting an intermediate tombstone cannot resurrect an earlier-generation part.
 - **WAL compaction**: With object storage enabled, the writer task removes the WAL range before checkpoint after part upload and manifest CAS succeed. Checkpoint is reset to 0 before replacement, so a crash during compaction replays either the entire old WAL or the new suffix; duplicates are possible but data is not lost. Local-only mode preserves the existing offset checkpoint.
@@ -183,6 +185,36 @@ A part is one immutable directory:
 
 Bloom filters are only for pruning; the final decision always comes from scanning blocks, so the scan guarantees correctness.
 
+### What a part keeps in memory, and what it re-reads
+
+Every structure above is durable in the part directory, which is what lets the
+resident half of it be a *cache* rather than a commitment. Three mechanisms
+younger than the rest of this document:
+
+- **Sidecars are evictable, in halves.** The bloom half — the megabytes — lives
+  under one process-wide LRU byte budget (`sidecar_cache_max_bytes`, 10% of the
+  declared budget) and is re-read from `index.bin` on the next pruning query. The
+  stream index — the kilobytes — stays resident, so the metadata paths that
+  cannot fail stay infallible, and a matchers-only query never touches a bloom at
+  all. Answer equality under eviction is pinned by a test that forces every open
+  to evict every other part. Before this the sidecars grew with the part count
+  and nothing evicted them, which is what ended the first day-long soak at
+  630 MiB of sidecar in a 2 GiB container.
+- **Decoded row groups are cached, and so are narrow-pass outcomes.**
+  `part/group_cache.rs` keeps decoded groups for reuse across scans under
+  `row_group_cache_max_bytes` (12.5% of the budget), keyed so that a selection is
+  served by slicing what is already decoded. Beside it, the narrow pass — the
+  per-row evaluation for rows a group-level filter could not exclude — memoizes
+  its outcome per (immutable part, group, predicate), so a repeated rare query
+  pays it mostly on groups holding nothing. Both are bounded and both are
+  droppable: the cost of a miss is a re-read, never a wrong answer.
+- **Row groups are decode units, and that sets their size.** A group must be
+  decoded to read any of it, so larger groups mean more wasted decode per match:
+  measured at 1.5 M rows and a 100-row answer, 8× larger groups cost **3.75×**
+  the time (`benches/scan_scaling.rs`). The 8192-row default is on the right side
+  of that curve, and the ceiling is 65 536 rows regardless — a group's bloom
+  windows are 1024 rows each and the selection mask is a `u64`.
+
 ## Read path
 
 LogQL parsing (chumsky) → plan → pruning in this order:
@@ -194,13 +226,20 @@ LogQL parsing (chumsky) → plan → pruning in this order:
 
 - This engine's differentiator is accelerating Loki's slow `| json | field="x"` pattern by push-down
   bloom pruning when the field was columnized at ingest. Push-down is part of the planner design from the start.
-  **This is built and has never been measured against Loki.** The claim and what would falsify it are stated in
-  [`VISION.md`](VISION.md).
+  **Measured against Loki and VictoriaLogs since**, on an equal container limit and the same corpus:
+  [`COMPARISON.md`](COMPARISON.md) at 150 k rows and
+  [`COMPARISON_LARGE_CORPUS.md`](COMPARISON_LARGE_CORPUS.md) at 1.5 M, both generated by `compare/run.sh`
+  with a row-equality gate that withholds any timing whose answers disagreed. The claim and what would
+  falsify it are stated in [`VISION.md`](VISION.md), which also scopes what the ten-times run changed.
 - DataFusion was considered as the execution engine and is **rejected** — see "Decided choices" above.
   Execution is a merge of per-part sorted iterators feeding a bounded top-K heap, so that a query's memory
-  is `limit` rows plus the heap rather than everything the window matched. Today it is neither: with any
-  pipeline stage the scan limit becomes `usize::MAX` (`query/execution.rs:102`), which is
-  [`VISION.md`](VISION.md) invariant III's worst violation.
+  is `limit` rows plus the heap rather than everything the window matched. **It is that now**: the log path
+  passes the request's own `limit` into the scan alongside a scan-row budget, a scanned-byte ceiling and a
+  memory reservation (`query/execution.rs`, `LogScan::new(..., limit, ...)`) — the `usize::MAX` this
+  document used to name as invariant III's worst violation is gone from it. One `usize::MAX` remains and is
+  a different thing: a metric query has no `limit` to stop at, since every matching row in the window
+  contributes to a sample, so that path is bounded by `max_query_scan_rows`, `max_query_scan_bytes` and
+  `max_metric_rows` instead of by a row count the client chose.
 
 ## S3 and manifest
 
