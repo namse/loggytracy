@@ -1,6 +1,6 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-5550377d5fb578e129fd4a9f66c70251401a48f2e293974cb13aa1ce4e49f4bf.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-480c1e169b67f11803bb51f7d6514102c527ab0b8fe17889a1efda2140a8d640.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
@@ -33,7 +33,7 @@
     "query_window_seconds": 60,
     "request_timeout_seconds": 60,
     "restore_lookback_seconds": 60,
-    "result_path": "/home/namse/loggytracy/target/compare/seed_victorialogs.json",
+    "result_path": "/home/namse/loggytracy/target/compare-10x/seed_victorialogs.json",
     "sample_interval_ms": 1000,
     "seed": 1592598566,
     "server_pid": null,
@@ -55,13 +55,13 @@
     "tenants": 4,
     "tier": "B",
     "verify": {
-      "anchor_ns": 1786028290000000000,
+      "anchor_ns": 1786515070000000000,
       "entries_per_push": 100,
       "labels_per_stream": 6,
       "limit": 20000,
       "push_connections": 4,
       "repeats": 5,
-      "rows": 150000,
+      "rows": 1500000,
       "step_ns": 1000000,
       "step_seconds": 10,
       "streams": 32,
@@ -71,42 +71,42 @@
     "warmup_seconds": 10
   },
   "memory": {
-    "anon_bytes_end": 565866496,
-    "anon_peak_bytes": 531320832,
-    "current_bytes": 682536960,
+    "anon_bytes_end": 698769408,
+    "anon_peak_bytes": 698740736,
+    "current_bytes": 941699072,
     "error": null,
-    "file_bytes_end": 36048896,
-    "peak_bytes": 682962944,
-    "peak_bytes_before": 557801472,
-    "source": "/sys/fs/cgroup/system.slice/docker-5550377d5fb578e129fd4a9f66c70251401a48f2e293974cb13aa1ce4e49f4bf.scope/memory.peak"
+    "file_bytes_end": 188903424,
+    "peak_bytes": 942387200,
+    "peak_bytes_before": 532074496,
+    "source": "/sys/fs/cgroup/system.slice/docker-480c1e169b67f11803bb51f7d6514102c527ab0b8fe17889a1efda2140a8d640.scope/memory.peak"
   },
   "phase": "seed",
   "run": {
-    "build_revision": "9a5ad8e",
+    "build_revision": "238e34e",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "seed": 1592598566
   },
   "seed": {
     "complete": true,
-    "elapsed_seconds": 0.230799973,
+    "elapsed_seconds": 3.379346994,
     "errors": 0,
     "first_error": null,
-    "line_bytes": 49029829,
-    "pushes": 1504,
+    "line_bytes": 490471555,
+    "pushes": 15008,
     "retries": 0,
-    "rows": 150000,
+    "rows": 1500000,
     "statuses": {
-      "200": 1504
+      "200": 15008
     },
-    "wire_bytes": 63003360
+    "wire_bytes": 630196444
   },
   "target": "victorialogs",
   "verdict": "PASS",
   "verify": {
-    "anchor_ns": 1786028290000000000,
-    "line_bytes": 49029829,
-    "rows": 150000,
-    "span_ns": 150000000000,
+    "anchor_ns": 1786515070000000000,
+    "line_bytes": 490471555,
+    "rows": 1500000,
+    "span_ns": 1500000000000,
     "streams": 32,
     "tenant": "verify-tenant-000"
   }

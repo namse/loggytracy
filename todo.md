@@ -841,11 +841,14 @@ retention item at M10's "honest metering" is untouched by any of this.
 ## Next: production polish, not more speed (decided 2026-08-07)
 
 The performance arc is frozen where it stands: every log shape under VictoriaLogs on both passes,
-`rate` at the 0.03 ms jitter floor, everything gated and recorded below. The user's direction after
-the sweep: wrap toward production readiness rather than extend the bench. The reasoning, recorded so
-the next session does not relitigate it: the claim is proven and sealed; further hot-path caching
-widens the answer-risk surface for diminishing returns (the advisory serve lived one day); and the
-next real bottleneck will come from running long, not from benching bigger. The one measured
+`rate` at the 0.03 ms jitter floor, everything gated and recorded below — all of it **at the bed's
+150 k-row dataset**, which the ten-times run of 2026-08-12 scoped rather than extended (item 3
+below: the claim's own shape widens to 15.4x/17.8x, three scanned shapes lose). The user's direction
+after the sweep: wrap toward production readiness rather than extend the bench. The reasoning,
+recorded so the next session does not relitigate it: the claim is proven and sealed; further hot-path
+caching widens the answer-risk surface for diminishing returns (the advisory serve lived one day);
+and the next real bottleneck will come from running long, not from benching bigger — which the
+retention lock-order stall then proved on 2026-08-11, found by running long and not by benching big. The one measured
 rejection standing guard: **do not build the memory-budget arena derivation** — deriving knob
 defaults from a memory limit was tried and made the engine worse (config.rs `HostMemory` doc,
 docs/MEMORY_BUDGET_GATE.md), and it stays out until a budget-point measurement campaign says
@@ -896,6 +899,54 @@ The polish order, each item a measurement or a bound, none a feature:
 3. **One large-corpus bed run** — 10-100x the 150k-row dataset, as claim-scope validation rather
    than tuning: does the 1.4 ms-constant race hold when parts multiply and the cache's working set
    overflows 256 MiB? Published win or lose, per house rule.
+
+   **Done at 10x, and it answers the question with a yes and a no** (`COMPARE_VERIFY_ROWS=1500000`,
+   published as [`docs/COMPARISON_LARGE_CORPUS.md`](docs/COMPARISON_LARGE_CORPUS.md), 2026-08-12,
+   load verdict gate PASS, nothing OOM-killed). The read path's two halves scale in opposite
+   directions, and the split is exactly along the mechanism:
+
+   | shape | lt p50, 150k → 1.5M | lt/VL, 150k → 1.5M |
+   |---|---|---|
+   | `metadata_rare` (the claim) | 0.23 → 0.39 ms | 0.19x → **0.06x** |
+   | `json_field_rare` | 0.25 → 0.44 ms | 0.00x → 0.00x |
+   | `trace_window` | 0.24 → 0.66 ms | 0.22x → 0.35x |
+   | `label_only` | 26.3 → 67.3 ms (warm 15.9 → 69.4) | 0.88x → 0.53x |
+   | `line_filter` | 3.52 → **53.4 ms** | 0.47x → **1.27x** |
+   | `json_field` | 11.5 → **103 ms** | 0.91x → **1.33x** |
+   | `sum(rate(...))` | 0.46 → 4.57 ms | 1.09x → **3.66x** |
+
+   **The claim's own shape got stronger**: 15.4x cold and 17.8x faster warm than VictoriaLogs at
+   1.5 M rows, against ~5x at 150 k. Ten times the rows do not make a bloom read ten times as much;
+   they do make a column scan. The constant-time race the item asked about holds, and widens.
+
+   **The sweep does not.** Three shapes now lose to VictoriaLogs. So "every log shape under
+   VictoriaLogs on both passes" — the sentence the 2026-08-07 freeze was declared on — is true of the
+   150 k dataset and not of this one; VISION now scopes it rather than leaving it standing, and the
+   150 k table stays published beside the new one rather than being replaced. `label_only` shows the
+   cause of the scanned half in one number: its warm pass went 15.9 → 69.4 ms, level with its own
+   cold pass, which is the working set outgrowing the caches.
+
+   Memory and disk at this size, for the record: ingest peak 1234 MiB against Loki's 2048 (its limit)
+   and VictoriaLogs' 952; settled data 307 MiB/GB against 292 and 187; ingest 19,916 eps against
+   19,853 and 19,935.
+- [ ] **`line_filter` degraded super-linearly and that is a scaling question, not a tuning one.**
+  Ten times the data, **fifteen** times the time: 3.52 → 53.4 ms. A scan cost alone predicts ten.
+  The distinction that decides whether the 2026-08-07 freeze covers this: making a fast shape faster
+  is the optimization that is frozen, while an engine that grows worse than its input is a
+  production-readiness property — it is the shape of a curve a customer's growth walks along, and
+  the same reasoning that put the soak first puts this here. So: **diagnose, do not tune.** The
+  outcome is one of two records — a fixable inefficiency, or the cache overflow the `label_only`
+  warm collapse already hints at, in which case it is a design cost and gets written down as a limit
+  rather than chased. `json_field` (9x for 10x) and `rate` (10x for 10x) are within a scan cost and
+  are not part of this item.
+- [ ] **Loki's `__stream_shard__` needs an exemption decision, or there are no Loki ratios above
+  150k rows.** 32 of 168 answers disagreed at 1.5 M rows, every one of them for the same reason: Loki
+  attaches `stream:__stream_shard__` once a stream is large enough to shard, with identical row counts
+  on both sides and no label missing on the loggytracy side. It is engine-internal, the same class as
+  the already-declared `detected_level`, and the agreement gate withheld every Loki timing ratio in
+  the run — which is the gate working. Declaring it by name, with counts, in
+  `src/bin/load/matrix.rs`'s digest is the small change; deciding to is the judgement, and it should
+  be made deliberately rather than to make a table look complete.
 4. **The review gate list** — docs/PRODUCTION_READINESS_REVIEW_2026-07-26.md worked through;
    CONFIGURATION/ARCHITECTURE re-checked against behavior (the cache, the narrow memo, StreamKey
    and the fence are all newer than the docs); refusal-path messages (429s, limit errors)
