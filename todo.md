@@ -1383,6 +1383,39 @@ throttled rate 0.0, RSS peak 2.0 GiB against 4, WAL backlog peak 21.2 MiB agains
 2 GiB is now known to be *at least* 20 k eps and the upper bound is unmeasured. The honest way to
 publish a capacity is to offer more until something refuses; that run has not been done.
 
+### The one failing gate, decomposed before it is moved (2026-08-12)
+
+The temptation with a single 9.3%-over number is to re-aim the gate at it. What the run's own
+percentiles say first:
+
+| | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| push **response** (from the intended send) | 12.74 | **273.33** | 538.28 | 5346.3 |
+| push **service** (from the actual send) | 11.96 | **47.60** | 128.27 | 4690.6 |
+| the **queueing delay** between them | 0.90 | **233.32** | 498.27 | 5306.3 |
+
+So 233 of the 273 ms is a push waiting for its own connection, not for the server. And the harness
+arithmetic says that is not a rare-tail effect but the steady state: 20 k eps ÷ 100 entries =
+**200 pushes/s over 8 connections = 40 ms of budget per push**, against a service p50 of 12 ms and a
+service **p95 of 47.6 ms**. At p95 the server is already outside the per-connection budget, so a
+backlog forms in the ordinary case and every 4.7-second service event puts ~100 pushes behind it.
+
+Two questions, and the second is not answered by the first: **is the 233 ms a property of the rig's
+8 connections?** and **what is the server's own tail — p99 128 ms, max 4.7 s — made of?**
+
+**Pre-registered, before the runs, so the reading cannot follow the result:** the discriminator is
+the connection count at a fixed offered rate. If head-of-line waiting is the mechanism, then at 32
+connections the response p95 collapses toward the service p95 (~40–50 ms) while the service
+percentiles stay put. If instead the server is saturated at 20 k eps, more concurrency arrives at a
+server that cannot take it: service p95 *rises* and the response p95 does not come down much. The
+first outcome says the 273.3 ms measures the client's fan-out and the gate has to name it; the
+second says the number is real backpressure and re-gating on service would be hiding it.
+
+Both arms run at the current revision rather than against `lockorder-1h`: that hour predates the
+in-flight body bound (`3bde4d7`), which put a new counter on the HTTP push path, and comparing across
+it would confound the connection count with a code change. The 8-connection arm is therefore also
+the check that the middleware cost nothing.
+
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
 The user's bar for this round: "VL보다 빠르지 않으면 의미가 없습니다" — `metadata_rare` must beat
