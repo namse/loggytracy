@@ -929,16 +929,48 @@ The polish order, each item a measurement or a bound, none a feature:
    Memory and disk at this size, for the record: ingest peak 1234 MiB against Loki's 2048 (its limit)
    and VictoriaLogs' 952; settled data 307 MiB/GB against 292 and 187; ingest 19,916 eps against
    19,853 and 19,935.
-- [ ] **`line_filter` degraded super-linearly and that is a scaling question, not a tuning one.**
+- [x] **`line_filter` degraded super-linearly and that is a scaling question, not a tuning one.**
   Ten times the data, **fifteen** times the time: 3.52 → 53.4 ms. A scan cost alone predicts ten.
   The distinction that decides whether the 2026-08-07 freeze covers this: making a fast shape faster
   is the optimization that is frozen, while an engine that grows worse than its input is a
   production-readiness property — it is the shape of a curve a customer's growth walks along, and
-  the same reasoning that put the soak first puts this here. So: **diagnose, do not tune.** The
-  outcome is one of two records — a fixable inefficiency, or the cache overflow the `label_only`
-  warm collapse already hints at, in which case it is a design cost and gets written down as a limit
-  rather than chased. `json_field` (9x for 10x) and `rate` (10x for 10x) are within a scan cost and
-  are not part of this item.
+  the same reasoning that put the soak first puts this here. So: **diagnose, do not tune.**
+
+  **Diagnosed, and most of the fifteen was never a degradation** (`benches/scan_scaling.rs`,
+  2026-08-12). Three findings, in the order they killed each other's hypotheses.
+
+  1. **Ten of the fifteen is a ten-times-bigger answer.** At `limit 20000` the bound never reaches
+     the scan, so the query returns everything the window matches — and the window holds ten times
+     more: **10,208 → 102,351 rows returned**, ×10.0. Per returned row the cost went 8.28 → 12.52 µs,
+     ×1.5. So 15.2x = ×10.0 more answer × ×1.5 per row. Comparing those two numbers as if they were
+     the same query was the reading error, and the per-limit table had said so all along.
+  2. **The scan path's own scaling is sub-linear, and it is not the part count.** At `limit 100` the
+     answer is pinned at 100 rows and the bed still read 8.8x (1.55 → 13.6 ms) while scanning *less*
+     (426,064 → 288,295 lines). The obvious suspect was per-part or per-row-group overhead — and it
+     is neither: the bed held 1.5 M rows in **two** parts (`part_count` read live off the container),
+     each with the default ~8,050-row groups, so no layout inflation to blame. The new bench sweeps
+     the same change with everything else held: 150 k → 500 k → 1.5 M rows at a fixed row group size,
+     same 100-row answer, **4.82 → 9.36 → 9.40 ms** — ×1.95 for ten times the data, and *flat* from
+     500 k on. The engine does not grow worse than its input.
+  3. **Row group size is the real cost driver, and it runs the other way.** Same 1.5 M rows, same
+     100-row answer, groups made larger instead of more numerous: 184 groups **9.46 ms**, 46 groups
+     **26.5 ms**, 24 groups **35.5 ms** — 8× bigger groups is **3.75× slower**, because a group is
+     the unit that must be decoded to read any of it. Two things follow: the 8192 default sits on the
+     right side of that curve, and "use bigger row groups" was never much of a lever anyway — the
+     format caps a group at 65,536 rows, since its bloom windows are 1024 rows each and the selection
+     mask is a `u64` (`part/reader.rs`, "exceeds the 64-window limit").
+
+  So the item closes as a **documented design cost, not a defect**: what grows with the corpus is the
+  answer, and what the scan pays per unit of window flattens out. `json_field` (9x for 10x) and `rate`
+  (10x for 10x) were within a scan cost before this and are unaffected by it.
+- [ ] **The residue, named so it is not mistaken for the above being incomplete.** The bed's
+  `limit 100` ratio is 8.8x where the controlled sweep of the same change is 1.95x, and that gap is
+  not the scan algorithm — it is everything the bench holds still and the bed does not. The bed issues
+  24 *different* windows per shape against one process, so each query lands on different row groups
+  with no locality, while the bench repeats one query and criterion warms it; and the bed's numbers
+  include the HTTP round trip, the LogQL parse and `data.stats`. Both are plausible and neither is
+  measured. Worth an hour only if a real deployment reports it — the engine's scaling curve is the
+  question this item existed to answer, and that one is answered.
 - [ ] **Loki's `__stream_shard__` needs an exemption decision, or there are no Loki ratios above
   150k rows.** 32 of 168 answers disagreed at 1.5 M rows, every one of them for the same reason: Loki
   attaches `stream:__stream_shard__` once a stream is large enough to shard, with identical row counts

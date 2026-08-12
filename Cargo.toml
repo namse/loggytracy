@@ -85,3 +85,7 @@ harness = false
 [[bench]]
 name = "query"
 harness = false
+
+[[bench]]
+name = "scan_scaling"
+harness = false
