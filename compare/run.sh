@@ -401,16 +401,23 @@ cat >"$OUT/bed.json" <<JSON
 }
 JSON
 
+# The artifacts are checked in beside the document, and copied by the same run
+# that wrote the document, so the two cannot drift. The retired numbers this
+# repository is recovering from had one cited artifact that did not exist and
+# another that disagreed with the document citing it — and on 2026-08-12 it
+# happened again from the other direction: a second corpus wrote its JSON into
+# the directory the first corpus's document names. So the document is told
+# which directory it is citing rather than assuming, and a run with its own
+# COMPARE_ARTIFACTS says so on its own first page.
+ARTIFACTS="${COMPARE_ARTIFACTS:-$ROOT/docs/artifacts/m9}"
+mkdir -p "$ARTIFACTS"
+COMPARE_ARTIFACTS_REL="$(realpath --relative-to="$(dirname "$DOC")" "$ARTIFACTS")"
+export COMPARE_ARTIFACTS_REL
+
 say "generating $DOC"
 cargo build --manifest-path "$ROOT/Cargo.toml" --release --bin compare_report
 "$ROOT/target/release/compare_report" "$OUT" "$DOC"
 
-# The artifacts are checked in beside the document, and copied by the same run
-# that wrote the document, so the two cannot drift. The retired numbers this
-# repository is recovering from had one cited artifact that did not exist and
-# another that disagreed with the document citing it.
-ARTIFACTS="${COMPARE_ARTIFACTS:-$ROOT/docs/artifacts/m9}"
-mkdir -p "$ARTIFACTS"
 for name in bed.json loki_config.diff loggytracy_env.txt victorialogs_flags.txt; do
   cp "$OUT/$name" "$ARTIFACTS/$name" 2>/dev/null || true
 done

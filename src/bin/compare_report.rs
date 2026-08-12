@@ -181,8 +181,13 @@ fn main() {
     let agreements = compute_agreements(&matrix);
 
     let mut page = String::new();
+    // The link the document prints for its own artifacts, set by the script
+    // that copied them. Hardcoding it is what let two corpora share one
+    // directory and left a document citing a run it did not describe.
+    let artifacts =
+        std::env::var("COMPARE_ARTIFACTS_REL").unwrap_or_else(|_| "artifacts/m9".to_string());
     header(&mut page, &bed);
-    reproduction(&mut page, &bed);
+    reproduction(&mut page, &bed, &artifacts);
     what_was_compared(&mut page, &bed, dir);
     ingest_table(&mut page, &load);
     // Agreement is printed before any timing, and the timing tables refuse a
@@ -397,7 +402,7 @@ for a shape whose answers disagreed, because a fast wrong answer is not a win.
     ));
 }
 
-fn reproduction(page: &mut String, bed: &Value) {
+fn reproduction(page: &mut String, bed: &Value, artifacts: &str) {
     page.push_str(&format!(
         r#"## Reproducing this
 
@@ -406,9 +411,9 @@ compare/run.sh
 ```
 
 That builds the loggytracy image, brings all three systems up under
-`compare/docker-compose.yml` at `{}` per container, runs every phase, and
+`compare/docker-compose.yml` at `{memory_limit}` per container, runs every phase, and
 rewrites this file. It takes minutes rather than hours; the run this document
-was generated from settled for {} seconds between ingest and query.
+was generated from settled for {settle} seconds between ingest and query.
 
 There is deliberately no other way to run a three-way comparison. The first
 three-way numbers came from an ad-hoc shell loop that bypassed this script and
@@ -422,15 +427,21 @@ The knobs are defaults, not assignments — `COMPARE_MEMORY`,
 `COMPARE_SEED` — so a reader can vary one without editing the script.
 
 Every number below comes from the JSON in
-[`artifacts/m9/`](artifacts/m9/), which the same run copied out of
+[`{artifacts}/`]({artifacts}/), which the same run copied out of
 `target/compare/` — so the artifacts and the document cannot disagree about
 which run they describe. That is not a formality: of the numbers this
 repository retired, one cited artifact did not exist and another disagreed with
-the document citing it on both build revision and verdict.
+the document citing it on both build revision and verdict. It stopped being one
+again on 2026-08-12, which is why this line is now a variable and not a
+constant: the ten-times run wrote its JSON over the 150 k run's, into the
+directory both documents named, and for a day the 150 k document cited a
+different run's artifacts. A second corpus needs a second directory, and the
+document has to say which one it read.
 
 "#,
-        bed["memory_limit"].as_str().unwrap_or("?"),
-        num(&bed["settle_seconds"]),
+        artifacts = artifacts,
+        memory_limit = bed["memory_limit"].as_str().unwrap_or("?"),
+        settle = num(&bed["settle_seconds"]),
     ));
 }
 
