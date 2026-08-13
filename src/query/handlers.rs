@@ -811,6 +811,14 @@ fn journal_writer_metrics(state: &AppState) -> String {
             .render("loggytracy_journal_checkpoint_ms"),
     );
     out.push_str(&flush_phase_metrics(state));
+    out.push_str(
+        "# HELP loggytracy_query_memory_exhausted_total Queries refused because this instance's query memory pool had no room. Distinct from the tenant read quota, which says a tenant asked for more than it was sold, and from a scan-limit refusal, which says the query was too broad: this one says the instance ran out of room for work it was willing to do, and is the read side's counterpart to ingest_throttled.\n\
+# TYPE loggytracy_query_memory_exhausted_total counter\n",
+    );
+    out.push_str(&format!(
+        "loggytracy_query_memory_exhausted_total {}\n",
+        state.query_memory_pool.exhausted()
+    ));
     out
 }
 

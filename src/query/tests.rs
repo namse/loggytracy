@@ -3734,3 +3734,42 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         assert_eq!(data[0].stream.get("status"), Some("500"));
         assert_eq!(data[0].values, vec![("10".to_string(), "500".to_string())]);
     }
+
+/// Every refusal this classifier can see, and the one that used to be a fault.
+///
+/// The scan path reports `String`, so this function is the only thing standing
+/// between a working limit and a `500`. An exhausted query memory pool reached
+/// clients as `INTERNAL_SERVER_ERROR` until 2026-08-13 — measured once in a
+/// 45-minute run at the capacity ceiling — which pages an operator for a
+/// refusal and tells a client library that backing off is pointless. The other
+/// arms are pinned beside it because the distinctions are the point: a broad
+/// query is permanently wrong (`400`), a busy instance is temporarily unable
+/// (`429`), and only an unrecognized error is a fault.
+#[test]
+fn a_refusal_is_never_reported_as_a_server_fault() {
+    use crate::query_memory::EXHAUSTED_PREFIX;
+
+    assert_eq!(
+        metric_error_status(&format!("{EXHAUSTED_PREFIX} 322122547 bytes is exhausted")),
+        StatusCode::TOO_MANY_REQUESTS,
+        "an instance out of query memory is busy, not broken"
+    );
+    assert_eq!(
+        metric_error_status(&format!("{TENANT_QUOTA_PREFIX}scan rate exceeded")),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        metric_error_status("query exceeds the maximum of 1000000 scanned rows"),
+        StatusCode::BAD_REQUEST,
+        "a query too broad to answer is permanently too broad"
+    );
+    assert_eq!(
+        metric_error_status("query timed out"),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+    assert_eq!(
+        metric_error_status("part reader returned garbage"),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "and something nobody recognizes is still a fault"
+    );
+}

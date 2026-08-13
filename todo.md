@@ -1573,7 +1573,7 @@ sizing and filling one filter per group plus one per 1,024-row window.
   twice on this page already, so it needs the same treatment as everything else — a change, a run at
   30 k, and the ceiling compared. Whether to spend that is the open question; the diagnosis is done
   either way.
-- [ ] **The ladder found a defect on its way past: an exhausted query memory pool answers `500`.**
+- [x] **The ladder found a defect on its way past: an exhausted query memory pool answers `500`.**
   One query in the run failed, and its message is
   `rate({service_name="api-gateway"}[1m]): query memory pool of 322122547 bytes is exhausted`.
   That is a **bounded resource refusing**, the same class as every other limit here, and
@@ -1584,6 +1584,29 @@ sizing and filling one filter per group plus one per 1,024-row window.
   rather than an edit is that it is API-visible and it moves the number between two gate buckets
   (the harness excludes `429` from its error rate and counts `500`), so the run that reports it
   should be the run that declares it.
+
+  **Fixed, and the user's reading of it corrected the fix** (2026-08-13). The first framing here —
+  "a limit did its job, so `429` and done" — was half right and the missing half is the important
+  one: the client should indeed be told `429`, but *this instance failed to serve a query it was
+  willing to serve*, and that is not a thing to make disappear. As a `500` it hid among faults; as a
+  bare `429` it would have hidden among healthy throttling, which is worse, because the first at
+  least made someone look.
+
+  So it is two pieces, not one. Outward, `metric_error_status` gains an arm and the refusal is
+  `TOO_MANY_REQUESTS` — matched on `query_memory::EXHAUSTED_PREFIX`, a constant shared by the code
+  that writes the message and the code that classifies it, because the scan path reports `String`
+  and a literal typed twice is this same `500` returning the day someone rewords it. Inward,
+  `QueryMemoryPool::exhausted` counts it at the point of refusal and `/metrics` publishes it.
+  That counter is the read side's `ingest_throttled` — the distinction this file's own
+  `RuntimeMetrics` doc comments already draw between "this instance is behind, scale or tune it" and
+  "this tenant asked for more than it was sold", which the read path had only the second half of.
+
+  Its limits are written where it is defined rather than left for a reader to discover: it cannot
+  say whether the cause is concurrency, one greedy query, or a budget too small, so it says to go
+  and look. `docs/RUNBOOK.md` carries it with that caveat and with where to look first. Pinned by
+  `a_refusal_is_never_reported_as_a_server_fault`, which asserts every arm of the classifier rather
+  than the new one alone, and by the pool's own test asserting the counter moves on refusal and not
+  on success.
 
 ### The one failing gate, decomposed before it is moved (2026-08-12)
 

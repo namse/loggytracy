@@ -29,9 +29,33 @@ const UNIT_BYTES: u64 = 1024;
 /// How much a reservation grows per semaphore touch.
 pub const RESERVATION_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The refusal's opening words, shared by the code that writes it and the code
+/// that classifies it.
+///
+/// The scan path reports `String`, so a status code is decided by reading the
+/// message — the same reason [`crate::query::TENANT_QUOTA_PREFIX`] exists. A
+/// literal typed twice is a refusal that silently becomes a `500` again the
+/// day someone rewords it.
+pub const EXHAUSTED_PREFIX: &str = "query memory pool of";
+
 pub struct QueryMemoryPool {
     semaphore: Arc<Semaphore>,
     budget_bytes: u64,
+    /// Queries this instance could not find memory for.
+    ///
+    /// Counted apart from every other refusal because it means something the
+    /// others do not: not that a tenant asked for more than it was sold
+    /// (`query_quota_rejected`), and not that a query was too broad
+    /// (`query exceeds the maximum ... scanned rows`, a `400`), but that **this
+    /// instance ran out of room for work it was willing to do**. It is the read
+    /// side's `ingest_throttled` — the signal an operator scales or re-budgets
+    /// on — and without it the event is invisible: as a `500` it hides among
+    /// faults, and as a bare `429` it hides among healthy throttling.
+    ///
+    /// What it does not say, and no single counter could: whether the cause was
+    /// too many concurrent queries, one query too greedy, or a budget too small
+    /// for the deployment. It says to go and look.
+    exhausted: Arc<AtomicU64>,
 }
 
 impl QueryMemoryPool {
@@ -42,11 +66,17 @@ impl QueryMemoryPool {
         Self {
             semaphore: Arc::new(Semaphore::new(permits)),
             budget_bytes,
+            exhausted: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn budget_bytes(&self) -> u64 {
         self.budget_bytes
+    }
+
+    /// Queries refused because this pool had no room. See [`Self::exhausted`].
+    pub fn exhausted(&self) -> u64 {
+        self.exhausted.load(Ordering::Relaxed)
     }
 
     /// The pool's admission step: one chunk, awaited, so a query arriving
@@ -65,6 +95,7 @@ impl QueryMemoryPool {
             budget_bytes: self.budget_bytes,
             granted_bytes: AtomicU64::new(u64::from(chunk_permits) * UNIT_BYTES),
             permits: Mutex::new(vec![permit]),
+            exhausted: self.exhausted.clone(),
         })
     }
 }
@@ -81,6 +112,7 @@ pub struct QueryMemoryReservation {
     budget_bytes: u64,
     granted_bytes: AtomicU64,
     permits: Mutex<Vec<OwnedSemaphorePermit>>,
+    exhausted: Arc<AtomicU64>,
 }
 
 impl QueryMemoryReservation {
@@ -102,8 +134,9 @@ impl QueryMemoryReservation {
                         .fetch_add(RESERVATION_CHUNK_BYTES, Ordering::AcqRel);
                 }
                 Err(_) => {
+                    self.exhausted.fetch_add(1, Ordering::Relaxed);
                     return Err(format!(
-                        "query memory pool of {} bytes is exhausted",
+                        "{EXHAUSTED_PREFIX} {} bytes is exhausted",
                         self.budget_bytes
                     ));
                 }
@@ -130,6 +163,16 @@ mod tests {
             .ensure(2 * RESERVATION_CHUNK_BYTES + 1)
             .expect_err("growth past the budget must refuse");
         assert!(error.contains("exhausted"), "{error}");
+        // The refusal is counted where it happens, and it is the one signal
+        // that says this instance could not serve work it was willing to do.
+        // The client is told `429`, which is correct and also indistinguishable
+        // from healthy throttling — so if this counter stops moving, the event
+        // becomes invisible rather than becoming rare.
+        assert_eq!(pool.exhausted(), 1);
+        assert!(
+            error.starts_with(EXHAUSTED_PREFIX),
+            "the classifier reads this prefix; {error}"
+        );
 
         // Releasing the reservation returns every byte: the next query
         // admits and grows to the full budget again.
@@ -138,6 +181,7 @@ mod tests {
         second
             .ensure(2 * RESERVATION_CHUNK_BYTES)
             .expect("the full budget is available again");
+        assert_eq!(pool.exhausted(), 1, "a success must not count as a refusal");
     }
 
     #[tokio::test]

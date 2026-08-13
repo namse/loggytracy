@@ -31,6 +31,17 @@ pub(crate) const TENANT_QUOTA_PREFIX: &str = "tenant quota: ";
 fn metric_error_status(error: &str) -> StatusCode {
     if error.starts_with(TENANT_QUOTA_PREFIX) {
         StatusCode::TOO_MANY_REQUESTS
+    } else if error.starts_with(crate::query_memory::EXHAUSTED_PREFIX) {
+        // This instance had no room, which is temporary by construction: the
+        // pool refills as the queries holding it finish, and the same request a
+        // moment later succeeds. It reached a client as `500` until 2026-08-13
+        // — a working limit wearing a fault's code, which pages an operator for
+        // a refusal and tells a client library to treat backoff as pointless.
+        // The event is not thereby harmless, and it is not meant to disappear
+        // into the throttling either: `QueryMemoryPool::exhausted` counts it on
+        // its own so "this instance could not serve work it was willing to do"
+        // stays visible after the client has been told the right thing.
+        StatusCode::TOO_MANY_REQUESTS
     } else if error.starts_with("metric query exceeds") || error.starts_with("query exceeds") {
         StatusCode::BAD_REQUEST
     } else if error == "query timed out"
