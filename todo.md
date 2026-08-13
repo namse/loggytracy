@@ -1461,6 +1461,34 @@ throttled rate 0.0, RSS peak 2.0 GiB against 4, WAL backlog peak 21.2 MiB agains
 2 GiB is now known to be *at least* 20 k eps and the upper bound is unmeasured. The honest way to
 publish a capacity is to offer more until something refuses; that run has not been done.
 
+### The ceiling, and the ladder that looks for it (registered before the runs, 2026-08-13)
+
+A rate ladder at the published configuration — 2 GiB, retention 30 m / 60 s / 5 m, everything else
+default — with the offered rate as the only variable: **30 k, then 45 k, then 60 k eps**, stopping at
+the first rung that refuses. A rung is 45 minutes because retention first has something to delete at
+t≈2100 s, and a capacity number measured before the deletes start is a number for a workload that
+does not exist.
+
+What counts as the ceiling, decided now rather than after seeing the numbers: **any of** achieved
+ingest below 99% of offered, a non-zero throttled count, a 5xx, or an OOM kill. Each of those is the
+server declining, which is the definition being measured; the p95 latency target is *not* one of them
+— a server can be at capacity and slow, and conflating the two is how "~18.6 k eps" got published as
+a capacity when it was partly a measurement of the retention freeze.
+
+**The one deliberate departure from the published soak: 32 connections, not 8.** At 100 entries per
+push, 60 k eps is 600 pushes/s, which over 8 connections is a 13 ms budget per push against a service
+p50 of 12 ms — the client would saturate before the server did and the ladder would measure the
+harness. `conn32-1h` measured the headroom directly: at 32 connections the queueing delay p95 is
+6.8 ms, so the client is not the constraint anywhere on this ladder. It also means the ceiling found
+here is **not** comparable to the 8-connection latency numbers, and the result has to say so.
+
+The prediction, so the reading cannot follow the result: the writer task is the suspect — one
+`sync_all` per batch, 96% busy at 20 k eps — but group commit is self-amortizing, so a batch at 3x
+the rate carries roughly 3x the records for about the same fsync. If that holds, the fsync path is
+*not* the ceiling and the ladder should climb until the memtable or WAL backlog gate refuses. If
+instead throughput flattens near 20–25 k eps with `records/batch` failing to rise, the fsync rate is
+the wall and the phase histograms will show it.
+
 ### The one failing gate, decomposed before it is moved (2026-08-12)
 
 The temptation with a single 9.3%-over number is to re-aim the gate at it. What the run's own
