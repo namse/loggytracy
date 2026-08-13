@@ -79,6 +79,39 @@ pub struct RuntimeMetrics {
     pub remote_restore_latency_ns: AtomicU64,
     pub remote_restore_latency: LatencyHistogram,
     pub cache_evictions: AtomicU64,
+    /// Where a flush pass's time goes, phase by phase.
+    ///
+    /// The capacity of this engine at a 2 GiB budget is set here and not in the
+    /// WAL: the rate ladder of 2026-08-13 pinned `memtable_buffered` at its
+    /// limit while the WAL backlog sat at 3% of its own, so what an operator
+    /// can offer is decided by how fast a memtable becomes parts. These are the
+    /// same shape as the journal writer's, and for the same reason — the push
+    /// tail was argued about for a week from the client's side because nothing
+    /// inside the process could say which phase was spending the time.
+    pub flush: FlushMetrics,
+}
+
+/// One flush pass, split where it hands work to something else.
+#[derive(Default)]
+pub struct FlushMetrics {
+    /// `journal.checkpoint()` from the flush loop's side. The checkpoint runs
+    /// **in the writer task**, so this includes queueing behind whatever pushes
+    /// are being fsynced — the flush's own wait on the ingest path.
+    pub checkpoint_wait: LatencyHistogram,
+    /// Materializing rows and writing parts: sort, dedup, Arrow build, Parquet
+    /// encode with zstd, blooms, `index.bin`, fsync, fadvise.
+    pub build: LatencyHistogram,
+    /// Re-opening what was just written, which validates checksums over all of
+    /// it. Deliberately outside the visibility lock, and therefore a candidate
+    /// for the largest phase nobody has ever measured.
+    pub open: LatencyHistogram,
+    /// The write-locked visibility transition: register the parts, commit the
+    /// memtable. Every queued query waits out this one.
+    pub visibility: LatencyHistogram,
+    /// Advancing the journal checkpoint, and WAL compaction when it fires.
+    pub advance_checkpoint: LatencyHistogram,
+    pub rows: AtomicU64,
+    pub parts: AtomicU64,
 }
 
 impl RuntimeMetrics {
@@ -115,6 +148,7 @@ impl RuntimeMetrics {
             remote_restore_latency_ns: AtomicU64::new(0),
             remote_restore_latency: LatencyHistogram::default(),
             cache_evictions: AtomicU64::new(0),
+            flush: FlushMetrics::default(),
         }
     }
 

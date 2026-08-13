@@ -328,7 +328,7 @@ GUARD=ok
   # this bound", and saying more would be inventing resolution the buckets do
   # not have.
   awk '
-    /^loggytracy_journal_.*_bucket\{le="/ {
+    /^loggytracy_(journal|flush)_.*_bucket\{le="/ {
       split($1, a, "_bucket"); name = a[1]
       split($1, b, "\""); bound = b[2]
       if (bound == "+Inf") next
@@ -336,13 +336,15 @@ GUARD=ok
       k = name SUBSEP (bound + 0); cum[k] = $2 + 0
       bounds[name SUBSEP (++nb[name])] = bound + 0
     }
-    /^loggytracy_journal_.*_count / { split($1, a, "_count"); total[a[1]] = $2 + 0 }
-    /^loggytracy_journal_.*_sum / { split($1, a, "_sum"); sum[a[1]] = $2 + 0 }
+    /^loggytracy_(journal|flush)_.*_count / { split($1, a, "_count"); total[a[1]] = $2 + 0 }
+    /^loggytracy_(journal|flush)_.*_sum / { split($1, a, "_sum"); sum[a[1]] = $2 + 0 }
     /^loggytracy_journal_batches_total /{ batches = $2 + 0 }
     /^loggytracy_journal_batched_records_total /{ records = $2 + 0 }
+    /^loggytracy_flush_rows_total /{ frows = $2 + 0 }
+    /^loggytracy_flush_parts_total /{ fparts = $2 + 0 }
     END {
       if (!order) exit
-      printf "push phases (one writer task; ms, bucketed upper bounds):\n"
+      printf "push and flush phases (one writer task, one flush loop; ms, bucketed upper bounds):\n"
       printf "  %-26s %10s %8s %8s %8s\n", "phase", "n", "mean", "p50<=", "p95<="
       for (o = 1; o <= order; o++) {
         name = oname[o]; n = total[name]; if (!n) continue
@@ -352,12 +354,14 @@ GUARD=ok
           if (p50 == "" && c >= 0.50 * n) p50 = bd
           if (p95 == "" && c >= 0.95 * n) p95 = bd
         }
-        short = name; sub(/^loggytracy_journal_/, "", short); sub(/_ms$/, "", short)
+        short = name; sub(/^loggytracy_/, "", short); sub(/_ms$/, "", short)
         printf "  %-26s %10d %8.2f %8s %8s\n", short, n, sum[name] / n, \
                (p50 == "" ? ">30000" : p50), (p95 == "" ? ">30000" : p95)
       }
       if (batches) printf "  batches=%d records=%d records/batch=%.2f\n", \
                           batches, records, records / batches
+      if (fparts) printf "  flush rows=%d parts=%d rows/part=%.0f\n", \
+                          frows, fparts, frows / fparts
     }' "$OUT/metrics-final.txt" 2>/dev/null
   echo "slow batches (>=250 ms), longest first:"
   sed 's/\x1b\[[0-9;]*m//g' "$SERVER_LOG" | grep "journal batch slow" \

@@ -810,6 +810,45 @@ fn journal_writer_metrics(state: &AppState) -> String {
             .checkpoint
             .render("loggytracy_journal_checkpoint_ms"),
     );
+    out.push_str(&flush_phase_metrics(state));
+    out
+}
+
+/// Where a flush pass's time goes.
+///
+/// The companion to the journal writer's phases, and the more consequential of
+/// the two: the rate ladder of 2026-08-13 put this engine's capacity ceiling
+/// here rather than in the WAL. A pass that takes longer than the memtable
+/// takes to refill *is* the ceiling, and before these the only evidence of it
+/// reaching one was a `429` arriving at a client.
+fn flush_phase_metrics(state: &AppState) -> String {
+    let flush = &state.metrics.flush;
+    let mut out = String::new();
+    out.push_str(
+        "# HELP loggytracy_flush_rows_total Rows written into parts by the flush loop.\n\
+# TYPE loggytracy_flush_rows_total counter\n",
+    );
+    out.push_str(&format!(
+        "loggytracy_flush_rows_total {}\n",
+        flush.rows.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP loggytracy_flush_parts_total Parts those passes produced. Divided by the rows, the part size the chunker is choosing.\n\
+# TYPE loggytracy_flush_parts_total counter\n",
+    );
+    out.push_str(&format!(
+        "loggytracy_flush_parts_total {}\n",
+        flush.parts.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        &flush
+            .checkpoint_wait
+            .render("loggytracy_flush_checkpoint_wait_ms"),
+    );
+    out.push_str(&flush.build.render("loggytracy_flush_build_ms"));
+    out.push_str(&flush.open.render("loggytracy_flush_open_ms"));
+    out.push_str(&flush.visibility.render("loggytracy_flush_visibility_ms"));
+    out.push_str(&flush.advance_checkpoint.render("loggytracy_flush_advance_ms"));
     out
 }
 

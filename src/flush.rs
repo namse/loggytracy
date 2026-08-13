@@ -107,6 +107,7 @@ pub async fn flush_loop(
             remote_cache.as_deref(),
             &config,
             &mut pending_checkpoint,
+            Some(&metrics),
         )
         .await
         {
@@ -180,6 +181,7 @@ pub async fn force_flush_pass(pass: ForceFlush<'_>) -> Result<bool, String> {
         remote_cache,
         config,
         pending_checkpoint,
+        None,
     )
     .await?;
 
@@ -204,6 +206,12 @@ async fn retry_pending_checkpoint(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// One flush pass.
+///
+/// `metrics` is `None` for the force-flush path on purpose. That pass drains
+/// whatever is left at shutdown rather than running at cadence, so its one
+/// unbounded outlier would sit in every run's phase distribution and make the
+/// steady-state numbers say something they do not mean.
 async fn flush_once(
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
@@ -213,8 +221,14 @@ async fn flush_once(
     remote_cache: Option<&RemoteCache>,
     config: &Config,
     pending_checkpoint: &mut Option<u64>,
+    metrics: Option<&RuntimeMetrics>,
 ) -> Result<(), String> {
+    let checkpoint_started = std::time::Instant::now();
     let ckpt = journal.checkpoint().await.map_err(|e| e.to_string())?;
+    let checkpoint_wait = checkpoint_started.elapsed();
+    if let Some(metrics) = metrics {
+        metrics.flush.checkpoint_wait.observe(checkpoint_wait);
+    }
     if ckpt.snapshot.is_empty() && ckpt.trace_snapshot.is_empty() {
         memtable.commit_flush();
         trace_memtable.commit_flush();
@@ -268,6 +282,7 @@ async fn flush_once(
         let traces_root = config.data_dir.join("traces");
         move || {
             let _arena = crate::memprof::enter(crate::memprof::Arena::Flush);
+            let build_started = std::time::Instant::now();
             let log_parts = part::flush_snapshot_chunked(
                 &snapshot_for_flush,
                 &parts_root,
@@ -307,6 +322,8 @@ async fn flush_once(
                         )),
                     }
                 };
+            let build = build_started.elapsed();
+            let open_started = std::time::Instant::now();
             let opened_log = match PartRegistry::open_parts(log_parts.clone()) {
                 Ok(opened) => opened,
                 Err(error) => return Err(rollback(error, &log_parts, &trace_parts)),
@@ -315,7 +332,14 @@ async fn flush_once(
                 Ok(opened) => opened,
                 Err(error) => return Err(rollback(error, &log_parts, &trace_parts)),
             };
-            Ok::<_, std::io::Error>((log_parts, trace_parts, opened_log, opened_traces))
+            Ok::<_, std::io::Error>((
+                log_parts,
+                trace_parts,
+                opened_log,
+                opened_traces,
+                build,
+                open_started.elapsed(),
+            ))
         }
     })
     .await
@@ -329,7 +353,11 @@ async fn flush_once(
     };
 
     match result {
-        Ok((new_parts, new_trace_parts, opened_log, opened_traces)) => {
+        Ok((new_parts, new_trace_parts, opened_log, opened_traces, build, open)) => {
+            if let Some(metrics) = metrics {
+                metrics.flush.build.observe(build);
+                metrics.flush.open.observe(open);
+            }
             let n = new_parts.len();
             let total_rows = new_parts
                 .iter()
@@ -440,6 +468,7 @@ async fn flush_once(
             // every millisecond of I/O spent under it was a millisecond every
             // queued query waited.
             drop(cache_guard);
+            let visibility_started = std::time::Instant::now();
             {
                 let _visibility_guard = crate::part_registry::PartRegistry::write_without_convoy(
                     registry.operation_lock(),
@@ -450,6 +479,8 @@ async fn flush_once(
                 memtable.commit_flush();
                 trace_memtable.commit_flush();
             }
+            let visibility = visibility_started.elapsed();
+            let advance_started = std::time::Instant::now();
             if let Err(error) = advance_checkpoint(
                 journal,
                 ckpt.offset,
@@ -471,6 +502,7 @@ async fn flush_once(
                     "parts were committed but journal checkpoint could not be advanced: {error}"
                 ));
             }
+            let advance = advance_started.elapsed();
             if remote_cache.is_some()
                 && let Err(error) = clear_flush_transaction(&config.data_dir)
             {
@@ -479,10 +511,25 @@ async fn flush_once(
                 // committed checkpoint.
                 tracing::warn!(%error, "failed to clear committed flush transaction");
             }
+            if let Some(metrics) = metrics {
+                metrics.flush.visibility.observe(visibility);
+                metrics.flush.advance_checkpoint.observe(advance);
+                metrics.flush.rows.fetch_add(total_rows, Ordering::Relaxed);
+                metrics.flush.parts.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            // The duration a flush's own log line never carried. A pass that
+            // takes longer than the memtable takes to refill is the capacity
+            // ceiling happening, and until this the only evidence of it was a
+            // 429 arriving at a client.
             tracing::info!(
                 offset = ckpt.offset,
                 rows = total_rows,
                 parts = n,
+                checkpoint_ms = checkpoint_wait.as_secs_f64() * 1e3,
+                build_ms = build.as_secs_f64() * 1e3,
+                open_ms = open.as_secs_f64() * 1e3,
+                visibility_ms = visibility.as_secs_f64() * 1e3,
+                advance_ms = advance.as_secs_f64() * 1e3,
                 "flushed memtable to parts"
             );
             Ok(())
@@ -573,6 +620,76 @@ mod tests {
         dir
     }
 
+    /// Every phase a flush passes through is measured, and by the flush loop
+    /// rather than by a caller.
+    ///
+    /// The push tail was argued about for a week from the client's side because
+    /// nothing in the process could say which phase spent the time; the rate
+    /// ladder then put the *capacity* ceiling in this loop rather than the WAL,
+    /// so the same blindness here is the more expensive one. A phase wired to
+    /// the wrong instant reads zero forever, which no "the histogram exists"
+    /// assertion would catch — so each phase must have observed the one pass.
+    #[tokio::test]
+    async fn every_flush_phase_is_measured_once_per_pass() {
+        let dir = temp_dir();
+        let config = Config {
+            data_dir: dir.clone(),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let memtable = Arc::new(MemTable::new());
+        let trace_memtable = Arc::new(TraceMemTable::new());
+        let journal =
+            Journal::spawn_with_traces(&config, memtable.clone(), trace_memtable.clone()).unwrap();
+        let registry = PartRegistry::new();
+        let trace_registry = TraceRegistry::new(registry.operation_lock());
+        let metrics = RuntimeMetrics::new();
+        let mut pending_checkpoint = None;
+
+        journal
+            .append_otlp_logs(
+                crate::tenant::test_tenant(),
+                Vec::new(),
+                vec![(
+                    crate::memtable::Labels::from([("app".to_string(), "a".to_string())]),
+                    vec![crate::memtable::LogEntry {
+                        timestamp_ns: 1,
+                        line: "one line".to_string(),
+                        structured_metadata: Vec::new(),
+                    }],
+                )],
+            )
+            .await
+            .unwrap();
+
+        flush_once(
+            &memtable,
+            &trace_memtable,
+            &journal,
+            &registry,
+            &trace_registry,
+            None,
+            &config,
+            &mut pending_checkpoint,
+            Some(&metrics),
+        )
+        .await
+        .expect("the flush succeeds");
+
+        for (phase, histogram) in [
+            ("checkpoint_wait", &metrics.flush.checkpoint_wait),
+            ("build", &metrics.flush.build),
+            ("open", &metrics.flush.open),
+            ("visibility", &metrics.flush.visibility),
+            ("advance_checkpoint", &metrics.flush.advance_checkpoint),
+        ] {
+            assert_eq!(histogram.count(), 1, "{phase} did not observe the pass");
+        }
+        assert_eq!(metrics.flush.rows.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.flush.parts.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn checkpoint_failure_does_not_flush_same_snapshot_again() {
         let data_dir = temp_dir();
@@ -602,6 +719,7 @@ mod tests {
         // Force write_checkpoint's temporary-file creation to fail.
         std::fs::create_dir_all(data_dir.join("journal.ckpt.tmp")).unwrap();
 
+        let metrics = RuntimeMetrics::new();
         let first = flush_once(
             &memtable,
             &trace_memtable,
@@ -611,6 +729,7 @@ mod tests {
             None,
             &config,
             &mut pending_checkpoint,
+            Some(&metrics),
         )
         .await;
         assert!(first.is_err());
