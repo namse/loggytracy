@@ -1489,6 +1489,39 @@ the rate carries roughly 3x the records for about the same fsync. If that holds,
 instead throughput flattens near 20–25 k eps with `records/batch` failing to rise, the fsync rate is
 the wall and the phase histograms will show it.
 
+**The first rung refused, so the ladder stopped there** (`cap-30k`, 45 minutes at 30 k eps offered,
+32 connections). 810,001 pushes offered, **154,610 refused with `429`** (19.1%), 65,539,100 of
+81,000,100 events accepted — **80.9% of the offer**. No 5xx from ingest, no OOM, `disk_guard=ok`.
+Every refusal is a `429`, which is backpressure working rather than the server failing, and the rate
+it settles at is the answer: **24,274 eps sustained at 2 GiB**, measured over 45 minutes with merge
+and retention active.
+
+**And the prediction's first branch held: the WAL is not the ceiling.** Group commit amortized
+exactly as it was supposed to — `records/batch` **1.59 → 2.39**, fsync mean **7.62 → 6.91 ms**, its
+p95 bucket 25 → 10 ms — so at 1.2x the accepted rate the writer task got *less* busy, not more:
+101 batches/s × 6.91 ms is a **70% duty cycle against 96%** at 20 k eps. The durability path had
+headroom the whole time.
+
+**What refused is flush, and the gauges name it to the megabyte.** `memtable_buffered` peaked at
+**124.0 MiB against the 122.9 MiB `max_memtable_bytes`** — the gate whose message is "flush is not
+keeping up" — while the WAL backlog peaked at **34.8 MiB against a 1 GiB limit**, two orders of
+magnitude of room. The flush lines say the same thing from the other side: `rows=153800 parts=3`,
+where the 20 k runs flushed 11–31 k rows into one part. So the capacity of this engine at 2 GiB is
+set by how fast a memtable becomes parts, not by how fast a WAL becomes durable — and the earlier
+"~18.6 k eps" was below even this, because it was measured through the retention freeze.
+
+- [ ] **The ladder found a defect on its way past: an exhausted query memory pool answers `500`.**
+  One query in the run failed, and its message is
+  `rate({service_name="api-gateway"}[1m]): query memory pool of 322122547 bytes is exhausted`.
+  That is a **bounded resource refusing**, the same class as every other limit here, and
+  `metric_error_status` (`query/mod.rs`) has no arm for it, so it falls through to
+  `INTERNAL_SERVER_ERROR`. A client cannot tell it from a server fault, an operator gets paged for a
+  working limit, and it is the same confusion the gRPC refusal audit found on the ingest side — a
+  refusal wearing the wrong code. The fix is one arm in that function; what makes it a decision
+  rather than an edit is that it is API-visible and it moves the number between two gate buckets
+  (the harness excludes `429` from its error rate and counts `500`), so the run that reports it
+  should be the run that declares it.
+
 ### The one failing gate, decomposed before it is moved (2026-08-12)
 
 The temptation with a single 9.3%-over number is to re-aim the gate at it. What the run's own
