@@ -1643,7 +1643,7 @@ the client's 8 connections queueing (233 ms, which moves to 6.8 ms at 32 connect
 inside the server) in front of a writer task at 96% utilization, whose service time is one WAL
 `sync_all` averaging 7.6 ms, whose own excursions to seconds are merge I/O on the shared device.
 
-- [ ] **What to do about it is a decision, not a finding, and it is the user's.** Every candidate is a
+- [x] **What to do about it is a decision, not a finding, and it is the user's.** Every candidate is a
   trade the 2026-08-07 freeze exists to stop being made casually, and none of them is a defect being
   fixed: `max_batch_ms` is 0, so a linger of a few ms would amortize each fsync over more pushes —
   it raises the floor for a lightly loaded server to buy tail at a busy one, and the comment on that
@@ -1652,6 +1652,32 @@ inside the server) in front of a writer task at 96% utilization, whose service t
   a second writer task is not available without giving up the single-file WAL's ordering. The
   diagnosis is what this item owed; the measurements above are what any of those choices would have
   to be judged against.
+
+  **Decided: nothing changes, and the trade is written into the architecture instead**
+  (2026-08-13, the user's call after the alternatives were laid out). What settled it was not the
+  9% — it was that the question turned out to be about what an acknowledgement *means*. This engine
+  answers after `sync_all`; the bed's other two answer in 1.4–4.7 ms, which cannot contain a device
+  sync on hardware where this engine measures one at ~7 ms, so they are acking before durability and
+  flushing behind it. That is a different promise, not a better implementation, and it is the
+  promise the "a client can only hold data back if the server declines it" premise rests on.
+  Splitting the writer is the one that would have removed the cost, and it removes the single
+  ordered WAL with it — which is what makes a checkpoint one number, and what makes a hole in the
+  middle of the WAL a refusal to start rather than a silent gap. `docs/ARCHITECTURE.md`'s durability
+  section now carries the measurement, the comparison, and the reason each alternative was declined,
+  so the next reader meets the trade instead of the symptom.
+- [ ] **A 3.8x on the bed's own push p95 that nothing explains, recorded rather than chased.** Same
+  bed, same corpus, same offered rate, same 8 connections: `3363d61`'s ten-times run read push
+  response p95 **24.3 ms** and today's read **91.9 ms**, while Loki (4.92 → 4.70) and VictoriaLogs
+  (2.16 → 1.44) did not move. Both still pass the harness's 250 ms target, which is why nothing
+  failed and why this would have gone unnoticed. What it is not: the two changes that touched the
+  push path in between — the in-flight body bound (`3bde4d7`) and the writer instrumentation
+  (`8d6fea8`) — were both measured at zero cost on the soak rig at the same offered rate (266.4 ms
+  without, 275.7 ms with, against the day's 273.3). What is left is host state — three 45-minute
+  soaks wrote tens of GB to the same filesystem today — or a four-minute phase being sensitive to
+  it. **Unknown, and left that way deliberately**: the discriminator is one more bed run, which is
+  cheap, but the number is not a gate and chasing it now is not what this phase is for. If it
+  reproduces on the next bed run for any reason, it is a real regression and this note is where it
+  starts.
 
 ## The claim arc, round four: the decode is kept, and the claim holds (2026-08-06)
 
