@@ -1,3 +1,43 @@
+/// Where the flush build spends its 98%.
+///
+/// The rate ladder of 2026-08-13 put this engine's capacity ceiling in the
+/// flush loop, and the loop's phase table then put 6.12 of a 6.46-second pass
+/// inside this file — so what a customer can offer this server is decided by
+/// the four spans below, and none of them had a number. They live in a
+/// `static` because `flush_rows_internal` takes no metrics handle and is
+/// called by both the flush and the merge; **only the flush path observes**,
+/// discriminated by the `merge_old_dirs` argument that is already there, so a
+/// merge rewrite cannot smear the distribution this exists to read.
+///
+/// Counted per part rather than per pass: a flush cuts its snapshot into
+/// chunks, so these see ~3.4 observations for each `loggytracy_flush_build_ms`.
+pub static FLUSH_BUILD: FlushBuildMetrics = FlushBuildMetrics::new();
+
+pub struct FlushBuildMetrics {
+    /// Sorting and deduplicating one part's rows by `(tenant, labels, ts)`.
+    pub sort: crate::metrics::LatencyHistogram,
+    /// Everything schema-shaped between the sort and the write: the stream
+    /// label set, the metadata column census, and `parse_rows` — which runs the
+    /// JSON parser over every line in the part.
+    pub parse: crate::metrics::LatencyHistogram,
+    /// `write_part_files`: Arrow build, Parquet encode with zstd, the trigram
+    /// and metadata blooms, `index.bin`, and the fsyncs that make them durable.
+    pub write: crate::metrics::LatencyHistogram,
+    /// The commit tail — tombstone, directory rename, parent fsync.
+    pub commit: crate::metrics::LatencyHistogram,
+}
+
+impl FlushBuildMetrics {
+    const fn new() -> Self {
+        Self {
+            sort: crate::metrics::LatencyHistogram::new(),
+            parse: crate::metrics::LatencyHistogram::new(),
+            write: crate::metrics::LatencyHistogram::new(),
+            commit: crate::metrics::LatencyHistogram::new(),
+        }
+    }
+}
+
 pub fn partition_of(ts_ns: i64) -> String {
     let secs = ts_ns.div_euclid(1_000_000_000);
     let dt = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
@@ -265,6 +305,18 @@ pub fn flush_row_stream_with_merge_tombstone(
     Ok((vec![part], dropped, kept))
 }
 
+/// Whether this call's phases enter [`FLUSH_BUILD`].
+///
+/// Only the flush path does. A merge rewrite runs the identical code with a
+/// tombstone, and letting it in would blend two workloads into the one
+/// distribution that exists to explain the flush ceiling — with nothing in the
+/// numbers to say it had happened. The discriminator is the argument that was
+/// already here, named so the meaning is testable without a global counter that
+/// every other test's flush also moves.
+fn measures_build(merge_old_dirs: Option<&[PathBuf]>) -> bool {
+    merge_old_dirs.is_none()
+}
+
 fn flush_rows_internal(
     rows: Vec<Row>,
     parts_root: &Path,
@@ -283,10 +335,15 @@ fn flush_rows_internal(
         by_partition.entry(p).or_default().push(row);
     }
 
+    let measured = measures_build(merge_old_dirs);
     let mut parts = Vec::new();
     let mut committed_dirs: Vec<PathBuf> = Vec::new();
     for (partition, mut part_rows) in by_partition {
+        let sort_started = std::time::Instant::now();
         sort_rows(&mut part_rows);
+        if measured {
+            FLUSH_BUILD.sort.observe(sort_started.elapsed());
+        }
         let part_id = gen_part_id(
             part_rows
                 .iter()
@@ -304,10 +361,15 @@ fn flush_rows_internal(
             return Err(e);
         }
 
+        let parse_started = std::time::Instant::now();
         let stream_labels = collect_stream_labels(&part_rows);
         let metadata_columns = select_metadata_columns(metadata_column_counts(&part_rows));
         let parsed_rows = parse_rows(&part_rows);
         let parsed_columns = select_metadata_columns(parsed_column_counts(&parsed_rows));
+        if measured {
+            FLUSH_BUILD.parse.observe(parse_started.elapsed());
+        }
+        let write_started = std::time::Instant::now();
         if let Err(e) = write_part_files(
             &tmp_dir,
             &part_id,
@@ -323,6 +385,10 @@ fn flush_rows_internal(
             return Err(e);
         }
 
+        if measured {
+            FLUSH_BUILD.write.observe(write_started.elapsed());
+        }
+        let commit_started = std::time::Instant::now();
         if let Some(old_dirs) = merge_old_dirs
             && let Err(e) = write_merge_tombstone(&tmp_dir, parts_root, old_dirs)
         {
@@ -362,6 +428,9 @@ fn flush_rows_internal(
             return Err(e);
         }
         committed_dirs.push(final_dir.clone());
+        if measured {
+            FLUSH_BUILD.commit.observe(commit_started.elapsed());
+        }
 
         let part = match load_part(&final_dir) {
             Ok(p) => p,

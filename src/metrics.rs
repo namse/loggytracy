@@ -193,6 +193,17 @@ pub struct LatencyHistogram {
 }
 
 impl LatencyHistogram {
+    /// `const` so a histogram can live in a `static`, which is how the flush
+    /// build's sub-phases are measured: they sit inside `part::format`, which
+    /// takes no metrics handle and is called from both the flush and the merge.
+    pub const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; LATENCY_BUCKET_BOUNDS_MS.len()],
+            count: AtomicU64::new(0),
+            sum_ms: AtomicU64::new(0),
+        }
+    }
+
     pub fn observe(&self, duration: Duration) {
         let millis = duration.as_secs_f64() * 1_000.0;
         for (index, bound) in LATENCY_BUCKET_BOUNDS_MS.iter().enumerate() {

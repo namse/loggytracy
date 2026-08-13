@@ -849,6 +849,14 @@ fn flush_phase_metrics(state: &AppState) -> String {
     out.push_str(&flush.open.render("loggytracy_flush_open_ms"));
     out.push_str(&flush.visibility.render("loggytracy_flush_visibility_ms"));
     out.push_str(&flush.advance_checkpoint.render("loggytracy_flush_advance_ms"));
+    // The build phase's own four, counted per part rather than per pass because
+    // a flush cuts its snapshot into chunks. Only the flush path observes them;
+    // a merge rewrite runs the same code and is deliberately excluded.
+    let build = &crate::part::FLUSH_BUILD;
+    out.push_str(&build.sort.render("loggytracy_flush_build_sort_ms"));
+    out.push_str(&build.parse.render("loggytracy_flush_build_parse_ms"));
+    out.push_str(&build.write.render("loggytracy_flush_build_write_ms"));
+    out.push_str(&build.commit.render("loggytracy_flush_build_commit_ms"));
     out
 }
 

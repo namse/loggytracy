@@ -3411,3 +3411,23 @@ not by the decode fallback"
             );
         }
     }
+
+    /// The build phase's sub-timers observe the flush path and not the merge.
+    ///
+    /// They live in a `static` shared by both callers, so this discriminator is
+    /// the only thing keeping a merge rewrite out of the distribution that
+    /// exists to explain the flush ceiling. If it ever stops meaning "this is a
+    /// merge", the numbers become a blend of two workloads and nothing else
+    /// would say so.
+    ///
+    /// **What this cannot check**, said rather than implied: it pins the
+    /// meaning of the discriminator, not that `flush_rows_internal` still calls
+    /// it. Asserting on `FLUSH_BUILD`'s counters would check that — and would
+    /// be a false failure the moment another test in this binary flushes a part
+    /// on another thread, which is most of them.
+    #[test]
+    fn only_the_flush_path_measures_the_build_sub_phases() {
+        assert!(measures_build(None), "a flush is measured");
+        assert!(!measures_build(Some(&[])), "a merge rewrite is not");
+        assert!(!measures_build(Some(&[PathBuf::from("/old/part")])));
+    }
