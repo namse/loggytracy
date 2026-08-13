@@ -856,6 +856,9 @@ fn flush_phase_metrics(state: &AppState) -> String {
     out.push_str(&build.sort.render("loggytracy_flush_build_sort_ms"));
     out.push_str(&build.parse.render("loggytracy_flush_build_parse_ms"));
     out.push_str(&build.write.render("loggytracy_flush_build_write_ms"));
+    out.push_str(&build.parquet.render("loggytracy_flush_build_parquet_ms"));
+    out.push_str(&build.index.render("loggytracy_flush_build_index_ms"));
+    out.push_str(&build.meta.render("loggytracy_flush_build_meta_ms"));
     out.push_str(&build.commit.render("loggytracy_flush_build_commit_ms"));
     out
 }

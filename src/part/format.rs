@@ -20,9 +20,17 @@ pub struct FlushBuildMetrics {
     /// label set, the metadata column census, and `parse_rows` — which runs the
     /// JSON parser over every line in the part.
     pub parse: crate::metrics::LatencyHistogram,
-    /// `write_part_files`: Arrow build, Parquet encode with zstd, the trigram
-    /// and metadata blooms, `index.bin`, and the fsyncs that make them durable.
+    /// `write_part_files` in total: Arrow build, Parquet encode with zstd, the
+    /// trigram and metadata blooms, `index.bin`, `meta.json`, and the fsyncs
+    /// that make them durable. Its own three are below.
     pub write: crate::metrics::LatencyHistogram,
+    /// `write_parquet`: Arrow arrays, dictionary encoding, zstd, the fsync.
+    pub parquet: crate::metrics::LatencyHistogram,
+    /// `write_index`: the trigram and metadata blooms over every line, and the
+    /// stream index, into one `index.bin`.
+    pub index: crate::metrics::LatencyHistogram,
+    /// `write_meta`: the part's `meta.json`, including its stream table.
+    pub meta: crate::metrics::LatencyHistogram,
     /// The commit tail — tombstone, directory rename, parent fsync.
     pub commit: crate::metrics::LatencyHistogram,
 }
@@ -33,6 +41,9 @@ impl FlushBuildMetrics {
             sort: crate::metrics::LatencyHistogram::new(),
             parse: crate::metrics::LatencyHistogram::new(),
             write: crate::metrics::LatencyHistogram::new(),
+            parquet: crate::metrics::LatencyHistogram::new(),
+            index: crate::metrics::LatencyHistogram::new(),
+            meta: crate::metrics::LatencyHistogram::new(),
             commit: crate::metrics::LatencyHistogram::new(),
         }
     }
@@ -380,6 +391,7 @@ fn flush_rows_internal(
             &metadata_columns,
             &parsed_columns,
             row_group_size,
+            measured,
         ) {
             rollback_committed(&committed_dirs);
             return Err(e);
@@ -526,8 +538,10 @@ fn write_part_files(
     metadata_columns: &[(String, u64)],
     parsed_columns: &[(String, u64)],
     row_group_size: usize,
+    measured: bool,
 ) -> io::Result<()> {
     let (ordinals, stream_table) = assign_stream_ordinals(rows)?;
+    let parquet_started = std::time::Instant::now();
     write_parquet(
         &dir.join(DATA_FILE),
         rows,
@@ -537,6 +551,10 @@ fn write_part_files(
         parsed_columns,
         row_group_size,
     )?;
+    if measured {
+        FLUSH_BUILD.parquet.observe(parquet_started.elapsed());
+    }
+    let index_started = std::time::Instant::now();
     write_index(
         &dir.join(INDEX_FILE),
         rows,
@@ -544,7 +562,11 @@ fn write_part_files(
         row_group_size,
         stream_labels,
     )?;
-    write_meta(
+    if measured {
+        FLUSH_BUILD.index.observe(index_started.elapsed());
+    }
+    let meta_started = std::time::Instant::now();
+    let result = write_meta(
         &dir.join(META_FILE),
         id,
         partition,
@@ -554,8 +576,11 @@ fn write_part_files(
         stream_labels,
         metadata_columns,
         parsed_columns,
-    )?;
-    Ok(())
+    );
+    if measured {
+        FLUSH_BUILD.meta.observe(meta_started.elapsed());
+    }
+    result
 }
 
 /// Row-group boundaries for a `(tenant, labels, timestamp)`-sorted row set.
