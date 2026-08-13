@@ -896,6 +896,14 @@ The polish order, each item a measurement or a bound, none a feature:
    a measurement the code has already moved past. The sidecar half was separately fixed and verified
    (`6615a04`, flat at 118–122 MiB through a day), and the push-body bound is untouched by any of
    this and still owed.
+
+   **Both halves are closed now, and so is the item** (audited 2026-08-13). The relaunched soak
+   answered `streams`: `parts` and `part_meta` carry the GROWING flag *together* off the same Q4
+   bump, ×1.15 each, so the gauge tracks the part count the way a per-part structure should and the
+   fingerprint the item scoped is not needed — `00f9799`'s interning did that work. The push-body
+   bound landed in `3bde4d7` as `LOGGYTRACY_MAX_INFLIGHT_PUSH_BYTES`, charged in the middleware
+   where the bytes are actually spent, and `conn8-1h` measured what it costs the push path: nothing
+   (response p95 266.4 ms against the pre-bound day's 273.3, service p50 unchanged).
 3. **One large-corpus bed run** — 10-100x the 150k-row dataset, as claim-scope validation rather
    than tuning: does the 1.4 ms-constant race hold when parts multiply and the cache's working set
    overflows 256 MiB? Published win or lose, per house rule.
@@ -1159,9 +1167,18 @@ found four things first, three of them the soak's own questions answering early.
   `data.parquet` alone, so a missing body stays loud), and that case is a DEBUG skip with no error
   recorded. Pinned red-before/green-after by
   `merge::tests::an_input_deleted_mid_merge_is_a_skip_and_not_an_error`.
-- [ ] **~1 % of queries 504 under sustained 20 k eps with merge and retention active** (48/4,926
+- [x] **~1 % of queries 504 under sustained 20 k eps with merge and retention active** (48/4,926
   at 8 GiB; first: `| json | level="debug"` timed out). The load gate's p95 passes in minutes-long
   runs; the sustained tail is a different number.
+
+  **Gone with the retention lock order, and four runs since say so** (audited 2026-08-13). The
+  timeouts were the world-stop: a query that arrives during a 20–50 s freeze is answered after the
+  harness's 60 s request timeout has already given up on it. Since `ca32ee5` every run has answered
+  every query it did not refuse on purpose — `soak-24h-lockorder` (a day), `conn8-1h`, `conn32-1h`
+  and `phase-1h` (an hour each) return **zero `500`s and zero `504`s** between them, against the
+  day-long pre-fix run's 856 and 17. Query response p99 is 519–640 ms across the four and the worst
+  single answer in any of them is 3.8 s. The `400`s that remain are one refusal working
+  (`query exceeds the maximum of 1000000 scanned rows`), which is not this item.
 - **Fixing the mmap threshold (`MALLOC_MMAP_THRESHOLD_=131072`, arenas left at 4) collapses the
   ratchet and still loses**: anon/live 5.30 → **1.60**, survival 150 → 502 s, then killed anyway.
   With retention mostly gone the remaining arithmetic is plain: the live sum's spikes reach
@@ -1220,7 +1237,7 @@ found four things first, three of them the soak's own questions answering early.
   read. If the residue survives one arena too, the remaining option is the one the M10 item named:
   an allocator whose heap decays (jemalloc/mimalloc), which is a dependency decision to bring to the
   user, not a knob.
-- [ ] **The read tail under sustained churn — mostly explained, one residue left.** The collapse
+- [x] **The read tail under sustained churn — mostly explained, one residue left.** The collapse
   (p95 33.3 s at 2 GiB budgeted / 78.0 s at 8 GiB default, in every long pre-eviction run) was
   substantially the unbounded part/sidecar backlog: with the blooms evictable and parts steady
   under retention, the same hour reads p95 **651 ms** and the load verdict is a full PASS. What
@@ -1256,7 +1273,16 @@ found four things first, three of them the soak's own questions answering early.
   consequence, and the `rows=325500 parts=6` flush right after the silence is that backlog draining.
   The structural cause is that the declared budget takes 60% of the limit while treating the page
   cache as free.
-- [ ] **The stall's remaining half, and the sampler now measures it instead of inferring it.**
+
+  **Closed on the item's own terms** (audited 2026-08-13). The tail's tail was **p99 16.9 s, max
+  26.6 s** when this was written; the day on the fixed lock order reads **p99 639 ms, max 3.1 s**,
+  and the three hours since read 520–561 ms and 1.4–3.8 s. The residue this item held open was the
+  ~20 s stalls beside merge, and those are the retention lock order two items below — the item that
+  found them is closed by the item that named them, not by them going unexplained. The last
+  sentence above is worth keeping as a standing caution rather than as an open task: the declared
+  budget still treats the page cache as free, which is why `posix_fadvise` on a written part is load
+  bearing rather than an optimization.
+- [x] **The stall's remaining half, and the sampler now measures it instead of inferring it.**
   `run_soak_local.sh` carries five more columns, all cumulative: PSI `some`/`full` stall
   microseconds, `pgscan_direct`/`pgsteal_direct` (direct reclaim, as against kswapd's, which costs
   the workload nothing) and `workingset_refault_file`. The verdict grew a stall table — every
@@ -1292,6 +1318,14 @@ found four things first, three of them the soak's own questions answering early.
   that touches the filesystem waits, including the log writer. The rig's disk is an SSD
   (`mq-deadline`) with 12.6 GB free, so it is not space — but the root filesystem it shares is 93%
   full, and ext4 at that fill level is a candidate on its own.
+
+  **The item's deliverable is the instrument, and it did its job** (audited 2026-08-13). The five
+  reclaim columns and the stall table are what killed the memory diagnosis — zero direct reclaim
+  inside a 23-second freeze — and the `io.pressure`/`cpu.pressure` columns that followed eliminated
+  the other two resources, which is what left a lock and led to the item below. Both candidate
+  explanations this item was opened to test were answered **no** and the runs are recorded above.
+  The ext4-fill suspicion in the last sentence was never needed: the freezes are gone at the same
+  fill level, so the filesystem was not it.
 - [x] **So the question is now which resource the threads wait on, and the sampler asks it
   directly.** Three more columns: `io.pressure` some/full and `cpu.pressure` some, and the stall
   table prints `mem_full` / `io_full` / `cpu_some` side by side for each freeze's own window.
@@ -1311,7 +1345,7 @@ found four things first, three of them the soak's own questions answering early.
   completion line is the last event of the freeze**, with the blocked merge's commit landing
   0.1–0.3 s after it. The freeze is not something retention interrupts. The freeze *is* retention's
   pass.
-- [ ] **The stall, named: retention holds the lock every query needs while it spins for a lock a
+- [x] **The stall, named: retention holds the lock every query needs while it spins for a lock a
   merge rewrite is holding.** `retention.rs:243–285` takes `operation_lock` exclusively **first**,
   then spins for `deletion_lock` exclusively. `merge/scheduler.rs:154` holds `deletion_lock`'s read
   half for the whole rewrite of a group — deliberately, so a group's inputs cannot be deleted under
@@ -1415,7 +1449,8 @@ them. Fewer freezes, fewer oversized scans. Not proven here.
 the GROWING flag, and they carry it *together* off the same Q4 bump: parts 294 → 337 is ×1.15,
 `part_meta` 14.0 → 16.1 MiB is ×1.15. The gauge tracks the part count, which is what a per-part
 structure should do — the interning of `00f9799` did the work the fingerprint was scoped for. Polish
-item 2 reduces to the in-flight push-body bound.
+item 2 reduced to the in-flight push-body bound, which `3bde4d7` then bounded — so polish item 2 is
+closed, and with items 1, 3 and 4 already done the whole polish list is.
 
 **What still fails, and it is one number.** `push_response_p95_ms` 273.3 ms against a 250 ms target,
 over by 9.3%, which is why the verdict reads `PASS_BEHAVIORAL_ONLY` rather than a full pass. Every
