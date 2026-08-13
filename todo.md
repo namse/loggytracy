@@ -1523,6 +1523,56 @@ where the 20 k runs flushed 11–31 k rows into one part. So the capacity of thi
 set by how fast a memtable becomes parts, not by how fast a WAL becomes durable — and the earlier
 "~18.6 k eps" was below even this, because it was measured through the retention freeze.
 
+### The ceiling, attributed to one line of code (2026-08-13)
+
+The same treatment the push path got, on the loop the ladder named. Three 45-minute runs at 30 k eps
+offered — the rung that pins the memtable — each adding one level of split, all agreeing with each
+other on the levels they share. Phases are per part where noted; a flush cuts its snapshot into
+**3.32** parts on average.
+
+| | mean | share of the pass |
+|---|---|---|
+| **flush pass** (`build` + open + visibility + advance + checkpoint wait) | 6,184 ms | |
+| `build` | **6,042 ms** | **98%** |
+| ├ `write_part_files` (×3.32) | 1,385 ms → 4,598 ms | 76% |
+| │ ├ **`write_index` — the blooms** (×3.32) | **1,181 ms → 3,922 ms** | **63%** |
+| │ ├ `write_parquet` — Arrow, dictionary, zstd, fsync (×3.32) | 159 ms → 528 ms | 9% |
+| │ └ `write_meta` (×3.32) | 44 ms → 147 ms | 2% |
+| ├ `parse_rows` + the column census (×3.32) | 272 ms → 903 ms | 15% |
+| ├ materialize and dedup (residual) | ~470 ms | 8% |
+| └ sort + commit (×3.32) | ~15 ms → 49 ms | 1% |
+| `flush_advance` | 90 ms | 1.5% |
+| `flush_visibility` — the write-locked transition every query waits out | 23 ms | 0.4% |
+| `flush_open` — re-reading and checksumming everything just written | 13 ms | 0.2% |
+
+**So the engine's capacity is spent building the index that makes its read claim true.** Roughly
+**63% of the flush pass is `write_index`**, and the flush loop is 95% busy at the ceiling, so about
+six of every ten seconds this server can spend accepting logs are spent constructing trigram and
+exact-field blooms. Those blooms are why `metadata_rare` answers in 0.38 ms against VictoriaLogs'
+5.99 and Loki's 561 at 1.5 M rows. Both halves of that trade are now measured numbers rather than
+one measured number and one intuition: **this engine buys its read speed with its write capacity.**
+
+Two guesses this killed, both mine. `flush_open` — re-opening every part to validate checksums,
+which the code's own comment flags as deliberate I/O — is **13 ms**, not a cost worth the sentence
+defending it. And `write_parquet`, the obvious suspect because it holds the compression, is **9%**;
+zstd is not where the time goes, so compression level is not a lever on capacity.
+
+What is inside the 63%, from reading rather than measuring: a `BTreeSet<[u8; 3]>` insert for every
+trigram of every line (a 100-byte line is ~98 trigrams, a part is ~47,000 rows, so ~4.6 M tree
+operations per part over a domain of 2²⁴), an exact-field token encoded per metadata field, per
+`| json` field and per logfmt field per canonical variant, the logfmt parse over every line, and then
+sizing and filling one filter per group plus one per 1,024-row window.
+
+- [ ] **One lever here is not a trade, and it is the same shape as the one already taken.** Every
+  other candidate costs read performance — a looser FPP, fewer windows, indexing fewer fields — and
+  those are the claim's own foundation. The trigram set is not: `BTreeSet<[u8; 3]>` over a 2²⁴ domain
+  produces exactly the same filter a bitmap or a hash set would, for O(log n) per insert against
+  O(1), and there are millions of inserts per part. That is the identical shape as the two-pass parse
+  this file recorded and the code has since removed — a structure doing work the output does not
+  need. **Unmeasured**: reading says it is a large fraction of the 63% and reading has been wrong
+  twice on this page already, so it needs the same treatment as everything else — a change, a run at
+  30 k, and the ceiling compared. Whether to spend that is the open question; the diagnosis is done
+  either way.
 - [ ] **The ladder found a defect on its way past: an exhausted query memory pool answers `500`.**
   One query in the run failed, and its message is
   `rate({service_name="api-gateway"}[1m]): query memory pool of 322122547 bytes is exhausted`.
@@ -2330,8 +2380,12 @@ Write path:
 - [x] One sort — the chunked flush (2026-08-03, below) emits streams in `(tenant, labels)` order with
       per-stream entry ordering, so the global sort is gone; the per-partition `sort_rows` stays as the
       dedup and as a near-O(n) safety net over already-sorted input
-- [ ] One parse — `encode_blooms` runs the JSON and logfmt parsers over every line twice, to size the filter
-      and then to fill it (`part/format.rs:335-341`, `:360-366`)
+- [x] One parse — `encode_blooms` runs the JSON and logfmt parsers over every line twice, to size the filter
+      and then to fill it (`part/format.rs:335-341`, `:360-366`). **Done, and found stale while measuring the
+      flush ceiling** (audited 2026-08-13): `encode_group_blooms` collects tokens once into their windows and
+      sizes each filter from what it collected, and its comment says so — "this used to be two passes that each
+      ran the JSON and logfmt parsers over every line ... the tokens are collected once instead". The `| json`
+      half now rides the parse the `_pf:` columns already paid for.
 - [x] Move `rows_from_snapshot` and the global sort inside `spawn_blocking` — done by the chunked flush
       (2026-08-03, below): materialization happens per chunk inside the blocking task, and
       `rows_from_snapshot` is no longer on the production path at all
