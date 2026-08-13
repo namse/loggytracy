@@ -125,9 +125,25 @@ nothing throttled** — for 24 hours, 1.73 billion events, with anon flat betwee
 sidecar 120 MiB, row-group cache 153 MiB, WAL file 34 MiB, WAL backlog 3 MiB
 against its 1 GiB bound.
 
-**The ceiling above 20 k eps is unmeasured.** This run offered 20 k and got all
-of it, so capacity is *at least* that; naming a higher number honestly takes a
-run that offers more until backpressure refuses, and that run has not been done.
+**The ceiling** (rate ladder at the same configuration, 45 minutes a rung,
+32 ingest connections so the client is never the constraint, 2026-08-13):
+
+| offered | achieved | refused `429` | `memtable_buffered` peak |
+|---|---|---|---|
+| 22 k | **22,000 eps** | **0%** | 43.0 MiB |
+| 24 k | 23,445 eps | 2.3% | 124.0 MiB |
+| 30 k | **24,274 eps** | 19.1% | 124.0 MiB |
+
+Two numbers, and an operator wants the first: **22 k eps sustained with nothing
+refused**, and **24,274 eps absorbed** while refusing the excess. Everything
+refused is a `429`; no rung produced a 5xx or an OOM. What sets the ceiling is
+**flush, not the WAL** — the two saturated rungs both pin `memtable_buffered` at
+124.0 MiB against the 122.9 MiB `max_memtable_bytes` ("flush is not keeping up"),
+while the WAL backlog peaks at 34.8 MiB against its 1 GiB bound and the journal
+writer is *less* busy at the higher rate because group commit amortizes
+(`records/batch` 1.59 → 2.39). Raising `LOGGYTRACY_MAX_MEMTABLE_BYTES` moves the
+refusal, not the flush rate.
+
 The predecessor of this measurement read ~18.6 k eps with 6.9% answered `429`
 (2026-08-10) — that run carried a retention/merge lock-order stall that froze the
 flush thread for up to 52 s at a time, which is where the throttling came from;

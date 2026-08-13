@@ -92,12 +92,37 @@ the completed 24-hour soak at a 2 GiB container (2026-08-10): **sustained
 capacity is the whole offered 20 k eps** — 19,999.8, nothing throttled — for
 24 hours and 1.73 billion events, with anon flat between 1.47 and 1.57 GiB,
 query response p95 428 ms / p99 640 ms and zero 5xx in 432,001 queries
-(`soak-24h-lockorder`, 2026-08-12). The ceiling above 20 k is unmeasured: this
-run got everything it offered. The predecessor read ~18.6 k eps with 6.9%
+(`soak-24h-lockorder`, 2026-08-12). The predecessor read ~18.6 k eps with 6.9%
 throttled, and the difference was one lock-order defect — retention held the lock
 every query needs while it spun for one a merge rewrite was holding, stopping the
 server for up to 52 s at a time and starving the flush thread into backpressure
 (`ca32ee5`).
+
+**And the ceiling above 20 k is measured now** (a rate ladder at the same
+configuration, 45 minutes a rung, 2026-08-13). Two numbers, because a capacity
+has two honest forms:
+
+| offered | achieved | refused `429` | memtable peak (limit 122.9 MiB) |
+|---|---|---|---|
+| 20 k (24 h) | 19,999.8 eps | 0% | — |
+| 22 k | **22,000 eps** | **0%** | 43.0 MiB |
+| 24 k | 23,445 eps | 2.3% | **124.0** |
+| 30 k | **24,274 eps** | 19.1% | **124.0** |
+
+**Sustained without refusing anything: 22 k eps.** **Absorbed under overload:
+24,274 eps**, the rate the engine settles at while refusing the rest — and every
+refusal is a `429`, with no 5xx and no OOM at any rung. The knee is sharp rather
+than gradual: at 22 k the memtable sits at 35% of its limit, and 9% more offered
+pins it there.
+
+**What sets it is flush, not durability.** At both pinned rungs
+`memtable_buffered` peaks at exactly 124.0 MiB against the 122.9 MiB
+`max_memtable_bytes` — the gate whose message is "flush is not keeping up" —
+while the WAL backlog peaks at 34.8 MiB against a 1 GiB limit. The write-ahead
+path has headroom the whole way: group commit amortizes as the rate rises
+(`records/batch` 1.59 → 2.39, fsync mean 7.62 → 6.91 ms), so the journal writer
+task is *less* busy at 24 k eps accepted than at 20 k — 70% duty against 96%.
+The capacity of this engine at 2 GiB is how fast a memtable becomes parts.
 
 **Two of the five did not fit their share when this was measured**, and that is
 the finding rather than a sizing problem: flush materialized a whole memtable

@@ -1502,6 +1502,19 @@ p95 bucket 25 → 10 ms — so at 1.2x the accepted rate the writer task got *le
 101 batches/s × 6.91 ms is a **70% duty cycle against 96%** at 20 k eps. The durability path had
 headroom the whole time.
 
+**Two more rungs bracket it, and the knee is sharp** (`cap-24k`, `cap-22k`). At 24 k offered the
+engine refuses 2.31% and achieves 23,445 eps; at **22 k it refuses nothing at all** and achieves the
+whole 22,000, with `memtable_buffered` peaking at **43.0 MiB — 35% of its limit**. So 9% more offered
+is the difference between a memtable that drains comfortably and one pinned against its ceiling;
+this is a flush rate being crossed, not a resource gradually filling. The two saturated rungs pin at
+*exactly* the same place — 124.0 MiB memtable, 34.8 MiB WAL backlog, both to the decimal at 24 k and
+at 30 k — which is a wall that does not move when the offer rises 25%, and is the strongest evidence
+that the gate is what it says it is.
+
+The publishable pair, both measured rather than inferred: **22 k eps sustained refusing nothing**
+(45 min), **24,274 eps absorbed** under a 30 k offer. `docs/CONFIGURATION.md` and `docs/VISION.md`
+carry both, and the sentence "the ceiling above 20 k is unmeasured" is retired from both.
+
 **What refused is flush, and the gauges name it to the megabyte.** `memtable_buffered` peaked at
 **124.0 MiB against the 122.9 MiB `max_memtable_bytes`** — the gate whose message is "flush is not
 keeping up" — while the WAL backlog peaked at **34.8 MiB against a 1 GiB limit**, two orders of
