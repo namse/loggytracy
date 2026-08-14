@@ -1,23 +1,22 @@
-//! Bloom construction and lookup, plus the parser pass that sizes the
+//! Bloom construction and lookup, plus the parser pass behind the
 //! exact-field filter.
 //!
-//! `encode_blooms` (`src/part/format.rs:318-383`) runs the JSON and logfmt
-//! parsers over every line **twice** per row group: once at `:335-341` to size
-//! the filter and again at `:360-366` to fill it. `encode_blooms` itself and
-//! `logql::indexed_parser_fields` are private to the crate, so the pass is
-//! measured through the public LogQL pipeline instead — the doubled cost is
-//! two of `blooms/parse_pass`, and `part/write` in `part.rs` shows it landing
-//! in a real flush.
+//! `bloom/group` measures [`loggytracy::part::encode_group_blooms`] itself —
+//! the function the ceiling run attributed **63% of the flush pass** to. It
+//! used to measure a copy of the trigram loop kept here in the bench, which
+//! meant the shipped code could change without this number moving; the
+//! function is public for exactly this reason and for no other.
+//! `bloom/build_line` keeps the pieces separable underneath it: the trigram half against the
+//! exact-field half, so a change can be attributed rather than just observed.
 
 #[path = "corpus/mod.rs"]
 #[allow(dead_code)]
 mod corpus;
 
-use std::collections::BTreeSet;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use loggytracy::bloom::{BloomFilter, trigrams};
+use loggytracy::bloom::BloomFilter;
 use loggytracy::logql;
 use loggytracy::memtable::LogEntry;
 
@@ -42,35 +41,64 @@ fn field_token(name: &str, value: &str) -> Vec<u8> {
     token
 }
 
-/// Exactly what `encode_blooms` does for the line filter: unique trigrams for
-/// the row group, then one filter sized to that count.
-fn build_line_bloom(lines: &[&str]) -> BloomFilter {
-    let mut unique: BTreeSet<[u8; 3]> = BTreeSet::new();
-    for line in lines {
-        for trigram in trigrams(line) {
-            unique.insert(trigram);
+/// The whole of one row group's filters, as the flush path builds them: the
+/// trigram bloom over every line plus one exact-field sub-bloom per window.
+///
+/// This is the shipped function, not a reproduction of it. The ceiling run of
+/// 2026-08-13 put 63% of the flush pass inside it, so it is the one bench in
+/// this file whose movement means capacity.
+fn bench_group_blooms(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bloom/group");
+    group
+        .sample_size(10)
+        .warm_up_time(WARM_UP)
+        .measurement_time(Duration::from_secs(2));
+    // A row group is `row_group_size` rows, so the sweep brackets the default.
+    // Both shapes are here because they load different halves: `plain` is
+    // trigrams and metadata tokens, `json` adds a parsed field per key.
+    for (name, shape) in [("plain", Shape::Plain), ("json", Shape::Json)] {
+        for rows in [1_000usize, 10_000] {
+            let corpus = corpus::generate(
+                &CorpusSpec::default()
+                    .rows(rows)
+                    .streams(16)
+                    .metadata_pairs(3)
+                    .only(shape),
+            );
+            let part_rows = corpus.rows();
+            let parsed = loggytracy::part::parse_rows(&part_rows);
+            group.throughput(Throughput::Bytes(corpus.line_bytes()));
+            group.bench_with_input(
+                BenchmarkId::from_parameter(format!("{name}/{rows}")),
+                &(part_rows, parsed),
+                |b, (part_rows, parsed)| {
+                    b.iter(|| {
+                        loggytracy::part::encode_group_blooms(part_rows, parsed)
+                            .expect("bench group encodes")
+                    });
+                },
+            );
         }
     }
-    let mut bloom = BloomFilter::with_capacity(unique.len().max(1), 0.01);
-    for trigram in &unique {
-        bloom.insert(trigram);
-    }
-    bloom
+    group.finish();
 }
 
+/// The trigram half on its own, so a change to it can be attributed rather
+/// than inferred from `bloom/group` moving. The unique-trigram set and the
+/// filter fill are the two terms; both are here because a structure change
+/// trades one against the other.
 fn bench_line_bloom_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("bloom/build_line");
     group
         .sample_size(10)
         .warm_up_time(WARM_UP)
         .measurement_time(Duration::from_secs(2));
-    // A row group is `row_group_size` rows, so the sweep brackets the default.
     for rows in [1_000usize, 10_000] {
         let corpus = corpus::generate(&CorpusSpec::default().rows(rows).streams(16));
         let lines = corpus.lines();
         group.throughput(Throughput::Bytes(corpus.line_bytes()));
         group.bench_with_input(BenchmarkId::from_parameter(rows), &lines, |b, lines| {
-            b.iter(|| build_line_bloom(lines));
+            b.iter(|| loggytracy::bloom::line_bloom(lines.iter().copied()));
         });
     }
     group.finish();
@@ -111,7 +139,7 @@ fn bench_exact_field_build(c: &mut Criterion) {
 fn bench_lookup(c: &mut Criterion) {
     let corpus = corpus::generate(&CorpusSpec::default().rows(10_000).streams(16));
     let lines = corpus.lines();
-    let bloom = build_line_bloom(&lines);
+    let bloom = loggytracy::bloom::line_bloom(lines.iter().copied());
     let tokens: Vec<Vec<u8>> = corpus
         .entries()
         .iter()
@@ -182,6 +210,7 @@ fn bench_parse_pass(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_group_blooms,
     bench_line_bloom_build,
     bench_exact_field_build,
     bench_lookup,

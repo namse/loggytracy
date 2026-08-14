@@ -491,7 +491,7 @@ fn metadata_column_counts(rows: &[Row]) -> BTreeMap<String, u64> {
 /// column fill and nothing else — the parse was the whole added write cost of
 /// the `_pf:` columns, and running it once instead of twice is half of it
 /// back.
-fn parse_rows(rows: &[Row]) -> Vec<Option<BTreeMap<String, String>>> {
+pub fn parse_rows(rows: &[Row]) -> Vec<Option<BTreeMap<String, String>>> {
     rows.iter()
         .map(|row| crate::logql::parsed_json_fields(&row.line))
         .collect()
@@ -896,12 +896,18 @@ fn encode_blooms(
 /// Split out of [`encode_blooms`] so a writer that never holds the whole part
 /// can produce the same bytes a row group at a time. The batch path above still
 /// calls it, so the existing part-format tests are what prove the two agree.
-fn encode_group_blooms(
+///
+/// Public for `benches/bloom.rs` alone, and it has to be: this function is
+/// **63% of the flush pass** at the ceiling, and the bench that claimed to
+/// measure it held its own copy of the trigram loop instead — so the shipped
+/// code could change without the bench moving, which is a regression gate
+/// guarding nothing. A bench measures the function or it measures a fiction.
+pub fn encode_group_blooms(
     rows: &[Row],
     parsed_rows: &[Option<BTreeMap<String, String>>],
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    let mut unique_trigrams: BTreeSet<[u8; 3]> = BTreeSet::new();
+    let mut unique_trigrams = crate::bloom::TrigramSet::new();
     // One pass. Sizing the filters needs the token counts and filling them
     // needs the tokens, and this used to be two passes that each ran the JSON
     // and logfmt parsers over every line — the whole parse, twice, for a
@@ -911,9 +917,7 @@ fn encode_group_blooms(
     let mut window_tokens: Vec<Vec<Vec<u8>>> = vec![Vec::new(); window_count];
     for (index, (row, parsed)) in rows.iter().zip(parsed_rows).enumerate() {
         let window = &mut window_tokens[index / crate::part::BLOOM_WINDOW_ROWS];
-        for tri in crate::bloom::trigrams(&row.line) {
-            unique_trigrams.insert(tri);
-        }
+        unique_trigrams.add_line(&row.line);
         for (name, value) in &row.structured_metadata {
             for value in crate::logql::canonical_index_values(value) {
                 window.push(encode_exact_field_token(name, &value)?);
@@ -939,12 +943,7 @@ fn encode_group_blooms(
             }
         }
     }
-    let estimated_items = unique_trigrams.len().max(1);
-    let mut bloom = BloomFilter::with_capacity(estimated_items, 0.01);
-    for tri in &unique_trigrams {
-        bloom.insert(tri);
-    }
-    let bytes = bloom.encode();
+    let bytes = unique_trigrams.finish().encode();
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(&bytes);
     // No token to index means no filters at all — a zero window count. A
