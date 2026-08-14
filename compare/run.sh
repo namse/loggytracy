@@ -418,15 +418,17 @@ say "generating $DOC"
 cargo build --manifest-path "$ROOT/Cargo.toml" --release --bin compare_report
 "$ROOT/target/release/compare_report" "$OUT" "$DOC"
 
-for name in bed.json loki_config.diff loggytracy_env.txt victorialogs_flags.txt; do
-  cp "$OUT/$name" "$ARTIFACTS/$name" 2>/dev/null || true
-done
-for TARGET in $TARGETS; do
-  for phase in load seed matrix; do
-    cp "$OUT/${phase}_$TARGET.json" "$ARTIFACTS/${phase}_$TARGET.json" 2>/dev/null || true
-  done
-done
-cp "$OUT"/load_*_*g.json "$ARTIFACTS/" 2>/dev/null || true
+# Everything the run produced, not a list of it. The list this replaces named
+# 18 of the 29 files a run writes, and the eleven it missed were not spares:
+# the per-limit matrix JSON the document's own limit table is computed from,
+# both buildinfo files behind its build table, and the startup log it prints
+# verbatim. So `compare_report` aborted on the first missing file when pointed
+# at the directory the document tells a reader to point it at, and the
+# sentence "every number below comes from the JSON in artifacts/" was false
+# for three of its sections. A hand-maintained copy list drifts from what the
+# report reads every time the report reads something new; copying the whole
+# directory cannot.
+cp "$OUT"/* "$ARTIFACTS/" 2>/dev/null || true
 echo "results: $OUT" >&2
 echo "document: $DOC" >&2
 

@@ -1018,7 +1018,7 @@ The polish order, each item a measurement or a bound, none a feature:
   15.61x warm against the earlier 15.4x / 17.8x, `line_filter` 1.25x against 1.27x, `json_field`
   1.20x against 1.33x, `rate` 3.59x against 3.66x. The scanned shapes' losses are not run-to-run
   noise.
-- [ ] **A second corpus needed a second artifact directory, and for a day it did not have one.**
+- [x] **A second corpus needed a second artifact directory, and for a day it did not have one.**
   Found while setting the re-run up, not by looking for it. `compare/run.sh` copies its JSON to
   `docs/artifacts/m9` by default and the generated document hardcoded that same path in its prose —
   so the ten-times run of 2026-08-12 wrote its artifacts over the 150 k run's, and
@@ -1030,6 +1030,47 @@ The polish order, each item a measurement or a bound, none a feature:
   is now passed in by the script that does the copying (`COMPARE_ARTIFACTS_REL`), and the ten-times
   run has `docs/artifacts/m9-10x`. Left open only as a reminder that the copy-and-cite path has no
   test: nothing fails if a document cites a directory that was written by a different run.
+
+  **Tested now** (2026-08-14). `compare_report::tests::a_published_document_cites_the_run_that_wrote_its_artifacts`
+  reads every `docs/*.md` carrying the generation header, parses back the run it names and the
+  directory it cites, and holds three things: the cited `bed.json` must agree with the document's
+  own header on `generated_at`, `revision` and `branch`; no two documents may cite one directory;
+  and no directory under `docs/artifacts/` may go uncited. The last is not decoration — it is what
+  keeps the first two honest, because a reworded sentence that stopped parsing would otherwise leave
+  the test passing over an empty set, and instead it leaves both directories orphaned and red. The
+  two sentences it parses are constants shared with the generator that writes them
+  (`HEADER_SENTINEL`, `ARTIFACTS_SENTINEL`), for the reason the query-memory refusal's
+  `EXHAUSTED_PREFIX` is a constant: a literal spelled twice is a check that stops checking the day
+  someone edits the prose, which is how these two came apart in the first place. Each of the three
+  rules was verified by breaking the tree — a drifted revision, two documents on one directory (the
+  2026-08-12 failure, replayed), and an uncited directory — and the duplicate rule was made to fire
+  on its own with two documents describing the *same* run, since the first mutation tripped the
+  identity check before it ever reached the second rule.
+
+  **And the test found a bigger one on its way in: the published document could not be regenerated
+  from its published artifacts.** `compare/run.sh` copied an enumerated 18 of the 29 files a run
+  writes, and the missing eleven were not spares — the per-limit matrix JSON behind the document's
+  own limit-sweep table, both buildinfo files behind its build table, and the startup log it prints
+  verbatim. Pointed at `docs/artifacts/m9`, the directory the document tells a reader to point it
+  at, `compare_report` aborted on the first missing file. So "every number below comes from the JSON
+  in `artifacts/m9/`" was false for three of its sections, for the same reason as the original
+  defect: a hand-maintained list that drifts from what the report reads. The list is gone — the
+  script copies the run's whole output directory, which cannot drift — and `docs/artifacts/m9` is
+  completed from `target/compare`, which still holds that run and is byte-identical to the published
+  directory on all 18 files it already had. The document now regenerates from its own artifacts, and
+  **not one number moves**: the only difference against the checked-in file is two prose paragraphs
+  the generator gained in later commits.
+
+  *Two things this deliberately does not do.* `docs/COMPARISON.md` is **not** regenerated with
+  today's binary, even though it would now succeed: the generator's prose has since grown a
+  `__stream_shard__` exemption that the 150 k run's digest never applied, so regenerating would
+  print a description of three exemptions over answers computed with two. That also settles why the
+  test is identity-based rather than a byte-for-byte regeneration check — the prose moves with the
+  generator while a published document is fixed to its run, so the two are only equal on the day of
+  the run. And `docs/artifacts/m9-10x` stays incomplete: its eleven files were overwritten and
+  cannot be recovered, and reconstructing them from the numbers in the document would invert the
+  direction the whole scheme rests on. It completes itself at the next `COMPARE_VERIFY_ROWS=1500000`
+  run, and asserting completeness for every cited directory is the check that lands with it.
 4. **The review gate list** — worked through on 2026-08-12, in three passes with a finding in each.
 
    **The gates, audited item by item against the code.** The list had drifted *both* ways. Done and
