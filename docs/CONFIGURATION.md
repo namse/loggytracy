@@ -125,24 +125,31 @@ nothing throttled** — for 24 hours, 1.73 billion events, with anon flat betwee
 sidecar 120 MiB, row-group cache 153 MiB, WAL file 34 MiB, WAL backlog 3 MiB
 against its 1 GiB bound.
 
-**The ceiling** (rate ladder at the same configuration, 45 minutes a rung,
-32 ingest connections so the client is never the constraint, 2026-08-13):
+**The ceiling** (rate ladder at the same configuration, 45 minutes a rung, with
+enough ingest connections that the client is never the constraint — 32 at 30 k,
+96 at 45 k, sized from the measured service p95; 2026-08-14):
 
 | offered | achieved | refused `429` | `memtable_buffered` peak |
 |---|---|---|---|
-| 22 k | **22,000 eps** | **0%** | 43.0 MiB |
-| 24 k | 23,445 eps | 2.3% | 124.0 MiB |
-| 30 k | **24,274 eps** | 19.1% | 124.0 MiB |
+| 30 k | **29,996.5 eps** | **0%** | 78.0 MiB |
+| 45 k | **34,666 eps** | 22.9% | 126.3 MiB |
 
-Two numbers, and an operator wants the first: **22 k eps sustained with nothing
-refused**, and **24,274 eps absorbed** while refusing the excess. Everything
+Two numbers, and an operator wants the first: **30 k eps sustained with nothing
+refused**, and **34,666 eps absorbed** while refusing the excess. Everything
 refused is a `429`; no rung produced a 5xx or an OOM. What sets the ceiling is
-**flush, not the WAL** — the two saturated rungs both pin `memtable_buffered` at
-124.0 MiB against the 122.9 MiB `max_memtable_bytes` ("flush is not keeping up"),
-while the WAL backlog peaks at 34.8 MiB against its 1 GiB bound and the journal
+**flush, not the WAL** — the saturated rung pins `memtable_buffered` at
+126.3 MiB against the 122.9 MiB `max_memtable_bytes` ("flush is not keeping up"),
+while the WAL backlog peaks at 27.7 MiB against its 1 GiB bound and the journal
 writer is *less* busy at the higher rate because group commit amortizes
-(`records/batch` 1.59 → 2.39). Raising `LOGGYTRACY_MAX_MEMTABLE_BYTES` moves the
+(`records/batch` 1.59 → 4.07). Raising `LOGGYTRACY_MAX_MEMTABLE_BYTES` moves the
 refusal, not the flush rate.
+
+No rung between 30 k and 45 k has been run, so the knee is bracketed to 15 k and
+not narrower. The pair this replaces — **22 k sustained / 24,274 absorbed**, the
+same rig two commits earlier — moved because the flush pass spent 63% of itself
+building blooms through a `BTreeSet` over a domain a bitmap covers in 2 MiB
+(`816b260`): `write_index` is now 10.9 µs an event instead of 25.2. A change to
+the flush path invalidates this table, which is why it carries its date.
 
 The predecessor of this measurement read ~18.6 k eps with 6.9% answered `429`
 (2026-08-10) — that run carried a retention/merge lock-order stall that froze the

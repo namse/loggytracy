@@ -1657,11 +1657,31 @@ sizing and filling one filter per group plus one per 1,024-row window.
   distribution. At full service the harness itself is now inside the measurement — 600 pushes/s over
   32 connections is a 53 ms budget against a service p95 of 114 ms, and the queueing delay p95 is
   191 ms. The next rung needs more connections before it can claim to be measuring the server.
-- [ ] **The ladder has to climb again, and this is not optional bookkeeping.** Two published
+- [x] **The ladder has to climb again, and this is not optional bookkeeping.** Two published
   documents state a capacity this engine no longer has, and the honest correction is a measured
   number rather than a deletion. The next rung is 45 k at more than 32 connections — the client's own
   budget is the constraint at 30 k already — with the same registered stopping rule: achieved below
   99% of offered, any throttle, any 5xx, or an OOM kill.
+
+  **Climbed, and 45 k is the rung that refuses** (`bitmap-45k`, 96 connections, 45 minutes).
+  22.9% refused, **34,666 eps achieved** of 45,000 offered, no 5xx, no OOM. `memtable_buffered`
+  peaked at **126.3 MiB against the 122.9 limit** and `rows/part` came back to 47,004 — the exact
+  signature the old saturated rungs had, so the same gate is refusing for the same reason at a
+  higher rate. The publishable pair is now **30 k sustained refusing nothing / 34,666 absorbed**,
+  against 22 k / 24,274 two commits earlier: **+36% and +43%.** `docs/VISION.md` and
+  `docs/CONFIGURATION.md` carry it with its date and with what invalidates it.
+
+  *The per-event cost held across rungs, which is the check that the bench number was real:*
+  `write_index` reads 10.87 µs/event at 30 k and **10.92 at 45 k** — the same work per event at
+  1.5x the rate, where the pre-change run read 25.15. `write_parquet` fell back to 4.05 from the
+  30 k run's 6.32, confirming that rise as the smaller-parts artifact it was read as rather than
+  anything the change introduced: at 45 k the parts are 47,004 rows again and the fixed costs
+  amortize as they used to.
+- [ ] **The knee is bracketed to 15 k where the last ladder bracketed its own to 2 k.** 30 k refuses
+  nothing, 45 k refuses 22.9%, and nothing between them has been run. One rung at ~37 k halves it and
+  is the only thing standing between the published pair and the precision the previous pair had. Not
+  urgent — both published numbers are measured and neither is an interpolation — but the asymmetry
+  should be a decision rather than an omission.
 
   *The connection count, chosen before the run and by arithmetic rather than by taste:* 45 k eps at
   100 entries a push is 450 pushes/s, and a connection can issue one push per service time, so

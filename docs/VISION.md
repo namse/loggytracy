@@ -99,30 +99,44 @@ server for up to 52 s at a time and starving the flush thread into backpressure
 (`ca32ee5`).
 
 **And the ceiling above 20 k is measured now** (a rate ladder at the same
-configuration, 45 minutes a rung, 2026-08-13). Two numbers, because a capacity
-has two honest forms:
+configuration, 45 minutes a rung, 2026-08-13 and re-run 2026-08-14). Two
+numbers, because a capacity has two honest forms:
 
 | offered | achieved | refused `429` | memtable peak (limit 122.9 MiB) |
 |---|---|---|---|
 | 20 k (24 h) | 19,999.8 eps | 0% | — |
-| 22 k | **22,000 eps** | **0%** | 43.0 MiB |
-| 24 k | 23,445 eps | 2.3% | **124.0** |
-| 30 k | **24,274 eps** | 19.1% | **124.0** |
+| **30 k** | **29,996.5 eps** | **0%** | 78.0 MiB |
+| **45 k** | **34,666 eps** | 22.9% | **126.3** |
 
-**Sustained without refusing anything: 22 k eps.** **Absorbed under overload:
-24,274 eps**, the rate the engine settles at while refusing the rest — and every
-refusal is a `429`, with no 5xx and no OOM at any rung. The knee is sharp rather
-than gradual: at 22 k the memtable sits at 35% of its limit, and 9% more offered
-pins it there.
+**Sustained without refusing anything: 30 k eps.** **Absorbed under overload:
+34,666 eps**, the rate the engine settles at while refusing the rest — and every
+refusal is a `429`, with no 5xx and no OOM at any rung.
 
-**What sets it is flush, not durability.** At both pinned rungs
-`memtable_buffered` peaks at exactly 124.0 MiB against the 122.9 MiB
-`max_memtable_bytes` — the gate whose message is "flush is not keeping up" —
-while the WAL backlog peaks at 34.8 MiB against a 1 GiB limit. The write-ahead
-path has headroom the whole way: group commit amortizes as the rate rises
-(`records/batch` 1.59 → 2.39, fsync mean 7.62 → 6.91 ms), so the journal writer
-task is *less* busy at 24 k eps accepted than at 20 k — 70% duty against 96%.
-The capacity of this engine at 2 GiB is how fast a memtable becomes parts.
+*Both numbers replace lower ones, and the reason is one line of code.* The
+ladder first read **22 k sustained / 24,274 absorbed**, and the flush loop's
+phase table then put 63% of the pass inside `write_index` — building the trigram
+and exact-field blooms that make the read claim below true. That set was a
+`BTreeSet` over a 2²⁴ domain where a bitmap over the same domain produces the
+identical filter (`816b260`); with it, `write_index` costs 10.9 µs an event
+instead of 25.2 and is 37% of the pass instead of 65%. **This engine buys its
+read speed with its write capacity, and the price was being paid twice.** The
+22 k/24,274 pair is retired rather than deleted: it is what the same rig
+measured two commits earlier, and it is why the ladder is re-run after any change
+to the flush path.
+
+**What sets it is flush, not durability.** At every refusing rung
+`memtable_buffered` pins against the 122.9 MiB `max_memtable_bytes` — the gate
+whose message is "flush is not keeping up" — while the WAL backlog peaks two
+orders of magnitude below its own limit. At 30 k, where nothing is refused, the
+memtable sits at 78.0 MiB and the flush loop is 88% busy rather than 95%. The
+write-ahead path has headroom the whole way: group commit amortizes as the rate
+rises (`records/batch` 1.59 → 4.07), so the journal writer is *less* busy at a
+higher accepted rate. The capacity of this engine at 2 GiB is how fast a memtable
+becomes parts.
+
+*Where the knee is, stated as what was measured rather than as a curve:* 30 k
+refuses nothing and 45 k refuses 22.9%, and no rung between them has been run.
+The earlier ladder bracketed its knee to 2 k and this one is bracketed to 15 k.
 
 **Two of the five did not fit their share when this was measured**, and that is
 the finding rather than a sizing problem: flush materialized a whole memtable
