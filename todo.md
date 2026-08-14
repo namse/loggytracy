@@ -1662,6 +1662,13 @@ sizing and filling one filter per group plus one per 1,024-row window.
   number rather than a deletion. The next rung is 45 k at more than 32 connections — the client's own
   budget is the constraint at 30 k already — with the same registered stopping rule: achieved below
   99% of offered, any throttle, any 5xx, or an OOM kill.
+
+  *The connection count, chosen before the run and by arithmetic rather than by taste:* 45 k eps at
+  100 entries a push is 450 pushes/s, and a connection can issue one push per service time, so
+  covering the 30 k run's service p95 of 114 ms needs 51 connections before the client is even at
+  parity. **96**, for roughly twice that. The 30 k rung is not re-run at 96 because it does not need
+  to be: it achieved 99.99% of its offer at 32, which is the client proving it was not the constraint
+  there.
 - [x] **The ladder found a defect on its way past: an exhausted query memory pool answers `500`.**
   One query in the run failed, and its message is
   `rate({service_name="api-gateway"}[1m]): query memory pool of 322122547 bytes is exhausted`.
