@@ -1604,7 +1604,7 @@ operations per part over a domain of 2²⁴), an exact-field token encoded per m
 `| json` field and per logfmt field per canonical variant, the logfmt parse over every line, and then
 sizing and filling one filter per group plus one per 1,024-row window.
 
-- [ ] **One lever here is not a trade, and it is the same shape as the one already taken.** Every
+- [x] **One lever here is not a trade, and it is the same shape as the one already taken.** Every
   other candidate costs read performance — a looser FPP, fewer windows, indexing fewer fields — and
   those are the claim's own foundation. The trigram set is not: `BTreeSet<[u8; 3]>` over a 2²⁴ domain
   produces exactly the same filter a bitmap or a hash set would, for O(log n) per insert against
@@ -1614,6 +1614,54 @@ sizing and filling one filter per group plus one per 1,024-row window.
   twice on this page already, so it needs the same treatment as everything else — a change, a run at
   30 k, and the ceiling compared. Whether to spend that is the open question; the diagnosis is done
   either way.
+
+  **Spent, and the rung that defined the ceiling stopped refusing** (`bitmap-30k`, 2026-08-14,
+  45 minutes at 30 k offered / 32 connections / 2 GiB, the same configuration as `writephase-30k`
+  beside it). **29,996.5 eps achieved of 30,000 offered, nothing throttled, no 5xx, no OOM** —
+  against 24,512 eps and 18.3% refused before. Every one of the ladder's registered stopping
+  conditions is now unmet at this rung, so **the published pair (22 k refusing nothing, 24,274
+  absorbed) is superseded and the ceiling is once again unmeasured, somewhere above 30 k.**
+  `docs/VISION.md` and `docs/CONFIGURATION.md` carry the retired numbers and cannot be corrected
+  until the ladder climbs again; that run is the item below.
+
+  *The gate that refused names itself as the one that stopped:* `memtable_buffered` peaked at
+  **78.0 MiB against its 122.9 MiB limit**, where both saturated rungs used to pin at 124.0 to the
+  decimal. WAL backlog 27.6 → 6.8 MiB. The flush loop went from **95% busy to 88%** while accepting
+  22% more events.
+
+  *What actually moved, per event — the only fair unit, because the shape of an observation
+  changed.* Flushes went 424 → 2,493 passes and parts 46,973 → 30,417 rows, since a flush that keeps
+  up cuts on its interval instead of draining a memtable pinned at the limit. So per-part means
+  flatter the result and per-event numbers are the honest ones:
+
+  | phase | µs/event before | after | |
+  |---|---|---|---|
+  | `write_index` | 25.15 | **10.87** | **−57%** |
+  | `write_part_files` | 29.48 | 19.67 | −33% |
+  | `build` | 38.71 | **29.43** | **−24%** |
+  | `write_parquet` | 3.39 | 6.32 | +87% |
+  | `write_meta` | 0.94 | 2.45 | +160% |
+  | `flush_visibility` | 0.15 | 1.10 | +642% |
+
+  **The blooms are no longer the flush's largest term: `write_index` is 37% of `build`, from 65%.**
+  The four rows that rose are per-part and per-pass fixed costs amortized over smaller parts and six
+  times as many passes — the signature of an engine that is no longer saturated rather than a cost
+  the bitmap introduced — but they are real at the new operating point, and `write_parquet` at 512 s
+  of the 2,700 is now the second-largest term where it used to be 9%. `flush_visibility`, the
+  write-locked transition every query waits out, went from 10 s to **89 s across the run**; it did
+  not become a stall (11,237 queries, 0 errors, the stall detector at n=0), and it is the number to
+  watch if the flush interval is ever shortened further.
+
+  *Latency is worse and the two runs cannot be compared on it:* response p95 162 → 298 ms, but 18.3%
+  of the earlier run's pushes were `429` refusals, which are cheap to serve and were flattering the
+  distribution. At full service the harness itself is now inside the measurement — 600 pushes/s over
+  32 connections is a 53 ms budget against a service p95 of 114 ms, and the queueing delay p95 is
+  191 ms. The next rung needs more connections before it can claim to be measuring the server.
+- [ ] **The ladder has to climb again, and this is not optional bookkeeping.** Two published
+  documents state a capacity this engine no longer has, and the honest correction is a measured
+  number rather than a deletion. The next rung is 45 k at more than 32 connections — the client's own
+  budget is the constraint at 30 k already — with the same registered stopping rule: achieved below
+  99% of offered, any throttle, any 5xx, or an OOM kill.
 - [x] **The ladder found a defect on its way past: an exhausted query memory pool answers `500`.**
   One query in the run failed, and its message is
   `rate({service_name="api-gateway"}[1m]): query memory pool of 322122547 bytes is exhausted`.
