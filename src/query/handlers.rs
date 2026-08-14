@@ -926,7 +926,17 @@ loggytracy_object_store_ranged_gets_total {}\n\
 # HELP loggytracy_object_store_bytes_total Bytes moved to and from the object store. Read bytes are what the responses agreed to return, not what a caller consumed.\n\
 # TYPE loggytracy_object_store_bytes_total counter\n\
 loggytracy_object_store_bytes_total{{direction=\"get\"}} {}\n\
-loggytracy_object_store_bytes_total{{direction=\"put\"}} {}\n",
+loggytracy_object_store_bytes_total{{direction=\"put\"}} {}\n\
+# HELP loggytracy_object_store_bytes_by_kind_total The same bytes split by what was read or written. A part restore and a manifest rewrite are both bytes and only one of them is a part; the totals above cannot tell them apart.\n\
+# TYPE loggytracy_object_store_bytes_by_kind_total counter\n\
+loggytracy_object_store_bytes_by_kind_total{{direction=\"get\",kind=\"manifest\"}} {}\n\
+loggytracy_object_store_bytes_by_kind_total{{direction=\"get\",kind=\"part\"}} {}\n\
+loggytracy_object_store_bytes_by_kind_total{{direction=\"get\",kind=\"trace_part\"}} {}\n\
+loggytracy_object_store_bytes_by_kind_total{{direction=\"get\",kind=\"other\"}} {}\n\
+loggytracy_object_store_bytes_by_kind_total{{direction=\"put\",kind=\"manifest\"}} {}\n\
+loggytracy_object_store_bytes_by_kind_total{{direction=\"put\",kind=\"part\"}} {}\n\
+loggytracy_object_store_bytes_by_kind_total{{direction=\"put\",kind=\"trace_part\"}} {}\n\
+loggytracy_object_store_bytes_by_kind_total{{direction=\"put\",kind=\"other\"}} {}\n",
         counts.puts,
         counts.multipart_puts,
         counts.gets,
@@ -937,6 +947,14 @@ loggytracy_object_store_bytes_total{{direction=\"put\"}} {}\n",
         counts.ranged_gets,
         counts.get_bytes,
         counts.put_bytes,
+        counts.get_bytes_by_kind.manifest,
+        counts.get_bytes_by_kind.part,
+        counts.get_bytes_by_kind.trace_part,
+        counts.get_bytes_by_kind.other,
+        counts.put_bytes_by_kind.manifest,
+        counts.put_bytes_by_kind.part,
+        counts.put_bytes_by_kind.trace_part,
+        counts.put_bytes_by_kind.other,
     )
 }
 

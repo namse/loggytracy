@@ -60,6 +60,81 @@ pub struct ObjectStoreOps {
     /// Bytes handed to the backend to store, counted before the call so a
     /// failed upload still shows what it tried to move.
     pub put_bytes: AtomicU64,
+    /// The same two totals, split by what was being read or written.
+    ///
+    /// Aggregates cannot answer the question this meter was added for. A part
+    /// restore and a manifest rewrite are both bytes, and only one of them is
+    /// what range reads would shrink — reading a single total and attributing
+    /// it to restores is the arithmetic-on-an-estimate this file's own header
+    /// warns about.
+    pub get_bytes_by_kind: PathBytes,
+    pub put_bytes_by_kind: PathBytes,
+}
+
+/// Bytes per object class. The classes are the storage layout's own top-level
+/// split, so a path that matches none of them is a path this accounting has
+/// not been taught about and is counted as `other` rather than dropped.
+#[derive(Debug, Default)]
+pub struct PathBytes {
+    pub manifest: AtomicU64,
+    pub part: AtomicU64,
+    pub trace_part: AtomicU64,
+    pub other: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PathByteCounts {
+    pub manifest: u64,
+    pub part: u64,
+    pub trace_part: u64,
+    pub other: u64,
+}
+
+/// Which class a key belongs to, decided by the prefixes `catalog.rs` builds.
+///
+/// Both manifests are one class: they are the same mechanism — one whole
+/// object rewritten per commit — and separating them would suggest the cost
+/// differs by domain when what it varies with is the commit rate.
+fn classify(location: &Path) -> ObjectClass {
+    let key = location.as_ref();
+    if key.ends_with("manifest.json") {
+        ObjectClass::Manifest
+    } else if key.contains("/parts/") || key.starts_with("parts/") {
+        ObjectClass::Part
+    } else if key.contains("/trace_parts/") || key.starts_with("trace_parts/") {
+        ObjectClass::TracePart
+    } else {
+        ObjectClass::Other
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectClass {
+    Manifest,
+    Part,
+    TracePart,
+    Other,
+}
+
+impl PathBytes {
+    fn add(&self, class: ObjectClass, bytes: u64) {
+        let counter = match class {
+            ObjectClass::Manifest => &self.manifest,
+            ObjectClass::Part => &self.part,
+            ObjectClass::TracePart => &self.trace_part,
+            ObjectClass::Other => &self.other,
+        };
+        counter.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PathByteCounts {
+        PathByteCounts {
+            manifest: self.manifest.load(Ordering::Relaxed),
+            part: self.part.load(Ordering::Relaxed),
+            trace_part: self.trace_part.load(Ordering::Relaxed),
+            other: self.other.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -74,6 +149,8 @@ pub struct ObjectStoreOpCounts {
     pub copies: u64,
     pub get_bytes: u64,
     pub put_bytes: u64,
+    pub get_bytes_by_kind: PathByteCounts,
+    pub put_bytes_by_kind: PathByteCounts,
 }
 
 impl ObjectStoreOps {
@@ -89,6 +166,8 @@ impl ObjectStoreOps {
             copies: self.copies.load(Ordering::Relaxed),
             get_bytes: self.get_bytes.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
+            get_bytes_by_kind: self.get_bytes_by_kind.snapshot(),
+            put_bytes_by_kind: self.put_bytes_by_kind.snapshot(),
         }
     }
 }
@@ -125,9 +204,9 @@ impl ObjectStore for CountingStore {
         // Counted before the call, and regardless of the outcome: a rejected
         // conditional put is a request the backend served and bills for.
         self.ops.puts.fetch_add(1, Ordering::Relaxed);
-        self.ops
-            .put_bytes
-            .fetch_add(payload.content_length() as u64, Ordering::Relaxed);
+        let bytes = payload.content_length() as u64;
+        self.ops.put_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.ops.put_bytes_by_kind.add(classify(location), bytes);
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -155,9 +234,9 @@ impl ObjectStore for CountingStore {
             // GET the two are equal, and for a ranged one only this is the
             // transfer. A failed GET moved nothing and is counted as a
             // request but not as bytes.
-            self.ops
-                .get_bytes
-                .fetch_add(got.range.end - got.range.start, Ordering::Relaxed);
+            let bytes = got.range.end - got.range.start;
+            self.ops.get_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.ops.get_bytes_by_kind.add(classify(location), bytes);
         }
         result
     }

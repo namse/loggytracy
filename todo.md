@@ -2755,6 +2755,49 @@ Read path:
       are merged; `loggytracy_wal_replayed_entries` still reports the upper bound a restart introduced
 - [ ] Add Parquet range reads (**multi-tenancy prerequisite** — shared parts must read only a tenant's byte range,
       so this is no longer an optional optimization)
+
+      **Measured before being built, and the measurement does not support the framing** (2026-08-14,
+      Tier B rig — `scripts/run_load_local.sh`, which already runs the engine on `file://` with an
+      8 MiB part cache to force eviction→restore — at 16 tenants for 240 s, with the byte meter added
+      in `bd72732`). Four facts, in the order they killed each other's readings.
+
+      1. **Part data is 99.9% of what this engine reads from object storage** — 917.3 MB against the
+         manifest's 0.85 MB. The first arithmetic on the aggregate said the opposite, which is why
+         the counter is split by object class: a part restore and a manifest rewrite are both bytes,
+         and the total cannot tell them apart.
+      2. **A restore already fetches only the parts a query admitted.** Eviction drops `data.parquet`
+         and keeps `index.bin` and `meta.json` (`cache.rs`, `evict_bodies`), so bloom and index
+         pruning happen locally and cost no bytes at all. There is no "download it to find out it
+         does not match" to remove.
+      3. **What it over-fetches is inside the admitted part, and it is not only the tenant axis.**
+         Every part held **15.2 of 16 tenants**, so ~93% of a restored part is rows the querying
+         tenant cannot see — but the download also ignores the row-group and page selection the scan
+         then applies for time and labels. So the honest description is not "shared parts must read
+         only a tenant's byte range": it is that **the download applies none of the selection the
+         read path already computes**, which costs a single-tenant deployment the same way.
+      4. **And the whole of it is a function of cache pressure, which is a deployment property
+         nothing states.** The same run with a cache that holds the working set: **64 restores and
+         749 KiB per query becomes 2 restores and 17.4 KiB — 43x.** The production default is
+         `LOGGYTRACY_CACHE_MAX_BYTES` = **10 GiB of local disk**, so the documented deployment is the
+         second regime and not the first.
+
+      So the item's value is `restore rate × over-fetch per restore`. The second factor is measured
+      now; the first is not a property of this code and cannot be derived from it — it is how often
+      queries reach outside the local disk cache, which depends on retention against cache size and
+      on how far back users query, and **no document here states either.** Building against an
+      unstated rate is the "arithmetic on an estimate" that `counting_store.rs`'s own header was
+      written to warn about.
+
+      *What this does not say:* that the work is worthless. At 30-day retention a 10 GiB cache holds a
+      fraction of the data, and any query outside it pays the full over-fetch. It says the item is
+      **unsizeable as written**, and that what it needs next is a stated deployment assumption rather
+      than code — plus a re-scope, because "tenant byte range" names one axis of a download that
+      currently uses none.
+
+      *One caveat on the rig, stated rather than buried:* the large-cache run's verdict is `FAIL`, on
+      `remote_healthy_fraction` 0.908 against a 0.95 gate. That is Tier B's injected 3% object-store
+      error rate landing on a much smaller number of operations, not a behaviour change — the byte
+      counters it produced are unaffected, and the small-cache run at the same injection passes.
 - [ ] Improve metric evaluation from bounded in-memory computation to streaming/pre-aggregation
 - [x] ~~Validate a deployment environment using real S3~~ — **confirmed out of scope.** This is an indie project,
       so local MinIO is the upper bound for load validation. What is validated, what risks remain, and what to

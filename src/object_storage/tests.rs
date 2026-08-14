@@ -1595,6 +1595,28 @@ opens a connection per part"
             "no read path asks for a byte range yet; when one does, this is the \
              number that stops being zero"
         );
+
+        // The split has to add up, or a class silently swallows another's
+        // bytes and the conclusion drawn from it is wrong in the direction
+        // nobody checks. `other` is a real class here, not a leak: the upload
+        // marker is neither a part nor a manifest.
+        let by_kind = tenth_publish.put_bytes_by_kind;
+        assert_eq!(
+            by_kind.manifest + by_kind.part + by_kind.trace_part + by_kind.other,
+            tenth_publish.put_bytes,
+            "the per-kind byte split must account for every byte the total counted"
+        );
+        assert!(
+            by_kind.part > 0 && by_kind.manifest > 0,
+            "publishing a part writes both part files and a manifest, so neither \
+             class may be zero: {by_kind:?}"
+        );
+        let read_kinds = tenth_publish.get_bytes_by_kind;
+        assert_eq!(
+            read_kinds.manifest + read_kinds.part + read_kinds.trace_part + read_kinds.other,
+            tenth_publish.get_bytes,
+            "the per-kind byte split must account for every byte the total counted"
+        );
     }
 
     /// The request half of a cost, with the byte half dropped. They are
@@ -1604,6 +1626,8 @@ opens a connection per part"
         ObjectStoreOpCounts {
             get_bytes: 0,
             put_bytes: 0,
+            get_bytes_by_kind: PathByteCounts::default(),
+            put_bytes_by_kind: PathByteCounts::default(),
             ..counts
         }
     }
@@ -1620,6 +1644,17 @@ opens a connection per part"
             copies: after.copies - before.copies,
             get_bytes: after.get_bytes - before.get_bytes,
             put_bytes: after.put_bytes - before.put_bytes,
+            get_bytes_by_kind: kind_delta(before.get_bytes_by_kind, after.get_bytes_by_kind),
+            put_bytes_by_kind: kind_delta(before.put_bytes_by_kind, after.put_bytes_by_kind),
+        }
+    }
+
+    fn kind_delta(before: PathByteCounts, after: PathByteCounts) -> PathByteCounts {
+        PathByteCounts {
+            manifest: after.manifest - before.manifest,
+            part: after.part - before.part,
+            trace_part: after.trace_part - before.trace_part,
+            other: after.other - before.other,
         }
     }
 

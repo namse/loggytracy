@@ -1322,6 +1322,27 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         "lists": probe::object_store_op_delta(&start_metrics, &end_metrics, "list"),
         "copies": probe::object_store_op_delta(&start_metrics, &end_metrics, "copy"),
         "listed_objects": delta("loggytracy_object_store_listed_objects_total"),
+        // The byte axis, and the restores that generate most of it. A restore
+        // downloads a whole part, and a part is shared by every tenant whose
+        // rows landed in it — so `get_bytes / restores` against a tenant's
+        // share of a part is the size of "add Parquet range reads", which was
+        // an argument from reading the code until this ran.
+        "ranged_gets": delta("loggytracy_object_store_ranged_gets_total"),
+        "get_bytes": delta("loggytracy_object_store_bytes_total{direction=\"get\"}"),
+        "put_bytes": delta("loggytracy_object_store_bytes_total{direction=\"put\"}"),
+        "get_bytes_by_kind": {
+            "manifest": delta("loggytracy_object_store_bytes_by_kind_total{direction=\"get\",kind=\"manifest\"}"),
+            "part": delta("loggytracy_object_store_bytes_by_kind_total{direction=\"get\",kind=\"part\"}"),
+            "trace_part": delta("loggytracy_object_store_bytes_by_kind_total{direction=\"get\",kind=\"trace_part\"}"),
+            "other": delta("loggytracy_object_store_bytes_by_kind_total{direction=\"get\",kind=\"other\"}"),
+        },
+        "put_bytes_by_kind": {
+            "manifest": delta("loggytracy_object_store_bytes_by_kind_total{direction=\"put\",kind=\"manifest\"}"),
+            "part": delta("loggytracy_object_store_bytes_by_kind_total{direction=\"put\",kind=\"part\"}"),
+            "trace_part": delta("loggytracy_object_store_bytes_by_kind_total{direction=\"put\",kind=\"trace_part\"}"),
+            "other": delta("loggytracy_object_store_bytes_by_kind_total{direction=\"put\",kind=\"other\"}"),
+        },
+        "restores": delta("loggytracy_remote_restore_latency_ms_count"),
         "cycles": {
             "flush": flush_success,
             "merge": merge_success,

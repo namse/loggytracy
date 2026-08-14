@@ -149,7 +149,7 @@ struct LocalMergeGroup {
 mod counting_store;
 mod fault_store;
 
-pub use counting_store::{CountingStore, ObjectStoreOpCounts, ObjectStoreOps};
+pub use counting_store::{CountingStore, ObjectStoreOpCounts, ObjectStoreOps, PathByteCounts};
 
 include!("paths.rs");
 include!("catalog.rs");
