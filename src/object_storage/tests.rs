@@ -1571,9 +1571,41 @@ opens a connection per part"
         let tenth_publish = delta(before, storage.operation_counts());
 
         assert_eq!(
-            tenth_publish, first_publish,
+            requests_of(tenth_publish),
+            requests_of(first_publish),
             "publication cost must not grow with the size of the manifest"
         );
+
+        // In *requests* it does not grow. In *bytes* it does, and the byte
+        // counter is what makes that visible: the manifest is rewritten whole
+        // on every publish, so the tenth costs about ten times the first to
+        // move even though it costs exactly the same to issue. That is
+        // "P1-11: manifest as generational deltas" in `todo.md`, deferred with
+        // its reason and measured here rather than argued — the two units
+        // disagree, and a design that reads only the first one cannot see it.
+        assert!(
+            tenth_publish.put_bytes > first_publish.put_bytes,
+            "the manifest is rewritten in full, so the tenth publish must move \
+             more bytes than the first: {} against {}",
+            tenth_publish.put_bytes,
+            first_publish.put_bytes
+        );
+        assert_eq!(
+            tenth_publish.ranged_gets, 0,
+            "no read path asks for a byte range yet; when one does, this is the \
+             number that stops being zero"
+        );
+    }
+
+    /// The request half of a cost, with the byte half dropped. They are
+    /// different units with different growth, and an assertion that means to
+    /// compare one must not silently compare both.
+    fn requests_of(counts: ObjectStoreOpCounts) -> ObjectStoreOpCounts {
+        ObjectStoreOpCounts {
+            get_bytes: 0,
+            put_bytes: 0,
+            ..counts
+        }
     }
 
     fn delta(before: ObjectStoreOpCounts, after: ObjectStoreOpCounts) -> ObjectStoreOpCounts {
@@ -1581,10 +1613,13 @@ opens a connection per part"
             puts: after.puts - before.puts,
             multipart_puts: after.multipart_puts - before.multipart_puts,
             gets: after.gets - before.gets,
+            ranged_gets: after.ranged_gets - before.ranged_gets,
             deletes: after.deletes - before.deletes,
             lists: after.lists - before.lists,
             listed_objects: after.listed_objects - before.listed_objects,
             copies: after.copies - before.copies,
+            get_bytes: after.get_bytes - before.get_bytes,
+            put_bytes: after.put_bytes - before.put_bytes,
         }
     }
 

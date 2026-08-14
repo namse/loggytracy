@@ -919,7 +919,14 @@ loggytracy_object_store_operations_total{{kind=\"list\"}} {}\n\
 loggytracy_object_store_operations_total{{kind=\"copy\"}} {}\n\
 # HELP loggytracy_object_store_listed_objects_total Objects the listings returned. A backend pages a listing, so its request count follows from this and the page size rather than from the list count.\n\
 # TYPE loggytracy_object_store_listed_objects_total counter\n\
-loggytracy_object_store_listed_objects_total {}\n",
+loggytracy_object_store_listed_objects_total {}\n\
+# HELP loggytracy_object_store_ranged_gets_total GETs that asked for a byte range rather than a whole object. Zero means every restore moves the whole part, including the rows belonging to other tenants of a shared part.\n\
+# TYPE loggytracy_object_store_ranged_gets_total counter\n\
+loggytracy_object_store_ranged_gets_total {}\n\
+# HELP loggytracy_object_store_bytes_total Bytes moved to and from the object store. Read bytes are what the responses agreed to return, not what a caller consumed.\n\
+# TYPE loggytracy_object_store_bytes_total counter\n\
+loggytracy_object_store_bytes_total{{direction=\"get\"}} {}\n\
+loggytracy_object_store_bytes_total{{direction=\"put\"}} {}\n",
         counts.puts,
         counts.multipart_puts,
         counts.gets,
@@ -927,6 +934,9 @@ loggytracy_object_store_listed_objects_total {}\n",
         counts.lists,
         counts.copies,
         counts.listed_objects,
+        counts.ranged_gets,
+        counts.get_bytes,
+        counts.put_bytes,
     )
 }
 
