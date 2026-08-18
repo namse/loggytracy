@@ -387,6 +387,15 @@ next audit starts from evidence rather than from this sentence. Two items are
 reframed rather than answered — an open question is not the same as unfinished
 work, and recording it as the latter is how a list stops being read.
 
+**Re-audited 2026-08-18, and it had drifted again — the same way and for the
+same reason.** Gate 5 was the part the 2026-08-12 pass did not reach: its three
+lines carry no evidence, and two of them were already answered elsewhere *in
+this document*, in the findings table above. The trigger was reaching for the
+list to decide what to do next and finding it named work that was finished, so
+the scope of this pass is what could have moved since `8b767a5`: Gate 5, and
+every line the work since then touched. Gates 1 and 4 were not re-read, and
+this sentence is here so the next reader knows that rather than inferring it.
+
 ### Gate 1 — data safety
 
 - [x] Fix P0-1 WAL-compaction wedge + consecutive-compaction/crash-injection tests
@@ -411,7 +420,8 @@ work, and recording it as the latter is how a list stops being read.
       function of the customer count. The aggregate shape shipped instead —
       known / infinite / unknown tenant counts and the newest push age
       (`tenant_policy_gauges`). Closing this needs a decision about the trust
-      boundary of that endpoint, not code
+      boundary of that endpoint, not code — **still true on 2026-08-18**: no
+      metric in `query/handlers.rs` carries a `tenant` label
 - [x] P2-2 metadata endpoint resource guards + apply `start`/`end`
 - [x] N4 remove O(parts) work from `/metrics`
 - [x] Adjust the default bind to the trust boundary — the defaults are
@@ -432,7 +442,8 @@ work, and recording it as the latter is how a list stops being read.
 - [x] P1-10 retry transient failures at startup — `with_object_store_retry` in
       `startup.rs`, 250 ms backoff against a budget, after which the process
       exits and the orchestrator's own restart backoff takes over
-- [ ] **P2-7 — histograms done, endpoint labels not.** `LatencyHistogram` emits
+- [ ] **P2-7 — histograms done, endpoint labels not** (confirmed open 2026-08-18:
+      `metrics.rs:76`, one `query_latency` for the whole read path). `LatencyHistogram` emits
       cumulative `le` buckets, which is the only shape `histogram_quantile` can
       read, and it replaced `*_latency_ns_total` counters that could only ever
       yield a mean while every target in these documents is written as p95/p99.
@@ -444,7 +455,10 @@ work, and recording it as the latter is how a list stops being read.
       `every_configuration_knob_is_documented`, that fails the build when a knob
       is added without a row) and `docs/RUNBOOK.md` all exist; the runbook's
       "What to alert on" is prose, and machine-readable alert rules are not
-      shipped
+      shipped. **Confirmed open 2026-08-18** — the repository contains no rules
+      file of any format. The runbook's table is nine rows of signal, condition
+      and meaning, which is the ruleset's own content: what is missing is the
+      form, not the decisions
 
 ### Gate 4 — scale validation
 
@@ -458,6 +472,24 @@ work, and recording it as the latter is how a list stops being read.
 
 - [x] P1-2 OTLP logs — implement/register `LogsService`
 - [x] P1-2 OTLP/HTTP (`/v1/logs`, `/v1/traces`), protobuf and JSON
-- [ ] P2-1 Loki API gaps
-- [ ] P2-5 duplicate observability → deduplication
-- [ ] LogQL improvements in P1 of `todo.md`
+- [x] **P2-5 duplicate observability → deduplication** — done, and done before
+      this line was last read. Observability landed first (replay WARN plus
+      `loggytracy_wal_replayed_entries`); removal followed, in the one sort every
+      part is written through (`part/format.rs:195`, `dedup_by` on
+      `Row::sort_key`), so a chunk cut between two twins does not save one. The
+      findings table above already said so
+- [ ] **P2-1 Loki API gaps — one gap left, and it is not the one this line
+      implies.** Audited against the finding's own table on 2026-08-18: `tail`,
+      `index/volume(_range)`, `detected_fields`, `detected_labels`,
+      `format_query`, JSON push, the delete API, Tempo v2 and `/api/echo` are
+      implemented; `patterns` is implemented on stated terms; `start`/`end` on
+      the metadata endpoints landed with P2-2; `buildinfo` reports a real
+      revision (`handlers.rs`, `build_revision()`). What remains is
+      **`label_values` ignoring Loki's `query` matcher parameter** —
+      `MetadataParams` (`query/mod.rs:243`) carries `start` and `end` and nothing
+      else, so a dropdown filtered by a matcher returns the unfiltered values
+- [ ] **LogQL improvements in P1 of `todo.md`** — one line open there, and it is
+      a stated divergence rather than a gap: exact-field pruning stays
+      conservative for empty-string equality and `_extracted` collisions, because
+      an empty equality also matches an absent field and absence is indexed
+      nowhere. Feature completeness, not a deployment gate

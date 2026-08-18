@@ -326,9 +326,17 @@ idle settle, while merge consolidated what ingest and the seed had left behind. 
 number that document reports. This blocks the arena work the same way building the gate blocked the fixes:
 there is no point sizing arenas against a measurement that stops before the largest term runs.
 
-- [ ] **Extend the memory gate through a settle with merge active**, and gate on the peak across it, not on
+- [x] **Extend the memory gate through a settle with merge active**, and gate on the peak across it, not on
       the peak of accepting load. The current pass means "survives ingest", which is not "fits a container"
-- [ ] **`merge_max_memory_bytes` must derive from the declared budget.** It defaults to 1 GiB — *half* of a
+      — **done, and it moved the answer.** `--settle` defaults to 150 s and the verdict reports which phase
+      the peak fell in (`src/bin/memory_gate.rs:483`, `:550`). Extended, `df6d65b` was `OOM_KILLED` at 2 GiB
+      having peaked 28.6 s *after* the last row was accepted; the honest floor is now
+      "1792 MiB dies, 2 GiB lives at 89%" ([`docs/MEMORY_BUDGET_GATE.md`](docs/MEMORY_BUDGET_GATE.md))
+- [x] **`merge_max_memory_bytes` must derive from the declared budget** — **done**:
+      `derive_defaults_from_budget` (`src/config.rs:465`) takes 25% of the declared budget with a 64 MiB
+      floor, and the budget itself defaults to 60% of the detected cgroup limit. An explicit env knob still
+      overrides its derived value, because the derivation runs before the environment is read. The text
+      below is what it was written against. It defaults to 1 GiB — *half* of a
       2 GiB container — from no number the operator gave, and
       [`docs/MEMORY_ATTRIBUTION.md`](docs/MEMORY_ATTRIBUTION.md) already measured one merge group's rewrite as
       the **largest single live term at 771 MiB**. That measurement predicted this kill and nothing acted on it
@@ -340,8 +348,9 @@ there is no point sizing arenas against a measurement that stops before the larg
       Gated now, twice over: the stall fix took load-phase response p95 to 98.5 ms in the bed (the 2 s
       numeric target passes inside the load verdict), and `compare/run.sh` fails unless loggytracy's load
       verdict is PASS (`eeae4a2`, `COMPARE_REQUIRE_PASS`).
-- [ ] Re-run `compare/run.sh` once the above lands. The matrix limit sweep is already in place (`5f1e9a2`), so
-      the run will report both the published limit of 20000 and Grafana's default of 100
+- [ ] Re-run `compare/run.sh` — **the two items above have landed, so this is unblocked rather than
+      waiting** (2026-08-18). The matrix limit sweep is already in place (`5f1e9a2`), so the run will report
+      both the published limit of 20000 and Grafana's default of 100
 
 ## Done — the merge streams
 
@@ -2680,7 +2689,10 @@ Read path:
 - [x] **Metadata endpoint guards**: Add semaphore, timeout, `start`/`end`, and `match[]` count limits to
       `labels`/`label_values`/`series`/`index_stats`.
 - [x] **Remove O(parts) from `/metrics`**: Workers publish merge-debt and unknown-tenant gauges.
-- [ ] **Multi-tenancy** (in progress). The design, cost model, and implementation checklist are in
+- [x] **Multi-tenancy** — **the instance's share is complete** (2026-08-18). Every sub-item below is done
+      except durable monthly usage accounting, which is the control plane's by the checklist's own reasoning,
+      and Parquet range reads, which is struck in P2 on measurement rather than deferred. The design, cost
+      model, and implementation checklist are in
       [`docs/MULTI_TENANCY_DESIGN.md`](docs/MULTI_TENANCY_DESIGN.md).
       **The previous design using tenants as a storage-path axis (`docs/ARCHITECTURE.md`, "Multi-tenancy")
       was discarded because of R2 Class A costs** — writing objects per tenant does not fit the $1 plan
