@@ -230,7 +230,8 @@ LogQL parsing (chumsky) → plan → pruning in this order:
 1. Time range → partition/part selection (manifest + part metadata)
 2. Label matchers → row-group pruning with the stream index
 3. Line filters (`|=`, `|~`) and structured-field filters → row-group pruning with trigram blooms
-4. Scan only remaining row groups (MemTable + local parts + S3 range reads)
+4. Scan only remaining row groups (MemTable + local parts; a part evicted from the local cache is
+   restored whole from object storage first — range reads were measured and decided against, `todo.md`)
 
 - This engine's differentiator is accelerating Loki's slow `| json | field="x"` pattern by push-down
   bloom pruning when the field was columnized at ingest. Push-down is part of the planner design from the start.

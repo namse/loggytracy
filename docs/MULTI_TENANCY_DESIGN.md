@@ -216,6 +216,18 @@ Range GET using the per-tenant `byte_range` is a **prerequisite**, not an
 optimization. R2 charges a range GET as one Class B, same as a full GET, and
 egress is free, so this reduces bytes at no request cost.
 
+> **Refuted by measurement, 2026-08-18** (`todo.md`, the struck "Add Parquet
+> range reads" entry). The argument turns on "a range GET is one Class B, same
+> as a full GET" — one fetch replacing one fetch. That is the step that is
+> wrong. A whole restored body is read by **5.66 distinct tenants** before
+> eviction takes it, and a selective fetch serves one tenant's slice, so the
+> same work is **5.66 range GETs against one full GET**: requests ×6.7 to move
+> ×0.37 the bytes. The amplification is real but it is not 1000x and it is not
+> waste — the bytes another tenant's rows cost are the bytes that tenant's own
+> query then does not pay for. Range reads are not a prerequisite here; they
+> are a **loss** at the sharing this design is built on, and they get worse the
+> better the sharing works.
+
 ### Condition 2: local cache layout is decoupled from remote layout
 
 | | Purpose | Unit |
@@ -291,11 +303,19 @@ it adds a second way to reach a tenant's rows, and this engine has one scan
 precisely so that the retention clamp, the tenant scope and the deletion mask
 cannot be applied in one place and forgotten in the other.
 
-**Not decided here.** It needs the byte ranges recorded in `TenantSegment` at
+~~**Not decided here.** It needs the byte ranges recorded in `TenantSegment` at
 write time either way, and it should be decided against a measurement of how
 often a shared-part miss actually happens under a real workload — which is a
 number no run has produced yet, because every load run so far has been
-ingest-dominated.
+ingest-dominated.~~
+
+**Decided 2026-08-18: neither, and the deciding measurement was not the one
+asked for above.** How often a shared-part miss happens is a deployment
+property and still unmeasured; it turned out not to be needed, because the
+*sign* of the work is negative whatever the rate. See the refutation under
+Condition 1 and the struck entry in `todo.md`. Per-tenant cache keys go with
+it: they need the range read to have a slice to key, and the sharing they would
+split is what pays for the download.
 
 ## Supporting changes
 

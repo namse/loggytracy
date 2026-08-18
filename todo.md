@@ -2698,10 +2698,14 @@ Read path:
         Details: [`docs/RETENTION_DESIGN.md`](docs/RETENTION_DESIGN.md)
   - [x] ~~`(tier, day)` partitioning~~ — rejected. Fixing retention at write time does not apply plan changes
         to existing data. Partitions remain by `day`.
-  - [ ] Add Parquet range reads (P2) and use `(part, tenant)` local cache keys. **Sidecar consolidation is
+  - [x] ~~Add Parquet range reads (P2) and use `(part, tenant)` local cache keys~~ — **decided against**;
+        the measurement and the reasons are on the P2 entry. Per-tenant cache keys go with it: they need
+        the range read to have anything to key, and the sharing they would split is what pays for the
+        download. **Sidecar consolidation is
         done**: the trigram blooms and the stream index are one `index.bin`, so a part is three files rather
         than four — one fewer billed PUT per flush, one fewer round trip per catalog restore, and one fewer
-        checksum pass per part at startup, which §8 measured as the actual startup cost
+        checksum pass per part at startup, which §8 measured as the actual startup cost, and it stands
+        on its own
   - [x] **Per-tenant ingest rate** — `ingest_rate` rides the same push as retention. The control plane sets the
         number; this side only owns the field and enforcement points. Check before decompression so an over-limit
         tenant cannot consume CPU.
@@ -2753,8 +2757,13 @@ Read path:
       sort, which now drops entries identical in tenant, stream, timestamp, line and metadata. A flush
       cannot see a twin that is already in an older part, so the removal lands the first time the two
       are merged; `loggytracy_wal_replayed_entries` still reports the upper bound a restart introduced
-- [ ] Add Parquet range reads (**multi-tenancy prerequisite** — shared parts must read only a tenant's byte range,
-      so this is no longer an optional optimization)
+- [x] ~~Add Parquet range reads (**multi-tenancy prerequisite** — shared parts must read only a tenant's byte
+      range, so this is no longer an optional optimization)~~ — **decided against, on measurement**
+      (2026-08-18). Both halves of the framing failed: the tenant byte range is the *only* over-fetch axis
+      that exists, and it is the axis that pays for itself. A restored body is read by 5.66 distinct
+      tenants before eviction, so serving them selectively is 5.66 fetches where the whole download is
+      one — **requests ×6.7 to move ×0.37 the bytes**, spent on the axis R2 bills to save the axis it
+      gives away. The two runs below are the record; the second is the one that decides it.
 
       **Measured before being built, and the measurement does not support the framing** (2026-08-14,
       Tier B rig — `scripts/run_load_local.sh`, which already runs the engine on `file://` with an
@@ -2775,6 +2784,9 @@ Read path:
          then applies for time and labels. So the honest description is not "shared parts must read
          only a tenant's byte range": it is that **the download applies none of the selection the
          read path already computes**, which costs a single-tenant deployment the same way.
+         — **Retracted 2026-08-18 by the block below.** The row-group half of this is wrong: the
+         selection equals the tenant segment exactly, so there is no time or label narrowing to
+         apply, and a single-tenant deployment has nothing to save at all.
       4. **And the whole of it is a function of cache pressure, which is a deployment property
          nothing states.** The same run with a cache that holds the working set: **64 restores and
          749 KiB per query becomes 2 restores and 17.4 KiB — 43x.** The production default is
@@ -2840,6 +2852,21 @@ Read path:
       of 16 tenants, and at a 256 MiB cache the same run restores twice — so the regime where this item
       exists at all is the one measured, and the numbers do not transfer to a deployment that states a
       different query distribution.
+- [ ] **Restores that no scan reads.** The run that closed the item above found the one thing in it that is
+      paid for and returns nothing: **23 of 152 restored bodies (15%) were downloaded whole and then read by
+      no scan at all** — not a partial read, none. A restore is admitted by `candidate_part_ids_with_exact_fields`
+      and `may_match_exact_fields` under `pin_query_parts` (`src/query/restore.rs`), and the scan afterwards
+      applies two things the admission did not: the frontier, which stops once the sink holds `limit` rows
+      whose worst is ahead of the part's whole segment, and the row-group selection, which can come back
+      empty on a part a bloom said "may match".
+
+      **Which of the two it is, is not measured, and it decides where the fix goes.** A frontier miss is an
+      ordering problem — the restore is issued before the scan knows it will not need the part, and the
+      answer is on the admission side. An empty selection after a may-match is a bloom false positive, and
+      the answer is in pruning. They are different work in different files, and 15% is not enough to pick
+      one. **Splitting it is one counter** on the same meter (`src/restore_meter.rs` already knows which
+      bodies went unread; it does not know why), so measure before building — the same order that turned
+      the item above around.
 - [ ] Improve metric evaluation from bounded in-memory computation to streaming/pre-aggregation
 - [x] ~~Validate a deployment environment using real S3~~ — **confirmed out of scope.** This is an indie project,
       so local MinIO is the upper bound for load validation. What is validated, what risks remain, and what to

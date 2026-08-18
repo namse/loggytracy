@@ -301,7 +301,8 @@ query-planning cost → `/ready` stuck at 503 with `merge_healthy=false`.
 - Use the same unit for both limits, or use a compression-ratio estimate during group selection (record uncompressed size in part metadata).
 - Add a fallback that halves the group and retries on memory-limit failure.
 - Ultimately replace merge with a streaming k-way merge to avoid materializing everything
-  (the same axis as "Parquet range read" in P2 of `todo.md`).
+  (the same axis as "Parquet range read" in P2 of `todo.md` — that item is now struck, but for a reason
+  that does not carry here: it lost on object-store request count, and a streaming merge issues none).
 
 ### P1-9. Cache eviction holds the registry write lock during synchronous directory traversal
 

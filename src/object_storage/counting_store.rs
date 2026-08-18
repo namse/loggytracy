@@ -21,8 +21,13 @@
 //! waste was read off the code rather than measured. Which byte ranges this
 //! engine asks for is a property of this engine, so it measures the same on
 //! `file://` as on R2 — the same argument that makes the counts portable.
-//! `ranged_gets` is the one to watch: it is zero today by construction, and it
-//! is what the work is for.
+//! `ranged_gets` is zero today by construction, and it stays that way:
+//! measured, the whole-object restore is read by 5.66 distinct tenants before
+//! eviction, so fetching each tenant's range instead is 5.66 requests where
+//! this is one — the work it was the before-number for is struck in `todo.md`
+//! for that reason. What the counter is now is a tripwire. A non-zero value
+//! means something started asking for ranges, and the decision above says
+//! nothing should have.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,10 +46,11 @@ pub struct ObjectStoreOps {
     pub puts: AtomicU64,
     pub multipart_puts: AtomicU64,
     pub gets: AtomicU64,
-    /// GETs that asked for a byte range rather than a whole object. **Zero
-    /// until Parquet range reads exist**, which is what makes it the honest
-    /// before-number for that work rather than a metric added afterwards to
-    /// describe the result.
+    /// GETs that asked for a byte range rather than a whole object. **Zero,
+    /// and expected to stay zero** — it was the before-number for Parquet
+    /// range reads, and that work was measured and decided against
+    /// (`todo.md`), so a non-zero reading now means the engine started
+    /// spending requests to save bytes the backend does not bill.
     pub ranged_gets: AtomicU64,
     pub deletes: AtomicU64,
     pub lists: AtomicU64,
