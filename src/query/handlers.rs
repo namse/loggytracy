@@ -70,6 +70,7 @@ pub async fn query_range(
                 limit,
                 forward,
                 Some(max_scan_rows),
+                crate::metrics::QueryEndpoint::QueryRange,
             )
             .await
             .map_err(|e| (metric_error_status(&e), e))?;
@@ -98,7 +99,14 @@ pub async fn query_range(
             let scan_start_override = retention_floor_ns
                 .map(|floor_ns| floor_ns.max(start_ns.saturating_sub(expr.lookback_ns())));
             let execution =
-                run_metric_query_with_stats(state, tenant, expr, times, scan_start_override)
+                run_metric_query_with_stats(
+                    state,
+                    tenant,
+                    expr,
+                    times,
+                    scan_start_override,
+                    crate::metrics::QueryEndpoint::QueryRange,
+                )
                     .await
                     .map_err(|e| (metric_error_status(&e), e))?;
             (
@@ -178,6 +186,7 @@ pub async fn query(
                 limit,
                 forward,
                 Some(max_scan_rows),
+                crate::metrics::QueryEndpoint::Query,
             )
             .await
             .map_err(|e| (metric_error_status(&e), e))?;
@@ -196,6 +205,7 @@ pub async fn query(
                 expr,
                 vec![end_ns],
                 scan_start_override,
+                crate::metrics::QueryEndpoint::Query,
             )
             .await
             .map_err(|e| (metric_error_status(&e), e))?;
@@ -674,7 +684,7 @@ loggytracy_force_flush_complete {}\n\
 # HELP loggytracy_build_info Build identity, always 1. Join on it to attribute a series to a revision.\n\
 # TYPE loggytracy_build_info gauge\n\
 loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
-# HELP loggytracy_query_latency_ms Query latency. The cumulative _ns_total counters only ever yielded a mean; every target is written as p95/p99, so use histogram_quantile on this.\n\
+# HELP loggytracy_query_latency_ms Query latency by the endpoint the query arrived at. The cumulative _ns_total counters only ever yielded a mean; every target is written as p95/p99, so use histogram_quantile on this, and sum by (le) across endpoints for the whole read path.\n\
 # TYPE loggytracy_query_latency_ms histogram\n\
 {}\
 # HELP loggytracy_remote_restore_latency_ms Object-store restore latency, the cost of a cache miss.\n\
@@ -759,7 +769,15 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         state.shutdown.is_flush_complete() as u8,
         env!("CARGO_PKG_VERSION"),
         build_revision(),
-        m.query_latency.render("loggytracy_query_latency_ms"),
+        crate::metrics::QueryEndpoint::ALL
+            .iter()
+            .map(|endpoint| {
+                m.query_latency[*endpoint as usize].render_labeled(
+                    "loggytracy_query_latency_ms",
+                    &format!("endpoint=\"{}\"", endpoint.label()),
+                )
+            })
+            .collect::<String>(),
         m.remote_restore_latency
             .render("loggytracy_remote_restore_latency_ms"),
     );

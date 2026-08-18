@@ -128,13 +128,18 @@ async fn run_unified_query(
     limit: usize,
     forward: bool,
 ) -> Result<Vec<StreamResult>, String> {
-    Ok(
-        run_unified_query_with_stats(
-            state, tenant, parsed, range, limit, forward, None,
-        )
-        .await?
-        .results,
+    Ok(run_unified_query_with_stats(
+        state,
+        tenant,
+        parsed,
+        range,
+        limit,
+        forward,
+        None,
+        crate::metrics::QueryEndpoint::Query,
     )
+    .await?
+    .results)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -146,6 +151,7 @@ async fn run_unified_query_with_stats(
     limit: usize,
     forward: bool,
     scan_budget: Option<usize>,
+    endpoint: crate::metrics::QueryEndpoint,
 ) -> Result<QueryExecution, String> {
     // Held for the whole scan. Every read path funnels through here — logs,
     // tail, volume, detected fields, restore probes — so the tenant's share of
@@ -170,11 +176,7 @@ async fn run_unified_query_with_stats(
         cancellation,
     )
     .await;
-    crate::metrics::RuntimeMetrics::observe(
-        &metrics.query_latency,
-        &metrics.query_latency_ns,
-        started.elapsed(),
-    );
+    metrics.observe_query(endpoint, started.elapsed());
     match &result {
         Ok(execution) => {
             metrics

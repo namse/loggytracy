@@ -226,6 +226,7 @@ async fn tail_poll(
         scan_limit,
         true,
         Some(state.config.max_query_scan_rows.min(MAX_LOG_SCAN_ROWS)),
+        crate::metrics::QueryEndpoint::Tail,
     )
     .await
     .ok()?;

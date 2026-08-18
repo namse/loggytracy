@@ -73,7 +73,9 @@ pub struct RuntimeMetrics {
     /// The cumulative `*_latency_ns_total` counters only ever yielded a mean,
     /// and every target in the plan documents is written as p95/p99 — numbers
     /// that were literally not derivable from what this endpoint exposed.
-    pub query_latency: LatencyHistogram,
+    /// One per endpoint. The single histogram this replaced could not say
+    /// which endpoint was slow, and did not cover the metric path at all.
+    pub query_latency: [LatencyHistogram; QueryEndpoint::ALL.len()],
     pub remote_restore_success: AtomicU64,
     pub remote_restore_errors: AtomicU64,
     pub remote_restore_latency_ns: AtomicU64,
@@ -142,7 +144,7 @@ impl RuntimeMetrics {
             query_scanned_rows: AtomicU64::new(0),
             query_scanned_bytes: AtomicU64::new(0),
             query_latency_ns: AtomicU64::new(0),
-            query_latency: LatencyHistogram::default(),
+            query_latency: std::array::from_fn(|_| LatencyHistogram::default()),
             remote_restore_success: AtomicU64::new(0),
             remote_restore_errors: AtomicU64::new(0),
             remote_restore_latency_ns: AtomicU64::new(0),
@@ -162,6 +164,16 @@ impl RuntimeMetrics {
     pub fn observe(histogram: &LatencyHistogram, counter: &AtomicU64, duration: Duration) {
         Self::add_duration(counter, duration);
         histogram.observe(duration);
+    }
+
+    /// Time one query against the endpoint it arrived at.
+    ///
+    /// The aggregate `query_latency_ns` counter stays fed from here so the two
+    /// cannot disagree about how many queries ran, and so the endpoint split
+    /// is an addition rather than a replacement for anything already scraped.
+    pub fn observe_query(&self, endpoint: QueryEndpoint, duration: Duration) {
+        Self::add_duration(&self.query_latency_ns, duration);
+        self.query_latency[endpoint as usize].observe(duration);
     }
 
     pub fn load(target: &AtomicU64) -> u64 {
@@ -184,6 +196,49 @@ impl Default for RuntimeMetrics {
 pub const LATENCY_BUCKET_BOUNDS_MS: [f64; 12] = [
     1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 30_000.0,
 ];
+
+/// Which endpoint a query arrived at, as the one dimension
+/// `loggytracy_query_latency_ms` carries.
+///
+/// A fixed set, not a string: the label's cardinality has to be a property of
+/// this binary rather than of what a client sends, which is the same reason
+/// tenants are not a metric label.
+///
+/// `Volume` is here because `index/volume` reduces to `bytes_over_time` and is
+/// answered by the metric evaluator — it is a different endpoint arriving at
+/// the same machinery, and a Grafana dashboard slow because volume is slow
+/// cannot be told from a slow `query_range` without this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryEndpoint {
+    QueryRange,
+    Query,
+    Tail,
+    Patterns,
+    DetectedFields,
+    Volume,
+}
+
+impl QueryEndpoint {
+    pub const ALL: [Self; 6] = [
+        Self::QueryRange,
+        Self::Query,
+        Self::Tail,
+        Self::Patterns,
+        Self::DetectedFields,
+        Self::Volume,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::QueryRange => "query_range",
+            Self::Query => "query",
+            Self::Tail => "tail",
+            Self::Patterns => "patterns",
+            Self::DetectedFields => "detected_fields",
+            Self::Volume => "volume",
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct LatencyHistogram {
@@ -225,20 +280,36 @@ impl LatencyHistogram {
 
     /// `(le bound, cumulative count)` pairs plus the `+Inf` total and sum.
     pub fn render(&self, name: &str) -> String {
+        self.render_labeled(name, "")
+    }
+
+    /// The same, with a label set every series carries. `labels` is a rendered
+    /// `k="v"` list without braces; `le` is appended to it on the buckets,
+    /// which is the order Prometheus's own exposition uses and the order
+    /// `histogram_quantile` needs to see.
+    pub fn render_labeled(&self, name: &str, labels: &str) -> String {
+        let separator = if labels.is_empty() { "" } else { "," };
+        let scalar = if labels.is_empty() {
+            String::new()
+        } else {
+            format!("{{{labels}}}")
+        };
         let mut out = String::new();
         for (index, bound) in LATENCY_BUCKET_BOUNDS_MS.iter().enumerate() {
             out.push_str(&format!(
-                "{name}_bucket{{le=\"{bound}\"}} {}\n",
+                "{name}_bucket{{{labels}{separator}le=\"{bound}\"}} {}\n",
                 self.buckets[index].load(Ordering::Relaxed)
             ));
         }
         let count = self.count.load(Ordering::Relaxed);
-        out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {count}\n"));
         out.push_str(&format!(
-            "{name}_sum {}\n",
+            "{name}_bucket{{{labels}{separator}le=\"+Inf\"}} {count}\n"
+        ));
+        out.push_str(&format!(
+            "{name}_sum{scalar} {}\n",
             self.sum_ms.load(Ordering::Relaxed)
         ));
-        out.push_str(&format!("{name}_count {count}\n"));
+        out.push_str(&format!("{name}_count{scalar} {count}\n"));
         out
     }
 }

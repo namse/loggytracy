@@ -442,8 +442,15 @@ this sentence is here so the next reader knows that rather than inferring it.
 - [x] P1-10 retry transient failures at startup — `with_object_store_retry` in
       `startup.rs`, 250 ms backoff against a budget, after which the process
       exits and the orchestrator's own restart backoff takes over
-- [ ] **P2-7 — histograms done, endpoint labels not** (confirmed open 2026-08-18:
-      `metrics.rs:76`, one `query_latency` for the whole read path). `LatencyHistogram` emits
+- [x] **P2-7 — done** (2026-08-18). `loggytracy_query_latency_ms` carries an
+      `endpoint` label over a fixed set of six, the cardinality being a property
+      of the binary rather than of what a client sends. Closing it found a
+      second hole the line did not name: the metric path recorded **no latency
+      at all**, so `rate`, `count_over_time` and everything `index/volume`
+      reduces to were absent from the read path's published latency — which was
+      therefore describing log queries while being read as describing queries.
+      Both funnels observe now. What follows is the state before it.
+      `LatencyHistogram` emits
       cumulative `le` buckets, which is the only shape `histogram_quantile` can
       read, and it replaced `*_latency_ns_total` counters that could only ever
       yield a mean while every target in these documents is written as p95/p99.

@@ -28,9 +28,16 @@ async fn run_metric_query(
     evaluation_times: Vec<i64>,
 ) -> Result<Vec<MetricSeries>, String> {
     Ok(
-        run_metric_query_with_stats(state, tenant, expr, evaluation_times, None)
-            .await?
-            .series,
+        run_metric_query_with_stats(
+            state,
+            tenant,
+            expr,
+            evaluation_times,
+            None,
+            crate::metrics::QueryEndpoint::Query,
+        )
+        .await?
+        .series,
     )
 }
 
@@ -49,6 +56,7 @@ async fn run_metric_query_with_stats(
     expr: logql::MetricExpr,
     evaluation_times: Vec<i64>,
     scan_start_override: Option<i64>,
+    endpoint: crate::metrics::QueryEndpoint,
 ) -> Result<MetricQueryResult, String> {
     // The same bound as the log path. A metric query is a scan with an
     // aggregation on top, so exempting it would leave the cheaper of the two
@@ -60,6 +68,13 @@ async fn run_metric_query_with_stats(
     let quota = state.tenant_quota.clone();
     let quota_tenant = tenant.clone();
     let cancellation = Arc::new(AtomicBool::new(false));
+    // Timed here for the same reason the log path is timed at its own funnel,
+    // and this is the half that was missing: `rate`, `count_over_time` and
+    // everything `index/volume` reduces to ran without appearing in
+    // `loggytracy_query_latency_ms` at all, so the read path's published
+    // latency described log queries and was read as describing queries.
+    let metrics = state.metrics.clone();
+    let started = std::time::Instant::now();
     let result = run_metric_query_with_stats_cancellable(
         state,
         tenant,
@@ -69,6 +84,7 @@ async fn run_metric_query_with_stats(
         cancellation,
     )
     .await;
+    metrics.observe_query(endpoint, started.elapsed());
     if let Ok(execution) = &result {
         quota.charge_scan(&quota_tenant, execution.scanned_bytes);
     }

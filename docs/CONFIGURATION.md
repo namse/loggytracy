@@ -326,7 +326,12 @@ plain `MALLOC_CONF` name is not consulted).
 - **`/ready` stays at 503** → Check which `/metrics` `*_errors_total` is increasing.
   Flush, merge, retention, object store, and local cache each lower readiness independently
 - **The disk is filling** → Reduce `CACHE_MAX_BYTES` or set `RETENTION_PERIOD`. Nothing is deleted when the latter is unset
-- **Want p95/p99** → Apply `histogram_quantile` to `loggytracy_query_latency_ms_bucket`.
+- **Want p95/p99** → Apply `histogram_quantile` to `loggytracy_query_latency_ms_bucket`,
+  which carries an `endpoint` label (`query_range`, `query`, `tail`, `patterns`,
+  `detected_fields`, `volume`). Per endpoint is the useful cut — a dashboard slow
+  because `volume` is slow does not look like a slow `query_range` — and the whole
+  read path is `sum by (le)` across them. There is no unlabeled series to read
+  instead: one would double-count under `sum`.
   `*_latency_ns_total` provides only an average
 
 

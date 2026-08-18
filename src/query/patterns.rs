@@ -67,6 +67,7 @@ pub async fn patterns(
         PATTERN_SAMPLE,
         false,
         Some(PATTERN_SAMPLE),
+        crate::metrics::QueryEndpoint::Patterns,
     )
     .await
     .map_err(|error| (metric_error_status(&error), error))?;

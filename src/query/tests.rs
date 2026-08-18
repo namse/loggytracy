@@ -350,6 +350,7 @@
                 1,
                 forward,
                 None,
+                crate::metrics::QueryEndpoint::Query,
             )
             .await
             .unwrap();
@@ -2093,15 +2094,23 @@
             Arc::new(PartRegistry::new()),
         );
         for millis in [0, 3, 40, 900] {
-            state
-                .metrics
-                .query_latency
-                .observe(std::time::Duration::from_millis(millis));
+            state.metrics.observe_query(
+                crate::metrics::QueryEndpoint::QueryRange,
+                std::time::Duration::from_millis(millis),
+            );
         }
+        // One observation on a second endpoint, so the assertions below prove
+        // the split is real rather than one histogram wearing a label.
+        state.metrics.observe_query(
+            crate::metrics::QueryEndpoint::Volume,
+            std::time::Duration::from_millis(900),
+        );
 
         let rendered = metrics(State(state)).await;
         let bucket = |bound: &str| -> u64 {
-            let needle = format!("loggytracy_query_latency_ms_bucket{{le=\"{bound}\"}} ");
+            let needle = format!(
+                "loggytracy_query_latency_ms_bucket{{endpoint=\"query_range\",le=\"{bound}\"}} "
+            );
             rendered
                 .lines()
                 .find_map(|line| line.strip_prefix(&needle))
@@ -2113,6 +2122,18 @@
 
         assert_eq!(bucket("1"), 1, "only the 0 ms observation is <= 1 ms");
         assert_eq!(bucket("5"), 2);
+        assert!(
+            rendered.contains("loggytracy_query_latency_ms_count{endpoint=\"volume\"} 1"),
+            "volume's own series must carry only volume's observation:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("loggytracy_query_latency_ms_count{endpoint=\"query_range\"} 4"),
+            "and query_range's must carry only its own:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("loggytracy_query_latency_ms_count{endpoint=\"tail\"} 0"),
+            "an endpoint nothing reached is still exported, so a dashboard shows a gap rather than a missing series:\n{rendered}"
+        );
         assert_eq!(bucket("50"), 3);
         assert_eq!(bucket("1000"), 4);
         assert_eq!(bucket("+Inf"), 4);
@@ -2124,7 +2145,10 @@
             assert!(current >= previous, "bucket {bound} went backwards");
             previous = current;
         }
-        assert!(rendered.contains("loggytracy_query_latency_ms_count 4"));
+        // The unlabeled series is gone on purpose: an aggregate that is also a
+        // labeled series double-counts under `sum`, and the whole-path number
+        // is `sum by (le)` across the endpoints.
+        assert!(!rendered.contains("loggytracy_query_latency_ms_count 4"));
         assert!(rendered.contains("# TYPE loggytracy_query_latency_ms histogram"));
         assert!(rendered.contains("loggytracy_build_info{"));
     }

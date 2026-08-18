@@ -131,8 +131,15 @@ async fn volume_response(
     // past it. Raise the scan start too, so no expired row reaches the sum.
     let scan_start_override =
         retention_floor_ns.map(|floor_ns| floor_ns.max(start_ns.saturating_sub(step_ns)));
-    let execution = run_metric_query_with_stats(state, tenant, expr, times, scan_start_override)
-        .await
+    let execution = run_metric_query_with_stats(
+        state,
+        tenant,
+        expr,
+        times,
+        scan_start_override,
+        crate::metrics::QueryEndpoint::Volume,
+    )
+    .await
         .map_err(|error| (metric_error_status(&error), error))?;
 
     let mut series = execution.series;
@@ -328,6 +335,7 @@ pub async fn detected_fields(
         sample_limit,
         false,
         Some(sample_limit),
+        crate::metrics::QueryEndpoint::DetectedFields,
     )
     .await
     .map_err(|error| (metric_error_status(&error), error))?;
