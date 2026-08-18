@@ -155,7 +155,7 @@ distributor:
         mirror_timeout: 2s
     heartbeat_period: 5s
     heartbeat_timeout: 1m0s
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     instance_port: 0
@@ -276,7 +276,7 @@ query_scheduler:
     zone_awareness_enabled: false
     num_tokens: 1
     replication_factor: 2
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     instance_port: 0
@@ -850,7 +850,7 @@ ruler:
         mirror_timeout: 2s
     heartbeat_period: 5s
     heartbeat_timeout: 1m0s
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     instance_port: 0
@@ -1037,7 +1037,7 @@ ingester:
     readiness_check_ring_health: true
     address: ""
     port: 0
-    id: 918fb8cef6f2
+    id: 2d8af41610db
   concurrent_flushes: 32
   flush_check_period: 30s
   flush_op_backoff:
@@ -1155,7 +1155,7 @@ pattern_ingester:
     readiness_check_ring_health: true
     address: ""
     port: 0
-    id: 918fb8cef6f2
+    id: 2d8af41610db
   client_config:
     pool_config:
       client_cleanup_period: 15s
@@ -1245,7 +1245,7 @@ index_gateway:
     zone_awareness_enabled: false
     num_tokens: 128
     replication_factor: 3
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     instance_port: 0
@@ -2075,7 +2075,7 @@ compactor:
     zone_awareness_enabled: false
     num_tokens: 1
     replication_factor: 1
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     instance_port: 0
@@ -2745,7 +2745,7 @@ common:
     zone_awareness_enabled: false
     num_tokens: 128
     replication_factor: 3
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     instance_port: 0

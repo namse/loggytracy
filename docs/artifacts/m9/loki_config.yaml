@@ -155,7 +155,7 @@ distributor:
         mirror_timeout: 2s
     heartbeat_period: 15s
     heartbeat_timeout: 1m0s
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     - lo
@@ -277,7 +277,7 @@ query_scheduler:
     zone_awareness_enabled: false
     num_tokens: 1
     replication_factor: 2
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     - lo
@@ -859,7 +859,7 @@ ruler:
         mirror_timeout: 2s
     heartbeat_period: 15s
     heartbeat_timeout: 1m0s
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     - lo
@@ -1048,7 +1048,7 @@ ingester:
     readiness_check_ring_health: true
     address: ""
     port: 0
-    id: 918fb8cef6f2
+    id: 2d8af41610db
   concurrent_flushes: 32
   flush_check_period: 30s
   flush_op_backoff:
@@ -1167,7 +1167,7 @@ pattern_ingester:
     readiness_check_ring_health: true
     address: ""
     port: 0
-    id: 918fb8cef6f2
+    id: 2d8af41610db
   client_config:
     pool_config:
       client_cleanup_period: 15s
@@ -1257,7 +1257,7 @@ index_gateway:
     zone_awareness_enabled: false
     num_tokens: 128
     replication_factor: 1
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     - lo
@@ -1779,7 +1779,7 @@ storage_config:
         connect_backoff_base_delay: 1s
         connect_backoff_max_delay: 5s
       log_gateway_requests: false
-    ingestername: 918fb8cef6f2
+    ingestername: 2d8af41610db
     mode: RW
     ingesterdbretainperiod: 20m0s
     build_per_tenant_index: false
@@ -1815,7 +1815,7 @@ storage_config:
         connect_backoff_base_delay: 1s
         connect_backoff_max_delay: 5s
       log_gateway_requests: false
-    ingestername: 918fb8cef6f2
+    ingestername: 2d8af41610db
     mode: RW
     ingesterdbretainperiod: 20m0s
   bloom_shipper:
@@ -2105,7 +2105,7 @@ compactor:
     zone_awareness_enabled: false
     num_tokens: 1
     replication_factor: 1
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     - lo
@@ -2798,7 +2798,7 @@ common:
     zone_awareness_enabled: false
     num_tokens: 128
     replication_factor: 3
-    instance_id: 918fb8cef6f2
+    instance_id: 2d8af41610db
     instance_interface_names:
     - eth0
     - lo

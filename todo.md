@@ -348,9 +348,14 @@ there is no point sizing arenas against a measurement that stops before the larg
       Gated now, twice over: the stall fix took load-phase response p95 to 98.5 ms in the bed (the 2 s
       numeric target passes inside the load verdict), and `compare/run.sh` fails unless loggytracy's load
       verdict is PASS (`eeae4a2`, `COMPARE_REQUIRE_PASS`).
-- [ ] Re-run `compare/run.sh` — **the two items above have landed, so this is unblocked rather than
-      waiting** (2026-08-18). The matrix limit sweep is already in place (`5f1e9a2`), so the run will report
-      both the published limit of 20000 and Grafana's default of 100
+- [x] Re-run `compare/run.sh` — **done 2026-08-18** at `e79e78c`, and the document is republished from it.
+      All three survived 2 GiB, agreement held at 168 of 168, and the claim's shape got faster: `metadata_rare`
+      cold 0.23 → 0.21 ms, `label_only` cold 26.3 → 17.7, `json_field` cold 11.5 → 10.0, ingest 19767 → 19933
+      eps — with Loki unchanged at 19869 and VictoriaLogs at 19930 → 19932, which is what makes the move the
+      engine's rather than the machine's. Two rows went the other way and are published as they came out:
+      `memory.peak` during queries 159.4 → 278.6 MiB, and 10.5 MiB of write-ahead log still on disk at the
+      settle point where the last run had drained to 0. Neither is attributable from this run — the query row
+      is `memory.peak`, which includes page cache, and no anonymous number is taken for that phase
 
 ## Done — the merge streams
 

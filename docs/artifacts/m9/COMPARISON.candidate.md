@@ -42,7 +42,7 @@ The knobs are defaults, not assignments — `COMPARE_MEMORY`,
 `COMPARE_SEED` — so a reader can vary one without editing the script.
 
 Every number below comes from the JSON in
-[`artifacts/m9/`](artifacts/m9/), which the same run copied out of
+[`../../docs/artifacts/m9/`](../../docs/artifacts/m9/), which the same run copied out of
 `target/compare/` — so the artifacts and the document cannot disagree about
 which run they describe. That is not a formality: of the numbers this
 repository retired, one cited artifact did not exist and another disagreed with
