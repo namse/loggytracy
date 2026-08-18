@@ -1343,6 +1343,29 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
             "other": delta("loggytracy_object_store_bytes_by_kind_total{direction=\"put\",kind=\"other\"}"),
         },
         "restores": delta("loggytracy_remote_restore_latency_ms_count"),
+        // The two numbers that decide whether a selective download is worth
+        // issuing. `selected_runs + part_scans` is the request count one would
+        // cost where a whole restore costs one GET, and
+        // `restored_body_scans / restores` is how many scans the whole copy
+        // serves before eviction takes it — the amortisation a range read
+        // cancels.
+        "part_scans": delta("loggytracy_query_part_scans_total"),
+        "row_groups": {
+            "present": delta("loggytracy_query_row_groups_total{stage=\"present\"}"),
+            "tenant": delta("loggytracy_query_row_groups_total{stage=\"tenant\"}"),
+            "selected": delta("loggytracy_query_row_groups_total{stage=\"selected\"}"),
+        },
+        "selected_runs": delta("loggytracy_query_selected_runs_total"),
+        "restore_first_scan": {
+            "parts": delta("loggytracy_restore_first_scan_total{stage=\"parts\"}"),
+            "present": delta("loggytracy_restore_first_scan_total{stage=\"present\"}"),
+            "selected": delta("loggytracy_restore_first_scan_total{stage=\"selected\"}"),
+            "runs": delta("loggytracy_restore_first_scan_total{stage=\"runs\"}"),
+        },
+        "restored_body_scans": delta("loggytracy_restored_body_scans_total"),
+        "restored_bodies": delta("loggytracy_restored_bodies_total{state=\"restored\"}"),
+        "retired_bodies": delta("loggytracy_restored_bodies_total{state=\"retired\"}"),
+        "restored_tenant_slices": delta("loggytracy_restored_tenant_slices_total"),
         "cycles": {
             "flush": flush_success,
             "merge": merge_success,

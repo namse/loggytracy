@@ -2798,6 +2798,48 @@ Read path:
       `remote_healthy_fraction` 0.908 against a 0.95 gate. That is Tier B's injected 3% object-store
       error rate landing on a much smaller number of operations, not a behaviour change — the byte
       counters it produced are unaffected, and the small-cache run at the same injection passes.
+
+      **The two numbers that decide the sign, measured** (2026-08-18, same rig and shape — 16 tenants,
+      240 s, 8 MiB cache — with the meter in `src/restore_meter.rs`; verdict `PASS`, which also settles
+      the caveat above: the earlier `FAIL` was the injected 3% landing on a different sample, and a
+      re-run at the same seed passes at 0.958).
+
+      The item trades a resource this backend does not bill for one it does. R2 bills per request and
+      egress is free, so the 917 MB the byte meter found costs nothing there; what a selective download
+      changes is the request count. Two numbers fix it, and both are properties of this code.
+
+      1. **What a selective download would cost in requests.** Over the first scan of each restored body
+         — the query the download is issued for — the selection is **1.00 contiguous run** of row groups,
+         **6.5%** of the part. A row group's column chunks are contiguous and the log path projects every
+         column, so that run is one byte range: **one range plus one footer, against the single GET a
+         whole restore issues today.**
+      2. **What the whole copy earns.** 152 bodies restored, **1,373 query scans served** before eviction
+         took them — **9.03 scans per body** — across **5.66 distinct tenants per body**. A selective
+         fetch serves one tenant's slice, so the same work is 5.66 separate fetches: **6.66 requests per
+         body with the footer cached, 11.3 without, against 1.**
+
+      So the trade, measured: **requests ×6.7, bytes ×0.37.** Not ×0.065 — the 93% over-fetch is not
+      waste but sharing, and 5.66 of a part's 15.2 tenants collect on it before eviction. The axis it
+      saves on is the one with no price and the axis it spends on is the one the whole layout was
+      designed around (`docs/ARCHITECTURE.md`, Class A costs).
+
+      **And the row-group axis turns out not to exist.** Selected row groups equal the tenant's segment
+      exactly — 5,344 of 5,344 — so time and label selection pruned nothing beyond the tenant, because a
+      tenant holds **1.2 row groups of a 17.8-group part**. That retracts the claim above that this
+      "costs a single-tenant deployment the same way": with one tenant `present == tenant` and there is
+      nothing to narrow. **The only over-fetch axis is the tenant axis, and it is the same axis that
+      pays for itself through sharing.**
+
+      *What the run does show as waste, on the other side of the ledger:* **23 of 152 restored bodies
+      (15%) were never read by any scan** — admitted by `candidate_part_ids`, downloaded whole, and then
+      either skipped by the scan frontier or found to select no row group. That is a restore-admission
+      question, not a range-read one, and it is the one number here that says something is being paid
+      for nothing.
+
+      *Scope of these numbers:* they are the pressured regime's. Reuse is a function of the query mix and
+      of 16 tenants, and at a 256 MiB cache the same run restores twice — so the regime where this item
+      exists at all is the one measured, and the numbers do not transfer to a deployment that states a
+      different query distribution.
 - [ ] Improve metric evaluation from bounded in-memory computation to streaming/pre-aggregation
 - [x] ~~Validate a deployment environment using real S3~~ — **confirmed out of scope.** This is an indie project,
       so local MinIO is the upper bound for load validation. What is validated, what risks remain, and what to

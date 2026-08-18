@@ -764,6 +764,7 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
             .render("loggytracy_remote_restore_latency_ms"),
     );
     body.push_str(&object_store_operation_metrics(&state));
+    body.push_str(&restore_economics_metrics());
     body.push_str(&delete_request_metrics(&state));
     body.push_str(&journal_writer_metrics(&state));
     body.push_str(&crate::memprof::render());
@@ -892,6 +893,56 @@ loggytracy_delete_hidden_rows_total {}\n",
         metrics.rejected.load(Ordering::Relaxed),
         metrics.cancelled.load(Ordering::Relaxed),
         metrics.hidden_rows.load(Ordering::Relaxed),
+    )
+}
+
+/// The two numbers that decide the sign of "add Parquet range reads": what a
+/// selective download would cost in requests, and what the whole-object
+/// download earns by leaving a reusable copy behind. See
+/// [`crate::restore_meter`] for why those two and not the byte total.
+fn restore_economics_metrics() -> String {
+    let meter = crate::restore_meter::global().snapshot();
+    format!(
+        "# HELP loggytracy_query_part_scans_total Query scans that read a part body. A rewrite is excluded: it reads what it was told to.\n\
+# TYPE loggytracy_query_part_scans_total counter\n\
+loggytracy_query_part_scans_total {}\n\
+# HELP loggytracy_query_row_groups_total Row groups in the parts those scans read, by how far selection narrowed them. `present` is the whole part a restore downloads, `tenant` is the querying tenant's segment, `selected` is what the scan read.\n\
+# TYPE loggytracy_query_row_groups_total counter\n\
+loggytracy_query_row_groups_total{{stage=\"present\"}} {}\n\
+loggytracy_query_row_groups_total{{stage=\"tenant\"}} {}\n\
+loggytracy_query_row_groups_total{{stage=\"selected\"}} {}\n\
+# HELP loggytracy_query_selected_runs_total Contiguous runs among the selected row groups. Column chunks of a row group are contiguous and the log path projects every column, so a run is one byte range: this plus one footer read is what a selective download would issue where a whole restore issues one GET.\n\
+# TYPE loggytracy_query_selected_runs_total counter\n\
+loggytracy_query_selected_runs_total {}\n\
+# HELP loggytracy_restore_first_scan_total The same three numbers over the first scan of each restored body alone. That scan is the query the download was issued for, so its selection is the one a selective download would have applied; the aggregates above mix it with scans of bodies that were never downloaded.\n\
+# TYPE loggytracy_restore_first_scan_total counter\n\
+loggytracy_restore_first_scan_total{{stage=\"parts\"}} {}\n\
+loggytracy_restore_first_scan_total{{stage=\"present\"}} {}\n\
+loggytracy_restore_first_scan_total{{stage=\"selected\"}} {}\n\
+loggytracy_restore_first_scan_total{{stage=\"runs\"}} {}\n\
+# HELP loggytracy_restored_body_scans_total Query scans served by a body that was downloaded whole after eviction and is still on disk. Divided by the restore count, this is how much later work one over-fetch prepaid.\n\
+# TYPE loggytracy_restored_body_scans_total counter\n\
+loggytracy_restored_body_scans_total {}\n\
+# HELP loggytracy_restored_bodies_total Bodies restored, and how many of them eviction has since taken. A restore still resident has not finished earning.\n\
+# TYPE loggytracy_restored_bodies_total counter\n\
+loggytracy_restored_bodies_total{{state=\"restored\"}} {}\n\
+loggytracy_restored_bodies_total{{state=\"retired\"}} {}\n\
+# HELP loggytracy_restored_tenant_slices_total Distinct (restored body, querying tenant) pairs. A whole restore costs one GET however many tenants read it; a selective download serves one slice, so this is how many it would have taken.\n\
+# TYPE loggytracy_restored_tenant_slices_total counter\n\
+loggytracy_restored_tenant_slices_total {}\n",
+        meter.part_scans,
+        meter.row_groups_present,
+        meter.row_groups_tenant,
+        meter.row_groups_selected,
+        meter.selected_runs,
+        meter.first_scan_parts,
+        meter.first_scan_row_groups_present,
+        meter.first_scan_row_groups_selected,
+        meter.first_scan_runs,
+        meter.restored_scans,
+        meter.restores,
+        meter.restored_retired,
+        meter.restored_tenant_slices,
     )
 }
 

@@ -357,6 +357,11 @@ impl ObjectStorage {
         std::fs::remove_dir_all(&final_dir).map_err(|error| error.to_string())?;
         std::fs::rename(&tmp_dir, &final_dir)
             .map_err(|error| format!("failed to commit cached part {}: {error}", descriptor.id))?;
+        // A catalog-only download restores no body, so it buys no later scan
+        // and is not what the reuse figure is about.
+        if include_data {
+            crate::restore_meter::global().note_restore(&final_dir);
+        }
         Ok(())
     }
 
@@ -470,6 +475,7 @@ impl ObjectStorage {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.to_string()),
             }
+            crate::restore_meter::global().note_evict(&dir);
             total = total.saturating_sub(bytes);
         }
         Ok(total)

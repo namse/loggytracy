@@ -29,6 +29,7 @@ pub mod part_registry;
 mod query;
 pub mod query_memory;
 mod remote_lifecycle;
+pub mod restore_meter;
 mod retention;
 mod router;
 mod runtime_error;

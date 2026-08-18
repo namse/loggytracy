@@ -998,6 +998,21 @@ impl PartReader {
         if sorted_selected.is_empty() {
             return Ok(stats);
         }
+        // Query scans only: a rewrite passes a window and reads what it was
+        // told to, so its selectivity is its own and not a query's.
+        if row_group_window.is_none() {
+            let tenant_groups = self
+                .tenant_row_groups(tenant)
+                .map(|groups| groups.end - groups.start)
+                .unwrap_or(0);
+            crate::restore_meter::global().note_query_scan(
+                &self.part.dir,
+                tenant,
+                self.part.meta.row_group_count,
+                tenant_groups,
+                &sorted_selected,
+            );
+        }
         // By time, not by ordinal. Ordinal order used to be time order; now it
         // is stream order, and visiting streams in turn would fill the sink
         // with one stream's rows before seeing another's — leaving the frontier
