@@ -243,6 +243,11 @@ pub struct QueryRangeParams {
 pub struct MetadataParams {
     pub start: Option<String>,
     pub end: Option<String>,
+    /// Loki's stream-selector filter on `label/{name}/values`. Absent on the
+    /// other metadata endpoints, which is why it is optional here rather than
+    /// a second parameter type: `labels` and `index_stats` deserialize the
+    /// same struct and simply never carry it.
+    pub query: Option<String>,
 }
 
 #[derive(serde::Deserialize)]

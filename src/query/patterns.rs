@@ -40,6 +40,7 @@ pub async fn patterns(
     let metadata_params = crate::query::MetadataParams {
         start: params.start.clone(),
         end: params.end.clone(),
+        query: None,
     };
     let Some(guard) = MetadataGuard::acquire(&state, &tenant, &metadata_params).await? else {
         return Ok(Json(serde_json::json!({ "status": "success", "data": [] })));

@@ -413,6 +413,38 @@ pub async fn labels(
     }))
 }
 
+/// The matchers `label/{name}/values?query=` filters by, or `None` when the
+/// caller sent no selector.
+///
+/// A line filter is refused rather than dropped. Label values come from stream
+/// labels, so no filter over line content can narrow them without a scan this
+/// endpoint does not run — and answering a query that carries one as though it
+/// did not is the silent approximation this engine refuses elsewhere. Grafana
+/// sends a selector here, so the refusal is for a caller that hand-wrote
+/// something this cannot honour.
+fn label_values_filter(
+    params: &crate::query::MetadataParams,
+) -> Result<Option<Vec<crate::logql::LabelMatcher>>, (StatusCode, String)> {
+    let Some(selector) = params.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = crate::logql::parse(selector).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("LogQL parse error: {error}"),
+        )
+    })?;
+    if !parsed.line_filters.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "label values can be filtered by a stream selector but not by a line filter: \
+             label values come from stream labels, which no filter over line content narrows"
+                .to_string(),
+        ));
+    }
+    Ok(Some(parsed.matchers))
+}
+
 pub async fn label_values(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -428,12 +460,32 @@ pub async fn label_values(
         }));
     };
     let mut values = std::collections::BTreeSet::new();
-    for v in state.memtable.label_values(&tenant, &name, guard.window) {
-        values.insert(v);
-    }
-    guard.check_deadline()?;
-    for v in state.parts.label_values(&tenant, &name, guard.window) {
-        values.insert(v);
+    match label_values_filter(&params)? {
+        // Loki filters this endpoint's values by a stream selector, and a
+        // dropdown built without it offers values that belong to another
+        // stream and return nothing when clicked.
+        Some(matchers) => {
+            for labels in state.memtable.series(&tenant, &matchers, guard.window) {
+                if let Some(value) = labels.get(&name) {
+                    values.insert(value.clone());
+                }
+            }
+            guard.check_deadline()?;
+            for labels in state.parts.series(&tenant, &matchers, guard.window) {
+                if let Some(value) = labels.get(&name) {
+                    values.insert(value.clone());
+                }
+            }
+        }
+        None => {
+            for v in state.memtable.label_values(&tenant, &name, guard.window) {
+                values.insert(v);
+            }
+            guard.check_deadline()?;
+            for v in state.parts.label_values(&tenant, &name, guard.window) {
+                values.insert(v);
+            }
+        }
     }
     Ok(Json(LokiResponse {
         status: "success",

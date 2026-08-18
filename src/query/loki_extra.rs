@@ -300,6 +300,7 @@ pub async fn detected_fields(
     let metadata_params = crate::query::MetadataParams {
         start: params.start.clone(),
         end: params.end.clone(),
+        query: None,
     };
     let Some(guard) = MetadataGuard::acquire(&state, &tenant, &metadata_params).await? else {
         return Ok(Json(serde_json::json!({ "fields": [] })));

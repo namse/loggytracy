@@ -2207,6 +2207,7 @@
         let window = |start_ns: i64| crate::query::MetadataParams {
             start: Some(start_ns.to_string()),
             end: Some(now_ns.to_string()),
+            query: None,
         };
         let values_in = async |params| {
             label_values(
@@ -2235,6 +2236,7 @@
         let empty = crate::query::MetadataParams {
             start: Some((now_ns + hour_ns).to_string()),
             end: Some((now_ns + 2 * hour_ns).to_string()),
+            query: None,
         };
         assert!(values_in(empty).await.is_empty());
     }
@@ -3896,4 +3898,73 @@ fn every_alert_signal_in_the_runbook_has_a_rule() {
         unexplained.is_empty(),
         "deploy/alerts.yml alerts on signals the runbook's table does not explain: {unexplained:#?}"
     );
+}
+
+/// Loki filters `label/{name}/values` by a stream selector, and a dropdown
+/// built without it offers values from streams the user is not looking at —
+/// clicking one returns nothing, which reads as data loss rather than as a
+/// wrong dropdown.
+#[tokio::test]
+async fn label_values_are_filtered_by_the_query_selector() {
+    let data_dir = temp_dir();
+    let memtable = Arc::new(MemTable::new());
+    for (app, env) in [("api", "prod"), ("api", "staging"), ("worker", "prod")] {
+        memtable.insert(
+            test_tenant(),
+            [
+                ("app".to_string(), app.to_string()),
+                ("env".to_string(), env.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            vec![LogEntry {
+                timestamp_ns: 1,
+                line: format!("{app} in {env}"),
+                structured_metadata: Vec::new(),
+            }],
+        );
+    }
+    let state = state_with(&data_dir, memtable, Arc::new(PartRegistry::new()));
+
+    let values_for = async |query: Option<&str>| {
+        label_values(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Path("env".to_string()),
+            Query(crate::query::MetadataParams {
+                start: None,
+                end: None,
+                query: query.map(str::to_string),
+            }),
+        )
+        .await
+    };
+
+    let mut unfiltered = values_for(None).await.unwrap().0.data;
+    unfiltered.sort();
+    assert_eq!(
+        unfiltered,
+        vec!["prod".to_string(), "staging".to_string()],
+        "with no selector every value the tenant holds is offered"
+    );
+
+    assert_eq!(
+        values_for(Some("{app=\"worker\"}")).await.unwrap().0.data,
+        vec!["prod".to_string()],
+        "worker only runs in prod, so staging must not be offered for it"
+    );
+
+    // An empty selector is not a filter that matches nothing.
+    let mut blank = values_for(Some("  ")).await.unwrap().0.data;
+    blank.sort();
+    assert_eq!(blank, unfiltered);
+
+    // A line filter cannot narrow stream labels, so it is refused rather than
+    // dropped: answering as though it were absent returns a superset while
+    // looking like it applied.
+    let Err((status, message)) = values_for(Some("{app=\"api\"} |= \"boom\"")).await else {
+        panic!("a line filter must be refused");
+    };
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(message.contains("line filter"), "{message}");
 }

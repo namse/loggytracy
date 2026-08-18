@@ -491,16 +491,20 @@ this sentence is here so the next reader knows that rather than inferring it.
       part is written through (`part/format.rs:195`, `dedup_by` on
       `Row::sort_key`), so a chunk cut between two twins does not save one. The
       findings table above already said so
-- [ ] **P2-1 Loki API gaps — one gap left, and it is not the one this line
-      implies.** Audited against the finding's own table on 2026-08-18: `tail`,
+- [x] **P2-1 Loki API gaps — closed 2026-08-18, and the last one was not what
+      this line implied.** Audited against the finding's own table on 2026-08-18: `tail`,
       `index/volume(_range)`, `detected_fields`, `detected_labels`,
       `format_query`, JSON push, the delete API, Tempo v2 and `/api/echo` are
       implemented; `patterns` is implemented on stated terms; `start`/`end` on
       the metadata endpoints landed with P2-2; `buildinfo` reports a real
-      revision (`handlers.rs`, `build_revision()`). What remains is
-      **`label_values` ignoring Loki's `query` matcher parameter** —
-      `MetadataParams` (`query/mod.rs:243`) carries `start` and `end` and nothing
-      else, so a dropdown filtered by a matcher returns the unfiltered values
+      revision (`handlers.rs`, `build_revision()`). The last gap —
+      `label_values` ignoring Loki's `query` matcher parameter — **closed the
+      same day**: the selector filters the values through the `series` lookup
+      both the memtable and the registry already had. One deliberate
+      divergence, in the same shape as the `_extracted` one: a `query` carrying
+      a **line filter** is refused rather than answered as though it were
+      absent, because label values come from stream labels and no filter over
+      line content narrows them without a scan this endpoint does not run
 - [ ] **LogQL improvements in P1 of `todo.md`** — one line open there, and it is
       a stated divergence rather than a gap: exact-field pruning stays
       conservative for empty-string equality and `_extracted` collisions, because
