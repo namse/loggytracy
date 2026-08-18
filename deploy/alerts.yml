@@ -151,11 +151,14 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "A part was too large to rewrite: tenant deletion is not complete"
+          summary: "A retention rewrite was skipped: tenant deletion is not complete"
           description: >-
             Rows a tenant asked to have deleted are masked at read time but
             still on disk and still in object storage. This is the one alert
             here whose meaning is a commitment to someone outside the system.
+            Not a size problem -- the rewrite streams, so it cannot fail for
+            want of memory at any part size; reaching this counter means I/O or
+            a corrupt input.
           runbook: docs/RUNBOOK.md#what-to-alert-on
 
       - alert: LoggytracyUnknownTenants

@@ -393,17 +393,43 @@ lines carry no evidence, and two of them were already answered elsewhere *in
 this document*, in the findings table above. The trigger was reaching for the
 list to decide what to do next and finding it named work that was finished, so
 the scope of this pass is what could have moved since `8b767a5`: Gate 5, and
-every line the work since then touched. Gates 1 and 4 were not re-read, and
-this sentence is here so the next reader knows that rather than inferring it.
+every line the work since then touched.
+
+**Gates 1 and 4 were then re-read too, the same day**, so this pass is a full
+one and every line below now carries where to look. They hold — but one of them
+holds by a different mechanism than its own words describe, and that mismatch
+had already leaked into the runbook and out of it into the alert rules. Written
+down where it happened, under N1(a).
 
 ### Gate 1 — data safety
 
 - [x] Fix P0-1 WAL-compaction wedge + consecutive-compaction/crash-injection tests
-- [x] P0-2 ingest backpressure (MemTable/WAL-backlog limit → 429)
+      — `journal/tests.rs`: `compaction_failure_does_not_fence_journal_writer`,
+      `compaction_retry_after_rename_failure_keeps_acknowledged_suffix`,
+      `replay_rolls_back_uncommitted_compaction_before_rename`,
+      `consecutive_compactions_truncate_whatever_the_batch_sizes_are`
+- [x] P0-2 ingest backpressure (MemTable/WAL-backlog limit → 429) —
+      `backpressure.rs`, refused before decompression so a rejected request
+      costs neither CPU nor WAL bytes
 - [x] N1(a) split fallback on merge memory overflow (guaranteed tenant deletion)
-- [x] N1(b) fail startup when policies are stored but the token is missing
-- [x] P1-4 writer fencing (manifest epoch + self-fence)
-- [x] Unify units for P1-8 `merge_max_input_bytes` vs `merge_max_memory_bytes`
+      — **holds, by a mechanism this line does not describe.** The fallback was
+      to halve an oversized group and retry; what shipped instead is a rewrite
+      that interleaves reading and writing (`merge/selection.rs`,
+      `rewrite_group`), so there is no memory overflow left to fall back from at
+      any part size. The guarantee is stronger and the words are stale, which
+      matters because they had been copied onward: `retention_rewrite_skipped`
+      still meant "a part too large to rewrite" in `RUNBOOK.md` on 2026-08-18,
+      and from there into `deploy/alerts.yml` two commits earlier. Both now say
+      what the counter means — a rewrite that failed on I/O or a corrupt input
+- [x] N1(b) fail startup when policies are stored but the token is missing —
+      `tenant_policy.rs:565`, pinned by
+      `dropping_the_token_with_stored_policies_fails_the_boot`
+- [x] P1-4 writer fencing (manifest epoch + self-fence) — `writer_epoch` on the
+      manifest, `check_epoch` on every commit path, `FENCED_ERROR` as the one
+      string a fenced writer reports
+- [x] Unify units for P1-8 `merge_max_input_bytes` vs `merge_max_memory_bytes` —
+      `Config::validate` (`config.rs:880`) refuses an input bound above the
+      memory bound, both in bytes
 
 ### Gate 2 — multi-tenancy completion
 
@@ -479,7 +505,9 @@ this sentence is here so the next reader knows that rather than inferring it.
       `part::tests::tenant_breadth_sets_the_row_group_floor_and_what_that_costs`
       builds parts across a tenant sweep and asserts the cost rather than
       describing it
-- [x] N6 Tempo time pruning (search and both tag endpoints)
+- [x] N6 Tempo time pruning (search and both tag endpoints) — `tempo/scan.rs`
+      prunes by `tenant_part_ids_in_range`, and `tempo/handlers.rs` runs every
+      window through `validate_query_range` first
 
 ### Gate 5 — feature completeness
 

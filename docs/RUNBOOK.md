@@ -56,7 +56,7 @@ without the other.
 | `loggytracy_remote_healthy` | Stays 0 | Object store unreachable. Set by three consecutive failures with no success between them, so an isolated failed request does not trip it |
 | `loggytracy_remote_consecutive_failures` | Rising but below 3 | The store is degrading without being declared down — the early signal the health flag deliberately hides |
 | `loggytracy_merge_debt_parts` | Upward trend | Merge cannot keep up; query-planning cost rises |
-| `loggytracy_retention_rewrite_skipped_total` | Increasing | A part is too large to rewrite. **Tenant deletion is not complete** |
+| `loggytracy_retention_rewrite_skipped_total` | Increasing | A retention rewrite failed and its group was skipped. **Tenant deletion is not complete.** Not a size problem: the rewrite interleaves reading and writing, so it cannot fail for want of memory at any part size (`merge/selection.rs`, `rewrite_group`) — reaching this counter means I/O or a corrupt input |
 | `loggytracy_tenant_policy_unknown_tenants` | Greater than 0 | Unknown tenants are accumulating data from the control plane's perspective |
 | `loggytracy_wal_replayed_entries` | Non-zero after a restart | The previous run did not shut down cleanly. **This is the upper bound on log lines this restart may have duplicated** — delivery is at-least-once, so records the WAL still held may already have been durable |
 | `loggytracy_stream_limit_rejected_total` | Increasing | A tenant is creating streams past its limit. **Usually a client putting a request id or timestamp in a label**, not a plan being outgrown — check the label names before raising anything |
