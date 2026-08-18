@@ -451,7 +451,13 @@ this sentence is here so the next reader knows that rather than inferring it.
       query path as a whole
 - [x] P2-8 non-stdin abort path — `SIGUSR1` forces termination during a drain
       (`shutdown.rs`), alongside the `exit`-on-stdin path a terminal has
-- [ ] **P3 — three of four.** `Dockerfile`, `docs/CONFIGURATION.md` (with a test,
+- [x] **P3 — four of four** (2026-08-18). `deploy/alerts.yml` ships 18 Prometheus
+      rules, one per row of the runbook's table, tied to it by
+      `query::tests::every_alert_signal_in_the_runbook_has_a_rule`: the test
+      fails on a row with no rule, on a rule naming a metric this engine does
+      not export, and on a rule alerting on a signal the runbook never
+      explained. Writing it caught two of the third kind. What follows is the
+      state before it. `Dockerfile`, `docs/CONFIGURATION.md` (with a test,
       `every_configuration_knob_is_documented`, that fails the build when a knob
       is added without a row) and `docs/RUNBOOK.md` all exist; the runbook's
       "What to alert on" is prose, and machine-readable alert rules are not

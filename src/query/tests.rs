@@ -3773,3 +3773,103 @@ fn a_refusal_is_never_reported_as_a_server_fault() {
         "and something nobody recognizes is still a fault"
     );
 }
+
+/// The runbook decides what to alert on; `deploy/alerts.yml` is that decision
+/// in the form a Prometheus can load. Two files holding one set of decisions
+/// drift, and the drift is silent in the worst direction: the operator is
+/// paged by neither because they believe the other has it. So the tie is a
+/// test rather than a convention.
+///
+/// Three ways it can fail, and each is a real defect rather than tidiness. A
+/// row added to the table with no rule is an alert someone decided to have and
+/// nobody will receive. A rule naming a metric this engine does not export is a
+/// rule that can never fire — a renamed metric leaves exactly this shape. And a
+/// rule on a signal the table never listed is a page whose meaning is written
+/// down nowhere.
+#[test]
+fn every_alert_signal_in_the_runbook_has_a_rule() {
+    let runbook = include_str!("../../docs/RUNBOOK.md");
+    let rules = include_str!("../../deploy/alerts.yml");
+    let exported = include_str!("handlers.rs");
+
+    // The signals are the first column of the "What to alert on" table, one
+    // backticked metric per row.
+    let table = runbook
+        .split_once("## What to alert on")
+        .expect("the runbook must still have the table these rules come from")
+        .1;
+    let table = table.split("\n## ").next().unwrap();
+    let signals: Vec<&str> = table
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `loggytracy_"))
+        .filter_map(|rest| rest.split_once('`').map(|(name, _)| name))
+        .collect();
+    // A row's condition and meaning name metrics too — "increasing while
+    // `flush_success_total` is flat" is half of an expression, and the memory
+    // row sends the reader to `loggytracy_query_latency_ms`. Those are
+    // explained by the table even though they are not its signals, so a rule
+    // may reach for them.
+    let mentioned: Vec<&str> = table
+        .match_indices('`')
+        .filter_map(|(at, _)| table[at + 1..].split_once('`').map(|(name, _)| name))
+        .map(|name| name.trim_start_matches("loggytracy_"))
+        .collect();
+    assert!(
+        signals.len() > 10,
+        "the table parsed as {} rows, which means its shape changed, not that it shrank",
+        signals.len()
+    );
+
+    let missing: Vec<&&str> = signals
+        .iter()
+        .filter(|name| !rules.contains(&format!("loggytracy_{name}")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these signals are in the runbook's table but no rule in deploy/alerts.yml uses them: {missing:#?}"
+    );
+
+    // Every metric a rule names must be one this engine actually renders, and
+    // must be a signal the table explains. Helper metrics a rule divides or
+    // guards by are still the first: an expression cannot evaluate against a
+    // series nobody exports.
+    let mut rest = rules;
+    let mut unexported: Vec<String> = Vec::new();
+    let mut unexplained: Vec<String> = Vec::new();
+    while let Some(start) = rest.find("loggytracy_") {
+        rest = &rest[start..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(rest.len());
+        let name = rest[..end].to_string();
+        rest = &rest[end..];
+        let bare = name.trim_start_matches("loggytracy_").to_string();
+        if !exported.contains(&name) && !unexported.contains(&name) {
+            unexported.push(name.clone());
+        }
+        // A histogram is exported under its base name and queried by its
+        // derived series, so the table naming the base is enough.
+        let explained = signals
+            .iter()
+            .chain(mentioned.iter())
+            .any(|known| bare == *known || bare.starts_with(known));
+        // Guards and denominators are not signals; they are named here so the
+        // list of what a rule may reach for stays visible.
+        const HELPERS: [&str; 3] = [
+            "loggytracy_part_count",
+            "loggytracy_tenant_policy_known_tenants",
+            "loggytracy_drain_in_progress",
+        ];
+        if !explained && !HELPERS.contains(&name.as_str()) && !unexplained.contains(&name) {
+            unexplained.push(name);
+        }
+    }
+    assert!(
+        unexported.is_empty(),
+        "deploy/alerts.yml names metrics this engine does not export: {unexported:#?}"
+    );
+    assert!(
+        unexplained.is_empty(),
+        "deploy/alerts.yml alerts on signals the runbook's table does not explain: {unexplained:#?}"
+    );
+}

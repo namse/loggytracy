@@ -43,6 +43,11 @@ measurement, and watch the instance's own peak once it is carrying traffic.
 
 ## What to alert on
 
+Loadable form: [`deploy/alerts.yml`](../deploy/alerts.yml), one Prometheus rule
+per row below. This table is the decisions and that file is their form, tied by
+`query::tests::every_alert_signal_in_the_runbook_has_a_rule` so neither can move
+without the other.
+
 | Signal | Condition | Meaning |
 |---|---|---|
 | `loggytracy_ingest_throttled_total` | Increasing | Returning 429; flush cannot keep up with ingest |
