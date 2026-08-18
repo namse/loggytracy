@@ -438,7 +438,19 @@ down where it happened, under N1(a).
       tenant, burst floored at `max_push_bytes` so a legal body is never refused
       forever), `default_tenant_max_streams` for `max_streams_per_user`, and the
       rate applies to both transports (`the_tenant_rate_applies_to_the_http_transport_too`)
-- [ ] **Tenant-labeled metrics — reframed as a decision, not a task.** The
+- [x] **Tenant-labeled metrics — the decision exists and is not this list's to
+      make** (closed 2026-08-18). The line asked for a decision about the trust
+      boundary of `/metrics`, and that decision was taken where the alternative
+      shipped: `admin.rs`'s `get_usage` says in its own doc comment that
+      per-tenant numbers are on the authenticated admin API *deliberately
+      rather than* as labels on `/metrics`, because that endpoint is
+      unauthenticated and process-wide by design and a label per tenant
+      multiplies every series by the customer count — the cardinality problem
+      this engine bounds everywhere else, on a workload whose whole point is
+      many small tenants. The reader that needs per-tenant numbers is the
+      control plane, which is already authenticated there and already asks one
+      tenant at a time. A deployment that wants them in Prometheus scrapes that
+      endpoint, not this one. What follows is the reframing this replaces. The
       original line bundled this with the quotas above, which are done. What is
       not done is emitting one series per tenant, and it is not obvious it should
       be: `/metrics` is unauthenticated (`metrics.rs`, the gauge doc), so
@@ -538,3 +550,21 @@ down where it happened, under N1(a).
       conservative for empty-string equality and `_extracted` collisions, because
       an empty equality also matches an absent field and absence is indexed
       nowhere. Feature completeness, not a deployment gate
+
+### Where the five gates stand after 2026-08-18
+
+Two lines are open and neither is work: N5 is a gate that was met and then unmet
+on purpose, left visible so a later reader does not re-open it, and the LogQL
+line is a stated divergence in feature completeness. **Nothing on this list
+blocks a deployment.**
+
+That is a statement about this list, and the list has been wrong in both
+directions twice. What makes it worth more this time is that every line now
+names where to look, so the next reader checks rather than believes — and two
+of the four things this pass fixed were found by a line's own evidence
+disagreeing with the code it pointed at.
+
+What is *not* on this list and still true: the query-side risks in
+[`LOAD_VALIDATION.md`](LOAD_VALIDATION.md) — latency tails against a real
+backend, throttling, and the cost model — remain unvalidated because they need
+a deployment, and no audit of a document can close them.
