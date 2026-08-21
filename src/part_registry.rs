@@ -1057,7 +1057,14 @@ mod tests {
         assert_eq!(registry.part_count(), 1, "the registry still answers");
         assert!(
             registry
-                .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(0, 2_000), 10, true)
+                .query(
+                    &test_tenant(),
+                    &[],
+                    &[],
+                    crate::part::QueryTimeRange::closed(0, 2_000),
+                    10,
+                    true
+                )
                 .is_ok(),
             "and still serves queries"
         );

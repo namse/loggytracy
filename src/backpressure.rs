@@ -415,7 +415,10 @@ mod tests {
     async fn a_disk_above_the_floor_admits_the_write() {
         let mut config = disk_config("above");
         config.min_free_disk_bytes = Some(1024);
-        let gate = disk_gate(config, crate::disk::DiskSpace::with_free_bytes(64 * 1024 * 1024));
+        let gate = disk_gate(
+            config,
+            crate::disk::DiskSpace::with_free_bytes(64 * 1024 * 1024),
+        );
         gate.check().expect("above the floor is not a refusal");
     }
 

@@ -1,10 +1,10 @@
 mod admin;
 mod app_state;
 mod backpressure;
-mod disk;
 pub mod bloom;
 pub mod clock;
 pub mod config;
+mod disk;
 // Shared with `benches/` and `bin/load`. One generator, so a load result and a
 // bench result describe the same bytes; see the module doc.
 pub mod corpus;

@@ -278,3 +278,21 @@ groups:
             only invented number in this file: the shape is the signal, the
             fraction is where a deployment decides it minds.
           runbook: docs/RUNBOOK.md#what-to-alert-on
+
+      - alert: LoggytracyDataDirRunningOut
+        expr: >-
+          loggytracy_data_dir_total_bytes > 0
+          and loggytracy_data_dir_free_bytes < 4294967296
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The data directory's filesystem is running out of room"
+          description: >-
+            Fires at twice LOGGYTRACY_MIN_FREE_DISK_BYTES, not at it: at the
+            floor ingest is already being refused, and this is the warning
+            before that. The 4 GiB literal is twice the *default* floor -- a
+            deployment that moved the knob has to move this number with it,
+            because Prometheus cannot read the process's configuration. Divide
+            by loggytracy_data_dir_total_bytes for a percentage.
+          runbook: docs/RUNBOOK.md#what-to-alert-on
