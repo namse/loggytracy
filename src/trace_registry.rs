@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::object_storage::TraceManifest;
 use crate::tenant::TenantId;
@@ -59,7 +61,7 @@ impl TraceRegistry {
     /// Every tenant that owns a segment in some trace part. See
     /// `PartRegistry::visit_tenants`.
     pub fn visit_tenants(&self, mut visit: impl FnMut(&TenantId)) {
-        for reader in self.inner.read().unwrap().values() {
+        for reader in self.inner.read().values() {
             for segment in &reader.part().meta.tenants {
                 visit(&segment.tenant);
             }
@@ -84,8 +86,8 @@ impl TraceRegistry {
                 .map_err(|error| format!("failed to open trace part {id}: {error}"))?;
             readers.insert(id, Arc::new(reader));
         }
-        let mut inner = self.inner.write().unwrap();
-        *self.stored_bytes.write().unwrap() = census_of(&readers);
+        let mut inner = self.inner.write();
+        *self.stored_bytes.write() = census_of(&readers);
         *inner = readers;
         Ok(())
     }
@@ -119,8 +121,8 @@ impl TraceRegistry {
             })?;
             readers.insert(descriptor.id.clone(), Arc::new(reader));
         }
-        *registry.stored_bytes.write().unwrap() = census_of(&readers);
-        *registry.inner.write().unwrap() = readers;
+        *registry.stored_bytes.write() = census_of(&readers);
+        *registry.inner.write() = readers;
         Ok(registry)
     }
 
@@ -146,8 +148,8 @@ impl TraceRegistry {
 
     pub fn register_opened(&self, readers: Vec<(String, Arc<TracePartReader>)>) -> Vec<String> {
         let ids = readers.iter().map(|(id, _)| id.clone()).collect();
-        let mut inner = self.inner.write().unwrap();
-        let mut census = self.stored_bytes.write().unwrap();
+        let mut inner = self.inner.write();
+        let mut census = self.stored_bytes.write();
         for (id, reader) in readers {
             // Registering an id already present replaces it, so its predecessor
             // leaves the census with it.
@@ -162,8 +164,8 @@ impl TraceRegistry {
     }
 
     pub fn unregister(&self, ids: &[String]) {
-        let mut inner = self.inner.write().unwrap();
-        let mut census = self.stored_bytes.write().unwrap();
+        let mut inner = self.inner.write();
+        let mut census = self.stored_bytes.write();
         for id in ids {
             if let Some(removed) = inner.remove(id) {
                 subtract(&mut census, &removed);
@@ -175,14 +177,13 @@ impl TraceRegistry {
     pub fn tenant_stored_bytes(&self, tenant: &TenantId) -> u64 {
         self.stored_bytes
             .read()
-            .unwrap()
             .get(tenant)
             .copied()
             .unwrap_or(0)
     }
 
     pub fn snapshot(&self) -> Vec<Arc<TracePartReader>> {
-        self.inner.read().unwrap().values().cloned().collect()
+        self.inner.read().values().cloned().collect()
     }
 
     pub fn candidate_part_ids(
@@ -192,7 +193,6 @@ impl TraceRegistry {
     ) -> std::collections::HashSet<String> {
         self.inner
             .read()
-            .unwrap()
             .iter()
             .filter(|(_, reader)| reader.may_match_trace_id(tenant, trace_id))
             .map(|(id, _)| id.clone())
@@ -205,7 +205,6 @@ impl TraceRegistry {
     pub fn tenant_part_ids(&self, tenant: &TenantId) -> std::collections::HashSet<String> {
         self.inner
             .read()
-            .unwrap()
             .iter()
             .filter(|(_, reader)| reader.part().meta.tenant_row_groups(tenant).is_some())
             .map(|(id, _)| id.clone())
@@ -222,7 +221,6 @@ impl TraceRegistry {
     ) -> std::collections::HashSet<String> {
         self.inner
             .read()
-            .unwrap()
             .iter()
             .filter(|(_, reader)| {
                 reader
@@ -240,7 +238,6 @@ impl TraceRegistry {
     ) -> std::collections::HashSet<String> {
         self.inner
             .read()
-            .unwrap()
             .iter()
             .filter(|(id, reader)| ids.contains(*id) && !reader.part().data_path().exists())
             .map(|(id, _)| id.clone())
@@ -251,14 +248,13 @@ impl TraceRegistry {
     pub fn part_dirs(&self) -> Vec<std::path::PathBuf> {
         self.inner
             .read()
-            .unwrap()
             .values()
             .map(|reader| reader.part().dir.clone())
             .collect()
     }
 
     pub fn part_ids(&self) -> std::collections::HashSet<String> {
-        self.inner.read().unwrap().keys().cloned().collect()
+        self.inner.read().keys().cloned().collect()
     }
 
     pub fn query_trace_id(
@@ -338,7 +334,7 @@ impl TraceRegistry {
     }
 
     pub fn part_count(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.read().len()
     }
 }
 

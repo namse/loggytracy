@@ -1276,6 +1276,7 @@ dependencies = [
  "libc",
  "object_store",
  "opentelemetry-proto",
+ "parking_lot",
  "parquet",
  "prost",
  "regex",

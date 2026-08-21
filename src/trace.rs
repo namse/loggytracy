@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 pub use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
@@ -288,7 +290,7 @@ impl TraceMemTable {
 
     pub fn insert(&self, spans: Vec<TraceSpan>) {
         let added = spans_bytes(&spans);
-        self.inner.write().unwrap().extend(spans);
+        self.inner.write().extend(spans);
         self.inner_bytes.fetch_add(added, Ordering::Relaxed);
     }
 
@@ -296,8 +298,8 @@ impl TraceMemTable {
     /// log memtable shares its snapshot: the copy doubled buffered memory at
     /// the moment the buffer is largest.
     pub fn begin_flush(&self) -> Arc<Vec<TraceSpan>> {
-        let mut inner = self.inner.write().unwrap();
-        let mut flushing = self.flushing.write().unwrap();
+        let mut inner = self.inner.write();
+        let mut flushing = self.flushing.write();
         let mut snapshot = std::mem::take(&mut *inner);
         let moved = self.inner_bytes.swap(0, Ordering::Relaxed);
         if let Some(previous) = flushing.take() {
@@ -310,26 +312,25 @@ impl TraceMemTable {
     }
 
     pub fn commit_flush(&self) {
-        *self.flushing.write().unwrap() = None;
+        *self.flushing.write() = None;
         self.flushing_bytes.store(0, Ordering::Relaxed);
     }
 
     pub fn abort_flush(&self, snapshot: Arc<Vec<TraceSpan>>) {
         // Cleared first so the unwrap below takes ownership rather than copying.
-        *self.flushing.write().unwrap() = None;
+        *self.flushing.write() = None;
         let mut snapshot = unwrap_spans(snapshot);
-        self.inner.write().unwrap().append(&mut snapshot);
+        self.inner.write().append(&mut snapshot);
         let returned = self.flushing_bytes.swap(0, Ordering::Relaxed);
         self.inner_bytes.fetch_add(returned, Ordering::Relaxed);
     }
 
     pub fn is_empty(&self) -> bool {
-        if !self.inner.read().unwrap().is_empty() {
+        if !self.inner.read().is_empty() {
             return false;
         }
         self.flushing
             .read()
-            .unwrap()
             .as_ref()
             .map(|spans| spans.is_empty())
             .unwrap_or(true)
@@ -338,8 +339,8 @@ impl TraceMemTable {
     /// Every tenant with spans that have not been flushed yet, including the
     /// ones in a flush that is still in flight. See `MemTable::tenants`.
     pub fn tenants(&self) -> std::collections::BTreeSet<TenantId> {
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
         inner
             .iter()
             .chain(flushing.as_deref().into_iter().flatten())
@@ -354,8 +355,8 @@ impl TraceMemTable {
     }
 
     pub fn query_trace_id(&self, tenant: &TenantId, trace_id: &str) -> Vec<TraceSpan> {
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
         inner
             .iter()
             .chain(flushing.as_deref().into_iter().flatten())
@@ -370,8 +371,8 @@ impl TraceMemTable {
         trace_id: &str,
         limit: usize,
     ) -> Result<Vec<TraceSpan>, String> {
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
         let mut spans = Vec::new();
         for span in inner
             .iter()
@@ -389,8 +390,8 @@ impl TraceMemTable {
     /// Every buffered span, across all tenants. Only the flush path may use
     /// this; query paths must go through the tenant-scoped variants.
     pub fn flush_snapshot(&self) -> Vec<TraceSpan> {
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
         inner
             .iter()
             .chain(flushing.as_deref().into_iter().flatten())
@@ -399,8 +400,8 @@ impl TraceMemTable {
     }
 
     pub fn snapshot(&self, tenant: &TenantId) -> Vec<TraceSpan> {
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
         inner
             .iter()
             .chain(flushing.as_deref().into_iter().flatten())
@@ -414,8 +415,8 @@ impl TraceMemTable {
         tenant: &TenantId,
         limit: usize,
     ) -> Result<Vec<TraceSpan>, String> {
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
         let mut spans = Vec::new();
         for span in inner
             .iter()

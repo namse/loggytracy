@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::logql::{LabelMatcher, LineFilter};
 use crate::memtable::{IndexStats, Labels, QueryResult, SharedLabels, StreamResult};
@@ -271,7 +273,7 @@ falling back to a parked acquisition, which briefly convoys new readers"
     /// guard instead of going through `snapshot`, which would clone one `Arc`
     /// per part; `/metrics` asks for this on every scrape.
     pub fn visit_tenants(&self, mut visit: impl FnMut(&TenantId)) {
-        for reader in self.inner.read().unwrap().values() {
+        for reader in self.inner.read().values() {
             for segment in &reader.meta().tenants {
                 visit(&segment.tenant);
             }
@@ -332,7 +334,7 @@ falling back to a parked acquisition, which briefly convoys new readers"
         let count = opened.len();
         let readers: HashMap<String, Arc<PartReader>> = opened.into_iter().collect();
         self.reset_layout(&readers);
-        *self.inner.write().unwrap() = readers;
+        *self.inner.write() = readers;
         if count > 0 {
             tracing::info!(parts = count, "loaded parts from disk");
         }
@@ -342,7 +344,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn has_missing_cache_files(&self) -> bool {
         self.inner
             .read()
-            .unwrap()
             .values()
             .any(|reader| !reader.part().data_path().exists())
     }
@@ -369,7 +370,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     ) -> std::collections::HashSet<String> {
         self.inner
             .read()
-            .unwrap()
             .iter()
             .filter(|(_, reader)| {
                 reader.may_match_exact_fields(tenant, matchers, line_filters, exact_fields, range)
@@ -384,7 +384,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     ) -> std::collections::HashSet<String> {
         self.inner
             .read()
-            .unwrap()
             .iter()
             .filter(|(id, reader)| ids.contains(*id) && !reader.part().data_path().exists())
             .map(|(id, _)| id.clone())
@@ -418,9 +417,9 @@ falling back to a parked acquisition, which briefly convoys new readers"
     /// exactly the visibility transition and nothing else.
     pub fn register_opened(&self, opened: Vec<(String, Arc<PartReader>)>) -> Vec<String> {
         let ids = opened.iter().map(|(id, _)| id.clone()).collect();
-        let mut inner = self.inner.write().unwrap();
-        let mut layout = self.layout.write().unwrap();
-        let mut census = self.census.write().unwrap();
+        let mut inner = self.inner.write();
+        let mut layout = self.layout.write();
+        let mut census = self.census.write();
         for (id, reader) in opened {
             // Registering an id that is already present replaces it, so its
             // predecessor has to leave the derived indexes with it.
@@ -439,9 +438,9 @@ falling back to a parked acquisition, which briefly convoys new readers"
     }
 
     pub fn unregister(&self, ids: &[String]) {
-        let mut inner = self.inner.write().unwrap();
-        let mut layout = self.layout.write().unwrap();
-        let mut census = self.census.write().unwrap();
+        let mut inner = self.inner.write();
+        let mut layout = self.layout.write();
+        let mut census = self.census.write();
         for id in ids {
             if let Some(removed) = inner.remove(id) {
                 layout.remove(&removed);
@@ -475,9 +474,9 @@ falling back to a parked acquisition, which briefly convoys new readers"
         opened: Vec<(String, Arc<PartReader>)>,
     ) -> Vec<String> {
         let new_ids: Vec<String> = opened.iter().map(|(id, _)| id.clone()).collect();
-        let mut inner = self.inner.write().unwrap();
-        let mut layout = self.layout.write().unwrap();
-        let mut census = self.census.write().unwrap();
+        let mut inner = self.inner.write();
+        let mut layout = self.layout.write();
+        let mut census = self.census.write();
         for (id, reader) in opened {
             if let Some(previous) = inner.insert(id, reader.clone()) {
                 layout.remove(&previous);
@@ -502,11 +501,11 @@ falling back to a parked acquisition, which briefly convoys new readers"
     }
 
     pub fn snapshot(&self) -> Vec<Arc<PartReader>> {
-        self.inner.read().unwrap().values().cloned().collect()
+        self.inner.read().values().cloned().collect()
     }
 
     pub fn layout_totals(&self) -> LayoutTotals {
-        *self.layout.read().unwrap()
+        *self.layout.read()
     }
 
     /// Rebuild the derived indexes from a whole set, for the paths that replace
@@ -520,13 +519,13 @@ falling back to a parked acquisition, which briefly convoys new readers"
                 census.add(&facts);
             }
         }
-        *self.layout.write().unwrap() = totals;
-        *self.census.write().unwrap() = census;
+        *self.layout.write() = totals;
+        *self.census.write() = census;
     }
 
     /// Whether the tenant already has this stream on disk.
     pub fn contains_stream(&self, tenant: &TenantId, key: u64) -> bool {
-        self.census.read().unwrap().contains(tenant, key)
+        self.census.read().contains(tenant, key)
     }
 
     /// Parts holding at least one row for the tenant. Its share of the
@@ -534,7 +533,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn tenant_part_count(&self, tenant: &TenantId) -> usize {
         self.inner
             .read()
-            .unwrap()
             .values()
             .filter(|reader| reader.meta().tenant_segment(tenant).is_some())
             .count()
@@ -542,7 +540,7 @@ falling back to a parked acquisition, which briefly convoys new readers"
 
     /// Distinct streams the tenant has on disk.
     pub fn tenant_stream_count(&self, tenant: &TenantId) -> usize {
-        self.census.read().unwrap().count(tenant)
+        self.census.read().count(tenant)
     }
 
     /// Bytes the tenant's row groups occupy across every registered part.
@@ -552,11 +550,11 @@ falling back to a parked acquisition, which briefly convoys new readers"
     /// whose contents say nothing about what is being kept. Excludes the
     /// Parquet footer and the sidecars, which belong to no single tenant.
     pub fn tenant_stored_bytes(&self, tenant: &TenantId) -> u64 {
-        self.census.read().unwrap().stored_bytes(tenant)
+        self.census.read().stored_bytes(tenant)
     }
 
     pub fn part_count(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.read().len()
     }
 
     /// Every registered part's directory. What eviction walks instead of the
@@ -564,14 +562,13 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn part_dirs(&self) -> Vec<std::path::PathBuf> {
         self.inner
             .read()
-            .unwrap()
             .values()
             .map(|reader| reader.part().dir.clone())
             .collect()
     }
 
     pub fn part_ids(&self) -> std::collections::HashSet<String> {
-        self.inner.read().unwrap().keys().cloned().collect()
+        self.inner.read().keys().cloned().collect()
     }
 
     pub fn query(
@@ -1025,6 +1022,41 @@ mod tests {
         assert_eq!(registry.tenant_stored_bytes(&acme), 0);
         assert_eq!(registry.tenant_stored_bytes(&globex), 0);
         assert!(globex_before > 0);
+    }
+
+    /// The reason these locks are not `std::sync`.
+    ///
+    /// A panic under a read guard is a real possibility on the query path — a
+    /// Parquet decode over a file this process did not write, an arithmetic
+    /// edge — and axum catches it per request rather than ending the process.
+    /// With a poisoning lock the *next* reader panics too, and so does every
+    /// one after it: one bad query turns into an instance that is up, passing
+    /// its liveness probe, and answering nothing. Nothing here writes under a
+    /// read guard, so there is no half-written state for the poison flag to be
+    /// warning about.
+    #[test]
+    fn a_panic_under_a_read_guard_does_not_wedge_the_registry() {
+        let dir = temp_dir();
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = PartRegistry::new();
+        registry
+            .register(part::flush_rows(vec![row("one", 1_000)], &parts_root, 100).unwrap())
+            .unwrap();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.inner.read();
+            panic!("deliberate: a reader panicking while holding the guard");
+        }));
+        assert!(panicked.is_err());
+
+        assert_eq!(registry.part_count(), 1, "the registry still answers");
+        assert!(
+            registry
+                .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(0, 2_000), 10, true)
+                .is_ok(),
+            "and still serves queries"
+        );
     }
 
     #[test]

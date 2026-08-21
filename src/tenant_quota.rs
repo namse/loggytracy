@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -72,7 +72,7 @@ impl std::fmt::Debug for QuerySlot {
 
 impl Drop for QuerySlot {
     fn drop(&mut self) {
-        let mut in_flight = self.quota.in_flight.lock().unwrap();
+        let mut in_flight = self.quota.in_flight.lock();
         if let Some(count) = in_flight.get_mut(&self.tenant) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -177,7 +177,7 @@ impl TenantQuota {
         let refill_per_ns = rate as f64 / 1e9;
         let now_ns = self.clock.now_ns();
 
-        let mut buckets = self.scan_buckets.lock().unwrap();
+        let mut buckets = self.scan_buckets.lock();
         let bucket = buckets.entry(tenant.clone()).or_insert(Bucket {
             available: capacity,
             capacity,
@@ -225,7 +225,7 @@ impl TenantQuota {
         }
 
         let limit = self.config.max_concurrent_queries_per_tenant as u32;
-        let mut in_flight = self.in_flight.lock().unwrap();
+        let mut in_flight = self.in_flight.lock();
         let count = in_flight.entry(tenant.clone()).or_insert(0);
         if *count >= limit {
             let running = *count;
@@ -319,7 +319,7 @@ this write would create another"
             return 0.0;
         }
         let now_ns = self.clock.now_ns();
-        let buckets = buckets.lock().unwrap();
+        let buckets = buckets.lock();
         let Some(bucket) = buckets.get(tenant) else {
             return self.capacity(rate);
         };
@@ -400,7 +400,7 @@ writes resume when retention retires enough of it"
             return Some(0.0);
         }
         let now_ns = self.clock.now_ns();
-        let buckets = self.scan_buckets.lock().unwrap();
+        let buckets = self.scan_buckets.lock();
         let Some(bucket) = buckets.get(tenant) else {
             // No bucket is a full bucket: nothing has been spent.
             return Some(self.capacity(rate));
@@ -429,7 +429,7 @@ writes resume when retention retires enough of it"
         let refill_per_ns = rate as f64 / 1e9;
         let now_ns = self.clock.now_ns();
 
-        let mut buckets = buckets.lock().unwrap();
+        let mut buckets = buckets.lock();
         let bucket = buckets.entry(tenant.clone()).or_insert(Bucket {
             available: capacity,
             capacity,
@@ -519,7 +519,7 @@ this request needs {bytes} bytes of budget"
             return;
         }
         let now_ns = self.clock.now_ns();
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.lock();
         buckets.retain(|_, bucket| {
             let elapsed_ns = now_ns.saturating_sub(bucket.updated_ns).max(0);
             // Refilled to capacity by now, so dropping it changes no decision.

@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::logql::{LabelMatcher, LineFilter};
 use crate::part::{MetadataWindow, QueryTimeRange};
@@ -237,7 +239,7 @@ impl MemTable {
             canonicalize_structured_metadata(&mut entry.structured_metadata);
         }
         let mut delta = entries_bytes(&entries);
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         let overhead = stream_overhead_bytes(&tenant, &labels);
         let streams = inner.entry(tenant).or_default();
         // One hash of the label set, whether or not the stream is new. Looking
@@ -270,8 +272,8 @@ impl MemTable {
     /// as well as the live buffer, so it has to stay reachable here, but there
     /// is no reason for the flush to hold a second copy of it.
     pub fn begin_flush(&self) -> Arc<MemTableSnapshot> {
-        let mut inner = self.inner.write().unwrap();
-        let mut flushing = self.flushing.write().unwrap();
+        let mut inner = self.inner.write();
+        let mut flushing = self.flushing.write();
         let mut snapshot = std::mem::take(&mut *inner);
         let moved = self.inner_bytes.swap(0, Ordering::Relaxed);
         let mut redundant_overhead = 0;
@@ -287,18 +289,18 @@ impl MemTable {
     }
 
     pub fn commit_flush(&self) {
-        let mut flushing = self.flushing.write().unwrap();
+        let mut flushing = self.flushing.write();
         *flushing = None;
         self.flushing_bytes.store(0, Ordering::Relaxed);
     }
 
     pub fn abort_flush(&self, snapshot: Arc<MemTableSnapshot>) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         // Clearing the slot first drops this snapshot's other reference, so the
         // unwrap below takes ownership instead of copying. The lock order is
         // the one every other path uses — inner, then flushing — because
         // reversing it here would be the deadlock the ordering exists to avoid.
-        let mut flushing = self.flushing.write().unwrap();
+        let mut flushing = self.flushing.write();
         *flushing = None;
         let redundant_overhead = merge_snapshot(&mut inner, unwrap_snapshot(snapshot));
         // The aborted snapshot is the one `flushing_bytes` was counting, so it
@@ -318,7 +320,6 @@ impl MemTable {
         if self
             .inner
             .read()
-            .unwrap()
             .get(tenant)
             .is_some_and(|streams| streams.contains_key(labels))
         {
@@ -326,7 +327,6 @@ impl MemTable {
         }
         self.flushing
             .read()
-            .unwrap()
             .as_deref()
             .and_then(|snapshot| snapshot.get(tenant))
             .is_some_and(|streams| streams.contains_key(labels))
@@ -337,13 +337,12 @@ impl MemTable {
     /// genuinely new stream appears.
     pub fn tenant_streams(&self, tenant: &TenantId) -> Vec<SharedLabels> {
         let mut streams: BTreeSet<SharedLabels> = BTreeSet::new();
-        if let Some(buffered) = self.inner.read().unwrap().get(tenant) {
+        if let Some(buffered) = self.inner.read().get(tenant) {
             streams.extend(buffered.keys().cloned());
         }
         if let Some(flushing) = self
             .flushing
             .read()
-            .unwrap()
             .as_deref()
             .and_then(|snapshot| snapshot.get(tenant))
         {
@@ -353,11 +352,11 @@ impl MemTable {
     }
 
     pub fn is_empty(&self) -> bool {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         if !inner.is_empty() {
             return false;
         }
-        let flushing = self.flushing.read().unwrap();
+        let flushing = self.flushing.read();
         flushing.as_ref().map(|m| m.is_empty()).unwrap_or(true)
     }
 
@@ -366,8 +365,8 @@ impl MemTable {
     /// pushed is invisible in `meta.json` until its first flush, so the
     /// unknown-tenant gauge reads this too.
     pub fn tenants(&self) -> BTreeSet<TenantId> {
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
         inner
             .keys()
             .chain(flushing.iter().flat_map(|snapshot| snapshot.keys()))
@@ -472,8 +471,8 @@ impl MemTable {
         // begin_flush and abort_flush acquire inner before flushing. Holding
         // both read guards in that order prevents observing the same entry in
         // both buffers if a flush starts between the two reads.
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
         // The live buffer first, so that for a stream present in both the rows
         // that were pushed earlier also arrive earlier. `sort_by` is stable, so
         // ordering by label set does not disturb that.
@@ -525,8 +524,8 @@ impl MemTable {
         window: MetadataWindow,
         mut visit: impl FnMut(&Labels, &[LogEntry]),
     ) {
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
         let mut retained = Vec::new();
         // Entry granularity rather than stream granularity: unlike a part,
         // whose bounds are already in its metadata, a memtable stream has to be
@@ -601,8 +600,8 @@ impl MemTable {
         let mut streams = 0usize;
         let mut entries = 0usize;
         let mut bytes = 0u64;
-        let inner = self.inner.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
         for snapshot in std::iter::once(&*inner).chain(flushing.as_deref()) {
             for tenant_streams in snapshot.values() {
                 streams += tenant_streams.len();
@@ -695,8 +694,8 @@ mod tests {
     fn the_size_counters_track_the_walked_total_across_a_flush_cycle() {
         let memtable = MemTable::new();
         let walked = |table: &MemTable| {
-            let inner = table.inner.read().unwrap();
-            let flushing = table.flushing.read().unwrap();
+            let inner = table.inner.read();
+            let flushing = table.flushing.read();
             snapshot_bytes(&inner) + flushing.as_deref().map(snapshot_bytes).unwrap_or(0)
         };
         let tenant = crate::tenant::test_tenant();

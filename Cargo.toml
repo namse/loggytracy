@@ -58,6 +58,13 @@ tikv-jemallocator = "0.7.0"
 # `statvfs`, for the one thing this process measures about the machine under it:
 # how much room is left on the disk the WAL cannot do without.
 libc = "0.2"
+# Locks without poisoning. A panic under a read guard — a Parquet decode, an
+# arithmetic edge — poisons a std lock, and every later `.read().unwrap()` on it
+# panics too, so one bad query takes the whole process down with it while the
+# process stays up. What the poison flag warns about is a half-written
+# structure, and the guards here that write are the ones this codebase already
+# treats as fatal; the guards that read cannot leave anything half-written.
+parking_lot = "0.12"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

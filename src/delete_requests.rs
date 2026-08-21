@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 use crate::logql;
 use crate::memtable::{Labels, LogEntry};
@@ -174,7 +174,7 @@ impl DeleteRequests {
             return Ok(0);
         };
         let bodies = storage.load_delete_requests().await?;
-        let mut by_tenant = self.by_tenant.write().expect("delete request lock");
+        let mut by_tenant = self.by_tenant.write();
         let mut loaded = 0usize;
         for body in bodies {
             let request: DeleteRequest = serde_json::from_slice(&body)
@@ -222,7 +222,7 @@ impl DeleteRequests {
         };
 
         {
-            let by_tenant = self.by_tenant.read().expect("delete request lock");
+            let by_tenant = self.by_tenant.read();
             if by_tenant
                 .get(tenant)
                 .is_some_and(|requests| requests.len() >= MAX_DELETE_REQUESTS_PER_TENANT)
@@ -243,7 +243,7 @@ impl DeleteRequests {
                 .map_err(DeleteRequestError::Storage)?;
         }
 
-        let mut by_tenant = self.by_tenant.write().expect("delete request lock");
+        let mut by_tenant = self.by_tenant.write();
         let requests = by_tenant.entry(tenant.clone()).or_default();
         if requests.len() >= MAX_DELETE_REQUESTS_PER_TENANT {
             self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
@@ -261,7 +261,6 @@ impl DeleteRequests {
     pub fn list(&self, tenant: &TenantId) -> Vec<DeleteRequest> {
         self.by_tenant
             .read()
-            .expect("delete request lock")
             .get(tenant)
             .map(|requests| {
                 requests
@@ -281,7 +280,7 @@ impl DeleteRequests {
         request_id: &str,
     ) -> Result<(), DeleteRequestError> {
         {
-            let by_tenant = self.by_tenant.read().expect("delete request lock");
+            let by_tenant = self.by_tenant.read();
             let Some(found) = by_tenant.get(tenant).and_then(|requests| {
                 requests
                     .iter()
@@ -301,7 +300,7 @@ impl DeleteRequests {
                 .await
                 .map_err(DeleteRequestError::Storage)?;
         }
-        let mut by_tenant = self.by_tenant.write().expect("delete request lock");
+        let mut by_tenant = self.by_tenant.write();
         if let Some(requests) = by_tenant.get_mut(tenant) {
             let before = requests.len();
             requests.retain(|compiled| compiled.request.request_id != request_id);
@@ -326,7 +325,6 @@ impl DeleteRequests {
             requests: self
                 .by_tenant
                 .read()
-                .expect("delete request lock")
                 .get(tenant)
                 .cloned()
                 .unwrap_or_default(),
@@ -339,7 +337,7 @@ impl DeleteRequests {
             return DeleteMasks::default();
         }
         DeleteMasks {
-            by_tenant: self.by_tenant.read().expect("delete request lock").clone(),
+            by_tenant: self.by_tenant.read().clone(),
         }
     }
 
@@ -355,7 +353,7 @@ impl DeleteRequests {
         if self.is_empty() {
             return;
         }
-        let mut by_tenant = self.by_tenant.write().expect("delete request lock");
+        let mut by_tenant = self.by_tenant.write();
         for (tenant, requests) in by_tenant.iter_mut() {
             for compiled in requests.iter_mut() {
                 if compiled.request.status == DeleteStatus::Processed {

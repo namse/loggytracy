@@ -340,7 +340,7 @@
             quota.check(&tenant("last"), 1).unwrap();
         }
         assert!(
-            quota.buckets.lock().unwrap().len() < SWEEP_EVERY as usize,
+            quota.buckets.lock().len() < SWEEP_EVERY as usize,
             "idle buckets that have refilled must not be kept"
         );
     }

@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, SystemTime};
@@ -641,7 +643,7 @@ resurrect data those policies had already expired",
     /// always mean "delete nothing".
     pub fn snapshot(&self) -> Option<Arc<PolicyMap>> {
         self.is_enabled()
-            .then(|| self.policies.read().unwrap().clone())
+            .then(|| self.policies.read().clone())
     }
 
     pub fn cutoffs_at(&self, now_ns: i64) -> Option<Cutoffs> {
@@ -827,7 +829,7 @@ resurrect data those policies had already expired",
     /// Copy-insert-swap. Pushes are rare, so paying a map copy per push keeps
     /// every query read to one `Arc` clone.
     fn mutate(&self, change: impl FnOnce(&mut BTreeMap<TenantId, PolicyEntry>)) {
-        let mut policies = self.policies.write().unwrap();
+        let mut policies = self.policies.write();
         let mut entries = policies.entries.clone();
         change(&mut entries);
         *policies = Arc::new(PolicyMap { entries });
