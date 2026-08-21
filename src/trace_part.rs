@@ -953,9 +953,13 @@ mod tests {
             previous_end = segment.bytes.end;
         }
         let total: u64 = segments.iter().map(|segment| segment.bytes.len()).sum();
-        let file_len = std::fs::metadata(root.join(&parts[0].meta.partition).join(&parts[0].meta.id).join(TRACE_DATA_FILE))
-            .unwrap()
-            .len();
+        let file_len = std::fs::metadata(
+            root.join(&parts[0].meta.partition)
+                .join(&parts[0].meta.id)
+                .join(TRACE_DATA_FILE),
+        )
+        .unwrap()
+        .len();
         assert!(
             total < file_len,
             "the footer belongs to no tenant, so the extents cannot cover the file"

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 #[cfg(test)]
@@ -642,8 +642,7 @@ resurrect data those policies had already expired",
     /// The current map, or `None` when per-tenant retention is off. `None` must
     /// always mean "delete nothing".
     pub fn snapshot(&self) -> Option<Arc<PolicyMap>> {
-        self.is_enabled()
-            .then(|| self.policies.read().clone())
+        self.is_enabled().then(|| self.policies.read().clone())
     }
 
     pub fn cutoffs_at(&self, now_ns: i64) -> Option<Cutoffs> {
@@ -1341,7 +1340,9 @@ mod tests {
 
         // A malformed value is rejected before anything is written.
         assert!(matches!(
-            policy.push(&tenant("acme"), "soon", None, None, None, None).await,
+            policy
+                .push(&tenant("acme"), "soon", None, None, None, None)
+                .await,
             Err(PolicyError::Invalid(_))
         ));
         assert_eq!(policy.metrics.push_rejected.load(Ordering::Relaxed), 1);

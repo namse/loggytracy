@@ -231,7 +231,10 @@ pub struct ScanOccupancy {
 
 impl ScanOccupancy {
     pub fn enter(metrics: std::sync::Arc<RuntimeMetrics>) -> Self {
-        let in_flight = metrics.query_scans_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let in_flight = metrics
+            .query_scans_in_flight
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         metrics
             .query_scans_in_flight_peak
             .fetch_max(in_flight, Ordering::Relaxed);

@@ -60,7 +60,8 @@ impl DiskSpace {
         match statvfs(path) {
             Ok(reading) => {
                 self.free_bytes.store(reading.free_bytes, Ordering::Relaxed);
-                self.total_bytes.store(reading.total_bytes, Ordering::Relaxed);
+                self.total_bytes
+                    .store(reading.total_bytes, Ordering::Relaxed);
             }
             Err(error) => {
                 tracing::warn!(
@@ -143,7 +144,8 @@ mod tests {
 
     #[test]
     fn a_reading_of_the_data_directory_is_plausible() {
-        let reading = statvfs(&std::env::temp_dir()).expect("the temp directory is on a filesystem");
+        let reading =
+            statvfs(&std::env::temp_dir()).expect("the temp directory is on a filesystem");
         assert!(reading.total_bytes > 0, "a filesystem has a size");
         assert!(
             reading.free_bytes <= reading.total_bytes,

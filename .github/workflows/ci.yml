@@ -1,5 +1,3 @@
-name: CI
-
 on:
   push:
   pull_request:
@@ -11,6 +9,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # A failing build should say what failed, not print a megabyte of backtrace.
+  RUST_BACKTRACE: 1
 
 jobs:
   # Format, lint and the test suite. All three share one debug build of the
@@ -117,3 +117,37 @@ jobs:
         # without it, `cargo bench -- --test` would also re-run the unit tests
         # under the bench profile.
         run: cargo bench --locked --benches -- --test
+
+  image:
+    # Only after the tests pass, and only for what is actually deployed. A pull
+    # request does not need a published image.
+    needs: check
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to the registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # The revision is baked in rather than inferred at runtime: `build_info`
+      # on /metrics is how a scraped series is attributed to code, which is the
+      # first question asked when two deployments behave differently.
+      - name: Build
+        run: |
+          docker build \
+            --build-arg LOGGYTRACY_BUILD_REVISION="${GITHUB_SHA}" \
+            --build-arg LOGGYTRACY_BUILD_BRANCH="${GITHUB_REF_NAME}" \
+            --tag "ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" \
+            --tag "ghcr.io/${GITHUB_REPOSITORY,,}:latest" \
+            .
+
+      # Both tags, because the immutable one is what a deployment should pin to
+      # and the moving one is what a person types.
+      - name: Push
+        run: |
+          docker push "ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          docker push "ghcr.io/${GITHUB_REPOSITORY,,}:latest"

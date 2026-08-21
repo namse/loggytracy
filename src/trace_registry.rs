@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 
@@ -175,11 +175,7 @@ impl TraceRegistry {
 
     /// Bytes the tenant's row groups occupy across every registered trace part.
     pub fn tenant_stored_bytes(&self, tenant: &TenantId) -> u64 {
-        self.stored_bytes
-            .read()
-            .get(tenant)
-            .copied()
-            .unwrap_or(0)
+        self.stored_bytes.read().get(tenant).copied().unwrap_or(0)
     }
 
     pub fn snapshot(&self) -> Vec<Arc<TracePartReader>> {

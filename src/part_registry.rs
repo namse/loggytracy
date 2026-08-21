@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 
@@ -123,11 +123,15 @@ impl TenantCensus {
     }
 
     fn count(&self, tenant: &TenantId) -> usize {
-        self.tenants.get(tenant).map_or(0, |entry| entry.streams.len())
+        self.tenants
+            .get(tenant)
+            .map_or(0, |entry| entry.streams.len())
     }
 
     fn stored_bytes(&self, tenant: &TenantId) -> u64 {
-        self.tenants.get(tenant).map_or(0, |entry| entry.stored_bytes)
+        self.tenants
+            .get(tenant)
+            .map_or(0, |entry| entry.stored_bytes)
     }
 }
 

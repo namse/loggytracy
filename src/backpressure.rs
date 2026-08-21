@@ -377,8 +377,10 @@ mod tests {
 
     fn disk_config(label: &str) -> Config {
         Config {
-            data_dir: std::env::temp_dir()
-                .join(format!("loggytracy-disk-gate-{label}-{}", uuid::Uuid::new_v4())),
+            data_dir: std::env::temp_dir().join(format!(
+                "loggytracy-disk-gate-{label}-{}",
+                uuid::Uuid::new_v4()
+            )),
             ..Config::default()
         }
     }
