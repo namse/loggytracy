@@ -55,6 +55,8 @@ COPY --from=build /src/target/release/loggytracy /usr/local/bin/loggytracy
 # cannot silently expose a listener with no TLS and no authentication. An image
 # exists to be reached, so it makes that decision explicitly here — which also
 # keeps the decision visible to anyone reading the Dockerfile.
+# An image's logs are read by a collector, not by a person at a terminal.
+ENV LOGGYTRACY_LOG_FORMAT=json
 ENV LOGGYTRACY_LISTEN_ADDR=0.0.0.0:3100
 ENV LOGGYTRACY_OTLP_GRPC_ADDR=0.0.0.0:4317
 EXPOSE 3100 4317

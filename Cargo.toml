@@ -40,7 +40,7 @@ regex-syntax = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 crc32fast = "1"
 url = "2"
 chrono = "0.4"

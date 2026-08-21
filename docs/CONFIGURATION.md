@@ -347,6 +347,16 @@ plain `MALLOC_CONF` name is not consulted).
 | `LOGGYTRACY_MALLOC_ARENA_MAX` | 4 | The arena cap the tuning applies. 1 was measured first and rejected: anon fell 3.6x but the allocation-heavy flush path halved its cadence contending for the single arena. 0 leaves glibc's own arena scaling in place (trim threshold still applied) |
 | `LOGGYTRACY_MALLOC_TRIM_INTERVAL` | `60s` (`off` disables) | How often a background loop calls glibc's `malloc_trim(0)`, returning free pages from the middle of every arena to the kernel. The fixed trim threshold only releases heap tops; without this the second 24-hour soak measured an ~130 MiB/hour anonymous creep with every gauged resident flat, reaching a 2 GiB kill at t≈8653 s. No-op on non-glibc builds |
 
+## Logging
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOGGYTRACY_LOG_FORMAT` | `text` | `text` or `json`. **The container image sets `json`** — a deployment ships these lines to a collector, and the default is the form worth having in front of a terminal |
+
+Read before anything else, because it decides how everything after it is
+written. A rejected configuration therefore reaches stderr through the panic
+rather than through a subscriber, which is the same place it went before.
+
 ---
 
 ## Tuning starting points

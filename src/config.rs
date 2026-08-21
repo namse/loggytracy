@@ -3,6 +3,35 @@ use std::time::Duration;
 
 use crate::tenant::{MissingTenantPolicy, TenantId};
 
+/// The shape of this process's own log lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl LogFormat {
+    fn from_env(name: &str, default: Self) -> Result<Self, String> {
+        let Ok(raw) = std::env::var(name) else {
+            return Ok(default);
+        };
+        Self::parse(&raw, default).map_err(|error| format!("invalid {name}: {error}"))
+    }
+
+    /// Split from the environment read so it can be tested without setting a
+    /// process-wide variable, which tests here do not do: they run in parallel
+    /// threads and the next one along would read it.
+    fn parse(raw: &str, default: Self) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(default),
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(format!("{other:?}: expected text or json")),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     /// Loopback by default, and deliberately so.
@@ -185,6 +214,13 @@ pub struct Config {
     /// while its inputs are still there, so two gigabytes covers both with
     /// margin on any disk large enough to hold the default 10 GiB cache.
     pub min_free_disk_bytes: Option<u64>,
+    /// How this process writes its own logs.
+    ///
+    /// A log engine whose own output has to be regex-parsed to be searched is
+    /// an odd thing to ship, but the human-readable form is the one worth
+    /// having in front of a terminal, so the default is what a developer sees
+    /// and the container image sets the other.
+    pub log_format: LogFormat,
     /// How often free space is re-read. It bounds how stale the number the
     /// ingest gate reads can be, and a `statvfs` costs nothing next to the
     /// flush tick beside it.
@@ -327,6 +363,7 @@ impl Default for Config {
             default_tenant_max_streams: None,
             default_tenant_max_stored_bytes: None,
             min_free_disk_bytes: Some(2 * 1024 * 1024 * 1024),
+            log_format: LogFormat::Text,
             disk_sample_interval: Duration::from_secs(10),
             retention_rewrite_threshold: 0.5,
             max_concurrent_tails: 8,
@@ -706,6 +743,7 @@ impl Config {
                 "LOGGYTRACY_MIN_FREE_DISK_BYTES",
                 defaults.min_free_disk_bytes,
             )?,
+            log_format: LogFormat::from_env("LOGGYTRACY_LOG_FORMAT", defaults.log_format)?,
             disk_sample_interval: env_required_duration(
                 "LOGGYTRACY_DISK_SAMPLE_INTERVAL",
                 defaults.disk_sample_interval,
@@ -1180,6 +1218,27 @@ fn positive_duration(name: &str, value: Duration) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_log_format_accepts_both_shapes_and_refuses_a_third() {
+        assert_eq!(
+            LogFormat::parse("json", LogFormat::Text).unwrap(),
+            LogFormat::Json
+        );
+        assert_eq!(
+            LogFormat::parse(" TEXT ", LogFormat::Json).unwrap(),
+            LogFormat::Text
+        );
+        assert_eq!(
+            LogFormat::parse("", LogFormat::Json).unwrap(),
+            LogFormat::Json,
+            "an empty value is an unset one"
+        );
+        // Refused rather than fallen back on: a deployment that asked for a
+        // format it did not get would find out by reading the logs, which is
+        // the thing it cannot do.
+        assert!(LogFormat::parse("logfmt", LogFormat::Text).is_err());
+    }
+
     use super::*;
 
     #[test]

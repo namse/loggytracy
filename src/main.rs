@@ -52,6 +52,22 @@ async fn run(malloc_tuned: bool) {
     let config = Arc::new(
         Config::from_env().unwrap_or_else(|error| panic!("invalid configuration: {error}")),
     );
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("loggytracy=info,warn"));
+    match config.log_format {
+        loggytracy::config::LogFormat::Text => {
+            tracing_subscriber::fmt().with_env_filter(filter).init()
+        }
+        loggytracy::config::LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_current_span(false)
+            .with_env_filter(filter)
+            .init(),
+    }
+    tracing::info!(
+        applied = malloc_tuned,
+        "glibc malloc tuning (LOGGYTRACY_MALLOC_TUNING=off to disable)"
+    );
     config.log_memory_budget();
     loggytracy::run(config).await;
 }
