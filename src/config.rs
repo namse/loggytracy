@@ -168,6 +168,27 @@ pub struct Config {
     /// unbounded means the first such tenant decides how much disk everyone
     /// else gets.
     pub default_tenant_max_stored_bytes: Option<u64>,
+    /// Free space on the data directory's filesystem below which ingest is
+    /// refused, or `None` to accept until the writes themselves fail.
+    ///
+    /// The last guard rather than the first. What normally keeps this disk in
+    /// bounds is cache eviction, and what keeps the WAL in bounds is the
+    /// backlog limit; this exists for the case where neither applies — a
+    /// sidecar set that eviction does not touch, a merge whose output doubles a
+    /// part while its inputs still exist, a volume smaller than someone
+    /// believed. Reaching it means refusing writes, which is recoverable.
+    /// Passing it means a flush that cannot write, which is the state
+    /// `RUNBOOK.md` calls the most dangerous one.
+    ///
+    /// The default leaves room for what has already been accepted to land:
+    /// the memtable limit is 256 MiB and a merge output can double a part
+    /// while its inputs are still there, so two gigabytes covers both with
+    /// margin on any disk large enough to hold the default 10 GiB cache.
+    pub min_free_disk_bytes: Option<u64>,
+    /// How often free space is re-read. It bounds how stale the number the
+    /// ingest gate reads can be, and a `statvfs` costs nothing next to the
+    /// flush tick beside it.
+    pub disk_sample_interval: Duration,
     /// Expired share of a part's rows that justifies one rewrite through
     /// merge. Below it the rows stay on disk, already invisible to queries.
     pub retention_rewrite_threshold: f64,
@@ -305,6 +326,8 @@ impl Default for Config {
             max_concurrent_queries_per_tenant: 4,
             default_tenant_max_streams: None,
             default_tenant_max_stored_bytes: None,
+            min_free_disk_bytes: Some(2 * 1024 * 1024 * 1024),
+            disk_sample_interval: Duration::from_secs(10),
             retention_rewrite_threshold: 0.5,
             max_concurrent_tails: 8,
             tail_poll_interval: Duration::from_secs(1),
@@ -679,6 +702,14 @@ impl Config {
                 "LOGGYTRACY_DEFAULT_TENANT_MAX_STORED_BYTES",
                 defaults.default_tenant_max_stored_bytes,
             )?,
+            min_free_disk_bytes: env_optional_u64(
+                "LOGGYTRACY_MIN_FREE_DISK_BYTES",
+                defaults.min_free_disk_bytes,
+            )?,
+            disk_sample_interval: env_required_duration(
+                "LOGGYTRACY_DISK_SAMPLE_INTERVAL",
+                defaults.disk_sample_interval,
+            )?,
             retention_rewrite_threshold: env_value(
                 "LOGGYTRACY_RETENTION_REWRITE_THRESHOLD",
                 defaults.retention_rewrite_threshold,
@@ -858,6 +889,18 @@ impl Config {
                 self.flush_max_bytes
             ));
         }
+        // A free-space floor below one flush leaves the guard nothing to
+        // guard: it would keep accepting until the disk is too full for the
+        // flush that makes the accepted data durable.
+        if let Some(floor) = self.min_free_disk_bytes
+            && floor < self.flush_max_bytes
+        {
+            return Err(format!(
+                "min_free_disk_bytes ({floor}) must not be below flush_max_bytes ({})",
+                self.flush_max_bytes
+            ));
+        }
+        positive_duration("disk_sample_interval", self.disk_sample_interval)?;
         positive_duration("flush_check_interval", self.flush_check_interval)?;
         if let Some(bytes) = self.wal_compact_min_bytes {
             positive_u64("wal_compact_min_bytes", bytes)?;

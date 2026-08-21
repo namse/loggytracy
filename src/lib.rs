@@ -1,6 +1,7 @@
 mod admin;
 mod app_state;
 mod backpressure;
+mod disk;
 pub mod bloom;
 pub mod clock;
 pub mod config;

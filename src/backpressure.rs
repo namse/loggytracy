@@ -86,6 +86,7 @@ pub struct IngestGate {
     /// already a `Bytes` in the heap. So it is counted at admission and
     /// released by the guard's `Drop`, and the sum is what a scrape reads.
     inflight_body_bytes: Arc<std::sync::atomic::AtomicU64>,
+    disk: Arc<crate::disk::DiskSpace>,
 }
 
 /// One admitted body's charge against the in-flight ceiling.
@@ -114,12 +115,18 @@ impl Drop for InflightBody {
 }
 
 impl IngestGate {
-    pub fn new(journal: Arc<Journal>, config: Arc<Config>, metrics: Arc<RuntimeMetrics>) -> Self {
+    pub fn new(
+        journal: Arc<Journal>,
+        config: Arc<Config>,
+        metrics: Arc<RuntimeMetrics>,
+        disk: Arc<crate::disk::DiskSpace>,
+    ) -> Self {
         Self {
             journal,
             config,
             metrics,
             inflight_body_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            disk,
         }
     }
 
@@ -224,6 +231,20 @@ flush is not keeping up"
 flush is not keeping up"
             )));
         }
+        // Last, because it is the condition the other two exist to prevent
+        // reaching. Both limits above bound something this process controls and
+        // clear on their own; this one bounds the machine, and past it the
+        // failure is a flush that cannot write — data acknowledged and stuck in
+        // a WAL that cannot be drained.
+        let free_bytes = self.disk.free_bytes();
+        if let Some(floor) = self.config.min_free_disk_bytes
+            && free_bytes < floor
+        {
+            return Err(self.overloaded(format!(
+                "the data directory's filesystem has {free_bytes} bytes free, below the floor \
+of {floor}; refusing writes so flush keeps room to run"
+            )));
+        }
         Ok(())
     }
 
@@ -244,6 +265,7 @@ flush is not keeping up"
             journal.clone(),
             Arc::new(config.clone()),
             Arc::new(RuntimeMetrics::new()),
+            Arc::new(crate::disk::DiskSpace::unknown()),
         ))
     }
 
@@ -350,5 +372,67 @@ mod tests {
                 .and_then(|info| info.retry_delay),
             Some(Config::default().backpressure_retry_after),
         );
+    }
+    use crate::memtable::MemTable;
+
+    fn disk_config(label: &str) -> Config {
+        Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("loggytracy-disk-gate-{label}-{}", uuid::Uuid::new_v4())),
+            ..Config::default()
+        }
+    }
+
+    fn disk_gate(config: Config, disk: crate::disk::DiskSpace) -> IngestGate {
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let memtable = Arc::new(MemTable::new());
+        let journal = Arc::new(crate::journal::Journal::spawn(&config, memtable).unwrap());
+        IngestGate::new(
+            journal,
+            Arc::new(config),
+            Arc::new(RuntimeMetrics::new()),
+            Arc::new(disk),
+        )
+    }
+
+    /// The floor refuses writes rather than letting them run the disk out from
+    /// under the flush that has to make them durable.
+    #[tokio::test]
+    async fn a_disk_below_the_floor_refuses_the_write() {
+        let mut config = disk_config("below");
+        config.min_free_disk_bytes = Some(64 * 1024 * 1024);
+        let gate = disk_gate(config, crate::disk::DiskSpace::with_free_bytes(1024));
+
+        let error = gate.check().expect_err("below the floor is a refusal");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.message.contains("free"), "{}", error.message);
+        assert_eq!(gate.metrics.ingest_throttled.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_disk_above_the_floor_admits_the_write() {
+        let mut config = disk_config("above");
+        config.min_free_disk_bytes = Some(1024);
+        let gate = disk_gate(config, crate::disk::DiskSpace::with_free_bytes(64 * 1024 * 1024));
+        gate.check().expect("above the floor is not a refusal");
+    }
+
+    /// An unmeasured disk is not an empty one. Between process start and the
+    /// first reading the gate has nothing to go on, and refusing then would
+    /// make an unreadable filesystem look like a full one.
+    #[tokio::test]
+    async fn an_unmeasured_disk_does_not_refuse() {
+        let mut config = disk_config("unknown");
+        config.min_free_disk_bytes = Some(u64::MAX - 1);
+        let gate = disk_gate(config, crate::disk::DiskSpace::unknown());
+        gate.check().expect("an unread disk refuses nothing");
+    }
+
+    #[tokio::test]
+    async fn the_floor_can_be_turned_off() {
+        let mut config = disk_config("off");
+        config.min_free_disk_bytes = None;
+        let gate = disk_gate(config, crate::disk::DiskSpace::with_free_bytes(0));
+        gate.check().expect("no floor is no refusal");
     }
 }

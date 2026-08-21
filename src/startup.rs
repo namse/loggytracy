@@ -522,6 +522,16 @@ pub async fn run(config: Arc<Config>) {
         },
     ));
 
+    {
+        let space = state.disk.clone();
+        let data_dir = config.data_dir.clone();
+        let interval = config.disk_sample_interval;
+        let drain_rx = shutdown.subscribe();
+        worker_handles.push(tokio::spawn(async move {
+            crate::disk::disk_sampler_loop(space, data_dir, interval, drain_rx).await;
+        }));
+    }
+
     let ingest_gate = state.ingest_gate.clone();
     let tenant_quota = state.tenant_quota.clone();
     let app = router::build_router(state);

@@ -28,6 +28,9 @@ pub struct AppState {
     pub tail_semaphore: Arc<tokio::sync::Semaphore>,
     pub memtable: Arc<MemTable>,
     pub journal: Arc<Journal>,
+    /// Free space on the data directory's filesystem, refreshed by a task.
+    /// Read by the ingest gate and by `/metrics`.
+    pub disk: Arc<crate::disk::DiskSpace>,
     pub parts: Arc<PartRegistry>,
     pub trace_parts: Arc<TraceRegistry>,
     pub flush_healthy: Arc<AtomicBool>,
@@ -82,10 +85,14 @@ impl AppState {
     /// Keeping this in one place prevents production and test limits from
     /// silently diverging.
     pub fn from_config(config: Arc<Config>, dependencies: AppStateDependencies) -> Self {
+        // Sampled once here so the gate never reads an unmeasured disk in
+        // production; the sampler task keeps it current from then on.
+        let disk = Arc::new(crate::disk::DiskSpace::sampled(&config.data_dir));
         let ingest_gate = Arc::new(IngestGate::new(
             dependencies.journal.clone(),
             config.clone(),
             dependencies.metrics.clone(),
+            disk.clone(),
         ));
         let delete_requests = dependencies.delete_requests.unwrap_or_else(|| {
             Arc::new(crate::delete_requests::DeleteRequests::new(
@@ -105,6 +112,7 @@ impl AppState {
         ));
         Self {
             ingest_gate,
+            disk,
             tenant_quota,
             delete_requests,
             clock: dependencies.clock,

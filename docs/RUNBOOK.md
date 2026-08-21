@@ -52,6 +52,7 @@ without the other.
 |---|---|---|
 | `loggytracy_ingest_throttled_total` | Increasing | Returning 429; flush cannot keep up with ingest |
 | `loggytracy_wal_backlog_bytes` | Upward trend | Same cause, earlier signal |
+| `loggytracy_data_dir_free_bytes` | Below `LOGGYTRACY_MIN_FREE_DISK_BYTES` × 2 | **Alert here, not at the floor.** At the floor ingest is already being refused; this is the warning before it. Divide by `loggytracy_data_dir_total_bytes` for a percentage |
 | `loggytracy_flush_errors_total` | Increasing while `flush_success_total` is flat | **Flush stopped.** Most dangerous state |
 | `loggytracy_remote_healthy` | Stays 0 | Object store unreachable. Set by three consecutive failures with no success between them, so an isolated failed request does not trip it |
 | `loggytracy_remote_consecutive_failures` | Rising but below 3 | The store is degrading without being declared down — the early signal the health flag deliberately hides |
@@ -116,6 +117,11 @@ For an S3-compatible store, set `OBJECT_STORE_CONDITIONAL_PUT=etag`. For a singl
 store, use a `file://` URL — it intentionally gives up CAS.
 
 ### Disk is full
+
+Ingest is already returning 429 by the time it is actually full: writes stop at
+`LOGGYTRACY_MIN_FREE_DISK_BYTES` of free space so that flush keeps room to run.
+That is a recoverable state — the alternative, past the floor, is a flush that
+cannot write, and acknowledged data stuck in a WAL that cannot be drained.
 
 ```
 du -sh $LOGGYTRACY_DATA_DIR/*        # which of wal / parts / traces is large
