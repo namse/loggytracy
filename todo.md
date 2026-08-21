@@ -2749,6 +2749,35 @@ Read path:
 - [x] Document TLS unsupported as an architecture decision
 - [x] Ingest input limits (body/decompressed length/line/label count and length/timestamp acceptance window)
 
+## P0 — closed after the 2026-08-21 review
+
+- [x] **Per-tenant storage limit** (`max_stored_bytes`). A plan that sells a period and a size had only the
+      period: retention decided when bytes left, nothing bounded how many piled up first. Pushed per tenant
+      beside the rates, defaulted by `LOGGYTRACY_DEFAULT_TENANT_MAX_STORED_BYTES` for tenants nothing has
+      been pushed for — which a free tier needs, since an unbounded default means the first unsold tenant
+      decides how much disk the rest get. Enforced by refusing writes, never by deleting: the space returns
+      when retention retires parts.
+- [x] **Storage accounting no longer depends on the cache.** The usage endpoint prorated `fs::metadata` of
+      the local Parquet body by row share, so an evicted part contributed nothing and the billed number fell
+      as parts went cold. It reads the per-tenant extents in `meta.json` now. Trace parts gained the same
+      extent (`TRACE_META_VERSION` 3), so a tenant sending traces is counted for them; version 2 parts
+      report zero until they age out.
+- [x] **Free disk space is measured, and bounds ingest.** `statvfs` on the data directory, sampled by a task,
+      published as `loggytracy_data_dir_free_bytes`/`_total_bytes`, and below
+      `LOGGYTRACY_MIN_FREE_DISK_BYTES` (2 GiB) ingest returns 429. The last guard rather than the first:
+      eviction bounds the cache and the backlog limit bounds the WAL, and past this one flush cannot write.
+- [x] **Locks no longer poison.** Every shared structure was behind a `std::sync` lock opened with
+      `.unwrap()`. A panic under a read guard — a Parquet decode is one — poisoned it, and every later
+      reader panicked, leaving an instance that is up, passing liveness, and answering nothing. parking_lot
+      throughout; the write guards were already treated as fatal and the read guards cannot leave a
+      half-written structure.
+- [x] **Structured logging.** `LOGGYTRACY_LOG_FORMAT=json`, set by the container image, text by default.
+- [x] **CI.** Format, clippy at `-D warnings`, the suite, and a GHCR image build on master.
+- [x] **Deployment guide** — [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). The systemd unit (`TimeoutStopSec`
+      defaults to a SIGKILL through the force-flush), the gateway's obligation to overwrite `X-Scope-OrgID`
+      rather than append, R2 bucket versioning, free-tier defaults, and the alerts that cannot be sent from
+      the machine they describe.
+
 ## P1 — LogQL improvements
 
 - [x] Support `line_format`, `label_format` — a deliberate subset of Go templates

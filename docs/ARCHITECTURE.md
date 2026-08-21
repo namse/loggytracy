@@ -141,6 +141,11 @@ and query paths.
   answers `INVALID_ARGUMENT` with no `RetryInfo`.
 - **Observability**: Expose every quota and rejection counter on `/metrics` with a tenant label. Operating
   quotas requires visibility into "who was blocked, where, and by how much."
+- **Storage limit**: `max_stored_bytes` is pushed alongside retention and bounds the bytes a tenant may
+  keep. Charged on the tenant's own extents in the shared objects — logs and traces — read from `meta.json`
+  rather than from the local files, so it does not move as the cache evicts and restores bodies. Over the
+  limit, writes are refused; nothing is deleted to make room, because the space comes back when retention
+  retires the oldest parts and choosing which of a customer's logs to destroy is not this engine's call.
 - **Current state**: Identification, validation, and isolation are implemented. `X-Scope-OrgID` is extracted
   from OTLP HTTP and gRPC and recorded in WAL records (the owner survives restart), while MemTable,
   part, trace part, query, and catalog reads all require a tenant argument. Only `/metrics` retains a
