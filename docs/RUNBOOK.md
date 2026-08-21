@@ -1,5 +1,6 @@
 # Operations runbook
 
+Getting from nothing to a running process is [`DEPLOYMENT.md`](DEPLOYMENT.md).
 Setting meanings are in [`CONFIGURATION.md`](CONFIGURATION.md), and design rationale is in
 [`ARCHITECTURE.md`](ARCHITECTURE.md). This document covers only **what to look at and what to do when something goes wrong**.
 
@@ -8,6 +9,8 @@ Setting meanings are in [`CONFIGURATION.md`](CONFIGURATION.md), and design ratio
 ## Deployment prerequisites — start here
 
 This engine is **single-machine, single-writer**. Breaking that assumption corrupts data.
+[`DEPLOYMENT.md`](DEPLOYMENT.md) has the unit file, the gateway contract and the free-tier
+defaults that satisfy the four points below; this is the short form of why they exist.
 
 1. **The disk must follow the pod.** The WAL in `LOGGYTRACY_DATA_DIR` is the **only copy** of data acked
    since the last flush. Use a StatefulSet + fixed PV, with the volume following the pod when rescheduled

@@ -3,6 +3,8 @@
 All settings are environment variables. `Config::from_env` reads them and `Config::validate` checks
 them; if validation fails, startup is refused because not starting is safer than running with a bad configuration.
 
+For a working set of them rather than the full reference, see [`DEPLOYMENT.md`](DEPLOYMENT.md).
+
 Tests enforce that this document does not omit any knob from `src/config.rs`
 (`every_configuration_knob_is_documented`). Adding a knob to the code without documenting it here
 breaks the tests rather than the build.
