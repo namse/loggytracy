@@ -9,21 +9,27 @@ Setting meanings are in [`CONFIGURATION.md`](CONFIGURATION.md), and design ratio
 ## Deployment prerequisites — start here
 
 This engine is **single-machine, single-writer**. Breaking that assumption corrupts data.
-[`DEPLOYMENT.md`](DEPLOYMENT.md) has the unit file, the gateway contract and the free-tier
+[`DEPLOYMENT.md`](DEPLOYMENT.md) has the `docker run` command, the gateway contract and the free-tier
 defaults that satisfy the four points below; this is the short form of why they exist.
 
-1. **The disk must follow the pod.** The WAL in `LOGGYTRACY_DATA_DIR` is the **only copy** of data acked
-   since the last flush. Use a StatefulSet + fixed PV, with the volume following the pod when rescheduled
-   to another node. Deployment + emptyDir loses data.
-2. **Set `terminationGracePeriodSeconds` high.** Force-flush retries without a hard timeout during shutdown.
-   If the orchestrator sends SIGKILL after 30 seconds, unflushed data remains only in the WAL, and the disk
-   may be discarded when the pod is scheduled on another node. **At least 10 minutes, preferably more.**
-   The point of the long grace period is that the decision to give up should be an operator's
-   (`kill -USR1`, which exits non-zero and says so) rather than a timer's (SIGKILL, which says nothing).
-3. **Use one replica.** Raising this to two or more lets the second instance claim the writer epoch and the
-   first one is fenced and killed. This is intentional, but such a configuration must not be created.
+1. **The container is disposable and the data directory is not.** The WAL in `LOGGYTRACY_DATA_DIR` is the
+   **only copy** of data acked since the last flush. Bind-mount it from the host, and never run without
+   that mount — a container's own filesystem goes away with the next `docker rm`, which the upgrade in
+   [`DEPLOYMENT.md`](DEPLOYMENT.md) §9 does every time. If this ever moves to an orchestrator, the same
+   rule reads: StatefulSet + fixed PV with the volume following the pod, never Deployment + emptyDir.
+2. **Give the stop no deadline.** Force-flush retries without a hard timeout during shutdown, and Docker's
+   default stop timeout is **10 seconds** — a SIGKILL in the middle of it. `--stop-timeout=-1` at
+   `docker run` makes the daemon wait; under an orchestrator, `terminationGracePeriodSeconds` is the same
+   setting with a floor instead of an off switch, and 10 minutes is the minimum worth setting.
+   The point either way is that the decision to give up should be an operator's
+   (`docker kill --signal=USR1 loggytracy`, which exits non-zero and says so) rather than a timer's
+   (SIGKILL, which says nothing).
+3. **Run one container against one prefix.** A second instance claims the writer epoch and the first one is
+   fenced and killed. This is intentional, but such a configuration must not be created — which is why the
+   upgrade stops the old container before starting the new one, rather than the other way around.
 4. **Keep the listening address inside the trust boundary.** TLS and authentication are outside this process,
-   and `X-Scope-OrgID` is trusted without proof.
+   and `X-Scope-OrgID` is trusted without proof. Publishing a port with `-p` writes an iptables rule that
+   the host firewall does not get to see first, so the `127.0.0.1:` prefix is what holds this line.
 
 ## Sizing
 
@@ -127,8 +133,14 @@ That is a recoverable state — the alternative, past the floor, is a flush that
 cannot write, and acknowledged data stuck in a WAL that cannot be drained.
 
 ```
-du -sh $LOGGYTRACY_DATA_DIR/*        # which of wal / parts / traces is large
+du -sh /var/lib/loggytracy/*         # which of wal / parts / traces is large
 ```
+
+Run that on the host against the bind-mount source rather than inside the
+container: the numbers are the same and the shell is one that exists. If the
+root filesystem is the one that filled instead, it is the container logs —
+`docker ps -s` and `/var/lib/docker/containers` — which means the rotation
+options in [`DEPLOYMENT.md`](DEPLOYMENT.md) §4 were dropped somewhere.
 
 - **parts/traces are large** → Reduce `CACHE_MAX_BYTES`. They are cache only and can be restored from S3.
   However, if `RETENTION_PERIOD` is unset, **nothing is deleted from S3** — decide that first.
@@ -175,7 +187,8 @@ that an incident occurred. However:
 - **Do not discard the old instance's disk.** Its WAL contains unflushed data.
 - The new instance operates normally.
 - To preserve old data, stop the new instance, restart the old instance on its disk, let flushing complete,
-  and then replace it through the normal procedure.
+  and then replace it through the normal procedure. If the old instance's container is still there,
+  `docker start` on it is enough; if it was removed, run the same image against the same bind mount.
 
 ---
 
@@ -184,14 +197,19 @@ that an incident occurred. However:
 Following the order is lossless. **If the order is violated, fencing kills the old instance**, so the violation
 will not go unnoticed.
 
-1. Send `SIGTERM` to the old instance. Draining starts and ingest returns 503.
-2. Wait until `curl /metrics | grep pending_flush_bytes` is **0** and `force_flush_complete` is 1.
-   The log warns the operator if this takes a long time. **Waiting is correct.**
-3. The process exits on its own. Exit code 0 means all acked data is durable. **Do not discard the disk if it is not 0.**
+1. `docker stop loggytracy` sends `SIGTERM`. Draining starts and ingest returns 503. With
+   `--stop-timeout=-1` the command does not return until the process exits, which is the point of it.
+2. Watch from another shell until `curl /metrics | grep pending_flush_bytes` is **0** and
+   `force_flush_complete` is 1. The log warns the operator if this takes a long time. **Waiting is correct.**
+3. The process exits on its own. `docker inspect -f '{{.State.ExitCode}}' loggytracy` says 0 when all acked
+   data is durable. **Do not discard the disk if it is not 0**, and read it before `docker rm` removes the
+   container, because the exit code and the log go together.
 4. Start the new instance afterward.
 
 The exit code in step 3 is the only basis for judgment. SIGKILL has no exit code, so if step 2 was skipped
-and the process was forced down, restart it on that disk to recover.
+and the process was forced down, restart it on that disk to recover. `docker stop` on a container started
+with `--restart unless-stopped` keeps it stopped, including across a host reboot, so nothing comes back up
+behind you while the disk is being moved.
 
 ### Shutdown takes longer than expected
 
@@ -210,7 +228,7 @@ two-hour run at 500 tenants, the force-flush itself was 47 ms.
 If the object store is down, step 2 never completes. That is the design: giving up would lose data, so the
 retry has no timeout. Two ways out, and they are not equivalent.
 
-- **`kill -USR1 <pid>`** — abandon the force-flush deliberately. The process exits **non-zero**, logs that
+- **`docker kill --signal=USR1 loggytracy`** — abandon the force-flush deliberately. The process exits **non-zero**, logs that
   it did so, and leaves the data in the WAL. Use this when the store will not recover soon and the pod has
   to go. Then **keep the disk** and restart on it.
 - **Doing nothing until the grace period expires** — the orchestrator sends SIGKILL. The data is in the
@@ -218,7 +236,8 @@ retry has no timeout. Two ways out, and they are not equivalent.
   clean shutdown afterwards. This is the case `terminationGracePeriodSeconds` is set high to avoid.
 
 Inside a container stdin is not a TTY, so the `exit`/`quit` command on stdin is only useful when a person
-is attached to a terminal. `SIGUSR1` is the one that works in a deployment.
+is attached to a terminal. `SIGUSR1` is the one that works in a deployment, and `docker kill --signal` is
+how it is sent — `docker stop` sends SIGTERM, which the process has already received by then.
 
 ## Recovery after forced termination
 

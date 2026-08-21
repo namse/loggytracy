@@ -3,6 +3,10 @@
 A single machine, a single writer, Cloudflare R2 behind it, and a gateway in
 front. Follow it top to bottom for a first deployment.
 
+The machine needs Docker and nothing else — no toolchain, no account for the
+service, no packages. Everything below is either a directory to create or a flag
+to pass.
+
 Settings are explained in [`CONFIGURATION.md`](CONFIGURATION.md); what to do
 when something breaks is in [`RUNBOOK.md`](RUNBOOK.md). This document is the
 part in between: how to get from nothing to a process that is running.
@@ -58,10 +62,20 @@ plus room to grow. 32 GiB is a comfortable starting point at a small tenant
 count.
 
 ```
-sudo useradd --system --home-dir /var/lib/loggytracy --create-home loggytracy
-sudo install -d -o loggytracy -g loggytracy -m 0750 /var/lib/loggytracy
-sudo install -d -o root -g loggytracy -m 0750 /etc/loggytracy
+sudo install -d -o 10001 -g 10001 -m 0750 /var/lib/loggytracy
+sudo install -d -o root -g root -m 0700 /etc/loggytracy
 ```
+
+No account is created on the host, and 10001 is not a typo for a name. The image
+runs as uid 10001, and a bind mount carries the host's numbers through
+untranslated, so the directory has to be owned by that number or the first WAL
+write fails with a permission error. Create it before the first `docker run`:
+a bind-mount source that does not exist yet is created by the daemon as
+root-owned, which fails the same way and looks like the image's fault.
+
+`/etc/loggytracy` holds the environment file, and `--env-file` is read by the
+docker CLI on the host rather than by the process in the container, so root-only
+is enough and 10001 has no business reading it.
 
 ## 3. Memory
 
@@ -73,82 +87,107 @@ about fifty times too small. 4 GB of RAM is a sane floor.
 
 ## 4. The service
 
-### systemd
-
-`/etc/systemd/system/loggytracy.service`:
-
-```ini
-[Unit]
-Description=loggytracy
-After=network-online.target
-Wants=network-online.target
-# Restarting is always safe here — the disk stays put and the WAL replays. What
-# is not safe is restarting forever: five failures in ten minutes means
-# something a restart does not fix, so the unit stops and the alerting notices.
-StartLimitIntervalSec=600
-StartLimitBurst=5
-
-[Service]
-ExecStart=/usr/local/bin/loggytracy
-User=loggytracy
-Group=loggytracy
-
-Environment=LOGGYTRACY_DATA_DIR=/var/lib/loggytracy
-Environment=LOGGYTRACY_LOG_FORMAT=json
-EnvironmentFile=/etc/loggytracy/loggytracy.env
-
-# Shutdown force-flushes without a deadline, because the alternative to waiting
-# is discarding acknowledged data. systemd's default is 90 seconds, which is a
-# SIGKILL in the middle of that.
-TimeoutStopSec=infinity
-# Startup reads every part's metadata before serving, which is linear in part
-# count.
-TimeoutStartSec=600
-
-Restart=always
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Three settings carry the weight here.
-
-`TimeoutStopSec=infinity` is the important one. On SIGTERM the process stops
-accepting writes and force-flushes everything it has acknowledged; that is the
-only thing standing between a planned restart and losing the last few seconds of
-every customer's logs. The default 90 seconds cuts it off with a SIGKILL. If
-that ever needs to be given up on, it is a person's call, not a timer's:
-`kill -USR1` abandons the force-flush and exits non-zero, saying so in the log.
-
-`Restart=always` is right for this shape of deployment. The process exits 1 in
-two cases — an operator abandoned a force-flush, or another writer claimed the
-object-store prefix — and both log "the WAL still holds unflushed data, do not
-discard this disk". On a single machine the disk does not go anywhere, so
-restarting on it replays the WAL and recovers. That warning is aimed at
-orchestrators that move a workload to another node and leave the volume behind.
-
-`StartLimitBurst=5` is what keeps that from becoming a loop. A wrong R2
-credential fails the same way every time; after five tries in ten minutes the
-unit gives up and stays failed, which is a state to alert on.
-
-### Docker
+One process, one container, one command. Pull the tag you mean to run — `latest`
+is for typing, not for deployments — and start it:
 
 ```
+docker pull ghcr.io/namse/loggytracy:<sha>
+
 docker run -d --name loggytracy \
   --restart unless-stopped \
-  --stop-timeout 3600 \
-  -v /var/lib/loggytracy:/var/lib/loggytracy \
+  --stop-timeout=-1 \
+  --log-driver json-file --log-opt max-size=100m --log-opt max-file=5 \
   --env-file /etc/loggytracy/loggytracy.env \
-  -p 127.0.0.1:3100:3100 -p 127.0.0.1:4317:4317 \
-  ghcr.io/namse/loggytracy:latest
+  -v /var/lib/loggytracy:/var/lib/loggytracy \
+  -p 127.0.0.1:3100:3100 \
+  -p 127.0.0.1:4317:4317 \
+  ghcr.io/namse/loggytracy:<sha>
 ```
 
-`--stop-timeout` matters even more here than under systemd: Docker's default is
-**10 seconds**. With Compose the equivalent is `stop_grace_period: 1h`.
+The image already sets `LOGGYTRACY_DATA_DIR=/var/lib/loggytracy` and
+`LOGGYTRACY_LOG_FORMAT=json`, binds both listeners to `0.0.0.0`, and runs as uid
+10001. What is left on the command line is the part the image cannot know: this
+machine's disk, this deployment's credentials, and who is allowed to reach the
+ports.
 
-The image already sets `LOGGYTRACY_LOG_FORMAT=json` and binds `0.0.0.0`, which
-is why the ports above are published to loopback only.
+Four flags carry the weight here.
+
+**`--stop-timeout=-1`.** On SIGTERM the process stops accepting writes and
+force-flushes everything it has acknowledged; that is the only thing standing
+between a planned restart and losing the last few seconds of every customer's
+logs. Docker's default cuts it off with a SIGKILL after **10 seconds**, which is
+the shortest deadline any of the usual supervisors sets. `-1` means no deadline —
+the daemon waits for the container to exit — and it is set at creation, so a
+plain `docker stop loggytracy` inherits it and nobody has to remember a flag at
+the moment it matters. `docker stop --timeout=60` overrides it for one call,
+which is a decision to lose data and should have to be typed like one. The equals
+sign is there so the `-1` reads as a value rather than another flag; on a daemon
+too old to take the indefinite form, a number of seconds longer than any
+force-flush could plausibly need — `86400` — is the same bet with a worse
+ending.
+
+If a force-flush ever has to be abandoned, that is a person's call rather than a
+timer's: `docker kill --signal=USR1 loggytracy` abandons it, exits non-zero and
+says so in the log, where a SIGKILL says nothing at all.
+
+**`--restart unless-stopped`.** The process exits 1 in two cases — an operator
+abandoned a force-flush, or another writer claimed the object-store prefix — and
+both log "the WAL still holds unflushed data, do not discard this disk". On a
+single machine the disk does not go anywhere, so restarting on it replays the WAL
+and recovers. `unless-stopped` also brings the engine back after a host reboot,
+and leaves a container that was stopped on purpose stopped — including across a
+reboot, which is what the fencing recovery in [`RUNBOOK.md`](RUNBOOK.md) depends
+on. The other side of that: after a deliberate `docker stop`, `docker start
+loggytracy` is a step someone has to take.
+
+What Docker cannot say is "stop trying". A service manager can give up after,
+say, five failures in ten minutes, on the grounds that whatever is wrong is not
+something a restart fixes, and stay failed where the alerting can see it.
+`on-failure:5` looks like that setting and is not one: Docker documents that the
+policy does not restart the container when the daemon restarts, so a host reboot
+would leave the engine down and nothing would bring it back. A restart loop is
+the lesser failure, so it is allowed to loop, and **"Instance down" in §7 is what
+notices it** rather than the restart policy. A wrong R2 credential fails the same
+way every time and nothing here will stop trying.
+
+**`--log-opt max-size`.** The default json-file driver does not rotate anything.
+The engine's own logs would then grow without bound on the root filesystem — the
+one place §2 worked to keep the data directory off — and a log engine that fills
+a disk with its own logs is a poor advertisement. Put the same two options in
+`/etc/docker/daemon.json` if this machine runs other containers, so it is the
+daemon's default rather than something each `docker run` has to remember.
+
+**`-p 127.0.0.1:...`.** Publishing a port inserts an iptables rule that is
+evaluated before the host firewall's own chain, so `-p 3100:3100` is reachable
+from the internet on a machine whose firewall is configured to deny it. Behind
+that port there is no TLS and no authentication (§5). The address prefix is what
+keeps a published port on loopback, and on this listener it is doing real work
+rather than being tidy.
+
+There is deliberately no `HEALTHCHECK`. Docker does not restart an unhealthy
+container — only an orchestrator does — so the only thing it would change is a
+word in `docker ps`, and `/ready` returns 503 in exactly the states where
+restarting is the wrong answer: an object store that is down recovers on its own
+and a restart only loses the WAL's head start. `/metrics` is where that judgment
+belongs, and §7 is where it is made.
+
+### Why not Compose
+
+Because of the first flag. `stop_grace_period` takes a duration and has no
+infinite form, so the setting that decides whether a planned restart is lossless
+would become a number somebody guessed; `24h` is as close as it gets. Compose
+earns its place by ordering containers that depend on each other, and here there
+is one container that depends on nothing else on the machine. If a gateway or a
+collector later moves onto the same box, that is when a compose file starts
+paying for itself — and the grace period is the line to check first when it does.
+
+### A host reboot is not a `docker stop`
+
+The daemon stops running containers on its way down, but systemd bounds how long
+the daemon itself may take, and past that bound the container is killed whatever
+`--stop-timeout` says. So a planned reboot is the procedure in §9 first — stop
+the engine, check the exit code — and `reboot` afterwards, followed by `docker
+start loggytracy`, since a container stopped on purpose stays that way.
 
 ## 5. The gateway contract
 
@@ -249,9 +288,14 @@ scrape_configs:
       - targets: ['127.0.0.1:3100']
 ```
 
+That target is the published port on the host. A scraper that is itself a
+container does not see it — `127.0.0.1` there is the scraper's own loopback — so
+put both on a user-defined network and scrape `loggytracy:3100`, which also means
+the metrics port never has to be published at all.
+
 Add `node_exporter` too. The engine reports free space on its own data
 directory (`loggytracy_data_dir_free_bytes`), but nothing else about the
-machine.
+machine — including the root filesystem the container logs are written to.
 
 Point Grafana at VictoriaMetrics as a Prometheus data source and build the
 alerts there — Grafana Alerting evaluates and delivers in one piece, so there is
@@ -264,7 +308,7 @@ out of bed:
 | Flush stopped | `increase(loggytracy_flush_errors_total[10m]) > 0 and increase(loggytracy_flush_success_total[10m]) == 0` | The worst state this engine has. The WAL grows until ingest is refused |
 | Object store unreachable | `loggytracy_remote_healthy == 0` for 5m | Nothing becomes durable |
 | Disk filling | `loggytracy_data_dir_free_bytes < 4e9` | Twice the refusal floor, so it is a warning and not a report |
-| Instance down | absent target for 2m | Covers a crash loop that exhausted `StartLimitBurst` |
+| Instance down | absent target for 2m | Nothing stops a restart loop here, so this is the only thing that reports one |
 
 **One of these cannot be alerted from this machine.** If the VM dies, Grafana
 dies with it and no alert is sent. Add an external dead man's switch — a
@@ -274,7 +318,9 @@ covering the failure that takes everything else down.
 
 ## 8. First boot
 
-Watch the log. In order, it will tell you:
+Watch the log — `docker logs -f loggytracy`, which is the whole of it, since a
+container that has never been removed keeps every line it has written. In order,
+it will tell you:
 
 - the configured memory budget — check it against the machine's RAM
 - `restored object-store manifest` with a generation and part count
@@ -301,17 +347,26 @@ Pin to the commit tag; `latest` is for typing, not for deployments.
 
 ```
 docker pull ghcr.io/namse/loggytracy:<sha>
-sudo systemctl restart loggytracy     # or: docker stop --time 3600 && docker run ...
+docker stop loggytracy
+docker inspect -f '{{.State.ExitCode}}' loggytracy
+docker logs --tail=20 loggytracy | grep 'graceful shutdown complete'
+docker rm loggytracy
+docker run -d --name loggytracy ... ghcr.io/namse/loggytracy:<sha>
 ```
 
 There is one instance, so a restart is a gap in ingest — clients hold their own
-WAL across it and resend. What matters is that the old process is allowed to
-finish its force-flush, which is what `TimeoutStopSec` above is for. Confirm it
-did:
+WAL across it and resend. What matters is that the old process was allowed to
+finish its force-flush, which is what `--stop-timeout=-1` is for, and the two
+lines in the middle are how you know it did. **Read them before `docker rm`.**
+Removing the container deletes its logs and its exit code together, and they are
+the only evidence that exists — a service manager writes to a journal that
+outlives the process, and here nothing outlives the container. An exit code of 0
+means every acknowledged line is durable. Anything else means it is not — **keep
+the disk** and go to [`RUNBOOK.md`](RUNBOOK.md) rather than starting the new tag
+on it.
 
-```
-journalctl -u loggytracy | grep 'graceful shutdown complete'
-```
+The old container has to stop before the new one starts, in that order and not
+the other way around, for the reason below.
 
 **Never run two instances against the same object-store prefix.** The second one
 claims the writer epoch and the first fences itself and exits 1, with unflushed

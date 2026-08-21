@@ -41,9 +41,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # The data directory holds the WAL, and until a flush lands the WAL is the only
-# copy of acknowledged data. It must be a persistent volume, and the volume must
-# follow the pod. See docs/RUNBOOK.md.
-RUN useradd --system --create-home --uid 10001 loggytracy
+# copy of acknowledged data. The container is disposable and this directory is
+# not: it must be a bind mount or a named volume that outlives every `docker rm`
+# and follows the workload if it ever moves. See docs/RUNBOOK.md.
+# The uid and gid are pinned because a bind mount carries the host's numbers
+# through untranslated, so docs/DEPLOYMENT.md has to name a number to chown to.
+RUN groupadd --system --gid 10001 loggytracy \
+    && useradd --system --create-home --uid 10001 --gid 10001 loggytracy
 USER loggytracy
 WORKDIR /var/lib/loggytracy
 VOLUME ["/var/lib/loggytracy"]

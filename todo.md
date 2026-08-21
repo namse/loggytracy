@@ -2773,8 +2773,10 @@ Read path:
       half-written structure.
 - [x] **Structured logging.** `LOGGYTRACY_LOG_FORMAT=json`, set by the container image, text by default.
 - [x] **CI.** Format, clippy at `-D warnings`, the suite, and a GHCR image build on master.
-- [x] **Deployment guide** — [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). The systemd unit (`TimeoutStopSec`
-      defaults to a SIGKILL through the force-flush), the gateway's obligation to overwrite `X-Scope-OrgID`
+- [x] **Deployment guide** — [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). One `docker run` on a host that
+      has nothing but Docker: `--stop-timeout=-1` because the default is a SIGKILL ten seconds into the
+      force-flush, log rotation because the default json-file driver has none, `127.0.0.1:` because a
+      published port outranks the host firewall. Plus the gateway's obligation to overwrite `X-Scope-OrgID`
       rather than append, R2 bucket versioning, free-tier defaults, and the alerts that cannot be sent from
       the machine they describe.
 
