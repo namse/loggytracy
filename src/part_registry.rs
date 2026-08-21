@@ -12,26 +12,40 @@ use crate::part::{
 };
 use crate::tenant::TenantId;
 
-/// The streams a part holds, per tenant.
+/// What a part holds for each of its tenants: the tenant's streams, and the
+/// bytes its row groups occupy in the shared object.
 ///
 /// A part's stream list is shared across its tenants, so it is filtered through
 /// each tenant's row groups — the same path a `series` query takes, and for the
 /// same reason: the part-wide list would attribute a neighbour's streams to
-/// every tenant in the part.
-fn reader_stream_keys(reader: &PartReader) -> Vec<(TenantId, Vec<u64>)> {
+/// every tenant in the part. The byte extent is already per tenant in
+/// `meta.json`, which is where it has to come from: the local file's size is
+/// gone once the cache evicts the body, and a quota that reads zero for evicted
+/// parts charges for whatever happens to be resident.
+fn reader_tenant_facts(reader: &PartReader) -> Vec<TenantFacts> {
     reader
         .meta()
         .tenants
         .iter()
         .map(|segment| {
-            let keys = reader
+            let stream_keys = reader
                 .series(&segment.tenant, &[])
                 .iter()
                 .map(stream_key)
                 .collect();
-            (segment.tenant.clone(), keys)
+            TenantFacts {
+                tenant: segment.tenant.clone(),
+                stream_keys,
+                stored_bytes: segment.bytes.len(),
+            }
         })
         .collect()
+}
+
+struct TenantFacts {
+    tenant: TenantId,
+    stream_keys: Vec<u64>,
+    stored_bytes: u64,
 }
 
 /// A stream's identity, hashed.
@@ -53,49 +67,65 @@ pub fn stream_key(labels: &Labels) -> u64 {
     hasher.finish()
 }
 
-/// Per-tenant stream sets, reference counted.
+/// Per-tenant stream sets and stored bytes, maintained as the part set changes.
 ///
 /// A stream lives in every part that holds a row for it, so removing one part
 /// must not remove the stream while another still has it. The count is what
-/// makes register/replace/unregister reversible.
+/// makes register/replace/unregister reversible. Bytes need no such counting —
+/// a part's extent for a tenant belongs to that part alone — but they are kept
+/// here rather than summed on demand for the same reason the limit exists: a
+/// storage quota is read on the ingest path, and walking every part's tenant
+/// index per write is the cost this engine bounds everywhere else.
 #[derive(Default)]
-struct StreamCensus {
-    tenants: HashMap<TenantId, HashMap<u64, u32>>,
+struct TenantCensus {
+    tenants: HashMap<TenantId, TenantEntry>,
 }
 
-impl StreamCensus {
-    fn add(&mut self, tenant: &TenantId, keys: impl IntoIterator<Item = u64>) {
-        let streams = self.tenants.entry(tenant.clone()).or_default();
-        for key in keys {
-            *streams.entry(key).or_insert(0) += 1;
+#[derive(Default)]
+struct TenantEntry {
+    streams: HashMap<u64, u32>,
+    stored_bytes: u64,
+}
+
+impl TenantCensus {
+    fn add(&mut self, facts: &TenantFacts) {
+        let entry = self.tenants.entry(facts.tenant.clone()).or_default();
+        for key in &facts.stream_keys {
+            *entry.streams.entry(*key).or_insert(0) += 1;
         }
+        entry.stored_bytes = entry.stored_bytes.saturating_add(facts.stored_bytes);
     }
 
-    fn remove(&mut self, tenant: &TenantId, keys: impl IntoIterator<Item = u64>) {
-        let Some(streams) = self.tenants.get_mut(tenant) else {
+    fn remove(&mut self, facts: &TenantFacts) {
+        let Some(entry) = self.tenants.get_mut(&facts.tenant) else {
             return;
         };
-        for key in keys {
-            if let Some(count) = streams.get_mut(&key) {
+        for key in &facts.stream_keys {
+            if let Some(count) = entry.streams.get_mut(key) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    streams.remove(&key);
+                    entry.streams.remove(key);
                 }
             }
         }
-        if streams.is_empty() {
-            self.tenants.remove(tenant);
+        entry.stored_bytes = entry.stored_bytes.saturating_sub(facts.stored_bytes);
+        if entry.streams.is_empty() && entry.stored_bytes == 0 {
+            self.tenants.remove(&facts.tenant);
         }
     }
 
     fn contains(&self, tenant: &TenantId, key: u64) -> bool {
         self.tenants
             .get(tenant)
-            .is_some_and(|streams| streams.contains_key(&key))
+            .is_some_and(|entry| entry.streams.contains_key(&key))
     }
 
     fn count(&self, tenant: &TenantId) -> usize {
-        self.tenants.get(tenant).map_or(0, HashMap::len)
+        self.tenants.get(tenant).map_or(0, |entry| entry.streams.len())
+    }
+
+    fn stored_bytes(&self, tenant: &TenantId) -> u64 {
+        self.tenants.get(tenant).map_or(0, |entry| entry.stored_bytes)
     }
 }
 
@@ -145,9 +175,10 @@ pub struct PartRegistry {
     /// on an unauthenticated endpoint. Maintaining them here costs O(1) per
     /// registry change and cannot fall out of step with the set it describes.
     layout: RwLock<LayoutTotals>,
-    /// Which streams each tenant currently has on disk, so ingest can tell a
-    /// new stream from one that already exists without walking every part.
-    streams: RwLock<StreamCensus>,
+    /// What each tenant currently holds on disk: its streams, so ingest can
+    /// tell a new one from one that already exists, and its bytes, so a
+    /// storage quota can be answered without walking every part.
+    census: RwLock<TenantCensus>,
     operation_lock: Arc<tokio::sync::RwLock<()>>,
     deletion_lock: Arc<tokio::sync::RwLock<()>>,
 }
@@ -163,7 +194,7 @@ impl PartRegistry {
         Self {
             inner: RwLock::new(HashMap::new()),
             layout: RwLock::new(LayoutTotals::default()),
-            streams: RwLock::new(StreamCensus::default()),
+            census: RwLock::new(TenantCensus::default()),
             operation_lock: Arc::new(tokio::sync::RwLock::new(())),
             deletion_lock: Arc::new(tokio::sync::RwLock::new(())),
         }
@@ -389,19 +420,19 @@ falling back to a parked acquisition, which briefly convoys new readers"
         let ids = opened.iter().map(|(id, _)| id.clone()).collect();
         let mut inner = self.inner.write().unwrap();
         let mut layout = self.layout.write().unwrap();
-        let mut census = self.streams.write().unwrap();
+        let mut census = self.census.write().unwrap();
         for (id, reader) in opened {
             // Registering an id that is already present replaces it, so its
             // predecessor has to leave the derived indexes with it.
             if let Some(previous) = inner.insert(id, reader.clone()) {
                 layout.remove(&previous);
-                for (tenant, keys) in reader_stream_keys(&previous) {
-                    census.remove(&tenant, keys);
+                for facts in reader_tenant_facts(&previous) {
+                    census.remove(&facts);
                 }
             }
             layout.add(&reader);
-            for (tenant, keys) in reader_stream_keys(&reader) {
-                census.add(&tenant, keys);
+            for facts in reader_tenant_facts(&reader) {
+                census.add(&facts);
             }
         }
         ids
@@ -410,12 +441,12 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn unregister(&self, ids: &[String]) {
         let mut inner = self.inner.write().unwrap();
         let mut layout = self.layout.write().unwrap();
-        let mut census = self.streams.write().unwrap();
+        let mut census = self.census.write().unwrap();
         for id in ids {
             if let Some(removed) = inner.remove(id) {
                 layout.remove(&removed);
-                for (tenant, keys) in reader_stream_keys(&removed) {
-                    census.remove(&tenant, keys);
+                for facts in reader_tenant_facts(&removed) {
+                    census.remove(&facts);
                 }
             }
         }
@@ -446,24 +477,24 @@ falling back to a parked acquisition, which briefly convoys new readers"
         let new_ids: Vec<String> = opened.iter().map(|(id, _)| id.clone()).collect();
         let mut inner = self.inner.write().unwrap();
         let mut layout = self.layout.write().unwrap();
-        let mut census = self.streams.write().unwrap();
+        let mut census = self.census.write().unwrap();
         for (id, reader) in opened {
             if let Some(previous) = inner.insert(id, reader.clone()) {
                 layout.remove(&previous);
-                for (tenant, keys) in reader_stream_keys(&previous) {
-                    census.remove(&tenant, keys);
+                for facts in reader_tenant_facts(&previous) {
+                    census.remove(&facts);
                 }
             }
             layout.add(&reader);
-            for (tenant, keys) in reader_stream_keys(&reader) {
-                census.add(&tenant, keys);
+            for facts in reader_tenant_facts(&reader) {
+                census.add(&facts);
             }
         }
         for id in old_ids {
             if let Some(removed) = inner.remove(id) {
                 layout.remove(&removed);
-                for (tenant, keys) in reader_stream_keys(&removed) {
-                    census.remove(&tenant, keys);
+                for facts in reader_tenant_facts(&removed) {
+                    census.remove(&facts);
                 }
             }
         }
@@ -482,20 +513,20 @@ falling back to a parked acquisition, which briefly convoys new readers"
     /// it outright rather than adding and removing.
     fn reset_layout(&self, readers: &HashMap<String, Arc<PartReader>>) {
         let mut totals = LayoutTotals::default();
-        let mut census = StreamCensus::default();
+        let mut census = TenantCensus::default();
         for reader in readers.values() {
             totals.add(reader);
-            for (tenant, keys) in reader_stream_keys(reader) {
-                census.add(&tenant, keys);
+            for facts in reader_tenant_facts(reader) {
+                census.add(&facts);
             }
         }
         *self.layout.write().unwrap() = totals;
-        *self.streams.write().unwrap() = census;
+        *self.census.write().unwrap() = census;
     }
 
     /// Whether the tenant already has this stream on disk.
     pub fn contains_stream(&self, tenant: &TenantId, key: u64) -> bool {
-        self.streams.read().unwrap().contains(tenant, key)
+        self.census.read().unwrap().contains(tenant, key)
     }
 
     /// Parts holding at least one row for the tenant. Its share of the
@@ -511,7 +542,17 @@ falling back to a parked acquisition, which briefly convoys new readers"
 
     /// Distinct streams the tenant has on disk.
     pub fn tenant_stream_count(&self, tenant: &TenantId) -> usize {
-        self.streams.read().unwrap().count(tenant)
+        self.census.read().unwrap().count(tenant)
+    }
+
+    /// Bytes the tenant's row groups occupy across every registered part.
+    ///
+    /// The tenant's share of the shared objects, not of the local disk: what a
+    /// plan sells is storage in the object store, and the local copy is a cache
+    /// whose contents say nothing about what is being kept. Excludes the
+    /// Parquet footer and the sidecars, which belong to no single tenant.
+    pub fn tenant_stored_bytes(&self, tenant: &TenantId) -> u64 {
+        self.census.read().unwrap().stored_bytes(tenant)
     }
 
     pub fn part_count(&self) -> usize {
@@ -856,13 +897,12 @@ falling back to a parked acquisition, which briefly convoys new readers"
                 stream_set.insert(labels);
             }
             entries += segment.row_count as usize;
-            // Attribute the part's stored bytes in proportion to the tenant's
-            // share of its rows; a shared object has no per-tenant file size.
-            if let Ok(metadata) = std::fs::metadata(reader.part().data_path()) {
-                let part_rows = reader.meta().row_count.max(1);
-                bytes +=
-                    (metadata.len() as u128 * segment.row_count as u128 / part_rows as u128) as u64;
-            }
+            // The extent `meta.json` records, not the local file's size. The
+            // previous arithmetic prorated `fs::metadata` by row share, which
+            // read nothing at all once the cache evicted the body — so the
+            // number a plan is billed on fell as parts went cold, and a tenant
+            // whose data had all aged out of the cache looked free.
+            bytes = bytes.saturating_add(segment.bytes.len());
         }
         IndexStats {
             streams: stream_set.len(),
@@ -904,6 +944,87 @@ mod tests {
             line: line.to_string(),
             structured_metadata: vec![],
         }
+    }
+
+    fn row_for(tenant: &str, line: &str, timestamp_ns: i64) -> Row {
+        let mut labels: Labels = BTreeMap::new();
+        labels.insert("app".to_string(), "test".to_string());
+        Row {
+            tenant: TenantId::parse(tenant).unwrap(),
+            timestamp_ns,
+            labels: std::sync::Arc::new(labels),
+            line: line.to_string(),
+            structured_metadata: vec![],
+        }
+    }
+
+    /// The number a plan is billed on must not depend on what the cache still
+    /// holds. Eviction removes the Parquet body and leaves the catalog, which
+    /// is exactly the state the previous `fs::metadata` arithmetic read as zero.
+    #[test]
+    fn stored_bytes_survive_the_body_being_evicted() {
+        let dir = temp_dir();
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = PartRegistry::new();
+        let parts = part::flush_rows(
+            vec![
+                row_for("acme", "one", 1_000),
+                row_for("acme", "two", 2_000),
+                row_for("globex", "three", 3_000),
+            ],
+            &parts_root,
+            1,
+        )
+        .unwrap();
+        let data_paths: Vec<_> = parts.iter().map(|part| part.data_path()).collect();
+        registry.register(parts).unwrap();
+
+        let acme = TenantId::parse("acme").unwrap();
+        let globex = TenantId::parse("globex").unwrap();
+        let before = registry.tenant_stored_bytes(&acme);
+        assert!(before > 0, "a registered part must charge the tenant bytes");
+        assert!(registry.tenant_stored_bytes(&globex) > 0);
+
+        for path in &data_paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_eq!(registry.tenant_stored_bytes(&acme), before);
+        assert_eq!(
+            registry.stats(&acme, MetadataWindow::unbounded()).bytes,
+            before
+        );
+    }
+
+    /// One tenant's bytes are its own: unregistering the part that held them
+    /// takes them back, and a neighbour in the same object is untouched.
+    #[test]
+    fn stored_bytes_follow_the_part_set() {
+        let dir = temp_dir();
+        let parts_root = dir.join("parts");
+        std::fs::create_dir_all(&parts_root).unwrap();
+        let registry = PartRegistry::new();
+        let parts = part::flush_rows(
+            vec![
+                row_for("acme", "one", 1_000),
+                row_for("globex", "two", 2_000),
+            ],
+            &parts_root,
+            1,
+        )
+        .unwrap();
+        let ids: Vec<String> = parts.iter().map(|part| part.meta.id.clone()).collect();
+        registry.register(parts).unwrap();
+
+        let acme = TenantId::parse("acme").unwrap();
+        let globex = TenantId::parse("globex").unwrap();
+        let globex_before = registry.tenant_stored_bytes(&globex);
+        assert!(registry.tenant_stored_bytes(&acme) > 0);
+
+        registry.unregister(&ids);
+        assert_eq!(registry.tenant_stored_bytes(&acme), 0);
+        assert_eq!(registry.tenant_stored_bytes(&globex), 0);
+        assert!(globex_before > 0);
     }
 
     #[test]

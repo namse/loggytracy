@@ -160,6 +160,14 @@ pub struct Config {
     /// pushed no `max_streams` for. `None` is unbounded, which is the
     /// pre-limit behaviour.
     pub default_tenant_max_streams: Option<u64>,
+    /// Bytes a tenant may keep stored, for tenants the control plane has pushed
+    /// no `max_stored_bytes` for. `None` is unbounded.
+    ///
+    /// A free tier is the reason this default exists at all: a tenant nothing
+    /// has been pushed for is one nobody has sold anything to, and leaving that
+    /// unbounded means the first such tenant decides how much disk everyone
+    /// else gets.
+    pub default_tenant_max_stored_bytes: Option<u64>,
     /// Expired share of a part's rows that justifies one rewrite through
     /// merge. Below it the rows stay on disk, already invisible to queries.
     pub retention_rewrite_threshold: f64,
@@ -296,6 +304,7 @@ impl Default for Config {
             default_tenant_query_scan_bytes_per_second: None,
             max_concurrent_queries_per_tenant: 4,
             default_tenant_max_streams: None,
+            default_tenant_max_stored_bytes: None,
             retention_rewrite_threshold: 0.5,
             max_concurrent_tails: 8,
             tail_poll_interval: Duration::from_secs(1),
@@ -665,6 +674,10 @@ impl Config {
             default_tenant_max_streams: env_optional_u64(
                 "LOGGYTRACY_DEFAULT_TENANT_MAX_STREAMS",
                 defaults.default_tenant_max_streams,
+            )?,
+            default_tenant_max_stored_bytes: env_optional_u64(
+                "LOGGYTRACY_DEFAULT_TENANT_MAX_STORED_BYTES",
+                defaults.default_tenant_max_stored_bytes,
             )?,
             retention_rewrite_threshold: env_value(
                 "LOGGYTRACY_RETENTION_REWRITE_THRESHOLD",

@@ -26,6 +26,11 @@ pub struct RuntimeMetrics {
     /// is generating labels, which is a client bug far more often than it is a
     /// plan being outgrown.
     pub stream_limit_rejected: AtomicU64,
+    /// Writes refused because the tenant is already storing everything its plan
+    /// sells. Separate from the rate rejections: a rate clears in a second on
+    /// its own, and this one clears only when retention retires parts, so the
+    /// two mean different things to whoever is looking at them.
+    pub storage_limit_rejected: AtomicU64,
     /// Records and entries the last startup replayed out of the WAL.
     ///
     /// Delivery is at-least-once: the checkpoint advances after a flush, so a
@@ -146,6 +151,7 @@ impl RuntimeMetrics {
             ingest_quota_rejected: AtomicU64::new(0),
             query_quota_rejected: AtomicU64::new(0),
             stream_limit_rejected: AtomicU64::new(0),
+            storage_limit_rejected: AtomicU64::new(0),
             wal_replayed_records: AtomicU64::new(0),
             wal_replayed_entries: AtomicU64::new(0),
             merge_debt_parts: AtomicU64::new(0),

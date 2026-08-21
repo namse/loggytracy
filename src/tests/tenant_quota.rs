@@ -7,13 +7,163 @@
     }
 
     fn quota(config: Config, clock: Arc<Clock>, policy: Arc<TenantPolicy>) -> TenantQuota {
+        quota_over(
+            config,
+            clock,
+            policy,
+            Arc::new(crate::part_registry::PartRegistry::new()),
+        )
+    }
+
+    fn quota_over(
+        config: Config,
+        clock: Arc<Clock>,
+        policy: Arc<TenantPolicy>,
+        parts: Arc<crate::part_registry::PartRegistry>,
+    ) -> TenantQuota {
         TenantQuota::new(
             Arc::new(config),
             clock,
             Arc::new(RuntimeMetrics::new()),
             policy,
+            parts,
+            Arc::new(crate::trace_registry::TraceRegistry::standalone()),
         )
     }
+
+    /// A registry holding one part with rows for each named tenant, so a
+    /// storage limit has something real to measure.
+    fn registry_holding(tenants: &[&str]) -> Arc<crate::part_registry::PartRegistry> {
+        use crate::memtable::Labels;
+        use crate::part::Row;
+        use std::collections::BTreeMap;
+
+        let root = std::env::temp_dir().join(format!(
+            "loggytracy-storage-quota-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut labels: Labels = BTreeMap::new();
+        labels.insert("app".to_string(), "test".to_string());
+        let rows: Vec<Row> = tenants
+            .iter()
+            .flat_map(|name| {
+                let labels = std::sync::Arc::new(labels.clone());
+                (0..64).map(move |index| Row {
+                    tenant: TenantId::parse(name).unwrap(),
+                    timestamp_ns: index,
+                    labels: labels.clone(),
+                    line: format!("line {index}"),
+                    structured_metadata: vec![],
+                })
+            })
+            .collect();
+        let registry = Arc::new(crate::part_registry::PartRegistry::new());
+        registry
+            .register(crate::part::flush_rows(rows, &root, 16).unwrap())
+            .unwrap();
+        for name in tenants {
+            assert!(registry.tenant_stored_bytes(&TenantId::parse(name).unwrap()) > 0);
+        }
+        registry
+    }
+
+    /// The limit is a stock, not a flow: being under it admits regardless of
+    /// how fast the tenant is writing, and being at it refuses regardless of
+    /// how slowly.
+    #[test]
+    fn a_tenant_at_its_storage_limit_is_refused_and_told_to_wait() {
+        let parts = registry_holding(&["acme"]);
+        let stored = parts.tenant_stored_bytes(&tenant("acme"));
+        let under = Config {
+            default_tenant_max_stored_bytes: Some(stored + 1),
+            ..Config::default()
+        };
+        quota_over(
+            under,
+            Clock::fixed(0),
+            Arc::new(TenantPolicy::disabled()),
+            parts.clone(),
+        )
+        .check(&tenant("acme"), 1)
+        .expect("a tenant below its limit still writes");
+
+        let at = Config {
+            default_tenant_max_stored_bytes: Some(stored),
+            ..Config::default()
+        };
+        let error = quota_over(at, Clock::fixed(0), Arc::new(TenantPolicy::disabled()), parts)
+            .check(&tenant("acme"), 1)
+            .expect_err("a tenant at its limit is refused");
+        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            error.retry_after.is_some_and(|wait| wait.as_secs() >= 60),
+            "a storage refusal clears when retention runs, not in a second"
+        );
+        assert!(error.message.contains("at its limit"), "{}", error.message);
+    }
+
+    /// One tenant's storage says nothing about its neighbour's, even though
+    /// they share the object.
+    #[test]
+    fn a_storage_limit_does_not_reach_the_tenant_beside_it() {
+        let parts = registry_holding(&["acme"]);
+        let stored = parts.tenant_stored_bytes(&tenant("acme"));
+        let config = Config {
+            default_tenant_max_stored_bytes: Some(stored),
+            ..Config::default()
+        };
+        let quota = quota_over(
+            config,
+            Clock::fixed(0),
+            Arc::new(TenantPolicy::disabled()),
+            parts,
+        );
+        quota
+            .check(&tenant("acme"), 1)
+            .expect_err("the tenant holding the part is at its limit");
+        quota
+            .check(&tenant("globex"), 1)
+            .expect("a tenant holding nothing is not");
+    }
+
+    /// The pushed limit wins over the configured default, the same way the
+    /// rates do — a free-tier default is what a tenant gets until a plan is
+    /// sold to it.
+    #[tokio::test]
+    async fn a_pushed_storage_limit_overrides_the_free_tier_default() {
+        let parts = registry_holding(&["acme", "globex"]);
+        let stored = parts.tenant_stored_bytes(&tenant("acme"));
+        let clock = Clock::fixed(0);
+        let policy = Arc::new(TenantPolicy::enabled_with_clock(clock.clone()));
+        policy
+            .push(
+                &tenant("acme"),
+                "7d",
+                None,
+                None,
+                None,
+                Some(&format!("{}", stored * 4)),
+            )
+            .await
+            .unwrap();
+        let config = Config {
+            default_tenant_max_stored_bytes: Some(1),
+            ..Config::default()
+        };
+        let quota = quota_over(config, clock, policy, parts);
+        quota
+            .check(&tenant("acme"), 1)
+            .expect("the pushed limit is four times what the tenant holds");
+        quota
+            .check(&tenant("globex"), 1)
+            .expect_err("a tenant with nothing pushed keeps the free-tier default");
+    }
+
 
     /// A rate limiter that never refills is a permanent outage for the tenant,
     /// so this checks both halves: that it catches and that it lets go.
@@ -113,11 +263,11 @@
         let clock = Clock::fixed(0);
         let policy = Arc::new(TenantPolicy::enabled_with_clock(clock.clone()));
         policy
-            .push(&tenant("premium"), "7d", Some("1MiB/s"), None, None)
+            .push(&tenant("premium"), "7d", Some("1MiB/s"), None, None, None)
             .await
             .unwrap();
         policy
-            .push(&tenant("blocked"), "7d", Some("0"), None, None)
+            .push(&tenant("blocked"), "7d", Some("0"), None, None, None)
             .await
             .unwrap();
         let config = Config {
@@ -304,11 +454,11 @@
         let clock = Clock::fixed(0);
         let policy = Arc::new(TenantPolicy::enabled_with_clock(clock.clone()));
         policy
-            .push(&tenant("suspended"), "7d", None, Some("0"), None)
+            .push(&tenant("suspended"), "7d", None, Some("0"), None, None)
             .await
             .unwrap();
         policy
-            .push(&tenant("active"), "7d", None, Some("1MiB/s"), None)
+            .push(&tenant("active"), "7d", None, Some("1MiB/s"), None, None)
             .await
             .unwrap();
         let quota = Arc::new(quota(Config::default(), clock, policy));

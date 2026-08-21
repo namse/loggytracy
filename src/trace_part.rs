@@ -32,6 +32,17 @@ pub struct TraceTenantSegment {
     pub row_group_start: u32,
     pub row_group_end: u32,
     pub row_count: u64,
+    /// Where this tenant's row groups sit in `data.parquet`.
+    ///
+    /// Recorded for accounting rather than for reading: nothing range-reads a
+    /// trace part yet. It is what a storage quota charges in, and it has to
+    /// come from the format because the alternative — the local file's size —
+    /// disappears the moment the cache evicts the body.
+    ///
+    /// `default` so a part written before the field existed still parses,
+    /// reporting an empty extent rather than failing to open.
+    #[serde(default)]
+    pub bytes: crate::part::ByteRange,
 }
 
 #[derive(Clone, Debug)]
@@ -281,7 +292,7 @@ fn write_trace_part_files(
     spans: &[&TraceSpan],
     row_group_size: usize,
 ) -> io::Result<()> {
-    write_trace_parquet(&dir.join(TRACE_DATA_FILE), spans, row_group_size)?;
+    let row_group_ranges = write_trace_parquet(&dir.join(TRACE_DATA_FILE), spans, row_group_size)?;
     write_trace_bloom(&dir.join(TRACE_BLOOM_FILE), spans, row_group_size)?;
 
     let bounds = row_group_bounds(spans, row_group_size);
@@ -314,7 +325,7 @@ fn write_trace_part_files(
                     .unwrap()
             })
             .collect(),
-        tenants: trace_tenant_segments(spans, &bounds),
+        tenants: trace_tenant_segments(spans, &bounds, &row_group_ranges),
         integrity: TracePartIntegrity {
             data_crc32: file_crc32(&dir.join(TRACE_DATA_FILE))?,
             bloom_crc32: file_crc32(&dir.join(TRACE_BLOOM_FILE))?,
@@ -365,7 +376,11 @@ fn trace_row_group_batch(schema: &Arc<Schema>, spans: &[&TraceSpan]) -> io::Resu
     .map_err(io::Error::other)
 }
 
-fn write_trace_parquet(path: &Path, spans: &[&TraceSpan], row_group_size: usize) -> io::Result<()> {
+fn write_trace_parquet(
+    path: &Path,
+    spans: &[&TraceSpan],
+    row_group_size: usize,
+) -> io::Result<Vec<crate::part::ByteRange>> {
     let schema = trace_schema();
     let bounds = row_group_bounds(spans, row_group_size);
     let file = fs::File::create(path)?;
@@ -382,8 +397,33 @@ fn write_trace_parquet(path: &Path, spans: &[&TraceSpan], row_group_size: usize)
         writer.write(&batch).map_err(io::Error::other)?;
         writer.flush().map_err(io::Error::other)?;
     }
-    writer.close().map_err(io::Error::other)?;
-    sync_file(path)
+    let metadata = writer.close().map_err(io::Error::other)?;
+    sync_file(path)?;
+
+    // Same extent arithmetic as the log side: a row group's column chunks are
+    // contiguous, but they are reported in schema order rather than file order.
+    let ranges: Vec<crate::part::ByteRange> = metadata
+        .row_groups()
+        .iter()
+        .map(|row_group| {
+            let mut start = u64::MAX;
+            let mut end = 0u64;
+            for column in row_group.columns() {
+                let (offset, length) = column.byte_range();
+                start = start.min(offset);
+                end = end.max(offset.saturating_add(length));
+            }
+            crate::part::ByteRange { start, end }
+        })
+        .collect();
+    if ranges.len() != bounds.len() {
+        return Err(io::Error::other(format!(
+            "trace parquet wrote {} row groups for {} planned boundaries",
+            ranges.len(),
+            bounds.len()
+        )));
+    }
+    Ok(ranges)
 }
 
 fn write_trace_bloom(path: &Path, spans: &[&TraceSpan], row_group_size: usize) -> io::Result<()> {
@@ -432,21 +472,25 @@ fn row_group_bounds(spans: &[&TraceSpan], row_group_size: usize) -> Vec<(usize, 
 fn trace_tenant_segments(
     spans: &[&TraceSpan],
     bounds: &[(usize, usize)],
+    row_group_ranges: &[crate::part::ByteRange],
 ) -> Vec<TraceTenantSegment> {
     let mut segments: Vec<TraceTenantSegment> = Vec::new();
     for (row_group, (start, end)) in bounds.iter().enumerate() {
         let tenant = &spans[*start].tenant;
         let row_count = (end - start) as u64;
+        let range = row_group_ranges.get(row_group).copied().unwrap_or_default();
         match segments.last_mut() {
             Some(segment) if segment.tenant == *tenant => {
                 segment.row_group_end = row_group as u32 + 1;
                 segment.row_count += row_count;
+                segment.bytes.end = segment.bytes.end.max(range.end);
             }
             _ => segments.push(TraceTenantSegment {
                 tenant: tenant.clone(),
                 row_group_start: row_group as u32,
                 row_group_end: row_group as u32 + 1,
                 row_count,
+                bytes: range,
             }),
         }
     }
@@ -865,6 +909,58 @@ mod tests {
             }],
         };
         normalize_request(&test_tenant(), request).unwrap()
+    }
+
+    /// Segments tile the object: each tenant's extent is non-empty and starts
+    /// where the previous one ended, which is what makes the sum of them the
+    /// tenant-attributable size of the part.
+    #[test]
+    fn tenant_segments_record_disjoint_byte_extents() {
+        let root = std::env::temp_dir().join(format!(
+            "loggytracy-trace-bytes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut all = Vec::new();
+        for tenant in ["acme", "globex"] {
+            for span in spans() {
+                all.push(TraceSpan {
+                    tenant: TenantId::parse(tenant).unwrap(),
+                    ..span
+                });
+            }
+        }
+        let parts = flush_trace_spans(&all, &root, 1).unwrap();
+        assert_eq!(parts.len(), 1);
+        let segments = &parts[0].meta.tenants;
+        assert_eq!(segments.len(), 2);
+
+        let mut previous_end = 0u64;
+        for segment in segments {
+            assert!(
+                !segment.bytes.is_empty(),
+                "tenant {} has no byte extent",
+                segment.tenant
+            );
+            assert!(
+                segment.bytes.start >= previous_end,
+                "tenant extents overlap"
+            );
+            previous_end = segment.bytes.end;
+        }
+        let total: u64 = segments.iter().map(|segment| segment.bytes.len()).sum();
+        let file_len = std::fs::metadata(root.join(&parts[0].meta.partition).join(&parts[0].meta.id).join(TRACE_DATA_FILE))
+            .unwrap()
+            .len();
+        assert!(
+            total < file_len,
+            "the footer belongs to no tenant, so the extents cannot cover the file"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

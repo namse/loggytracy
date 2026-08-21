@@ -100,6 +100,8 @@ impl AppState {
             dependencies.clock.clone(),
             dependencies.metrics.clone(),
             dependencies.tenant_policy.clone(),
+            dependencies.parts.clone(),
+            dependencies.trace_parts.clone(),
         ));
         Self {
             ingest_gate,

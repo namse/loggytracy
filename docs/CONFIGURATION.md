@@ -39,6 +39,7 @@ environment variables (`OBJECT_STORE_*` takes precedence). For S3-compatible sto
 | `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` | unset (unlimited) | Default for tenants whose rate has not been pushed by the control plane |
 | `LOGGYTRACY_DEFAULT_TENANT_QUERY_SCAN_BYTES_PER_SECOND` | none (unlimited) | Read-side default for tenants the control plane has pushed no `query_rate` for |
 | `LOGGYTRACY_DEFAULT_TENANT_MAX_STREAMS` | none (unbounded) | Distinct streams a tenant may hold, for tenants with no pushed `max_streams`. **Stream cardinality is the one cost neither retention nor merge reclaims** — `stream.idx` is an eviction-exempt catalog |
+| `LOGGYTRACY_DEFAULT_TENANT_MAX_STORED_BYTES` | none (unbounded) | Bytes a tenant may keep stored, for tenants with no pushed `max_stored_bytes`. A plain byte count, or `off`. **Set this before opening a free tier**: a tenant nothing was pushed for is one nobody sold anything to, and unbounded means the first of them decides how much disk the rest get |
 | `LOGGYTRACY_MAX_CONCURRENT_QUERIES_PER_TENANT` | 4 | Queries one tenant may run at once. The scan rate bounds work over time; this bounds how much happens simultaneously, so one tenant cannot take every permit of the shared query semaphore |
 | `LOGGYTRACY_TENANT_INGEST_BURST` | `10s` | Time during which an unused tenant rate can accumulate for one burst. Capacity never falls below `MAX_PUSH_BYTES` |
 
@@ -56,7 +57,8 @@ second such as `4MiB/s`, `0` (writes disabled), or `unlimited`.
 
 ```
 PUT /loggytracy/api/v1/admin/tenants/{tenant}/retention
-{"retention": "7d", "ingest_rate": "4MiB/s", "query_rate": "64MiB/s", "max_streams": 100}
+{"retention": "7d", "ingest_rate": "4MiB/s", "query_rate": "64MiB/s", "max_streams": 100,
+ "max_stored_bytes": "10GiB"}
 ```
 
 `query_rate` is the read side, in bytes of *scanned* data per second. It is
@@ -71,6 +73,25 @@ cardinality is the one cost neither retention nor merge takes back. Only a
 stream that is new to both the parts and the buffers can be refused — a tenant
 at its limit keeps writing to the streams it has rather than going dark, so the
 failure is a client that mints label values and not a client that grew.
+
+`max_stored_bytes` is the other half of a plan that sells a period and a size:
+retention decides when bytes leave, and this decides how many may pile up before
+they do. It is a size, not a rate, so it is spelled `10GiB` rather than
+`10GiB/s`, and pushing a rate spelling is refused rather than guessed at.
+
+It is enforced by **refusing writes, not by deleting**. A tenant over its limit
+keeps every byte it has and gets `429` with `Retry-After: 60`; the space comes
+back on its own when retention retires the oldest parts, and writes resume
+without anyone doing anything. Deleting to make room would mean this engine
+choosing which of a customer's logs to destroy, which is not a decision it has
+the standing to make.
+
+The comparison is against the tenant's own byte extents in the shared objects —
+logs and traces both — read from `meta.json` rather than from the local files,
+so it does not change as the cache evicts and restores bodies. The Parquet
+footer and the sidecars belong to no single tenant and are not charged to one.
+`GET …/tenants/{tenant}/usage` reports the same number as `stored_bytes`
+alongside `max_stored_bytes`, which is what a control plane shows a customer.
 
 The body is the complete policy, not a patch. If it is pushed without `ingest_rate`, the existing value
 is **cleared** and reverts to the default above.

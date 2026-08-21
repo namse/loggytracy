@@ -10,7 +10,33 @@ use crate::trace_part::{TracePart, TracePartReader, discover_trace_parts};
 
 pub struct TraceRegistry {
     inner: RwLock<HashMap<String, Arc<TracePartReader>>>,
+    /// Bytes each tenant holds across the registered trace parts, maintained as
+    /// the set changes for the same reason the log registry keeps its own: a
+    /// storage quota is read on the ingest path, and summing tenant segments
+    /// per write is work proportional to the part count.
+    stored_bytes: RwLock<HashMap<TenantId, u64>>,
     operation_lock: Arc<tokio::sync::RwLock<()>>,
+}
+
+/// One trace part's contribution to the per-tenant totals.
+fn reader_tenant_bytes(reader: &TracePartReader) -> Vec<(TenantId, u64)> {
+    reader
+        .part()
+        .meta
+        .tenants
+        .iter()
+        .map(|segment| (segment.tenant.clone(), segment.bytes.len()))
+        .collect()
+}
+
+fn census_of(readers: &HashMap<String, Arc<TracePartReader>>) -> HashMap<TenantId, u64> {
+    let mut totals: HashMap<TenantId, u64> = HashMap::new();
+    for reader in readers.values() {
+        for (tenant, bytes) in reader_tenant_bytes(reader) {
+            *totals.entry(tenant).or_insert(0) += bytes;
+        }
+    }
+    totals
 }
 
 impl TraceRegistry {
@@ -21,6 +47,7 @@ impl TraceRegistry {
     pub fn new(operation_lock: Arc<tokio::sync::RwLock<()>>) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            stored_bytes: RwLock::new(HashMap::new()),
             operation_lock,
         }
     }
@@ -57,7 +84,9 @@ impl TraceRegistry {
                 .map_err(|error| format!("failed to open trace part {id}: {error}"))?;
             readers.insert(id, Arc::new(reader));
         }
-        *self.inner.write().unwrap() = readers;
+        let mut inner = self.inner.write().unwrap();
+        *self.stored_bytes.write().unwrap() = census_of(&readers);
+        *inner = readers;
         Ok(())
     }
 
@@ -90,6 +119,7 @@ impl TraceRegistry {
             })?;
             readers.insert(descriptor.id.clone(), Arc::new(reader));
         }
+        *registry.stored_bytes.write().unwrap() = census_of(&readers);
         *registry.inner.write().unwrap() = readers;
         Ok(registry)
     }
@@ -116,15 +146,39 @@ impl TraceRegistry {
 
     pub fn register_opened(&self, readers: Vec<(String, Arc<TracePartReader>)>) -> Vec<String> {
         let ids = readers.iter().map(|(id, _)| id.clone()).collect();
-        self.inner.write().unwrap().extend(readers);
+        let mut inner = self.inner.write().unwrap();
+        let mut census = self.stored_bytes.write().unwrap();
+        for (id, reader) in readers {
+            // Registering an id already present replaces it, so its predecessor
+            // leaves the census with it.
+            if let Some(previous) = inner.insert(id, reader.clone()) {
+                subtract(&mut census, &previous);
+            }
+            for (tenant, bytes) in reader_tenant_bytes(&reader) {
+                *census.entry(tenant).or_insert(0) += bytes;
+            }
+        }
         ids
     }
 
     pub fn unregister(&self, ids: &[String]) {
         let mut inner = self.inner.write().unwrap();
+        let mut census = self.stored_bytes.write().unwrap();
         for id in ids {
-            inner.remove(id);
+            if let Some(removed) = inner.remove(id) {
+                subtract(&mut census, &removed);
+            }
         }
+    }
+
+    /// Bytes the tenant's row groups occupy across every registered trace part.
+    pub fn tenant_stored_bytes(&self, tenant: &TenantId) -> u64 {
+        self.stored_bytes
+            .read()
+            .unwrap()
+            .get(tenant)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn snapshot(&self) -> Vec<Arc<TracePartReader>> {
@@ -285,5 +339,16 @@ impl TraceRegistry {
 
     pub fn part_count(&self) -> usize {
         self.inner.read().unwrap().len()
+    }
+}
+
+fn subtract(census: &mut HashMap<TenantId, u64>, reader: &TracePartReader) {
+    for (tenant, bytes) in reader_tenant_bytes(reader) {
+        if let Some(total) = census.get_mut(&tenant) {
+            *total = total.saturating_sub(bytes);
+            if *total == 0 {
+                census.remove(&tenant);
+            }
+        }
     }
 }

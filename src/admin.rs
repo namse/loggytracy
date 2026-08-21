@@ -28,6 +28,10 @@ struct RetentionRequest {
     /// Distinct log streams the tenant may hold at once.
     #[serde(default)]
     max_streams: Option<u64>,
+    /// Bytes the tenant may keep stored, as a size such as `10GiB`. Optional
+    /// for the same reason as the rates.
+    #[serde(default)]
+    max_stored_bytes: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -40,6 +44,8 @@ pub struct RetentionResponse {
     query_rate: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_streams: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_stored_bytes: Option<String>,
     updated_at: String,
 }
 
@@ -69,6 +75,7 @@ pub async fn put_retention(
             request.ingest_rate.as_deref(),
             request.query_rate.as_deref(),
             request.max_streams,
+            request.max_stored_bytes.as_deref(),
         )
         .await
         .map_err(into_http)?;
@@ -85,6 +92,7 @@ pub async fn put_retention(
         ingest_rate: view.ingest_rate,
         query_rate: view.query_rate,
         max_streams: view.max_streams,
+        max_stored_bytes: view.max_stored_bytes,
         updated_at: rfc3339(view.updated_at),
     }))
 }
@@ -108,6 +116,7 @@ pub async fn get_retention(
         ingest_rate: view.ingest_rate,
         query_rate: view.query_rate,
         max_streams: view.max_streams,
+        max_stored_bytes: view.max_stored_bytes,
         updated_at: rfc3339(view.updated_at),
     }))
 }
@@ -154,6 +163,14 @@ pub async fn get_usage(
     };
     let on_disk = state.parts.stats(&tenant, window);
     let buffered = state.memtable.stats(&tenant, window);
+    // What a storage plan charges for: the tenant's own extents in the shared
+    // objects, logs and traces together. Read from the registries' running
+    // census rather than recomputed, so this endpoint costs the same whether
+    // the tenant has one part or ten thousand.
+    let stored_bytes = state
+        .parts
+        .tenant_stored_bytes(&tenant)
+        .saturating_add(state.trace_parts.tenant_stored_bytes(&tenant));
     // The union, for the same reason the limit uses it: a flushed stream lives
     // in both until the buffer is cleared.
     let streams = state
@@ -176,6 +193,12 @@ pub async fn get_usage(
         "parts": state.parts.tenant_part_count(&tenant),
         "entries": on_disk.entries + buffered.entries,
         "bytes": on_disk.bytes + buffered.bytes,
+        // `bytes` above counts logs, including what is buffered and therefore
+        // not yet stored anywhere. `stored_bytes` is the durable total the
+        // limit is compared against, so a control plane showing a customer
+        // their usage reads this one and nothing else.
+        "stored_bytes": stored_bytes,
+        "max_stored_bytes": state.tenant_quota.max_stored_bytes_for(&tenant),
         // Remaining tokens, not consumption: the control plane holds the
         // monthly ledger, and what an instance can answer is how close this
         // tenant is to being refused right now.

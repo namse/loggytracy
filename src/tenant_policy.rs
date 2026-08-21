@@ -67,6 +67,28 @@ pub enum TenantQueryRate {
     BytesPerSecond(u64),
 }
 
+/// How much a tenant may keep stored on this instance.
+///
+/// A *stock*, where the two rates above are flows, and that difference is the
+/// whole reason it exists: a rate bounds what a tenant can do to its
+/// neighbours in a second, and nothing about a rate stops a tenant inside it
+/// from accumulating storage forever. Retention is the other half — it decides
+/// when bytes leave — so a plan that sells a period and a size needs both, and
+/// this is the size.
+///
+/// Enforced by refusing writes rather than by deleting. A tenant over its limit
+/// keeps every byte it already has and is told to stop sending; the bytes come
+/// back on their own when retention retires the oldest parts. Deleting to make
+/// room would be this engine choosing which of a customer's logs to destroy,
+/// which is not a decision it has the standing to make.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TenantStorageLimit {
+    Unlimited,
+    /// Zero means the tenant may not store anything, which is a suspended
+    /// account that has not yet been deleted.
+    Bytes(u64),
+}
+
 /// What the control plane pushed for one tenant.
 ///
 /// The raw strings are kept as they arrived so a `GET` returns what was sent.
@@ -93,6 +115,11 @@ struct PolicyEntry {
     /// tenant that mints a label value per request turns disk into something
     /// nothing takes back.
     max_streams: Option<u64>,
+    /// Bytes the tenant may keep stored, or `None` when the control plane has
+    /// said nothing. Kept alongside the string it arrived as, like the rates,
+    /// so a `GET` returns what was pushed rather than a re-rendering of it.
+    max_stored_bytes: Option<TenantStorageLimit>,
+    raw_max_stored_bytes: Option<String>,
     updated_at: SystemTime,
 }
 
@@ -102,6 +129,7 @@ pub struct PolicyView {
     pub ingest_rate: Option<String>,
     pub query_rate: Option<String>,
     pub max_streams: Option<u64>,
+    pub max_stored_bytes: Option<String>,
     pub updated_at: SystemTime,
 }
 
@@ -130,12 +158,19 @@ impl PolicyMap {
         self.entries.get(tenant).and_then(|entry| entry.max_streams)
     }
 
+    pub fn max_stored_bytes(&self, tenant: &TenantId) -> Option<TenantStorageLimit> {
+        self.entries
+            .get(tenant)
+            .and_then(|entry| entry.max_stored_bytes)
+    }
+
     pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
         self.entries.get(tenant).map(|entry| PolicyView {
             retention: entry.raw.clone(),
             ingest_rate: entry.raw_ingest_rate.clone(),
             query_rate: entry.raw_query_rate.clone(),
             max_streams: entry.max_streams,
+            max_stored_bytes: entry.raw_max_stored_bytes.clone(),
             updated_at: entry.updated_at,
         })
     }
@@ -315,6 +350,8 @@ struct PolicyDocument {
     query_rate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_streams: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_stored_bytes: Option<String>,
     updated_at: String,
 }
 
@@ -409,6 +446,15 @@ impl PolicyStore {
                     })
                 })
                 .transpose()?;
+            let max_stored_bytes = document
+                .max_stored_bytes
+                .as_deref()
+                .map(|raw| {
+                    parse_storage_limit(raw).map_err(|error| {
+                        format!("invalid max_stored_bytes {raw:?} in {file_name:?}: {error}")
+                    })
+                })
+                .transpose()?;
             let updated_at = parse_timestamp(&document.updated_at).map_err(|error| {
                 format!(
                     "invalid updated_at {:?} in {file_name:?}: {error}",
@@ -425,6 +471,8 @@ impl PolicyStore {
                     query_rate,
                     raw_query_rate: document.query_rate,
                     max_streams: document.max_streams,
+                    max_stored_bytes,
+                    raw_max_stored_bytes: document.max_stored_bytes,
                     updated_at,
                 },
             );
@@ -635,6 +683,7 @@ resurrect data those policies had already expired",
         raw_ingest_rate: Option<&str>,
         raw_query_rate: Option<&str>,
         max_streams: Option<u64>,
+        raw_max_stored_bytes: Option<&str>,
     ) -> Result<PolicyView, PolicyError> {
         let Some(store) = &self.store else {
             return Err(PolicyError::Invalid(
@@ -662,9 +711,17 @@ resurrect data those policies had already expired",
                 return Err(PolicyError::Invalid(error));
             }
         };
+        let max_stored_bytes = match raw_max_stored_bytes.map(parse_storage_limit).transpose() {
+            Ok(limit) => limit,
+            Err(error) => {
+                self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(PolicyError::Invalid(error));
+            }
+        };
         let raw = raw.trim().to_string();
         let raw_ingest_rate = raw_ingest_rate.map(|rate| rate.trim().to_string());
         let raw_query_rate = raw_query_rate.map(|rate| rate.trim().to_string());
+        let raw_max_stored_bytes = raw_max_stored_bytes.map(|limit| limit.trim().to_string());
 
         // Stamped under the lock, not on arrival: two concurrent pushes for the
         // same tenant commit in lock order, and a timestamp taken before the
@@ -677,6 +734,7 @@ resurrect data those policies had already expired",
             ingest_rate: raw_ingest_rate.clone(),
             query_rate: raw_query_rate.clone(),
             max_streams,
+            max_stored_bytes: raw_max_stored_bytes.clone(),
             updated_at: format_timestamp(updated_at),
         };
         if let Err(error) = store.put(tenant, &document).await {
@@ -696,6 +754,8 @@ resurrect data those policies had already expired",
                     query_rate,
                     raw_query_rate: raw_query_rate.clone(),
                     max_streams,
+                    max_stored_bytes,
+                    raw_max_stored_bytes: raw_max_stored_bytes.clone(),
                     updated_at,
                 },
             );
@@ -706,6 +766,7 @@ resurrect data those policies had already expired",
             ingest_rate: raw_ingest_rate,
             query_rate: raw_query_rate,
             max_streams,
+            max_stored_bytes: raw_max_stored_bytes,
             updated_at,
         })
     }
@@ -725,6 +786,10 @@ resurrect data those policies had already expired",
 
     pub fn max_streams(&self, tenant: &TenantId) -> Option<u64> {
         self.snapshot()?.max_streams(tenant)
+    }
+
+    pub fn max_stored_bytes(&self, tenant: &TenantId) -> Option<TenantStorageLimit> {
+        self.snapshot()?.max_stored_bytes(tenant)
     }
 
     /// Return the tenant to *unknown*, which keeps its data forever. This is
@@ -787,6 +852,8 @@ resurrect data those policies had already expired",
                         query_rate: None,
                         raw_query_rate: None,
                         max_streams: None,
+                        max_stored_bytes: None,
+                        raw_max_stored_bytes: None,
                         updated_at: SystemTime::now(),
                     },
                 );
@@ -885,6 +952,28 @@ pub fn parse_query_rate(raw: &str) -> Result<TenantQueryRate, String> {
     }
 }
 
+/// Parses a storage limit: a byte size, or the literal `unlimited`.
+///
+/// The same spellings as a rate without the `/s`, so a control plane rendering
+/// a plan writes `4MiB/s` and `10GiB` from the same formatter.
+pub fn parse_storage_limit(raw: &str) -> Result<TenantStorageLimit, String> {
+    let value = raw.trim();
+    if value.eq_ignore_ascii_case("unlimited") {
+        return Ok(TenantStorageLimit::Unlimited);
+    }
+    if value.ends_with("/s") {
+        return Err("a storage limit is a size, not a rate; drop the \"/s\"".to_string());
+    }
+    match parse_ingest_rate(value) {
+        Ok(TenantIngestRate::BytesPerSecond(bytes)) => Ok(TenantStorageLimit::Bytes(bytes)),
+        Ok(TenantIngestRate::Unlimited) => Ok(TenantStorageLimit::Unlimited),
+        Err(_) => Err(
+            "expected a byte size such as 512MiB, 10GiB, 0, or the literal \"unlimited\""
+                .to_string(),
+        ),
+    }
+}
+
 pub fn parse_ingest_rate(raw: &str) -> Result<TenantIngestRate, String> {
     let value = raw.trim();
     if value.eq_ignore_ascii_case("unlimited") {
@@ -921,6 +1010,31 @@ mod tests {
 
     fn days(count: u64) -> Duration {
         Duration::from_secs(count * 24 * 60 * 60)
+    }
+
+    #[test]
+    fn parses_storage_limits_and_refuses_a_rate_spelling() {
+        assert_eq!(
+            parse_storage_limit("10GiB").unwrap(),
+            TenantStorageLimit::Bytes(10 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_storage_limit(" 512MiB ").unwrap(),
+            TenantStorageLimit::Bytes(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_storage_limit("0").unwrap(),
+            TenantStorageLimit::Bytes(0)
+        );
+        assert_eq!(
+            parse_storage_limit("unlimited").unwrap(),
+            TenantStorageLimit::Unlimited
+        );
+        // A size and a rate are different things, and "4MiB/s" of storage is a
+        // control plane that filled in the wrong field. Refusing it is how the
+        // mistake surfaces at the push rather than as a limit nobody set.
+        assert!(parse_storage_limit("4MiB/s").is_err());
+        assert!(parse_storage_limit("forever").is_err());
     }
 
     #[test]
@@ -981,16 +1095,16 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "30d", None, None, None)
+            .push(&tenant("acme"), "30d", None, None, None, None)
             .await
             .unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None, None, None)
+            .push(&tenant("intern"), "infinite", None, None, None, None)
             .await
             .unwrap();
         // A downgrade taken before the restart must still be in force after it.
         policy
-            .push(&tenant("acme"), "7d", None, None, None)
+            .push(&tenant("acme"), "7d", None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1047,7 +1161,7 @@ mod tests {
         let dir = data_dir.join(TENANT_POLICY_PREFIX);
         let policy = TenantPolicy::for_test_with_local_store(dir.clone());
         policy
-            .push(&tenant("acme"), "7d", None, None, None)
+            .push(&tenant("acme"), "7d", None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1103,7 +1217,7 @@ mod tests {
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
         policy
-            .push(&tenant("acme"), "7d", None, None, None)
+            .push(&tenant("acme"), "7d", None, None, None, None)
             .await
             .unwrap();
 
@@ -1143,7 +1257,7 @@ mod tests {
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
         policy
-            .push(&tenant("acme"), "1d", None, None, None)
+            .push(&tenant("acme"), "1d", None, None, None, None)
             .await
             .unwrap();
 
@@ -1159,7 +1273,7 @@ mod tests {
         // The control plane upgrades the tenant. The row is still on disk, and
         // the new plan covers it again.
         policy
-            .push(&tenant("acme"), "30d", None, None, None)
+            .push(&tenant("acme"), "30d", None, None, None, None)
             .await
             .unwrap();
         assert!(
@@ -1185,7 +1299,7 @@ mod tests {
         TenantPolicy::load(&with_token, Some(storage.clone()))
             .await
             .expect("an empty store boots")
-            .push(&tenant("acme"), "0", None, None, None)
+            .push(&tenant("acme"), "0", None, None, None, None)
             .await
             .expect("the deletion is stored");
 
@@ -1219,13 +1333,13 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "30d", None, None, None)
+            .push(&tenant("acme"), "30d", None, None, None, None)
             .await
             .unwrap();
 
         // A malformed value is rejected before anything is written.
         assert!(matches!(
-            policy.push(&tenant("acme"), "soon", None, None, None).await,
+            policy.push(&tenant("acme"), "soon", None, None, None, None).await,
             Err(PolicyError::Invalid(_))
         ));
         assert_eq!(policy.metrics.push_rejected.load(Ordering::Relaxed), 1);
@@ -1242,7 +1356,7 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "1ms", None, None, None)
+            .push(&tenant("acme"), "1ms", None, None, None, None)
             .await
             .unwrap();
         assert!(policy.query_floor_ns(&tenant("acme")).is_some());
@@ -1268,11 +1382,11 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage);
         policy
-            .push(&tenant("acme"), "3650d", None, None, None)
+            .push(&tenant("acme"), "3650d", None, None, None, None)
             .await
             .unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None, None, None)
+            .push(&tenant("intern"), "infinite", None, None, None, None)
             .await
             .unwrap();
 

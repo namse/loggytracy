@@ -681,6 +681,9 @@ loggytracy_query_quota_rejected_total {}\n\
 # HELP loggytracy_stream_limit_rejected_total Writes refused for creating a stream past the tenant's limit. Far more often a client minting label values than a plan being outgrown.\n\
 # TYPE loggytracy_stream_limit_rejected_total counter\n\
 loggytracy_stream_limit_rejected_total {}\n\
+# HELP loggytracy_storage_limit_rejected_total Writes refused because the tenant already stores what its plan sells. Unlike the rate rejections this one clears only when retention retires parts.\n\
+# TYPE loggytracy_storage_limit_rejected_total counter\n\
+loggytracy_storage_limit_rejected_total {}\n\
 # HELP loggytracy_wal_replayed_records Records this process replayed from the WAL at startup. Non-zero means the previous run did not shut down cleanly.\n\
 # TYPE loggytracy_wal_replayed_records gauge\n\
 loggytracy_wal_replayed_records {}\n\
@@ -797,6 +800,7 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         m.ingest_quota_rejected.load(Ordering::Relaxed),
         m.query_quota_rejected.load(Ordering::Relaxed),
         m.stream_limit_rejected.load(Ordering::Relaxed),
+        m.storage_limit_rejected.load(Ordering::Relaxed),
         m.wal_replayed_records.load(Ordering::Relaxed),
         m.wal_replayed_entries.load(Ordering::Relaxed),
         state.ingest_gate.buffered_bytes(),

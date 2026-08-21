@@ -11,7 +11,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::metrics::RuntimeMetrics;
 use crate::tenant::TenantId;
-use crate::tenant_policy::{TenantIngestRate, TenantPolicy, TenantQueryRate};
+use crate::tenant_policy::{TenantIngestRate, TenantPolicy, TenantQueryRate, TenantStorageLimit};
 
 /// Enforces the per-tenant ingest rate the control plane pushed.
 ///
@@ -33,6 +33,11 @@ pub struct TenantQuota {
     clock: Arc<Clock>,
     metrics: Arc<RuntimeMetrics>,
     policy: Arc<TenantPolicy>,
+    /// Held rather than passed in per call, so a storage limit cannot be
+    /// enforced on one ingest path and forgotten on another — which is the
+    /// failure the two transports were split apart to prevent.
+    parts: Arc<crate::part_registry::PartRegistry>,
+    trace_parts: Arc<crate::trace_registry::TraceRegistry>,
     buckets: Mutex<HashMap<TenantId, Bucket>>,
     /// The read side, kept in its own map so a tenant reading hard cannot
     /// spend the budget that decides whether its writes are accepted. They are
@@ -93,18 +98,31 @@ struct Bucket {
 /// the tenant id comes from a request header.
 const SWEEP_EVERY: u64 = 1024;
 
+/// What a client is told to wait after being refused for storage.
+///
+/// Not a computed time-to-clear: what frees the space is retention retiring
+/// parts, whose timing depends on the tenant's own retention period and on when
+/// a merge tick reaches those parts. Nothing here can turn that into a number.
+/// It is a floor that keeps a refused client from spinning at its own retry
+/// rate for something that will not change within a second.
+const STORAGE_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 impl TenantQuota {
     pub fn new(
         config: Arc<Config>,
         clock: Arc<Clock>,
         metrics: Arc<RuntimeMetrics>,
         policy: Arc<TenantPolicy>,
+        parts: Arc<crate::part_registry::PartRegistry>,
+        trace_parts: Arc<crate::trace_registry::TraceRegistry>,
     ) -> Self {
         Self {
             config,
             clock,
             metrics,
             policy,
+            parts,
+            trace_parts,
             buckets: Mutex::new(HashMap::new()),
             scan_buckets: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
@@ -122,6 +140,8 @@ impl TenantQuota {
             Clock::system(),
             Arc::new(RuntimeMetrics::new()),
             Arc::new(TenantPolicy::disabled()),
+            Arc::new(crate::part_registry::PartRegistry::new()),
+            Arc::new(crate::trace_registry::TraceRegistry::standalone()),
         ))
     }
 
@@ -131,6 +151,7 @@ impl TenantQuota {
     /// before it is decompressed or decoded, so a tenant over its rate cannot
     /// spend this instance's CPU on a body that will not be accepted.
     pub fn check(&self, tenant: &TenantId, bytes: u64) -> Result<(), IngestError> {
+        self.admit_storage(tenant)?;
         let rate = match self.resolve(tenant) {
             TenantIngestRate::Unlimited => return Ok(()),
             TenantIngestRate::BytesPerSecond(rate) => rate,
@@ -308,6 +329,60 @@ this write would create another"
 
     pub fn max_streams_for(&self, tenant: &TenantId) -> Option<u64> {
         self.resolve_max_streams(tenant)
+    }
+
+    /// The tenant's storage limit in bytes, or `None` when it has none.
+    pub fn max_stored_bytes_for(&self, tenant: &TenantId) -> Option<u64> {
+        match self.resolve_storage_limit(tenant) {
+            TenantStorageLimit::Unlimited => None,
+            TenantStorageLimit::Bytes(bytes) => Some(bytes),
+        }
+    }
+
+    fn resolve_storage_limit(&self, tenant: &TenantId) -> TenantStorageLimit {
+        self.policy
+            .max_stored_bytes(tenant)
+            .or_else(|| {
+                self.config
+                    .default_tenant_max_stored_bytes
+                    .map(TenantStorageLimit::Bytes)
+            })
+            .unwrap_or(TenantStorageLimit::Unlimited)
+    }
+
+    /// Refuse the write when the tenant is already holding everything its plan
+    /// sells it.
+    ///
+    /// Read from the registries' running census, so this costs the same on a
+    /// tenant with one part as on one with ten thousand.
+    ///
+    /// The comparison is against what is *stored*, not against what this
+    /// request would make stored. A request is at most `max_push_bytes` and the
+    /// limit is measured in gigabytes, so the overrun a "check before, not
+    /// after" rule allows is one request deep — and checking the other way
+    /// would mean estimating a body's compressed size before compressing it.
+    pub fn admit_storage(&self, tenant: &TenantId) -> Result<(), IngestError> {
+        let TenantStorageLimit::Bytes(limit) = self.resolve_storage_limit(tenant) else {
+            return Ok(());
+        };
+        let stored = self
+            .parts
+            .tenant_stored_bytes(tenant)
+            .saturating_add(self.trace_parts.tenant_stored_bytes(tenant));
+        if stored < limit {
+            return Ok(());
+        }
+        self.metrics
+            .storage_limit_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        Err(IngestError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "tenant {tenant} stores {stored} bytes, at its limit of {limit}; \
+writes resume when retention retires enough of it"
+            ),
+            retry_after: Some(STORAGE_LIMIT_RETRY_AFTER),
+        })
     }
 
     fn resolve_max_streams(&self, tenant: &TenantId) -> Option<u64> {
