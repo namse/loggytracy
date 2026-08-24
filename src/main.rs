@@ -41,14 +41,6 @@ fn main() {
 }
 
 async fn run(malloc_tuned: bool) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("loggytracy=info,warn"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-    tracing::info!(
-        applied = malloc_tuned,
-        "glibc malloc tuning (LOGGYTRACY_MALLOC_TUNING=off to disable)"
-    );
-
     let config = Arc::new(
         Config::from_env().unwrap_or_else(|error| panic!("invalid configuration: {error}")),
     );
