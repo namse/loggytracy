@@ -35,38 +35,31 @@ environment variables (`OBJECT_STORE_*` takes precedence). For S3-compatible sto
 | Variable | Default | Description |
 |---|---|---|
 | `LOGGYTRACY_MISSING_TENANT` | unset (reject) | Tenant a request without `X-Scope-OrgID` is filed under. **Unset — the default — rejects such requests with 400**: behind a gateway a missing header is the gateway failing, which should fail loudly rather than quietly pool everyone's data. Set it (any valid tenant id) for single-tenant deployments where nothing mints the header |
-| `LOGGYTRACY_TENANT_POLICY_TOKEN` | unset (disabled) | Enables the per-tenant policy admin API and disables global retention. **With the token set, the pushed policies are the tenant registry: only tenants the control plane has pushed a policy for are served, everything else receives 403.** Without it every well-formed tenant id is accepted — and because the header value supplied by the upstream is trusted without proof, anyone who can reach the listener can then create any tenant |
-| `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` | unset (unlimited) | Default for tenants whose rate has not been pushed by the control plane |
-| `LOGGYTRACY_DEFAULT_TENANT_QUERY_SCAN_BYTES_PER_SECOND` | none (unlimited) | Read-side default for tenants the control plane has pushed no `query_rate` for |
 | `LOGGYTRACY_DEFAULT_TENANT_MAX_STREAMS` | none (unbounded) | Distinct streams a tenant may hold, for tenants with no pushed `max_streams`. **Stream cardinality is the one cost neither retention nor merge reclaims** — `stream.idx` is an eviction-exempt catalog |
 | `LOGGYTRACY_DEFAULT_TENANT_MAX_STORED_BYTES` | none (unbounded) | Bytes a tenant may keep stored, for tenants with no pushed `max_stored_bytes`. A plain byte count, or `off`. **Set this before opening a free tier**: a tenant nothing was pushed for is one nobody sold anything to, and unbounded means the first of them decides how much disk the rest get |
-| `LOGGYTRACY_MAX_CONCURRENT_QUERIES_PER_TENANT` | 4 | Queries one tenant may run at once. The scan rate bounds work over time; this bounds how much happens simultaneously, so one tenant cannot take every permit of the shared query semaphore |
-| `LOGGYTRACY_TENANT_INGEST_BURST` | `10s` | Time during which an unused tenant rate can accumulate for one burst. Capacity never falls below `MAX_PUSH_BYTES` |
+| `LOGGYTRACY_MAX_CONCURRENT_QUERIES_PER_TENANT` | 4 | Queries one tenant may run at once, so one tenant cannot take every permit of the shared query semaphore |
 
-**Note:** with `TENANT_POLICY_TOKEN` set and `MISSING_TENANT` naming a tenant, headerless requests are
-served only once a policy has been pushed for that tenant — it is onboarded like any other.
+**The pushed policies are the tenant registry**: only tenants the control plane
+has pushed a policy for are served, everything else receives 403. The admin API
+that pushes them carries no authentication of its own — loggytracy is not built
+to be reachable from the outside network, and assumes every request arrives
+through a secured channel.
 
-**Constraint:** startup is refused when any tenant policy is stored but `TENANT_POLICY_TOKEN` is absent.
-Without the token, query clamping disappears and deleted data can reappear.
+**Note:** with `MISSING_TENANT` naming a tenant, headerless requests are served
+only once a policy has been pushed for that tenant — it is onboarded like any
+other.
 
-### Per-tenant ingest rates are not configured here
+### Per-tenant limits are not configured here
 
-Because rates vary by plan and can change after launch, **the control plane pushes them per tenant.**
-They are the `ingest_rate` field in the policy body, alongside `retention`. The value is bytes per
-second such as `4MiB/s`, `0` (writes disabled), or `unlimited`.
+Because limits vary by plan and can change after launch, **the control plane
+pushes them per tenant**, alongside `retention` in the policy body. There are no
+per-tenant *rates*: how fast the instance accepts work is the global
+backpressure gate's question, answered from the server's own state.
 
 ```
 PUT /loggytracy/api/v1/admin/tenants/{tenant}/retention
-{"retention": "7d", "ingest_rate": "4MiB/s", "query_rate": "64MiB/s", "max_streams": 100,
- "max_stored_bytes": "10GiB"}
+{"retention": "7d", "max_streams": 100, "max_stored_bytes": "10GiB"}
 ```
-
-`query_rate` is the read side, in bytes of *scanned* data per second. It is
-charged after a query completes with what the scan actually read, because the
-cost of a query is not knowable before running it — so a tenant that overruns is
-refused on its next query rather than mid-scan, which bounds the overrun at one
-query instead of preventing it. `0` means the tenant may not query at all, which
-is a real state: a suspended account still owns its data.
 
 `max_streams` bounds distinct streams rather than a rate, because stream
 cardinality is the one cost neither retention nor merge takes back. Only a
@@ -93,10 +86,10 @@ footer and the sidecars belong to no single tenant and are not charged to one.
 `GET …/tenants/{tenant}/usage` reports the same number as `stored_bytes`
 alongside `max_stored_bytes`, which is what a control plane shows a customer.
 
-The body is the complete policy, not a patch. If it is pushed without `ingest_rate`, the existing value
+The body is the complete policy, not a patch. If it is pushed without `max_streams`, the existing value
 is **cleared** and reverts to the default above.
 
-This rate applies to one instance; it is not the monthly usage sold by a plan. Monthly usage spans
+These limits apply to one instance; they are not the monthly usage sold by a plan. Monthly usage spans
 multiple instances and outlives any instance, so only the control plane can own that state.
 
 ## Ingest input limits
@@ -105,7 +98,6 @@ All limits are checked **before** writing to the journal, so rejected requests l
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_MAX_PUSH_BYTES` | 16 MiB | Largest single request the tenant ingest quota must always admit — the token bucket's burst floor. The OTLP body limit itself is a 16 MiB constant on both transports |
 | `LOGGYTRACY_MAX_LINE_BYTES` | 256 KiB | Maximum size of one log line |
 | `LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM` | 30 | Maximum labels per stream |
 | `LOGGYTRACY_MAX_LABEL_NAME_BYTES` | 1024 | |
@@ -227,17 +219,17 @@ windows, so the operation cannot fail permanently.
 
 ## Retention
 
+Retention is **per tenant only**: each tenant keeps data for the period its
+pushed policy names, a tenant pushed `infinite` or nothing keeps data forever,
+and there is no global period.
+
 | Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_RETENTION_PERIOD` | unset (**retain forever**) | Global retention period. If unset, S3 and the disk grow forever |
 | `LOGGYTRACY_RETENTION_INTERVAL` | `5m` | |
 | `LOGGYTRACY_RETENTION_BATCH_SIZE` | 100 | Number of parts processed per tick |
 | `LOGGYTRACY_RETENTION_GRACE_PERIOD` | `1h` | Grace period before deleting orphan objects |
 | `LOGGYTRACY_MAX_RETENTION_RUNTIME` | `2m` | Object-store operation timeout for retention/GC |
 | `LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` | 0.5 | Rewrite when the expired-row fraction of a part exceeds this value. Tenant deletion (`retention: "0"`) ignores this value |
-
-**Constraint:** `RETENTION_PERIOD` and `TENANT_POLICY_TOKEN` cannot be set together. Per-tenant
-retention replaces the global period, and startup failure is safer than silently ignoring one setting.
 
 ## Cache
 
@@ -368,7 +360,7 @@ rather than through a subscriber, which is the same place it went before.
   (`loggytracy_ingest_throttled_total`); if none appear, the limit is too high
 - **`/ready` stays at 503** → Check which `/metrics` `*_errors_total` is increasing.
   Flush, merge, retention, object store, and local cache each lower readiness independently
-- **The disk is filling** → Reduce `CACHE_MAX_BYTES` or set `RETENTION_PERIOD`. Nothing is deleted when the latter is unset
+- **The disk is filling** → Reduce `CACHE_MAX_BYTES` or shorten the pushed tenant retentions. Nothing is deleted for a tenant whose policy retains forever
 - **Want p95/p99** → Apply `histogram_quantile` to `loggytracy_query_latency_ms_bucket`,
   which carries an `endpoint` label (`query_range`, `query`, `tail`, `patterns`,
   `detected_fields`, `volume`). Per endpoint is the useful cut — a dashboard slow

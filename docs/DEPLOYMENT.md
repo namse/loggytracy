@@ -191,8 +191,11 @@ start loggytracy`, since a container stopped on purpose stays that way.
 
 ## 5. The gateway contract
 
-The engine has no TLS and no authentication. It reads `X-Scope-OrgID` and
-believes it. Everything that makes that safe lives in front of it.
+**loggytracy is not built to be a server reachable from the outside network.**
+It has no TLS and no authentication — the admin API included — and it reads
+`X-Scope-OrgID` and believes it. It is provided on the assumption that every
+request reaches it through a secured channel; everything that makes that
+assumption true lives in front of it.
 
 - **Terminate TLS and authenticate at the gateway.** Only the gateway may reach
   the listener; bind it to loopback, or to a private interface with a firewall.
@@ -200,11 +203,10 @@ believes it. Everything that makes that safe lives in front of it.
   own `X-Scope-OrgID` must not have it survive. Appending produces two header
   values and the engine reads the first one, which is the client's. In nginx:
   `proxy_set_header X-Scope-OrgID $verified_tenant;` replaces whatever arrived.
-- **Set `LOGGYTRACY_TENANT_POLICY_TOKEN`** (§6). Without it any string that
-  reaches the listener becomes a tenant. With it, the pushed policies are the
-  tenant registry: anything the control plane has not onboarded gets 403 — a
-  second line behind the gateway, for the day something reaches the port that
-  should not have, and it never needs a restart to change.
+- The pushed policies are the tenant registry: anything the control plane has
+  not onboarded gets 403 — a second line behind the gateway, for the day
+  something reaches the port that should not have, and it never needs a restart
+  to change.
 
 Verify it, rather than assuming it, once the gateway is up:
 
@@ -216,11 +218,8 @@ The engine should see your own tenant, not that one.
 
 ## 6. Tenant policy and free-tier defaults
 
-Set `LOGGYTRACY_TENANT_POLICY_TOKEN` to a long random string. It does three
-things: it enables per-tenant retention, it mounts the admin API, and it makes
-the pushed policies the tenant registry — only tenants the control plane has
-pushed a policy for are served. Without it the admin routes do not exist at
-all rather than existing unauthenticated.
+The pushed policies are the tenant registry — only tenants the control plane
+has pushed a policy for are served, and retention is what each policy names.
 
 Onboarding a tenant *is* the policy push below: the moment the `PUT` answers
 200, that tenant's requests are served, with no restart and nothing else to
@@ -234,9 +233,9 @@ its name and pushes a policy for it too; it is onboarded like any other.
 
 **Set defaults before opening a free tier.** A push may carry only `retention`
 and leave the limits out, and every omitted limit is unbounded by default — the
-first such tenant decides how much disk and how much write throughput everyone
-else gets. The `DEFAULT_TENANT_*` values below are what an onboarded tenant
-gets for the fields its policy never named.
+first such tenant decides how much disk everyone else gets. The
+`DEFAULT_TENANT_*` values below are what an onboarded tenant gets for the
+fields its policy never named.
 
 `/etc/loggytracy/loggytracy.env`, in full:
 
@@ -251,11 +250,7 @@ AWS_SECRET_ACCESS_KEY=...
 LOGGYTRACY_LISTEN_ADDR=127.0.0.1:3100
 LOGGYTRACY_OTLP_GRPC_ADDR=127.0.0.1:4317
 
-LOGGYTRACY_TENANT_POLICY_TOKEN=<a long random string>
-
 # Free tier: what an onboarded tenant gets for fields its plan never named.
-LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND=262144
-LOGGYTRACY_DEFAULT_TENANT_QUERY_SCAN_BYTES_PER_SECOND=16777216
 LOGGYTRACY_DEFAULT_TENANT_MAX_STREAMS=1000
 LOGGYTRACY_DEFAULT_TENANT_MAX_STORED_BYTES=1073741824
 ```
@@ -265,10 +260,8 @@ and survive restarts; there is nothing to reload:
 
 ```
 curl -X PUT https://your-gateway/loggytracy/api/v1/admin/tenants/acme/retention \
-  -H "Authorization: Bearer $LOGGYTRACY_TENANT_POLICY_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"retention": "30d", "ingest_rate": "4MiB/s", "query_rate": "64MiB/s",
-       "max_streams": 10000, "max_stored_bytes": "50GiB"}'
+  -d '{"retention": "30d", "max_streams": 10000, "max_stored_bytes": "50GiB"}'
 ```
 
 The body is the whole policy, not a patch: a field left out is cleared.
@@ -276,8 +269,7 @@ The body is the whole policy, not a patch: a field left out is cleared.
 Read a tenant's usage — this is what a customer-facing dashboard shows:
 
 ```
-curl https://your-gateway/loggytracy/api/v1/admin/tenants/acme/usage \
-  -H "Authorization: Bearer $LOGGYTRACY_TENANT_POLICY_TOKEN"
+curl https://your-gateway/loggytracy/api/v1/admin/tenants/acme/usage
 ```
 
 `stored_bytes` against `max_stored_bytes` is the storage figure. Over the limit,
@@ -289,8 +281,7 @@ the reconciliation read for a control plane checking what it believes it
 onboarded:
 
 ```
-curl https://your-gateway/loggytracy/api/v1/admin/tenants \
-  -H "Authorization: Bearer $LOGGYTRACY_TENANT_POLICY_TOKEN"
+curl https://your-gateway/loggytracy/api/v1/admin/tenants
 ```
 
 ## 7. Monitoring

@@ -52,7 +52,7 @@ elsewhere in these docs.
 | Ingest protocols | **OTLP only**, over gRPC (`:4317`) or HTTP (`POST /v1/logs`, `/v1/traces`), traces and logs. Loki push is removed — see [`VISION.md`](VISION.md), "Ingest is OTLP" |
 | Query protocol | **Loki HTTP API, unchanged.** The ingest decision above does not touch it: Grafana's Loki data source is how anyone reads this engine, and a query protocol and an ingest protocol are separate choices |
 | Transport security | **TLS is unsupported.** Only plain HTTP/gRPC is provided; a reverse proxy or service mesh handles end-to-end encryption |
-| Multi-tenancy | Multi-tenant. `X-Scope-OrgID` identifies tenants, and tenants are the unit of throttling and quota |
+| Multi-tenancy | Multi-tenant. `X-Scope-OrgID` identifies tenants, and tenants are the unit of quota and retention |
 | Validation environment | **Do not test against S3** (neither real cloud nor local MinIO). Trust the `object_store` crate and test our code closely up to the crate boundary |
 
 ## Transport security — TLS unsupported
@@ -64,7 +64,10 @@ through `object_store`, so it is unaffected by this decision.
 
 Therefore, deployments must satisfy the following requirements.
 
-- Keep the listening address inside the trust boundary. Direct exposure to a public network is unsupported.
+- Keep the listening address inside the trust boundary. **loggytracy is not built to be a server
+  reachable from the outside network**: it is provided on the assumption that every request — the
+  admin API included — arrives through a secured channel, and direct exposure to a public network is
+  unsupported.
 - Perform authentication and authorization outside this process (at a proxy or gateway), and pass the
   proxy-verified tenant as `X-Scope-OrgID`. The engine trusts this header — **tenant isolation fails if
   the engine is directly reachable from a network location where the header can be forged.**
@@ -109,9 +112,9 @@ The procedure and acceptance criteria are in [`LOAD_VALIDATION.md`](LOAD_VALIDAT
 
 ## Multi-tenancy
 
-Multi-tenancy is not an optional feature but **the basic unit of resource management**. Because throttles
-and quotas are operated per tenant, the tenant must be a first-class identifier across ingest, storage,
-and query paths.
+Multi-tenancy is not an optional feature but **the basic unit of resource management**. Because quotas
+and retention are operated per tenant, the tenant must be a first-class identifier across ingest,
+storage, and query paths.
 
 - **Identification**: `X-Scope-OrgID` header (the Loki/Tempo convention). OTLP uses the same key in gRPC
   metadata. Validate the value against `[a-zA-Z0-9_-]{1,64}` **before** journal append because it is used
@@ -130,27 +133,28 @@ and query paths.
   time, not write time, so plan upgrades and downgrades affect already-recorded data. A tenant never pushed
   is **policy-unknown, and unknown means retain**. Tenant deletion is retention `0`. See
   [`docs/RETENTION_DESIGN.md`](RETENTION_DESIGN.md) for details.
-- **Throttle and quota targets**: ingest rate (bytes/s, events/s), active stream count (cardinality),
-  storage capacity, concurrent query count, and query scan budget. When exceeded, ingest returns `429`
+- **Quota targets**: active stream count (cardinality), storage capacity, and concurrent query count.
+  There are no per-tenant rates — how fast the instance accepts work is the global backpressure gate's
+  question, answered from the server's own state. When a quota is exceeded, ingest returns `429`
   (Alloy backs off and relies on its own WAL), while queries return `429` or `422`. Over gRPC the same
   refusal is `RESOURCE_EXHAUSTED` **carrying `RetryInfo`**: the OTLP specification makes a bare
   `RESOURCE_EXHAUSTED` non-retryable and tells the client to drop the telemetry, so the attachment is
   what makes "the client holds its data because the server declined it" true on that transport rather
   than only on HTTP. A *limit* violation is the opposite instruction — permanent for that batch — and
   answers `INVALID_ARGUMENT` with no `RetryInfo`.
-- **Observability**: Expose every quota and rejection counter on `/metrics` with a tenant label. Operating
-  quotas requires visibility into "who was blocked, where, and by how much."
+- **Observability**: rejection counters are on `/metrics` without tenant labels (a label per tenant
+  multiplies every series by the tenant count); per-tenant numbers are the admin usage endpoint's.
 - **Storage limit**: `max_stored_bytes` is pushed alongside retention and bounds the bytes a tenant may
   keep. Charged on the tenant's own extents in the shared objects — logs and traces — read from `meta.json`
   rather than from the local files, so it does not move as the cache evicts and restores bodies. Over the
   limit, writes are refused; nothing is deleted to make room, because the space comes back when retention
   retires the oldest parts and choosing which of a customer's logs to destroy is not this engine's call.
-- **Current state**: Identification, validation, and isolation are implemented. `X-Scope-OrgID` is extracted
-  from OTLP HTTP and gRPC and recorded in WAL records (the owner survives restart), while MemTable,
-  part, trace part, query, and catalog reads all require a tenant argument. Only `/metrics` retains a
-  process-wide operator aggregation. **Per-tenant quotas, throttles, durable usage accounting, and tier
-  partitioning** remain; these are steps 5 and 6 in `docs/MULTI_TENANCY_DESIGN.md`
-  (see P0-3 in `docs/PRODUCTION_READINESS_REVIEW.md`).
+- **Current state**: Identification, validation, isolation, per-tenant retention, and the stock quotas
+  (streams, stored bytes, query concurrency) are implemented. `X-Scope-OrgID` is extracted from OTLP
+  HTTP and gRPC and recorded in WAL records (the owner survives restart), while MemTable, part, trace
+  part, query, and catalog reads all require a tenant argument. Only `/metrics` retains a process-wide
+  operator aggregation. **Durable usage accounting and tier partitioning** remain, along with adaptive
+  (resource-pressure-based) throttling in place of the removed per-tenant rates.
 
 ## Data model
 
@@ -272,7 +276,7 @@ LogQL parsing (chumsky) → plan → pruning in this order:
 All limits apply **before** journal append, so rejected requests leave no trace in the WAL.
 Protecting the engine takes priority over preserving every log line — Alloy retries or drops rejected batches from its own WAL.
 
-- `LOGGYTRACY_MAX_PUSH_BYTES` (16 MiB by default): The largest single request the tenant ingest quota must always be able to admit — the token bucket's burst capacity is floored at this. The OTLP body limit itself is a 16 MiB constant, matched across both transports.
+- The OTLP body limit is a 16 MiB constant, matched across both transports.
 - `LOGGYTRACY_MAX_LINE_BYTES` (256 KiB by default)
 - `LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM` (30 by default), `LOGGYTRACY_MAX_LABEL_NAME_BYTES` (1 KiB by default), and `LOGGYTRACY_MAX_LABEL_VALUE_BYTES` (2 KiB by default): Defend against stream-cardinality explosions. The stream index is a persistent catalog excluded from the cache limit, so a cardinality explosion becomes non-evictable disk usage.
 - `LOGGYTRACY_MAX_TIMESTAMP_AGE` (7d by default) and `LOGGYTRACY_MAX_TIMESTAMP_SKEW` (1h by default): Acceptance window relative to the server clock. Disable with `off` when bulk-loading historical data. Because partitions are UTC-day based, clock errors or unit mistakes (sending seconds/milliseconds as nanoseconds) multiply partitions; in particular, **a future-date part never reaches the retention cutoff.**
@@ -281,20 +285,16 @@ Protecting the engine takes priority over preserving every log line — Alloy re
 
 ### Retention settings
 
-There are two modes and they **cannot be mixed**. Setting both causes a validation error at startup —
-silently ignoring a retention setting would be the worst outcome.
-
- - `LOGGYTRACY_RETENTION_PERIOD` (unset by default): Global period applied to all tenants.
- - `LOGGYTRACY_TENANT_POLICY_TOKEN` (unset by default): Per-tenant retention. When set, the
-   `PUT/GET/DELETE /loggytracy/api/v1/admin/tenants/{tenant}/retention` routes (plus
-   `GET …/admin/tenants`) open and pushed policies become the sole authority — including over which
-   tenants are served at all: the pushed policies are the tenant registry, a push onboards a tenant
-   and a delete offboards it, with no restart. When unset, the routes do not exist and every
-   well-formed tenant id is served. Use with
-   `LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` (0.5 by default — expired-row fraction at which a part is rewritten).
-   There is **no** setting that caps pushed values. An instance-side cap would not reach unknown tenants,
-   causing a tenant explicitly marked "retain forever" to retain less data than a tenant with no policy
-   (`RETENTION_DESIGN.md`, "Rejected: an instance-side maximum").
+Retention is **per tenant only**. The
+`PUT/GET/DELETE /loggytracy/api/v1/admin/tenants/{tenant}/retention` routes (plus
+`GET …/admin/tenants`) are always mounted — with no authentication of their own, per the trust
+boundary above — and pushed policies are the sole authority, including over which tenants are served
+at all: the pushed policies are the tenant registry, a push onboards a tenant and a delete offboards
+it, with no restart. Use with
+`LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` (0.5 by default — expired-row fraction at which a part is rewritten).
+There is **no** setting that caps pushed values. An instance-side cap would not reach unknown tenants,
+causing a tenant explicitly marked "retain forever" to retain less data than a tenant with no policy
+(`RETENTION_DESIGN.md`, "Rejected: an instance-side maximum").
 
 Policies are stored as one object per tenant (`tenant_policies/<tenant>.json`) and return `200` only
 after storage completes. Failure returns `503` and the control plane retries. All policies are loaded at
@@ -303,7 +303,6 @@ startup, and failure is fatal — the same severity as being unable to read the 
 Policies are **not** on the ingest or query hot path. Writes do not look them up at all, and reads leave
 the range of a tenant without a policy unchanged (fail open).
 
-These limits are still global. Per-tenant throttling and quotas are future work (see "Multi-tenancy" above).
 
 ## LogQL support (subset)
 

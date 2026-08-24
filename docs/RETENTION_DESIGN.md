@@ -168,14 +168,12 @@ Three properties make the second half cheap:
 
 ```
 PUT /loggytracy/api/v1/admin/tenants/{tenant}/retention
-Authorization: Bearer <LOGGYTRACY_TENANT_POLICY_TOKEN>
 Content-Type: application/json
 
 {"retention": "30d"}
 
 200 OK    the policy is durable and in force
 400       malformed tenant id or retention value; nothing stored
-401       missing or wrong token
 503       could not be persisted; the control plane must retry
 ```
 
@@ -193,12 +191,15 @@ GET    /loggytracy/api/v1/admin/tenants
            plane's reconciliation read
 ```
 
-**The pushed policies are also the tenant registry.** With the admin API
-enabled, only tenants that have a pushed policy are served at all: the `PUT`
-above is how a tenant is onboarded (its requests are accepted the moment the
-200 arrives), and the `DELETE` offboards it (its requests get 403 from then
-on, while its data is kept). Without `LOGGYTRACY_TENANT_POLICY_TOKEN` there is
-no registry and every well-formed tenant id is served.
+**The pushed policies are also the tenant registry.** Only tenants that have
+a pushed policy are served at all: the `PUT` above is how a tenant is
+onboarded (its requests are accepted the moment the 200 arrives), and the
+`DELETE` offboards it (its requests get 403 from then on, while its data is
+kept).
+
+The admin routes carry no authentication of their own. loggytracy is not
+built to be reachable from the outside network; it assumes every request —
+these included — arrives through a secured channel.
 
 Values are Prometheus-style durations (`7d`, `24h`, `90m`), the literal
 `"infinite"`, or `"0"` (see [Tenant deletion](#tenant-deletion)).
@@ -249,21 +250,9 @@ The request body is untrusted input.
 - A well-formed value is applied exactly as sent. **Nothing caps, rounds or
   otherwise reinterprets it** —
   see [Rejected: an instance-side maximum](#rejected-an-instance-side-maximum).
-- The bearer token is compared in constant time. With no token configured the
-  routes are not mounted at all.
 
-### Relationship to the existing global `retention_period`
-
-Two modes, never mixed:
-
-| `LOGGYTRACY_TENANT_POLICY_TOKEN` | Behaviour |
-|---|---|
-| unset | Exactly the old behaviour: global `retention_period`, or no retention when it too is unset. The admin routes do not exist. |
-| set | The pushed policies are the sole authority. |
-
-Setting **both** the token and `retention_period` is a config validation error
-(`config.rs` `validate`). A silently ignored retention setting is the worst
-possible outcome, so it fails at startup instead.
+The global `retention_period` this design once coexisted with is gone: the
+pushed policies are the sole authority, and there is no other mode.
 
 ## Two-layer deletion
 
@@ -394,7 +383,6 @@ table: "Trace part format — done"). Everything above applies symmetrically via
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LOGGYTRACY_TENANT_POLICY_TOKEN` | unset | Bearer token for the admin routes. Unset disables per-tenant retention entirely and the routes are not mounted. |
 | `LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` | 0.5 | Expired-row fraction that forces a rewrite. Ignored for tenants at zero retention. |
 
 Checked in `config.rs` `validate` alongside the other retention settings.
@@ -418,10 +406,6 @@ M7):
   `tenant_policy_push_persist_errors`. `push_rejected` counts only requests
   that meant to change a policy and were refused for being malformed, so a bad
   `GET` never makes the control plane look like it is pushing garbage.
-- `tenant_policy_admin_unauthorized` (counter — admin requests that failed the
-  bearer check, on any of the three methods). Separate from `push_rejected`
-  because the two answer different questions: whether the control plane is
-  broken, and whether someone is knocking.
 - `tenant_policy_known_tenants` (gauge), `tenant_policy_infinite_tenants`
   (gauge), `tenant_policy_unknown_tenants` (gauge — tenants with data but no
   policy). "With data" includes both memtables, not only the parts: a tenant
@@ -536,17 +520,17 @@ so such a gate would have nothing to measure.
       `updated_at`. The `Arc<…>` read path is unchanged — a push copies the map,
       inserts, and swaps, which is cheap because pushes are rare and keeps query
       reads lock-light.
-- [x] The three admin routes and bearer auth live in `src/admin.rs`, mounted by
-      `router.rs` only when the token is configured.
+- [x] The three admin routes live in `src/admin.rs`, always mounted by
+      `router.rs`; authentication is the secured channel's job, not theirs.
 - [x] One object per tenant at `tenant_policies/<tenant>.json`, through
       `ObjectStorage` when configured and under `<data_dir>` otherwise. The
       in-memory map is updated only after the write succeeds; a failure is a
       `503`.
 - [x] `TenantPolicy::load` runs in `startup.rs` before the workers spawn.
       Failure is fatal.
-- [x] `config.rs` — the five polling variables are gone,
-      `LOGGYTRACY_TENANT_POLICY_TOKEN` replaces them, and the mutual-exclusion
-      check against `retention_period` is keyed on the token.
+- [x] `config.rs` — the five polling variables are gone, and later the token
+      and the global `retention_period` went too: per-tenant policy is the
+      only mode.
 - [x] `merge/selection.rs` — a tenant at zero retention ignores
       `retention_rewrite_threshold` (`Cutoffs::holds_zero_retention_rows`).
 
@@ -561,11 +545,9 @@ so such a gate would have nothing to measure.
 - [x] `DELETE` returns a tenant to unknown: data kept, queries unclamped
 - [x] `retention: "0"` empties queries immediately and makes every part holding
       that tenant merge-eligible regardless of the threshold
-- [x] an unauthenticated or wrong-token push changes nothing
 - [x] a malformed tenant id or retention value is a `400` and stores nothing
 - [x] a pushed value is reported and enforced exactly as sent, and an explicit
       `infinite` keeps exactly as much as never being pushed
-- [x] setting both `RETENTION_PERIOD` and the token fails validation
 - [x] a merge whose inputs another writer replaced first is skipped, not
       reported as a store failure, and `PartRegistry::replace` tolerates an
       input already retired

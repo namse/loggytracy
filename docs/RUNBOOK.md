@@ -71,7 +71,7 @@ without the other.
 | `loggytracy_wal_replayed_entries` | Non-zero after a restart | The previous run did not shut down cleanly. **This is the upper bound on log lines this restart may have duplicated** — delivery is at-least-once, so records the WAL still held may already have been durable |
 | `loggytracy_stream_limit_rejected_total` | Increasing | A tenant is creating streams past its limit. **Usually a client putting a request id or timestamp in a label**, not a plan being outgrown — check the label names before raising anything |
 | `loggytracy_query_memory_exhausted_total` | Increasing | **This instance could not serve a query it was willing to serve** — the query memory pool had no room. The read side's `ingest_throttled_total`: a scaling or budget question, not a plan one. The client is correctly told `429` and will retry, so nothing looks broken from outside; this counter is the only place the event is visible. It does not say *which* of three causes — too many concurrent queries, one query too greedy, or `LOGGYTRACY_QUERY_MEMORY_BUDGET` too small for this deployment — so it is a signal to go and look, starting at `loggytracy_query_latency_ms` and the concurrent-scan setting |
-| `loggytracy_query_quota_rejected_total` | Increasing | A tenant is over its read quota — scan rate or concurrency. Like the ingest one: a plan question, not a scaling one |
+| `loggytracy_query_quota_rejected_total` | Increasing | A tenant is over its concurrent-query limit. A plan question, not a scaling one |
 | `loggytracy_delete_hidden_rows_total` | Rising steadily long after a request | The rows are hidden but not gone — no rewrite has reached the parts holding them. See below |
 | `loggytracy_delete_requests_rejected_total` | Increasing | A tenant is at the per-request limit. Each outstanding request is a predicate every one of that tenant's scans evaluates per row |
 | `loggytracy_pending_flush_bytes` | Does not reach 0 while draining | Shutdown has not reached durability |
@@ -142,7 +142,7 @@ root filesystem is the one that filled instead, it is the container logs —
 options in [`DEPLOYMENT.md`](DEPLOYMENT.md) §4 were dropped somewhere.
 
 - **parts/traces are large** → Reduce `CACHE_MAX_BYTES`. They are cache only and can be restored from S3.
-  However, if `RETENTION_PERIOD` is unset, **nothing is deleted from S3** — decide that first.
+  However, nothing is deleted from S3 for a tenant whose pushed retention keeps data forever — decide the retentions first.
 - **WAL is large** → Flush is not progressing. Follow the item above.
 - The stream index is not evicted. A label-cardinality explosion becomes **non-evictable disk usage**,
   so the only remedy is to fix labels at ingest.

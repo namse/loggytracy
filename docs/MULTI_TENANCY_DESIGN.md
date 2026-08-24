@@ -562,8 +562,8 @@ This is the gap `PRODUCTION_READINESS_REVIEW.md:276` records as
 | Cache-miss fetch cost | **done** — a body-only restore GETs the body alone and leaves the local catalog in place: one Class B per miss instead of three |
 | Range GET: recorded byte ranges | **done, and currently unused** — every `TenantSegment` carries its `ByteRange` in `data.parquet` and a CRC32 of exactly that range. The read half is decided against on measurement, so these two fields are a cost with no reader |
 | Range GET: reading through them / per-`(part, tenant)` cache | **decided against, on measurement** — a restored body is read by several tenants before eviction, so serving them selectively trades Class A requests to save bytes R2 gives away. Design if ever revisited: the push decoder |
-| Ingest rate quota | **done** — `ingest_rate` rides the same pushed policy as retention (`4MiB/s`, `0`, `unlimited`), enforced per tenant before the body is decompressed. `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` covers tenants the control plane has said nothing about |
-| Query-scan and stream-count quotas | **done** — `query_rate` and `max_streams` ride the same pushed policy as `ingest_rate`; a scan is charged what it actually read, and `max_streams` is enforced against the union of parts and buffers |
+| Per-tenant rates (ingest, query scan) | **removed** — built, then taken out: how fast the instance accepts work is the global backpressure gate's question, answered from the server's own state, and adaptive resource-pressure throttling is the planned replacement. The stock quotas below stay |
+| Stream-count quota | **done** — `max_streams` rides the same pushed policy as retention, enforced against the union of parts and buffers |
 | Per-tenant usage | **done** — `GET /loggytracy/api/v1/admin/tenants/{tenant}/usage`. Deliberately *not* labels on `/metrics`: that scrape is unauthenticated and process-wide by design, and a label per tenant is the cardinality problem this engine bounds everywhere else |
 | Durable monthly usage accounting | **out of scope, decided** — a month is spent across instances and outlives any of them, so the control plane holds it. An instance answers only for its own share, which is the endpoint above |
 
@@ -637,13 +637,8 @@ isolation boundary once files are no longer separate.
 
 ### 5. Quotas and limits
 
-- [x] Per-tenant ingest rate, checked **before** the body is decompressed so an
-      over-limit tenant cannot consume CPU. Monthly volume is the control
-      plane's, not an instance's.
 - [x] Active stream count cap — `max_streams`, enforced against the union of
       what the tenant holds in parts and in the buffers.
-- [x] Query scanned-bytes accounting per tenant — `query_rate`, charged after a
-      scan with what it actually read.
 - [x] Per-tenant query concurrency — `max_concurrent_queries_per_tenant`
       (`tenant_quota.rs`). The global semaphores in `app_state.rs` stay: they
       are the process-wide memory bound, which is a different question from a
