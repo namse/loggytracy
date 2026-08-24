@@ -186,7 +186,19 @@ GET    /loggytracy/api/v1/admin/tenants/{tenant}/retention
 
 DELETE /loggytracy/api/v1/admin/tenants/{tenant}/retention
        200 the tenant returns to *unknown*, which keeps its data forever
+
+GET    /loggytracy/api/v1/admin/tenants
+       200 {"tenants":[{"tenant":"acme","retention":"30d",...,"updated_at":"<rfc3339>"}]}
+           every pushed tenant with its policy, in name order — the control
+           plane's reconciliation read
 ```
+
+**The pushed policies are also the tenant registry.** With the admin API
+enabled, only tenants that have a pushed policy are served at all: the `PUT`
+above is how a tenant is onboarded (its requests are accepted the moment the
+200 arrives), and the `DELETE` offboards it (its requests get 403 from then
+on, while its data is kept). Without `LOGGYTRACY_TENANT_POLICY_TOKEN` there is
+no registry and every well-formed tenant id is served.
 
 Values are Prometheus-style durations (`7d`, `24h`, `90m`), the literal
 `"infinite"`, or `"0"` (see [Tenant deletion](#tenant-deletion)).

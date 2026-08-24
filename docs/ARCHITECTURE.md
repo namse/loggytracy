@@ -287,8 +287,11 @@ silently ignoring a retention setting would be the worst outcome.
 
  - `LOGGYTRACY_RETENTION_PERIOD` (unset by default): Global period applied to all tenants.
  - `LOGGYTRACY_TENANT_POLICY_TOKEN` (unset by default): Per-tenant retention. When set, the
-   `PUT/GET/DELETE /loggytracy/api/v1/admin/tenants/{tenant}/retention` routes open and pushed policies
-   become the sole authority. When unset, the routes do not exist. Use with
+   `PUT/GET/DELETE /loggytracy/api/v1/admin/tenants/{tenant}/retention` routes (plus
+   `GET …/admin/tenants`) open and pushed policies become the sole authority — including over which
+   tenants are served at all: the pushed policies are the tenant registry, a push onboards a tenant
+   and a delete offboards it, with no restart. When unset, the routes do not exist and every
+   well-formed tenant id is served. Use with
    `LOGGYTRACY_RETENTION_REWRITE_THRESHOLD` (0.5 by default — expired-row fraction at which a part is rewritten).
    There is **no** setting that caps pushed values. An instance-side cap would not reach unknown tenants,
    causing a tenant explicitly marked "retain forever" to retain less data than a tenant with no policy

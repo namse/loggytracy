@@ -200,10 +200,11 @@ believes it. Everything that makes that safe lives in front of it.
   own `X-Scope-OrgID` must not have it survive. Appending produces two header
   values and the engine reads the first one, which is the client's. In nginx:
   `proxy_set_header X-Scope-OrgID $verified_tenant;` replaces whatever arrived.
-- **Set `LOGGYTRACY_ALLOWED_TENANTS`.** It is off by default, which means any
-  string that reaches the listener becomes a tenant. With the list set, anything
-  outside it gets 403 — a second line behind the gateway, for the day something
-  reaches the port that should not have.
+- **Set `LOGGYTRACY_TENANT_POLICY_TOKEN`** (§6). Without it any string that
+  reaches the listener becomes a tenant. With it, the pushed policies are the
+  tenant registry: anything the control plane has not onboarded gets 403 — a
+  second line behind the gateway, for the day something reaches the port that
+  should not have, and it never needs a restart to change.
 
 Verify it, rather than assuming it, once the gateway is up:
 
@@ -215,14 +216,25 @@ The engine should see your own tenant, not that one.
 
 ## 6. Tenant policy and free-tier defaults
 
-Set `LOGGYTRACY_TENANT_POLICY_TOKEN` to a long random string. It does two
-things: it enables per-tenant retention, and it mounts the admin API. Without
-it the admin routes do not exist at all rather than existing unauthenticated.
+Set `LOGGYTRACY_TENANT_POLICY_TOKEN` to a long random string. It does three
+things: it enables per-tenant retention, it mounts the admin API, and it makes
+the pushed policies the tenant registry — only tenants the control plane has
+pushed a policy for are served. Without it the admin routes do not exist at
+all rather than existing unauthenticated.
 
-**Set defaults before opening a free tier.** A tenant the control plane has
-pushed nothing for is a tenant nobody sold anything to, and every limit is
-unbounded by default — the first such tenant decides how much disk and how much
-write throughput everyone else gets.
+Onboarding a tenant *is* the policy push below: the moment the `PUT` answers
+200, that tenant's requests are served, with no restart and nothing else to
+call. Offboarding is the same API backwards — push `retention: "0"` to expire
+the data, then `DELETE …/retention` to return the tenant to unknown, which
+refuses its requests from then on. A deployment that files headerless requests
+under the default tenant (`MISSING_TENANT_POLICY=default`) must push a policy
+for that default tenant too; it is onboarded like any other.
+
+**Set defaults before opening a free tier.** A push may carry only `retention`
+and leave the limits out, and every omitted limit is unbounded by default — the
+first such tenant decides how much disk and how much write throughput everyone
+else gets. The `DEFAULT_TENANT_*` values below are what an onboarded tenant
+gets for the fields its policy never named.
 
 `/etc/loggytracy/loggytracy.env`, in full:
 
@@ -238,10 +250,9 @@ LOGGYTRACY_LISTEN_ADDR=127.0.0.1:3100
 LOGGYTRACY_OTLP_GRPC_ADDR=127.0.0.1:4317
 
 LOGGYTRACY_TENANT_POLICY_TOKEN=<a long random string>
-LOGGYTRACY_ALLOWED_TENANTS=acme,globex,initech
 LOGGYTRACY_MISSING_TENANT_POLICY=reject
 
-# Free tier: what a tenant gets before a plan is pushed for it.
+# Free tier: what an onboarded tenant gets for fields its plan never named.
 LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND=262144
 LOGGYTRACY_DEFAULT_TENANT_QUERY_SCAN_BYTES_PER_SECOND=16777216
 LOGGYTRACY_DEFAULT_TENANT_MAX_STREAMS=1000
@@ -276,6 +287,15 @@ curl https://your-gateway/loggytracy/api/v1/admin/tenants/acme/usage \
 `stored_bytes` against `max_stored_bytes` is the storage figure. Over the limit,
 writes get 429 and nothing is deleted; the space returns on its own as retention
 retires the oldest parts, and writes resume without anyone doing anything.
+
+List every tenant this instance serves, with the policy each one was pushed —
+the reconciliation read for a control plane checking what it believes it
+onboarded:
+
+```
+curl https://your-gateway/loggytracy/api/v1/admin/tenants \
+  -H "Authorization: Bearer $LOGGYTRACY_TENANT_POLICY_TOKEN"
+```
 
 ## 7. Monitoring
 
