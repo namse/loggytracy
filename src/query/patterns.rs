@@ -35,7 +35,7 @@ pub async fn patterns(
     headers: HeaderMap,
     Query(params): Query<PatternsParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let metadata_params = crate::query::MetadataParams {
         start: params.start.clone(),

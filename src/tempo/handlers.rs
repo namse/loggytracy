@@ -3,7 +3,7 @@ pub async fn trace_by_id(
     headers: HeaderMap,
     Path(trace_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let trace_id =
         canonical_trace_id(&trace_id).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
@@ -40,7 +40,7 @@ pub async fn search(
     headers: HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let limit = params.limit.unwrap_or(20);
     let max_search_limit = state
@@ -186,7 +186,7 @@ pub async fn search_tags(
     headers: HeaderMap,
     Query(params): Query<TagParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let Some(range) = tag_range(&state, &tenant, &params)? else {
         return Ok(Json(empty_tags()));
@@ -223,7 +223,7 @@ pub async fn search_tag_values(
     Path(tag): Path<String>,
     Query(params): Query<TagParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let Some(range) = tag_range(&state, &tenant, &params)? else {
         return Ok(Json(serde_json::json!({ "tag": tag, "values": [] })));

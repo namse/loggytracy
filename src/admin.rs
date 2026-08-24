@@ -49,9 +49,17 @@ pub struct RetentionResponse {
     updated_at: String,
 }
 
+#[derive(Serialize)]
+pub struct TenantListResponse {
+    tenants: Vec<RetentionResponse>,
+}
+
 /// `PUT …/tenants/{tenant}/retention` — the control plane's only way to change
-/// retention. Answered only once the policy is durable, so the caller's retry
-/// loop terminates on a real guarantee rather than on an in-memory write.
+/// retention, and the only way a tenant is onboarded at all: the pushed
+/// policies are the tenant registry, so the moment this answers 200 the
+/// tenant's requests are served. Answered only once the policy is durable, so
+/// the caller's retry loop terminates on a real guarantee rather than on an
+/// in-memory write.
 pub async fn put_retention(
     State(state): State<Arc<AppState>>,
     Path(raw_tenant): Path<String>,
@@ -121,8 +129,42 @@ pub async fn get_retention(
     }))
 }
 
-/// `DELETE` returns the tenant to *unknown*, which keeps its data forever. It
-/// is not tenant deletion — that is `retention: "0"`.
+/// `GET …/admin/tenants` — every tenant this instance serves, with the policy
+/// each one was pushed. The pushed policies are the tenant registry, so this
+/// is the control plane's reconciliation read: what it believes it onboarded
+/// against what this instance actually holds.
+pub async fn list_tenants(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<TenantListResponse>, (StatusCode, String)> {
+    authorize(&state, &headers)?;
+    // The routes are only mounted with a token, so the policy is enabled and
+    // the snapshot exists; an empty instance still answers with an empty list.
+    let tenants = state
+        .tenant_policy
+        .snapshot()
+        .map(|policies| {
+            policies
+                .views()
+                .map(|(tenant, view)| RetentionResponse {
+                    tenant: tenant.as_str().to_string(),
+                    retention: view.retention,
+                    ingest_rate: view.ingest_rate,
+                    query_rate: view.query_rate,
+                    max_streams: view.max_streams,
+                    max_stored_bytes: view.max_stored_bytes,
+                    updated_at: rfc3339(view.updated_at),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Json(TenantListResponse { tenants }))
+}
+
+/// `DELETE` returns the tenant to *unknown*: its data is kept forever, and —
+/// because the pushed policies are the tenant registry — its requests are
+/// refused from here on. Deleting the data is `retention: "0"`, pushed before
+/// this.
 pub async fn delete_retention(
     State(state): State<Arc<AppState>>,
     Path(raw_tenant): Path<String>,

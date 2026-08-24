@@ -125,6 +125,19 @@ struct PolicyEntry {
     updated_at: SystemTime,
 }
 
+impl PolicyEntry {
+    fn view(&self) -> PolicyView {
+        PolicyView {
+            retention: self.raw.clone(),
+            ingest_rate: self.raw_ingest_rate.clone(),
+            query_rate: self.raw_query_rate.clone(),
+            max_streams: self.max_streams,
+            max_stored_bytes: self.raw_max_stored_bytes.clone(),
+            updated_at: self.updated_at,
+        }
+    }
+}
+
 /// One tenant's policy as the admin endpoints report it.
 pub struct PolicyView {
     pub retention: String,
@@ -166,15 +179,19 @@ impl PolicyMap {
             .and_then(|entry| entry.max_stored_bytes)
     }
 
+    pub fn contains(&self, tenant: &TenantId) -> bool {
+        self.entries.contains_key(tenant)
+    }
+
+    /// Every tenant with a pushed policy, in name order.
+    pub fn views(&self) -> impl Iterator<Item = (&TenantId, PolicyView)> {
+        self.entries
+            .iter()
+            .map(|(tenant, entry)| (tenant, entry.view()))
+    }
+
     pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
-        self.entries.get(tenant).map(|entry| PolicyView {
-            retention: entry.raw.clone(),
-            ingest_rate: entry.raw_ingest_rate.clone(),
-            query_rate: entry.raw_query_rate.clone(),
-            max_streams: entry.max_streams,
-            max_stored_bytes: entry.raw_max_stored_bytes.clone(),
-            updated_at: entry.updated_at,
-        })
+        self.entries.get(tenant).map(PolicyEntry::view)
     }
 
     pub fn tenant_count(&self) -> usize {
@@ -665,6 +682,20 @@ resurrect data those policies had already expired",
 
     pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
         self.snapshot()?.view(tenant)
+    }
+
+    /// Whether this instance serves `tenant`.
+    ///
+    /// With per-tenant policy enabled, the pushed policies *are* the tenant
+    /// registry: a push onboards a tenant the moment it is durable, and a
+    /// delete returns it to unknown, which every request path refuses. With
+    /// the policy switched off there is no registry and every well-formed id
+    /// is served.
+    pub fn is_tenant_allowed(&self, tenant: &TenantId) -> bool {
+        match self.snapshot() {
+            Some(policies) => policies.contains(tenant),
+            None => true,
+        }
     }
 
     /// Store one tenant's retention, then apply it.

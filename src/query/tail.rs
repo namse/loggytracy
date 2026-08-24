@@ -29,7 +29,7 @@ pub async fn tail(
     Query(params): Query<TailParams>,
     upgrade: axum::extract::ws::WebSocketUpgrade,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     // Everything that can be rejected is rejected before the upgrade. A client
     // that gets a 101 and then an immediate close cannot tell a bad query from

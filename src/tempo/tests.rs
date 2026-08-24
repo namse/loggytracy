@@ -326,7 +326,7 @@
     /// span filter does.
     #[tokio::test]
     async fn a_span_that_began_before_the_window_and_ran_into_it_still_matches() {
-        let (state, now_ns) = retention_state(&[]);
+        let (state, now_ns) = retention_state(&[(test_tenant().as_str(), TenantRetention::Infinite)]);
         // Reuse the fixture's straddling trace: its old span starts two hours
         // back, and a window opened after that start still overlaps nothing of
         // it — the span is a microsecond long. The fresh span is what carries
@@ -502,32 +502,26 @@
         );
     }
 
-    /// A tenant the control plane has never mentioned is never clamped, on any
-    /// of the four trace read paths.
+    /// With per-tenant policy enabled, the pushed policies are the tenant
+    /// registry: a tenant nothing was pushed for is refused on every one of
+    /// the four trace read paths, not silently served unclamped.
     #[tokio::test]
-    async fn an_unknown_tenant_keeps_every_span_on_every_trace_path() {
+    async fn a_tenant_without_a_pushed_policy_is_refused_on_every_trace_path() {
         let (state, _now_ns) = retention_state(&[(
             "someone-else",
             TenantRetention::Finite(std::time::Duration::from_secs(1)),
         )]);
 
-        let response = trace_by_id(
+        let error = trace_by_id(
             State(state.clone()),
             crate::tenant::test_tenant_headers(),
             Path("aa".repeat(16)),
         )
         .await
-        .unwrap()
-        .0;
-        assert_eq!(
-            response["batches"][0]["instrumentationLibrarySpans"][0]["spans"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
 
-        let found = search(
+        let error = search(
             State(state.clone()),
             crate::tenant::test_tenant_headers(),
             Query(SearchParams {
@@ -540,36 +534,27 @@
             }),
         )
         .await
-        .unwrap()
-        .0;
-        assert_eq!(found["traces"].as_array().unwrap().len(), 3);
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
 
-        let tags = search_tags(
+        let error = search_tags(
             State(state.clone()),
             crate::tenant::test_tenant_headers(),
             Query(TagParams::default()),
         )
-            .await
-            .unwrap()
-            .0;
-        assert!(
-            tags["tags"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tag| tag == "old.attribute")
-        );
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
 
-        let values = search_tag_values(
+        let error = search_tag_values(
             State(state),
             crate::tenant::test_tenant_headers(),
             Path("old.attribute".to_string()),
             Query(TagParams::default()),
         )
         .await
-        .unwrap()
-        .0;
-        assert_eq!(values["values"].as_array().unwrap().len(), 1);
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
     }
 
     /// The current Grafana Tempo datasource tries the v2 tag APIs first. They
@@ -577,7 +562,8 @@
     /// pairs each value with a type, and neither is a second scan.
     #[tokio::test]
     async fn the_v2_tag_apis_answer_from_the_same_traversal_as_v1() {
-        let (state, _now_ns) = retention_state(&[]);
+        let (state, _now_ns) =
+            retention_state(&[(test_tenant().as_str(), TenantRetention::Infinite)]);
 
         let v2 = search_tags_v2(
             State(state.clone()),

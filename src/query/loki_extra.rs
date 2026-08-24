@@ -48,7 +48,7 @@ async fn volume_response(
     params: VolumeParams,
     ranged: bool,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let now_ns = state.clock.now_ns();
     let end_ns = match params.end.as_deref() {
@@ -252,7 +252,7 @@ pub async fn detected_labels(
     headers: HeaderMap,
     Query(params): Query<crate::query::MetadataParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let Some(guard) = MetadataGuard::acquire(&state, &tenant, &params).await? else {
         return Ok(Json(serde_json::json!({ "detectedLabels": [] })));
@@ -295,7 +295,7 @@ pub async fn detected_fields(
     headers: HeaderMap,
     Query(params): Query<DetectedFieldsParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let metadata_params = crate::query::MetadataParams {
         start: params.start.clone(),

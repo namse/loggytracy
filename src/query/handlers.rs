@@ -3,7 +3,7 @@ pub async fn query_range(
     headers: HeaderMap,
     Query(params): Query<QueryRangeParams>,
 ) -> Result<Json<LokiResponse<QueryRangeData>>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let parsed = logql::parse_expr(&params.query)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
@@ -136,7 +136,7 @@ pub async fn query(
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
 ) -> Result<Json<LokiResponse<QueryRangeData>>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let parsed = logql::parse_expr(&params.query)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
@@ -407,7 +407,7 @@ pub async fn labels(
     headers: HeaderMap,
     Query(params): Query<crate::query::MetadataParams>,
 ) -> Result<Json<LokiResponse<Vec<String>>>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let Some(guard) = MetadataGuard::acquire(&state, &tenant, &params).await? else {
         return Ok(Json(LokiResponse {
@@ -467,7 +467,7 @@ pub async fn label_values(
     Path(name): Path<String>,
     Query(params): Query<crate::query::MetadataParams>,
 ) -> Result<Json<LokiResponse<Vec<String>>>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let Some(guard) = MetadataGuard::acquire(&state, &tenant, &params).await? else {
         return Ok(Json(LokiResponse {
@@ -581,7 +581,7 @@ pub async fn index_stats(
     headers: HeaderMap,
     Query(params): Query<crate::query::MetadataParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let Some(guard) = MetadataGuard::acquire(&state, &tenant, &params).await? else {
         return Ok(Json(serde_json::json!({
@@ -1183,7 +1183,7 @@ pub async fn series(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<LokiResponse<Vec<HashMap<String, String>>>>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     // `series` is the one metadata endpoint whose cost the client chooses:
     // every `match[]` is another full pass. The cap bounds that multiplier,

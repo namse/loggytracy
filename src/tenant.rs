@@ -9,8 +9,12 @@ pub const MAX_TENANT_ID_BYTES: usize = 64;
 /// A validated tenant identifier.
 ///
 /// The raw value arrives from an untrusted header and ends up in object-store
-/// keys and local filesystem paths, so the allowlist is applied once here and
-/// the rest of the engine may assume every `TenantId` is already safe.
+/// keys and local filesystem paths, so validation is applied once here and
+/// the rest of the engine may assume every `TenantId` is already safe. Which
+/// tenants are *served* is the pushed policy set's decision
+/// ([`crate::tenant_policy::TenantPolicy::is_tenant_allowed`]): with
+/// per-tenant policy enabled, only tenants the control plane has pushed a
+/// policy for are accepted.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TenantId(Arc<str>);
 
@@ -121,7 +125,7 @@ pub fn resolve(
     raw: Option<&str>,
     default_tenant: &TenantId,
     policy: MissingTenantPolicy,
-    allowed: Option<&std::collections::BTreeSet<TenantId>>,
+    allowed: impl Fn(&TenantId) -> bool,
 ) -> Result<TenantId, TenantError> {
     let tenant = match raw {
         Some(value) => TenantId::parse(value).map_err(TenantError::Invalid)?,
@@ -132,9 +136,7 @@ pub fn resolve(
     };
     // Checked after parsing so a malformed id is still reported as malformed:
     // the two failures send an operator to different places.
-    if let Some(allowed) = allowed
-        && !allowed.contains(&tenant)
-    {
+    if !allowed(&tenant) {
         return Err(TenantError::NotAllowed(tenant));
     }
     Ok(tenant)
@@ -166,6 +168,7 @@ impl TenantError {
 pub fn from_headers(
     headers: &axum::http::HeaderMap,
     config: &crate::config::Config,
+    tenant_policy: &crate::tenant_policy::TenantPolicy,
 ) -> Result<TenantId, TenantError> {
     let raw = match headers.get(TENANT_HEADER) {
         Some(value) => Some(
@@ -179,7 +182,7 @@ pub fn from_headers(
         raw,
         &config.default_tenant,
         config.missing_tenant_policy,
-        config.allowed_tenants.as_ref(),
+        |tenant| tenant_policy.is_tenant_allowed(tenant),
     )
 }
 
@@ -187,6 +190,7 @@ pub fn from_headers(
 pub fn from_grpc_metadata(
     metadata: &tonic::metadata::MetadataMap,
     config: &crate::config::Config,
+    tenant_policy: &crate::tenant_policy::TenantPolicy,
 ) -> Result<TenantId, TenantError> {
     let raw = match metadata.get(TENANT_METADATA_KEY) {
         Some(value) => Some(
@@ -200,7 +204,7 @@ pub fn from_grpc_metadata(
         raw,
         &config.default_tenant,
         config.missing_tenant_policy,
-        config.allowed_tenants.as_ref(),
+        |tenant| tenant_policy.is_tenant_allowed(tenant),
     )
 }
 
@@ -257,21 +261,21 @@ mod tests {
         assert!(TenantId::parse("a\0b").is_err());
     }
 
-    /// The list is checked after parsing, so the two rejections stay distinct:
-    /// a malformed id is the client's bug, an unlisted one is the operator's
-    /// configuration.
+    /// The registry is checked after parsing, so the two rejections stay
+    /// distinct: a malformed id is the client's bug, an unserved one means the
+    /// control plane has not onboarded that tenant.
     #[test]
-    fn resolve_rejects_a_tenant_outside_the_allowlist() {
+    fn resolve_rejects_a_tenant_the_registry_does_not_serve() {
         let default_tenant = TenantId::parse("default").unwrap();
-        let allowed: std::collections::BTreeSet<TenantId> =
-            [TenantId::parse("acme").unwrap()].into_iter().collect();
+        let acme = TenantId::parse("acme").unwrap();
+        let allowed = |tenant: &TenantId| *tenant == acme;
 
         assert_eq!(
             resolve(
                 Some("acme"),
                 &default_tenant,
                 MissingTenantPolicy::UseDefault,
-                Some(&allowed),
+                allowed,
             )
             .unwrap(),
             TenantId::parse("acme").unwrap()
@@ -281,7 +285,7 @@ mod tests {
                 Some("stranger"),
                 &default_tenant,
                 MissingTenantPolicy::UseDefault,
-                Some(&allowed),
+                allowed,
             ),
             Err(TenantError::NotAllowed(_))
         ));
@@ -290,18 +294,19 @@ mod tests {
                 Some("not a tenant"),
                 &default_tenant,
                 MissingTenantPolicy::UseDefault,
-                Some(&allowed),
+                allowed,
             ),
             Err(TenantError::Invalid(_))
         ));
-        // The default is subject to the list too, which is why `validate`
-        // refuses a configuration that leaves it out.
+        // The default tenant is subject to the registry like any other: a
+        // deployment that files headerless requests under it must push a
+        // policy for it.
         assert!(matches!(
             resolve(
                 None,
                 &default_tenant,
                 MissingTenantPolicy::UseDefault,
-                Some(&allowed),
+                allowed,
             ),
             Err(TenantError::NotAllowed(_))
         ));
@@ -310,13 +315,25 @@ mod tests {
     #[test]
     fn resolve_applies_the_missing_header_policy() {
         let default_tenant = TenantId::parse("default").unwrap();
+        let allow_all = |_: &TenantId| true;
 
         assert_eq!(
-            resolve(None, &default_tenant, MissingTenantPolicy::UseDefault, None).unwrap(),
+            resolve(
+                None,
+                &default_tenant,
+                MissingTenantPolicy::UseDefault,
+                allow_all
+            )
+            .unwrap(),
             default_tenant
         );
         assert!(matches!(
-            resolve(None, &default_tenant, MissingTenantPolicy::Reject, None),
+            resolve(
+                None,
+                &default_tenant,
+                MissingTenantPolicy::Reject,
+                allow_all
+            ),
             Err(TenantError::Missing)
         ));
         // An empty header is a client bug, not an absent header.
@@ -325,7 +342,7 @@ mod tests {
                 Some(""),
                 &default_tenant,
                 MissingTenantPolicy::UseDefault,
-                None
+                allow_all
             ),
             Err(TenantError::Invalid(_))
         ));

@@ -2125,8 +2125,41 @@
             policy.clone(),
         );
 
-        // No snapshot yet: reads fail open, so the control plane is never on
-        // the query hot path.
+        // Nothing pushed yet: the pushed policies are the tenant registry, so
+        // the tenant is not served until the control plane onboards it.
+        let now_ns_query = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let refused = match query_range(
+            State(state.clone()),
+            crate::tenant::test_tenant_headers(),
+            Query(QueryRangeParams {
+                query: "{app=\"api\"}".to_string(),
+                start: Some((now_ns_query - 86_400_000_000_000).to_string()),
+                end: Some(now_ns_query.to_string()),
+                limit: Some(100),
+                direction: Some("forward".to_string()),
+                step: None,
+            }),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a tenant nothing was pushed for must be refused"),
+        };
+        assert_eq!(refused.0, StatusCode::FORBIDDEN);
+
+        policy.install_for_test(
+            [(
+                test_tenant(),
+                crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_secs(
+                    7 * 24 * 60 * 60,
+                )),
+            )]
+            .into_iter()
+            .collect(),
+        );
         assert_eq!(lines_in_last_day(state.clone()).await.len(), 1);
 
         policy.install_for_test(
@@ -2350,9 +2383,11 @@
         assert!(refused.1.contains("match[]"), "{}", refused.1);
     }
 
-    /// A tenant the control plane never mentioned reads its full history.
+    /// With per-tenant policy enabled, the pushed policies are the tenant
+    /// registry: a tenant the control plane never mentioned is refused at
+    /// query time rather than served its full history.
     #[tokio::test]
-    async fn an_unknown_tenant_is_never_clamped() {
+    async fn a_tenant_without_a_pushed_policy_is_refused_at_query_time() {
         let data_dir = temp_dir();
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2382,7 +2417,24 @@
         let state =
             tenant_policy_state(&data_dir, memtable, Arc::new(PartRegistry::new()), policy);
 
-        assert_eq!(lines_in_last_day(state).await.len(), 1);
+        let refused = match query_range(
+            State(state),
+            crate::tenant::test_tenant_headers(),
+            Query(QueryRangeParams {
+                query: "{app=\"api\"}".to_string(),
+                start: Some((now_ns - 86_400_000_000_000).to_string()),
+                end: Some(now_ns.to_string()),
+                limit: Some(100),
+                direction: Some("forward".to_string()),
+                step: None,
+            }),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a tenant nothing was pushed for must be refused"),
+        };
+        assert_eq!(refused.0, StatusCode::FORBIDDEN);
     }
 
     /// A metric query's first evaluation point looks back past the requested

@@ -18,6 +18,7 @@
             Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
             crate::clock::Clock::system(),
             Arc::new(crate::part_registry::PartRegistry::new()),
         );
@@ -159,6 +160,7 @@
             Arc::new(config.clone()),
             IngestGate::for_test(&journal, &config),
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
             crate::clock::Clock::system(),
             Arc::new(crate::part_registry::PartRegistry::new()),
         );
@@ -180,6 +182,7 @@
             Arc::new(quota_config.clone()),
             IngestGate::for_test(&journal, &quota_config),
             crate::tenant_quota::TenantQuota::for_test(&quota_config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
             crate::clock::Clock::system(),
             Arc::new(crate::part_registry::PartRegistry::new()),
         );
@@ -231,6 +234,7 @@
             Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
             crate::clock::Clock::system(),
             Arc::new(crate::part_registry::PartRegistry::new()),
         );
@@ -279,6 +283,7 @@ specification tells it to drop the batch"
             Arc::new(config.clone()),
             IngestGate::for_test(&journal, &config),
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
             crate::clock::Clock::system(),
             Arc::new(crate::part_registry::PartRegistry::new()),
         );

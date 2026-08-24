@@ -19,7 +19,7 @@ pub async fn submit_delete_request(
     headers: HeaderMap,
     Query(params): Query<DeleteSubmitParams>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let start_ns = crate::query::parse_time_ns(&params.start)
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid start: {error}")))?;
@@ -45,7 +45,7 @@ pub async fn list_delete_requests(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     let requests: Vec<serde_json::Value> = state
         .delete_requests
@@ -73,7 +73,7 @@ pub async fn cancel_delete_request(
     headers: HeaderMap,
     Query(params): Query<DeleteCancelParams>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     state
         .delete_requests

@@ -534,6 +534,7 @@ pub async fn run(config: Arc<Config>) {
 
     let ingest_gate = state.ingest_gate.clone();
     let tenant_quota = state.tenant_quota.clone();
+    let tenant_policy = state.tenant_policy.clone();
     let app = router::build_router(state);
 
     // A SIGTERM/SIGINT starts draining: new ingest is rejected, and every drain
@@ -567,6 +568,7 @@ LOGGYTRACY_TENANT_POLICY_TOKEN is set, so the object store grows without bound"
         config.clone(),
         ingest_gate.clone(),
         tenant_quota.clone(),
+        tenant_policy.clone(),
     );
     // Logs and traces share the listener, the journal and the drain signal.
     // `ARCHITECTURE.md` has described OTLP as an ingest protocol from the
@@ -578,6 +580,7 @@ LOGGYTRACY_TENANT_POLICY_TOKEN is set, so the object store grows without bound"
         config.clone(),
         ingest_gate,
         tenant_quota,
+        tenant_policy,
         clock.clone(),
         parts,
     );

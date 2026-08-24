@@ -24,6 +24,7 @@ pub struct TraceIngestService {
     config: Arc<Config>,
     ingest_gate: Arc<IngestGate>,
     tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
+    tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
 }
 
 impl TraceIngestService {
@@ -33,6 +34,7 @@ impl TraceIngestService {
         config: Arc<Config>,
         ingest_gate: Arc<IngestGate>,
         tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
+        tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
     ) -> Self {
         Self {
             journal,
@@ -40,6 +42,7 @@ impl TraceIngestService {
             config,
             ingest_gate,
             tenant_quota,
+            tenant_policy,
         }
     }
 
@@ -158,7 +161,8 @@ impl TraceService for TraceIngestService {
             tenant_quota: &self.tenant_quota,
         };
         ingest.admit_transport().map_err(ingest_error_to_status)?;
-        let tenant = crate::tenant::from_grpc_metadata(request.metadata(), &self.config)
+        let tenant =
+            crate::tenant::from_grpc_metadata(request.metadata(), &self.config, &self.tenant_policy)
             .map_err(crate::tenant::TenantError::into_grpc)?;
         let request = request.into_inner();
         ingest
@@ -239,6 +243,7 @@ mod tests {
             Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
         );
 
         let status = service.export(tenant_request(request())).await.unwrap_err();
@@ -279,6 +284,7 @@ mod tests {
             Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
         );
 
         service
@@ -321,6 +327,7 @@ mod tests {
             Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
         );
         let response = service.export(tenant_request(request())).await.unwrap();
         assert!(response.into_inner().partial_success.is_none());
@@ -371,6 +378,7 @@ mod tests {
             Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
         );
         let mut invalid = request();
         invalid.resource_spans[0].scope_spans[0].spans[0].trace_id = vec![0; 16];
@@ -405,6 +413,7 @@ mod tests {
             Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
         );
         let mut oversized = request();
         oversized.resource_spans[0].scope_spans[0].spans[0].name =
@@ -445,6 +454,7 @@ mod tests {
             Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
         );
         let mut too_many = request();
         too_many.resource_spans[0].scope_spans[0].spans = vec![Span::default(); MAX_OTLP_SPANS + 1];
@@ -500,6 +510,7 @@ mod tests {
             Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
+            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
         );
         service.export(tenant_request(request())).await.unwrap();
         for _ in 0..100 {

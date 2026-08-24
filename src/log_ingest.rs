@@ -36,6 +36,7 @@ pub struct LogIngestService {
     config: Arc<Config>,
     ingest_gate: Arc<IngestGate>,
     tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
+    tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
     clock: Arc<crate::clock::Clock>,
     parts: Arc<crate::part_registry::PartRegistry>,
 }
@@ -47,6 +48,7 @@ impl LogIngestService {
         config: Arc<Config>,
         ingest_gate: Arc<IngestGate>,
         tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
+        tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
         clock: Arc<crate::clock::Clock>,
         parts: Arc<crate::part_registry::PartRegistry>,
     ) -> Self {
@@ -56,6 +58,7 @@ impl LogIngestService {
             config,
             ingest_gate,
             tenant_quota,
+            tenant_policy,
             clock,
             parts,
         }
@@ -295,7 +298,8 @@ impl LogsService for LogIngestService {
             memtable: self.journal.log_memtable(),
         };
         ingest.admit_transport().map_err(ingest_error_to_status)?;
-        let tenant = crate::tenant::from_grpc_metadata(request.metadata(), &self.config)
+        let tenant =
+            crate::tenant::from_grpc_metadata(request.metadata(), &self.config, &self.tenant_policy)
             .map_err(crate::tenant::TenantError::into_grpc)?;
         let request = request.into_inner();
         ingest

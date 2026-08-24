@@ -253,15 +253,14 @@
     }
 
     /// 403 and not 400: the request is well formed and there is nothing the
-    /// client can change about it. Ported from the Loki push tests when that
-    /// ingest was removed — the allowlist is about the tenant header, which
-    /// this transport carries the same way.
+    /// client can change about it. With per-tenant policy enabled, the pushed
+    /// policies are the tenant registry — a tenant nothing was pushed for is
+    /// not served, on this transport like any other.
     #[tokio::test]
-    async fn an_export_from_a_tenant_outside_the_allowlist_is_refused() {
+    async fn an_export_from_a_tenant_without_a_pushed_policy_is_refused() {
         let config = Config {
             data_dir: std::env::temp_dir()
                 .join(format!("loggytracy-otlp-http-allow-{}", uuid::Uuid::new_v4())),
-            allowed_tenants: Some([test_tenant()].into_iter().collect()),
             ..Config::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
@@ -271,8 +270,22 @@
         let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
             parts.operation_lock(),
         ));
-        let state =
-            crate::test_support::state(config, memtable.clone(), journal, parts, trace_parts, None);
+        let tenant_policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_with_clock(
+            crate::clock::Clock::system(),
+        ));
+        tenant_policy
+            .push(&test_tenant(), "30d", None, None, None, None)
+            .await
+            .expect("the test tenant is onboarded by pushing a policy");
+        let state = crate::test_support::state_with_tenant_policy(
+            config,
+            memtable.clone(),
+            journal,
+            parts,
+            trace_parts,
+            None,
+            tenant_policy,
+        );
 
         let body = log_request("accepted").encode_to_vec();
         let (status, _, _) = post(&state, "/v1/logs", "application/x-protobuf", body).await;

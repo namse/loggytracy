@@ -140,7 +140,7 @@ async fn logs_inner(
     body: Bytes,
 ) -> Result<Response, IngestError> {
     let encoding = OtlpEncoding::from_headers(&headers)?;
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     // Charged on the wire size and before decoding, unlike the gRPC path which
     // is handed an already-decoded message. This is the earlier of the two
@@ -171,7 +171,7 @@ pub async fn traces(
     };
     ingest.admit_transport()?;
     let encoding = OtlpEncoding::from_headers(&headers)?;
-    let tenant = crate::tenant::from_headers(&headers, &state.config)
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http)?;
     ingest.admit_tenant(&tenant, body.len())?;
     let request: ExportTraceServiceRequest = encoding.decode(&body)?;
