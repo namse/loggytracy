@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::tenant::{MissingTenantPolicy, TenantId};
+use crate::tenant::TenantId;
 
 /// The shape of this process's own log lines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,10 +46,12 @@ pub struct Config {
     pub listen_addr: String,
     pub otlp_grpc_addr: String,
     pub data_dir: PathBuf,
-    /// Tenant a request is attributed to when it carries no `X-Scope-OrgID`
-    /// and `missing_tenant_policy` accepts it.
-    pub default_tenant: TenantId,
-    pub missing_tenant_policy: MissingTenantPolicy,
+    /// Tenant a request without `X-Scope-OrgID` is attributed to, or `None` —
+    /// the default — to reject such requests with 400. The opt-in exists for
+    /// single-tenant deployments with no gateway minting the header; behind a
+    /// gateway a missing header is the gateway failing, which should fail
+    /// loudly rather than quietly pool everyone's data in one tenant.
+    pub missing_tenant: Option<TenantId>,
     pub max_batch_bytes: usize,
     /// How long the journal writer waits for more records before writing the
     /// batch it already has. **Zero — the default — means it does not wait.**
@@ -305,9 +307,7 @@ impl Default for Config {
             listen_addr: "127.0.0.1:3100".to_string(),
             otlp_grpc_addr: "127.0.0.1:4317".to_string(),
             data_dir: PathBuf::from("./data"),
-            default_tenant: TenantId::parse("default")
-                .expect("the built-in default tenant is valid"),
-            missing_tenant_policy: MissingTenantPolicy::UseDefault,
+            missing_tenant: None,
             max_batch_bytes: 1024 * 1024,
             max_batch_ms: 0,
             max_push_bytes: 16 * 1024 * 1024,
@@ -562,16 +562,12 @@ impl Config {
             data_dir: std::env::var("LOGGYTRACY_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| defaults.data_dir.clone()),
-            default_tenant: match std::env::var("LOGGYTRACY_DEFAULT_TENANT") {
-                Ok(raw) => TenantId::parse(&raw)
-                    .map_err(|error| format!("invalid LOGGYTRACY_DEFAULT_TENANT: {error}"))?,
-                Err(_) => defaults.default_tenant.clone(),
-            },
-            missing_tenant_policy: match std::env::var("LOGGYTRACY_MISSING_TENANT_POLICY") {
-                Ok(raw) => raw.parse().map_err(|error| {
-                    format!("invalid LOGGYTRACY_MISSING_TENANT_POLICY: {error}")
-                })?,
-                Err(_) => defaults.missing_tenant_policy,
+            missing_tenant: match std::env::var("LOGGYTRACY_MISSING_TENANT") {
+                Ok(raw) => Some(
+                    TenantId::parse(&raw)
+                        .map_err(|error| format!("invalid LOGGYTRACY_MISSING_TENANT: {error}"))?,
+                ),
+                Err(_) => defaults.missing_tenant.clone(),
             },
             max_batch_bytes: env_positive_usize(
                 "LOGGYTRACY_MAX_BATCH_BYTES",

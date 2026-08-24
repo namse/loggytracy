@@ -34,8 +34,7 @@ environment variables (`OBJECT_STORE_*` takes precedence). For S3-compatible sto
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOGGYTRACY_DEFAULT_TENANT` | `default` | Tenant assigned to requests without `X-Scope-OrgID` |
-| `LOGGYTRACY_MISSING_TENANT_POLICY` | `default` | `default` or `reject`; whether requests without a header are assigned to the default tenant or rejected |
+| `LOGGYTRACY_MISSING_TENANT` | unset (reject) | Tenant a request without `X-Scope-OrgID` is filed under. **Unset — the default — rejects such requests with 400**: behind a gateway a missing header is the gateway failing, which should fail loudly rather than quietly pool everyone's data. Set it (any valid tenant id) for single-tenant deployments where nothing mints the header |
 | `LOGGYTRACY_TENANT_POLICY_TOKEN` | unset (disabled) | Enables the per-tenant policy admin API and disables global retention. **With the token set, the pushed policies are the tenant registry: only tenants the control plane has pushed a policy for are served, everything else receives 403.** Without it every well-formed tenant id is accepted — and because the header value supplied by the upstream is trusted without proof, anyone who can reach the listener can then create any tenant |
 | `LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND` | unset (unlimited) | Default for tenants whose rate has not been pushed by the control plane |
 | `LOGGYTRACY_DEFAULT_TENANT_QUERY_SCAN_BYTES_PER_SECOND` | none (unlimited) | Read-side default for tenants the control plane has pushed no `query_rate` for |
@@ -44,8 +43,8 @@ environment variables (`OBJECT_STORE_*` takes precedence). For S3-compatible sto
 | `LOGGYTRACY_MAX_CONCURRENT_QUERIES_PER_TENANT` | 4 | Queries one tenant may run at once. The scan rate bounds work over time; this bounds how much happens simultaneously, so one tenant cannot take every permit of the shared query semaphore |
 | `LOGGYTRACY_TENANT_INGEST_BURST` | `10s` | Time during which an unused tenant rate can accumulate for one burst. Capacity never falls below `MAX_PUSH_BYTES` |
 
-**Note:** with `TENANT_POLICY_TOKEN` set and `MISSING_TENANT_POLICY=default`, headerless requests are
-served only once a policy has been pushed for the default tenant — it is onboarded like any other.
+**Note:** with `TENANT_POLICY_TOKEN` set and `MISSING_TENANT` naming a tenant, headerless requests are
+served only once a policy has been pushed for that tenant — it is onboarded like any other.
 
 **Constraint:** startup is refused when any tenant policy is stored but `TENANT_POLICY_TOKEN` is absent.
 Without the token, query clamping disappears and deleted data can reappear.

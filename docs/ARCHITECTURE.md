@@ -116,10 +116,9 @@ and query paths.
 - **Identification**: `X-Scope-OrgID` header (the Loki/Tempo convention). OTLP uses the same key in gRPC
   metadata. Validate the value against `[a-zA-Z0-9_-]{1,64}` **before** journal append because it is used
   directly in object-store keys and local file paths.
-  - `LOGGYTRACY_DEFAULT_TENANT` (default `default`): Tenant applied to requests without a header.
-  - `LOGGYTRACY_MISSING_TENANT_POLICY` (default `default`): `default` accepts them as the tenant above;
-    `reject` returns 400. A **blank** header is rejected by both policies so client bugs are not silently
-    routed to another tenant.
+  - `LOGGYTRACY_MISSING_TENANT` (unset by default): Tenant applied to requests without a header. Unset,
+    such requests get 400 — the single-tenant opt-in for deployments with no gateway minting the header.
+    A **blank** header is rejected either way so client bugs are not silently routed to another tenant.
 - **Isolation point**: The tenant is **not** a storage-path partitioning axis, but a sort and index key
   inside each part. One part object contains all tenants, rows are sorted by `(tenant, timestamp_ns)`,
   and row groups never cross tenant boundaries. The tenant index in `meta.json` contains each tenant's row
@@ -278,7 +277,7 @@ Protecting the engine takes priority over preserving every log line — Alloy re
 - `LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM` (30 by default), `LOGGYTRACY_MAX_LABEL_NAME_BYTES` (1 KiB by default), and `LOGGYTRACY_MAX_LABEL_VALUE_BYTES` (2 KiB by default): Defend against stream-cardinality explosions. The stream index is a persistent catalog excluded from the cache limit, so a cardinality explosion becomes non-evictable disk usage.
 - `LOGGYTRACY_MAX_TIMESTAMP_AGE` (7d by default) and `LOGGYTRACY_MAX_TIMESTAMP_SKEW` (1h by default): Acceptance window relative to the server clock. Disable with `off` when bulk-loading historical data. Because partitions are UTC-day based, clock errors or unit mistakes (sending seconds/milliseconds as nanoseconds) multiply partitions; in particular, **a future-date part never reaches the retention cutoff.**
 
-- `LOGGYTRACY_DEFAULT_TENANT`, `LOGGYTRACY_MISSING_TENANT_POLICY`: Tenant identification (see "Multi-tenancy" above). Allowlist validation also applies before journal append, like the other limits.
+- `LOGGYTRACY_MISSING_TENANT`: Tenant identification for headerless requests (see "Multi-tenancy" above). Tenant-id validation also applies before journal append, like the other limits.
 
 ### Retention settings
 

@@ -226,9 +226,11 @@ Onboarding a tenant *is* the policy push below: the moment the `PUT` answers
 200, that tenant's requests are served, with no restart and nothing else to
 call. Offboarding is the same API backwards — push `retention: "0"` to expire
 the data, then `DELETE …/retention` to return the tenant to unknown, which
-refuses its requests from then on. A deployment that files headerless requests
-under the default tenant (`MISSING_TENANT_POLICY=default`) must push a policy
-for that default tenant too; it is onboarded like any other.
+refuses its requests from then on. Requests without an `X-Scope-OrgID` header
+are rejected by default — the gateway mints the header here, so a missing one
+is the gateway failing, and it fails loudly. A deployment that instead wants
+headerless requests filed under a tenant sets `LOGGYTRACY_MISSING_TENANT` to
+its name and pushes a policy for it too; it is onboarded like any other.
 
 **Set defaults before opening a free tier.** A push may carry only `retention`
 and leave the limits out, and every omitted limit is unbounded by default — the
@@ -250,7 +252,6 @@ LOGGYTRACY_LISTEN_ADDR=127.0.0.1:3100
 LOGGYTRACY_OTLP_GRPC_ADDR=127.0.0.1:4317
 
 LOGGYTRACY_TENANT_POLICY_TOKEN=<a long random string>
-LOGGYTRACY_MISSING_TENANT_POLICY=reject
 
 # Free tier: what an onboarded tenant gets for fields its plan never named.
 LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND=262144
@@ -258,11 +259,6 @@ LOGGYTRACY_DEFAULT_TENANT_QUERY_SCAN_BYTES_PER_SECOND=16777216
 LOGGYTRACY_DEFAULT_TENANT_MAX_STREAMS=1000
 LOGGYTRACY_DEFAULT_TENANT_MAX_STORED_BYTES=1073741824
 ```
-
-`MISSING_TENANT_POLICY=reject` is worth the line. With the default, a request
-that arrives without a header is quietly filed under the default tenant — and if
-the gateway ever stops setting the header, every customer's logs land in the
-same place instead of failing loudly.
 
 Then push a plan per tenant. Retention and every limit take effect immediately
 and survive restarts; there is nothing to reload:

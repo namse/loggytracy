@@ -71,27 +71,6 @@ impl<'de> serde::Deserialize<'de> for TenantId {
     }
 }
 
-/// What to do when a request carries no `X-Scope-OrgID`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MissingTenantPolicy {
-    /// Attribute the request to `Config::default_tenant`.
-    UseDefault,
-    /// Reject the request.
-    Reject,
-}
-
-impl std::str::FromStr for MissingTenantPolicy {
-    type Err = String;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "default" | "use_default" | "accept" => Ok(Self::UseDefault),
-            "reject" | "require" => Ok(Self::Reject),
-            other => Err(format!("expected 'default' or 'reject', got {other:?}")),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum TenantError {
     Missing,
@@ -103,7 +82,11 @@ pub enum TenantError {
 impl fmt::Display for TenantError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing => write!(f, "{TENANT_HEADER} is required but was not supplied"),
+            Self::Missing => write!(
+                f,
+                "{TENANT_HEADER} is required but was not supplied; set \
+LOGGYTRACY_MISSING_TENANT to accept headerless requests"
+            ),
             Self::Invalid(reason) => write!(f, "invalid {TENANT_HEADER}: {reason}"),
             // Names the tenant rather than the list: an operator debugging a
             // rejected client needs to see what was sent, and the list is
@@ -119,19 +102,22 @@ impl fmt::Display for TenantError {
 ///
 /// `raw` is `None` when the header is absent and `Some` when it is present,
 /// including when it is present but empty (which is always an error rather
-/// than a fallback to the default tenant: an empty value is a client bug, and
+/// than a fallback to `missing_tenant`: an empty value is a client bug, and
 /// silently attributing that traffic to another tenant hides it).
+///
+/// A headerless request is rejected unless `missing_tenant` names the tenant
+/// to file it under — the single-tenant opt-in, off by default because in a
+/// gatewayed deployment a missing header is the gateway failing.
 pub fn resolve(
     raw: Option<&str>,
-    default_tenant: &TenantId,
-    policy: MissingTenantPolicy,
+    missing_tenant: Option<&TenantId>,
     allowed: impl Fn(&TenantId) -> bool,
 ) -> Result<TenantId, TenantError> {
     let tenant = match raw {
         Some(value) => TenantId::parse(value).map_err(TenantError::Invalid)?,
-        None => match policy {
-            MissingTenantPolicy::UseDefault => default_tenant.clone(),
-            MissingTenantPolicy::Reject => return Err(TenantError::Missing),
+        None => match missing_tenant {
+            Some(tenant) => tenant.clone(),
+            None => return Err(TenantError::Missing),
         },
     };
     // Checked after parsing so a malformed id is still reported as malformed:
@@ -178,12 +164,9 @@ pub fn from_headers(
         ),
         None => None,
     };
-    resolve(
-        raw,
-        &config.default_tenant,
-        config.missing_tenant_policy,
-        |tenant| tenant_policy.is_tenant_allowed(tenant),
-    )
+    resolve(raw, config.missing_tenant.as_ref(), |tenant| {
+        tenant_policy.is_tenant_allowed(tenant)
+    })
 }
 
 /// Resolve the tenant for an OTLP gRPC request.
@@ -200,12 +183,9 @@ pub fn from_grpc_metadata(
         ),
         None => None,
     };
-    resolve(
-        raw,
-        &config.default_tenant,
-        config.missing_tenant_policy,
-        |tenant| tenant_policy.is_tenant_allowed(tenant),
-    )
+    resolve(raw, config.missing_tenant.as_ref(), |tenant| {
+        tenant_policy.is_tenant_allowed(tenant)
+    })
 }
 
 /// The tenant every test uses unless it is specifically exercising isolation.
@@ -266,84 +246,48 @@ mod tests {
     /// control plane has not onboarded that tenant.
     #[test]
     fn resolve_rejects_a_tenant_the_registry_does_not_serve() {
-        let default_tenant = TenantId::parse("default").unwrap();
+        let solo = TenantId::parse("solo").unwrap();
         let acme = TenantId::parse("acme").unwrap();
         let allowed = |tenant: &TenantId| *tenant == acme;
 
         assert_eq!(
-            resolve(
-                Some("acme"),
-                &default_tenant,
-                MissingTenantPolicy::UseDefault,
-                allowed,
-            )
-            .unwrap(),
+            resolve(Some("acme"), Some(&solo), allowed).unwrap(),
             TenantId::parse("acme").unwrap()
         );
         assert!(matches!(
-            resolve(
-                Some("stranger"),
-                &default_tenant,
-                MissingTenantPolicy::UseDefault,
-                allowed,
-            ),
+            resolve(Some("stranger"), Some(&solo), allowed),
             Err(TenantError::NotAllowed(_))
         ));
         assert!(matches!(
-            resolve(
-                Some("not a tenant"),
-                &default_tenant,
-                MissingTenantPolicy::UseDefault,
-                allowed,
-            ),
+            resolve(Some("not a tenant"), Some(&solo), allowed),
             Err(TenantError::Invalid(_))
         ));
-        // The default tenant is subject to the registry like any other: a
-        // deployment that files headerless requests under it must push a
+        // The missing-header tenant is subject to the registry like any other:
+        // a deployment that files headerless requests under it must push a
         // policy for it.
         assert!(matches!(
-            resolve(
-                None,
-                &default_tenant,
-                MissingTenantPolicy::UseDefault,
-                allowed,
-            ),
+            resolve(None, Some(&solo), allowed),
             Err(TenantError::NotAllowed(_))
         ));
     }
 
+    /// Headerless requests are rejected unless a tenant was named for them —
+    /// the single-tenant opt-in.
     #[test]
-    fn resolve_applies_the_missing_header_policy() {
-        let default_tenant = TenantId::parse("default").unwrap();
+    fn resolve_applies_the_missing_tenant_opt_in() {
+        let solo = TenantId::parse("solo").unwrap();
         let allow_all = |_: &TenantId| true;
 
-        assert_eq!(
-            resolve(
-                None,
-                &default_tenant,
-                MissingTenantPolicy::UseDefault,
-                allow_all
-            )
-            .unwrap(),
-            default_tenant
+        assert_eq!(resolve(None, Some(&solo), allow_all).unwrap(), solo);
+        let refused = resolve(None, None, allow_all).unwrap_err();
+        assert!(matches!(refused, TenantError::Missing));
+        assert!(
+            refused.to_string().contains("LOGGYTRACY_MISSING_TENANT"),
+            "the refusal names the opt-in an operator would reach for: {refused}"
         );
-        assert!(matches!(
-            resolve(
-                None,
-                &default_tenant,
-                MissingTenantPolicy::Reject,
-                allow_all
-            ),
-            Err(TenantError::Missing)
-        ));
         // An empty header is a client bug, not an absent header.
         assert!(matches!(
-            resolve(
-                Some(""),
-                &default_tenant,
-                MissingTenantPolicy::UseDefault,
-                allow_all
-            ),
+            resolve(Some(""), Some(&solo), allow_all),
             Err(TenantError::Invalid(_))
         ));
     }
