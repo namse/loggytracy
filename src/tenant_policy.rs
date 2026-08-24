@@ -60,14 +60,6 @@ pub enum TenantStorageLimit {
 struct PolicyEntry {
     retention: TenantRetention,
     raw: String,
-    /// Distinct log streams the tenant may hold at once, or `None` when the
-    /// control plane has said nothing.
-    ///
-    /// Stream cardinality is the one cost here that neither retention nor merge
-    /// reclaims on its own: `stream.idx` is an eviction-exempt catalog, so a
-    /// tenant that mints a label value per request turns disk into something
-    /// nothing takes back.
-    max_streams: Option<u64>,
     /// Bytes the tenant may keep stored, or `None` when the control plane has
     /// said nothing. Kept alongside the string it arrived as, so a `GET`
     /// returns what was pushed rather than a re-rendering of it.
@@ -80,7 +72,6 @@ impl PolicyEntry {
     fn view(&self) -> PolicyView {
         PolicyView {
             retention: self.raw.clone(),
-            max_streams: self.max_streams,
             max_stored_bytes: self.raw_max_stored_bytes.clone(),
             updated_at: self.updated_at,
         }
@@ -90,7 +81,6 @@ impl PolicyEntry {
 /// One tenant's policy as the admin endpoints report it.
 pub struct PolicyView {
     pub retention: String,
-    pub max_streams: Option<u64>,
     pub max_stored_bytes: Option<String>,
     pub updated_at: SystemTime,
 }
@@ -103,10 +93,6 @@ pub struct PolicyMap {
 impl PolicyMap {
     pub fn retention(&self, tenant: &TenantId) -> Option<TenantRetention> {
         self.entries.get(tenant).map(|entry| entry.retention)
-    }
-
-    pub fn max_streams(&self, tenant: &TenantId) -> Option<u64> {
-        self.entries.get(tenant).and_then(|entry| entry.max_streams)
     }
 
     pub fn max_stored_bytes(&self, tenant: &TenantId) -> Option<TenantStorageLimit> {
@@ -295,8 +281,6 @@ struct PolicyDocument {
     /// deserialize is a fatal boot — the same trap `meta.json` fell into
     /// before it had a version field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_streams: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     max_stored_bytes: Option<String>,
     updated_at: String,
 }
@@ -394,7 +378,6 @@ impl PolicyStore {
                 PolicyEntry {
                     retention,
                     raw: document.retention,
-                    max_streams: document.max_streams,
                     max_stored_bytes,
                     raw_max_stored_bytes: document.max_stored_bytes,
                     updated_at,
@@ -591,16 +574,15 @@ impl TenantPolicy {
     /// The order is the whole point of the push shape: a success is a promise
     /// that the policy survives a restart, so the control plane's retry loop
     /// terminates on a real guarantee.
-    /// A push carries the whole policy, so omitting `max_streams` clears it
-    /// rather than leaving the previous value in place. Merging instead would
-    /// make the stored state depend on the order of pushes, and a control
-    /// plane retrying a push it believes to be complete would silently keep a
-    /// limit it thinks it removed.
+    /// A push carries the whole policy, so omitting `max_stored_bytes` clears
+    /// it rather than leaving the previous value in place. Merging instead
+    /// would make the stored state depend on the order of pushes, and a
+    /// control plane retrying a push it believes to be complete would silently
+    /// keep a limit it thinks it removed.
     pub async fn push(
         &self,
         tenant: &TenantId,
         raw: &str,
-        max_streams: Option<u64>,
         raw_max_stored_bytes: Option<&str>,
     ) -> Result<PolicyView, PolicyError> {
         let Some(store) = &self.store else {
@@ -633,7 +615,6 @@ impl TenantPolicy {
         let updated_at = self.clock.now();
         let document = PolicyDocument {
             retention: raw.clone(),
-            max_streams,
             max_stored_bytes: raw_max_stored_bytes.clone(),
             updated_at: format_timestamp(updated_at),
         };
@@ -649,7 +630,6 @@ impl TenantPolicy {
                 PolicyEntry {
                     retention,
                     raw: raw.clone(),
-                    max_streams,
                     max_stored_bytes,
                     raw_max_stored_bytes: raw_max_stored_bytes.clone(),
                     updated_at,
@@ -659,14 +639,9 @@ impl TenantPolicy {
         self.metrics.push_accepted.fetch_add(1, Ordering::Relaxed);
         Ok(PolicyView {
             retention: raw,
-            max_streams,
             max_stored_bytes: raw_max_stored_bytes,
             updated_at,
         })
-    }
-
-    pub fn max_streams(&self, tenant: &TenantId) -> Option<u64> {
-        self.snapshot()?.max_streams(tenant)
     }
 
     pub fn max_stored_bytes(&self, tenant: &TenantId) -> Option<TenantStorageLimit> {
@@ -722,7 +697,6 @@ impl TenantPolicy {
                     PolicyEntry {
                         retention,
                         raw,
-                        max_streams: None,
                         max_stored_bytes: None,
                         raw_max_stored_bytes: None,
                         updated_at: SystemTime::now(),
@@ -943,7 +917,7 @@ mod tests {
         assert!(!policy.is_tenant_allowed(&tenant("acme")));
 
         policy
-            .push(&tenant("acme"), "30d", None, None)
+            .push(&tenant("acme"), "30d", None)
             .await
             .unwrap();
         assert!(policy.is_tenant_allowed(&tenant("acme")));
@@ -963,16 +937,16 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "30d", None, None)
+            .push(&tenant("acme"), "30d", None)
             .await
             .unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None, None)
+            .push(&tenant("intern"), "infinite", None)
             .await
             .unwrap();
         // A downgrade taken before the restart must still be in force after it.
         policy
-            .push(&tenant("acme"), "7d", None, None)
+            .push(&tenant("acme"), "7d", None)
             .await
             .unwrap();
         assert_eq!(
@@ -1025,7 +999,7 @@ mod tests {
         let dir = data_dir.join(TENANT_POLICY_PREFIX);
         let policy = TenantPolicy::for_test_with_local_store(dir.clone());
         policy
-            .push(&tenant("acme"), "7d", None, None)
+            .push(&tenant("acme"), "7d", None)
             .await
             .unwrap();
         assert_eq!(
@@ -1075,7 +1049,7 @@ mod tests {
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
         policy
-            .push(&tenant("acme"), "7d", None, None)
+            .push(&tenant("acme"), "7d", None)
             .await
             .unwrap();
 
@@ -1115,7 +1089,7 @@ mod tests {
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
         policy
-            .push(&tenant("acme"), "1d", None, None)
+            .push(&tenant("acme"), "1d", None)
             .await
             .unwrap();
 
@@ -1131,7 +1105,7 @@ mod tests {
         // The control plane upgrades the tenant. The row is still on disk, and
         // the new plan covers it again.
         policy
-            .push(&tenant("acme"), "30d", None, None)
+            .push(&tenant("acme"), "30d", None)
             .await
             .unwrap();
         assert!(
@@ -1148,14 +1122,14 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "30d", None, None)
+            .push(&tenant("acme"), "30d", None)
             .await
             .unwrap();
 
         // A malformed value is rejected before anything is written.
         assert!(matches!(
             policy
-                .push(&tenant("acme"), "soon", None, None)
+                .push(&tenant("acme"), "soon", None)
                 .await,
             Err(PolicyError::Invalid(_))
         ));
@@ -1173,7 +1147,7 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "1ms", None, None)
+            .push(&tenant("acme"), "1ms", None)
             .await
             .unwrap();
         assert!(policy.query_floor_ns(&tenant("acme")).is_some());
@@ -1199,11 +1173,11 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage);
         policy
-            .push(&tenant("acme"), "3650d", None, None)
+            .push(&tenant("acme"), "3650d", None)
             .await
             .unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None, None)
+            .push(&tenant("intern"), "infinite", None)
             .await
             .unwrap();
 

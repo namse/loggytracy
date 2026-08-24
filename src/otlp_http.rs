@@ -112,8 +112,6 @@ pub async fn logs(
         ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
         clock: &state.clock,
-        parts: &state.parts,
-        memtable: &state.memtable,
     };
     // Ahead of the request counter as well as the body work, the accounting
     // the push handler this replaces kept: a refusal at the gate is not an

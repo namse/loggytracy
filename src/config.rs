@@ -64,9 +64,6 @@ pub struct Config {
     /// added latency.
     pub max_batch_ms: u64,
     pub max_line_bytes: usize,
-    pub max_label_names_per_stream: usize,
-    pub max_label_name_bytes: usize,
-    pub max_label_value_bytes: usize,
     /// How far behind and ahead of the server clock an entry timestamp may be.
     /// Timestamps outside the window create day partitions that retention can
     /// never expire, so they are rejected at ingest.
@@ -135,10 +132,6 @@ pub struct Config {
     /// of the shared query semaphore and the other tenants queue behind it
     /// however small their queries are.
     pub max_concurrent_queries_per_tenant: usize,
-    /// Distinct streams a tenant may hold, for tenants the control plane has
-    /// pushed no `max_streams` for. `None` is unbounded, which is the
-    /// pre-limit behaviour.
-    pub default_tenant_max_streams: Option<u64>,
     /// Bytes a tenant may keep stored, for tenants the control plane has pushed
     /// no `max_stored_bytes` for. `None` is unbounded.
     ///
@@ -267,9 +260,6 @@ impl Default for Config {
             max_batch_bytes: 1024 * 1024,
             max_batch_ms: 0,
             max_line_bytes: 256 * 1024,
-            max_label_names_per_stream: 30,
-            max_label_name_bytes: 1024,
-            max_label_value_bytes: 2048,
             max_timestamp_age: Some(Duration::from_secs(7 * 24 * 60 * 60)),
             max_timestamp_skew: Some(Duration::from_secs(60 * 60)),
             max_memtable_bytes: Some(256 * 1024 * 1024),
@@ -301,7 +291,6 @@ impl Default for Config {
             retention_grace_period: Duration::from_secs(60 * 60),
             max_retention_runtime: Duration::from_secs(120),
             max_concurrent_queries_per_tenant: 4,
-            default_tenant_max_streams: None,
             default_tenant_max_stored_bytes: None,
             min_free_disk_bytes: Some(2 * 1024 * 1024 * 1024),
             log_format: LogFormat::Text,
@@ -528,18 +517,6 @@ impl Config {
                 "LOGGYTRACY_MAX_LINE_BYTES",
                 defaults.max_line_bytes,
             )?,
-            max_label_names_per_stream: env_positive_usize(
-                "LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM",
-                defaults.max_label_names_per_stream,
-            )?,
-            max_label_name_bytes: env_positive_usize(
-                "LOGGYTRACY_MAX_LABEL_NAME_BYTES",
-                defaults.max_label_name_bytes,
-            )?,
-            max_label_value_bytes: env_positive_usize(
-                "LOGGYTRACY_MAX_LABEL_VALUE_BYTES",
-                defaults.max_label_value_bytes,
-            )?,
             max_timestamp_age: env_duration(
                 "LOGGYTRACY_MAX_TIMESTAMP_AGE",
                 defaults.max_timestamp_age,
@@ -646,10 +623,6 @@ impl Config {
             max_concurrent_queries_per_tenant: env_positive_usize(
                 "LOGGYTRACY_MAX_CONCURRENT_QUERIES_PER_TENANT",
                 defaults.max_concurrent_queries_per_tenant,
-            )?,
-            default_tenant_max_streams: env_optional_u64(
-                "LOGGYTRACY_DEFAULT_TENANT_MAX_STREAMS",
-                defaults.default_tenant_max_streams,
             )?,
             default_tenant_max_stored_bytes: env_optional_u64(
                 "LOGGYTRACY_DEFAULT_TENANT_MAX_STORED_BYTES",
@@ -817,12 +790,6 @@ impl Config {
         // Zero is the default and means "do not linger", so this one is not a
         // positive-value knob.
         positive_usize("max_line_bytes", self.max_line_bytes)?;
-        positive_usize(
-            "max_label_names_per_stream",
-            self.max_label_names_per_stream,
-        )?;
-        positive_usize("max_label_name_bytes", self.max_label_name_bytes)?;
-        positive_usize("max_label_value_bytes", self.max_label_value_bytes)?;
         if let Some(age) = self.max_timestamp_age {
             positive_duration("max_timestamp_age", age)?;
         }

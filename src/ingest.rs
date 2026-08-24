@@ -3,9 +3,8 @@
 //! The Loki push handlers lived here until the bed moved to OTLP and the
 //! endpoint was removed (`todo.md`, "Next — OTLP only"). What survived the
 //! removal is exactly what was never about that wire: the timestamp window
-//! and the label bounds exist to keep a label set from becoming a cardinality
-//! problem and a timestamp from landing in a partition retention has already
-//! swept, and `otlp_log`'s normalization is checked against them in
+//! exists to keep a timestamp from landing in a partition retention has
+//! already swept, and `otlp_log`'s normalization is checked against it in
 //! `log_ingest.rs` the same way the push decoder was.
 
 use crate::config::Config;
@@ -51,36 +50,6 @@ check the client clock and timestamp units, or raise LOGGYTRACY_MAX_TIMESTAMP_SK
 
 fn duration_to_ns(duration: std::time::Duration) -> i64 {
     duration.as_nanos().min(i64::MAX as u128) as i64
-}
-
-pub fn validate_labels(
-    labels: &std::collections::BTreeMap<String, String>,
-    config: &Config,
-) -> Result<(), String> {
-    if labels.len() > config.max_label_names_per_stream {
-        return Err(format!(
-            "stream has {} labels, exceeding the maximum of {}",
-            labels.len(),
-            config.max_label_names_per_stream
-        ));
-    }
-    for (name, value) in labels {
-        if name.len() > config.max_label_name_bytes {
-            return Err(format!(
-                "label name is {} bytes, exceeding the maximum of {}",
-                name.len(),
-                config.max_label_name_bytes
-            ));
-        }
-        if value.len() > config.max_label_value_bytes {
-            return Err(format!(
-                "value of label '{name}' is {} bytes, exceeding the maximum of {}",
-                value.len(),
-                config.max_label_value_bytes
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -142,34 +111,4 @@ mod tests {
         assert!(window.validate(i64::MAX).is_ok());
     }
 
-    #[test]
-    fn label_bounds_refuse_counts_and_lengths_past_the_configured_limits() {
-        let config = Config {
-            max_label_names_per_stream: 2,
-            max_label_name_bytes: 8,
-            max_label_value_bytes: 8,
-            ..Config::default()
-        };
-        let ok = std::collections::BTreeMap::from([
-            ("a".to_string(), "1".to_string()),
-            ("b".to_string(), "2".to_string()),
-        ]);
-        assert!(validate_labels(&ok, &config).is_ok());
-
-        let too_many = std::collections::BTreeMap::from([
-            ("a".to_string(), "1".to_string()),
-            ("b".to_string(), "2".to_string()),
-            ("c".to_string(), "3".to_string()),
-        ]);
-        let error = validate_labels(&too_many, &config).unwrap_err();
-        assert!(error.contains("3 labels"), "{error}");
-
-        let long_name =
-            std::collections::BTreeMap::from([("very_long_name".to_string(), "1".to_string())]);
-        assert!(validate_labels(&long_name, &config).is_err());
-
-        let long_value =
-            std::collections::BTreeMap::from([("a".to_string(), "far too long".to_string())]);
-        assert!(validate_labels(&long_value, &config).is_err());
-    }
 }

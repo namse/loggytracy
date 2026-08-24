@@ -38,7 +38,6 @@ pub struct LogIngestService {
     tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
     tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
     clock: Arc<crate::clock::Clock>,
-    parts: Arc<crate::part_registry::PartRegistry>,
 }
 
 impl LogIngestService {
@@ -51,7 +50,6 @@ impl LogIngestService {
         tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
         tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
         clock: Arc<crate::clock::Clock>,
-        parts: Arc<crate::part_registry::PartRegistry>,
     ) -> Self {
         Self {
             journal,
@@ -61,7 +59,6 @@ impl LogIngestService {
             tenant_quota,
             tenant_policy,
             clock,
-            parts,
         }
     }
 
@@ -85,11 +82,6 @@ pub struct OtlpLogIngest<'a> {
     pub ingest_gate: &'a IngestGate,
     pub tenant_quota: &'a crate::tenant_quota::TenantQuota,
     pub clock: &'a crate::clock::Clock,
-    /// Needed for the stream-cardinality check, which has to know what the
-    /// tenant already holds on disk. Carried here rather than looked up
-    /// because OTLP does not go through `AppState`.
-    pub parts: &'a crate::part_registry::PartRegistry,
-    pub memtable: &'a crate::memtable::MemTable,
 }
 
 impl OtlpLogIngest<'_> {
@@ -171,16 +163,11 @@ impl OtlpLogIngest<'_> {
         };
         let streams = normalize_request(request)
             .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-        // The same input limits the Loki path applies. A record that arrives
-        // over OTLP is not exempt from the bounds that keep a label set from
-        // becoming a cardinality problem or a timestamp from landing in a
-        // partition retention has already swept.
+        // A record that arrives over OTLP is still bounded: a line has a size
+        // limit, and a timestamp outside the window would land in a partition
+        // retention has already swept.
         let window = crate::ingest::TimestampWindow::from_config(self.config, self.clock);
-        for (labels, entries) in &streams {
-            crate::ingest::validate_labels(labels, self.config)
-                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-            self.tenant_quota
-                .admit_stream(&tenant, labels, self.parts, self.memtable)?;
+        for (_labels, entries) in &streams {
             for entry in entries {
                 if entry.line.len() > self.config.max_line_bytes {
                     return Err((
@@ -295,8 +282,6 @@ impl LogsService for LogIngestService {
             ingest_gate: &self.ingest_gate,
             tenant_quota: &self.tenant_quota,
             clock: &self.clock,
-            parts: &self.parts,
-            memtable: self.journal.log_memtable(),
         };
         ingest.admit_transport().map_err(ingest_error_to_status)?;
         let tenant =

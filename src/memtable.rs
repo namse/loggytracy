@@ -312,45 +312,6 @@ impl MemTable {
         );
     }
 
-    /// Whether the tenant already has this stream buffered, in either the live
-    /// buffer or the one being flushed. Both count: a stream mid-flush is not a
-    /// new stream, and treating it as one would charge a tenant twice for it
-    /// every time a flush is in progress.
-    pub fn contains_stream(&self, tenant: &TenantId, labels: &Labels) -> bool {
-        if self
-            .inner
-            .read()
-            .get(tenant)
-            .is_some_and(|streams| streams.contains_key(labels))
-        {
-            return true;
-        }
-        self.flushing
-            .read()
-            .as_deref()
-            .and_then(|snapshot| snapshot.get(tenant))
-            .is_some_and(|streams| streams.contains_key(labels))
-    }
-
-    /// Every stream the tenant has buffered. Small by construction — it is
-    /// bounded by what a flush interval accumulates — and only walked when a
-    /// genuinely new stream appears.
-    pub fn tenant_streams(&self, tenant: &TenantId) -> Vec<SharedLabels> {
-        let mut streams: BTreeSet<SharedLabels> = BTreeSet::new();
-        if let Some(buffered) = self.inner.read().get(tenant) {
-            streams.extend(buffered.keys().cloned());
-        }
-        if let Some(flushing) = self
-            .flushing
-            .read()
-            .as_deref()
-            .and_then(|snapshot| snapshot.get(tenant))
-        {
-            streams.extend(flushing.keys().cloned());
-        }
-        streams.into_iter().collect()
-    }
-
     pub fn is_empty(&self) -> bool {
         let inner = self.inner.read();
         if !inner.is_empty() {

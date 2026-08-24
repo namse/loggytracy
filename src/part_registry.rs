@@ -14,124 +14,55 @@ use crate::part::{
 };
 use crate::tenant::TenantId;
 
-/// What a part holds for each of its tenants: the tenant's streams, and the
-/// bytes its row groups occupy in the shared object.
-///
-/// A part's stream list is shared across its tenants, so it is filtered through
-/// each tenant's row groups — the same path a `series` query takes, and for the
-/// same reason: the part-wide list would attribute a neighbour's streams to
-/// every tenant in the part. The byte extent is already per tenant in
-/// `meta.json`, which is where it has to come from: the local file's size is
-/// gone once the cache evicts the body, and a quota that reads zero for evicted
-/// parts charges for whatever happens to be resident.
+/// What a part holds for each of its tenants: the bytes its row groups occupy
+/// in the shared object. The byte extent is already per tenant in `meta.json`,
+/// which is where it has to come from: the local file's size is gone once the
+/// cache evicts the body, and a quota that reads zero for evicted parts
+/// charges for whatever happens to be resident.
 fn reader_tenant_facts(reader: &PartReader) -> Vec<TenantFacts> {
     reader
         .meta()
         .tenants
         .iter()
-        .map(|segment| {
-            let stream_keys = reader
-                .series(&segment.tenant, &[])
-                .iter()
-                .map(stream_key)
-                .collect();
-            TenantFacts {
-                tenant: segment.tenant.clone(),
-                stream_keys,
-                stored_bytes: segment.bytes.len(),
-            }
+        .map(|segment| TenantFacts {
+            tenant: segment.tenant.clone(),
+            stored_bytes: segment.bytes.len(),
         })
         .collect()
 }
 
 struct TenantFacts {
     tenant: TenantId,
-    stream_keys: Vec<u64>,
     stored_bytes: u64,
 }
 
-/// A stream's identity, hashed.
-///
-/// Hashed rather than stored: the point of a cardinality limit is that this set
-/// stays small, but "small" is per tenant and there can be many tenants, and a
-/// `Labels` map per entry would cost far more than the limit it enforces. A
-/// collision would count a genuinely new stream as one that already exists,
-/// which admits one stream too many rather than refusing a legitimate one — the
-/// direction a limit should err in.
-pub fn stream_key(labels: &Labels) -> u64 {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for (name, value) in labels {
-        name.hash(&mut hasher);
-        value.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Per-tenant stream sets and stored bytes, maintained as the part set changes.
-///
-/// A stream lives in every part that holds a row for it, so removing one part
-/// must not remove the stream while another still has it. The count is what
-/// makes register/replace/unregister reversible. Bytes need no such counting —
-/// a part's extent for a tenant belongs to that part alone — but they are kept
-/// here rather than summed on demand for the same reason the limit exists: a
-/// storage quota is read on the ingest path, and walking every part's tenant
-/// index per write is the cost this engine bounds everywhere else.
+/// Per-tenant stored bytes, maintained as the part set changes. Kept rather
+/// than summed on demand because the storage quota is read on the ingest path,
+/// and walking every part's tenant index per write is the cost this engine
+/// bounds everywhere else.
 #[derive(Default)]
 struct TenantCensus {
-    tenants: HashMap<TenantId, TenantEntry>,
-}
-
-#[derive(Default)]
-struct TenantEntry {
-    streams: HashMap<u64, u32>,
-    stored_bytes: u64,
+    tenants: HashMap<TenantId, u64>,
 }
 
 impl TenantCensus {
     fn add(&mut self, facts: &TenantFacts) {
         let entry = self.tenants.entry(facts.tenant.clone()).or_default();
-        for key in &facts.stream_keys {
-            *entry.streams.entry(*key).or_insert(0) += 1;
-        }
-        entry.stored_bytes = entry.stored_bytes.saturating_add(facts.stored_bytes);
+        *entry = entry.saturating_add(facts.stored_bytes);
     }
 
     fn remove(&mut self, facts: &TenantFacts) {
         let Some(entry) = self.tenants.get_mut(&facts.tenant) else {
             return;
         };
-        for key in &facts.stream_keys {
-            if let Some(count) = entry.streams.get_mut(key) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    entry.streams.remove(key);
-                }
-            }
-        }
-        entry.stored_bytes = entry.stored_bytes.saturating_sub(facts.stored_bytes);
-        if entry.streams.is_empty() && entry.stored_bytes == 0 {
+        *entry = entry.saturating_sub(facts.stored_bytes);
+        if *entry == 0 {
             self.tenants.remove(&facts.tenant);
         }
     }
 
-    fn contains(&self, tenant: &TenantId, key: u64) -> bool {
-        self.tenants
-            .get(tenant)
-            .is_some_and(|entry| entry.streams.contains_key(&key))
-    }
-
-    fn count(&self, tenant: &TenantId) -> usize {
-        self.tenants
-            .get(tenant)
-            .map_or(0, |entry| entry.streams.len())
-    }
-
     fn stored_bytes(&self, tenant: &TenantId) -> u64 {
-        self.tenants
-            .get(tenant)
-            .map_or(0, |entry| entry.stored_bytes)
+        self.tenants.get(tenant).copied().unwrap_or(0)
     }
 }
 
@@ -527,11 +458,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
         *self.census.write() = census;
     }
 
-    /// Whether the tenant already has this stream on disk.
-    pub fn contains_stream(&self, tenant: &TenantId, key: u64) -> bool {
-        self.census.read().contains(tenant, key)
-    }
-
     /// Parts holding at least one row for the tenant. Its share of the
     /// (tenant, part) pairs the layout charges in.
     pub fn tenant_part_count(&self, tenant: &TenantId) -> usize {
@@ -540,11 +466,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
             .values()
             .filter(|reader| reader.meta().tenant_segment(tenant).is_some())
             .count()
-    }
-
-    /// Distinct streams the tenant has on disk.
-    pub fn tenant_stream_count(&self, tenant: &TenantId) -> usize {
-        self.census.read().count(tenant)
     }
 
     /// Bytes the tenant's row groups occupy across every registered part.

@@ -20,7 +20,6 @@
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
             crate::clock::Clock::system(),
-            Arc::new(crate::part_registry::PartRegistry::new()),
         );
         (memtable, service)
     }
@@ -162,7 +161,6 @@
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
             crate::clock::Clock::system(),
-            Arc::new(crate::part_registry::PartRegistry::new()),
         );
         let status = service
             .export(tenant_request(request(vec![record("while draining")])))
@@ -201,7 +199,6 @@
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
             crate::clock::Clock::system(),
-            Arc::new(crate::part_registry::PartRegistry::new()),
         );
 
         service
@@ -250,7 +247,6 @@ specification tells it to drop the batch"
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
             crate::clock::Clock::system(),
-            Arc::new(crate::part_registry::PartRegistry::new()),
         );
 
         service
@@ -270,47 +266,6 @@ specification tells it to drop the batch"
             .export(tenant_request(request(vec![record("third line")])))
             .await
             .expect("a retired backlog accepts writes again");
-    }
-
-    /// The label-count bound applies to what promotion produces: three
-    /// promoted resource attributes against a limit of two is a refusal, and
-    /// nothing may have been written.
-    #[tokio::test]
-    async fn an_export_whose_promoted_labels_exceed_the_limit_is_refused() {
-        let (memtable, service) = fixture(Config {
-            max_label_names_per_stream: 2,
-            ..config("label_count")
-        });
-        let mut export = request(vec![record("too many labels")]);
-        let resource = export.resource_logs[0].resource.as_mut().unwrap();
-        for name in ["deployment.environment", "cloud.region"] {
-            resource.attributes.push(KeyValue {
-                key: name.to_string(),
-                value: Some(AnyValue {
-                    value: Some(any_value::Value::StringValue("x".to_string())),
-                }),
-                ..Default::default()
-            });
-        }
-
-        let status = service
-            .export(tenant_request(export))
-            .await
-            .expect_err("three promoted labels against a limit of two");
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert!(status.message().contains("3 labels"), "{}", status.message());
-        assert!(
-            memtable
-                .query(
-                    &test_tenant(),
-                    &[],
-                    &[],
-                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
-                    10,
-                    true
-                )
-                .is_empty()
-        );
     }
 
     /// `time_unix_nano` is a u64 and the storage timestamp is an i64; the

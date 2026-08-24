@@ -16,10 +16,6 @@ pub struct RuntimeMetrics {
     /// this one says the instance was willing and the tenant was over what it
     /// was sold.
     pub query_quota_rejected: AtomicU64,
-    /// Writes refused because they would create a stream past the tenant's
-    /// limit. This one says the tenant is generating labels, which is a client
-    /// bug far more often than it is a plan being outgrown.
-    pub stream_limit_rejected: AtomicU64,
     /// Writes refused because the tenant is already storing everything its plan
     /// sells. It clears only when retention retires parts, which is why the
     /// refusal carries a long Retry-After.
@@ -142,7 +138,6 @@ impl RuntimeMetrics {
             ingest_errors: AtomicU64::new(0),
             ingest_throttled: AtomicU64::new(0),
             query_quota_rejected: AtomicU64::new(0),
-            stream_limit_rejected: AtomicU64::new(0),
             storage_limit_rejected: AtomicU64::new(0),
             wal_replayed_records: AtomicU64::new(0),
             wal_replayed_entries: AtomicU64::new(0),

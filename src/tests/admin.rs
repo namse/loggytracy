@@ -112,8 +112,8 @@
 
     /// A limit rides on the same push as retention, survives a restart with
     /// it, and is reported as sent. The last part matters most: a body
-    /// without `max_streams` clears the limit rather than keeping it, because
-    /// the body is the policy and not a patch of it.
+    /// without `max_stored_bytes` clears the limit rather than keeping it,
+    /// because the body is the policy and not a patch of it.
     #[tokio::test]
     async fn a_limit_rides_the_same_push_and_a_body_without_one_clears_it() {
         let storage = Arc::new(ObjectStorage::in_memory());
@@ -124,13 +124,18 @@
             &state,
             "PUT",
             RETENTION_URI,
-            r#"{"retention":"30d","max_streams":100}"#,
+            r#"{"retention":"30d","max_stored_bytes":"10GiB"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["max_streams"], 100);
-        assert_eq!(policy.max_streams(&tenant("acme")), Some(100));
+        assert_eq!(json["max_stored_bytes"], "10GiB");
+        assert_eq!(
+            policy.max_stored_bytes(&tenant("acme")),
+            Some(crate::tenant_policy::TenantStorageLimit::Bytes(
+                10 * 1024 * 1024 * 1024
+            ))
+        );
 
         // Durable, and readable back through a restart.
         let reload_config = Config::default();
@@ -138,8 +143,10 @@
             .await
             .unwrap();
         assert_eq!(
-            reloaded.max_streams(&tenant("acme")),
-            Some(100),
+            reloaded.max_stored_bytes(&tenant("acme")),
+            Some(crate::tenant_policy::TenantStorageLimit::Bytes(
+                10 * 1024 * 1024 * 1024
+            )),
             "a limit that does not survive a restart is not a policy"
         );
 
@@ -148,11 +155,11 @@
         assert!(
             serde_json::from_str::<serde_json::Value>(&body)
                 .unwrap()
-                .get("max_streams")
+                .get("max_stored_bytes")
                 .is_none()
         );
         assert_eq!(
-            policy.max_streams(&tenant("acme")),
+            policy.max_stored_bytes(&tenant("acme")),
             None,
             "omitting the field clears it; the body is the whole policy"
         );
@@ -350,7 +357,6 @@
         assert_eq!(status, StatusCode::OK);
         let usage: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(usage["tenant"], "acme");
-        assert_eq!(usage["streams"], 1);
         assert_eq!(usage["entries"], 1);
 
         // A different tenant sees its own zeroes, not acme's numbers.
@@ -363,7 +369,6 @@
         .await;
         assert_eq!(status, StatusCode::OK);
         let other: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(other["streams"], 0);
         assert_eq!(other["entries"], 0);
     }
 
@@ -391,7 +396,7 @@
             !rendered.contains("acme"),
             "a tenant id in the operator scrape is a series per tenant"
         );
-        assert!(rendered.contains("loggytracy_stream_limit_rejected_total"));
+        assert!(rendered.contains("loggytracy_storage_limit_rejected_total"));
     }
 
     async fn read_labels_as(state: &Arc<AppState>, tenant: &str) -> StatusCode {
@@ -468,7 +473,7 @@
         for (uri, request_body) in [
             (
                 "/loggytracy/api/v1/admin/tenants/zeta/retention",
-                r#"{"retention":"7d","max_streams":100}"#,
+                r#"{"retention":"7d","max_stored_bytes":"1GiB"}"#,
             ),
             (
                 "/loggytracy/api/v1/admin/tenants/acme/retention",
@@ -492,9 +497,9 @@
         );
         assert_eq!(tenants[0]["retention"], "30d");
         assert_eq!(tenants[1]["retention"], "7d");
-        assert_eq!(tenants[1]["max_streams"], 100);
+        assert_eq!(tenants[1]["max_stored_bytes"], "1GiB");
         assert!(
-            tenants[0].get("max_streams").is_none(),
+            tenants[0].get("max_stored_bytes").is_none(),
             "a field the control plane never pushed is absent, not defaulted"
         );
         assert!(tenants[0]["updated_at"].as_str().is_some());

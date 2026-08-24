@@ -573,7 +573,6 @@ pub async fn run(config: Arc<Config>) {
         tenant_quota,
         tenant_policy,
         clock.clone(),
-        parts,
     );
     let otlp_task_health = otlp_healthy;
     let mut otlp_drain = shutdown.subscribe();

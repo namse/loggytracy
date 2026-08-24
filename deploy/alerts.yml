@@ -47,21 +47,6 @@ groups:
             the backlog grows before the refusals start.
           runbook: docs/RUNBOOK.md#what-to-alert-on
 
-      - alert: LoggytracyStreamLimitRejecting
-        expr: increase(loggytracy_stream_limit_rejected_total[15m]) > 0
-        for: 15m
-        labels:
-          severity: warning
-        annotations:
-          summary: "A tenant is creating streams past its limit"
-          description: >-
-            Usually a client putting a request id or a timestamp in a label,
-            not a plan being outgrown. Check the label names before raising
-            anything.
-          runbook: docs/RUNBOOK.md#what-to-alert-on
-
-  - name: loggytracy-durability
-    rules:
       - alert: LoggytracyFlushStopped
         expr: >-
           increase(loggytracy_flush_errors_total[10m]) > 0

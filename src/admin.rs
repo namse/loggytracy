@@ -16,14 +16,10 @@ pub const MAX_ADMIN_BODY_BYTES: usize = 4 * 1024;
 #[derive(Deserialize)]
 struct RetentionRequest {
     retention: String,
-    /// Distinct log streams the tenant may hold at once. Optional so a
-    /// control plane that only manages retention keeps working unchanged;
-    /// omitting it clears any limit previously pushed for the tenant — the
-    /// body is the whole policy, not a patch of it.
-    #[serde(default)]
-    max_streams: Option<u64>,
     /// Bytes the tenant may keep stored, as a size such as `10GiB`. Optional
-    /// for the same reason.
+    /// so a control plane that only manages retention keeps working
+    /// unchanged; omitting it clears any limit previously pushed for the
+    /// tenant — the body is the whole policy, not a patch of it.
     #[serde(default)]
     max_stored_bytes: Option<String>,
 }
@@ -32,8 +28,6 @@ struct RetentionRequest {
 pub struct RetentionResponse {
     tenant: String,
     retention: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_streams: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_stored_bytes: Option<String>,
     updated_at: String,
@@ -65,19 +59,13 @@ pub async fn put_retention(
     })?;
     let view = state
         .tenant_policy
-        .push(
-            &tenant,
-            &request.retention,
-            request.max_streams,
-            request.max_stored_bytes.as_deref(),
-        )
+        .push(&tenant, &request.retention, request.max_stored_bytes.as_deref())
         .await
         .map_err(into_http)?;
     tracing::info!(%tenant, retention = %view.retention, "tenant policy updated");
     Ok(Json(RetentionResponse {
         tenant: tenant.as_str().to_string(),
         retention: view.retention,
-        max_streams: view.max_streams,
         max_stored_bytes: view.max_stored_bytes,
         updated_at: rfc3339(view.updated_at),
     }))
@@ -97,7 +85,6 @@ pub async fn get_retention(
     Ok(Json(RetentionResponse {
         tenant: tenant.as_str().to_string(),
         retention: view.retention,
-        max_streams: view.max_streams,
         max_stored_bytes: view.max_stored_bytes,
         updated_at: rfc3339(view.updated_at),
     }))
@@ -121,7 +108,6 @@ pub async fn list_tenants(
                 .map(|(tenant, view)| RetentionResponse {
                     tenant: tenant.as_str().to_string(),
                     retention: view.retention,
-                    max_streams: view.max_streams,
                     max_stored_bytes: view.max_stored_bytes,
                     updated_at: rfc3339(view.updated_at),
                 })
@@ -179,23 +165,8 @@ pub async fn get_usage(
         .parts
         .tenant_stored_bytes(&tenant)
         .saturating_add(state.trace_parts.tenant_stored_bytes(&tenant));
-    // The union, for the same reason the limit uses it: a flushed stream lives
-    // in both until the buffer is cleared.
-    let streams = state
-        .memtable
-        .tenant_streams(&tenant)
-        .iter()
-        .filter(|labels| {
-            !state
-                .parts
-                .contains_stream(&tenant, crate::part_registry::stream_key(labels))
-        })
-        .count()
-        + state.parts.tenant_stream_count(&tenant);
     Ok(Json(serde_json::json!({
         "tenant": tenant.as_str(),
-        "streams": streams,
-        "max_streams": state.tenant_quota.max_streams_for(&tenant),
         "parts": state.parts.tenant_part_count(&tenant),
         "entries": on_disk.entries + buffered.entries,
         "bytes": on_disk.bytes + buffered.bytes,
