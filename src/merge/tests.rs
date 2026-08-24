@@ -582,7 +582,6 @@
             // Far above the single part below: only the expired share can
             // make this part eligible.
             merge_min_part_count: 4,
-            retention_period: None,
             ..Config::default()
         };
         let parts_root = dir.join("parts");
@@ -669,7 +668,6 @@
         let config = Config {
             data_dir: dir.clone(),
             merge_min_part_count: 4,
-            retention_period: None,
             ..Config::default()
         };
         let parts_root = dir.join("parts");
@@ -714,7 +712,6 @@
         let config = Config {
             data_dir: dir.clone(),
             merge_min_part_count: 4,
-            retention_period: None,
             ..Config::default()
         };
         let parts_root = dir.join("parts");
@@ -787,7 +784,6 @@
         let config = Config {
             data_dir: dir.clone(),
             merge_min_part_count: 2,
-            retention_period: None,
             ..Config::default()
         };
         let parts_root = dir.join("parts");
@@ -902,7 +898,6 @@
         let config = Config {
             data_dir: dir.clone(),
             merge_min_part_count: 4,
-            retention_period: None,
             // One row per row group, and a budget that fits a single row but
             // not the whole part.
             row_group_size: 1,
@@ -997,7 +992,6 @@
         let config = Config {
             data_dir: dir.clone(),
             merge_min_part_count: 4,
-            retention_period: None,
             // Below one row. Reading the group used to exceed this before the
             // first row was produced; a stream never accumulates against it.
             merge_max_memory_bytes: 1,
@@ -1158,7 +1152,6 @@
             merge_min_part_count: 2,
             merge_target_part_rows: 1000,
             merge_max_part_rows: 10000,
-            retention_period: None,
             ..Config::default()
         };
         let parts_root = dir.join("parts");
@@ -1215,7 +1208,6 @@
             data_dir: dir.clone(),
             // Nothing here can form an ordinary group.
             merge_min_part_count: 4,
-            retention_period: None,
             ..Config::default()
         };
         let parts_root = dir.join("parts");
@@ -1260,7 +1252,6 @@
         let config = Config {
             data_dir: dir.clone(),
             merge_min_part_count: 2,
-            retention_period: None,
             ..Config::default()
         };
         let parts_root = dir.join("parts");
@@ -1338,7 +1329,6 @@
             data_dir: dir.clone(),
             merge_min_part_count: 2,
             merge_max_groups_per_tick: 8,
-            retention_period: None,
             ..Config::default()
         };
         let parts_root = dir.join("parts");
@@ -1402,7 +1392,6 @@
             data_dir: dir.clone(),
             // No group will ever form: one part, and the minimum is four.
             merge_min_part_count: 4,
-            retention_period: None,
             ..Config::default()
         };
         let parts_root = dir.join("parts");

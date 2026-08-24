@@ -548,15 +548,6 @@ pub async fn run(config: Arc<Config>) {
         });
     }
 
-    if config.retention_period.is_none() && config.tenant_policy_token.is_none() {
-        // Neither mechanism is configured, so nothing ever expires. This is a
-        // legitimate configuration for a fixed-size dataset and a data-loss
-        // trap for anything else, and it is silent either way without this.
-        tracing::warn!(
-            "no retention is configured: neither LOGGYTRACY_RETENTION_PERIOD nor \
-LOGGYTRACY_TENANT_POLICY_TOKEN is set, so the object store grows without bound"
-        );
-    }
     announce_bind(&config.otlp_grpc_addr, "LOGGYTRACY_OTLP_GRPC_ADDR");
     let otlp_addr = config
         .otlp_grpc_addr

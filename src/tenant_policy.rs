@@ -326,11 +326,6 @@ pub struct TenantPolicyMetrics {
     /// look like a control plane pushing garbage.
     pub push_rejected: AtomicU64,
     pub push_persist_errors: AtomicU64,
-    /// Admin requests that failed the bearer check, on any of the three
-    /// methods. Separate from `push_rejected` because the two ask different
-    /// questions: one is "is the control plane broken", the other is "is
-    /// someone knocking".
-    pub admin_unauthorized: AtomicU64,
 }
 
 /// Why a policy change did not take effect.
@@ -578,8 +573,9 @@ pub struct TenantPolicy {
 }
 
 impl TenantPolicy {
-    /// A policy that is switched off: every tenant keeps everything, and the
-    /// admin routes are not mounted.
+    /// A storeless fixture that serves every tenant and never expires
+    /// anything. Production always loads a store ([`Self::load`]); this exists
+    /// for tests exercising paths that are not about the registry.
     pub fn disabled() -> Self {
         Self::with_entries(None, BTreeMap::new())
     }
@@ -629,22 +625,6 @@ impl TenantPolicy {
             None => PolicyStore::Local(config.data_dir.join(TENANT_POLICY_PREFIX)),
         };
         let entries = store.load_all().await?;
-        if config.tenant_policy_token.is_none() {
-            // Without a token nothing clamps queries, so every row a downgrade
-            // or a deletion had made invisible becomes readable again — and
-            // with the admin routes unmounted there is no surface on which an
-            // operator would notice. A forgotten environment variable must not
-            // be able to undelete data, so this is fatal rather than a warning.
-            if !entries.is_empty() {
-                return Err(format!(
-                    "{} stored tenant retention policies were found but \
-LOGGYTRACY_TENANT_POLICY_TOKEN is not set; starting without it would unclamp every query and \
-resurrect data those policies had already expired",
-                    entries.len()
-                ));
-            }
-            return Ok(Self::disabled());
-        }
         tracing::info!(
             tenants = entries.len(),
             "loaded per-tenant retention policies"
@@ -656,8 +636,8 @@ resurrect data those policies had already expired",
         self.store.is_some()
     }
 
-    /// The current map, or `None` when per-tenant retention is off. `None` must
-    /// always mean "delete nothing".
+    /// The current map, or `None` for the storeless test fixture
+    /// ([`Self::disabled`]). `None` must always mean "delete nothing".
     pub fn snapshot(&self) -> Option<Arc<PolicyMap>> {
         self.is_enabled().then(|| self.policies.read().clone())
     }
@@ -686,11 +666,9 @@ resurrect data those policies had already expired",
 
     /// Whether this instance serves `tenant`.
     ///
-    /// With per-tenant policy enabled, the pushed policies *are* the tenant
-    /// registry: a push onboards a tenant the moment it is durable, and a
-    /// delete returns it to unknown, which every request path refuses. With
-    /// the policy switched off there is no registry and every well-formed id
-    /// is served.
+    /// The pushed policies *are* the tenant registry: a push onboards a tenant
+    /// the moment it is durable, and a delete returns it to unknown, which
+    /// every request path refuses.
     pub fn is_tenant_allowed(&self, tenant: &TenantId) -> bool {
         match self.snapshot() {
             Some(policies) => policies.contains(tenant),
@@ -848,12 +826,6 @@ resurrect data those policies had already expired",
 
     pub fn record_rejected_push(&self) {
         self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_unauthorized(&self) {
-        self.metrics
-            .admin_unauthorized
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Copy-insert-swap. Pushes are rare, so paying a map copy per push keeps
@@ -1142,11 +1114,7 @@ mod tests {
         assert!(!policy.is_tenant_allowed(&tenant("stranger")));
 
         // Onboarding survives a restart with the policy it rode in on.
-        let config = Config {
-            tenant_policy_token: Some("secret".to_string()),
-            retention_period: None,
-            ..Config::default()
-        };
+        let config = Config::default();
         let restarted = TenantPolicy::load(&config, Some(storage)).await.unwrap();
         assert!(restarted.is_tenant_allowed(&tenant("acme")));
 
@@ -1177,11 +1145,7 @@ mod tests {
             "every push is accepted"
         );
 
-        let config = Config {
-            tenant_policy_token: Some("secret".to_string()),
-            retention_period: None,
-            ..Config::default()
-        };
+        let config = Config::default();
         let restarted = TenantPolicy::load(&config, Some(storage)).await.unwrap();
         let map = restarted.snapshot().unwrap();
         assert_eq!(map.tenant_count(), 2);
@@ -1234,8 +1198,6 @@ mod tests {
         );
 
         let config = Config {
-            tenant_policy_token: Some("secret".to_string()),
-            retention_period: None,
             data_dir: data_dir.clone(),
             ..Config::default()
         };
@@ -1260,11 +1222,7 @@ mod tests {
             .put_tenant_policy("acme", b"{\"retention\":\"soon\"".to_vec())
             .await
             .unwrap();
-        let config = Config {
-            tenant_policy_token: Some("secret".to_string()),
-            retention_period: None,
-            ..Config::default()
-        };
+        let config = Config::default();
         assert!(TenantPolicy::load(&config, Some(storage)).await.is_err());
     }
 
@@ -1346,49 +1304,6 @@ mod tests {
                 .unwrap()
                 .is_expired(&tenant("acme"), start_ns),
             "the upgrade must apply to data written under the old plan"
-        );
-    }
-
-    /// Retention `0` is how a tenant is deleted, and until a rewrite reclaims
-    /// the rows the only thing hiding them is the query clamp. Dropping the
-    /// token drops the clamp, so a boot that would do that has to fail.
-    #[tokio::test]
-    async fn dropping_the_token_with_stored_policies_fails_the_boot() {
-        let storage = Arc::new(ObjectStorage::in_memory());
-        let with_token = Config {
-            tenant_policy_token: Some("secret".to_string()),
-            retention_period: None,
-            ..Config::default()
-        };
-        TenantPolicy::load(&with_token, Some(storage.clone()))
-            .await
-            .expect("an empty store boots")
-            .push(&tenant("acme"), "0", None, None, None, None)
-            .await
-            .expect("the deletion is stored");
-
-        let without_token = Config {
-            tenant_policy_token: None,
-            ..with_token.clone()
-        };
-        let error = match TenantPolicy::load(&without_token, Some(storage.clone())).await {
-            Err(error) => error,
-            Ok(_) => panic!("a stored policy without a token must not boot"),
-        };
-        assert!(error.contains("TENANT_POLICY_TOKEN"), "{error}");
-
-        // With the policy withdrawn there is nothing left to unclamp, so the
-        // guard stops applying: it protects stored decisions, not the token.
-        TenantPolicy::load(&with_token, Some(storage.clone()))
-            .await
-            .unwrap()
-            .remove(&tenant("acme"))
-            .await
-            .unwrap();
-        assert!(
-            TenantPolicy::load(&without_token, Some(storage))
-                .await
-                .is_ok()
         );
     }
 

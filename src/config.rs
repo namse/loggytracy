@@ -131,25 +131,10 @@ pub struct Config {
     pub object_store_url: Option<String>,
     pub cache_max_bytes: u64,
     pub cache_eviction_interval: Duration,
-    /// Global retention, or `None` for unbounded.
-    ///
-    /// Unbounded is the right default only because it is not the mechanism:
-    /// per-tenant retention is pushed by the control plane, and configuring
-    /// both is a validation error rather than a precedence rule. A default
-    /// period here would silently delete data the control plane believes it
-    /// still owns. Startup warns when neither is configured, since unbounded
-    /// with nothing pushed means the object store grows forever.
-    pub retention_period: Option<Duration>,
     pub retention_interval: Duration,
     pub retention_batch_size: usize,
     pub retention_grace_period: Duration,
     pub max_retention_runtime: Duration,
-    /// Bearer token for the admin routes the control plane pushes retention
-    /// through. When unset, retention is exactly the global `retention_period`
-    /// behaviour and the routes are not mounted; when set, the pushed policies
-    /// are the sole authority. Setting both is a validation error rather than a
-    /// silently ignored setting.
-    pub tenant_policy_token: Option<String>,
     /// Ingest rate for tenants the control plane has pushed no rate for.
     ///
     /// This is a default, not a plan: per-tenant rates are pushed, because
@@ -341,12 +326,10 @@ impl Default for Config {
             object_store_url: None,
             cache_max_bytes: 10 * 1024 * 1024 * 1024,
             cache_eviction_interval: Duration::from_secs(30),
-            retention_period: None,
             retention_interval: Duration::from_secs(300),
             retention_batch_size: 100,
             retention_grace_period: Duration::from_secs(60 * 60),
             max_retention_runtime: Duration::from_secs(120),
-            tenant_policy_token: None,
             default_tenant_ingest_bytes_per_second: None,
             tenant_ingest_burst: Duration::from_secs(10),
             default_tenant_query_scan_bytes_per_second: None,
@@ -681,7 +664,6 @@ impl Config {
                 "LOGGYTRACY_CACHE_EVICTION_INTERVAL",
                 defaults.cache_eviction_interval,
             )?,
-            retention_period: env_duration("LOGGYTRACY_RETENTION_PERIOD", None)?,
             retention_interval: env_required_duration(
                 "LOGGYTRACY_RETENTION_INTERVAL",
                 defaults.retention_interval,
@@ -698,9 +680,6 @@ impl Config {
                 "LOGGYTRACY_MAX_RETENTION_RUNTIME",
                 defaults.max_retention_runtime,
             )?,
-            tenant_policy_token: std::env::var("LOGGYTRACY_TENANT_POLICY_TOKEN")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
             default_tenant_ingest_bytes_per_second: env_optional_u64(
                 "LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND",
                 defaults.default_tenant_ingest_bytes_per_second,
@@ -962,22 +941,10 @@ selected above the read budget can never be merged",
         positive_duration("merge_interval", self.merge_interval)?;
         positive_u64("cache_max_bytes", self.cache_max_bytes)?;
         positive_duration("cache_eviction_interval", self.cache_eviction_interval)?;
-        if let Some(period) = self.retention_period {
-            positive_duration("retention_period", period)?;
-        }
         positive_duration("retention_interval", self.retention_interval)?;
         positive_usize("retention_batch_size", self.retention_batch_size)?;
         positive_duration("retention_grace_period", self.retention_grace_period)?;
         positive_duration("max_retention_runtime", self.max_retention_runtime)?;
-        // A silently ignored retention setting is the worst possible outcome,
-        // so the two modes fail at startup instead of quietly picking one.
-        if self.tenant_policy_token.is_some() && self.retention_period.is_some() {
-            return Err(
-                "LOGGYTRACY_RETENTION_PERIOD and LOGGYTRACY_TENANT_POLICY_TOKEN are mutually \
-exclusive: per-tenant retention replaces the global period"
-                    .to_string(),
-            );
-        }
         if !self.retention_rewrite_threshold.is_finite()
             || self.retention_rewrite_threshold <= 0.0
             || self.retention_rewrite_threshold > 1.0
@@ -1293,23 +1260,6 @@ mod tests {
                 .unwrap()
                 .is_zero()
         );
-    }
-
-    #[test]
-    fn the_two_retention_modes_are_mutually_exclusive() {
-        let mut config = Config {
-            tenant_policy_token: Some("secret".to_string()),
-            ..Config::default()
-        };
-        assert!(config.validate().is_ok());
-
-        // Silently ignoring one of the two would be the worst outcome, so it
-        // fails at startup instead.
-        config.retention_period = Some(Duration::from_secs(3600));
-        assert!(config.validate().is_err());
-
-        config.tenant_policy_token = None;
-        assert!(config.validate().is_ok());
     }
 
     #[test]

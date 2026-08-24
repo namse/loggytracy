@@ -8,7 +8,6 @@
     use tower::ServiceExt;
 
     const RETENTION_URI: &str = "/loggytracy/api/v1/admin/tenants/acme/retention";
-    const TOKEN: &str = "control-plane-secret";
 
     fn temp_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -24,11 +23,9 @@
         TenantId::parse(raw).expect("valid tenant id")
     }
 
-    fn state_with(policy: Arc<TenantPolicy>, token: Option<&str>) -> Arc<AppState> {
+    fn state_with(policy: Arc<TenantPolicy>) -> Arc<AppState> {
         let config = Config {
             data_dir: temp_dir(),
-            tenant_policy_token: token.map(str::to_string),
-            retention_period: None,
             ..Config::default()
         };
         let memtable = Arc::new(MemTable::new());
@@ -52,14 +49,11 @@
         state: &Arc<AppState>,
         method: &str,
         uri: &str,
-        token: Option<&str>,
         body: &str,
     ) -> (StatusCode, String) {
-        let mut request = axum::http::Request::builder().method(method).uri(uri);
-        if let Some(token) = token {
-            request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
-        }
-        let request = request
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
             .body(axum::body::Body::from(body.to_string()))
             .unwrap();
         let response = crate::build_router(state.clone())
@@ -77,16 +71,15 @@
     async fn a_push_is_stored_then_readable_and_deletable() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone()));
-        let state = state_with(policy.clone(), Some(TOKEN));
+        let state = state_with(policy.clone());
 
-        let (status, _) = call(&state, "GET", RETENTION_URI, Some(TOKEN), "").await;
+        let (status, _) = call(&state, "GET", RETENTION_URI, "").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "no policy pushed yet");
 
         let (status, body) = call(
             &state,
             "PUT",
             RETENTION_URI,
-            Some(TOKEN),
             r#"{"retention":"30d"}"#,
         )
         .await;
@@ -100,14 +93,14 @@
         assert_eq!(storage.load_tenant_policies().await.unwrap().len(), 1);
         assert!(policy.query_floor_ns(&tenant("acme")).is_some());
 
-        let (status, body) = call(&state, "GET", RETENTION_URI, Some(TOKEN), "").await;
+        let (status, body) = call(&state, "GET", RETENTION_URI, "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).unwrap()["retention"],
             "30d"
         );
 
-        let (status, _) = call(&state, "DELETE", RETENTION_URI, Some(TOKEN), "").await;
+        let (status, _) = call(&state, "DELETE", RETENTION_URI, "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             policy.query_floor_ns(&tenant("acme")),
@@ -125,13 +118,12 @@
     async fn an_ingest_rate_rides_the_same_push_and_a_body_without_one_clears_it() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone()));
-        let state = state_with(policy.clone(), Some(TOKEN));
+        let state = state_with(policy.clone());
 
         let (status, body) = call(
             &state,
             "PUT",
             RETENTION_URI,
-            Some(TOKEN),
             r#"{"retention":"30d","ingest_rate":"4MiB/s"}"#,
         )
         .await;
@@ -146,11 +138,7 @@
         );
 
         // Durable, and readable back through a restart.
-        let reload_config = Config {
-            tenant_policy_token: Some(TOKEN.to_string()),
-            retention_period: None,
-            ..Config::default()
-        };
+        let reload_config = Config::default();
         let reloaded = TenantPolicy::load(&reload_config, Some(storage.clone()))
             .await
             .unwrap();
@@ -166,7 +154,6 @@
             &state,
             "PUT",
             RETENTION_URI,
-            Some(TOKEN),
             r#"{"retention":"30d"}"#,
         )
         .await;
@@ -189,7 +176,6 @@
             &state,
             "PUT",
             RETENTION_URI,
-            Some(TOKEN),
             r#"{"retention":"7d","ingest_rate":"quickly"}"#,
         )
         .await;
@@ -206,13 +192,12 @@
         let policy = Arc::new(TenantPolicy::for_test_with_store(Arc::new(
             ObjectStorage::in_memory_with_failing_writes(),
         )));
-        let state = state_with(policy.clone(), Some(TOKEN));
+        let state = state_with(policy.clone());
 
         let (status, _) = call(
             &state,
             "PUT",
             RETENTION_URI,
-            Some(TOKEN),
             r#"{"retention":"30d"}"#,
         )
         .await;
@@ -239,31 +224,15 @@
     }
 
     #[tokio::test]
-    async fn an_unauthenticated_or_wrong_token_push_changes_nothing() {
-        let storage = Arc::new(ObjectStorage::in_memory());
-        let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone()));
-        let state = state_with(policy.clone(), Some(TOKEN));
-
-        for token in [None, Some("wrong"), Some("control-plane-secre")] {
-            let (status, _) =
-                call(&state, "PUT", RETENTION_URI, token, r#"{"retention":"0"}"#).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{token:?}");
-        }
-        assert!(storage.load_tenant_policies().await.unwrap().is_empty());
-        assert_eq!(policy.query_floor_ns(&tenant("acme")), None);
-    }
-
-    #[tokio::test]
     async fn a_malformed_tenant_or_value_is_a_400_and_stores_nothing() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = Arc::new(TenantPolicy::for_test_with_store(storage.clone()));
-        let state = state_with(policy, Some(TOKEN));
+        let state = state_with(policy);
 
         let (status, _) = call(
             &state,
             "PUT",
             "/loggytracy/api/v1/admin/tenants/..%2Fetc/retention",
-            Some(TOKEN),
             r#"{"retention":"30d"}"#,
         )
         .await;
@@ -274,26 +243,10 @@
         );
 
         for body in [r#"{"retention":"soon"}"#, r#"{"retention":7}"#, "{}", "not json"] {
-            let (status, _) = call(&state, "PUT", RETENTION_URI, Some(TOKEN), body).await;
+            let (status, _) = call(&state, "PUT", RETENTION_URI, body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         }
         assert!(storage.load_tenant_policies().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn the_admin_routes_do_not_exist_without_a_token() {
-        let state = state_with(Arc::new(TenantPolicy::disabled()), None);
-        for method in ["PUT", "GET", "DELETE"] {
-            let (status, _) = call(
-                &state,
-                method,
-                RETENTION_URI,
-                Some(TOKEN),
-                r#"{"retention":"30d"}"#,
-            )
-            .await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{method}");
-        }
     }
 
     /// A pushed value is applied exactly as sent. The instance has no setting
@@ -304,13 +257,12 @@
         let policy = Arc::new(TenantPolicy::for_test_with_store(Arc::new(
             ObjectStorage::in_memory(),
         )));
-        let state = state_with(policy.clone(), Some(TOKEN));
+        let state = state_with(policy.clone());
 
         let (status, body) = call(
             &state,
             "PUT",
             RETENTION_URI,
-            Some(TOKEN),
             r#"{"retention":"30d"}"#,
         )
         .await;
@@ -336,13 +288,12 @@
         let policy = Arc::new(TenantPolicy::for_test_with_store(Arc::new(
             ObjectStorage::in_memory(),
         )));
-        let state = state_with(policy.clone(), Some(TOKEN));
+        let state = state_with(policy.clone());
 
         let (status, _) = call(
             &state,
             "PUT",
             RETENTION_URI,
-            Some(TOKEN),
             r#"{"retention":"infinite"}"#,
         )
         .await;
@@ -359,7 +310,7 @@
         let policy = Arc::new(TenantPolicy::for_test_with_store(Arc::new(
             ObjectStorage::in_memory(),
         )));
-        let state = state_with(policy.clone(), Some(TOKEN));
+        let state = state_with(policy.clone());
         use std::sync::atomic::Ordering;
         state.metrics.merge_errors.store(11, Ordering::Relaxed);
         state
@@ -367,14 +318,14 @@
             .merge_inputs_changed
             .store(22, Ordering::Relaxed);
         state.metrics.retention_success.store(33, Ordering::Relaxed);
-        policy.record_unauthorized();
+        policy.record_rejected_push();
 
         let body = crate::query::metrics(axum::extract::State(state.clone())).await;
         for (name, value) in [
             ("loggytracy_merge_errors_total", "11"),
             ("loggytracy_merge_inputs_changed_total", "22"),
             ("loggytracy_retention_success_total", "33"),
-            ("loggytracy_tenant_policy_admin_unauthorized_total", "1"),
+            ("loggytracy_tenant_policy_push_rejected_total", "1"),
         ] {
             assert!(
                 body.lines().any(|line| line == format!("{name} {value}")),
@@ -384,27 +335,17 @@
     }
 
 
-    /// Per-tenant numbers live here, not as labels on `/metrics`.
-    ///
-    /// That endpoint is unauthenticated and process-wide by design, and a label
-    /// per tenant would multiply every series by the tenant count — on a
-    /// workload whose whole point is many small tenants, that is the
-    /// cardinality problem this engine bounds everywhere else. The reader that
-    /// needs per-tenant numbers is the control plane, which is already
-    /// authenticated here.
+    /// Per-tenant numbers live here, not as labels on `/metrics`: a label per
+    /// tenant would multiply every series by the tenant count — on a workload
+    /// whose whole point is many small tenants, that is the cardinality
+    /// problem this engine bounds everywhere else. The reader that needs
+    /// per-tenant numbers is the control plane, which already asks per tenant.
     #[tokio::test]
-    async fn per_tenant_usage_is_authenticated_and_scoped_to_one_tenant() {
+    async fn per_tenant_usage_is_scoped_to_one_tenant() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = Arc::new(TenantPolicy::for_test_with_store(storage));
-        let state = state_with(policy, Some(TOKEN));
+        let state = state_with(policy);
         let uri = "/loggytracy/api/v1/admin/tenants/acme/usage";
-
-        let (status, _) = call(&state, "GET", uri, None, "").await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "usage names a tenant, so it is not public"
-        );
 
         state.memtable.insert(
             tenant("acme"),
@@ -418,7 +359,7 @@
             }],
         );
 
-        let (status, body) = call(&state, "GET", uri, Some(TOKEN), "").await;
+        let (status, body) = call(&state, "GET", uri, "").await;
         assert_eq!(status, StatusCode::OK);
         let usage: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(usage["tenant"], "acme");
@@ -430,7 +371,6 @@
             &state,
             "GET",
             "/loggytracy/api/v1/admin/tenants/other/usage",
-            Some(TOKEN),
             "",
         )
         .await;
@@ -446,7 +386,7 @@
     async fn the_operator_scrape_carries_no_tenant_labels() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = Arc::new(TenantPolicy::for_test_with_store(storage));
-        let state = state_with(policy, Some(TOKEN));
+        let state = state_with(policy);
         state.memtable.insert(
             tenant("acme"),
             [("app".to_string(), "scrape".to_string())]
@@ -488,7 +428,7 @@
     async fn a_push_onboards_the_tenant_and_a_delete_offboards_it() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = Arc::new(TenantPolicy::for_test_with_store(storage));
-        let state = state_with(policy, Some(TOKEN));
+        let state = state_with(policy);
 
         assert_eq!(
             read_labels_as(&state, "acme").await,
@@ -500,7 +440,6 @@
             &state,
             "PUT",
             RETENTION_URI,
-            Some(TOKEN),
             r#"{"retention":"30d"}"#,
         )
         .await;
@@ -516,7 +455,7 @@
             "onboarding one tenant does not open the door for another"
         );
 
-        let (status, _) = call(&state, "DELETE", RETENTION_URI, Some(TOKEN), "").await;
+        let (status, _) = call(&state, "DELETE", RETENTION_URI, "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             read_labels_as(&state, "acme").await,
@@ -531,13 +470,10 @@
     async fn the_tenant_list_reports_every_pushed_policy() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = Arc::new(TenantPolicy::for_test_with_store(storage));
-        let state = state_with(policy, Some(TOKEN));
+        let state = state_with(policy);
         const LIST_URI: &str = "/loggytracy/api/v1/admin/tenants";
 
-        let (status, _) = call(&state, "GET", LIST_URI, None, "").await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-        let (status, body) = call(&state, "GET", LIST_URI, Some(TOKEN), "").await;
+        let (status, body) = call(&state, "GET", LIST_URI, "").await;
         assert_eq!(status, StatusCode::OK);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["tenants"].as_array().unwrap().len(), 0);
@@ -552,11 +488,11 @@
                 r#"{"retention":"30d"}"#,
             ),
         ] {
-            let (status, _) = call(&state, "PUT", uri, Some(TOKEN), request_body).await;
+            let (status, _) = call(&state, "PUT", uri, request_body).await;
             assert_eq!(status, StatusCode::OK);
         }
 
-        let (_, body) = call(&state, "GET", LIST_URI, Some(TOKEN), "").await;
+        let (_, body) = call(&state, "GET", LIST_URI, "").await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let tenants = json["tenants"].as_array().unwrap();
         assert_eq!(

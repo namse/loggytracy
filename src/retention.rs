@@ -127,56 +127,6 @@ async fn retention_once(
     .await
 }
 
-/// What decides that a part has expired.
-///
-/// The two modes are never mixed: `config.validate` rejects a configuration
-/// that sets both a global period and a policy endpoint.
-enum Expiry {
-    Global { cutoff_ns: i64 },
-    PerTenant(crate::tenant_policy::Cutoffs),
-}
-
-impl Expiry {
-    /// `None` means "delete nothing this tick": retention is off entirely.
-    /// An enabled policy always resolves, even before the control plane has
-    /// pushed anything — an empty map makes every tenant unknown, and unknown
-    /// already means keep.
-    fn resolve(config: &Config, tenant_policy: &TenantPolicy, now_ns: u128) -> Option<Self> {
-        let clamped_now_ns = now_ns.min(i64::MAX as u128) as i64;
-        if tenant_policy.is_enabled() {
-            return tenant_policy
-                .cutoffs_at(clamped_now_ns)
-                .map(Self::PerTenant);
-        }
-        let retention_period = config.retention_period?;
-        Some(Self::Global {
-            cutoff_ns: now_ns
-                .saturating_sub(retention_period.as_nanos())
-                .min(i64::MAX as u128) as i64,
-        })
-    }
-
-    fn log_part_expired(&self, meta: &crate::part::PartMeta) -> bool {
-        match self {
-            Self::Global { cutoff_ns } => meta.max_ts_ns < *cutoff_ns,
-            Self::PerTenant(cutoffs) => cutoffs.log_part_fully_expired(meta),
-        }
-    }
-
-    fn trace_part_expired(&self, meta: &crate::trace_part::TracePartMeta) -> bool {
-        match self {
-            Self::Global { cutoff_ns } => meta.max_ts_ns < *cutoff_ns,
-            Self::PerTenant(cutoffs) => cutoffs.trace_part_fully_expired(meta),
-        }
-    }
-
-    fn mode(&self) -> &'static str {
-        match self {
-            Self::Global { .. } => "global",
-            Self::PerTenant(_) => "per-tenant",
-        }
-    }
-}
 
 async fn retention_once_at(
     registry: &PartRegistry,
@@ -186,7 +136,11 @@ async fn retention_once_at(
     tenant_policy: &TenantPolicy,
     now_ns: u128,
 ) -> Result<(), String> {
-    let Some(expiry) = Expiry::resolve(config, tenant_policy, now_ns) else {
+    // `None` means "delete nothing this tick" — the storeless test fixture.
+    // A loaded policy always resolves, even before the control plane has
+    // pushed anything: an empty map makes every tenant unknown, and unknown
+    // already means keep.
+    let Some(cutoffs) = tenant_policy.cutoffs_at(now_ns.min(i64::MAX as u128) as i64) else {
         return Ok(());
     };
     let batch_size = config.retention_batch_size.max(1);
@@ -198,7 +152,7 @@ async fn retention_once_at(
     let mut log_parts: Vec<_> = registry
         .snapshot()
         .into_iter()
-        .filter(|reader| expiry.log_part_expired(reader.meta()))
+        .filter(|reader| cutoffs.log_part_fully_expired(reader.meta()))
         .map(|reader| {
             (
                 ManifestPart {
@@ -212,7 +166,7 @@ async fn retention_once_at(
     let mut trace_parts: Vec<_> = trace_registry
         .snapshot()
         .into_iter()
-        .filter(|reader| expiry.trace_part_expired(&reader.part().meta))
+        .filter(|reader| cutoffs.trace_part_fully_expired(&reader.part().meta))
         .map(|reader| {
             (
                 TraceManifestPart {
@@ -382,11 +336,7 @@ async fn retention_once_at(
             }
         }
     }
-    tracing::info!(
-        removed,
-        mode = expiry.mode(),
-        "retention removed expired parts"
-    );
+    tracing::info!(removed, "retention removed expired parts");
     Ok(())
 }
 
@@ -447,12 +397,9 @@ mod tests {
         std::env::temp_dir().join(format!("loggytracy-{label}-{}", uuid::Uuid::new_v4()))
     }
 
-    /// Per-tenant retention runs with no global period, so every per-tenant
-    /// test uses this configuration.
     fn per_tenant_config(root: std::path::PathBuf) -> Config {
         Config {
             data_dir: root,
-            retention_period: None,
             ..Config::default()
         }
     }
@@ -804,7 +751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retention_is_disabled_without_a_period() {
+    async fn the_storeless_fixture_deletes_nothing() {
         let root =
             std::env::temp_dir().join(format!("loggytracy-retention-{}", uuid::Uuid::new_v4()));
         let registry = Arc::new(PartRegistry::new());
@@ -849,18 +796,15 @@ mod tests {
         let trace_registry = Arc::new(TraceRegistry::standalone());
         let config = Config {
             data_dir: root,
-            retention_period: Some(Duration::from_secs(1)),
             ..Config::default()
         };
-        retention_once(
-            &registry,
-            &trace_registry,
-            None,
-            &config,
-            &TenantPolicy::disabled(),
-        )
-        .await
-        .unwrap();
+        let policy = policy_with(&[(
+            crate::tenant::test_tenant().as_str(),
+            TenantRetention::Finite(Duration::from_secs(1)),
+        )]);
+        retention_once(&registry, &trace_registry, None, &config, &policy)
+            .await
+            .unwrap();
         assert_eq!(registry.part_count(), 0);
         assert!(!parts[0].dir.exists());
     }
@@ -900,10 +844,12 @@ mod tests {
         let trace_registry = Arc::new(TraceRegistry::standalone());
         let config = Config {
             data_dir: root,
-            retention_period: Some(Duration::from_secs(1)),
             ..Config::default()
         };
-        let policy = TenantPolicy::disabled();
+        let policy = policy_with(&[(
+            crate::tenant::test_tenant().as_str(),
+            TenantRetention::Finite(Duration::from_secs(1)),
+        )]);
 
         // The merge rewrite, holding its inputs against deletion.
         let rewrite_guard = registry.deletion_lock().read_owned().await;
@@ -963,19 +909,16 @@ mod tests {
         let remote = RemoteCache::new(storage.clone(), parts_root.clone());
         let config = Config {
             data_dir: root,
-            retention_period: Some(Duration::from_secs(1)),
             ..Config::default()
         };
+        let policy = policy_with(&[(
+            crate::tenant::test_tenant().as_str(),
+            TenantRetention::Finite(Duration::from_secs(1)),
+        )]);
 
-        retention_once(
-            &registry,
-            &trace_registry,
-            Some(&remote),
-            &config,
-            &TenantPolicy::disabled(),
-        )
-        .await
-        .unwrap();
+        retention_once(&registry, &trace_registry, Some(&remote), &config, &policy)
+            .await
+            .unwrap();
 
         assert!(storage.load_manifest().await.unwrap().parts.is_empty());
         assert_eq!(registry.part_count(), 0);
@@ -1009,20 +952,16 @@ mod tests {
         let trace_registry = Arc::new(TraceRegistry::standalone());
         let config = Config {
             data_dir: root,
-            retention_period: Some(Duration::from_nanos(10)),
             ..Config::default()
         };
+        let policy = policy_with(&[(
+            crate::tenant::test_tenant().as_str(),
+            TenantRetention::Finite(Duration::from_nanos(10)),
+        )]);
 
-        retention_once_at(
-            &registry,
-            &trace_registry,
-            None,
-            &config,
-            &TenantPolicy::disabled(),
-            100,
-        )
-        .await
-        .unwrap();
+        retention_once_at(&registry, &trace_registry, None, &config, &policy, 100)
+            .await
+            .unwrap();
 
         assert_eq!(registry.part_count(), 1);
         assert!(parts[0].dir.exists());

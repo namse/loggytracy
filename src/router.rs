@@ -54,13 +54,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/echo", get(tempo::echo))
         .route("/ready", get(query::ready));
-    // Without a token there is no per-tenant retention at all, so the admin
-    // surface does not exist rather than existing unauthenticated.
-    let router = match state.config.tenant_policy_token {
-        Some(_) => router.merge(admin_router()),
-        None => router,
-    };
-    router.with_state(state)
+    // The admin routes carry no authentication of their own: loggytracy is
+    // not built to be reachable from the outside network, and assumes every
+    // request arrives through a secured channel.
+    router.merge(admin_router()).with_state(state)
 }
 
 /// The write routes, with the body limit they enforce.
