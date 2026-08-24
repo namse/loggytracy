@@ -47,19 +47,6 @@ groups:
             the backlog grows before the refusals start.
           runbook: docs/RUNBOOK.md#what-to-alert-on
 
-      - alert: LoggytracyIngestQuotaRejecting
-        expr: increase(loggytracy_ingest_quota_rejected_total[15m]) > 0
-        for: 15m
-        labels:
-          severity: info
-        annotations:
-          summary: "A tenant is over its ingest rate"
-          description: >-
-            Different from LoggytracyIngestThrottled: the server is healthy and
-            the tenant is sending more than its plan allows. A plan question,
-            not a scaling one.
-          runbook: docs/RUNBOOK.md#what-to-alert-on
-
       - alert: LoggytracyStreamLimitRejecting
         expr: increase(loggytracy_stream_limit_rejected_total[15m]) > 0
         for: 15m

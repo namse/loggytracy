@@ -63,12 +63,6 @@ pub struct Config {
     /// per second. Raise it only on a disk where an fsync costs more than the
     /// added latency.
     pub max_batch_ms: u64,
-    /// The largest single request the tenant ingest quota must always be able
-    /// to admit: the token bucket's burst capacity is floored at this, or a
-    /// legal body larger than the bucket would be refused forever. The OTLP
-    /// body limit itself is `MAX_OTLP_REQUEST_BYTES`, a constant matched
-    /// across both transports.
-    pub max_push_bytes: usize,
     pub max_line_bytes: usize,
     pub max_label_names_per_stream: usize,
     pub max_label_name_bytes: usize,
@@ -135,34 +129,11 @@ pub struct Config {
     pub retention_batch_size: usize,
     pub retention_grace_period: Duration,
     pub max_retention_runtime: Duration,
-    /// Ingest rate for tenants the control plane has pushed no rate for.
-    ///
-    /// This is a default, not a plan: per-tenant rates are pushed, because
-    /// plans differ between tenants and change after launch, and neither of
-    /// those fits in this process's environment. What belongs here is the
-    /// answer for a tenant nothing is known about — including every tenant
-    /// when per-tenant policy is switched off entirely. `None` is unlimited,
-    /// which is the pre-quota behaviour.
-    pub default_tenant_ingest_bytes_per_second: Option<u64>,
-    /// How long a tenant may bank an unused rate for and spend at once.
-    ///
-    /// Logs arrive in bursts, so a bucket sized at exactly one second of rate
-    /// would refuse ordinary traffic. The capacity is also floored at
-    /// `max_push_bytes` so that a single legal body always eventually fits:
-    /// without that floor a low rate would reject the same request forever,
-    /// which is the latching failure the backpressure gate is careful to avoid.
-    pub tenant_ingest_burst: Duration,
-    /// Query scan rate for tenants the control plane has pushed no rate for.
-    /// The read counterpart to `default_tenant_ingest_bytes_per_second`, with
-    /// the same division of responsibility: plans are pushed, this is the
-    /// answer for a tenant nothing is known about.
-    pub default_tenant_query_scan_bytes_per_second: Option<u64>,
     /// Queries one tenant may have running at once.
     ///
-    /// The scan rate bounds a tenant's total work over time; this bounds how
-    /// much of it happens simultaneously. Without it a single tenant issuing
-    /// concurrent scans takes every permit of the shared query semaphore and
-    /// the other tenants queue behind it however small their queries are.
+    /// Without it a single tenant issuing concurrent scans takes every permit
+    /// of the shared query semaphore and the other tenants queue behind it
+    /// however small their queries are.
     pub max_concurrent_queries_per_tenant: usize,
     /// Distinct streams a tenant may hold, for tenants the control plane has
     /// pushed no `max_streams` for. `None` is unbounded, which is the
@@ -295,7 +266,6 @@ impl Default for Config {
             missing_tenant: None,
             max_batch_bytes: 1024 * 1024,
             max_batch_ms: 0,
-            max_push_bytes: 16 * 1024 * 1024,
             max_line_bytes: 256 * 1024,
             max_label_names_per_stream: 30,
             max_label_name_bytes: 1024,
@@ -330,9 +300,6 @@ impl Default for Config {
             retention_batch_size: 100,
             retention_grace_period: Duration::from_secs(60 * 60),
             max_retention_runtime: Duration::from_secs(120),
-            default_tenant_ingest_bytes_per_second: None,
-            tenant_ingest_burst: Duration::from_secs(10),
-            default_tenant_query_scan_bytes_per_second: None,
             max_concurrent_queries_per_tenant: 4,
             default_tenant_max_streams: None,
             default_tenant_max_stored_bytes: None,
@@ -557,10 +524,6 @@ impl Config {
                 defaults.max_batch_bytes,
             )?,
             max_batch_ms: env_u64("LOGGYTRACY_MAX_BATCH_MS", defaults.max_batch_ms)?,
-            max_push_bytes: env_positive_usize(
-                "LOGGYTRACY_MAX_PUSH_BYTES",
-                defaults.max_push_bytes,
-            )?,
             max_line_bytes: env_positive_usize(
                 "LOGGYTRACY_MAX_LINE_BYTES",
                 defaults.max_line_bytes,
@@ -679,18 +642,6 @@ impl Config {
             max_retention_runtime: env_required_duration(
                 "LOGGYTRACY_MAX_RETENTION_RUNTIME",
                 defaults.max_retention_runtime,
-            )?,
-            default_tenant_ingest_bytes_per_second: env_optional_u64(
-                "LOGGYTRACY_DEFAULT_TENANT_INGEST_BYTES_PER_SECOND",
-                defaults.default_tenant_ingest_bytes_per_second,
-            )?,
-            tenant_ingest_burst: env_required_duration(
-                "LOGGYTRACY_TENANT_INGEST_BURST",
-                defaults.tenant_ingest_burst,
-            )?,
-            default_tenant_query_scan_bytes_per_second: env_optional_u64(
-                "LOGGYTRACY_DEFAULT_TENANT_QUERY_SCAN_BYTES_PER_SECOND",
-                defaults.default_tenant_query_scan_bytes_per_second,
             )?,
             max_concurrent_queries_per_tenant: env_positive_usize(
                 "LOGGYTRACY_MAX_CONCURRENT_QUERIES_PER_TENANT",
@@ -865,7 +816,6 @@ impl Config {
         positive_usize("max_batch_bytes", self.max_batch_bytes)?;
         // Zero is the default and means "do not linger", so this one is not a
         // positive-value knob.
-        positive_usize("max_push_bytes", self.max_push_bytes)?;
         positive_usize("max_line_bytes", self.max_line_bytes)?;
         positive_usize(
             "max_label_names_per_stream",

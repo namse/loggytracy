@@ -31,52 +31,11 @@ pub enum TenantRetention {
     Infinite,
 }
 
-/// How fast one tenant may write to this instance.
-///
-/// A *rate*, deliberately, and not the monthly volume budget the plan sells.
-/// A monthly budget is platform-wide state — several instances can serve the
-/// same tenant, and the month outlives any of them — so the control plane is
-/// the only place that can hold it. What an instance can enforce on its own is
-/// the share of itself it hands to one tenant, and that is what protects the
-/// other tenants on it from a neighbour's burst.
-///
-/// The numbers are not decided here. Plans differ, they change after launch,
-/// and a value compiled in or read from this instance's environment could be
-/// neither per-tenant nor changed without a restart. This is the field the
-/// control plane pushes into; [`TenantIngestRate`] is only its shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TenantIngestRate {
-    Unlimited,
-    /// Zero is a legal value and means the tenant may not write at all, the
-    /// same way `retention: "0"` is how a tenant is deleted rather than a
-    /// degenerate case of keeping data.
-    BytesPerSecond(u64),
-}
-
-/// How much a tenant may read from this instance, in bytes of scanned data per
-/// second.
-///
-/// The read counterpart to [`TenantIngestRate`], and shaped the same way for
-/// the same reason: plans differ per tenant and change after launch. Scanning
-/// is the expensive side of this engine — a single query can walk gigabytes —
-/// and until now nothing bounded one tenant's share of that.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TenantQueryRate {
-    Unlimited,
-    /// Zero means the tenant may not query. That is a real state — a suspended
-    /// account still owns its data and must not be able to read it — and it is
-    /// spelled the same way `retention: "0"` and `ingest_rate: "0"` are.
-    BytesPerSecond(u64),
-}
-
 /// How much a tenant may keep stored on this instance.
 ///
-/// A *stock*, where the two rates above are flows, and that difference is the
-/// whole reason it exists: a rate bounds what a tenant can do to its
-/// neighbours in a second, and nothing about a rate stops a tenant inside it
-/// from accumulating storage forever. Retention is the other half — it decides
-/// when bytes leave — so a plan that sells a period and a size needs both, and
-/// this is the size.
+/// A *stock*: nothing else bounds how much a tenant inside every other limit
+/// can accumulate. Retention is the other half — it decides when bytes leave —
+/// so a plan that sells a period and a size needs both, and this is the size.
 ///
 /// Enforced by refusing writes rather than by deleting. A tenant over its limit
 /// keeps every byte it already has and is told to stop sending; the bytes come
@@ -87,7 +46,8 @@ pub enum TenantQueryRate {
 pub enum TenantStorageLimit {
     Unlimited,
     /// Zero means the tenant may not store anything, which is a suspended
-    /// account that has not yet been deleted.
+    /// account that has not yet been deleted. It is spelled the same way
+    /// `retention: "0"` is.
     Bytes(u64),
 }
 
@@ -100,15 +60,6 @@ pub enum TenantStorageLimit {
 struct PolicyEntry {
     retention: TenantRetention,
     raw: String,
-    /// `None` for a policy pushed before ingest rates existed, which is left
-    /// distinct from an explicit `unlimited` for the same reason an unknown
-    /// tenant is distinct from an infinite one: only one of them is an answer
-    /// the control plane gave. An absent rate falls back to the configured
-    /// default for tenants nothing is known about.
-    ingest_rate: Option<TenantIngestRate>,
-    raw_ingest_rate: Option<String>,
-    query_rate: Option<TenantQueryRate>,
-    raw_query_rate: Option<String>,
     /// Distinct log streams the tenant may hold at once, or `None` when the
     /// control plane has said nothing.
     ///
@@ -118,8 +69,8 @@ struct PolicyEntry {
     /// nothing takes back.
     max_streams: Option<u64>,
     /// Bytes the tenant may keep stored, or `None` when the control plane has
-    /// said nothing. Kept alongside the string it arrived as, like the rates,
-    /// so a `GET` returns what was pushed rather than a re-rendering of it.
+    /// said nothing. Kept alongside the string it arrived as, so a `GET`
+    /// returns what was pushed rather than a re-rendering of it.
     max_stored_bytes: Option<TenantStorageLimit>,
     raw_max_stored_bytes: Option<String>,
     updated_at: SystemTime,
@@ -129,8 +80,6 @@ impl PolicyEntry {
     fn view(&self) -> PolicyView {
         PolicyView {
             retention: self.raw.clone(),
-            ingest_rate: self.raw_ingest_rate.clone(),
-            query_rate: self.raw_query_rate.clone(),
             max_streams: self.max_streams,
             max_stored_bytes: self.raw_max_stored_bytes.clone(),
             updated_at: self.updated_at,
@@ -141,8 +90,6 @@ impl PolicyEntry {
 /// One tenant's policy as the admin endpoints report it.
 pub struct PolicyView {
     pub retention: String,
-    pub ingest_rate: Option<String>,
-    pub query_rate: Option<String>,
     pub max_streams: Option<u64>,
     pub max_stored_bytes: Option<String>,
     pub updated_at: SystemTime,
@@ -156,17 +103,6 @@ pub struct PolicyMap {
 impl PolicyMap {
     pub fn retention(&self, tenant: &TenantId) -> Option<TenantRetention> {
         self.entries.get(tenant).map(|entry| entry.retention)
-    }
-
-    /// The rate the control plane pushed for this tenant, or `None` when it
-    /// has said nothing — in which case the caller applies the configured
-    /// default rather than inventing one here.
-    pub fn ingest_rate(&self, tenant: &TenantId) -> Option<TenantIngestRate> {
-        self.entries.get(tenant).and_then(|entry| entry.ingest_rate)
-    }
-
-    pub fn query_rate(&self, tenant: &TenantId) -> Option<TenantQueryRate> {
-        self.entries.get(tenant).and_then(|entry| entry.query_rate)
     }
 
     pub fn max_streams(&self, tenant: &TenantId) -> Option<u64> {
@@ -354,14 +290,10 @@ enum PolicyStore {
 #[derive(Serialize, Deserialize)]
 struct PolicyDocument {
     retention: String,
-    /// Absent in every policy stored before ingest rates existed. `default`
-    /// rather than required, because a stored policy that suddenly fails to
+    /// Absent in every policy stored before limits existed. `default` rather
+    /// than required, because a stored policy that suddenly fails to
     /// deserialize is a fatal boot — the same trap `meta.json` fell into
     /// before it had a version field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ingest_rate: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    query_rate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_streams: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -442,24 +374,6 @@ impl PolicyStore {
                     document.retention
                 )
             })?;
-            let ingest_rate = document
-                .ingest_rate
-                .as_deref()
-                .map(|raw| {
-                    parse_ingest_rate(raw).map_err(|error| {
-                        format!("invalid ingest_rate {raw:?} in {file_name:?}: {error}")
-                    })
-                })
-                .transpose()?;
-            let query_rate = document
-                .query_rate
-                .as_deref()
-                .map(|raw| {
-                    parse_query_rate(raw).map_err(|error| {
-                        format!("invalid query_rate {raw:?} in {file_name:?}: {error}")
-                    })
-                })
-                .transpose()?;
             let max_stored_bytes = document
                 .max_stored_bytes
                 .as_deref()
@@ -480,10 +394,6 @@ impl PolicyStore {
                 PolicyEntry {
                     retention,
                     raw: document.retention,
-                    ingest_rate,
-                    raw_ingest_rate: document.ingest_rate,
-                    query_rate,
-                    raw_query_rate: document.query_rate,
                     max_streams: document.max_streams,
                     max_stored_bytes,
                     raw_max_stored_bytes: document.max_stored_bytes,
@@ -681,17 +591,15 @@ impl TenantPolicy {
     /// The order is the whole point of the push shape: a success is a promise
     /// that the policy survives a restart, so the control plane's retry loop
     /// terminates on a real guarantee.
-    /// A push carries the whole policy, so omitting `ingest_rate` clears it
+    /// A push carries the whole policy, so omitting `max_streams` clears it
     /// rather than leaving the previous value in place. Merging instead would
     /// make the stored state depend on the order of pushes, and a control
     /// plane retrying a push it believes to be complete would silently keep a
-    /// rate it thinks it removed.
+    /// limit it thinks it removed.
     pub async fn push(
         &self,
         tenant: &TenantId,
         raw: &str,
-        raw_ingest_rate: Option<&str>,
-        raw_query_rate: Option<&str>,
         max_streams: Option<u64>,
         raw_max_stored_bytes: Option<&str>,
     ) -> Result<PolicyView, PolicyError> {
@@ -707,20 +615,6 @@ impl TenantPolicy {
                 return Err(PolicyError::Invalid(error));
             }
         };
-        let ingest_rate = match raw_ingest_rate.map(parse_ingest_rate).transpose() {
-            Ok(rate) => rate,
-            Err(error) => {
-                self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
-                return Err(PolicyError::Invalid(error));
-            }
-        };
-        let query_rate = match raw_query_rate.map(parse_query_rate).transpose() {
-            Ok(rate) => rate,
-            Err(error) => {
-                self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
-                return Err(PolicyError::Invalid(error));
-            }
-        };
         let max_stored_bytes = match raw_max_stored_bytes.map(parse_storage_limit).transpose() {
             Ok(limit) => limit,
             Err(error) => {
@@ -729,8 +623,6 @@ impl TenantPolicy {
             }
         };
         let raw = raw.trim().to_string();
-        let raw_ingest_rate = raw_ingest_rate.map(|rate| rate.trim().to_string());
-        let raw_query_rate = raw_query_rate.map(|rate| rate.trim().to_string());
         let raw_max_stored_bytes = raw_max_stored_bytes.map(|limit| limit.trim().to_string());
 
         // Stamped under the lock, not on arrival: two concurrent pushes for the
@@ -741,8 +633,6 @@ impl TenantPolicy {
         let updated_at = self.clock.now();
         let document = PolicyDocument {
             retention: raw.clone(),
-            ingest_rate: raw_ingest_rate.clone(),
-            query_rate: raw_query_rate.clone(),
             max_streams,
             max_stored_bytes: raw_max_stored_bytes.clone(),
             updated_at: format_timestamp(updated_at),
@@ -759,10 +649,6 @@ impl TenantPolicy {
                 PolicyEntry {
                     retention,
                     raw: raw.clone(),
-                    ingest_rate,
-                    raw_ingest_rate: raw_ingest_rate.clone(),
-                    query_rate,
-                    raw_query_rate: raw_query_rate.clone(),
                     max_streams,
                     max_stored_bytes,
                     raw_max_stored_bytes: raw_max_stored_bytes.clone(),
@@ -773,25 +659,10 @@ impl TenantPolicy {
         self.metrics.push_accepted.fetch_add(1, Ordering::Relaxed);
         Ok(PolicyView {
             retention: raw,
-            ingest_rate: raw_ingest_rate,
-            query_rate: raw_query_rate,
             max_streams,
             max_stored_bytes: raw_max_stored_bytes,
             updated_at,
         })
-    }
-
-    /// The rate the control plane pushed for `tenant`, or `None` when it has
-    /// said nothing about it — including when per-tenant policy is off
-    /// entirely. The caller applies the configured default in that case, so
-    /// that "policy disabled" and "tenant unknown" behave identically instead
-    /// of one of them silently meaning unlimited.
-    pub fn ingest_rate(&self, tenant: &TenantId) -> Option<TenantIngestRate> {
-        self.snapshot()?.ingest_rate(tenant)
-    }
-
-    pub fn query_rate(&self, tenant: &TenantId) -> Option<TenantQueryRate> {
-        self.snapshot()?.query_rate(tenant)
     }
 
     pub fn max_streams(&self, tenant: &TenantId) -> Option<u64> {
@@ -851,10 +722,6 @@ impl TenantPolicy {
                     PolicyEntry {
                         retention,
                         raw,
-                        ingest_rate: None,
-                        raw_ingest_rate: None,
-                        query_rate: None,
-                        raw_query_rate: None,
                         max_streams: None,
                         max_stored_bytes: None,
                         raw_max_stored_bytes: None,
@@ -942,24 +809,9 @@ pub fn parse_retention(raw: &str) -> Result<TenantRetention, String> {
     Ok(TenantRetention::Finite(Duration::from_nanos(nanos)))
 }
 
-/// Parses an ingest rate: a byte size per second, or the literal `unlimited`.
-///
-/// `"0"` is accepted and means the tenant may not write, mirroring
-/// `retention: "0"`. The unit is bytes per second and is not optional in the
-/// suffix-less case for the same reason a bare number is not a duration: a
-/// value whose unit has to be guessed is a value that will eventually be
-/// guessed wrong.
-pub fn parse_query_rate(raw: &str) -> Result<TenantQueryRate, String> {
-    match parse_ingest_rate(raw)? {
-        TenantIngestRate::Unlimited => Ok(TenantQueryRate::Unlimited),
-        TenantIngestRate::BytesPerSecond(rate) => Ok(TenantQueryRate::BytesPerSecond(rate)),
-    }
-}
-
-/// Parses a storage limit: a byte size, or the literal `unlimited`.
-///
-/// The same spellings as a rate without the `/s`, so a control plane rendering
-/// a plan writes `4MiB/s` and `10GiB` from the same formatter.
+/// Parses a storage limit: a byte size such as `10GiB`, `0`, or the literal
+/// `unlimited`. `"0"` means the tenant may not store anything, mirroring
+/// `retention: "0"`.
 pub fn parse_storage_limit(raw: &str) -> Result<TenantStorageLimit, String> {
     let value = raw.trim();
     if value.eq_ignore_ascii_case("unlimited") {
@@ -968,22 +820,6 @@ pub fn parse_storage_limit(raw: &str) -> Result<TenantStorageLimit, String> {
     if value.ends_with("/s") {
         return Err("a storage limit is a size, not a rate; drop the \"/s\"".to_string());
     }
-    match parse_ingest_rate(value) {
-        Ok(TenantIngestRate::BytesPerSecond(bytes)) => Ok(TenantStorageLimit::Bytes(bytes)),
-        Ok(TenantIngestRate::Unlimited) => Ok(TenantStorageLimit::Unlimited),
-        Err(_) => Err(
-            "expected a byte size such as 512MiB, 10GiB, 0, or the literal \"unlimited\""
-                .to_string(),
-        ),
-    }
-}
-
-pub fn parse_ingest_rate(raw: &str) -> Result<TenantIngestRate, String> {
-    let value = raw.trim();
-    if value.eq_ignore_ascii_case("unlimited") {
-        return Ok(TenantIngestRate::Unlimited);
-    }
-    let value = value.strip_suffix("/s").map(str::trim_end).unwrap_or(value);
     let (number, unit) = if let Some(number) = value.strip_suffix("KiB") {
         (number, 1024u64)
     } else if let Some(number) = value.strip_suffix("MiB") {
@@ -996,12 +832,12 @@ pub fn parse_ingest_rate(raw: &str) -> Result<TenantIngestRate, String> {
         (value, 1u64)
     };
     let number: u64 = number.trim().parse().map_err(|_| {
-        "expected a byte rate such as 512KiB/s, 4MiB/s, 0, or the literal \"unlimited\"".to_string()
+        "expected a byte size such as 512MiB, 10GiB, 0, or the literal \"unlimited\"".to_string()
     })?;
     let bytes = number
         .checked_mul(unit)
-        .ok_or_else(|| "ingest rate overflow".to_string())?;
-    Ok(TenantIngestRate::BytesPerSecond(bytes))
+        .ok_or_else(|| "storage limit overflow".to_string())?;
+    Ok(TenantStorageLimit::Bytes(bytes))
 }
 
 #[cfg(test)]
@@ -1107,7 +943,7 @@ mod tests {
         assert!(!policy.is_tenant_allowed(&tenant("acme")));
 
         policy
-            .push(&tenant("acme"), "30d", None, None, None, None)
+            .push(&tenant("acme"), "30d", None, None)
             .await
             .unwrap();
         assert!(policy.is_tenant_allowed(&tenant("acme")));
@@ -1127,16 +963,16 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "30d", None, None, None, None)
+            .push(&tenant("acme"), "30d", None, None)
             .await
             .unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None, None, None, None)
+            .push(&tenant("intern"), "infinite", None, None)
             .await
             .unwrap();
         // A downgrade taken before the restart must still be in force after it.
         policy
-            .push(&tenant("acme"), "7d", None, None, None, None)
+            .push(&tenant("acme"), "7d", None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1189,7 +1025,7 @@ mod tests {
         let dir = data_dir.join(TENANT_POLICY_PREFIX);
         let policy = TenantPolicy::for_test_with_local_store(dir.clone());
         policy
-            .push(&tenant("acme"), "7d", None, None, None, None)
+            .push(&tenant("acme"), "7d", None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1239,7 +1075,7 @@ mod tests {
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
         policy
-            .push(&tenant("acme"), "7d", None, None, None, None)
+            .push(&tenant("acme"), "7d", None, None)
             .await
             .unwrap();
 
@@ -1279,7 +1115,7 @@ mod tests {
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
         policy
-            .push(&tenant("acme"), "1d", None, None, None, None)
+            .push(&tenant("acme"), "1d", None, None)
             .await
             .unwrap();
 
@@ -1295,7 +1131,7 @@ mod tests {
         // The control plane upgrades the tenant. The row is still on disk, and
         // the new plan covers it again.
         policy
-            .push(&tenant("acme"), "30d", None, None, None, None)
+            .push(&tenant("acme"), "30d", None, None)
             .await
             .unwrap();
         assert!(
@@ -1312,14 +1148,14 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "30d", None, None, None, None)
+            .push(&tenant("acme"), "30d", None, None)
             .await
             .unwrap();
 
         // A malformed value is rejected before anything is written.
         assert!(matches!(
             policy
-                .push(&tenant("acme"), "soon", None, None, None, None)
+                .push(&tenant("acme"), "soon", None, None)
                 .await,
             Err(PolicyError::Invalid(_))
         ));
@@ -1337,7 +1173,7 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy
-            .push(&tenant("acme"), "1ms", None, None, None, None)
+            .push(&tenant("acme"), "1ms", None, None)
             .await
             .unwrap();
         assert!(policy.query_floor_ns(&tenant("acme")).is_some());
@@ -1363,11 +1199,11 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage);
         policy
-            .push(&tenant("acme"), "3650d", None, None, None, None)
+            .push(&tenant("acme"), "3650d", None, None)
             .await
             .unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None, None, None, None)
+            .push(&tenant("intern"), "infinite", None, None)
             .await
             .unwrap();
 

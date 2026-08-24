@@ -11,25 +11,18 @@ pub struct RuntimeMetrics {
     /// from `ingest_errors`: this one says the server is healthy and saying no,
     /// which is the signal an operator scales or tunes flush on.
     pub ingest_throttled: AtomicU64,
-    /// Requests refused because the tenant was over the ingest rate its policy
-    /// grants. Separate from `ingest_throttled`: that one says this instance is
-    /// behind and an operator should scale or tune it, this one says the
-    /// instance is healthy and the tenant asked for more than it was sold.
-    pub ingest_quota_rejected: AtomicU64,
-    /// Queries refused by the tenant's own read quota — its scan rate or its
-    /// concurrency limit. Separate from `query_errors`, which counts queries
-    /// this instance failed to answer: this one says the instance was willing
-    /// and the tenant was over what it was sold.
+    /// Queries refused by the tenant's own concurrency limit. Separate from
+    /// `query_errors`, which counts queries this instance failed to answer:
+    /// this one says the instance was willing and the tenant was over what it
+    /// was sold.
     pub query_quota_rejected: AtomicU64,
     /// Writes refused because they would create a stream past the tenant's
-    /// limit. Counted apart from the rate rejections: this one says the tenant
-    /// is generating labels, which is a client bug far more often than it is a
-    /// plan being outgrown.
+    /// limit. This one says the tenant is generating labels, which is a client
+    /// bug far more often than it is a plan being outgrown.
     pub stream_limit_rejected: AtomicU64,
     /// Writes refused because the tenant is already storing everything its plan
-    /// sells. Separate from the rate rejections: a rate clears in a second on
-    /// its own, and this one clears only when retention retires parts, so the
-    /// two mean different things to whoever is looking at them.
+    /// sells. It clears only when retention retires parts, which is why the
+    /// refusal carries a long Retry-After.
     pub storage_limit_rejected: AtomicU64,
     /// Records and entries the last startup replayed out of the WAL.
     ///
@@ -148,7 +141,6 @@ impl RuntimeMetrics {
             ingest_requests: AtomicU64::new(0),
             ingest_errors: AtomicU64::new(0),
             ingest_throttled: AtomicU64::new(0),
-            ingest_quota_rejected: AtomicU64::new(0),
             query_quota_rejected: AtomicU64::new(0),
             stream_limit_rejected: AtomicU64::new(0),
             storage_limit_rejected: AtomicU64::new(0),

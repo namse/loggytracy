@@ -144,10 +144,10 @@
         }
     }
 
-    /// Backpressure and the tenant rate are decided before the request is
-    /// normalized, and they answer with the code OTLP exporters back off on.
+    /// A drained server refuses before the request is normalized, with the
+    /// code OTLP exporters back off on.
     #[tokio::test]
-    async fn a_drained_or_over_quota_export_is_refused_before_it_is_normalized() {
+    async fn a_drained_export_is_refused_before_it_is_normalized() {
         let config = config("drain");
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let memtable = Arc::new(MemTable::new());
@@ -169,41 +169,6 @@
             .await
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unavailable);
-
-        let quota_config = Config {
-            default_tenant_ingest_bytes_per_second: Some(1),
-            tenant_ingest_burst: std::time::Duration::from_nanos(1),
-            max_push_bytes: 1,
-            ..config.clone()
-        };
-        let quota_service = LogIngestService::new(
-            journal.clone(),
-            Arc::new(crate::shutdown::ShutdownState::new()),
-            Arc::new(quota_config.clone()),
-            IngestGate::for_test(&journal, &quota_config),
-            crate::tenant_quota::TenantQuota::for_test(&quota_config),
-            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
-            crate::clock::Clock::system(),
-            Arc::new(crate::part_registry::PartRegistry::new()),
-        );
-        // The first export drains the one-byte bucket, the second finds it empty.
-        let _ = quota_service
-            .export(tenant_request(request(vec![record("first")])))
-            .await;
-        let status = quota_service
-            .export(tenant_request(request(vec![record("second")])))
-            .await
-            .expect_err("the tenant is over its rate");
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-        // The delay this refusal computes from how far over the rate the tenant
-        // is used to be dropped on the way to the wire, which turned a
-        // "come back in n seconds" into a status a collector discards on.
-        assert!(
-            status
-                .get_details_retry_info()
-                .is_some_and(|info| info.retry_delay.is_some_and(|delay| !delay.is_zero())),
-            "a rate refusal must name a delay"
-        );
 
         assert!(
             memtable

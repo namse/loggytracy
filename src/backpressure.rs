@@ -146,9 +146,8 @@ impl IngestGate {
     ///
     /// **An empty server always admits one body**, whatever the ceiling says.
     /// Without that a ceiling set below one legal request would refuse it
-    /// forever with nothing in flight to wait for — the same trap
-    /// `max_push_bytes` flooring the token bucket's burst avoids. Progress is
-    /// the invariant; the ceiling only decides how many bodies share the server.
+    /// forever with nothing in flight to wait for. Progress is the invariant;
+    /// the ceiling only decides how many bodies share the server.
     pub fn admit_body(&self, bytes: u64) -> Result<InflightBody, IngestError> {
         let Some(limit) = self.config.max_inflight_push_bytes else {
             return Ok(self.charge(0));

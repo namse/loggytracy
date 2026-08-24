@@ -16,19 +16,14 @@ pub const MAX_ADMIN_BODY_BYTES: usize = 4 * 1024;
 #[derive(Deserialize)]
 struct RetentionRequest {
     retention: String,
-    /// Optional so a control plane that only manages retention keeps working
-    /// unchanged. Omitting it clears any rate previously pushed for the
-    /// tenant — the body is the whole policy, not a patch of it.
-    #[serde(default)]
-    ingest_rate: Option<String>,
-    /// The read side of the same policy. Optional for the same reason.
-    #[serde(default)]
-    query_rate: Option<String>,
-    /// Distinct log streams the tenant may hold at once.
+    /// Distinct log streams the tenant may hold at once. Optional so a
+    /// control plane that only manages retention keeps working unchanged;
+    /// omitting it clears any limit previously pushed for the tenant — the
+    /// body is the whole policy, not a patch of it.
     #[serde(default)]
     max_streams: Option<u64>,
     /// Bytes the tenant may keep stored, as a size such as `10GiB`. Optional
-    /// for the same reason as the rates.
+    /// for the same reason.
     #[serde(default)]
     max_stored_bytes: Option<String>,
 }
@@ -37,10 +32,6 @@ struct RetentionRequest {
 pub struct RetentionResponse {
     tenant: String,
     retention: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ingest_rate: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    query_rate: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_streams: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,25 +68,15 @@ pub async fn put_retention(
         .push(
             &tenant,
             &request.retention,
-            request.ingest_rate.as_deref(),
-            request.query_rate.as_deref(),
             request.max_streams,
             request.max_stored_bytes.as_deref(),
         )
         .await
         .map_err(into_http)?;
-    tracing::info!(
-        %tenant,
-        retention = %view.retention,
-        ingest_rate = view.ingest_rate.as_deref().unwrap_or("unset"),
-        query_rate = view.query_rate.as_deref().unwrap_or("unset"),
-        "tenant policy updated"
-    );
+    tracing::info!(%tenant, retention = %view.retention, "tenant policy updated");
     Ok(Json(RetentionResponse {
         tenant: tenant.as_str().to_string(),
         retention: view.retention,
-        ingest_rate: view.ingest_rate,
-        query_rate: view.query_rate,
         max_streams: view.max_streams,
         max_stored_bytes: view.max_stored_bytes,
         updated_at: rfc3339(view.updated_at),
@@ -116,8 +97,6 @@ pub async fn get_retention(
     Ok(Json(RetentionResponse {
         tenant: tenant.as_str().to_string(),
         retention: view.retention,
-        ingest_rate: view.ingest_rate,
-        query_rate: view.query_rate,
         max_streams: view.max_streams,
         max_stored_bytes: view.max_stored_bytes,
         updated_at: rfc3339(view.updated_at),
@@ -142,8 +121,6 @@ pub async fn list_tenants(
                 .map(|(tenant, view)| RetentionResponse {
                     tenant: tenant.as_str().to_string(),
                     retention: view.retention,
-                    ingest_rate: view.ingest_rate,
-                    query_rate: view.query_rate,
                     max_streams: view.max_streams,
                     max_stored_bytes: view.max_stored_bytes,
                     updated_at: rfc3339(view.updated_at),
@@ -215,8 +192,6 @@ pub async fn get_usage(
         })
         .count()
         + state.parts.tenant_stream_count(&tenant);
-    let (ingest_budget, query_budget) = state.tenant_quota.budget_snapshot(&tenant);
-
     Ok(Json(serde_json::json!({
         "tenant": tenant.as_str(),
         "streams": streams,
@@ -230,11 +205,6 @@ pub async fn get_usage(
         // their usage reads this one and nothing else.
         "stored_bytes": stored_bytes,
         "max_stored_bytes": state.tenant_quota.max_stored_bytes_for(&tenant),
-        // Remaining tokens, not consumption: the control plane holds the
-        // monthly ledger, and what an instance can answer is how close this
-        // tenant is to being refused right now.
-        "ingest_budget_bytes": ingest_budget,
-        "query_budget_bytes": query_budget,
     })))
 }
 

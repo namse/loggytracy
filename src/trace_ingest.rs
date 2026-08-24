@@ -87,9 +87,7 @@ impl OtlpTraceIngest<'_> {
         tenant: &crate::tenant::TenantId,
         encoded_len: usize,
     ) -> Result<(), IngestError> {
-        // Charged on the encoded size, before normalization walks the spans,
-        // for the same reason the Loki path charges before decompressing.
-        self.tenant_quota.check(tenant, encoded_len as u64)?;
+        self.tenant_quota.admit_storage(tenant)?;
         if encoded_len > MAX_OTLP_REQUEST_BYTES {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,

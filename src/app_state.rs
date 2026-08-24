@@ -104,7 +104,6 @@ impl AppState {
         });
         let tenant_quota = Arc::new(TenantQuota::new(
             config.clone(),
-            dependencies.clock.clone(),
             dependencies.metrics.clone(),
             dependencies.tenant_policy.clone(),
             dependencies.parts.clone(),

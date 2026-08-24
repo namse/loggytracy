@@ -44,10 +44,6 @@ async fn run_metric_query(
 struct MetricQueryResult {
     series: Vec<MetricSeries>,
     scanned_rows: u64,
-    /// Carried so the tenant's scan budget is charged in bytes on both paths.
-    /// Rows would be a different unit for the same bucket, and a metric query
-    /// over wide lines would then look cheap.
-    scanned_bytes: u64,
 }
 
 async fn run_metric_query_with_stats(
@@ -65,8 +61,6 @@ async fn run_metric_query_with_stats(
         .tenant_quota
         .begin_query(&tenant)
         .map_err(|error| format!("{TENANT_QUOTA_PREFIX}{}", error.message))?;
-    let quota = state.tenant_quota.clone();
-    let quota_tenant = tenant.clone();
     let cancellation = Arc::new(AtomicBool::new(false));
     // Timed here for the same reason the log path is timed at its own funnel,
     // and this is the half that was missing: `rate`, `count_over_time` and
@@ -85,9 +79,6 @@ async fn run_metric_query_with_stats(
     )
     .await;
     metrics.observe_query(endpoint, started.elapsed());
-    if let Ok(execution) = &result {
-        quota.charge_scan(&quota_tenant, execution.scanned_bytes);
-    }
     result
 }
 
@@ -148,7 +139,7 @@ async fn run_metric_query_with_stats_cancellable(
         let rate = matches!(function, logql::RangeFunction::Rate);
         let bytes = matches!(function, logql::RangeFunction::BytesOverTime);
         let columns = expr.required_columns();
-        let (diff, accepted, scanned_rows, scanned_bytes) = run_metric_count_scan(
+        let (diff, accepted, scanned_rows, _scanned_bytes) = run_metric_count_scan(
             state,
             tenant,
             query,
@@ -184,7 +175,6 @@ async fn run_metric_query_with_stats_cancellable(
         return Ok(MetricQueryResult {
             series,
             scanned_rows,
-            scanned_bytes,
         });
     }
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -206,7 +196,7 @@ async fn run_metric_query_with_stats_cancellable(
         max_metric_series,
         Some(max_query_memory_bytes),
     );
-    let (sink, scanned_rows, scanned_bytes) = run_metric_event_scan(
+    let (sink, scanned_rows, _scanned_bytes) = run_metric_event_scan(
         state.clone(),
         tenant,
         query,
@@ -285,7 +275,6 @@ async fn run_metric_query_with_stats_cancellable(
             .map(|(labels, samples)| MetricSeries { labels, samples })
             .collect(),
         scanned_rows,
-        scanned_bytes,
     })
 }
 

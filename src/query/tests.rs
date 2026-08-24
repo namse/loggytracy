@@ -3029,34 +3029,10 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         let memtable = Arc::new(MemTable::new());
         let config = Config {
             data_dir: dir.clone(),
-            default_tenant_query_scan_bytes_per_second: Some(1),
-            tenant_ingest_burst: std::time::Duration::from_nanos(1),
-            max_push_bytes: 1,
+            max_concurrent_queries_per_tenant: 1,
             ..Config::default()
         };
-        // Backed by a part, not the memtable: the scan budget is charged on
-        // bytes read out of parts, which is where a query's real cost is.
         let parts = Arc::new(PartRegistry::new());
-        parts
-            .register(
-                part::flush_rows(
-                    vec![Row {
-                        tenant: test_tenant(),
-                        timestamp_ns: 1_700_000_000_000_000_000,
-                        labels: SharedLabels::new(
-                            [("app".to_string(), "quota".to_string())]
-                                .into_iter()
-                                .collect(),
-                        ),
-                        line: "a line long enough to cost some scan budget".to_string(),
-                        structured_metadata: Vec::new(),
-                    }],
-                    &dir.join("parts"),
-                    config.row_group_size,
-                )
-                .unwrap(),
-            )
-            .unwrap();
         let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::standalone());
         let state = crate::test_support::state(
             config.clone(),
@@ -3067,15 +3043,15 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             None,
         );
 
-        let uri = "/loki/api/v1/query_range?query=%7Bapp%3D%22quota%22%7D";
-        let (first, _) = get_json(&state, uri).await;
-        assert_eq!(first, StatusCode::OK, "the first query runs and pays after");
+        // The tenant's one slot is taken by a query still in flight.
+        let slot = state.tenant_quota.begin_query(&test_tenant()).unwrap();
 
-        let (second, body) = get_json(&state, uri).await;
+        let uri = "/loki/api/v1/query_range?query=%7Bapp%3D%22quota%22%7D";
+        let (refused, body) = get_json(&state, uri).await;
         assert_eq!(
-            second,
+            refused,
             StatusCode::TOO_MANY_REQUESTS,
-            "the next query pays for the last one: {body}"
+            "a tenant at its concurrency limit is told to come back: {body}"
         );
         assert_eq!(
             state
@@ -3093,6 +3069,10 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             0,
             "a refused query is not a failed one"
         );
+
+        drop(slot);
+        let (allowed, _) = get_json(&state, uri).await;
+        assert_eq!(allowed, StatusCode::OK, "the freed slot admits the next query");
     }
 
     fn unwrapped_entries(values: &[(i64, &str)]) -> Vec<(SharedLabels, LogEntry)> {

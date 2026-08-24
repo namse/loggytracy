@@ -223,35 +223,6 @@
         assert!(lines(&memtable).is_empty());
     }
 
-    /// HTTP and gRPC share one admission path, so the tenant rate applies to
-    /// both. Checking it here rather than only on gRPC is the point of that
-    /// sharing: a limit enforced on one transport is not a limit.
-    #[tokio::test]
-    async fn the_tenant_rate_applies_to_the_http_transport_too() {
-        let config = Config {
-            data_dir: std::env::temp_dir()
-                .join(format!("loggytracy-otlp-http-rate-{}", uuid::Uuid::new_v4())),
-            default_tenant_ingest_bytes_per_second: Some(1),
-            tenant_ingest_burst: std::time::Duration::from_nanos(1),
-            max_push_bytes: 1,
-            ..Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let memtable = Arc::new(MemTable::new());
-        let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
-        let parts = Arc::new(PartRegistry::new());
-        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
-            parts.operation_lock(),
-        ));
-        let state =
-            crate::test_support::state(config, memtable.clone(), journal, parts, trace_parts, None);
-
-        let body = log_request("first").encode_to_vec();
-        let _ = post(&state, "/v1/logs", "application/x-protobuf", body.clone()).await;
-        let (status, _, _) = post(&state, "/v1/logs", "application/x-protobuf", body).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    }
-
     /// 403 and not 400: the request is well formed and there is nothing the
     /// client can change about it. With per-tenant policy enabled, the pushed
     /// policies are the tenant registry — a tenant nothing was pushed for is
@@ -274,7 +245,7 @@
             crate::clock::Clock::system(),
         ));
         tenant_policy
-            .push(&test_tenant(), "30d", None, None, None, None)
+            .push(&test_tenant(), "30d", None, None)
             .await
             .expect("the test tenant is onboarded by pushing a policy");
         let state = crate::test_support::state_with_tenant_policy(
