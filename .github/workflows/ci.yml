@@ -46,7 +46,21 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --locked
+        # The full output is written to a file and uploaded on failure, because
+        # a flaky failure's one useful fact is the panic message of the run
+        # that failed — a rerun that passes destroys it. `--no-fail-fast` so a
+        # flake does not hide whatever else failed in the same run.
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast 2>&1 | tee target/test-output.log
+
+      - name: Preserve the full test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-output.log
+          if-no-files-found: ignore
 
       - name: Load-harness smoke run
         # NOT A MEASUREMENT. Debug profile, twenty seconds, on a shared runner
