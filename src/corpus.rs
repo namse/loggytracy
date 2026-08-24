@@ -641,11 +641,18 @@ impl Corpus {
         snapshot
     }
 
+    /// Rows in the shape a part writer expects. Callers hand these straight to
+    /// `flush_rows`, skipping the memtable — which is where structured metadata
+    /// takes its canonical form on the real path — so it is canonicalized here.
+    /// The entries themselves stay as generated: a push body carrying unsorted
+    /// metadata is exactly what exercises the ingest path's own sort.
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::with_capacity(self.entry_count());
         for stream in &self.streams {
             for entry in &stream.entries {
-                rows.push(Row::from_entry(&stream.tenant, &stream.labels, entry));
+                let mut row = Row::from_entry(&stream.tenant, &stream.labels, entry);
+                crate::memtable::canonicalize_structured_metadata(&mut row.structured_metadata);
+                rows.push(row);
             }
         }
         rows
