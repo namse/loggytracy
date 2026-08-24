@@ -466,3 +466,113 @@
         );
         assert!(rendered.contains("loggytracy_stream_limit_rejected_total"));
     }
+
+    async fn read_labels_as(state: &Arc<AppState>, tenant: &str) -> StatusCode {
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/loki/api/v1/labels")
+            .header(crate::tenant::TENANT_HEADER, tenant)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        crate::build_router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The pushed policies are the tenant registry: a push onboards the tenant
+    /// the moment it answers 200, and a delete returns it to unknown, which
+    /// every request path refuses.
+    #[tokio::test]
+    async fn a_push_onboards_the_tenant_and_a_delete_offboards_it() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = Arc::new(TenantPolicy::for_test_with_store(storage));
+        let state = state_with(policy, Some(TOKEN));
+
+        assert_eq!(
+            read_labels_as(&state, "acme").await,
+            StatusCode::FORBIDDEN,
+            "a tenant nothing was pushed for is not served"
+        );
+
+        let (status, _) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            Some(TOKEN),
+            r#"{"retention":"30d"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            read_labels_as(&state, "acme").await,
+            StatusCode::OK,
+            "the push onboarded the tenant"
+        );
+        assert_eq!(
+            read_labels_as(&state, "stranger").await,
+            StatusCode::FORBIDDEN,
+            "onboarding one tenant does not open the door for another"
+        );
+
+        let (status, _) = call(&state, "DELETE", RETENTION_URI, Some(TOKEN), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            read_labels_as(&state, "acme").await,
+            StatusCode::FORBIDDEN,
+            "the delete offboarded the tenant"
+        );
+    }
+
+    /// `GET …/admin/tenants` is the control plane's reconciliation read: every
+    /// pushed tenant with its policy, and nothing else.
+    #[tokio::test]
+    async fn the_tenant_list_reports_every_pushed_policy() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = Arc::new(TenantPolicy::for_test_with_store(storage));
+        let state = state_with(policy, Some(TOKEN));
+        const LIST_URI: &str = "/loggytracy/api/v1/admin/tenants";
+
+        let (status, _) = call(&state, "GET", LIST_URI, None, "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, body) = call(&state, "GET", LIST_URI, Some(TOKEN), "").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["tenants"].as_array().unwrap().len(), 0);
+
+        for (uri, request_body) in [
+            (
+                "/loggytracy/api/v1/admin/tenants/zeta/retention",
+                r#"{"retention":"7d","ingest_rate":"1MiB"}"#,
+            ),
+            (
+                "/loggytracy/api/v1/admin/tenants/acme/retention",
+                r#"{"retention":"30d"}"#,
+            ),
+        ] {
+            let (status, _) = call(&state, "PUT", uri, Some(TOKEN), request_body).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (_, body) = call(&state, "GET", LIST_URI, Some(TOKEN), "").await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let tenants = json["tenants"].as_array().unwrap();
+        assert_eq!(
+            tenants
+                .iter()
+                .map(|entry| entry["tenant"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["acme", "zeta"],
+            "listed in name order"
+        );
+        assert_eq!(tenants[0]["retention"], "30d");
+        assert_eq!(tenants[1]["retention"], "7d");
+        assert_eq!(tenants[1]["ingest_rate"], "1MiB");
+        assert!(
+            tenants[0].get("ingest_rate").is_none(),
+            "a field the control plane never pushed is absent, not defaulted"
+        );
+        assert!(tenants[0]["updated_at"].as_str().is_some());
+    }

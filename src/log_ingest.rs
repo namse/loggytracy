@@ -42,6 +42,7 @@ pub struct LogIngestService {
 }
 
 impl LogIngestService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         journal: Arc<Journal>,
         shutdown: Arc<ShutdownState>,

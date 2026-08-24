@@ -1122,6 +1122,38 @@ mod tests {
         assert_eq!(policy.query_floor_ns(&tenant("acme")), None);
     }
 
+    /// The pushed policies are the tenant registry: enabled and empty serves
+    /// nobody, a push onboards, a remove offboards, and the switched-off
+    /// policy has no registry at all.
+    #[tokio::test]
+    async fn the_registry_follows_pushes_and_removes() {
+        let disabled = TenantPolicy::disabled();
+        assert!(disabled.is_tenant_allowed(&tenant("anyone")));
+
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = TenantPolicy::for_test_with_store(storage.clone());
+        assert!(!policy.is_tenant_allowed(&tenant("acme")));
+
+        policy
+            .push(&tenant("acme"), "30d", None, None, None, None)
+            .await
+            .unwrap();
+        assert!(policy.is_tenant_allowed(&tenant("acme")));
+        assert!(!policy.is_tenant_allowed(&tenant("stranger")));
+
+        // Onboarding survives a restart with the policy it rode in on.
+        let config = Config {
+            tenant_policy_token: Some("secret".to_string()),
+            retention_period: None,
+            ..Config::default()
+        };
+        let restarted = TenantPolicy::load(&config, Some(storage)).await.unwrap();
+        assert!(restarted.is_tenant_allowed(&tenant("acme")));
+
+        policy.remove(&tenant("acme")).await.unwrap();
+        assert!(!policy.is_tenant_allowed(&tenant("acme")));
+    }
+
     #[tokio::test]
     async fn a_push_is_durable_and_survives_a_restart() {
         let storage = Arc::new(ObjectStorage::in_memory());
