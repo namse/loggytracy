@@ -48,7 +48,7 @@ elsewhere in these docs.
 | Physical format | Parquet (dictionary + zstd) + sidecar index files |
 | Indexes | Stream index + per-block trigram bloom filter (no inverted index) |
 | Query language | LogQL — high-usage subset only, with clear errors for unsupported syntax |
-| API | Loki HTTP API compatible (direct Grafana Loki data source), with the Tempo API for traces |
+| API | Loki HTTP API compatible (direct Grafana Loki data source) for logs. The Tempo API was removed with the read-path decision (issue #3, M12): traces are ingested and stored but unreadable until the first-party trace API (M13) |
 | Ingest protocols | **OTLP only**, over gRPC (`:4317`) or HTTP (`POST /v1/logs`, `/v1/traces`), traces and logs. Loki push is removed — see [`VISION.md`](VISION.md), "Ingest is OTLP" |
 | Query protocol | **Loki HTTP API, unchanged.** The ingest decision above does not touch it: Grafana's Loki data source is how anyone reads this engine, and a query protocol and an ingest protocol are separate choices |
 | Transport security | **TLS is unsupported.** Only plain HTTP/gRPC is provided; a reverse proxy or service mesh handles end-to-end encryption |

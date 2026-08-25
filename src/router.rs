@@ -4,7 +4,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 
-use crate::{AppState, admin, otlp_http, query, tempo};
+use crate::{AppState, admin, otlp_http, query};
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     // The ingest routes carry their own body limit, so they are merged as a
@@ -37,22 +37,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .delete(query::cancel_delete_request),
         )
         .route("/metrics", get(query::metrics))
-        .route("/api/traces/{trace_id}", get(tempo::trace_by_id))
-        .route("/api/search", get(tempo::search))
-        .route("/api/search/tags", get(tempo::search_tags))
-        .route(
-            "/api/search/tag/{tag}/values",
-            get(tempo::search_tag_values),
-        )
-        // The current Grafana Tempo datasource tries the v2 tag APIs first and
-        // falls back to v1, so without these every tag lookup pays a failed
-        // request before the one that works.
-        .route("/api/v2/search/tags", get(tempo::search_tags_v2))
-        .route(
-            "/api/v2/search/tag/{tag}/values",
-            get(tempo::search_tag_values_v2),
-        )
-        .route("/api/echo", get(tempo::echo))
+        // The Tempo routes were removed with the read-path decision (issue #3):
+        // traces are ingested and stored but unreadable until the first-party
+        // trace API (M13) ships.
         .route("/ready", get(query::ready));
     // The admin routes carry no authentication of their own: loggytracy is
     // not built to be reachable from the outside network, and assumes every

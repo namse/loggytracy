@@ -151,26 +151,6 @@ pub fn normalize_request(
     Ok(spans)
 }
 
-pub fn canonical_trace_id(input: &str) -> Result<String, String> {
-    let input = input.trim();
-    if input.len() != TRACE_ID_BYTES * 2 {
-        return Err("trace ID must contain exactly 32 hexadecimal characters".to_string());
-    }
-    let mut bytes = Vec::with_capacity(TRACE_ID_BYTES);
-    let chars: Vec<char> = input.chars().collect();
-    for pair in chars.chunks_exact(2) {
-        let high = pair[0]
-            .to_digit(16)
-            .ok_or_else(|| "trace ID must contain only hexadecimal characters".to_string())?;
-        let low = pair[1]
-            .to_digit(16)
-            .ok_or_else(|| "trace ID must contain only hexadecimal characters".to_string())?;
-        bytes.push(((high << 4) | low) as u8);
-    }
-    normalize_id(&bytes, TRACE_ID_BYTES, TraceError::InvalidTraceId)
-        .map_err(|error| error.to_string())
-}
-
 fn normalize_span(
     tenant: &TenantId,
     span: Span,

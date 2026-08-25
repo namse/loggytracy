@@ -6,10 +6,11 @@ use crate::metrics::RuntimeMetrics;
 use crate::object_storage::RemoteCache;
 use crate::runtime_error::RuntimeError;
 
+// The Traces variant left with the Tempo surface (issue #3); the first-party
+// trace API (M13) brings trace-part restore back to the read path.
 #[derive(Clone, Copy)]
 pub(crate) enum RemoteDomain {
     Logs,
-    Traces,
 }
 
 /// Pin local immutable bodies for one query while preserving the shared
@@ -53,15 +54,6 @@ where
                 tokio::time::timeout(
                     timeout,
                     remote.storage.restore_parts(&remote.parts_root, &missing),
-                )
-                .await
-            }
-            RemoteDomain::Traces => {
-                tokio::time::timeout(
-                    timeout,
-                    remote
-                        .storage
-                        .restore_trace_parts(&remote.trace_parts_root(), &missing),
                 )
                 .await
             }
@@ -113,7 +105,6 @@ where
                 }
                 return Err(RuntimeError::Timeout(match domain {
                     RemoteDomain::Logs => "object store restore timed out".to_string(),
-                    RemoteDomain::Traces => "trace object store restore timed out".to_string(),
                 }));
             }
         }

@@ -36,7 +36,6 @@ mod router;
 mod runtime_error;
 mod shutdown;
 mod startup;
-mod tempo;
 pub mod tenant;
 pub mod tenant_policy;
 mod tenant_quota;
