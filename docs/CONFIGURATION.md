@@ -35,7 +35,6 @@ environment variables (`OBJECT_STORE_*` takes precedence). For S3-compatible sto
 | Variable | Default | Description |
 |---|---|---|
 | `LOGGYTRACY_MISSING_TENANT` | unset (reject) | Tenant a request without `X-Scope-OrgID` is filed under. **Unset — the default — rejects such requests with 400**: behind a gateway a missing header is the gateway failing, which should fail loudly rather than quietly pool everyone's data. Set it (any valid tenant id) for single-tenant deployments where nothing mints the header |
-| `LOGGYTRACY_DEFAULT_TENANT_MAX_STREAMS` | none (unbounded) | Distinct streams a tenant may hold, for tenants with no pushed `max_streams`. **Stream cardinality is the one cost neither retention nor merge reclaims** — `stream.idx` is an eviction-exempt catalog |
 | `LOGGYTRACY_DEFAULT_TENANT_MAX_STORED_BYTES` | none (unbounded) | Bytes a tenant may keep stored, for tenants with no pushed `max_stored_bytes`. A plain byte count, or `off`. **Set this before opening a free tier**: a tenant nothing was pushed for is one nobody sold anything to, and unbounded means the first of them decides how much disk the rest get |
 | `LOGGYTRACY_MAX_CONCURRENT_QUERIES_PER_TENANT` | 4 | Queries one tenant may run at once, so one tenant cannot take every permit of the shared query semaphore |
 
@@ -58,14 +57,8 @@ backpressure gate's question, answered from the server's own state.
 
 ```
 PUT /loggytracy/api/v1/admin/tenants/{tenant}/retention
-{"retention": "7d", "max_streams": 100, "max_stored_bytes": "10GiB"}
+{"retention": "7d", "max_stored_bytes": "10GiB"}
 ```
-
-`max_streams` bounds distinct streams rather than a rate, because stream
-cardinality is the one cost neither retention nor merge takes back. Only a
-stream that is new to both the parts and the buffers can be refused — a tenant
-at its limit keeps writing to the streams it has rather than going dark, so the
-failure is a client that mints label values and not a client that grew.
 
 `max_stored_bytes` is the other half of a plan that sells a period and a size:
 retention decides when bytes leave, and this decides how many may pile up before
@@ -86,8 +79,8 @@ footer and the sidecars belong to no single tenant and are not charged to one.
 `GET …/tenants/{tenant}/usage` reports the same number as `stored_bytes`
 alongside `max_stored_bytes`, which is what a control plane shows a customer.
 
-The body is the complete policy, not a patch. If it is pushed without `max_streams`, the existing value
-is **cleared** and reverts to the default above.
+The body is the complete policy, not a patch. If it is pushed without `max_stored_bytes`, the existing
+value is **cleared** and reverts to the default above.
 
 These limits apply to one instance; they are not the monthly usage sold by a plan. Monthly usage spans
 multiple instances and outlives any instance, so only the control plane can own that state.
@@ -99,9 +92,6 @@ All limits are checked **before** writing to the journal, so rejected requests l
 | Variable | Default | Description |
 |---|---|---|
 | `LOGGYTRACY_MAX_LINE_BYTES` | 256 KiB | Maximum size of one log line |
-| `LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM` | 30 | Maximum labels per stream |
-| `LOGGYTRACY_MAX_LABEL_NAME_BYTES` | 1024 | |
-| `LOGGYTRACY_MAX_LABEL_VALUE_BYTES` | 2048 | |
 | `LOGGYTRACY_MAX_TIMESTAMP_AGE` | `7d` (`off` allowed) | Reject timestamps older than this |
 | `LOGGYTRACY_MAX_TIMESTAMP_SKEW` | `1h` (`off` allowed) | Reject timestamps farther in the future than this. **A future part never reaches the retention cutoff** — confusing seconds or milliseconds with nanoseconds is common |
 
@@ -128,7 +118,7 @@ value beside the budget and its source.
 | `SIDECAR_CACHE_MAX_BYTES` | 10% | 32 MiB |
 
 The nominal shares sum to 72.5%: the remainder covers flush (which rides
-ingest), the sidecar stream indexes, and the metering gap above.
+ingest), the part sidecars, and the metering gap above.
 
 **Measured capacity at this budget** (24-hour soak, 2 GiB container, retention
 30 m, 2026-08-12): the engine sustains **the full offered 20 k eps — 19,999.8,
@@ -238,8 +228,7 @@ and there is no global period.
 | `LOGGYTRACY_CACHE_MAX_BYTES` | 10 GiB | Local part cache limit. Exceeding it triggers LRU eviction |
 | `LOGGYTRACY_CACHE_EVICTION_INTERVAL` | `30s` | |
 
-Small catalog files such as the stream index are not evicted. Therefore, **a label-cardinality explosion
-becomes disk usage that cannot be evicted**.
+Small catalog files such as `meta.json` are not evicted; the data body and the blooms are.
 
 ## Query resource limits
 
@@ -251,7 +240,7 @@ becomes disk usage that cannot be evicted**.
 | `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES` | 512 MiB (budget-derived) | One query's own materialization cap |
 | `LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES` | 512 MiB (minimum 8 MiB; budget-derived) | The shared pool **all** queries together materialize from, reserved incrementally as rows survive the pipeline. A query refused here gets an error naming the pool; before this the aggregate was `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES` and nothing enforced it |
 | `LOGGYTRACY_ROW_GROUP_CACHE_MAX_BYTES` | 256 MiB, `off` disables (budget-derived) | Decoded row groups kept across scans. A part is immutable, so a group decoded whole by one scan serves every later scan without paying the reader build again; the budget bounds what stays resident (`loggytracy_row_group_cache_bytes` reports it). Entries die with their part on merge or retirement |
-| `LOGGYTRACY_SIDECAR_CACHE_MAX_BYTES` | unbounded (`off`; budget-derived) | Byte cap on the resident bloom half of part sidecars, evicted LRU across parts. The blooms are durable in `index.bin`, so an evicted part's next pruning query pays one re-read; the stream-index half stays resident (tens of KB per part). Unbounded, residency is ~2 MiB per live part and grows with ingest rate × retention window — the term that killed the first 24-hour soak (`todo.md`) |
+| `LOGGYTRACY_SIDECAR_CACHE_MAX_BYTES` | unbounded (`off`; budget-derived) | Byte cap on the resident blooms of part sidecars, evicted LRU across parts. The blooms are durable in `index.bin`, so an evicted part's next pruning query pays one re-read. Unbounded, residency is ~2 MiB per live part and grows with ingest rate × retention window — the term that killed the first 24-hour soak (`todo.md`) |
 | `LOGGYTRACY_MAX_LOG_LIMIT` | 100,000 | Maximum `limit` parameter |
 | `LOGGYTRACY_MAX_QUERY_RUNTIME` | `30s` | Also the timeout for metadata endpoints |
 | `LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS` | 8 | Shared with metadata endpoints |

@@ -251,7 +251,6 @@ LOGGYTRACY_LISTEN_ADDR=127.0.0.1:3100
 LOGGYTRACY_OTLP_GRPC_ADDR=127.0.0.1:4317
 
 # Free tier: what an onboarded tenant gets for fields its plan never named.
-LOGGYTRACY_DEFAULT_TENANT_MAX_STREAMS=1000
 LOGGYTRACY_DEFAULT_TENANT_MAX_STORED_BYTES=1073741824
 ```
 
@@ -261,7 +260,7 @@ and survive restarts; there is nothing to reload:
 ```
 curl -X PUT https://your-gateway/loggytracy/api/v1/admin/tenants/acme/retention \
   -H 'Content-Type: application/json' \
-  -d '{"retention": "30d", "max_streams": 10000, "max_stored_bytes": "50GiB"}'
+  -d '{"retention": "30d", "max_stored_bytes": "50GiB"}'
 ```
 
 The body is the whole policy, not a patch: a field left out is cleared.

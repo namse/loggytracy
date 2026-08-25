@@ -143,8 +143,6 @@ options in [`DEPLOYMENT.md`](DEPLOYMENT.md) §4 were dropped somewhere.
 - **parts/traces are large** → Reduce `CACHE_MAX_BYTES`. They are cache only and can be restored from S3.
   However, nothing is deleted from S3 for a tenant whose pushed retention keeps data forever — decide the retentions first.
 - **WAL is large** → Flush is not progressing. Follow the item above.
-- The stream index is not evicted. A label-cardinality explosion becomes **non-evictable disk usage**,
-  so the only remedy is to fix labels at ingest.
 
 ### Tenant deletion does not finish
 
@@ -173,9 +171,9 @@ request advances on the next merge tick that reaches it. If it does not:
   tenant spread across many parts advances a few per tick rather than all at
   once.
 
-The status is deliberately conservative: part metadata records `streams` for the
-whole part, so a part holding that stream for a *different* tenant keeps the
-request at `received`. It never claims a removal that has not happened.
+The status is deliberately conservative: only a tenant segment's time span can
+rule a part out, so any part overlapping the request's window keeps it at
+`received`. It never claims a removal that has not happened.
 
 ### Two instances started with the same prefix
 

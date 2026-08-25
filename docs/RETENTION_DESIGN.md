@@ -653,13 +653,11 @@ side, which the deletion section states outright rather than leaving to be
 inferred from here — see
 [What zero retention does not do](#what-zero-retention-does-not-do).
 
-**Label endpoints clamp at part granularity.** `labels`, `label_values`,
+**Metadata endpoints clamp at part granularity.** `labels`, `label_values`,
 `series` and `index_stats` have no range to clamp, so they take the floor
-directly. MemTable entries are filtered per entry; parts are pruned per part,
-because the stream index has no per-stream timestamps. A part that straddles
-the floor therefore still contributes all of its label values. Finer pruning
-would need time-partitioned stream postings, which is not worth it for these
-endpoints.
+directly. MemTable entries are filtered per entry; parts are pruned per part
+through their tenant segments. A part that straddles the floor therefore
+still contributes all of its sampled attribute values.
 
 **A fully clamped-away range returns empty, not an error.** When the whole
 requested window is older than the tenant's retention, the clamped start passes
@@ -705,14 +703,12 @@ it admits a part holding rows for a tenant at zero retention, and for the same
 reason stated there: otherwise a part too large for any ordinary group keeps the
 rows until retention deletes the whole part, and "deleted" would be describing
 the mask rather than a removal. The test is made from `meta.json` — tenant
-segments overlapping the window, and a recorded stream matching the selector —
-so it costs a map lookup rather than a read.
+segments overlapping the window — so it costs a map lookup rather than a read.
 
 **`status` is conservative.** A request is promoted from `received` to
-`processed` only when no part's metadata could still hold a row it covers. Part
-metadata records `streams` for the whole part rather than per tenant, so a part
-holding that stream for a *different* tenant keeps the request at `received`.
-The status lags; it never claims removal that has not happened.
+`processed` only when no part's metadata could still hold a row it covers, and
+only the tenant segment's time span can rule a part out. The status lags; it
+never claims removal that has not happened.
 
 **Refused: pipeline stages in the selector.** Matchers and line filters name
 rows that exist. A stage names a value derived from them, and "the lines whose

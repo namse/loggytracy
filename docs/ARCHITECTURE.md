@@ -133,7 +133,7 @@ storage, and query paths.
   time, not write time, so plan upgrades and downgrades affect already-recorded data. A tenant never pushed
   is **policy-unknown, and unknown means retain**. Tenant deletion is retention `0`. See
   [`docs/RETENTION_DESIGN.md`](RETENTION_DESIGN.md) for details.
-- **Quota targets**: active stream count (cardinality), storage capacity, and concurrent query count.
+- **Quota targets**: storage capacity and concurrent query count.
   There are no per-tenant rates — how fast the instance accepts work is the global backpressure gate's
   question, answered from the server's own state. When a quota is exceeded, ingest returns `429`
   (Alloy backs off and relies on its own WAL), while queries return `429` or `422`. Over gRPC the same
@@ -150,7 +150,7 @@ storage, and query paths.
   limit, writes are refused; nothing is deleted to make room, because the space comes back when retention
   retires the oldest parts and choosing which of a customer's logs to destroy is not this engine's call.
 - **Current state**: Identification, validation, isolation, per-tenant retention, and the stock quotas
-  (streams, stored bytes, query concurrency) are implemented. `X-Scope-OrgID` is extracted from OTLP
+  (stored bytes, query concurrency) are implemented. `X-Scope-OrgID` is extracted from OTLP
   HTTP and gRPC and recorded in WAL records (the owner survives restart), while MemTable, part, trace
   part, query, and catalog reads all require a tenant argument. Only `/metrics` retains a process-wide
   operator aggregation. **Durable usage accounting and tier partitioning** remain, along with adaptive
@@ -158,11 +158,16 @@ storage, and query paths.
 
 ## Data model
 
-- Logs and spans are unified as wide events consisting of "timestamp + field set" (following the OTel data model).
-- Fields have two layers:
-  - **stream fields**: Low cardinality (`app`, `host`, and so on). They identify streams, are indexed in the stream index, and correspond to LogQL labels.
-  - **General fields**: High cardinality is allowed (`user_id`, `trace_id`, and so on). Store them in columns and prune with bloom filters; they correspond to LogQL pipeline filters such as `| user_id="123"`.
-- Detect value types at ingest (numbers, timestamps, IPs, and so on) and store them in typed columns rather than as strings.
+**A log is `tenant + timestamp + line + attributes`. There is no stream.**
+Logs and spans are unified as wide events consisting of "timestamp + field set"
+(following the OTel data model). Every attribute — resource and record alike —
+lives in the row's own structured metadata under a normalized key
+(`service.name` → `service_name`); nothing is promoted to a label, and no
+label-set grouping exists anywhere in storage. LogQL's `{k="v"}` selector is a
+filter over those attributes, accelerated by per-row-group exact-field blooms
+and the `_sm:` columns rather than by a stream index. High-cardinality
+attributes (`user_id`, `trace_id`) are ordinary attributes — the cardinality
+problem the stream model had does not exist here.
 
 ## Write path
 
@@ -190,14 +195,15 @@ Alloy ──▶ Ingest API
 
 A part is one immutable directory:
 
-- `data.parquet` — Schema built from fields actually present in the part (dynamic per-part schema): a
-  `_stream` u32 ordinal naming the row's label set (the sets themselves live once in `meta.json`'s
-  stream table, in ordinal order), one `_sm:<key>` column per structured-metadata key up to a cap of 128
+- `data.parquet` — Schema built from fields actually present in the part (dynamic per-part schema):
+  `_tenant`, `timestamp_ns`, `_msg`, one `_sm:<key>` column per attribute key up to a cap of 128
   chosen by row count, and a residual JSON column for the rare keys past the cap — null for every row
-  whose keys all made columns, which is every row the intended consumer sends.
-- Trigram bloom-filter sidecar — Per row group. Three-grams from text columns such as `_msg`, used to prune substring searches (`|=`). Word queries are also covered by trigrams.
-- Stream-index sidecar — Stream fields → row-group postings (roaring bitmap).
-- Metadata file — Time range, row count, field list, min/max, and CRC32 for each part file. Metadata itself is also checked with CRC32; inconsistent parts are not loaded.
+  whose keys all made columns, which is every row the intended consumer sends. Rows are sorted
+  `(tenant, timestamp)` and row groups never straddle a tenant.
+- `index.bin` — Per-row-group trigram blooms over `_msg` (pruning `|=`/`|~`) and per-window
+  exact-field blooms over attribute pairs (pruning `{k="v"}` selectors and `| field="v"` filters).
+- Metadata file — Time range, row count, per-tenant segments, column census, and CRC32 for each part
+  file. Metadata itself is also checked with CRC32; inconsistent parts are not loaded.
 
 Bloom filters are only for pruning; the final decision always comes from scanning blocks, so the scan guarantees correctness.
 
@@ -207,14 +213,12 @@ Every structure above is durable in the part directory, which is what lets the
 resident half of it be a *cache* rather than a commitment. Three mechanisms
 younger than the rest of this document:
 
-- **Sidecars are evictable, in halves.** The bloom half — the megabytes — lives
-  under one process-wide LRU byte budget (`sidecar_cache_max_bytes`, 10% of the
-  declared budget) and is re-read from `index.bin` on the next pruning query. The
-  stream index — the kilobytes — stays resident, so the metadata paths that
-  cannot fail stay infallible, and a matchers-only query never touches a bloom at
-  all. Answer equality under eviction is pinned by a test that forces every open
-  to evict every other part. Before this the sidecars grew with the part count
-  and nothing evicted them, which is what ended the first day-long soak at
+- **Sidecars are evictable.** The blooms — the megabytes — live under one
+  process-wide LRU byte budget (`sidecar_cache_max_bytes`, 10% of the declared
+  budget) and are re-read from `index.bin` on the next pruning query. Answer
+  equality under eviction is pinned by a test that forces every open to evict
+  every other part. Before this the sidecars grew with the part count and
+  nothing evicted them, which is what ended the first day-long soak at
   630 MiB of sidecar in a 2 GiB container.
 - **Decoded row groups are cached, and so are narrow-pass outcomes.**
   `part/group_cache.rs` keeps decoded groups for reuse across scans under
@@ -236,8 +240,8 @@ younger than the rest of this document:
 LogQL parsing (chumsky) → plan → pruning in this order:
 
 1. Time range → partition/part selection (manifest + part metadata)
-2. Label matchers → row-group pruning with the stream index
-3. Line filters (`|=`, `|~`) and structured-field filters → row-group pruning with trigram blooms
+2. Selector equalities and structured-field filters → row-group and window pruning with exact-field blooms
+3. Line filters (`|=`, `|~`) → row-group pruning with trigram blooms
 4. Scan only remaining row groups (MemTable + local parts; a part evicted from the local cache is
    restored whole from object storage first — range reads were measured and decided against, `todo.md`)
 
@@ -261,7 +265,7 @@ LogQL parsing (chumsky) → plan → pruning in this order:
 ## S3 and manifest
 
 - Update the manifest after a part upload completes. The manifest is versioned and uses S3 conditional writes (If-None-Match) for compare-and-swap.
-- The local disk is a part cache. Keep small metadata/bloom/stream-index catalog files and LRU-evict only `data.parquet` bodies. Queries and merges download only bodies selected by time and label pruning into a verified temporary directory and pin them against eviction while reading. Parquet range-read optimization is deferred.
+- The local disk is a part cache. Keep small metadata/bloom catalog files and LRU-evict only `data.parquet` bodies. Queries and merges download only bodies selected by time and label pruning into a verified temporary directory and pin them against eviction while reading. Parquet range-read optimization is deferred.
 - Hardware replacement (graceful shutdown): 1) on SIGTERM, immediately block the ingest endpoint (reject new requests); 2) drain until accepted in-flight requests finish WAL append/ack; 3) force-flush the MemTable accumulated by then and verify S3 upload and manifest update completion; 4) terminate the process, discard the disk, and switch hardware. Data Alloy tried to send after blocking is retried from Alloy's own buffer because it receives no ack, then reaches the replacement when it resumes the same endpoint. A narrow disconnect just before ack during drain can cause duplicates (same nature as at-least-once above), but not loss.
 
 ### Object-store settings
@@ -278,7 +282,6 @@ Protecting the engine takes priority over preserving every log line — Alloy re
 
 - The OTLP body limit is a 16 MiB constant, matched across both transports.
 - `LOGGYTRACY_MAX_LINE_BYTES` (256 KiB by default)
-- `LOGGYTRACY_MAX_LABEL_NAMES_PER_STREAM` (30 by default), `LOGGYTRACY_MAX_LABEL_NAME_BYTES` (1 KiB by default), and `LOGGYTRACY_MAX_LABEL_VALUE_BYTES` (2 KiB by default): Defend against stream-cardinality explosions. The stream index is a persistent catalog excluded from the cache limit, so a cardinality explosion becomes non-evictable disk usage.
 - `LOGGYTRACY_MAX_TIMESTAMP_AGE` (7d by default) and `LOGGYTRACY_MAX_TIMESTAMP_SKEW` (1h by default): Acceptance window relative to the server clock. Disable with `off` when bulk-loading historical data. Because partitions are UTC-day based, clock errors or unit mistakes (sending seconds/milliseconds as nanoseconds) multiply partitions; in particular, **a future-date part never reaches the retention cutoff.**
 
 - `LOGGYTRACY_MISSING_TENANT`: Tenant identification for headerless requests (see "Multi-tenancy" above). Tenant-id validation also applies before journal append, like the other limits.
