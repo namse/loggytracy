@@ -174,6 +174,19 @@ The implementation plan and design decisions are recorded in
 - [ ] A fresh-context review reports no blocking findings.
 - [x] Focused tests, `cargo test --all-targets`, `cargo fmt --all -- --check`, Clippy with warnings denied, and `git diff --check` pass.
 
+## M12 acceptance checklist
+
+The read-path decision (issue #3) and the implementation plan are recorded in
+[`docs/M12_IMPLEMENTATION_PLAN.md`](M12_IMPLEMENTATION_PLAN.md). The
+acceptance checklist lives there; this file tracks execution state.
+
+- [ ] Phase 2 — Tempo surface removed.
+- [ ] Phases 3–8 — first-party log API (`params`, `/logs`, histogram,
+  attributes, tail, delete move).
+- [ ] Phase 9 — `docs/QUERY_API.md` + pinning test.
+- [ ] Phase 10 — comparison bed ported.
+- [ ] Phases 11–12 — Loki surface removed, docs swept.
+
 ## Completion protocol
 
 For each pending milestone, replace broad outcome text with a concrete

@@ -341,6 +341,8 @@ Unsupported syntax is rejected during parsing with a clear error message.
 | M9 | **The comparison bed.** Loki beside loggytracy at an equal container memory limit, same corpus, four query shapes plus ingest, disk-per-GB and object-store operation counts | The claim in [`VISION.md`](VISION.md) is either supported by a published table or abandoned |
 | M10 | **Declared memory budget** ([`VISION.md`](VISION.md) I). One budget knob, arena accounting, honest memtable metering, sidecars inside the budget, admission by budget rather than by slot | The engine runs a sustained mixed load under a declared budget and a test asserts peak RSS stays under it |
 | M11 | **Bounded copies and deep pruning** ([`VISION.md`](VISION.md) II, III). `Arc<Labels>` end to end, the two free memcpys removed, single sort and single parse; streaming top-K execution, projection pushdown, cached Parquet footers, regex literal extraction | The M8 benchmarks move, and M9's table is regenerated against the same Loki build |
+| M12 | **The first-party read path** (issue #3, [`M12_IMPLEMENTATION_PLAN.md`](M12_IMPLEMENTATION_PLAN.md)). Flat-filter GET + NDJSON log query API (`/logs`, histogram, attributes, tail, delete); Loki and Tempo surfaces removed; comparison bed ported; `QUERY_API.md` pinned by tests | Every read goes through the first-party API, no `/loki` or Tempo route remains, and the reduced digests still agree on a bed smoke run |
+| M13 | **Trace read path.** First-party trace query API (search + trace-by-id, same parameter grammar) for the fn0 console; ends the trace read gap opened by the M12 Tempo removal | Traces are queryable again through the first-party API |
 
 ## References
 
