@@ -4,35 +4,27 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
-use crate::logql::{LabelMatcher, LineFilter};
+use crate::logql::LineFilter;
 use crate::part::{MetadataWindow, QueryTimeRange};
 use crate::tenant::TenantId;
 
+/// A string→string map. Once the identity of a stream; now only the shape the
+/// LogQL pipeline uses for its per-entry field map and the query layer for
+/// attribute sets.
 pub type Labels = BTreeMap<String, String>;
 
-/// One stream's label set, shared by every row that belongs to the stream
-/// instead of copied into each of them.
+/// A shared, usually empty, label map.
 ///
-/// The memtable already held one `Labels` per stream, and every hop after it
-/// held one per *row*: `Row::from_entry`, the part writer's stream index and
-/// stream set, the reader, the registry, the executor and the metric path. That
-/// was measured at 1 326-1 345 bytes and 11-27 allocations per row
-/// ([`docs/MEMORY_ATTRIBUTION.md`](../docs/MEMORY_ATTRIBUTION.md) hypothesis 2)
-/// and 721 MiB live in the flush arena — the largest live term in the process.
-///
-/// `Arc` rather than an interned handle: an intern table needs a global map, a
-/// lock on the ingest path and a policy for when an entry may be dropped, and
-/// buys 4 bytes per row over a pointer. Sharing is already scoped by the
-/// structures that hold it — a memtable stream, a `Vec<Row>` for one flush, one
-/// query's result — so a refcount expresses exactly the lifetime that is
-/// wanted and nothing has to decide when to evict.
+/// The stream concept is gone from storage — a row carries its attributes in
+/// its own `structured_metadata` — but the sink and response plumbing still
+/// pass a shared map alongside each entry. Production code passes an empty
+/// one; the alias survives for that plumbing and for the pipeline's field
+/// maps.
 pub type SharedLabels = Arc<Labels>;
 
-/// One tenant's streams. The MemTable keeps a map of these rather than one
-/// flat `(tenant, labels)` map so that every read path has to name a tenant
-/// before it can reach any entry.
-pub type TenantStreams = HashMap<SharedLabels, Vec<LogEntry>>;
-pub type MemTableSnapshot = HashMap<TenantId, TenantStreams>;
+/// One tenant's buffered entries, flat. There is no grouping by attributes:
+/// an entry's attributes live in its own `structured_metadata`.
+pub type MemTableSnapshot = HashMap<TenantId, Vec<LogEntry>>;
 
 #[derive(Clone)]
 pub struct LogEntry {
@@ -71,21 +63,6 @@ pub struct MemTable {
     flushing_bytes: AtomicU64,
 }
 
-/// What a stream's own identity contributes, counted once per stream rather
-/// than per entry. High-cardinality label sets are the case the memtable
-/// ceiling most needs to catch, so this is counted rather than ignored.
-fn stream_overhead_bytes(tenant: &TenantId, labels: &Labels) -> u64 {
-    labels_overhead_bytes(tenant.as_str().len(), labels)
-}
-
-fn labels_overhead_bytes(tenant_bytes: usize, labels: &Labels) -> u64 {
-    let labels_bytes: usize = labels
-        .iter()
-        .map(|(name, value)| name.len() + value.len())
-        .sum();
-    (tenant_bytes + labels_bytes) as u64
-}
-
 /// Sorted by key, duplicate keys collapsed to their first occurrence.
 pub fn canonicalize_structured_metadata(pairs: &mut Vec<(String, String)>) {
     if pairs.windows(2).all(|pair| pair[0].0 < pair[1].0) {
@@ -113,14 +90,7 @@ fn entries_bytes(entries: &[LogEntry]) -> u64 {
 /// them against.
 #[cfg(test)]
 fn snapshot_bytes(snapshot: &MemTableSnapshot) -> u64 {
-    let mut bytes = 0u64;
-    for (tenant, streams) in snapshot {
-        for (labels, entries) in streams {
-            bytes += stream_overhead_bytes(tenant, labels);
-            bytes += entries_bytes(entries);
-        }
-    }
-    bytes
+    snapshot.values().map(|entries| entries_bytes(entries)).sum()
 }
 
 /// Take ownership of a shared snapshot, copying only if someone else still
@@ -131,80 +101,12 @@ fn unwrap_snapshot(snapshot: Arc<MemTableSnapshot>) -> MemTableSnapshot {
     Arc::try_unwrap(snapshot).unwrap_or_else(|shared| (*shared).clone())
 }
 
-/// Merge `source` into `target`, reporting the stream overhead the merge made
-/// redundant.
-///
-/// A stream present in both buffers was counted once in each, but the merged
-/// buffer holds one copy of its identity. Returning the difference keeps the
-/// byte counters exactly equal to a full walk without either side having to
-/// perform one — the collision count is bounded by the stream count, not the
-/// row count.
-fn merge_snapshot(target: &mut MemTableSnapshot, source: MemTableSnapshot) -> u64 {
-    let mut redundant_overhead = 0u64;
-    for (tenant, streams) in source {
-        let tenant_bytes = tenant.as_str().len();
-        let tenant_streams = target.entry(tenant).or_default();
-        for (labels, entries) in streams {
-            let overhead = labels_overhead_bytes(tenant_bytes, &labels);
-            let stream = tenant_streams.entry(labels).or_default();
-            if !stream.is_empty() {
-                redundant_overhead += overhead;
-            }
-            stream.extend(entries);
-        }
+/// Merge `source` into `target`. Entries are appended per tenant; with no
+/// per-stream identity there is no overhead to reconcile.
+fn merge_snapshot(target: &mut MemTableSnapshot, source: MemTableSnapshot) {
+    for (tenant, entries) in source {
+        target.entry(tenant).or_default().extend(entries);
     }
-    redundant_overhead
-}
-
-/// One stream, offered to the sink in the query's direction.
-///
-/// The stream is sorted first, so the sink's frontier ends it: the first entry
-/// on the far side of the frontier means every later one in this direction is
-/// too. That replaces "each stream contributes at most `limit` rows", which was
-/// only sound when nothing filtered rows after the scan — with a `| json |
-/// field=` stage the surviving count is not the scanned count, and the old rule
-/// was therefore restricted to backward scans and bypassed entirely by
-/// `normal_scan_limit = usize::MAX`.
-#[allow(clippy::too_many_arguments)]
-fn scan_memtable_stream(
-    labels: &SharedLabels,
-    entries: &[LogEntry],
-    line_filters: &[LineFilter],
-    range: QueryTimeRange,
-    forward: bool,
-    scan_limit: Option<usize>,
-    cancellation: Option<&AtomicBool>,
-    scanned_rows: &mut usize,
-    sink: &mut dyn crate::part::RowSink,
-    scan_stopped: &mut bool,
-) -> Result<(), String> {
-    let mut ordered: Vec<&LogEntry> = entries.iter().collect();
-    ordered.sort_unstable_by_key(|entry| entry.timestamp_ns);
-    if !forward {
-        ordered.reverse();
-    }
-    for entry in ordered {
-        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-            *scan_stopped = true;
-            break;
-        }
-        if crate::part::beyond_frontier(sink.frontier_ns(), forward, entry.timestamp_ns) {
-            break;
-        }
-        if scan_limit.is_some_and(|limit| *scanned_rows >= limit) {
-            *scan_stopped = true;
-            break;
-        }
-        *scanned_rows = scanned_rows.saturating_add(1);
-        if range.contains(entry.timestamp_ns)
-            && line_filters
-                .iter()
-                .all(|filter| filter.matches(&entry.line))
-        {
-            sink.accept(labels, entry.clone())?;
-        }
-    }
-    Ok(())
 }
 
 impl Default for MemTable {
@@ -223,14 +125,14 @@ impl MemTable {
         }
     }
 
-    pub fn insert(&self, tenant: TenantId, labels: Labels, mut entries: Vec<LogEntry>) {
-        // Every ingest path — Loki push in both encodings, OTLP, and journal
-        // replay of any of them — converges here, so this is where structured
-        // metadata takes its canonical form: sorted by key, one value per key,
-        // first occurrence winning. First-wins is the visibility the pipeline
-        // already has (`fields.entry(name).or_insert`), so canonicalizing does
-        // not change what a query can see; OTLP genuinely produces duplicates
-        // when a record attribute shares a name with a resource attribute.
+    pub fn insert(&self, tenant: TenantId, mut entries: Vec<LogEntry>) {
+        // Every ingest path — OTLP over either transport, and journal replay —
+        // converges here, so this is where structured metadata takes its
+        // canonical form: sorted by key, one value per key, first occurrence
+        // winning. First-wins is the visibility the pipeline already has
+        // (`fields.entry(name).or_insert`), so canonicalizing does not change
+        // what a query can see; OTLP genuinely produces duplicates when a
+        // record attribute shares a name with a resource attribute.
         // Sorted-unique is what lets the part format store the pairs as
         // columns and rebuild them with a merge instead of a sort, and it
         // makes `Row::sort_key`'s dedup order-insensitive — strictly stronger,
@@ -238,26 +140,15 @@ impl MemTable {
         for entry in &mut entries {
             canonicalize_structured_metadata(&mut entry.structured_metadata);
         }
-        let mut delta = entries_bytes(&entries);
+        let delta = entries_bytes(&entries);
         let mut inner = self.inner.write();
-        let overhead = stream_overhead_bytes(&tenant, &labels);
-        let streams = inner.entry(tenant).or_default();
-        // One hash of the label set, whether or not the stream is new. Looking
-        // the key up first to avoid allocating an `Arc` for a stream that is
-        // already buffered costs a second hash of the whole `BTreeMap`, which
-        // measured dearer than the 32-byte allocation it saves.
-        match streams.entry(Arc::new(labels)) {
+        match inner.entry(tenant) {
             std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                let stream = occupied.get_mut();
-                if stream.is_empty() {
-                    delta += overhead;
-                }
-                stream.extend(entries);
+                occupied.get_mut().extend(entries);
             }
-            // Moved, not extended into an empty vector: a stream's first push
+            // Moved, not extended into an empty vector: a tenant's first push
             // used to copy every `LogEntry` it carried.
             std::collections::hash_map::Entry::Vacant(vacant) => {
-                delta += overhead;
                 vacant.insert(entries);
             }
         }
@@ -276,15 +167,13 @@ impl MemTable {
         let mut flushing = self.flushing.write();
         let mut snapshot = std::mem::take(&mut *inner);
         let moved = self.inner_bytes.swap(0, Ordering::Relaxed);
-        let mut redundant_overhead = 0;
         if let Some(previous_snapshot) = flushing.take() {
-            redundant_overhead = merge_snapshot(&mut snapshot, unwrap_snapshot(previous_snapshot));
+            merge_snapshot(&mut snapshot, unwrap_snapshot(previous_snapshot));
         }
         let snapshot = Arc::new(snapshot);
         *flushing = Some(snapshot.clone());
         // `flushing_bytes` already covers the snapshot that was merged in.
-        self.flushing_bytes
-            .fetch_add(moved.saturating_sub(redundant_overhead), Ordering::Relaxed);
+        self.flushing_bytes.fetch_add(moved, Ordering::Relaxed);
         snapshot
     }
 
@@ -302,23 +191,23 @@ impl MemTable {
         // reversing it here would be the deadlock the ordering exists to avoid.
         let mut flushing = self.flushing.write();
         *flushing = None;
-        let redundant_overhead = merge_snapshot(&mut inner, unwrap_snapshot(snapshot));
+        merge_snapshot(&mut inner, unwrap_snapshot(snapshot));
         // The aborted snapshot is the one `flushing_bytes` was counting, so it
         // moves back wholesale rather than being recomputed.
         let returned = self.flushing_bytes.swap(0, Ordering::Relaxed);
-        self.inner_bytes.fetch_add(
-            returned.saturating_sub(redundant_overhead),
-            Ordering::Relaxed,
-        );
+        self.inner_bytes.fetch_add(returned, Ordering::Relaxed);
     }
 
     pub fn is_empty(&self) -> bool {
         let inner = self.inner.read();
-        if !inner.is_empty() {
+        if inner.values().any(|entries| !entries.is_empty()) {
             return false;
         }
         let flushing = self.flushing.read();
-        flushing.as_ref().map(|m| m.is_empty()).unwrap_or(true)
+        flushing
+            .as_ref()
+            .map(|snapshot| snapshot.values().all(|entries| entries.is_empty()))
+            .unwrap_or(true)
     }
 
     /// Every tenant with entries that have not been flushed yet, including the
@@ -350,30 +239,19 @@ impl MemTable {
     pub fn query(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         range: QueryTimeRange,
         limit: usize,
         forward: bool,
     ) -> Vec<StreamResult> {
-        self.query_with_scan_limit(
-            tenant,
-            matchers,
-            line_filters,
-            range,
-            limit,
-            forward,
-            None,
-            None,
-        )
-        .results
+        self.query_with_scan_limit(tenant, line_filters, range, limit, forward, None, None)
+            .results
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn query_with_scan_limit(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         range: QueryTimeRange,
         limit: usize,
@@ -387,7 +265,6 @@ impl MemTable {
         let scanned_rows = self
             .scan_into(
                 tenant,
-                matchers,
                 line_filters,
                 range,
                 forward,
@@ -406,16 +283,12 @@ impl MemTable {
     /// Both buffers' rows for one tenant, offered to `sink` in the query's
     /// direction.
     ///
-    /// Streams are visited in label order, which is what the `BTreeMap` this
-    /// used to group into gave for free and what a bounded sink needs kept: it
-    /// breaks ties by arrival, so the arrival order is part of which rows a
-    /// limited query returns. `HashMap` iteration order would have made that
-    /// answer differ between two runs of the same query.
+    /// Attribute selection is not done here: matchers became pipeline field
+    /// filters, evaluated by the sink against each entry's own metadata.
     #[allow(clippy::too_many_arguments)]
     pub fn scan_into(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         range: QueryTimeRange,
         forward: bool,
@@ -427,45 +300,48 @@ impl MemTable {
         if sink.is_closed() {
             return Ok(scanned_rows);
         }
-        let mut scan_stopped = false;
 
         // begin_flush and abort_flush acquire inner before flushing. Holding
         // both read guards in that order prevents observing the same entry in
         // both buffers if a flush starts between the two reads.
         let inner = self.inner.read();
         let flushing = self.flushing.read();
-        // The live buffer first, so that for a stream present in both the rows
-        // that were pushed earlier also arrive earlier. `sort_by` is stable, so
-        // ordering by label set does not disturb that.
-        let mut streams: Vec<(&SharedLabels, &[LogEntry])> = Vec::new();
+        // The live buffer first, so rows pushed earlier arrive earlier on a
+        // timestamp tie; the sort below is stable, so arrival order survives
+        // it and a limited query returns the same rows on every run.
+        let mut ordered: Vec<&LogEntry> = Vec::new();
         for buffer in std::iter::once(&*inner).chain(flushing.as_deref()) {
-            if let Some(tenant_streams) = buffer.get(tenant) {
-                streams.extend(
-                    tenant_streams
-                        .iter()
-                        .filter(|(labels, _)| matchers.iter().all(|m| m.matches(labels)))
-                        .map(|(labels, entries)| (labels, entries.as_slice())),
-                );
+            if let Some(entries) = buffer.get(tenant) {
+                ordered.extend(entries.iter());
             }
         }
-        streams.sort_by(|left, right| left.0.cmp(right.0));
+        ordered.sort_by_key(|entry| entry.timestamp_ns);
+        if !forward {
+            ordered.reverse();
+        }
 
+        let empty_labels: SharedLabels = SharedLabels::default();
         let mut result = Ok(());
-        for (labels, entries) in streams {
-            result = scan_memtable_stream(
-                labels,
-                entries,
-                line_filters,
-                range,
-                forward,
-                scan_limit,
-                cancellation,
-                &mut scanned_rows,
-                sink,
-                &mut scan_stopped,
-            );
-            if result.is_err() || scan_stopped {
+        for entry in ordered {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 break;
+            }
+            if crate::part::beyond_frontier(sink.frontier_ns(), forward, entry.timestamp_ns) {
+                break;
+            }
+            if scan_limit.is_some_and(|limit| scanned_rows >= limit) {
+                break;
+            }
+            scanned_rows = scanned_rows.saturating_add(1);
+            if range.contains(entry.timestamp_ns)
+                && line_filters
+                    .iter()
+                    .all(|filter| filter.matches(&entry.line))
+            {
+                result = sink.accept(&empty_labels, entry.clone());
+                if result.is_err() {
+                    break;
+                }
             }
         }
         drop(flushing);
@@ -475,56 +351,41 @@ impl MemTable {
 
     /// Run `visit` over both buffers of one tenant while holding the read
     /// guards in the order `begin_flush`/`abort_flush` acquire them, so an
-    /// entry can never be observed in both buffers or in neither.
-    /// Visit each of the tenant's streams, restricted to entries the tenant's
-    /// retention still covers. `retention_floor_ns` of `None` visits
-    /// everything, which is the fail-open behaviour for an unknown tenant.
-    fn for_each_tenant_stream(
+    /// entry can never be observed in both buffers or in neither. Restricted
+    /// to entries the window still covers.
+    fn for_each_tenant_entry(
         &self,
         tenant: &TenantId,
         window: MetadataWindow,
-        mut visit: impl FnMut(&Labels, &[LogEntry]),
+        mut visit: impl FnMut(&LogEntry),
     ) {
         let inner = self.inner.read();
         let flushing = self.flushing.read();
-        let mut retained = Vec::new();
-        // Entry granularity rather than stream granularity: unlike a part,
-        // whose bounds are already in its metadata, a memtable stream has to be
-        // walked anyway, so filtering it exactly costs nothing extra.
-        let mut visit_retained = |labels: &Labels, entries: &[LogEntry]| {
-            retained.clear();
-            retained.extend(
-                entries
-                    .iter()
-                    .filter(|entry| window.contains(entry.timestamp_ns))
-                    .cloned(),
-            );
-            if !retained.is_empty() {
-                visit(labels, &retained);
-            }
-        };
-        if let Some(streams) = inner.get(tenant) {
-            for (labels, entries) in streams {
-                visit_retained(labels.as_ref(), entries);
-            }
-        }
-        if let Some(streams) = flushing.as_ref().and_then(|f| f.get(tenant)) {
-            for (labels, entries) in streams {
-                visit_retained(labels.as_ref(), entries);
+        for buffer in std::iter::once(&*inner).chain(flushing.as_deref()) {
+            if let Some(entries) = buffer.get(tenant) {
+                for entry in entries {
+                    if window.contains(entry.timestamp_ns) {
+                        visit(entry);
+                    }
+                }
             }
         }
     }
 
+    /// Attribute names present in the tenant's buffered metadata.
     pub fn label_names(&self, tenant: &TenantId, window: MetadataWindow) -> Vec<String> {
         let mut names = BTreeSet::new();
-        self.for_each_tenant_stream(tenant, window, |labels, _| {
-            for k in labels.keys() {
-                names.insert(k.clone());
+        self.for_each_tenant_entry(tenant, window, |entry| {
+            for (name, _) in &entry.structured_metadata {
+                if !names.contains(name) {
+                    names.insert(name.clone());
+                }
             }
         });
         names.into_iter().collect()
     }
 
+    /// Values the tenant's buffered metadata holds for one attribute name.
     pub fn label_values(
         &self,
         tenant: &TenantId,
@@ -532,24 +393,33 @@ impl MemTable {
         window: MetadataWindow,
     ) -> Vec<String> {
         let mut values = BTreeSet::new();
-        self.for_each_tenant_stream(tenant, window, |labels, _| {
-            if let Some(v) = labels.get(name) {
-                values.insert(v.clone());
+        self.for_each_tenant_entry(tenant, window, |entry| {
+            for (key, value) in &entry.structured_metadata {
+                if key == name && !values.contains(value) {
+                    values.insert(value.clone());
+                }
             }
         });
         values.into_iter().collect()
     }
 
+    /// Distinct attribute sets in the tenant's buffer, filtered by `matchers`
+    /// evaluated against each entry's metadata.
     pub fn series(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
+        matchers: &[crate::logql::LabelMatcher],
         window: MetadataWindow,
     ) -> Vec<Labels> {
         let mut result: BTreeSet<Labels> = BTreeSet::new();
-        self.for_each_tenant_stream(tenant, window, |labels, _| {
-            if matchers.iter().all(|m| m.matches(labels)) {
-                result.insert(labels.clone());
+        self.for_each_tenant_entry(tenant, window, |entry| {
+            let set: Labels = entry
+                .structured_metadata
+                .iter()
+                .cloned()
+                .collect();
+            if matchers.iter().all(|m| m.matches(&set)) {
+                result.insert(set);
             }
         });
         result.into_iter().collect()
@@ -558,50 +428,33 @@ impl MemTable {
     /// Process-wide totals for the operator metrics endpoint. Not a query
     /// path: nothing here is returned to a tenant.
     pub fn global_stats(&self) -> IndexStats {
-        let mut streams = 0usize;
         let mut entries = 0usize;
         let mut bytes = 0u64;
         let inner = self.inner.read();
         let flushing = self.flushing.read();
         for snapshot in std::iter::once(&*inner).chain(flushing.as_deref()) {
-            for tenant_streams in snapshot.values() {
-                streams += tenant_streams.len();
-                for stream in tenant_streams.values() {
-                    entries += stream.len();
-                    for entry in stream {
-                        bytes += entry.line.len() as u64;
-                    }
+            for tenant_entries in snapshot.values() {
+                entries += tenant_entries.len();
+                for entry in tenant_entries {
+                    bytes += entry.line.len() as u64;
                 }
             }
         }
-        IndexStats {
-            streams,
-            entries,
-            bytes,
-        }
+        IndexStats { entries, bytes }
     }
 
     pub fn stats(&self, tenant: &TenantId, window: MetadataWindow) -> IndexStats {
-        let mut stream_set: BTreeSet<Labels> = BTreeSet::new();
         let mut entries = 0usize;
         let mut bytes = 0u64;
-        self.for_each_tenant_stream(tenant, window, |labels, stream| {
-            stream_set.insert(labels.clone());
-            entries += stream.len();
-            for e in stream {
-                bytes += e.line.len() as u64;
-            }
+        self.for_each_tenant_entry(tenant, window, |entry| {
+            entries += 1;
+            bytes += entry.line.len() as u64;
         });
-        IndexStats {
-            streams: stream_set.len(),
-            entries,
-            bytes,
-        }
+        IndexStats { entries, bytes }
     }
 }
 
 pub struct IndexStats {
-    pub streams: usize,
     pub entries: usize,
     pub bytes: u64,
 }
@@ -619,12 +472,8 @@ mod tests {
     fn inserted_metadata_is_sorted_and_first_wins_on_duplicate_keys() {
         let memtable = MemTable::new();
         let tenant = crate::tenant::test_tenant();
-        let labels: Labels = [("app".to_string(), "canon".to_string())]
-            .into_iter()
-            .collect();
         memtable.insert(
             tenant.clone(),
-            labels,
             vec![LogEntry {
                 timestamp_ns: 1,
                 line: "line".to_string(),
@@ -636,7 +485,7 @@ mod tests {
             }],
         );
         let snapshot = memtable.begin_flush();
-        let entry = &snapshot[&tenant].values().next().unwrap()[0];
+        let entry = &snapshot[&tenant][0];
         assert_eq!(
             entry.structured_metadata,
             vec![
@@ -660,31 +509,18 @@ mod tests {
             snapshot_bytes(&inner) + flushing.as_deref().map(snapshot_bytes).unwrap_or(0)
         };
         let tenant = crate::tenant::test_tenant();
-        let labels: Labels = [("app".to_string(), "sizes".to_string())]
-            .into_iter()
-            .collect();
 
-        memtable.insert(
-            tenant.clone(),
-            labels.clone(),
-            vec![sample_entry("first", 1)],
-        );
+        memtable.insert(tenant.clone(), vec![sample_entry("first", 1)]);
         assert_eq!(memtable.approximate_size() as u64, walked(&memtable));
 
-        // A second insert into the same stream must not re-count the stream's
-        // own identity.
-        memtable.insert(
-            tenant.clone(),
-            labels.clone(),
-            vec![sample_entry("second", 2)],
-        );
+        memtable.insert(tenant.clone(), vec![sample_entry("second", 2)]);
         assert_eq!(memtable.approximate_size() as u64, walked(&memtable));
 
         let snapshot = memtable.begin_flush();
         assert_eq!(memtable.approximate_size() as u64, walked(&memtable));
 
         // An insert while a flush is in flight lands in the other buffer.
-        memtable.insert(tenant, labels, vec![sample_entry("third", 3)]);
+        memtable.insert(tenant, vec![sample_entry("third", 3)]);
         assert_eq!(memtable.approximate_size() as u64, walked(&memtable));
 
         memtable.abort_flush(snapshot);
@@ -705,10 +541,6 @@ mod tests {
         }
     }
 
-    fn sample_labels() -> Labels {
-        std::iter::once(("app".to_string(), "test".to_string())).collect()
-    }
-
     fn tenant(name: &str) -> TenantId {
         TenantId::parse(name).unwrap()
     }
@@ -717,23 +549,18 @@ mod tests {
         tenant("acme")
     }
 
+    fn total_entries(results: &[StreamResult]) -> usize {
+        results.iter().map(|stream| stream.entries.len()).sum()
+    }
+
     #[test]
     fn a_tenant_never_sees_another_tenants_entries() {
         let memtable = MemTable::new();
-        memtable.insert(
-            tenant("acme"),
-            sample_labels(),
-            vec![sample_entry("acme line", 100)],
-        );
-        memtable.insert(
-            tenant("globex"),
-            sample_labels(),
-            vec![sample_entry("globex line", 100)],
-        );
+        memtable.insert(tenant("acme"), vec![sample_entry("acme line", 100)]);
+        memtable.insert(tenant("globex"), vec![sample_entry("globex line", 100)]);
 
         let acme = memtable.query(
             &tenant("acme"),
-            &[],
             &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             100,
@@ -762,7 +589,6 @@ mod tests {
                 .query(
                     &tenant("initech"),
                     &[],
-                    &[],
                     crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                     100,
                     true
@@ -787,11 +613,7 @@ mod tests {
         // begin_flush clears inner and moves the data to the flushing buffer.
         // unified_query also scans the flushing buffer, so data is not lost during flushing (#2 regression).
         let mt = MemTable::new();
-        mt.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("hello", 100)],
-        );
+        mt.insert(sample_tenant(), vec![sample_entry("hello", 100)]);
 
         let snapshot = mt.begin_flush();
         assert_eq!(snapshot.len(), 1);
@@ -799,14 +621,13 @@ mod tests {
         let results = mt.query(
             &sample_tenant(),
             &[],
-            &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             100,
             true,
         );
-        let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
-            total, 1,
+            total_entries(&results),
+            1,
             "flushing buffer should remain visible during flush"
         );
 
@@ -814,14 +635,13 @@ mod tests {
         let results2 = mt.query(
             &sample_tenant(),
             &[],
-            &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             100,
             true,
         );
-        let total2: usize = results2.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
-            total2, 0,
+            total_entries(&results2),
+            0,
             "after commit_flush, no data should remain visible"
         );
     }
@@ -829,11 +649,7 @@ mod tests {
     #[test]
     fn abort_flush_restores_to_inner() {
         let mt = MemTable::new();
-        mt.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("hello", 100)],
-        );
+        mt.insert(sample_tenant(), vec![sample_entry("hello", 100)]);
 
         let snapshot = mt.begin_flush();
         mt.abort_flush(snapshot);
@@ -841,13 +657,15 @@ mod tests {
         let results = mt.query(
             &sample_tenant(),
             &[],
-            &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             100,
             true,
         );
-        let total: usize = results.iter().map(|s| s.entries.len()).sum();
-        assert_eq!(total, 1, "abort_flush should restore data to inner");
+        assert_eq!(
+            total_entries(&results),
+            1,
+            "abort_flush should restore data to inner"
+        );
         assert!(!mt.is_empty());
     }
 
@@ -858,11 +676,7 @@ mod tests {
     #[test]
     fn a_flush_shares_the_snapshot_instead_of_duplicating_it() {
         let memtable = MemTable::new();
-        memtable.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("shared", 100)],
-        );
+        memtable.insert(sample_tenant(), vec![sample_entry("shared", 100)]);
 
         let snapshot = memtable.begin_flush();
         assert_eq!(
@@ -882,39 +696,34 @@ mod tests {
     #[test]
     fn an_aborted_flush_returns_its_entries_without_copying_them() {
         let memtable = MemTable::new();
-        memtable.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("returned", 100)],
-        );
+        memtable.insert(sample_tenant(), vec![sample_entry("returned", 100)]);
         let before = memtable.approximate_size();
 
         let snapshot = memtable.begin_flush();
-        assert!(
-            memtable
-                .query(
-                    &sample_tenant(),
-                    &[],
-                    &[],
-                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
-                    10,
-                    true
-                )
-                .len()
-                == 1
+        assert_eq!(
+            total_entries(&memtable.query(
+                &sample_tenant(),
+                &[],
+                crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                10,
+                true
+            )),
+            1
         );
         memtable.abort_flush(snapshot);
 
         let results = memtable.query(
             &sample_tenant(),
             &[],
-            &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             10,
             true,
         );
-        let total: usize = results.iter().map(|stream| stream.entries.len()).sum();
-        assert_eq!(total, 1, "the aborted entries are back in the live buffer");
+        assert_eq!(
+            total_entries(&results),
+            1,
+            "the aborted entries are back in the live buffer"
+        );
         assert_eq!(
             memtable.approximate_size(),
             before,
@@ -926,103 +735,56 @@ mod tests {
     fn begin_flush_keeps_query_consistent_with_concurrent_insert() {
         // Data inserted while flushing is in progress must also be visible.
         let mt = MemTable::new();
-        mt.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("first", 100)],
-        );
+        mt.insert(sample_tenant(), vec![sample_entry("first", 100)]);
 
         let _snapshot = mt.begin_flush();
         // Receive new data while flushing is in progress.
-        mt.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("second", 200)],
-        );
+        mt.insert(sample_tenant(), vec![sample_entry("second", 200)]);
 
         let results = mt.query(
             &sample_tenant(),
-            &[],
             &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             100,
             true,
         );
-        let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(
-            total, 2,
+            total_entries(&results),
+            2,
             "both flushing buffer and inner should be visible concurrently"
         );
     }
 
     #[test]
-    fn stats_does_not_count_same_stream_twice_during_flush() {
-        let mt = MemTable::new();
-        mt.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("first", 100)],
-        );
-        let _snapshot = mt.begin_flush();
-        mt.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("second", 200)],
-        );
-
-        let stats = mt.stats(&sample_tenant(), MetadataWindow::unbounded());
-        assert_eq!(stats.streams, 1);
-        assert_eq!(stats.entries, 2);
-    }
-
-    #[test]
     fn begin_flush_preserves_previous_uncommitted_snapshot() {
         let memtable = MemTable::new();
-        memtable.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("first", 100)],
-        );
+        memtable.insert(sample_tenant(), vec![sample_entry("first", 100)]);
 
         let _first_snapshot = memtable.begin_flush();
-        memtable.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("second", 200)],
-        );
+        memtable.insert(sample_tenant(), vec![sample_entry("second", 200)]);
 
         let second_snapshot = memtable.begin_flush();
-        let snapshot_entries: usize = second_snapshot
-            .values()
-            .flat_map(|streams| streams.values())
-            .map(Vec::len)
-            .sum();
+        let snapshot_entries: usize = second_snapshot.values().map(Vec::len).sum();
         assert_eq!(snapshot_entries, 2);
 
         memtable.abort_flush(second_snapshot);
         let results = memtable.query(
             &sample_tenant(),
             &[],
-            &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             100,
             true,
         );
-        let total_entries: usize = results.iter().map(|stream| stream.entries.len()).sum();
-        assert_eq!(total_entries, 2);
+        assert_eq!(total_entries(&results), 2);
     }
 
     #[test]
     fn the_range_decides_whether_a_row_on_end_is_returned() {
         let memtable = MemTable::new();
-        memtable.insert(
-            sample_tenant(),
-            sample_labels(),
-            vec![sample_entry("on the boundary", 200)],
-        );
+        memtable.insert(sample_tenant(), vec![sample_entry("on the boundary", 200)]);
         let rows = |range| {
             memtable
-                .query(&sample_tenant(), &[], &[], range, 100, true)
+                .query(&sample_tenant(), &[], range, 100, true)
                 .iter()
                 .map(|stream| stream.entries.len())
                 .sum::<usize>()

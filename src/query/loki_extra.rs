@@ -12,8 +12,8 @@ pub struct VolumeParams {
     pub end: Option<String>,
     pub step: Option<String>,
     pub limit: Option<usize>,
-    /// Labels to aggregate the volume by. Empty means per stream, which is
-    /// what `aggregateBy=series` asks for.
+    /// Attributes to aggregate the volume by. Empty means one total series:
+    /// with no stream concept there is no per-stream breakdown.
     #[serde(rename = "targetLabels")]
     pub target_labels: Option<String>,
     /// Accepted and not acted on separately: with no `targetLabels` the result
@@ -23,7 +23,8 @@ pub struct VolumeParams {
     pub aggregate_by: Option<String>,
 }
 
-/// `index/volume` — bytes per stream over the window, as an instant vector.
+/// `index/volume` — bytes over the window, as an instant vector; broken down
+/// by `targetLabels` when given, one total series otherwise.
 pub async fn index_volume(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -257,30 +258,39 @@ pub async fn detected_labels(
     let Some(guard) = MetadataGuard::acquire(&state, &tenant, &params).await? else {
         return Ok(Json(serde_json::json!({ "detectedLabels": [] })));
     };
-    let mut names = BTreeSet::new();
+    // Values come from a bounded sample now that no value index exists —
+    // the same shape `detected_fields` always had.
+    let mut per_name: std::collections::BTreeMap<String, BTreeSet<String>> =
+        std::collections::BTreeMap::new();
     for name in state.memtable.label_names(&tenant, guard.window) {
-        names.insert(name);
+        for value in state.memtable.label_values(&tenant, &name, guard.window) {
+            per_name.entry(name.clone()).or_default().insert(value);
+        }
     }
     guard.check_deadline()?;
-    for name in state.parts.label_names(&tenant, guard.window) {
-        names.insert(name);
+    for metadata in state
+        .parts
+        .sample_metadata(
+            &tenant,
+            guard.window,
+            METADATA_SAMPLE_ROWS,
+        )
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+    {
+        for (name, value) in metadata {
+            per_name.entry(name).or_default().insert(value);
+        }
     }
 
-    let mut detected = Vec::new();
-    for name in names {
-        guard.check_deadline()?;
-        let mut values = BTreeSet::new();
-        for value in state.memtable.label_values(&tenant, &name, guard.window) {
-            values.insert(value);
-        }
-        for value in state.parts.label_values(&tenant, &name, guard.window) {
-            values.insert(value);
-        }
-        detected.push(serde_json::json!({
-            "label": name,
-            "cardinality": values.len(),
-        }));
-    }
+    let detected: Vec<serde_json::Value> = per_name
+        .into_iter()
+        .map(|(name, values)| {
+            serde_json::json!({
+                "label": name,
+                "cardinality": values.len(),
+            })
+        })
+        .collect();
     Ok(Json(serde_json::json!({ "detectedLabels": detected })))
 }
 

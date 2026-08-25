@@ -94,14 +94,20 @@
             .await
             .expect("the export is accepted");
 
-        let results = memtable.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true);
+        let results = memtable.query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true);
         let entries: Vec<&str> = results
             .iter()
             .flat_map(|stream| stream.entries.iter())
             .map(|entry| entry.line.as_str())
             .collect();
         assert_eq!(entries, vec!["order placed"]);
-        assert_eq!(results[0].labels["service_name"], "checkout");
+        assert!(
+            results[0]
+                .entries[0]
+                .structured_metadata
+                .contains(&("service_name".to_string(), "checkout".to_string())),
+            "the resource attribute rides in the entry's own metadata"
+        );
     }
 
     /// A record arriving over gRPC is not exempt from the bounds the Loki path
@@ -136,7 +142,7 @@
         for table in [&memtable, &memtable_window] {
             assert!(
                 table
-                    .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+                    .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                     .is_empty(),
                 "a refused export must not have been written"
             );
@@ -170,7 +176,7 @@
 
         assert!(
             memtable
-                .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+                .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                 .is_empty(),
             "a refused export must not have been written"
         );
@@ -323,16 +329,19 @@ specification tells it to drop the batch"
             &replayed,
             &crate::trace::TraceMemTable::new())
         .expect("the WAL replays");
-        let results = replayed.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true);
+        let results = replayed.query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true);
         let lines: Vec<&str> = results
             .iter()
             .flat_map(|stream| stream.entries.iter())
             .map(|entry| entry.line.as_str())
             .collect();
         assert_eq!(lines, vec!["survives a crash"]);
-        assert_eq!(
-            results[0].labels["service_name"], "checkout",
-            "replay reconstructs the stream, not just the line"
+        assert!(
+            results[0]
+                .entries[0]
+                .structured_metadata
+                .contains(&("service_name".to_string(), "checkout".to_string())),
+            "replay reconstructs the attributes, not just the line"
         );
     }
 

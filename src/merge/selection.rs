@@ -291,7 +291,7 @@ pub fn rewrite_group(
         // actually leave. A part that no rewrite ever touches keeps them, which
         // is why the request stays `received` until one has.
         if !deletes.is_empty()
-            && deletes.hides_row(&row.tenant, &row.labels, row.timestamp_ns, &row.line)
+            && deletes.hides_row(&row.tenant, row.timestamp_ns, &row.line, &row.structured_metadata)
         {
             return false;
         }

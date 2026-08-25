@@ -158,6 +158,17 @@ impl LogQuery {
         // `line_format` having rewritten the line a later parser would read.
         let mut json_only = true;
         let mut predicates = Vec::new();
+        // A selector equality is a statement about the row's own pushed
+        // attributes — the strongest predicate a scan can prune on, evaluated
+        // before any parser can synthesize a field.
+        for matcher in &self.matchers {
+            if matcher.op == MatcherOp::Eq && !matcher.value.is_empty() {
+                predicates.push(ExactFieldPredicate::new(
+                    matcher.name.clone(),
+                    matcher.value.clone(),
+                ));
+            }
+        }
         for stage in &self.stages {
             match stage {
                 PipelineStage::Json => parser_seen = true,
@@ -276,6 +287,14 @@ impl LogQuery {
             }
             fields.entry(name.clone()).or_insert_with(|| value.clone());
             observe_extracted_name(&mut next_extracted_suffix, name);
+        }
+        // The selector is the pipeline's leading filter now that no stream
+        // exists to match it against: it reads the same field map the stages
+        // do — the row's pushed attributes, before any parser runs.
+        for matcher in &self.matchers {
+            if !matcher.matches(&fields) {
+                return Ok(false);
+            }
         }
         for stage in &self.stages {
             if cancellation.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
@@ -673,6 +692,11 @@ impl MetricExpr {
         let query = self.log_query();
         let mut line = !query.line_filters.is_empty() || self.reads_lines();
         let mut named: BTreeSet<String> = BTreeSet::new();
+        // Selectors read the row's attributes per entry now, so the columns
+        // they name must be decoded even on the narrowest metric scan.
+        for matcher in &query.matchers {
+            named.insert(matcher.name.clone());
+        }
         for stage in &query.stages {
             match stage {
                 // An extraction is shadowed by same-named pushed metadata, so

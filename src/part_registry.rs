@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 
-use crate::logql::{LabelMatcher, LineFilter};
-use crate::memtable::{IndexStats, Labels, QueryResult, SharedLabels, StreamResult};
+use crate::logql::LineFilter;
+use crate::memtable::{IndexStats, QueryResult, StreamResult};
 use crate::object_storage::Manifest;
 use crate::part::{
     ExactFieldPredicate, ExactFieldPruning, MetadataWindow, Part, PartReader, QueryTimeRange,
@@ -72,8 +72,10 @@ pub struct LayoutTotals {
     /// `Σ parts.tenants.len()` — the number of (tenant, part) pairs, which is
     /// the unit this layout actually charges in.
     pub tenant_segments: u64,
-    /// Bloom and stream-index bytes held resident by open parts. The local
-    /// cache budget does not cover these.
+    /// Sidecar bytes held resident by open parts, beyond what the bloom
+    /// cache's own budget reports. With the stream index gone this is zero;
+    /// the field stays so the gauge keeps its meaning if a resident sidecar
+    /// returns.
     pub sidecar_resident_bytes: u64,
     /// Total `meta.json` across parts, which startup parses before serving.
     pub meta_bytes: u64,
@@ -84,9 +86,6 @@ impl LayoutTotals {
         self.tenant_segments = self
             .tenant_segments
             .saturating_add(reader.meta().tenants.len() as u64);
-        self.sidecar_resident_bytes = self
-            .sidecar_resident_bytes
-            .saturating_add(reader.index_resident_bytes());
         self.meta_bytes = self.meta_bytes.saturating_add(reader.meta().meta_bytes);
     }
 
@@ -94,9 +93,6 @@ impl LayoutTotals {
         self.tenant_segments = self
             .tenant_segments
             .saturating_sub(reader.meta().tenants.len() as u64);
-        self.sidecar_resident_bytes = self
-            .sidecar_resident_bytes
-            .saturating_sub(reader.index_resident_bytes());
         self.meta_bytes = self.meta_bytes.saturating_sub(reader.meta().meta_bytes);
     }
 }
@@ -286,10 +282,9 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn candidate_part_ids(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         range: QueryTimeRange,
     ) -> std::collections::HashSet<String> {
-        self.candidate_part_ids_with_exact_fields(tenant, matchers, &[], &[], range)
+        self.candidate_part_ids_with_exact_fields(tenant, &[], &[], range)
     }
 
     /// Plans against catalog-resident indexes only, including the optional
@@ -298,7 +293,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn candidate_part_ids_with_exact_fields(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
         range: QueryTimeRange,
@@ -307,7 +301,7 @@ falling back to a parked acquisition, which briefly convoys new readers"
             .read()
             .iter()
             .filter(|(_, reader)| {
-                reader.may_match_exact_fields(tenant, matchers, line_filters, exact_fields, range)
+                reader.may_match_exact_fields(tenant, line_filters, exact_fields, range)
             })
             .map(|(id, _)| id.clone())
             .collect()
@@ -499,7 +493,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn query(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         range: QueryTimeRange,
         limit: usize,
@@ -508,7 +501,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
         Ok(self
             .query_with_exact_field_pruning_and_scan_limit(
                 tenant,
-                matchers,
                 ExactFieldPruning::new(line_filters, &[]),
                 range,
                 limit,
@@ -522,7 +514,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn query_with_exact_field_pruning(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         range: QueryTimeRange,
         limit: usize,
@@ -530,7 +521,7 @@ falling back to a parked acquisition, which briefly convoys new readers"
     ) -> Result<Vec<StreamResult>, String> {
         Ok(self
             .query_with_exact_field_pruning_and_scan_limit(
-                tenant, matchers, pruning, range, limit, forward, None, None,
+                tenant, pruning, range, limit, forward, None, None,
             )?
             .results)
     }
@@ -539,7 +530,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn query_with_exact_field_pruning_and_scan_limit(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         range: QueryTimeRange,
         limit: usize,
@@ -549,7 +539,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     ) -> Result<QueryResult, String> {
         self.query_with_exact_field_pruning_and_scan_limits(
             tenant,
-            matchers,
             pruning,
             range,
             limit,
@@ -564,7 +553,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn query_with_exact_field_pruning_and_scan_limits(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         range: QueryTimeRange,
         limit: usize,
@@ -576,7 +564,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
         let mut rows = crate::part::TopKRows::new(limit, forward);
         let stats = self.scan_into(
             tenant,
-            matchers,
             pruning,
             range,
             forward,
@@ -606,7 +593,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
     pub fn scan_into(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         range: QueryTimeRange,
         forward: bool,
@@ -632,11 +618,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
                     return false;
                 };
                 range.overlaps(segment.min_ts_ns, segment.max_ts_ns)
-                    && (matchers.is_empty()
-                        || r.meta()
-                            .streams
-                            .iter()
-                            .any(|labels| matchers.iter().all(|matcher| matcher.matches(labels))))
             })
             .collect();
         candidates.sort_by_key(|r| {
@@ -694,7 +675,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
             let part_stats = reader
                 .scan_into(
                     tenant,
-                    matchers,
                     pruning.line_filters,
                     pruning.exact_fields,
                     range,
@@ -723,10 +703,7 @@ falling back to a parked acquisition, which briefly convoys new readers"
     }
 
     /// Whether the part still holds anything for the tenant that its
-    /// retention covers. The stream index has no per-stream timestamps, so
-    /// this prunes at part granularity: a part entirely below the floor
-    /// contributes nothing, and one that straddles it contributes all of its
-    /// labels. `None` prunes nothing.
+    /// retention covers, at part granularity.
     fn within_window(reader: &PartReader, tenant: &TenantId, window: MetadataWindow) -> bool {
         reader
             .meta()
@@ -734,78 +711,70 @@ falling back to a parked acquisition, which briefly convoys new readers"
             .is_some_and(|segment| window.overlaps(segment.min_ts_ns, segment.max_ts_ns))
     }
 
-    pub fn label_names(&self, tenant: &TenantId, window: MetadataWindow) -> Vec<String> {
-        let mut set = BTreeSet::new();
+    /// Attribute names stored as `_sm:` columns in parts overlapping the
+    /// window.
+    ///
+    /// The stream index that used to answer the metadata endpoints went with
+    /// the stream concept, so names come from the per-part key census in
+    /// `meta.json`. The census is part-wide rather than per-tenant, and keys
+    /// past the column cap live only in the residual blob — both err toward
+    /// listing a name over hiding one.
+    pub fn metadata_key_names(&self, tenant: &TenantId, window: MetadataWindow) -> Vec<String> {
+        let mut names = BTreeSet::new();
         for reader in self.snapshot() {
             if !Self::within_window(&reader, tenant, window) {
                 continue;
             }
-            for name in reader.label_names(tenant) {
-                set.insert(name);
+            for (key, _) in &reader.meta().metadata_columns {
+                if !names.contains(key) {
+                    names.insert(key.clone());
+                }
             }
         }
-        set.into_iter().collect()
+        names.into_iter().collect()
     }
 
-    pub fn label_values(
+    /// The newest `limit` rows' metadata in the window, for the sampled
+    /// answers the metadata endpoints give now that no value index exists.
+    pub fn sample_metadata(
         &self,
         tenant: &TenantId,
-        name: &str,
         window: MetadataWindow,
-    ) -> Vec<String> {
-        let mut set = BTreeSet::new();
-        for reader in self.snapshot() {
-            if !Self::within_window(&reader, tenant, window) {
-                continue;
-            }
-            for v in reader.label_values(tenant, name) {
-                set.insert(v);
-            }
-        }
-        set.into_iter().collect()
-    }
-
-    pub fn series(
-        &self,
-        tenant: &TenantId,
-        matchers: &[LabelMatcher],
-        window: MetadataWindow,
-    ) -> Vec<Labels> {
-        let mut set: std::collections::BTreeSet<Labels> = std::collections::BTreeSet::new();
-        for reader in self.snapshot() {
-            if !Self::within_window(&reader, tenant, window) {
-                continue;
-            }
-            for labels in reader.series(tenant, matchers) {
-                set.insert(labels);
-            }
-        }
-        set.into_iter().collect()
+        limit: usize,
+    ) -> Result<Vec<Vec<(String, String)>>, String> {
+        let mut rows = crate::part::TopKRows::new(limit, false);
+        self.scan_into(
+            tenant,
+            ExactFieldPruning::new(&[], &[]),
+            QueryTimeRange::closed(window.start_ns, window.end_ns),
+            false,
+            None,
+            None,
+            None,
+            &crate::part::ColumnSet::all(),
+            &mut rows,
+        )?;
+        Ok(rows
+            .into_rows()
+            .into_iter()
+            .map(|(_, entry)| entry.structured_metadata)
+            .collect())
     }
 
     /// Process-wide totals for the operator metrics endpoint.
     pub fn global_stats(&self) -> IndexStats {
-        let mut stream_set: BTreeSet<SharedLabels> = BTreeSet::new();
         let mut entries = 0usize;
         let mut bytes = 0u64;
         for reader in self.snapshot() {
-            for labels in &reader.meta().streams {
-                stream_set.insert(labels.clone());
-            }
             entries += reader.meta().row_count as usize;
             if let Ok(metadata) = std::fs::metadata(reader.part().data_path()) {
                 bytes += metadata.len();
             }
         }
-        IndexStats {
-            streams: stream_set.len(),
-            entries,
-            bytes,
-        }
+        IndexStats { entries, bytes }
     }
 
     pub fn stats(&self, tenant: &TenantId, window: MetadataWindow) -> IndexStats {
-        let mut stream_set: BTreeSet<Labels> = BTreeSet::new();
         let mut entries = 0usize;
         let mut bytes = 0u64;
         for reader in self.snapshot() {
@@ -815,9 +784,6 @@ falling back to a parked acquisition, which briefly convoys new readers"
             let Some(segment) = reader.meta().tenant_segment(tenant) else {
                 continue;
             };
-            for labels in reader.series(tenant, &[]) {
-                stream_set.insert(labels);
-            }
             entries += segment.row_count as usize;
             // The extent `meta.json` records, not the local file's size. The
             // previous arithmetic prorated `fs::metadata` by row share, which
@@ -826,11 +792,7 @@ falling back to a parked acquisition, which briefly convoys new readers"
             // whose data had all aged out of the cache looked free.
             bytes = bytes.saturating_add(segment.bytes.len());
         }
-        IndexStats {
-            streams: stream_set.len(),
-            entries,
-            bytes,
-        }
+        IndexStats { entries, bytes }
     }
 }
 
@@ -862,7 +824,6 @@ mod tests {
         Row {
             tenant: test_tenant(),
             timestamp_ns,
-            labels: std::sync::Arc::new(labels),
             line: line.to_string(),
             structured_metadata: vec![],
         }
@@ -874,7 +835,6 @@ mod tests {
         Row {
             tenant: TenantId::parse(tenant).unwrap(),
             timestamp_ns,
-            labels: std::sync::Arc::new(labels),
             line: line.to_string(),
             structured_metadata: vec![],
         }
@@ -978,10 +938,7 @@ mod tests {
         assert_eq!(registry.part_count(), 1, "the registry still answers");
         assert!(
             registry
-                .query(
-                    &test_tenant(),
-                    &[],
-                    &[],
+                .query(&test_tenant(), &[],
                     crate::part::QueryTimeRange::closed(0, 2_000),
                     10,
                     true
@@ -1004,10 +961,7 @@ mod tests {
         registry.register(second).unwrap();
 
         let result = registry
-            .query(
-                &test_tenant(),
-                &[],
-                &[],
+            .query(&test_tenant(), &[],
                 crate::part::QueryTimeRange::closed(0, 1_000),
                 2,
                 true,
@@ -1050,10 +1004,7 @@ mod tests {
 
         let newest = |limit| {
             registry
-                .query(
-                    &test_tenant(),
-                    &[],
-                    &[],
+                .query(&test_tenant(), &[],
                     crate::part::QueryTimeRange::closed(0, 1_000),
                     limit,
                     false,
@@ -1108,10 +1059,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(registry.part_count(), 1);
         let results = registry
-            .query(
-                &test_tenant(),
-                &[],
-                &[],
+            .query(&test_tenant(), &[],
                 crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                 100,
                 true,
@@ -1187,10 +1135,7 @@ mod tests {
 
         std::fs::write(data_path, b"corrupt").unwrap();
 
-        let result = registry.query(
-            &test_tenant(),
-            &[],
-            &[],
+        let result = registry.query(&test_tenant(), &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             100,
             true,
@@ -1209,10 +1154,7 @@ mod tests {
         registry.register(parts).unwrap();
 
         let results = registry
-            .query(
-                &test_tenant(),
-                &[],
-                &[],
+            .query(&test_tenant(), &[],
                 crate::part::QueryTimeRange::closed(i64::MAX, i64::MAX),
                 100,
                 true,
@@ -1243,7 +1185,6 @@ mod tests {
                 .candidate_part_ids_with_exact_fields(
                     &test_tenant(),
                     &[],
-                    &[],
                     std::slice::from_ref(&predicate),
                     crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                 )
@@ -1253,7 +1194,6 @@ mod tests {
             registry
                 .candidate_part_ids_with_exact_fields(
                     &test_tenant(),
-                    &[],
                     &[],
                     &[predicate],
                     crate::part::QueryTimeRange::closed(first_ts, first_ts),

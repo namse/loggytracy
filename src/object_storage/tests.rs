@@ -18,13 +18,12 @@
     }
 
     fn row(line: &str) -> Row {
-        let labels: Labels = [("app".to_string(), "remote".to_string())]
+        let _labels: Labels = [("app".to_string(), "remote".to_string())]
             .into_iter()
             .collect();
         Row {
             tenant: test_tenant(),
             timestamp_ns: 1_700_000_000_000_000_000,
-            labels: std::sync::Arc::new(labels),
             line: line.to_string(),
             structured_metadata: Vec::new(),
         }
@@ -250,7 +249,7 @@
         let registry =
             crate::part_registry::PartRegistry::load_from_manifest(&source, &manifest).unwrap();
         let result = registry
-            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+            .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .unwrap();
         assert_eq!(result[0].entries[0].line, "from object store");
     }
@@ -1493,7 +1492,7 @@ opens a connection per part"
         let registry =
             crate::part_registry::PartRegistry::load_from_manifest(&root, &manifest).unwrap();
         let result = registry
-            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+            .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .unwrap();
         assert_eq!(result[0].entries[0].line, "contended");
     }
@@ -1721,7 +1720,7 @@ opens a connection per part"
         let registry =
             crate::part_registry::PartRegistry::load_from_manifest(&root, &manifest).unwrap();
         let result = registry
-            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+            .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .unwrap();
         assert_eq!(result[0].entries[0].line, "evicted then restored");
     }
@@ -1755,7 +1754,7 @@ opens a connection per part"
         let registry =
             crate::part_registry::PartRegistry::load_from_manifest(&root, &manifest).unwrap();
         let result = registry
-            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+            .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .unwrap();
         assert_eq!(result[0].entries[0].line, "damaged then restored");
     }

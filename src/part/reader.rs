@@ -67,19 +67,10 @@ pub struct PartReader {
     /// always-resident form at ~2 MiB per part, growing with the retention
     /// window; see the bloom cache (`bloom_cache.rs`).
     blooms: Arc<BloomSlot>,
-    stream_index: StreamMap,
-    stream_labels: Vec<String>,
     /// The keys stored as `_sm:` columns, in schema (sorted) order.
     metadata_keys: Vec<String>,
     /// The `| json`-extracted fields stored as `_pf:` columns, sorted.
     parsed_keys: Vec<String>,
-    /// Bytes the stream index occupies for as long as this reader lives —
-    /// the half of the sidecar that stays resident unconditionally, because
-    /// the infallible metadata paths read it and it is tens of kilobytes
-    /// against the blooms' megabytes. Recorded at open because that is the
-    /// only moment the size is free. The blooms report through
-    /// [`bloom_cache_bytes`] instead.
-    index_resident_bytes: u64,
     /// Whole row groups decoded by earlier scans, kept under the process-wide
     /// budget; dies with this reader.
     group_cache: GroupCache,
@@ -357,20 +348,17 @@ fn open_part_data(
         .iter()
         .map(|(key, _)| key.clone())
         .collect();
-    // Before the generic comparison: a part from before the `_stream` ordinal
-    // has label columns where column 3 now lives, and the failure has to name
-    // its own remedy rather than read as corruption. Checked here so it also
-    // fires before any arrow downcast could panic on a Utf8 column.
-    let stream_field_ok = arrow_reader_metadata
+    // Before the generic comparison: a part from the stream era carries a
+    // `_stream` ordinal column, and the failure has to name its own remedy
+    // rather than read as corruption.
+    if arrow_reader_metadata
         .schema()
         .fields()
-        .get(3)
-        .is_some_and(|field| {
-            field.name() == STREAM_COLUMN && field.data_type() == &DataType::UInt32
-        });
-    if !stream_field_ok {
+        .iter()
+        .any(|field| field.name() == "_stream")
+    {
         return Err(format!(
-            "part {} was written before the {STREAM_COLUMN} ordinal column; this engine \
+            "part {} was written with the retired _stream ordinal column; this engine \
 versions nothing, so delete the data directory and re-ingest",
             part.meta.id
         ));
@@ -385,38 +373,6 @@ versions nothing, so delete the data directory and re-ingest",
         ));
     }
     Ok((data_file, arrow_reader_metadata))
-}
-
-fn validate_stream_index(part: &Part, index: &StreamMap) -> Result<(), String> {
-    let expected: BTreeSet<(String, String)> = part
-        .meta
-        .streams
-        .iter()
-        .flat_map(|labels| {
-            labels
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-        })
-        .collect();
-    let mut indexed = BTreeSet::new();
-    for (name, values) in index {
-        for (value, bitmap) in values {
-            if bitmap.is_empty() || bitmap.iter().any(|rg| rg >= part.meta.row_group_count) {
-                return Err(format!(
-                    "stream index has invalid row-group bitmap for part {}",
-                    part.meta.id
-                ));
-            }
-            indexed.insert((name.clone(), value.clone()));
-        }
-    }
-    if indexed != expected {
-        return Err(format!(
-            "stream index labels do not match metadata for part {}",
-            part.meta.id
-        ));
-    }
-    Ok(())
 }
 
 impl PartReader {
@@ -446,11 +402,8 @@ impl PartReader {
             ));
         }
         let index_bytes = fs::read(part.index_path()).map_err(|e| e.to_string())?;
-        let (bloom_bytes, stream_bytes) = split_index(&index_bytes)?;
+        let bloom_bytes = split_index(&index_bytes)?;
         let decoded_blooms = Arc::new(decode_blooms(bloom_bytes, &part.meta.row_group_rows)?);
-        let stream_index = decode_stream_index(stream_bytes)?;
-        validate_stream_index(&part, &stream_index)?;
-        let stream_labels = part.meta.stream_labels.clone();
         let metadata_keys: Vec<String> = part
             .meta
             .metadata_columns
@@ -466,7 +419,6 @@ impl PartReader {
         if require_data || part.data_path().exists() {
             open_part_data(&part, true, false)?;
         }
-        let index_resident_bytes = stream_index_resident_bytes(&stream_index);
         let cache_projection =
             ScanProjection::build(&metadata_keys, &parsed_keys, &ColumnSet::all());
         let blooms = BloomSlot::new();
@@ -477,20 +429,12 @@ impl PartReader {
         Ok(Self {
             part,
             blooms,
-            stream_index,
-            stream_labels,
             metadata_keys,
             parsed_keys,
-            index_resident_bytes,
             group_cache: GroupCache::from_global(),
             cache_projection,
             data_metadata: std::sync::OnceLock::new(),
         })
-    }
-
-    /// See [`PartReader::index_resident_bytes`].
-    pub fn index_resident_bytes(&self) -> u64 {
-        self.index_resident_bytes
     }
 
     /// The blooms, resident or re-read: a cache hit touches the LRU, a miss
@@ -510,7 +454,7 @@ impl PartReader {
                 self.part.meta.id
             )
         })?;
-        let (bloom_bytes, _) = split_index(&index_bytes)?;
+        let bloom_bytes = split_index(&index_bytes)?;
         let decoded = Arc::new(decode_blooms(bloom_bytes, &self.part.meta.row_group_rows)?);
         self.blooms
             .install(decoded.clone(), bloom_resident_bytes(&decoded));
@@ -536,78 +480,9 @@ impl PartReader {
             .map(|segment| segment.row_group_start..segment.row_group_end)
     }
 
-    /// Label names a tenant can see. Derived from the stream index restricted
-    /// to the tenant's row groups rather than the part-wide label list.
-    pub fn label_names(&self, tenant: &TenantId) -> Vec<String> {
-        let Some(groups) = self.tenant_row_groups(tenant) else {
-            return Vec::new();
-        };
-        self.stream_index
-            .iter()
-            .filter(|(_, values)| {
-                values
-                    .values()
-                    .any(|bitmap| bitmap.iter().any(|rg| groups.contains(&rg)))
-            })
-            .map(|(name, _)| name.clone())
-            .collect()
-    }
-
-    /// Label names present anywhere in the part, for internal use by callers
-    /// that already know they are not serving a tenant query (schema checks).
-    pub fn all_label_names(&self) -> &[String] {
-        &self.stream_labels
-    }
-
-    pub fn label_values(&self, tenant: &TenantId, name: &str) -> Vec<String> {
-        let Some(groups) = self.tenant_row_groups(tenant) else {
-            return Vec::new();
-        };
-        self.stream_index
-            .get(name)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter(|(_, bitmap)| bitmap.iter().any(|rg| groups.contains(&rg)))
-                    .map(|(value, _)| value.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn series(&self, tenant: &TenantId, matchers: &[LabelMatcher]) -> Vec<Labels> {
-        let Some(groups) = self.tenant_row_groups(tenant) else {
-            return Vec::new();
-        };
-        self.part
-            .meta
-            .streams
-            .iter()
-            .filter(|labels| matchers.iter().all(|m| m.matches(labels.as_ref())))
-            .filter(|labels| self.stream_occurs_in(labels, &groups))
-            .map(|labels| (**labels).clone())
-            .collect()
-    }
-
-    /// Whether a stream's labels are indexed in any of `groups`. The part-wide
-    /// stream list is shared by all tenants, so it has to be filtered through
-    /// the row-group posting lists before it can be returned.
-    fn stream_occurs_in(&self, labels: &Labels, groups: &std::ops::Range<u32>) -> bool {
-        if labels.is_empty() {
-            return true;
-        }
-        labels.iter().all(|(name, value)| {
-            self.stream_index
-                .get(name)
-                .and_then(|values| values.get(value))
-                .is_some_and(|bitmap| bitmap.iter().any(|rg| groups.contains(&rg)))
-        })
-    }
-
     pub fn query(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         range: QueryTimeRange,
         limit: usize,
@@ -616,7 +491,6 @@ impl PartReader {
         Ok(self
             .query_with_exact_field_pruning_and_scan_limit(
                 tenant,
-                matchers,
                 ExactFieldPruning::new(line_filters, &[]),
                 range,
                 limit,
@@ -633,7 +507,6 @@ impl PartReader {
     pub fn query_with_exact_field_pruning(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         range: QueryTimeRange,
         limit: usize,
@@ -641,7 +514,7 @@ impl PartReader {
     ) -> Result<Vec<StreamResult>, String> {
         Ok(self
             .query_with_exact_field_pruning_and_scan_limit(
-                tenant, matchers, pruning, range, limit, forward, None, None,
+                tenant, pruning, range, limit, forward, None, None,
             )?
             .results)
     }
@@ -650,7 +523,6 @@ impl PartReader {
     pub fn query_with_exact_field_pruning_and_scan_limit(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         range: QueryTimeRange,
         limit: usize,
@@ -660,7 +532,6 @@ impl PartReader {
     ) -> Result<QueryResult, String> {
         self.query_with_exact_field_pruning_and_scan_limits(
             tenant,
-            matchers,
             pruning,
             range,
             limit,
@@ -675,7 +546,6 @@ impl PartReader {
     pub fn query_with_exact_field_pruning_and_scan_limits(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         pruning: ExactFieldPruning<'_>,
         range: QueryTimeRange,
         limit: usize,
@@ -686,7 +556,6 @@ impl PartReader {
     ) -> Result<QueryResult, String> {
         self.query_internal(
             tenant,
-            matchers,
             pruning.line_filters,
             pruning.exact_fields,
             range,
@@ -731,7 +600,6 @@ impl PartReader {
                 &segment.tenant,
                 &[],
                 &[],
-                &[],
                 QueryTimeRange::unbounded(),
                 true,
                 None,
@@ -753,17 +621,15 @@ impl PartReader {
     fn select_row_groups(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         time_range: QueryTimeRange,
     ) -> Result<Vec<u32>, String> {
-        self.select_row_groups_with_exact_fields(tenant, matchers, line_filters, &[], time_range)
+        self.select_row_groups_with_exact_fields(tenant, line_filters, &[], time_range)
     }
 
     fn select_row_groups_with_exact_fields(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
         time_range: QueryTimeRange,
@@ -803,9 +669,6 @@ impl PartReader {
             ) {
                 continue;
             }
-            if !row_group_matches_index(rg, matchers, &self.stream_index) {
-                continue;
-            }
             if let Some(blooms) = &blooms {
                 if !self.bloom_prune(blooms, rgu, &prune_literals) {
                     continue;
@@ -825,7 +688,6 @@ impl PartReader {
     pub fn may_match_exact_fields(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
         range: QueryTimeRange,
@@ -833,7 +695,7 @@ impl PartReader {
         // A bloom re-read that fails must answer "may match": skipping a
         // part on an I/O error would silently drop rows, where admitting it
         // surfaces the error on the scan that follows.
-        self.select_row_groups_with_exact_fields(tenant, matchers, line_filters, exact_fields, range)
+        self.select_row_groups_with_exact_fields(tenant, line_filters, exact_fields, range)
             .map(|groups| !groups.is_empty())
             .unwrap_or(true)
     }
@@ -842,7 +704,6 @@ impl PartReader {
     fn query_internal(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
         time_range: QueryTimeRange,
@@ -856,7 +717,6 @@ impl PartReader {
         let mut rows = TopKRows::new(limit, forward);
         let stats = self.scan_into(
             tenant,
-            matchers,
             line_filters,
             exact_fields,
             time_range,
@@ -893,7 +753,6 @@ impl PartReader {
     pub fn scan_into(
         &self,
         tenant: &TenantId,
-        matchers: &[LabelMatcher],
         line_filters: &[LineFilter],
         exact_fields: &[ExactFieldPredicate],
         time_range: QueryTimeRange,
@@ -924,27 +783,14 @@ impl PartReader {
             .enabled()
             .then(|| projection.view_in(&self.cache_projection))
             .flatten();
-        // Matchers are evaluated once per stream, not once per row: the
-        // `_stream` ordinal names the row's label set, so the per-row check
-        // is one boolean lookup. This is also what retired the blind-count
-        // second projection — reading the ordinal costs a u32 per row, which
-        // is cheaper than proving a group uniform used to be.
-        let stream_matches: Vec<bool> = self
-            .part
-            .meta
-            .streams
-            .iter()
-            .map(|labels| matchers.iter().all(|matcher| matcher.matches(labels)))
-            .collect();
         // The predicates the part's own columns answer *exactly*: a string
-        // equality on a field that is not one of this part's stream labels,
-        // read from the `_sm:` column (pushed metadata) and — when the only
-        // parser in the pipeline is `| json` over the stored line — falling
-        // back to the `_pf:` column exactly as the pipeline falls back from
-        // metadata to extraction. For such a predicate the columns *are* the
-        // field the filter would see, so rows are selected on the narrow
-        // columns before the wide decode — the row-level precision the
-        // row-group bloom cannot give.
+        // equality on a field, read from the `_sm:` column (pushed metadata)
+        // and — when the only parser in the pipeline is `| json` over the
+        // stored line — falling back to the `_pf:` column exactly as the
+        // pipeline falls back from metadata to extraction. For such a
+        // predicate the columns *are* the field the filter would see, so rows
+        // are selected on the narrow columns before the wide decode — the
+        // row-level precision the row-group bloom cannot give.
         //
         // Absence is decidable when a key list is under its cap: every present
         // key then has a column, so a key that is not listed is on no row. A
@@ -953,10 +799,7 @@ impl PartReader {
         // false positive from a group decode into no read at all.
         let mut definitive: Vec<DefinitiveColumn> = Vec::new();
         for predicate in exact_fields {
-            if predicate.canonical
-                || predicate.value.is_empty()
-                || self.stream_labels.binary_search(&predicate.name).is_ok()
-            {
+            if predicate.canonical || predicate.value.is_empty() {
                 continue;
             }
             let sm_key = self.metadata_keys.binary_search(&predicate.name).ok();
@@ -995,15 +838,9 @@ impl PartReader {
         }
 
         let selected = if exact_fields.is_empty() {
-            self.select_row_groups(tenant, matchers, line_filters, time_range)?
+            self.select_row_groups(tenant, line_filters, time_range)?
         } else {
-            self.select_row_groups_with_exact_fields(
-                tenant,
-                matchers,
-                line_filters,
-                exact_fields,
-                time_range,
-            )?
+            self.select_row_groups_with_exact_fields(tenant, line_filters, exact_fields, time_range)?
         };
         let mut sorted_selected = selected;
         if let Some(window) = &row_group_window {
@@ -1027,20 +864,11 @@ impl PartReader {
                 &sorted_selected,
             );
         }
-        // By time, not by ordinal. Ordinal order used to be time order; now it
-        // is stream order, and visiting streams in turn would fill the sink
-        // with one stream's rows before seeing another's — leaving the frontier
-        // loose and the per-group skip below unable to reject anything. Sorting
-        // the selected groups by the end the scan reaches first tightens it as
-        // fast as the old layout did.
-        //
-        // A windowed read is the exception: it is a rewrite reading the part
-        // in layout order, and `MergedRows` k-way-merges what it returns on
-        // the promise that each page arrives in `Row::sort_key` order. Time
-        // order is not that order once a row group straddles two streams —
-        // its `min_ts` reaches back to the younger stream's start, and the
-        // time sort visits it early, handing the merge (and therefore the
-        // parts it writes) rows that have left layout order.
+        // By the end the scan reaches first, so the sink's frontier tightens
+        // as early as possible. A windowed read is the exception: it is a
+        // rewrite reading the part in layout order, and `MergedRows`
+        // k-way-merges what it returns on the promise that each page arrives
+        // in `Row::sort_key` order.
         if row_group_window.is_none() {
             sorted_selected.sort_unstable_by_key(|&row_group| {
                 let rgu = row_group as usize;
@@ -1069,6 +897,9 @@ impl PartReader {
         } else {
             Some(self.decoded_blooms()?)
         };
+        // The sink plumbing still carries a shared label map per row; with no
+        // stream concept it is one empty map for the whole scan.
+        let empty_labels: SharedLabels = SharedLabels::default();
 
         'row_groups: for &row_group in &sorted_selected {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -1268,7 +1099,7 @@ impl PartReader {
                         cache_view.as_ref().expect("a cached serve implies a view"),
                         false,
                         count_scanned_rows,
-                        &stream_matches,
+                        &empty_labels,
                         &mut stats,
                         sink,
                     ) {
@@ -1303,7 +1134,7 @@ impl PartReader {
                         cache_view.as_ref().expect("a cached serve implies a view"),
                         true,
                         count_scanned_rows,
-                        &stream_matches,
+                        &empty_labels,
                         &mut stats,
                         sink,
                     ) {
@@ -1362,7 +1193,7 @@ impl PartReader {
                         view,
                         false,
                         count_scanned_rows,
-                        &stream_matches,
+                        &empty_labels,
                         &mut stats,
                         sink,
                     ) {
@@ -1411,7 +1242,7 @@ impl PartReader {
                         projection,
                         true,
                         count_scanned_rows,
-                        &stream_matches,
+                        &empty_labels,
                         &mut stats,
                         sink,
                     ) {
@@ -1487,7 +1318,7 @@ impl PartReader {
                     projection,
                     true,
                     count_scanned_rows,
-                    &stream_matches,
+                    &empty_labels,
                     &mut stats,
                     sink,
                 ) {
@@ -1617,8 +1448,8 @@ impl PartReader {
         base_selection: Option<&RowSelection>,
         stats: &mut ScanStats,
     ) -> Result<Option<RowSelection>, String> {
-        let sm_leaf = |key: usize| 4 + key;
-        let pf_leaf = |key: usize| 4 + self.metadata_keys.len() + key;
+        let sm_leaf = |key: usize| 3 + key;
+        let pf_leaf = |key: usize| 3 + self.metadata_keys.len() + key;
         let mut leaves = vec![1usize];
         for def in definitive {
             leaves.extend(def.sm_key.map(sm_leaf));
@@ -1740,7 +1571,7 @@ impl PartReader {
         // off.
         charge_batch_bytes: bool,
         count_scanned_rows: bool,
-        stream_matches: &[bool],
+        empty_labels: &SharedLabels,
         stats: &mut ScanStats,
         sink: &mut dyn RowSink,
     ) -> Result<ScanStep, String> {
@@ -1780,18 +1611,12 @@ impl PartReader {
         let sm = projection
             .residual
             .map(|index| batch.column(index).as_string::<i32>());
-        let stream = batch.column(projection.stream).as_primitive::<UInt32Type>();
 
         let row_indices: Box<dyn Iterator<Item = usize>> = if forward {
             Box::new(0..batch.num_rows())
         } else {
             Box::new((0..batch.num_rows()).rev())
         };
-        // Rows are sorted by stream inside a group, so consecutive rows almost
-        // always share an ordinal — one *run* per stream. The run test is a
-        // single u32 compare; a boundary pays one table index and one
-        // precomputed-match lookup, which is the whole label machinery now.
-        let mut run: Option<(u32, SharedLabels, bool)> = None;
         for i in row_indices {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Ok(ScanStep::Stop);
@@ -1807,14 +1632,6 @@ impl PartReader {
                 ));
             }
             let ts_val = ts.value(i);
-            // Per row, not per group. A row group holds a run of *whole
-            // streams*, each ordered by time inside itself, so the group as a
-            // whole is not time-ordered and one row past the frontier says
-            // nothing about the rows after it — they may belong to another
-            // stream and still qualify. Stopping the group here returned rows
-            // from the middle of the window while Loki returned the newest
-            // hundred, live in the comparison bed. Only `span_beyond_frontier`
-            // over the group's `meta.json` span may skip whole groups.
             if beyond_frontier(sink.frontier_ns(), forward, ts_val) {
                 continue;
             }
@@ -1831,31 +1648,6 @@ impl PartReader {
                 stats.scanned_rows = stats.scanned_rows.saturating_add(1);
             }
             if !time_range.contains(ts_val) {
-                continue;
-            }
-            let ordinal = stream.value(i);
-            let (labels, matched) = match &run {
-                Some((previous, labels, matched)) if *previous == ordinal => {
-                    (labels.clone(), *matched)
-                }
-                _ => {
-                    let index = ordinal as usize;
-                    let streams = &self.part.meta.streams;
-                    if index >= streams.len() || index >= stream_matches.len() {
-                        return Err(format!(
-                            "part {} row group {row_group} references stream ordinal \
-{ordinal} beyond the {}-entry stream table",
-                            self.part.meta.id,
-                            streams.len()
-                        ));
-                    }
-                    let labels = streams[index].clone();
-                    let matched = stream_matches[index];
-                    run = Some((ordinal, labels.clone(), matched));
-                    (labels, matched)
-                }
-            };
-            if !matched {
                 continue;
             }
             // Filters test the borrowed value; the `String` is built only for
@@ -1921,7 +1713,7 @@ impl PartReader {
                 })
                 .filter(|extracted| !extracted.is_empty());
             sink.accept_extracted(
-                &labels,
+                empty_labels,
                 LogEntry {
                     timestamp_ns: ts_val,
                     line,
@@ -1957,9 +1749,6 @@ struct ScanProjection {
     leaves: Vec<usize>,
     /// Projected index of `_msg`, when the line is read at all.
     msg: Option<usize>,
-    /// Projected index of the `_stream` ordinal column — always in the mask;
-    /// it is one u32 per row and it is how every row names its label set.
-    stream: usize,
     /// `(index into metadata_keys, projected index)` per projected `_sm:`.
     metadata: Vec<(usize, usize)>,
     /// `(index into parsed_keys, projected index)` per projected `_pf:` —
@@ -1977,8 +1766,8 @@ impl ScanProjection {
         parsed_keys: &[String],
         columns: &ColumnSet,
     ) -> Self {
-        let residual_leaf = 4 + metadata_keys.len() + parsed_keys.len();
-        let mut leaves = vec![0usize, 1, 3];
+        let residual_leaf = 3 + metadata_keys.len() + parsed_keys.len();
+        let mut leaves = vec![0usize, 1];
         if columns.line {
             leaves.push(2);
         }
@@ -1986,14 +1775,14 @@ impl ScanProjection {
         let include_residual = match &columns.metadata {
             MetadataProjection::All => {
                 for key in 0..metadata_keys.len() {
-                    metadata_leaves.push((key, 4 + key));
+                    metadata_leaves.push((key, 3 + key));
                 }
                 true
             }
             MetadataProjection::Named(names) => {
                 for (key_index, key) in metadata_keys.iter().enumerate() {
                     if names.contains(key) {
-                        metadata_leaves.push((key_index, 4 + key_index));
+                        metadata_leaves.push((key_index, 3 + key_index));
                     }
                 }
                 // The residual is read only when a named field might live in
@@ -2011,7 +1800,7 @@ impl ScanProjection {
         // shortcut is offered only when every extracted key has a column.
         if columns.parsed_fields && parsed_keys.len() < MAX_METADATA_COLUMNS {
             for key in 0..parsed_keys.len() {
-                parsed_leaves.push((key, 4 + metadata_keys.len() + key));
+                parsed_leaves.push((key, 3 + metadata_keys.len() + key));
             }
         }
         leaves.extend(metadata_leaves.iter().map(|&(_, leaf)| leaf));
@@ -2031,7 +1820,6 @@ impl ScanProjection {
         };
         Self {
             msg: columns.line.then(|| rank(2)),
-            stream: rank(3),
             metadata: metadata_leaves
                 .iter()
                 .map(|&(key, leaf)| (key, rank(leaf)))
@@ -2061,7 +1849,6 @@ impl ScanProjection {
                 Some(position) => Some(rank_of(position)?),
                 None => None,
             },
-            stream: rank_of(self.stream)?,
             metadata: self
                 .metadata
                 .iter()
@@ -2086,12 +1873,6 @@ enum ScanStep {
     Continue,
     /// Nothing further in the part can enter the result: a limit was reached or
     /// the query was cancelled, neither of which depends on order.
-    ///
-    /// There is deliberately no group-level step between these two. A row
-    /// group holds several whole streams, so no single row's position proves
-    /// anything about the rest of its group; the sound group-level skip is
-    /// `span_beyond_frontier` over the group's recorded span, taken before the
-    /// group is opened.
     Stop,
 }
 
@@ -2167,35 +1948,6 @@ impl PartReader {
         rg: usize,
         predicate: &ExactFieldPredicate,
     ) -> Option<u64> {
-        // A stream label is not in the exact-field bloom, but it is in the
-        // stream index — so the predicate is answerable, just from the
-        // other side. This used to scan unconditionally, which made
-        // `| app="x"` on a stream label the one equality that could not
-        // prune, even though the index knows exactly which row groups hold
-        // it.
-        //
-        // The label is what the filter sees even when a parser extracted
-        // the same name, because the label is canonical and the extraction
-        // is renamed to `<name>_extracted`. So the index is authoritative
-        // here rather than merely a hint. It speaks at group granularity:
-        // admit every window or none.
-        if self
-            .stream_labels
-            .iter()
-            .any(|name| name == &predicate.name)
-        {
-            // An empty value means "absent or empty", and absence is not
-            // an entry in the index.
-            if predicate.value.is_empty() {
-                return None;
-            }
-            let admitted = self
-                .stream_index
-                .get(&predicate.name)
-                .and_then(|values| values.get(&predicate.value))
-                .is_some_and(|bitmap| bitmap.contains(rg as u32));
-            return if admitted { None } else { Some(0) };
-        }
         // Field-filter execution may treat an absent field as an empty
         // string. Absence is not represented in the bloom, so an empty
         // equality cannot safely reject anything.
@@ -2228,34 +1980,6 @@ impl PartReader {
     }
 }
 
-fn row_group_matches_index(rg: u32, matchers: &[LabelMatcher], index: &StreamMap) -> bool {
-    for m in matchers {
-        match m.op {
-            MatcherOp::Eq => {
-                // {label=""} matches a missing label. The stream index has no entry for
-                // streams without the label, so conservatively allow an empty value
-                // to keep this consistent with the memtable path.
-                if m.value.is_empty() {
-                    continue;
-                }
-                let Some(values) = index.get(&m.name) else {
-                    return false;
-                };
-                let Some(bitmap) = values.get(&m.value) else {
-                    return false;
-                };
-                if !bitmap.contains(rg) {
-                    return false;
-                }
-            }
-            MatcherOp::Neq | MatcherOp::Re | MatcherOp::NRe => {
-                // conservative: cannot precisely prune with these ops
-            }
-        }
-    }
-    true
-}
-
 /// What the decoded blooms cost in memory — the evictable half of the
 /// sidecar, charged to the global bloom-cache budget.
 ///
@@ -2270,20 +1994,6 @@ fn bloom_resident_bytes(blooms: &DecodedBlooms) -> u64 {
     for window in blooms.exact_fields.iter().flatten() {
         if let WindowBloom::Filter(filter) = window {
             total = total.saturating_add(filter.resident_bytes() as u64);
-        }
-    }
-    total
-}
-
-/// What the stream index costs in memory — the half that stays resident for
-/// the reader's lifetime, because the infallible metadata paths read it.
-fn stream_index_resident_bytes(stream_index: &StreamMap) -> u64 {
-    let mut total: u64 = 0;
-    for (name, values) in stream_index {
-        total = total.saturating_add(name.len() as u64);
-        for (value, bitmap) in values {
-            total = total.saturating_add(value.len() as u64);
-            total = total.saturating_add(bitmap.serialized_size() as u64);
         }
     }
     total
@@ -2395,63 +2105,6 @@ fn decode_length_prefixed_bloom(buf: &[u8], pos: &mut usize) -> Result<BloomFilt
         .ok_or_else(|| "bloom payload truncated".to_string())?;
     *pos = payload_end;
     BloomFilter::decode(payload)
-}
-
-fn decode_stream_index(buf: &[u8]) -> Result<StreamMap, String> {
-    if buf.len() < 8 {
-        return Err("stream index too short".to_string());
-    }
-    if &buf[0..4] != STREAM_MAGIC {
-        return Err("stream index magic mismatch".to_string());
-    }
-    let count = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-    let mut pos = 8;
-    let mut map: StreamMap = BTreeMap::new();
-    for _ in 0..count {
-        if pos + 4 > buf.len() {
-            return Err("stream index name length truncated".to_string());
-        }
-        let name_len =
-            u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-        pos += 4;
-        if pos + name_len > buf.len() {
-            return Err("stream index name truncated".to_string());
-        }
-        let name = std::str::from_utf8(&buf[pos..pos + name_len])
-            .map_err(|e| e.to_string())?
-            .to_string();
-        pos += name_len;
-        if pos + 4 > buf.len() {
-            return Err("stream index value length truncated".to_string());
-        }
-        let value_len =
-            u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-        pos += 4;
-        if pos + value_len > buf.len() {
-            return Err("stream index value truncated".to_string());
-        }
-        let value = std::str::from_utf8(&buf[pos..pos + value_len])
-            .map_err(|e| e.to_string())?
-            .to_string();
-        pos += value_len;
-        if pos + 4 > buf.len() {
-            return Err("stream index bitmap length truncated".to_string());
-        }
-        let bm_len =
-            u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-        pos += 4;
-        if pos + bm_len > buf.len() {
-            return Err("stream index bitmap truncated".to_string());
-        }
-        let bitmap =
-            RoaringBitmap::deserialize_from(&buf[pos..pos + bm_len]).map_err(|e| e.to_string())?;
-        pos += bm_len;
-        map.entry(name).or_default().insert(value, bitmap);
-    }
-    if pos != buf.len() {
-        return Err("stream index has trailing bytes".to_string());
-    }
-    Ok(map)
 }
 
 pub fn group_by_labels(collected: Vec<(SharedLabels, LogEntry)>) -> Vec<StreamResult> {

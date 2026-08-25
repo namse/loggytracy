@@ -7,6 +7,28 @@
     use crate::part_registry::PartRegistry;
     use tower::ServiceExt;
 
+    /// The stream era attached these pairs as labels; storage now keeps them
+    /// as each row's own attributes, which is what selectors match against.
+    fn rows_with_attributes(attributes: &Labels, mut rows: Vec<Row>) -> Vec<Row> {
+        for row in &mut rows {
+            row.structured_metadata
+                .extend(attributes.iter().map(|(k, v)| (k.clone(), v.clone())));
+            crate::memtable::canonicalize_structured_metadata(&mut row.structured_metadata);
+        }
+        rows
+    }
+
+    /// The same fold for buffered entries.
+    fn with_attributes(attributes: Labels, mut entries: Vec<LogEntry>) -> Vec<LogEntry> {
+        for entry in &mut entries {
+            entry
+                .structured_metadata
+                .extend(attributes.iter().map(|(k, v)| (k.clone(), v.clone())));
+            crate::memtable::canonicalize_structured_metadata(&mut entry.structured_metadata);
+        }
+        entries
+    }
+
     fn temp_dir() -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!(
@@ -69,15 +91,11 @@
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            vec![LogEntry {
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), vec![LogEntry {
                 timestamp_ns: 5_000_000_000,
                 line: "hello from http".to_string(),
                 structured_metadata: Vec::new(),
-            }],
-        );
+            }]));
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
         let request = axum::http::Request::builder()
             .uri("/loki/api/v1/query_range?query=%7Bapp%3D%22api%22%7D%20%7C%3D%20%22hello%22&start=4&end=6&limit=10&direction=forward")
@@ -117,10 +135,7 @@
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels.clone(),
-            vec![
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), vec![
                 LogEntry {
                     timestamp_ns: START_NS,
                     line: "memtable on start".to_string(),
@@ -131,8 +146,7 @@
                     line: "memtable on end".to_string(),
                     structured_metadata: Vec::new(),
                 },
-            ],
-        );
+            ]));
         let parts = Arc::new(PartRegistry::new());
         parts
             .register(
@@ -142,9 +156,11 @@
                         .map(|(timestamp_ns, line)| Row {
                             tenant: test_tenant(),
                             timestamp_ns,
-                            labels: std::sync::Arc::new(labels.clone()),
                             line: line.to_string(),
-                            structured_metadata: Vec::new(),
+                            structured_metadata: vec![(
+                                "app".to_string(),
+                                "api".to_string(),
+                            )],
                         })
                         .collect(),
                     &data_dir.join("parts"),
@@ -240,13 +256,10 @@
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
             test_tenant(),
-            [("app".to_string(), "api".to_string())]
-                .into_iter()
-                .collect(),
             vec![LogEntry {
                 timestamp_ns: AT_NS,
                 line: "on the last evaluation point".to_string(),
-                structured_metadata: Vec::new(),
+                structured_metadata: vec![("app".to_string(), "api".to_string())],
             }],
         );
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
@@ -280,15 +293,11 @@
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            vec![LogEntry {
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), vec![LogEntry {
                 timestamp_ns: 20_000_000_000,
                 line: "inside first lookback".to_string(),
                 structured_metadata: Vec::new(),
-            }],
-        );
+            }]));
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
 
         let response = query_range(
@@ -328,17 +337,13 @@
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            (0..3)
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), (0..3)
                 .map(|timestamp_ns| LogEntry {
                     timestamp_ns,
                     line: format!("line-{timestamp_ns}"),
                     structured_metadata: Vec::new(),
                 })
-                .collect(),
-        );
+                .collect()));
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
         let parsed = logql::parse("{}").unwrap();
         for (forward, wanted_line) in [(true, "line-0"), (false, "line-2")] {
@@ -382,24 +387,20 @@
     /// several parts, out of order, with timestamps spread far wider than any
     /// limit those tests ask for.
     fn early_termination_state(data_dir: &std::path::Path) -> Arc<AppState> {
-        let labels: Labels = [("app".to_string(), "api".to_string())]
-            .into_iter()
-            .collect();
-        let shared = std::sync::Arc::new(labels.clone());
+        let attributes = vec![("app".to_string(), "api".to_string())];
         let line = |timestamp_ns: i64| {
             format!(r#"{{"status":"{}","seq":{timestamp_ns}}}"#, 500 - (timestamp_ns % 3))
         };
         let memtable = Arc::new(MemTable::new());
-        // Newest, and out of order within the stream.
+        // Newest, and out of order.
         memtable.insert(
             test_tenant(),
-            labels,
             [93i64, 90, 92, 91]
                 .into_iter()
                 .map(|timestamp_ns| LogEntry {
                     timestamp_ns,
                     line: line(timestamp_ns),
-                    structured_metadata: Vec::new(),
+                    structured_metadata: attributes.clone(),
                 })
                 .collect(),
         );
@@ -418,9 +419,8 @@
                             .map(|offset| Row {
                                 tenant: test_tenant(),
                                 timestamp_ns: base + offset,
-                                labels: shared.clone(),
                                 line: line(base + offset),
-                                structured_metadata: Vec::new(),
+                                structured_metadata: attributes.clone(),
                             })
                             .collect(),
                         &data_dir.join("parts"),
@@ -648,60 +648,6 @@
     }
 
     #[tokio::test]
-    async fn distinct_stream_count_deduplicates_memtable_and_parts() {
-        let data_dir = temp_dir();
-        let config = Config {
-            data_dir: data_dir.clone(),
-            ..Config::default()
-        };
-        let labels: Labels = [("app".to_string(), "same-stream".to_string())]
-            .into_iter()
-            .collect();
-        let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels.clone(),
-            vec![LogEntry {
-                timestamp_ns: 2,
-                line: "in memory".to_string(),
-                structured_metadata: Vec::new(),
-            }],
-        );
-        let parts_root = data_dir.join("parts");
-        let parts = Arc::new(PartRegistry::new());
-        parts
-            .register(
-                part::flush_rows(
-                    vec![Row {
-                        tenant: test_tenant(),
-                        timestamp_ns: 1,
-                        labels: std::sync::Arc::new(labels),
-                        line: "on disk".to_string(),
-                        structured_metadata: Vec::new(),
-                    }],
-                    &parts_root,
-                    config.row_group_size,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
-        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
-            parts.operation_lock(),
-        ));
-        let state = crate::test_support::state(
-            config,
-            memtable,
-            journal,
-            parts,
-            trace_parts,
-            None,
-        );
-
-        assert_eq!(distinct_stream_count(&state, &test_tenant(), crate::part::MetadataWindow::unbounded()), 1);
-    }
-
-    #[tokio::test]
     async fn readiness_reflects_background_worker_health() {
         let data_dir = temp_dir();
         let config = Config {
@@ -845,32 +791,26 @@
         let labels: Labels = [("app".to_string(), "remote".to_string())]
             .into_iter()
             .collect();
-        let local_parts = part::flush_rows(
-            vec![Row {
+        let local_parts = part::flush_rows(rows_with_attributes(&labels, vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000,
-                labels: std::sync::Arc::new(labels),
                 line: "restored after eviction".to_string(),
                 structured_metadata: Vec::new(),
-            }],
+            }]),
             &parts_root,
-            config.row_group_size,
-        )
+            config.row_group_size)
         .unwrap();
         let other_labels: Labels = [("app".to_string(), "other".to_string())]
             .into_iter()
             .collect();
-        let other_parts = part::flush_rows(
-            vec![Row {
+        let other_parts = part::flush_rows(rows_with_attributes(&other_labels, vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_001,
-                labels: std::sync::Arc::new(other_labels),
                 line: "must remain remote".to_string(),
                 structured_metadata: Vec::new(),
-            }],
+            }]),
             &parts_root,
-            config.row_group_size,
-        )
+            config.row_group_size)
         .unwrap();
         let other_data_path = other_parts[0].data_path();
         let mut published_parts = local_parts.clone();
@@ -921,32 +861,26 @@
         let labels: Labels = [("app".to_string(), "remote".to_string())]
             .into_iter()
             .collect();
-        let old = part::flush_rows(
-            vec![Row {
+        let old = part::flush_rows(rows_with_attributes(&labels, vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1,
-                labels: std::sync::Arc::new(labels.clone()),
                 line: "old generation".to_string(),
                 structured_metadata: Vec::new(),
-            }],
+            }]),
             &parts_root,
-            config.row_group_size,
-        )
+            config.row_group_size)
         .unwrap();
         storage.publish(&old, &[]).await.unwrap();
         let parts = Arc::new(PartRegistry::load_from_disk(&parts_root).unwrap());
 
-        let new = part::flush_rows(
-            vec![Row {
+        let new = part::flush_rows(rows_with_attributes(&labels, vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 2,
-                labels: std::sync::Arc::new(labels),
                 line: "new generation".to_string(),
                 structured_metadata: Vec::new(),
-            }],
+            }]),
             &parts_root,
-            config.row_group_size,
-        )
+            config.row_group_size)
         .unwrap();
         let manifest = storage
             .publish(&new, &[old[0].meta.id.clone()])
@@ -999,29 +933,22 @@
             ("trace_id".to_string(), "abc".to_string()),
         ];
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels.clone(),
-            vec![LogEntry {
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), vec![LogEntry {
                 timestamp_ns: 10,
                 line: line.to_string(),
                 structured_metadata: metadata.clone(),
-            }],
-        );
+            }]));
         let parts = Arc::new(PartRegistry::new());
         parts
             .register(
-                part::flush_rows(
-                    vec![Row {
+                part::flush_rows(rows_with_attributes(&labels, vec![Row {
                         tenant: test_tenant(),
                         timestamp_ns: 20,
-                        labels: std::sync::Arc::new(labels),
                         line: line.to_string(),
                         structured_metadata: metadata,
-                    }],
+                    }]),
                     &data_dir.join("parts"),
-                    1,
-                )
+                    1)
                 .unwrap(),
             )
             .unwrap();
@@ -1055,63 +982,7 @@
         }
     }
 
-    #[tokio::test]
-    async fn synthesized_extracted_field_never_false_negative_prunes_parts() {
-        let data_dir = temp_dir();
-        // `foo` and `foo_extracted` are *stream labels* rather than pushed
-        // metadata, because a collision with metadata drops the extraction
-        // (Loki's rule, see `merge_extracted`) and there would be no
-        // synthesized name left to prune on.
-        let labels: Labels = [
-            ("app".to_string(), "api".to_string()),
-            ("foo".to_string(), "x".to_string()),
-            ("foo_extracted".to_string(), "y".to_string()),
-        ]
-        .into_iter()
-        .collect();
-        let metadata = vec![];
-        let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels.clone(),
-            vec![LogEntry {
-                timestamp_ns: 10,
-                line: r#"{"foo":"z"}"#.to_string(),
-                structured_metadata: metadata.clone(),
-            }],
-        );
-        let parts = Arc::new(PartRegistry::new());
-        parts
-            .register(
-                part::flush_rows(
-                    vec![Row {
-                        tenant: test_tenant(),
-                        timestamp_ns: 20,
-                        labels: std::sync::Arc::new(labels),
-                        line: r#"{"foo":"z"}"#.to_string(),
-                        structured_metadata: metadata,
-                    }],
-                    &data_dir.join("parts"),
-                    1,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let state = test_state(&data_dir, memtable, parts, None);
-        let parsed = logql::parse(r#"{} | json | foo_extracted_2="z""#).unwrap();
-
-        let result = run_unified_query(state, test_tenant(), parsed, crate::part::QueryTimeRange::closed(0, 30), 10, true)
-            .await
-            .unwrap();
-        let timestamps: Vec<_> = result[0]
-            .entries
-            .iter()
-            .map(|entry| entry.timestamp_ns)
-            .collect();
-        assert_eq!(timestamps, vec![10, 20]);
-    }
-
-    #[test]
+        #[test]
     fn metric_windows_are_left_open_and_aggregations_recompute_each_step() {
         let a: SharedLabels = SharedLabels::new([("app".to_string(), "a".to_string())].into_iter().collect());
         let b: SharedLabels = SharedLabels::new([("app".to_string(), "b".to_string())].into_iter().collect());
@@ -1223,17 +1094,14 @@
         let parts = Arc::new(PartRegistry::new());
         parts
             .register(
-                part::flush_rows(
-                    vec![Row {
+                part::flush_rows(rows_with_attributes(&labels, vec![Row {
                         tenant: test_tenant(),
                         timestamp_ns: i64::MIN,
-                        labels: std::sync::Arc::new(labels.clone()),
                         line: "oldest".to_string(),
                         structured_metadata: vec![],
-                    }],
+                    }]),
                     &data_dir.join("parts"),
-                    1,
-                )
+                    1)
                 .unwrap(),
             )
             .unwrap();
@@ -1246,7 +1114,7 @@
         let result = run_metric_query(state, test_tenant(), expr, vec![i64::MIN + 1])
             .await
             .unwrap();
-        assert_eq!(*result[0].labels, labels);
+        assert!(result[0].labels.is_empty(), "an ungrouped series carries no labels");
         assert_eq!(result[0].samples, vec![(i64::MIN + 1, 1.0)]);
     }
 
@@ -1257,17 +1125,13 @@
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            (1..=3)
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), (1..=3)
                 .map(|second| LogEntry {
                     timestamp_ns: second * 1_000_000_000,
                     line: "xx".to_string(),
                     structured_metadata: vec![],
                 })
-                .collect(),
-        );
+                .collect()));
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
 
         let range = query_range(
@@ -1326,7 +1190,7 @@
         let in_memtable = {
             let data_dir = temp_dir();
             let memtable = Arc::new(MemTable::new());
-            memtable.insert(test_tenant(), labels.clone(), entries.clone());
+            memtable.insert(test_tenant(), with_attributes(labels.clone(), entries.clone()));
             test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None)
         };
         let in_parts = {
@@ -1336,14 +1200,13 @@
                 .map(|entry| Row {
                     tenant: test_tenant(),
                     timestamp_ns: entry.timestamp_ns,
-                    labels: std::sync::Arc::new(labels.clone()),
                     line: entry.line.clone(),
                     structured_metadata: entry.structured_metadata.clone(),
                 })
                 .collect();
             let parts = Arc::new(PartRegistry::new());
             parts
-                .register(part::flush_rows(rows, &data_dir.join("parts"), 16).unwrap())
+                .register(part::flush_rows(rows_with_attributes(&labels, rows), &data_dir.join("parts"), 16).unwrap())
                 .unwrap();
             test_state(&data_dir, Arc::new(MemTable::new()), parts, None)
         };
@@ -1405,17 +1268,13 @@
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            (0..50i64)
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), (0..50i64)
                 .map(|i| LogEntry {
                     timestamp_ns: 1_000_000_000 + i * 137_000_000,
                     line: format!("line-{i}"),
                     structured_metadata: vec![],
                 })
-                .collect(),
-        );
+                .collect()));
         let data_dir = temp_dir();
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
         for function in ["rate", "count_over_time", "bytes_over_time"] {
@@ -1448,18 +1307,14 @@
         }
     }
 
-    /// A stage-less query skips the pipeline, and the skip must keep its one
-    /// observable rule: a metadata pair whose key is a stream label never
-    /// reaches the response — the label wins the field map's seeding.
+    /// The selector matches the row's own attributes: an attribute that says
+    /// something else keeps the row out of the answer, and the value the row
+    /// pushed is the one the response shows.
     #[tokio::test]
-    async fn the_stageless_fast_path_keeps_the_label_shadowing_rule() {
-        let labels: Labels = [("app".to_string(), "api".to_string())]
-            .into_iter()
-            .collect();
+    async fn the_selector_matches_the_rows_own_attributes() {
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
             test_tenant(),
-            labels,
             vec![LogEntry {
                 timestamp_ns: 10,
                 line: "line".to_string(),
@@ -1471,11 +1326,23 @@
         );
         let data_dir = temp_dir();
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
-        let parsed = logql::parse(r#"{app="api"}"#).unwrap();
+
+        let refused = run_unified_query(
+            state.clone(),
+            test_tenant(),
+            logql::parse(r#"{app="api"}"#).unwrap(),
+            crate::part::QueryTimeRange::closed(0, 20),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(refused.is_empty() || refused.iter().all(|s| s.entries.is_empty()));
+
         let results = run_unified_query(
             state,
             test_tenant(),
-            parsed,
+            logql::parse(r#"{app="smuggled"}"#).unwrap(),
             crate::part::QueryTimeRange::closed(0, 20),
             10,
             false,
@@ -1483,7 +1350,7 @@
         .await
         .unwrap();
         let data = build_stream_data(results, false);
-        assert_eq!(data[0].stream.get("app"), Some("api"), "the label must win");
+        assert_eq!(data[0].stream.get("app"), Some("smuggled"));
         assert_eq!(data[0].stream.get("trace_id"), Some("t1"));
     }
 
@@ -1522,7 +1389,7 @@
         let in_memtable = {
             let data_dir = temp_dir();
             let memtable = Arc::new(MemTable::new());
-            memtable.insert(test_tenant(), labels.clone(), entries.clone());
+            memtable.insert(test_tenant(), with_attributes(labels.clone(), entries.clone()));
             test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None)
         };
         let in_parts = {
@@ -1532,14 +1399,20 @@
                 .map(|entry| Row {
                     tenant: test_tenant(),
                     timestamp_ns: entry.timestamp_ns,
-                    labels: std::sync::Arc::new(labels.clone()),
                     line: entry.line.clone(),
                     structured_metadata: entry.structured_metadata.clone(),
                 })
                 .collect();
             let parts = Arc::new(PartRegistry::new());
             parts
-                .register(part::flush_rows(rows, &data_dir.join("parts"), 16).unwrap())
+                .register(
+                    part::flush_rows(
+                        rows_with_attributes(&labels, rows),
+                        &data_dir.join("parts"),
+                        16,
+                    )
+                    .unwrap(),
+                )
                 .unwrap();
             test_state(&data_dir, Arc::new(MemTable::new()), parts, None)
         };
@@ -1616,7 +1489,7 @@
         let in_memtable = {
             let data_dir = temp_dir();
             let memtable = Arc::new(MemTable::new());
-            memtable.insert(test_tenant(), labels.clone(), entries.clone());
+            memtable.insert(test_tenant(), with_attributes(labels.clone(), entries.clone()));
             test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None)
         };
         let in_parts = {
@@ -1626,14 +1499,13 @@
                 .map(|entry| Row {
                     tenant: test_tenant(),
                     timestamp_ns: entry.timestamp_ns,
-                    labels: std::sync::Arc::new(labels.clone()),
                     line: entry.line.clone(),
                     structured_metadata: entry.structured_metadata.clone(),
                 })
                 .collect();
             let parts = Arc::new(PartRegistry::new());
             parts
-                .register(part::flush_rows(rows, &data_dir.join("parts"), 8).unwrap())
+                .register(part::flush_rows(rows_with_attributes(&labels, rows), &data_dir.join("parts"), 8).unwrap())
                 .unwrap();
             test_state(&data_dir, Arc::new(MemTable::new()), parts, None)
         };
@@ -1696,17 +1568,13 @@
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            (0..ROWS)
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), (0..ROWS)
                 .map(|index| LogEntry {
                     timestamp_ns: 1_000_000_000 + index as i64 * 1_000_000,
                     line: "x".repeat(1024),
                     structured_metadata: vec![],
                 })
-                .collect(),
-        );
+                .collect()));
 
         // Well under the half-megabyte of lines, and well over the eight
         // kilobytes of samples they fold down to.
@@ -1759,10 +1627,7 @@
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            vec![
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), vec![
                 LogEntry {
                     timestamp_ns: 6_000_000_000,
                     line: r#"{"level":"info","app":"line"}"#.to_string(),
@@ -1778,8 +1643,7 @@
                     line: "not json".to_string(),
                     structured_metadata: vec![],
                 },
-            ],
-        );
+            ]));
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
 
         let logql::QueryExpr::Metric(expr) =
@@ -1798,8 +1662,11 @@
             .collect();
         assert_eq!(levels, vec!["error".to_string(), "info".to_string()]);
 
+        // An extraction that collides with pushed metadata is discarded —
+        // the pushed attribute is authoritative — so grouping by the name
+        // reads the pushed value, never the line's.
         let logql::QueryExpr::Metric(expr) = logql::parse_expr(
-            r#"sum by (app_extracted) (count_over_time({app="api"} | json | app="api" [5s]))"#,
+            r#"sum by (app) (count_over_time({app="api"} | json [5s]))"#,
         )
         .unwrap() else {
             panic!("expected metric")
@@ -1810,7 +1677,8 @@
         assert!(
             result
                 .iter()
-                .any(|series| { series.labels.get("app_extracted") == Some(&"line".to_string()) })
+                .all(|series| series.labels.get("app") == Some(&"api".to_string())),
+            "the pushed attribute wins over the line's extraction"
         );
 
         let logql::QueryExpr::Metric(expr) =
@@ -1836,29 +1704,23 @@
         let labels: Labels = [("app".to_string(), "api".to_string())]
             .into_iter()
             .collect();
-        let wanted = part::flush_rows(
-            vec![Row {
+        let wanted = part::flush_rows(rows_with_attributes(&labels, vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 6_000_000_000,
-                labels: std::sync::Arc::new(labels.clone()),
                 line: "wanted".to_string(),
                 structured_metadata: vec![("tenant".to_string(), "one".to_string())],
-            }],
+            }]),
             &parts_root,
-            1,
-        )
+            1)
         .unwrap();
-        let unwanted = part::flush_rows(
-            vec![Row {
+        let unwanted = part::flush_rows(rows_with_attributes(&labels, vec![Row {
                 tenant: test_tenant(),
                 timestamp_ns: 7_000_000_000,
-                labels: std::sync::Arc::new(labels),
                 line: "unwanted".to_string(),
                 structured_metadata: vec![("tenant".to_string(), "two".to_string())],
-            }],
+            }]),
             &parts_root,
-            1,
-        )
+            1)
         .unwrap();
         let unwanted_path = unwanted[0].data_path();
         let mut published = wanted.clone();
@@ -1896,56 +1758,7 @@
         );
     }
 
-    #[tokio::test]
-    async fn synthesized_extracted_field_restores_an_evicted_part_conservatively() {
-        let data_dir = temp_dir();
-        let parts_root = data_dir.join("parts");
-        let storage = Arc::new(crate::object_storage::ObjectStorage::in_memory());
-        // Stream labels rather than pushed metadata, for the reason in
-        // `synthesized_extracted_field_never_false_negative_prunes_parts`.
-        let labels: Labels = [
-            ("app".to_string(), "api".to_string()),
-            ("foo".to_string(), "x".to_string()),
-            ("foo_extracted".to_string(), "y".to_string()),
-        ]
-        .into_iter()
-        .collect();
-        let flushed = part::flush_rows(
-            vec![Row {
-                tenant: test_tenant(),
-                timestamp_ns: 10,
-                labels: std::sync::Arc::new(labels),
-                line: r#"{"foo":"z"}"#.to_string(),
-                structured_metadata: vec![],
-            }],
-            &parts_root,
-            1,
-        )
-        .unwrap();
-        storage.publish(&flushed, &[]).await.unwrap();
-        let parts = Arc::new(PartRegistry::load_from_disk(&parts_root).unwrap());
-        storage
-            .evict_cache(&parts_root, 0, &parts.part_dirs())
-            .unwrap();
-        assert!(!flushed[0].data_path().exists());
-        let state = test_state(
-            &data_dir,
-            Arc::new(MemTable::new()),
-            parts,
-            Some(Arc::new(crate::object_storage::RemoteCache::new(
-                storage, parts_root,
-            ))),
-        );
-        let parsed = logql::parse(r#"{} | json | foo_extracted_2="z""#).unwrap();
-
-        let result = run_unified_query(state, test_tenant(), parsed, crate::part::QueryTimeRange::closed(0, 20), 10, true)
-            .await
-            .unwrap();
-        assert_eq!(result[0].entries[0].line, r#"{"foo":"z"}"#);
-        assert!(flushed[0].data_path().exists());
-    }
-
-    #[tokio::test]
+        #[tokio::test]
     async fn invalid_metric_step_and_range_are_client_errors() {
         let data_dir = temp_dir();
         let state = test_state(
@@ -2108,13 +1921,10 @@
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
             test_tenant(),
-            [("app".to_string(), "api".to_string())]
-                .into_iter()
-                .collect(),
             vec![LogEntry {
                 timestamp_ns: one_hour_ago,
                 line: "an hour old".to_string(),
-                structured_metadata: Vec::new(),
+                structured_metadata: vec![("app".to_string(), "api".to_string())],
             }],
         );
         let policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test());
@@ -2297,15 +2107,11 @@
         let memtable = Arc::new(MemTable::new());
         for (app, timestamp_ns) in [("recent", now_ns - hour_ns), ("ancient", now_ns - 48 * hour_ns)]
         {
-            memtable.insert(
-                test_tenant(),
-                [("app".to_string(), app.to_string())].into_iter().collect(),
-                vec![LogEntry {
+            memtable.insert(test_tenant(), with_attributes([("app".to_string(), app.to_string())].into_iter().collect(), vec![LogEntry {
                     timestamp_ns,
                     line: format!("{app} line"),
                     structured_metadata: Vec::new(),
-                }],
-            );
+                }]));
         }
         let state = state_with(&data_dir, memtable, Arc::new(PartRegistry::new()));
 
@@ -2396,9 +2202,6 @@
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
             test_tenant(),
-            [("app".to_string(), "api".to_string())]
-                .into_iter()
-                .collect(),
             vec![LogEntry {
                 timestamp_ns: now_ns - 3_600_000_000_000,
                 line: "an hour old".to_string(),
@@ -2449,9 +2252,6 @@
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
             test_tenant(),
-            [("app".to_string(), "api".to_string())]
-                .into_iter()
-                .collect(),
             vec![LogEntry {
                 // Inside the 1h lookback of the evaluation point, but outside
                 // the 60s retention floor.
@@ -2508,24 +2308,18 @@
         let memtable = Arc::new(MemTable::new());
         memtable.insert(
             test_tenant(),
-            [("app".to_string(), "expired".to_string())]
-                .into_iter()
-                .collect(),
             vec![LogEntry {
                 timestamp_ns: now_ns - 3_600_000_000_000,
                 line: "an hour old".to_string(),
-                structured_metadata: Vec::new(),
+                structured_metadata: vec![("app".to_string(), "stale".to_string())],
             }],
         );
         memtable.insert(
             test_tenant(),
-            [("app".to_string(), "fresh".to_string())]
-                .into_iter()
-                .collect(),
             vec![LogEntry {
                 timestamp_ns: now_ns,
                 line: "just now".to_string(),
-                structured_metadata: Vec::new(),
+                structured_metadata: vec![("app".to_string(), "fresh".to_string())],
             }],
         );
         let policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test());
@@ -2565,7 +2359,7 @@
             .unwrap()
             .0;
         assert_eq!(stats["data"]["entries"], 1);
-        assert_eq!(stats["data"]["streams"], 1);
+        assert_eq!(stats["data"]["streams"], 0, "streams are gone from the model");
 
         let matched = series(
             State(state),
@@ -2612,14 +2406,10 @@
         let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
 
         let collision_ns = 1_700_000_000_000_000_000;
-        memtable.insert(
-            test_tenant(),
-            tail_labels(),
-            vec![
+        memtable.insert(test_tenant(), with_attributes(tail_labels(), vec![
                 tail_entry(collision_ns, "first"),
                 tail_entry(collision_ns, "second"),
-            ],
-        );
+            ]));
 
         let mut cursor = TailCursor::new(collision_ns - 1);
         let query = tail_query();
@@ -2638,11 +2428,7 @@
         );
 
         // A third line at the very same nanosecond still has to arrive.
-        memtable.insert(
-            test_tenant(),
-            tail_labels(),
-            vec![tail_entry(collision_ns, "third")],
-        );
+        memtable.insert(test_tenant(), with_attributes(tail_labels(), vec![tail_entry(collision_ns, "third")]));
         let third = tail_poll(&state, &test_tenant(), &query, &mut cursor, collision_ns, 100)
             .await
             .expect("a late arrival at the same timestamp is not lost");
@@ -2662,7 +2448,7 @@
         let entries: Vec<LogEntry> = (0..5)
             .map(|index| tail_entry(base_ns + index, &format!("line-{index}")))
             .collect();
-        memtable.insert(test_tenant(), tail_labels(), entries);
+        memtable.insert(test_tenant(), with_attributes(tail_labels(), entries));
 
         let mut cursor = TailCursor::new(base_ns - 1);
         let query = tail_query();
@@ -2826,26 +2612,24 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
         let base_ns = 1_700_000_000_000_000_000;
         for (app, line) in [("a", "aaaa"), ("a", "bbbbbb"), ("b", "cc")] {
-            memtable.insert(
-                test_tenant(),
-                [("app".to_string(), app.to_string())]
+            memtable.insert(test_tenant(), with_attributes([("app".to_string(), app.to_string())]
                     .into_iter()
-                    .collect::<Labels>(),
-                vec![LogEntry {
+                    .collect::<Labels>(), vec![LogEntry {
                     timestamp_ns: base_ns,
                     line: line.to_string(),
                     structured_metadata: vec![],
-                }],
-            );
+                }]));
         }
         (state, base_ns)
     }
 
     /// Volume is `bytes_over_time` under a different name, so it is answered by
     /// the metric evaluator rather than by a scan of its own. That is what puts
-    /// it inside the same scan budgets, retention clamp and tenant scope.
+    /// it inside the same scan budgets, retention clamp and tenant scope. With
+    /// no stream concept, no `targetLabels` means one total series; the
+    /// breakdown lives in `index_volume_aggregates_by_target_labels`.
     #[tokio::test]
-    async fn index_volume_reports_bytes_per_stream() {
+    async fn index_volume_reports_total_bytes() {
         let (state, base_ns) = volume_state();
 
         let (status, body) = get_json(
@@ -2860,16 +2644,11 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"]["resultType"], "vector");
 
-        let mut by_app: BTreeMap<String, f64> = BTreeMap::new();
-        for series in body["data"]["result"].as_array().unwrap() {
-            by_app.insert(
-                series["metric"]["app"].as_str().unwrap().to_string(),
-                series["value"][1].as_str().unwrap().parse().unwrap(),
-            );
-        }
-        // "aaaa" + "bbbbbb" against "cc".
-        assert_eq!(by_app["a"], 10.0);
-        assert_eq!(by_app["b"], 2.0);
+        let series = body["data"]["result"].as_array().unwrap();
+        assert_eq!(series.len(), 1, "one ungrouped series");
+        // "aaaa" + "bbbbbb" + "cc".
+        let total: f64 = series[0]["value"][1].as_str().unwrap().parse().unwrap();
+        assert_eq!(total, 12.0);
     }
 
     /// The histogram above Explore's results is the ranged form, which has to
@@ -2882,17 +2661,13 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
         let base_ns = 1_700_000_000_000_000_000;
         for offset in 0..3i64 {
-            memtable.insert(
-                test_tenant(),
-                [("app".to_string(), "a".to_string())]
+            memtable.insert(test_tenant(), with_attributes([("app".to_string(), "a".to_string())]
                     .into_iter()
-                    .collect::<Labels>(),
-                vec![LogEntry {
+                    .collect::<Labels>(), vec![LogEntry {
                     timestamp_ns: base_ns + offset * 1_000_000_000,
                     line: "aaaa".to_string(),
                     structured_metadata: vec![],
-                }],
-            );
+                }]));
         }
 
         let (status, body) = get_json(
@@ -2907,8 +2682,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"]["resultType"], "matrix");
         let series = body["data"]["result"].as_array().unwrap();
-        assert_eq!(series.len(), 1, "the selector narrowed it to one stream");
-        assert_eq!(series[0]["metric"]["app"], "a");
+        assert_eq!(series.len(), 1, "the selector narrowed it to one series");
         let values = series[0]["values"].as_array().unwrap();
         assert_eq!(
             values.len(),
@@ -2965,12 +2739,9 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         let dir = temp_dir();
         let memtable = Arc::new(MemTable::new());
         let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
-        memtable.insert(
-            test_tenant(),
-            [("app".to_string(), "fields".to_string())]
+        memtable.insert(test_tenant(), with_attributes([("app".to_string(), "fields".to_string())]
                 .into_iter()
-                .collect::<Labels>(),
-            vec![
+                .collect::<Labels>(), vec![
                 LogEntry {
                     timestamp_ns: 1_700_000_000_000_000_000,
                     line: "one".to_string(),
@@ -2987,8 +2758,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
                         ("trace_id".to_string(), "def".to_string()),
                     ],
                 },
-            ],
-        );
+            ]));
 
         let (status, body) = get_json(&state, "/loki/api/v1/detected_fields").await;
         assert_eq!(status, StatusCode::OK);
@@ -3327,13 +3097,9 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
                 structured_metadata: vec![],
             });
         }
-        memtable.insert(
-            test_tenant(),
-            [("app".to_string(), "patterns".to_string())]
+        memtable.insert(test_tenant(), with_attributes([("app".to_string(), "patterns".to_string())]
                 .into_iter()
-                .collect::<Labels>(),
-            entries,
-        );
+                .collect::<Labels>(), entries));
 
         let (status, body) = get_json(
             &state,
@@ -3414,17 +3180,13 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         let state = test_state(&dir, memtable.clone(), Arc::new(PartRegistry::new()), None);
         let base_ns = 1_700_000_000_000_000_000i64;
         for (app, line) in [("keep", "kept line"), ("drop", "secret line")] {
-            memtable.insert(
-                test_tenant(),
-                [("app".to_string(), app.to_string())]
+            memtable.insert(test_tenant(), with_attributes([("app".to_string(), app.to_string())]
                     .into_iter()
-                    .collect::<Labels>(),
-                vec![LogEntry {
+                    .collect::<Labels>(), vec![LogEntry {
                     timestamp_ns: base_ns,
                     line: line.to_string(),
                     structured_metadata: vec![],
-                }],
-            );
+                }]));
         }
         (state, base_ns)
     }
@@ -3598,13 +3360,15 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
-    fn stream_result(labels: &[(&str, &str)], entries: Vec<LogEntry>) -> StreamResult {
+    fn stream_result(labels: &[(&str, &str)], mut entries: Vec<LogEntry>) -> StreamResult {
+        for entry in &mut entries {
+            entry
+                .structured_metadata
+                .extend(labels.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            crate::memtable::canonicalize_structured_metadata(&mut entry.structured_metadata);
+        }
         StreamResult {
-            labels: labels
-                .iter()
-                .map(|(name, value)| (name.to_string(), value.to_string()))
-                .collect::<std::collections::BTreeMap<_, _>>()
-                .into(),
+            labels: SharedLabels::default(),
             entries,
         }
     }
@@ -3669,15 +3433,11 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            vec![log_entry(
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), vec![log_entry(
                 10,
                 r#"{"level":"error","status":"500"}"#,
                 &[("trace_id", "t1")],
-            )],
-        );
+            )]));
         let data_dir = temp_dir();
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
         let parsed = logql::parse(r#"{app="api"} | json"#).unwrap();
@@ -3713,14 +3473,10 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            vec![
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), vec![
                 log_entry(10, r#"{"level":"error","_msg":"boom"}"#, &[]),
                 log_entry(11, r#"{"level":"info","_msg":"fine"}"#, &[]),
-            ],
-        );
+            ]));
         let data_dir = temp_dir();
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
         let parsed = logql::parse(r#"{app="api"} | json | _msg="boom""#).unwrap();
@@ -3751,15 +3507,11 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             .into_iter()
             .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            vec![log_entry(
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), vec![log_entry(
                 10,
                 r#"{"trace_id":"from-the-line","level":"error"}"#,
                 &[("trace_id", "from-the-push")],
-            )],
-        );
+            )]));
         let data_dir = temp_dir();
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
         let results = run_unified_query(
@@ -3840,11 +3592,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         .into_iter()
         .collect();
         let memtable = Arc::new(MemTable::new());
-        memtable.insert(
-            test_tenant(),
-            labels,
-            vec![log_entry(10, r#"{"status":"500"}"#, &[])],
-        );
+        memtable.insert(test_tenant(), with_attributes(labels.clone(), vec![log_entry(10, r#"{"status":"500"}"#, &[])]));
         let data_dir = temp_dir();
         let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
         let results = run_unified_query(
@@ -4013,20 +3761,16 @@ async fn label_values_are_filtered_by_the_query_selector() {
     let data_dir = temp_dir();
     let memtable = Arc::new(MemTable::new());
     for (app, env) in [("api", "prod"), ("api", "staging"), ("worker", "prod")] {
-        memtable.insert(
-            test_tenant(),
-            [
+        memtable.insert(test_tenant(), with_attributes([
                 ("app".to_string(), app.to_string()),
                 ("env".to_string(), env.to_string()),
             ]
             .into_iter()
-            .collect(),
-            vec![LogEntry {
+            .collect(), vec![LogEntry {
                 timestamp_ns: 1,
                 line: format!("{app} in {env}"),
                 structured_metadata: Vec::new(),
-            }],
-        );
+            }]));
     }
     let state = state_with(&data_dir, memtable, Arc::new(PartRegistry::new()));
 

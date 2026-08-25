@@ -49,11 +49,10 @@
         let rows: Vec<Row> = tenants
             .iter()
             .flat_map(|name| {
-                let labels = std::sync::Arc::new(labels.clone());
+                let _labels = std::sync::Arc::new(labels.clone());
                 (0..64).map(move |index| Row {
                     tenant: TenantId::parse(name).unwrap(),
                     timestamp_ns: index,
-                    labels: labels.clone(),
                     line: format!("line {index}"),
                     structured_metadata: vec![],
                 })

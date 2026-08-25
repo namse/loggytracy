@@ -98,8 +98,8 @@ fn unified_query_with_stats_cancellable_with_memory(
     // to have deleted.
     let deleted = state.delete_requests.mask_for(tenant);
     let hidden_rows = &state.delete_requests.metrics.hidden_rows;
-    let hidden = |labels: &Labels, entry: &LogEntry| {
-        if deleted.hides(labels, entry) {
+    let hidden = |_labels: &Labels, entry: &LogEntry| {
+        if deleted.hides(entry) {
             hidden_rows.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -452,8 +452,8 @@ async fn run_metric_count_scan(
         let _arena = crate::memprof::enter(crate::memprof::Arena::Query);
         let deleted = state.delete_requests.mask_for(&tenant);
         let hidden_rows = &state.delete_requests.metrics.hidden_rows;
-        let hidden = |labels: &Labels, entry: &LogEntry| {
-            if deleted.hides(labels, entry) {
+        let hidden = |_labels: &Labels, entry: &LogEntry| {
+            if deleted.hides(entry) {
                 hidden_rows.fetch_add(1, Ordering::Relaxed);
                 return true;
             }

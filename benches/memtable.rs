@@ -1,9 +1,7 @@
 //! MemTable insert and the memtable query path.
 //!
-//! `scan_memtable_stream` (`src/memtable.rs:145-156`) collects and sorts the
-//! whole stream on every query before it looks at the time range, so the query
-//! sweep varies entries-per-stream and the cardinality sweep varies how many
-//! streams a matcher has to walk past.
+//! A query sorts the tenant's whole buffer before it looks at the time range,
+//! so the query sweep varies entries per tenant.
 
 #[path = "corpus/mod.rs"]
 #[allow(dead_code)]
@@ -12,7 +10,7 @@ mod corpus;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use loggytracy::logql::{LabelMatcher, LineFilter, MatcherOp};
+use loggytracy::logql::LineFilter;
 use loggytracy::memtable::MemTable;
 
 use corpus::CorpusSpec;
@@ -22,12 +20,8 @@ use corpus::CorpusSpec;
 /// regression gate, not a distribution.
 const WARM_UP: Duration = Duration::from_millis(500);
 fn fill(memtable: &MemTable, corpus: &corpus::Corpus) {
-    for stream in &corpus.streams {
-        memtable.insert(
-            stream.tenant.clone(),
-            (*stream.labels).clone(),
-            stream.entries.clone(),
-        );
+    for (tenant, entries) in corpus.snapshot() {
+        memtable.insert(tenant, entries);
     }
 }
 
@@ -50,8 +44,8 @@ fn bench_insert(c: &mut Criterion) {
                     || batches.clone(),
                     |batches| {
                         let memtable = MemTable::new();
-                        for (labels, entries) in batches {
-                            memtable.insert(tenant.clone(), labels, entries);
+                        for entries in batches {
+                            memtable.insert(tenant.clone(), entries);
                         }
                         memtable
                     },
@@ -92,7 +86,6 @@ fn bench_query_stream_depth(c: &mut Criterion) {
                     memtable.query(
                         &tenant,
                         &[],
-                        &[],
                         loggytracy::part::QueryTimeRange::closed(start, end),
                         100,
                         false,
@@ -100,47 +93,6 @@ fn bench_query_stream_depth(c: &mut Criterion) {
                 });
             },
         );
-    }
-    group.finish();
-}
-
-/// Label matching across a cardinality sweep. One hardcoded label set is what
-/// the old harness had, so nothing ever measured the walk past the streams a
-/// matcher rejects.
-fn bench_query_cardinality(c: &mut Criterion) {
-    let mut group = c.benchmark_group("memtable/query_cardinality");
-    group
-        .sample_size(20)
-        .warm_up_time(WARM_UP)
-        .measurement_time(Duration::from_secs(2));
-    for streams in [1usize, 256, 8_192] {
-        let corpus = corpus::generate(
-            &CorpusSpec::default()
-                .rows(50_000)
-                .streams(streams)
-                .labels_per_stream(6)
-                .out_of_order(true),
-        );
-        let memtable = MemTable::new();
-        fill(&memtable, &corpus);
-        let tenant = corpus.tenant().clone();
-        let matcher =
-            LabelMatcher::new("app".to_string(), MatcherOp::Eq, corpus.label_value("app"))
-                .expect("bench matcher is well formed");
-        let start = corpus.min_ts_ns();
-        let end = corpus.max_ts_ns();
-        group.bench_with_input(BenchmarkId::from_parameter(streams), &streams, |b, _| {
-            b.iter(|| {
-                memtable.query(
-                    &tenant,
-                    std::slice::from_ref(&matcher),
-                    &[],
-                    loggytracy::part::QueryTimeRange::closed(start, end),
-                    100,
-                    false,
-                )
-            });
-        });
     }
     group.finish();
 }
@@ -169,7 +121,6 @@ fn bench_query_line_filter(c: &mut Criterion) {
         b.iter(|| {
             memtable.query(
                 &tenant,
-                &[],
                 &filters,
                 loggytracy::part::QueryTimeRange::closed(start, end),
                 100,
@@ -184,7 +135,6 @@ criterion_group!(
     benches,
     bench_insert,
     bench_query_stream_depth,
-    bench_query_cardinality,
     bench_query_line_filter
 );
 criterion_main!(benches);

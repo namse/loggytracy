@@ -7,11 +7,11 @@
 ///
 /// Nothing about the format required that. Every file a part is made of is
 /// produced a row group at a time — Parquet flushes per row group already, the
-/// blooms are per row group, the stream index addresses row groups by ordinal,
-/// and `meta.json`'s extremes, tenant segments and counts all accumulate. The
-/// one thing that genuinely has to be known before the first row group is the
-/// **schema**, because it names a column per stream label — and a merge can
-/// read that from its inputs' `meta.json` without touching a row.
+/// blooms are per row group, and `meta.json`'s extremes, tenant segments and
+/// counts all accumulate. The one thing that genuinely has to be known before
+/// the first row group is the **schema**, because it names a column per
+/// metadata key — and a merge can read that from its inputs' `meta.json`
+/// without touching a row.
 ///
 /// So this holds one row group and a set of counters. The output is the same
 /// bytes the batch path writes, and it is the same functions that write them:
@@ -29,7 +29,7 @@ pub struct StreamingPartWriter {
     /// The keys this part stores as `_sm:` columns, chosen before the first
     /// row: a merge sums its inputs' recorded per-key row counts and takes the
     /// same top-N `select_metadata_columns` takes — deterministic without
-    /// reading a row, exactly like the stream-label union. The counts are
+    /// reading a row. The counts are
     /// re-counted during `push`, so keys whose rows retention or a delete
     /// dropped do not inflate the next merge's choice.
     metadata_keys: Vec<String>,
@@ -43,11 +43,6 @@ pub struct StreamingPartWriter {
     group_parsed: Vec<Option<BTreeMap<String, String>>>,
 
     bloom_sections: Vec<Vec<u8>>,
-    index: BTreeMap<String, BTreeMap<String, RoaringBitmap>>,
-    /// First-occurrence ordinal assignment, shared with the batch path so the
-    /// two writers cannot disagree on a part's stream table.
-    ordinals: StreamOrdinals,
-    group_ordinals: Vec<u32>,
 
     row_count: u64,
     min_ts_ns: i64,
@@ -85,9 +80,6 @@ impl StreamingPartWriter {
             group: Vec::new(),
             group_parsed: Vec::new(),
             bloom_sections: Vec::new(),
-            index: BTreeMap::new(),
-            ordinals: StreamOrdinals::new(),
-            group_ordinals: Vec::new(),
             row_count: 0,
             min_ts_ns: i64::MAX,
             max_ts_ns: i64::MIN,
@@ -102,8 +94,7 @@ impl StreamingPartWriter {
 
     pub fn push(&mut self, row: Row) -> io::Result<()> {
         // The same rule `row_group_bounds` applies to a slice: one tenant per
-        // group, cut on size. Not on stream change — that was measured worse,
-        // and the selectivity comes from the sort order rather than the cut.
+        // group, cut on size.
         let cut = self
             .group
             .first()
@@ -118,8 +109,6 @@ impl StreamingPartWriter {
         self.materialized_bytes = self
             .materialized_bytes
             .saturating_add(row.materialized_bytes());
-        let ordinal = self.ordinals.ordinal_of(&row.labels)?;
-        self.group_ordinals.push(ordinal);
         for (name, _) in &row.structured_metadata {
             if self.metadata_keys.binary_search(name).is_ok() {
                 *self.metadata_counts.entry(name.clone()).or_default() += 1;
@@ -150,7 +139,6 @@ impl StreamingPartWriter {
         let batch = row_group_batch(
             &self.schema,
             &self.group,
-            &self.group_ordinals,
             &self.group_parsed,
             &self.metadata_keys,
             &self.parsed_keys,
@@ -163,39 +151,7 @@ impl StreamingPartWriter {
         self.bloom_sections
             .push(encode_group_blooms(&self.group, &self.group_parsed)?);
 
-        for row in &self.group {
-            for (label, value) in row.labels.iter() {
-                // Owned keys, unlike the batch path, because the rows are gone
-                // after this call. Cloned only when a name or value is seen for
-                // the first time, so the cost is per distinct stream rather
-                // than per row.
-                match self.index.get_mut(label.as_str()) {
-                    Some(values) => match values.get_mut(value.as_str()) {
-                        Some(bitmap) => {
-                            bitmap.insert(ordinal);
-                        }
-                        None => {
-                            let mut bitmap = RoaringBitmap::new();
-                            bitmap.insert(ordinal);
-                            values.insert(value.clone(), bitmap);
-                        }
-                    },
-                    None => {
-                        let mut bitmap = RoaringBitmap::new();
-                        bitmap.insert(ordinal);
-                        self.index
-                            .entry(label.clone())
-                            .or_default()
-                            .insert(value.clone(), bitmap);
-                    }
-                }
-            }
-        }
-
         let first = self.group.first().expect("checked non-empty");
-        // Scanned rather than taken from the ends: rows are ordered by stream
-        // before time, so a group holding two streams does not start at its own
-        // minimum.
         let min_ts_ns = self
             .group
             .iter()
@@ -239,7 +195,6 @@ impl StreamingPartWriter {
 
         self.group.clear();
         self.group_parsed.clear();
-        self.group_ordinals.clear();
         Ok(())
     }
 
@@ -268,34 +223,7 @@ impl StreamingPartWriter {
         for section in &self.bloom_sections {
             blooms.extend_from_slice(section);
         }
-        let entry_count: usize = self.index.values().map(|values| values.len()).sum();
-        let entries = self
-            .index
-            .iter()
-            .flat_map(|(name, values)| {
-                values
-                    .iter()
-                    .map(move |(value, bitmap)| (name.as_str(), value.as_str(), bitmap))
-            })
-            .collect::<Vec<_>>();
-        let streams = serialize_stream_index(entry_count, entries)?;
-        write_index_sections(&dir.join(INDEX_FILE), &blooms, &streams)?;
-
-        // The ordinal table in assignment order — `meta.streams` IS the
-        // ordinal table now — and the label-name union derived from what
-        // actually survived, which is what `validate_meta_file`'s exactness
-        // check always demanded. Deriving it here (instead of accepting a
-        // superset from the merge inputs) is what retired the hazard where a
-        // label whose last rows retention dropped failed the merged part's
-        // own validation.
-        let stream_table = std::mem::replace(&mut self.ordinals, StreamOrdinals::new()).into_table();
-        let stream_labels: Vec<String> = {
-            let mut names: BTreeSet<&str> = BTreeSet::new();
-            for labels in &stream_table {
-                names.extend(labels.keys().map(String::as_str));
-            }
-            names.into_iter().map(str::to_string).collect()
-        };
+        write_index_sections(&dir.join(INDEX_FILE), &blooms)?;
 
         // A tenant's extent is the span of its row groups, which the writer
         // only learns from the metadata it just wrote. The segments were
@@ -352,9 +280,7 @@ impl StreamingPartWriter {
             materialized_bytes: self.materialized_bytes,
             // Every declared key stays listed, even at a count of zero:
             // the Parquet file carries its (all-null) column either way, and
-            // `meta.json`'s key list is what the schema check rebuilds. Same
-            // superset behavior as `stream_labels` after retention drops a
-            // stream.
+            // `meta.json`'s key list is what the schema check rebuilds.
             metadata_columns: self
                 .metadata_keys
                 .iter()
@@ -369,16 +295,6 @@ impl StreamingPartWriter {
                 .parsed_keys
                 .iter()
                 .map(|key| (key.clone(), self.parsed_counts.get(key).copied().unwrap_or(0)))
-                .collect(),
-            stream_labels,
-            streams: stream_table
-                .iter()
-                .map(|labels| {
-                    labels
-                        .iter()
-                        .map(|(name, value)| (name.clone(), value.clone()))
-                        .collect()
-                })
                 .collect(),
             integrity,
         };

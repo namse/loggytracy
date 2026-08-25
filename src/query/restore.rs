@@ -24,7 +24,6 @@ where
         || {
             state.parts.candidate_part_ids_with_exact_fields(
                 tenant,
-                &parsed.matchers,
                 &parsed.line_filters,
                 &exact_fields,
                 range,

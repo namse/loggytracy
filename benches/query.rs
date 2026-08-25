@@ -110,12 +110,8 @@ fn bed() -> Bed {
             .seed(base.seed + 1_000)
             .start_ts_ns(max_ts + base.step_ns),
     );
-    for stream in &buffered.streams {
-        memtable.insert(
-            stream.tenant.clone(),
-            (*stream.labels).clone(),
-            stream.entries.clone(),
-        );
+    for (tenant, entries) in buffered.snapshot() {
+        memtable.insert(tenant, entries);
     }
     max_ts = max_ts.max(buffered.max_ts_ns());
     rows += buffered.entry_count();

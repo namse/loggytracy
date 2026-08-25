@@ -420,7 +420,7 @@ pub async fn labels(
         names.insert(n);
     }
     guard.check_deadline()?;
-    for n in state.parts.label_names(&tenant, guard.window) {
+    for n in state.parts.metadata_key_names(&tenant, guard.window) {
         names.insert(n);
     }
     Ok(Json(LokiResponse {
@@ -429,15 +429,20 @@ pub async fn labels(
     }))
 }
 
+/// Rows the sampled metadata answers below read at most. The value index went
+/// with the stream concept, so values and series come from the newest rows in
+/// the window rather than from a catalog — the same bounded-sample shape
+/// `detected_fields` always had.
+pub(crate) const METADATA_SAMPLE_ROWS: usize = 1000;
+
 /// The matchers `label/{name}/values?query=` filters by, or `None` when the
 /// caller sent no selector.
 ///
-/// A line filter is refused rather than dropped. Label values come from stream
-/// labels, so no filter over line content can narrow them without a scan this
-/// endpoint does not run — and answering a query that carries one as though it
-/// did not is the silent approximation this engine refuses elsewhere. Grafana
-/// sends a selector here, so the refusal is for a caller that hand-wrote
-/// something this cannot honour.
+/// A line filter is refused rather than dropped: this endpoint samples
+/// metadata without evaluating line content, and answering a query that
+/// carries one as though it did not is the silent approximation this engine
+/// refuses elsewhere. Grafana sends a selector here, so the refusal is for a
+/// caller that hand-wrote something this cannot honour.
 fn label_values_filter(
     params: &crate::query::MetadataParams,
 ) -> Result<Option<Vec<crate::logql::LabelMatcher>>, (StatusCode, String)> {
@@ -477,9 +482,10 @@ pub async fn label_values(
     };
     let mut values = std::collections::BTreeSet::new();
     match label_values_filter(&params)? {
-        // Loki filters this endpoint's values by a stream selector, and a
-        // dropdown built without it offers values that belong to another
-        // stream and return nothing when clicked.
+        // Loki filters this endpoint's values by a selector, and a dropdown
+        // built without it offers values that belong to other rows and return
+        // nothing when clicked. The selector is evaluated against each
+        // sampled row's own metadata.
         Some(matchers) => {
             for labels in state.memtable.series(&tenant, &matchers, guard.window) {
                 if let Some(value) = labels.get(&name) {
@@ -487,8 +493,15 @@ pub async fn label_values(
                 }
             }
             guard.check_deadline()?;
-            for labels in state.parts.series(&tenant, &matchers, guard.window) {
-                if let Some(value) = labels.get(&name) {
+            for metadata in state
+                .parts
+                .sample_metadata(&tenant, guard.window, METADATA_SAMPLE_ROWS)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+            {
+                let set: crate::memtable::Labels = metadata.into_iter().collect();
+                if matchers.iter().all(|m| m.matches(&set))
+                    && let Some(value) = set.get(&name)
+                {
                     values.insert(value.clone());
                 }
             }
@@ -498,8 +511,16 @@ pub async fn label_values(
                 values.insert(v);
             }
             guard.check_deadline()?;
-            for v in state.parts.label_values(&tenant, &name, guard.window) {
-                values.insert(v);
+            for metadata in state
+                .parts
+                .sample_metadata(&tenant, guard.window, METADATA_SAMPLE_ROWS)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+            {
+                for (key, value) in metadata {
+                    if key == name {
+                        values.insert(value);
+                    }
+                }
             }
         }
     }
@@ -592,12 +613,12 @@ pub async fn index_stats(
     let mem = state.memtable.stats(&tenant, guard.window);
     guard.check_deadline()?;
     let disk = state.parts.stats(&tenant, guard.window);
-    guard.check_deadline()?;
-    let stream_count = distinct_stream_count(&state, &tenant, guard.window);
+    // `streams` stays in the shape because Loki's API has it; with no stream
+    // concept there is nothing to count, and 0 is the honest constant.
     Ok(Json(serde_json::json!({
         "status": "success",
         "data": {
-            "streams": stream_count,
+            "streams": 0,
             "entries": mem.entries + disk.entries,
             "bytes": mem.bytes + disk.bytes
         }
@@ -1191,13 +1212,26 @@ pub async fn series(
             data: Vec::new(),
         }));
     };
+    let sampled = state
+        .parts
+        .sample_metadata(&tenant, guard.window, METADATA_SAMPLE_ROWS)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let sampled_sets: Vec<Labels> = sampled
+        .into_iter()
+        .map(|metadata| metadata.into_iter().collect())
+        .collect();
     let mut all_series: Vec<Labels> = Vec::new();
     for matcher_str in &matchers {
         guard.check_deadline()?;
         let parsed = logql::parse(matcher_str)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("LogQL parse error: {}", e)))?;
         all_series.extend(state.memtable.series(&tenant, &parsed.matchers, guard.window));
-        all_series.extend(state.parts.series(&tenant, &parsed.matchers, guard.window));
+        all_series.extend(
+            sampled_sets
+                .iter()
+                .filter(|set| parsed.matchers.iter().all(|m| m.matches(set)))
+                .cloned(),
+        );
     }
     all_series.sort();
     all_series.dedup();

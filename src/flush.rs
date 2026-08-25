@@ -650,14 +650,11 @@ mod tests {
             .append_otlp_logs(
                 crate::tenant::test_tenant(),
                 Vec::new(),
-                vec![(
-                    crate::memtable::Labels::from([("app".to_string(), "a".to_string())]),
-                    vec![crate::memtable::LogEntry {
-                        timestamp_ns: 1,
-                        line: "one line".to_string(),
-                        structured_metadata: Vec::new(),
-                    }],
-                )],
+                vec![crate::memtable::LogEntry {
+                    timestamp_ns: 1,
+                    line: "one line".to_string(),
+                    structured_metadata: vec![("app".to_string(), "a".to_string())],
+                }],
             )
             .await
             .unwrap();
@@ -698,12 +695,10 @@ mod tests {
             ..Config::default()
         };
         let memtable = Arc::new(MemTable::new());
-        let labels: Labels = [("app".to_string(), "test".to_string())]
+        let _labels: Labels = [("app".to_string(), "test".to_string())]
             .into_iter()
             .collect();
-        memtable.insert(
-            test_tenant(),
-            labels,
+        memtable.insert(test_tenant(), 
             vec![LogEntry {
                 timestamp_ns: 1_700_000_000_000_000_000,
                 line: "only once".to_string(),
@@ -751,10 +746,7 @@ mod tests {
         );
         assert!(pending_checkpoint.is_none());
         let results = registry
-            .query(
-                &test_tenant(),
-                &[],
-                &[],
+            .query(&test_tenant(), &[],
                 crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                 100,
                 true,

@@ -231,19 +231,16 @@ fn replay_otlp_log_record(
 ) -> Result<u64, String> {
     let request = ExportLogsServiceRequest::decode(payload)
         .map_err(|e| format!("OTLP log protobuf decode failed at offset {offset}: {e}"))?;
-    let streams = match crate::otlp_log::normalize_request(request) {
-        Ok(streams) => streams,
+    let entries = match crate::otlp_log::normalize_request(request) {
+        Ok(entries) => entries,
         Err(crate::otlp_log::OtlpLogError::EmptyRequest) => {
             tracing::warn!(offset, "empty OTLP log record in journal, skipping");
             return Ok(0);
         }
         Err(e) => return Err(format!("OTLP log record invalid at offset {offset}: {e}")),
     };
-    let mut replayed_entries = 0u64;
-    for (labels, entries) in streams {
-        replayed_entries += entries.len() as u64;
-        memtable.insert(tenant.clone(), labels, entries);
-    }
+    let replayed_entries = entries.len() as u64;
+    memtable.insert(tenant.clone(), entries);
     Ok(replayed_entries)
 }
 

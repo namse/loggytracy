@@ -343,13 +343,10 @@
 
         state.memtable.insert(
             tenant("acme"),
-            [("app".to_string(), "usage".to_string())]
-                .into_iter()
-                .collect(),
             vec![crate::memtable::LogEntry {
                 timestamp_ns: 1_700_000_000_000_000_000,
                 line: "counted".to_string(),
-                structured_metadata: Vec::new(),
+                structured_metadata: vec![("app".to_string(), "usage".to_string())],
             }],
         );
 
@@ -381,13 +378,10 @@
         let state = state_with(policy);
         state.memtable.insert(
             tenant("acme"),
-            [("app".to_string(), "scrape".to_string())]
-                .into_iter()
-                .collect(),
             vec![crate::memtable::LogEntry {
                 timestamp_ns: 1,
                 line: "x".to_string(),
-                structured_metadata: Vec::new(),
+                structured_metadata: vec![("app".to_string(), "scrape".to_string())],
             }],
         );
 

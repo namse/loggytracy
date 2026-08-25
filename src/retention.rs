@@ -358,10 +358,6 @@ mod tests {
         Row {
             tenant: tenant(owner),
             timestamp_ns,
-            labels: [("app".to_string(), owner.to_string())]
-                .into_iter()
-                .collect::<std::collections::BTreeMap<_, _>>()
-                .into(),
             line: format!("{owner} line"),
             structured_metadata: vec![],
         }
@@ -430,9 +426,6 @@ mod tests {
 
         memtable.insert(
             tenant("brand-new"),
-            [("app".to_string(), "api".to_string())]
-                .into_iter()
-                .collect(),
             vec![crate::memtable::LogEntry {
                 timestamp_ns: 1_000,
                 line: "never flushed".to_string(),
@@ -526,9 +519,6 @@ mod tests {
         let memtable = crate::memtable::MemTable::new();
         memtable.insert(
             tenant("unmentioned"),
-            [("app".to_string(), "unmentioned".to_string())]
-                .into_iter()
-                .collect(),
             vec![crate::memtable::LogEntry {
                 timestamp_ns: 1_000,
                 line: "still in the memtable".to_string(),
@@ -547,10 +537,7 @@ mod tests {
         .await
         .unwrap();
 
-        let in_memory = memtable.query(
-            &tenant("unmentioned"),
-            &[],
-            &[],
+        let in_memory = memtable.query(&tenant("unmentioned"), &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             10,
             true,
@@ -776,14 +763,13 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("loggytracy-retention-{}", uuid::Uuid::new_v4()));
         let parts_root = root.join("parts");
-        let labels: Labels = [("app".to_string(), "retention".to_string())]
+        let _labels: Labels = [("app".to_string(), "retention".to_string())]
             .into_iter()
             .collect();
         let parts = part::flush_rows(
             vec![Row {
                 tenant: crate::tenant::test_tenant(),
                 timestamp_ns: 1_000,
-                labels: std::sync::Arc::new(labels),
                 line: "expired".to_string(),
                 structured_metadata: vec![],
             }],
@@ -824,14 +810,13 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let parts_root = root.join("parts");
-        let labels: Labels = [("app".to_string(), "retention".to_string())]
+        let _labels: Labels = [("app".to_string(), "retention".to_string())]
             .into_iter()
             .collect();
         let parts = part::flush_rows(
             vec![Row {
                 tenant: crate::tenant::test_tenant(),
                 timestamp_ns: 1_000,
-                labels: std::sync::Arc::new(labels),
                 line: "expired".to_string(),
                 structured_metadata: vec![],
             }],
@@ -886,14 +871,13 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("loggytracy-retention-{}", uuid::Uuid::new_v4()));
         let parts_root = root.join("parts");
-        let labels: Labels = [("app".to_string(), "remote-retention".to_string())]
+        let _labels: Labels = [("app".to_string(), "remote-retention".to_string())]
             .into_iter()
             .collect();
         let parts = part::flush_rows(
             vec![Row {
                 tenant: crate::tenant::test_tenant(),
                 timestamp_ns: 1_000,
-                labels: std::sync::Arc::new(labels),
                 line: "expired remotely".to_string(),
                 structured_metadata: vec![],
             }],
@@ -936,10 +920,6 @@ mod tests {
             vec![Row {
                 tenant: crate::tenant::test_tenant(),
                 timestamp_ns: 90,
-                labels: [("app".to_string(), "boundary".to_string())]
-                    .into_iter()
-                    .collect::<std::collections::BTreeMap<_, _>>()
-                    .into(),
                 line: "boundary".to_string(),
                 structured_metadata: vec![],
             }],

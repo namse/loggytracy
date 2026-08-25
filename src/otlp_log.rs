@@ -1,41 +1,8 @@
-use std::collections::BTreeMap;
-
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 
-use crate::memtable::{Labels, LogEntry};
-
-/// Resource attributes promoted to stream labels.
-///
-/// Everything else becomes structured metadata. The split matters because
-/// labels are what stream cardinality is counted in — the plan sells a bounded
-/// number of active streams — and an OTLP resource routinely carries dozens of
-/// attributes, several of them unique per process. Promoting all of them would
-/// make every pod its own stream.
-///
-/// This is Loki's own default promotion list rather than a set invented here,
-/// so a collector configured for Loki keeps producing the same streams.
-const PROMOTED_RESOURCE_ATTRIBUTES: &[&str] = &[
-    "cloud.availability_zone",
-    "cloud.region",
-    "container.name",
-    "deployment.environment",
-    "deployment.environment.name",
-    "k8s.cluster.name",
-    "k8s.container.name",
-    "k8s.cronjob.name",
-    "k8s.daemonset.name",
-    "k8s.deployment.name",
-    "k8s.job.name",
-    "k8s.namespace.name",
-    "k8s.pod.name",
-    "k8s.replicaset.name",
-    "k8s.statefulset.name",
-    "service.instance.id",
-    "service.name",
-    "service.namespace",
-];
+use crate::memtable::LogEntry;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum OtlpLogError {
@@ -53,64 +20,47 @@ impl std::fmt::Display for OtlpLogError {
     }
 }
 
-/// Turn an OTLP export into the same `(labels, entries)` shape a Loki push
-/// produces, so both protocols land in one memtable and one part format.
+/// Turn an OTLP export into flat log entries.
 ///
-/// Records that share a label set are grouped, because a stream is what the
-/// storage layer keys on and one export usually carries many records from the
-/// same resource.
+/// There is no stream concept: nothing is promoted to a label, and every
+/// resource attribute, scope name and record attribute lands in the entry's
+/// structured metadata. Attribute keys are normalized to the LogQL identifier
+/// grammar (`service.name` → `service_name`) so every stored key is one a
+/// query can name — Loki's own OTLP intake normalizes the same way.
+///
 /// Consumes the request: the decoded protobuf serves nothing after this — the
 /// WAL stores the received bytes, not the message — so every body string,
 /// attribute key and value moves into its `LogEntry` instead of being cloned
 /// per row on the ingest hot path.
 pub fn normalize_request(
     request: ExportLogsServiceRequest,
-) -> Result<Vec<(Labels, Vec<LogEntry>)>, OtlpLogError> {
-    let mut streams: BTreeMap<Labels, Vec<LogEntry>> = BTreeMap::new();
+) -> Result<Vec<LogEntry>, OtlpLogError> {
+    let mut entries = Vec::new();
     for resource_logs in request.resource_logs {
         let resource_attributes = resource_logs
             .resource
             .map(|resource| resource.attributes)
             .unwrap_or_default();
-        let (labels, resource_metadata) = split_resource_attributes(resource_attributes);
+        let mut resource_metadata = Vec::with_capacity(resource_attributes.len());
+        for attribute in resource_attributes {
+            if let Some(value) = attribute.value {
+                resource_metadata.push((
+                    normalize_attribute_key(&attribute.key),
+                    scalar_string_owned(value).unwrap_or_else(|value| value_json(&value)),
+                ));
+            }
+        }
         for scope_logs in resource_logs.scope_logs {
             let scope_name = scope_logs.scope.map(|scope| scope.name).unwrap_or_default();
             for record in scope_logs.log_records {
-                let entry = normalize_record(record, &resource_metadata, &scope_name)?;
-                streams.entry(labels.clone()).or_default().push(entry);
+                entries.push(normalize_record(record, &resource_metadata, &scope_name)?);
             }
         }
     }
-    if streams.is_empty() {
+    if entries.is_empty() {
         return Err(OtlpLogError::EmptyRequest);
     }
-    Ok(streams.into_iter().collect())
-}
-
-fn split_resource_attributes(attributes: Vec<KeyValue>) -> (Labels, Vec<(String, String)>) {
-    let mut labels: Labels = BTreeMap::new();
-    let mut metadata = Vec::new();
-    for attribute in attributes {
-        let Some(value) = attribute.value else {
-            continue;
-        };
-        let value = match scalar_string_owned(value) {
-            Ok(value) => value,
-            // A non-scalar resource attribute is never a label: a label value
-            // is a string, and flattening a map into one would invent a format
-            // that queries would then have to guess at.
-            Err(value) => {
-                metadata.push((attribute.key, value_json(&value)));
-                continue;
-            }
-        };
-        if PROMOTED_RESOURCE_ATTRIBUTES.contains(&attribute.key.as_str()) {
-            labels.insert(sanitize_label_name(&attribute.key), value);
-        } else {
-            metadata.push((attribute.key, value));
-        }
-    }
-    (labels, metadata)
+    Ok(entries)
 }
 
 fn normalize_record(
@@ -159,7 +109,7 @@ fn normalize_record(
     for attribute in record.attributes {
         if let Some(value) = attribute.value {
             structured_metadata.push((
-                attribute.key,
+                normalize_attribute_key(&attribute.key),
                 scalar_string_owned(value).unwrap_or_else(|value| value_json(&value)),
             ));
         }
@@ -172,10 +122,10 @@ fn normalize_record(
     })
 }
 
-/// Label names are matched by LogQL, whose grammar is Prometheus-shaped, so
-/// the dots OTLP uses have to become underscores. This is what the Loki
-/// exporter does too, which is why `service.name` is queried as `service_name`.
-fn sanitize_label_name(name: &str) -> String {
+/// Attribute keys are matched by LogQL, whose grammar is Prometheus-shaped, so
+/// the dots OTLP uses have to become underscores. This is what Loki's OTLP
+/// intake does too, which is why `service.name` is queried as `service_name`.
+pub fn normalize_attribute_key(name: &str) -> String {
     name.chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '_' {

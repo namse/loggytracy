@@ -172,7 +172,6 @@ impl<'a> LogScan<'a> {
 
         scanned_rows = scanned_rows.saturating_add(memtable.scan_into(
             self.tenant,
-            &self.query.matchers,
             &self.query.line_filters,
             self.range,
             self.forward,
@@ -193,7 +192,6 @@ impl<'a> LogScan<'a> {
             .map(|budget| budget.saturating_sub(scanned_bytes));
         let part_stats = parts.scan_into(
             self.tenant,
-            &self.query.matchers,
             ExactFieldPruning::new(&self.query.line_filters, &exact_fields),
             self.range,
             self.forward,
@@ -297,18 +295,12 @@ impl PipelineSink<'_> {
         if self.hidden.is_some_and(|hidden| hidden(labels, &entry)) {
             return Ok(());
         }
-        if self.query.stages.is_empty() {
-            // A stage-less pipeline accepts every row, and its one observable
-            // effect is the seeding rule: a metadata pair whose key is a
-            // stream label never enters the field map (the label wins), so it
-            // never survives to the response either. Reproducing that rule
-            // directly skips the full evaluation — which clones the label set
-            // into a `BTreeMap` per row, a per-row cost every bare-selector
-            // query paid, and at `max_metric_rows` scale the dominant term of
-            // a metric scan.
-            entry
-                .structured_metadata
-                .retain(|(name, _)| !labels.contains_key(name));
+        if self.query.stages.is_empty() && self.query.matchers.is_empty() {
+            // A matcherless, stage-less pipeline accepts every row and changes
+            // nothing about it, so the full evaluation — which builds a
+            // `BTreeMap` field map per row — is skipped. A selector cannot
+            // take this path: it is evaluated against the row's attributes
+            // inside the pipeline now that no stream exists to match first.
         } else if !self.query.process_entry_with_precomputed_json(
             labels,
             &mut entry,
@@ -425,10 +417,11 @@ impl CountingSink<'_> {
         if self.hidden.is_some_and(|hidden| hidden(labels, &entry)) {
             return Ok(());
         }
-        // Same rule as `PipelineSink`: stages run per row (a field filter must
-        // still reject), and a stage-less pipeline accepts everything — its
-        // shadowing effect touches only fields nothing here reads.
-        if !self.query.stages.is_empty()
+        // Same rule as `PipelineSink`: matchers and stages run per row (a
+        // selector or field filter must still reject), and a matcherless,
+        // stage-less pipeline accepts everything — its effects touch only
+        // fields nothing here reads.
+        if (!self.query.stages.is_empty() || !self.query.matchers.is_empty())
             && !self.query.process_entry_with_precomputed_json(
                 labels,
                 &mut entry,

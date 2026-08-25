@@ -229,20 +229,19 @@ can be written in"
             &restored,
         )
         .unwrap();
-        let results = restored.query(
-            &test_tenant(),
-            &[],
-            &[],
+        let results = restored.query(&test_tenant(), &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             10,
             true,
         );
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].labels.get("service_name").unwrap(), "api");
         assert_eq!(results[0].entries[0].line, "hello");
         assert_eq!(
             results[0].entries[0].structured_metadata,
-            vec![("trace_id".to_string(), "abc123".to_string())]
+            vec![
+                ("service_name".to_string(), "api".to_string()),
+                ("trace_id".to_string(), "abc123".to_string()),
+            ]
         );
     }
 
@@ -277,7 +276,7 @@ can be written in"
             h.journal.ckpt_path(),
             &restored,
         ).unwrap();
-        let results = restored.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true);
+        let results = restored.query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true);
         let lines: Vec<_> = results
             .iter()
             .flat_map(|stream| stream.entries.iter().map(|entry| entry.line.as_str()))
@@ -314,7 +313,7 @@ can be written in"
             &restored,
         ).unwrap();
         let lines: Vec<_> = restored
-            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+            .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .into_iter()
             .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
             .collect();
@@ -351,7 +350,7 @@ can be written in"
             &restored,
         ).unwrap();
         let lines: Vec<_> = restored
-            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+            .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .into_iter()
             .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
             .collect();
@@ -385,7 +384,7 @@ can be written in"
         ).unwrap();
         assert!(
             restored
-                .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+                .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                 .is_empty()
         );
         assert_eq!(
@@ -470,7 +469,7 @@ can be written in"
         .unwrap();
         assert!(
             restored
-                .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+                .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                 .is_empty(),
             "both batches were flushed, so replay must yield nothing"
         );
@@ -584,7 +583,7 @@ can be written in"
         let (start, end) = replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt).unwrap();
         assert_eq!(start, 0);
         assert!(end > 0);
-        let results = mt.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
+        let results = mt.query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 2);
     }
@@ -713,7 +712,7 @@ can be written in"
 
         let mt = MemTable::new();
         replay(h.journal.wal_path(), h.journal.ckpt_path(), &mt).unwrap();
-        let results = mt.query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
+        let results = mt.query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true);
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
     }
@@ -752,7 +751,7 @@ can be written in"
 
         let lines = |tenant: &TenantId| -> Vec<String> {
             restored
-                .query(tenant, &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
+                .query(tenant, &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
                 .into_iter()
                 .flat_map(|stream| stream.entries)
                 .map(|entry| entry.line)

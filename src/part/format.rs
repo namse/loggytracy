@@ -14,11 +14,11 @@
 pub static FLUSH_BUILD: FlushBuildMetrics = FlushBuildMetrics::new();
 
 pub struct FlushBuildMetrics {
-    /// Sorting and deduplicating one part's rows by `(tenant, labels, ts)`.
+    /// Sorting and deduplicating one part's rows by `(tenant, ts)`.
     pub sort: crate::metrics::LatencyHistogram,
-    /// Everything schema-shaped between the sort and the write: the stream
-    /// label set, the metadata column census, and `parse_rows` — which runs the
-    /// JSON parser over every line in the part.
+    /// Everything schema-shaped between the sort and the write: the metadata
+    /// column census, and `parse_rows` — which runs the JSON parser over every
+    /// line in the part.
     pub parse: crate::metrics::LatencyHistogram,
     /// `write_part_files` in total: Arrow build, Parquet encode with zstd, the
     /// trigram and metadata blooms, `index.bin`, `meta.json`, and the fsyncs
@@ -26,10 +26,10 @@ pub struct FlushBuildMetrics {
     pub write: crate::metrics::LatencyHistogram,
     /// `write_parquet`: Arrow arrays, dictionary encoding, zstd, the fsync.
     pub parquet: crate::metrics::LatencyHistogram,
-    /// `write_index`: the trigram and metadata blooms over every line, and the
-    /// stream index, into one `index.bin`.
+    /// `write_index`: the trigram and metadata blooms over every line, into
+    /// `index.bin`.
     pub index: crate::metrics::LatencyHistogram,
-    /// `write_meta`: the part's `meta.json`, including its stream table.
+    /// `write_meta`: the part's `meta.json`.
     pub meta: crate::metrics::LatencyHistogram,
     /// The commit tail — tombstone, directory rename, parent fsync.
     pub commit: crate::metrics::LatencyHistogram,
@@ -63,11 +63,9 @@ fn gen_part_id(min_ts_ns: i64) -> String {
 
 pub fn rows_from_snapshot(snapshot: &MemTableSnapshot) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
-    for (tenant, streams) in snapshot {
-        for (labels, entries) in streams {
-            for e in entries {
-                rows.push(Row::from_entry(tenant, labels, e));
-            }
+    for (tenant, entries) in snapshot {
+        for e in entries {
+            rows.push(Row::from_entry(tenant, e));
         }
     }
     sort_rows(&mut rows);
@@ -85,13 +83,13 @@ pub fn rows_from_snapshot(snapshot: &MemTableSnapshot) -> Vec<Row> {
 /// sized by its input, so bounding the input bounds them all.
 ///
 /// Order and dedup are [`sort_rows`]'s, reproduced without a global sort:
-/// streams are visited in `(tenant, labels)` order — the prefix of
-/// [`Row::sort_key`] — and each stream's entries are emitted in
-/// `(timestamp, line, metadata)` order, the suffix. The snapshot is shared
-/// with concurrent queries, so entries are ordered through a side index
-/// rather than sorted in place. A duplicate pair always shares a stream, so
-/// skipping an entry equal to the stream's previously emitted one is the same
-/// dedup even when a chunk cut falls between the two.
+/// tenants are visited in name order — the prefix of [`Row::sort_key`] — and
+/// each tenant's entries are emitted in `(timestamp, line, metadata)` order,
+/// the suffix. The snapshot is shared with concurrent queries, so entries are
+/// ordered through a side index rather than sorted in place. A duplicate pair
+/// always shares a tenant, so skipping an entry equal to the tenant's
+/// previously emitted one is the same dedup even when a chunk cut falls
+/// between the two.
 ///
 /// A chunk that fails rolls back every part this call already committed, so
 /// the caller sees the all-or-nothing flush it always had.
@@ -101,15 +99,11 @@ pub fn flush_snapshot_chunked(
     row_group_size: usize,
     chunk_bytes: u64,
 ) -> io::Result<Vec<Part>> {
-    let mut streams: Vec<(&TenantId, &SharedLabels, &Vec<LogEntry>)> = Vec::new();
-    for (tenant, tenant_streams) in snapshot {
-        for (labels, entries) in tenant_streams {
-            if !entries.is_empty() {
-                streams.push((tenant, labels, entries));
-            }
-        }
-    }
-    streams.sort_by(|a, b| (a.0.as_str(), a.1.as_ref()).cmp(&(b.0.as_str(), b.1.as_ref())));
+    let mut tenants: Vec<(&TenantId, &Vec<LogEntry>)> = snapshot
+        .iter()
+        .filter(|(_, entries)| !entries.is_empty())
+        .collect();
+    tenants.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
 
     let mut parts: Vec<Part> = Vec::new();
     let mut chunk: Vec<Row> = Vec::new();
@@ -135,7 +129,7 @@ pub fn flush_snapshot_chunked(
         }
     }
 
-    for (tenant, labels, entries) in streams {
+    for (tenant, entries) in tenants {
         let mut order: Vec<u32> = (0..entries.len() as u32).collect();
         order.sort_by(|&a, &b| {
             let ea = &entries[a as usize];
@@ -159,7 +153,7 @@ pub fn flush_snapshot_chunked(
                 }
             }
             prev = Some(i);
-            let row = Row::from_entry(tenant, labels, entry);
+            let row = Row::from_entry(tenant, entry);
             chunk_used = chunk_used.saturating_add(row.materialized_bytes());
             chunk.push(row);
             if chunk_used >= chunk_bytes {
@@ -180,10 +174,10 @@ pub fn flush_snapshot_chunked(
 /// response never reached the client is retried, and a crash between a flush
 /// and its checkpoint replays a WAL suffix that is already in a part — both
 /// produce a second copy of an entry that is identical in every field. Loki
-/// resolves this the same way: within a stream, one timestamp and one line is
-/// one entry.
+/// resolves this the same way: one timestamp and one identical line is one
+/// entry.
 ///
-/// What is given up is two genuinely distinct entries that share a stream, a
+/// What is given up is two genuinely distinct entries that share a tenant, a
 /// nanosecond, a line and its metadata. At nanosecond resolution that is a
 /// collision of things already indistinguishable to a reader.
 ///
@@ -227,15 +221,10 @@ pub fn flush_rows_with_merge_tombstone(
 ///
 /// `metadata_keys`/`parsed_keys` and `partition` come from the inputs'
 /// `meta.json`, not from the rows, because the schema names those columns and
-/// has to exist before the first row group. Labels stopped being schema when
-/// the `_stream` ordinal landed: the writer assigns ordinals as rows arrive
-/// and derives `meta.streams` and `stream_labels` from what actually
-/// survived — which also retired the superset hazard where a label whose
-/// last rows retention dropped would fail the merged part's own metadata
-/// validation.
+/// has to exist before the first row group.
 ///
-/// A stream that turns out to be empty leaves no part and no tombstone, the
-/// same as flushing an empty `Vec`.
+/// An input set that turns out to be empty leaves no part and no tombstone,
+/// the same as flushing an empty `Vec`.
 #[allow(clippy::too_many_arguments)]
 pub fn flush_row_stream_with_merge_tombstone(
     rows: &mut MergedRows,
@@ -373,7 +362,6 @@ fn flush_rows_internal(
         }
 
         let parse_started = std::time::Instant::now();
-        let stream_labels = collect_stream_labels(&part_rows);
         let metadata_columns = select_metadata_columns(metadata_column_counts(&part_rows));
         let parsed_rows = parse_rows(&part_rows);
         let parsed_columns = select_metadata_columns(parsed_column_counts(&parsed_rows));
@@ -387,7 +375,6 @@ fn flush_rows_internal(
             &partition,
             &part_rows,
             &parsed_rows,
-            &stream_labels,
             &metadata_columns,
             &parsed_columns,
             row_group_size,
@@ -466,16 +453,6 @@ fn rollback_committed(committed_dirs: &[PathBuf]) {
     }
 }
 
-fn collect_stream_labels(rows: &[Row]) -> Vec<String> {
-    let mut set = BTreeSet::new();
-    for r in rows {
-        for k in r.labels.keys() {
-            set.insert(k.clone());
-        }
-    }
-    set.into_iter().collect()
-}
-
 /// How many rows of the part carry each metadata key.
 fn metadata_column_counts(rows: &[Row]) -> BTreeMap<String, u64> {
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
@@ -515,8 +492,7 @@ fn parsed_column_counts(parsed: &[Option<BTreeMap<String, String>>]) -> BTreeMap
 /// churning key names cannot push `trace_id` out of a column; ties break on
 /// the key so the choice is deterministic. The counts travel into `meta.json`
 /// because a merge must choose its output's columns *before* reading a row —
-/// the same constraint that makes `stream_labels` a union of the inputs' metas
-/// — and summing recorded counts is what keeps that choice deterministic too.
+/// and summing recorded counts is what keeps that choice deterministic too.
 /// Keys past the cap stay in the residual blob column; the invariant the read
 /// path relies on is that a columnized key never also appears in the residual.
 pub(crate) fn select_metadata_columns(counts: BTreeMap<String, u64>) -> Vec<(String, u64)> {
@@ -534,18 +510,15 @@ fn write_part_files(
     partition: &str,
     rows: &[Row],
     parsed_rows: &[Option<BTreeMap<String, String>>],
-    stream_labels: &[String],
     metadata_columns: &[(String, u64)],
     parsed_columns: &[(String, u64)],
     row_group_size: usize,
     measured: bool,
 ) -> io::Result<()> {
-    let (ordinals, stream_table) = assign_stream_ordinals(rows)?;
     let parquet_started = std::time::Instant::now();
     let row_group_ranges = write_parquet(
         &dir.join(DATA_FILE),
         rows,
-        &ordinals,
         parsed_rows,
         metadata_columns,
         parsed_columns,
@@ -555,13 +528,7 @@ fn write_part_files(
         FLUSH_BUILD.parquet.observe(parquet_started.elapsed());
     }
     let index_started = std::time::Instant::now();
-    write_index(
-        &dir.join(INDEX_FILE),
-        rows,
-        parsed_rows,
-        row_group_size,
-        stream_labels,
-    )?;
+    write_index(&dir.join(INDEX_FILE), rows, parsed_rows, row_group_size)?;
     if measured {
         FLUSH_BUILD.index.observe(index_started.elapsed());
     }
@@ -572,8 +539,6 @@ fn write_part_files(
         partition,
         rows,
         row_group_size,
-        &stream_table,
-        stream_labels,
         metadata_columns,
         parsed_columns,
         &row_group_ranges,
@@ -584,19 +549,8 @@ fn write_part_files(
     result
 }
 
-/// Row-group boundaries for a `(tenant, labels, timestamp)`-sorted row set.
-///
-/// A row group never spans two tenants, and holds a contiguous run of whole
-/// streams rather than one stream each.
-///
-/// Cutting on every stream change was tried and measured worse: with 128
-/// streams across 8 parts it turned roughly 3 row groups per part into 128, all
-/// far under `row_group_size`, and the per-group cost swamped the pruning win —
-/// `label_only` forward went from 2.04 ms to 5.19 ms while reading half the
-/// rows. The selectivity does not come from the cut; it comes from the sort
-/// order. Rows ordered by stream before time make a stream contiguous, so it
-/// touches one or two groups instead of all of them, and the groups stay the
-/// size they were.
+/// Row-group boundaries for a `(tenant, timestamp)`-sorted row set. A row
+/// group never spans two tenants.
 fn row_group_bounds(rows: &[Row], row_group_size: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut segment_start = 0usize;
@@ -616,77 +570,11 @@ fn row_group_bounds(rows: &[Row], row_group_size: usize) -> Vec<(usize, usize)> 
     out
 }
 
-/// First-occurrence stream ordinals over a sorted, deduplicated row stream.
-///
-/// Both writers fold the identical `(tenant, labels, ts, …)`-sorted sequence
-/// through this, so the assignment is a pure function of the rows and the two
-/// cannot disagree — which is what lets the streaming writer emit ordinals a
-/// row group at a time without ever seeing the whole part.
-///
-/// Dedup crosses tenants on purpose, matching what `meta.streams` always
-/// stored: a label set two tenants share is one table entry with two runs in
-/// the row order. Tenancy is enforced by row groups and the `_tenant` column,
-/// never by the ordinal.
-pub(crate) struct StreamOrdinals {
-    by_labels: HashMap<SharedLabels, u32>,
-    table: Vec<SharedLabels>,
-    /// The run fast path: consecutive rows almost always share a stream, and
-    /// `Arc::ptr_eq` answers without hashing the map.
-    last: Option<(SharedLabels, u32)>,
-}
-
-impl StreamOrdinals {
-    pub(crate) fn new() -> Self {
-        Self {
-            by_labels: HashMap::new(),
-            table: Vec::new(),
-            last: None,
-        }
-    }
-
-    pub(crate) fn ordinal_of(&mut self, labels: &SharedLabels) -> io::Result<u32> {
-        if let Some((last_labels, ordinal)) = &self.last
-            && (Arc::ptr_eq(last_labels, labels) || last_labels == labels)
-        {
-            return Ok(*ordinal);
-        }
-        let ordinal = match self.by_labels.get(labels) {
-            Some(ordinal) => *ordinal,
-            None => {
-                let ordinal = u32::try_from(self.table.len()).map_err(|_| {
-                    io::Error::other("part stream table exceeds u32 ordinals")
-                })?;
-                self.by_labels.insert(labels.clone(), ordinal);
-                self.table.push(labels.clone());
-                ordinal
-            }
-        };
-        self.last = Some((labels.clone(), ordinal));
-        Ok(ordinal)
-    }
-
-    pub(crate) fn into_table(self) -> Vec<SharedLabels> {
-        self.table
-    }
-}
-
-/// The batch path's fold: one ordinal per row, plus the table the rows
-/// defined, in assignment order.
-fn assign_stream_ordinals(rows: &[Row]) -> io::Result<(Vec<u32>, Vec<SharedLabels>)> {
-    let mut ordinals = StreamOrdinals::new();
-    let mut per_row = Vec::with_capacity(rows.len());
-    for row in rows {
-        per_row.push(ordinals.ordinal_of(&row.labels)?);
-    }
-    Ok((per_row, ordinals.into_table()))
-}
-
 /// The Parquet column a metadata key is stored in.
 ///
 /// The `_sm:` prefix keeps the metadata namespace disjoint from the reserved
-/// columns that precede it in the schema: `:` cannot appear in a validated
-/// label name, and metadata keys are arbitrary strings (OTLP attributes keep
-/// their dots), so the mapping is injective in both directions.
+/// columns that precede it in the schema, so the mapping is injective in both
+/// directions.
 fn metadata_column_name(key: &str) -> String {
     format!("_sm:{key}")
 }
@@ -702,12 +590,6 @@ fn part_schema(metadata_keys: &[String], parsed_keys: &[String]) -> Arc<Schema> 
         Field::new(TENANT_COLUMN, DataType::Utf8, false),
         Field::new("timestamp_ns", DataType::Int64, false),
         Field::new("_msg", DataType::Utf8, false),
-        // One ordinal instead of a column per stream label: the label sets
-        // live once in `meta.streams` and every row names its set by index.
-        // The wide projection stops paying a per-label column build, and the
-        // scan resolves labels with an `Arc` clone instead of rebuilding maps
-        // from columns.
-        Field::new(STREAM_COLUMN, DataType::UInt32, false),
     ];
     for key in metadata_keys {
         fields.push(Field::new(metadata_column_name(key), DataType::Utf8, true));
@@ -722,7 +604,6 @@ fn part_schema(metadata_keys: &[String], parsed_keys: &[String]) -> Arc<Schema> 
 fn row_group_batch(
     schema: &Arc<Schema>,
     rows: &[Row],
-    ordinals: &[u32],
     parsed_rows: &[Option<BTreeMap<String, String>>],
     metadata_keys: &[String],
     parsed_keys: &[String],
@@ -760,7 +641,6 @@ fn row_group_batch(
         Arc::new(StringArray::from(tenants)),
         Arc::new(Int64Array::from(ts)),
         Arc::new(StringArray::from(msg)),
-        Arc::new(UInt32Array::from(ordinals.to_vec())),
     ];
     for key in metadata_keys {
         let vals: Vec<Option<&str>> = rows
@@ -846,7 +726,6 @@ fn row_group_byte_ranges(metadata: &parquet::file::metadata::ParquetMetaData) ->
 fn write_parquet(
     path: &Path,
     rows: &[Row],
-    ordinals: &[u32],
     parsed_rows: &[Option<BTreeMap<String, String>>],
     metadata_columns: &[(String, u64)],
     parsed_columns: &[(String, u64)],
@@ -871,7 +750,6 @@ fn write_parquet(
         let batch = row_group_batch(
             &schema,
             &rows[*start..*end],
-            &ordinals[*start..*end],
             &parsed_rows[*start..*end],
             &metadata_keys,
             &parsed_keys,

@@ -291,7 +291,7 @@ async fn m6_machine_replacement_force_flush_is_lossless() {
     storage_b.restore_parts(&parts_root_b, &log_ids).await.unwrap();
     let registry_b = PartRegistry::load_from_manifest(&parts_root_b, &log_manifest).unwrap();
     let results = registry_b
-        .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
+        .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
         .unwrap();
     let total: usize = results.iter().map(|stream| stream.entries.len()).sum();
     assert_eq!(

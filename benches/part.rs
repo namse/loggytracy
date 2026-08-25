@@ -17,7 +17,7 @@ mod corpus;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use loggytracy::logql::{LabelMatcher, LineFilter, MatcherOp};
+use loggytracy::logql::LineFilter;
 use loggytracy::part::{ExactFieldPredicate, ExactFieldPruning, Part, PartReader, Row, flush_rows};
 
 use corpus::{CorpusSpec, Shape, scratch::ScratchDir};
@@ -82,7 +82,8 @@ fn bench_write(c: &mut Criterion) {
     group.finish();
 }
 
-/// The projection sweep: one matcher, N label columns, all of them decoded.
+/// The projection sweep: one attribute predicate, N attribute columns, all of
+/// them decoded.
 fn bench_scan_label_columns(c: &mut Criterion) {
     let mut group = c.benchmark_group("part/scan_label_columns");
     group
@@ -98,9 +99,7 @@ fn bench_scan_label_columns(c: &mut Criterion) {
         );
         let written = write_part(&corpus, "part-scan");
         let tenant = corpus.tenant().clone();
-        let matcher =
-            LabelMatcher::new("app".to_string(), MatcherOp::Eq, corpus.label_value("app"))
-                .expect("bench matcher is well formed");
+        let predicate = ExactFieldPredicate::new("app", corpus.label_value("app"));
         let start = corpus.min_ts_ns();
         let end = corpus.max_ts_ns();
         group.throughput(Throughput::Elements(corpus.entry_count() as u64));
@@ -111,10 +110,12 @@ fn bench_scan_label_columns(c: &mut Criterion) {
                 b.iter(|| {
                     written
                         .reader
-                        .query(
+                        .query_with_exact_field_pruning(
                             &tenant,
-                            std::slice::from_ref(&matcher),
-                            &[],
+                            loggytracy::part::ExactFieldPruning::new(
+                                &[],
+                                std::slice::from_ref(&predicate),
+                            ),
                             loggytracy::part::QueryTimeRange::closed(start, end),
                             usize::MAX,
                             true,
@@ -158,7 +159,6 @@ fn bench_scan_tenants(c: &mut Criterion) {
                     .query(
                         &tenant,
                         &[],
-                        &[],
                         loggytracy::part::QueryTimeRange::closed(start, end),
                         100,
                         false,
@@ -197,7 +197,6 @@ fn bench_scan_filters(c: &mut Criterion) {
                 .query(
                     &tenant,
                     &[],
-                    &[],
                     loggytracy::part::QueryTimeRange::closed(start, end),
                     100,
                     false,
@@ -216,7 +215,6 @@ fn bench_scan_filters(c: &mut Criterion) {
                 .reader
                 .query(
                     &tenant,
-                    &[],
                     &hit,
                     loggytracy::part::QueryTimeRange::closed(start, end),
                     100,
@@ -236,7 +234,6 @@ fn bench_scan_filters(c: &mut Criterion) {
                 .reader
                 .query(
                     &tenant,
-                    &[],
                     &miss,
                     loggytracy::part::QueryTimeRange::closed(start, end),
                     100,
@@ -272,7 +269,6 @@ fn bench_scan_filters(c: &mut Criterion) {
                     .reader
                     .query_with_exact_field_pruning(
                         &tenant,
-                        &[],
                         ExactFieldPruning::new(&[], &predicates),
                         loggytracy::part::QueryTimeRange::closed(start, end),
                         100,
@@ -295,7 +291,6 @@ fn bench_scan_filters(c: &mut Criterion) {
                 .reader
                 .query_with_exact_field_pruning(
                     &tenant,
-                    &[],
                     ExactFieldPruning::new(&[], &predicates),
                     loggytracy::part::QueryTimeRange::closed(start, end),
                     100,
@@ -332,7 +327,6 @@ fn report_allocations() {
                 .reader
                 .query(
                     &tenant,
-                    &[],
                     &[],
                     loggytracy::part::QueryTimeRange::closed(start, end),
                     usize::MAX,

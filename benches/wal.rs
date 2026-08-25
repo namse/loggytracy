@@ -51,18 +51,12 @@ fn push_payload() -> (Vec<u8>, TenantId) {
             .streams(1)
             .labels_per_stream(6),
     );
-    let batches = corpus::push_batches(&corpus);
-    (encode_otlp(&batches), corpus.tenant().clone())
+    (encode_otlp(&corpus.streams), corpus.tenant().clone())
 }
 
 /// The bytes the WAL stores: the export itself, one `ResourceLogs` per
-/// stream, the labels riding as resource attributes.
-fn encode_otlp(
-    batches: &[(
-        loggytracy::memtable::Labels,
-        Vec<loggytracy::memtable::LogEntry>,
-    )],
-) -> Vec<u8> {
+/// generator stream, the attributes riding as resource attributes.
+fn encode_otlp(streams: &[loggytracy::corpus::Stream]) -> Vec<u8> {
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
@@ -75,15 +69,16 @@ fn encode_otlp(
         ..Default::default()
     };
     let request = ExportLogsServiceRequest {
-        resource_logs: batches
+        resource_logs: streams
             .iter()
-            .map(|(labels, entries)| ResourceLogs {
+            .map(|stream| ResourceLogs {
                 resource: Some(Resource {
-                    attributes: labels.iter().map(|(k, v)| attr(k, v)).collect(),
+                    attributes: stream.labels.iter().map(|(k, v)| attr(k, v)).collect(),
                     ..Default::default()
                 }),
                 scope_logs: vec![ScopeLogs {
-                    log_records: entries
+                    log_records: stream
+                        .entries
                         .iter()
                         .map(|entry| LogRecord {
                             time_unix_nano: entry.timestamp_ns.max(0) as u64,

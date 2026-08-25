@@ -95,17 +95,17 @@ impl Journal {
 
     /// An OTLP log export: `data` is the encoded `ExportLogsServiceRequest`
     /// itself — for the HTTP protobuf transport the received body verbatim —
-    /// and `streams` is what `otlp_log::normalize_request` already produced
+    /// and `entries` is what `otlp_log::normalize_request` already produced
     /// for the memtable, so nothing is normalized twice and nothing is
     /// re-encoded into a second message for the WAL's sake.
     pub async fn append_otlp_logs(
         &self,
         tenant: TenantId,
         data: Vec<u8>,
-        streams: Vec<(Labels, Vec<LogEntry>)>,
+        entries: Vec<LogEntry>,
     ) -> Result<(), IoError> {
         let payload = compress_payload(&data)?;
-        self.send_append(TENANT_RECORD_KIND_OTLP_LOGS, payload, tenant, streams, Vec::new())
+        self.send_append(TENANT_RECORD_KIND_OTLP_LOGS, payload, tenant, entries, Vec::new())
             .await
     }
 
@@ -125,7 +125,7 @@ impl Journal {
         kind: u8,
         payload: Vec<u8>,
         tenant: TenantId,
-        streams: Vec<(Labels, Vec<LogEntry>)>,
+        entries: Vec<LogEntry>,
         traces: Vec<TraceSpan>,
     ) -> Result<(), IoError> {
         let framed_len =
@@ -148,7 +148,7 @@ impl Journal {
                 kind,
                 payload,
                 tenant,
-                streams,
+                entries,
                 traces,
                 queued_at,
                 done: done_tx,
@@ -263,13 +263,13 @@ async fn writer_loop(
                 kind,
                 payload,
                 tenant,
-                streams,
+                entries,
                 traces,
                 queued_at,
                 done,
             } => {
                 batch_bytes += framed_record_len(&tenant, &payload);
-                batch.push((kind, payload, tenant, streams, traces, queued_at, done));
+                batch.push((kind, payload, tenant, entries, traces, queued_at, done));
                 // Take what has already arrived and write it. Waiting for more
                 // charged every push the full linger even when the channel was
                 // empty, which fixed single-connection throughput at
@@ -300,13 +300,13 @@ async fn writer_loop(
                             kind,
                             payload,
                             tenant,
-                            streams,
+                            entries,
                             traces,
                             queued_at,
                             done,
                         })) => {
                             batch_bytes += framed_record_len(&tenant, &payload);
-                            batch.push((kind, payload, tenant, streams, traces, queued_at, done));
+                            batch.push((kind, payload, tenant, entries, traces, queued_at, done));
                         }
                         Ok(Some(JournalCmd::Checkpoint { done })) => {
                             pending_checkpoint = Some(done);
@@ -409,10 +409,8 @@ async fn writer_loop(
                     // charged to the same arena its contents already are.
                     let _arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
                     let records = batch.len();
-                    for (_, _, tenant, streams, traces, _, done) in batch.drain(..) {
-                        for (labels, entries) in streams {
-                            memtable.insert(tenant.clone(), labels, entries);
-                        }
+                    for (_, _, tenant, entries, traces, _, done) in batch.drain(..) {
+                        memtable.insert(tenant.clone(), entries);
                         trace_memtable.insert(traces);
                         let _ = done.send(Ok(()));
                     }

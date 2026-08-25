@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, UInt32Array};
-use arrow::datatypes::{DataType, Field, Int64Type, Schema, UInt32Type};
+use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
@@ -20,14 +20,11 @@ use parquet::errors::Result as ParquetResult;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::schema::types::ColumnPath;
-use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 use crate::bloom::BloomFilter;
-use crate::logql::{LabelMatcher, LineFilter, MatcherOp};
-use crate::memtable::{
-    Labels, LogEntry, MemTableSnapshot, QueryResult, SharedLabels, StreamResult,
-};
+use crate::logql::LineFilter;
+use crate::memtable::{LogEntry, MemTableSnapshot, QueryResult, SharedLabels, StreamResult};
 use crate::tenant::TenantId;
 
 pub const DATA_FILE: &str = "data.parquet";
@@ -46,7 +43,6 @@ pub const INDEX_MAGIC: &[u8; 5] = b"LTIX1";
 pub const META_FILE: &str = "meta.json";
 pub const MERGE_TOMBSTONE_FILE: &str = ".merge.tombstone";
 const BLOOM_MAGIC: &[u8; 4] = b"BTF5";
-const STREAM_MAGIC: &[u8; 4] = b"SIX1";
 
 /// Rows per exact-field sub-bloom window inside a row group.
 ///
@@ -87,11 +83,6 @@ const EXACT_FIELD_SCALAR_SCOPE: u8 = 0;
 /// is also the leading column.
 pub const TENANT_COLUMN: &str = "_tenant";
 
-/// Parquet column holding the row's stream ordinal — the index into
-/// `PartMeta::streams`, which is the part's label-set table. Column 3 in
-/// every part schema.
-pub const STREAM_COLUMN: &str = "_stream";
-
 /// The most metadata keys one part stores as `_sm:` columns; the rest of a
 /// row's pairs stay in the residual `structured_metadata` blob.
 ///
@@ -105,12 +96,11 @@ pub const MAX_METADATA_COLUMNS: usize = 128;
 
 /// Which of a part's columns a scan decodes.
 ///
-/// The tenant, timestamp and label columns are always read — the first two are
-/// the isolation cross-check and the sort axis, the labels are matcher input
-/// and series identity, and all are cheap dictionary runs. What a query can
-/// spare is the line and the metadata: `sum(rate({app="x"}[5m]))` needs
-/// neither, and decoding them anyway was most of what the metric path paid
-/// per row.
+/// The tenant and timestamp columns are always read — they are the isolation
+/// cross-check and the sort axis, and both are cheap dictionary runs. What a
+/// query can spare is the line and the metadata: `sum(rate({app="x"}[5m]))`
+/// needs neither, and decoding them anyway was most of what the metric path
+/// paid per row.
 ///
 /// `Named` is only sound when the caller can prove nothing downstream reads an
 /// unlisted field. A parser stage cannot prove it — an extraction is shadowed
@@ -208,8 +198,6 @@ impl MetadataWindow {
         max_ts_ns >= self.start_ns && min_ts_ns <= self.end_ns
     }
 }
-
-pub type StreamMap = BTreeMap<String, BTreeMap<String, RoaringBitmap>>;
 
 /// The time window a log scan is allowed to return rows from.
 ///
@@ -434,7 +422,6 @@ pub struct PartMeta {
     /// Merge compares this against its budgets instead of the compressed file
     /// size, which is smaller by whatever zstd achieved on the data.
     pub materialized_bytes: u64,
-    pub stream_labels: Vec<String>,
     /// The metadata keys stored as `_sm:` columns, sorted, with the number of
     /// rows carrying each. See `MAX_METADATA_COLUMNS`.
     pub metadata_columns: Vec<(String, u64)>,
@@ -443,10 +430,6 @@ pub struct PartMeta {
     /// the query-time parser would produce, exact by construction because the
     /// writer runs the same extraction.
     pub parsed_columns: Vec<(String, u64)>,
-    /// One entry per distinct label set, interned across parts at open —
-    /// see `intern_stream_labels`. This is also the `_stream` ordinal table
-    /// the reader resolves rows through; there is no separate copy.
-    pub streams: Vec<SharedLabels>,
     /// Size of `meta.json` on disk, recorded when it was read.
     ///
     /// Startup parses this file for every part before serving anything, and
@@ -487,7 +470,6 @@ impl Part {
 pub struct Row {
     pub tenant: TenantId,
     pub timestamp_ns: i64,
-    pub labels: SharedLabels,
     pub line: String,
     pub structured_metadata: Vec<(String, String)>,
 }
@@ -500,57 +482,33 @@ impl Row {
     /// on-disk size against a materialized budget is what made large groups
     /// select successfully and then always fail to read.
     pub fn materialized_bytes(&self) -> u64 {
-        let labels_bytes: usize = self
-            .labels
-            .iter()
-            .map(|(name, value)| name.len() + value.len())
-            .sum();
         let metadata_bytes: usize = self
             .structured_metadata
             .iter()
             .map(|(name, value)| name.len() + value.len())
             .sum();
-        (labels_bytes + self.line.len() + metadata_bytes + std::mem::size_of::<Row>()) as u64
+        (self.line.len() + metadata_bytes + std::mem::size_of::<Row>()) as u64
     }
 
-    /// The label set is shared with the stream it came from rather than copied.
-    /// This clone used to be the whole `BTreeMap` and it is why a flush held
-    /// 3.3x the memtable it was materializing.
-    pub fn from_entry(tenant: &TenantId, labels: &SharedLabels, e: &LogEntry) -> Self {
+    pub fn from_entry(tenant: &TenantId, e: &LogEntry) -> Self {
         Self {
             tenant: tenant.clone(),
             timestamp_ns: e.timestamp_ns,
-            labels: labels.clone(),
             line: e.line.clone(),
             structured_metadata: e.structured_metadata.clone(),
         }
     }
 
-    /// The part sort key. Timestamp order is preserved *within* a tenant, so
-    /// the reader's early termination and row-group time pruning keep working.
-    /// The full identity of a row, not just its placement.
-    ///
-    /// `(tenant, timestamp)` is what the layout needs — tenant-aligned row
-    /// groups and time order within a tenant. Everything after the timestamp is
-    /// a tie-break, which the ordering never cared about, and which makes two
-    /// copies of one entry sort adjacent so a duplicate can be recognised.
-    /// Sorted by stream before time, so a row group holds one stream.
-    ///
-    /// It used to be `(tenant, timestamp, labels, …)`, which interleaved every
-    /// active stream through every row group. `docs/COMPARISON.md` measured
-    /// what that costs: answering `{app="api-gateway"}` returned 6,250 rows and
-    /// decoded **57,344**, because a row group containing one matching row
-    /// contains rows of all eight apps and every one of them is decoded. Loki
-    /// read 6,254 for the same answer, because its chunks are per stream.
-    ///
-    /// Ordering by the label set first makes a row group a single stream's run,
-    /// which is what lets the stream index prune to the streams a query names
-    /// rather than merely to the parts that hold them. The cost is that a part
-    /// is no longer one timestamp-ordered run — see [`ScanStep::StopGroup`].
-    fn sort_key(&self) -> (&str, &Labels, i64, &str, &[(String, String)]) {
+    /// The part sort key. `(tenant, timestamp)` is what the layout needs —
+    /// tenant-aligned row groups and time order within a tenant, so a part is
+    /// one timestamp-ordered run per tenant and the reader's early termination
+    /// and row-group time pruning work directly. Everything after the
+    /// timestamp is a tie-break, which the ordering never cared about, and
+    /// which makes two copies of one entry sort adjacent so a duplicate can be
+    /// recognised.
+    fn sort_key(&self) -> (&str, i64, &str, &[(String, String)]) {
         (
             self.tenant.as_str(),
-            self.labels.as_ref(),
             self.timestamp_ns,
             self.line.as_str(),
             &self.structured_metadata,

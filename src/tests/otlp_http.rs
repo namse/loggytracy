@@ -96,7 +96,7 @@
 
     fn lines(memtable: &MemTable) -> Vec<String> {
         memtable
-            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+            .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .iter()
             .flat_map(|stream| stream.entries.iter())
             .map(|entry| entry.line.clone())
@@ -278,10 +278,7 @@
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(
             memtable
-                .query(
-                    &crate::tenant::TenantId::parse("stranger").unwrap(),
-                    &[],
-                    &[],
+                .query(&crate::tenant::TenantId::parse("stranger").unwrap(), &[],
                     crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                     10,
                     true

@@ -593,11 +593,11 @@ impl MetricEventSink {
         }
         // Before the pipeline runs: a delete selector matches the line as it
         // was written, and `line_format` would have rewritten it.
-        if !self.mask.is_empty() && self.mask.hides(labels, &entry) {
+        if !self.mask.is_empty() && self.mask.hides(&entry) {
             self.hidden_rows += 1;
             return Ok(());
         }
-        if !self.query.stages.is_empty()
+        if (!self.query.stages.is_empty() || !self.query.matchers.is_empty())
             && !self.query.process_entry_with_precomputed_json(
                 labels,
                 &mut entry,

@@ -5,8 +5,6 @@ fn write_meta(
     partition: &str,
     rows: &[Row],
     row_group_size: usize,
-    stream_table: &[SharedLabels],
-    stream_labels: &[String],
     metadata_columns: &[(String, u64)],
     parsed_columns: &[(String, u64)],
     row_group_ranges: &[ByteRange],
@@ -17,8 +15,6 @@ fn write_meta(
     // no longer the first and last row.
     let min_ts = rows.iter().map(|r| r.timestamp_ns).min().unwrap_or_default();
     let max_ts = rows.iter().map(|r| r.timestamp_ns).max().unwrap_or_default();
-    // Scanned, not read off the ends. Rows are ordered by stream before time,
-    // so a group spanning two streams does not start at its own minimum.
     let row_group_min_ts: Vec<i64> = bounds
         .iter()
         .map(|(start, end)| {
@@ -43,11 +39,10 @@ fn write_meta(
         .iter()
         .map(|(start, end)| (end - start) as u32)
         .collect();
-    // Whether the group is one non-decreasing run of timestamps — true exactly
-    // when the group holds one stream's rows (or several that happen not to
-    // interleave). The read path may only stop early inside a group it knows
-    // is ordered; without this bit it must read the group whole, which is the
-    // correctness fix the bed forced (`todo.md`, "Open correctness defects").
+    // Whether the group is one non-decreasing run of timestamps. Rows are
+    // sorted by `(tenant, timestamp)`, so this is true by construction for a
+    // freshly written part; the bit is kept so the reader's early stop stays
+    // an explicitly recorded property rather than an assumption.
     let row_group_ts_monotonic: Vec<bool> = bounds
         .iter()
         .map(|(start, end)| {
@@ -57,18 +52,6 @@ fn write_meta(
         })
         .collect();
     let mut tenants = tenant_segments(rows, &bounds, row_group_ranges);
-
-    // The ordinal table, in assignment order: `meta.streams` is what the
-    // `_stream` column indexes into, so its order is load-bearing now and
-    // comes from the writer's own fold rather than a sorted re-collection.
-    let streams: Vec<Vec<(String, String)>> = stream_table
-        .iter()
-        .map(|m| {
-            m.iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect()
-        })
-        .collect();
 
     let dir = path
         .parent()
@@ -96,10 +79,8 @@ fn write_meta(
         row_group_ts_monotonic,
         tenants,
         materialized_bytes: rows.iter().map(Row::materialized_bytes).sum(),
-        stream_labels: stream_labels.to_vec(),
         metadata_columns: metadata_columns.to_vec(),
         parsed_columns: parsed_columns.to_vec(),
-        streams,
         integrity,
     };
     meta.integrity.metadata_crc32 = metadata_crc32(&meta).map_err(io::Error::other)?;
@@ -213,7 +194,6 @@ struct MetaFile {
     row_group_ts_monotonic: Vec<bool>,
     tenants: Vec<TenantSegment>,
     materialized_bytes: u64,
-    stream_labels: Vec<String>,
     /// The metadata keys this part stores as `_sm:` columns, sorted, each with
     /// the number of rows carrying it. The counts are what let a merge choose
     /// its output's columns deterministically without reading a row.
@@ -221,7 +201,6 @@ struct MetaFile {
     /// The same for `_pf:` columns: the fields `| json` extracts from the
     /// part's lines, stored beside the line it still keeps.
     parsed_columns: Vec<(String, u64)>,
-    streams: Vec<Vec<(String, String)>>,
     integrity: PartIntegrity,
 }
 
@@ -251,49 +230,6 @@ struct MergeTombstone {
     old_dirs: Vec<PathBuf>,
 }
 
-/// One `Arc<Labels>` per distinct label set across every open part.
-///
-/// A part's `meta.streams` repeats the label sets of every other part that
-/// holds the same streams — under a steady corpus that is the *same* few
-/// hundred sets duplicated per part, and the 24-hour soak read `part_meta`
-/// as its one remaining GROWING row (todo.md, 2026-08-10). Interning at
-/// part-open collapses the duplication to one allocation per distinct set,
-/// and `stream_table` disappears as a separate copy because `meta.streams`
-/// *is* the shared table now.
-///
-/// This is not the intern table `SharedLabels`' doc rejects: that rejection
-/// is about the ingest path, where a global lock would sit under every row
-/// and an eviction policy would have to exist. This one is consulted at
-/// part open only — hundreds of lookups per part, on the cold path — and
-/// entries are `Weak`, so a set's lifetime is exactly the parts that hold
-/// it and nothing ever decides to evict.
-fn intern_stream_labels(labels: Labels) -> SharedLabels {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    static INTERN: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<u64, Vec<std::sync::Weak<Labels>>>>,
-    > = std::sync::OnceLock::new();
-    let mut hasher = DefaultHasher::new();
-    labels.hash(&mut hasher);
-    let key = hasher.finish();
-    let mut table = INTERN
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-        .lock()
-        .expect("stream intern table poisoned");
-    let bucket = table.entry(key).or_default();
-    bucket.retain(|weak| weak.strong_count() > 0);
-    for weak in bucket.iter() {
-        if let Some(shared) = weak.upgrade()
-            && *shared == labels
-        {
-            return shared;
-        }
-    }
-    let shared = Arc::new(labels);
-    bucket.push(Arc::downgrade(&shared));
-    shared
-}
-
 pub fn load_part(dir: &Path) -> Result<Part, String> {
     let _arena = crate::memprof::enter(crate::memprof::Arena::PartMeta);
     let meta_str = fs::read_to_string(dir.join(META_FILE)).map_err(|e| e.to_string())?;
@@ -306,11 +242,6 @@ pub fn load_part(dir: &Path) -> Result<Part, String> {
         ));
     }
     validate_meta_file(dir, &meta_file)?;
-    let streams: Vec<SharedLabels> = meta_file
-        .streams
-        .iter()
-        .map(|pairs| intern_stream_labels(pairs.iter().cloned().collect()))
-        .collect();
     let meta = PartMeta {
         id: meta_file.id,
         partition: meta_file.partition,
@@ -324,10 +255,8 @@ pub fn load_part(dir: &Path) -> Result<Part, String> {
         row_group_ts_monotonic: meta_file.row_group_ts_monotonic,
         tenants: meta_file.tenants,
         materialized_bytes: meta_file.materialized_bytes,
-        stream_labels: meta_file.stream_labels,
         metadata_columns: meta_file.metadata_columns,
         parsed_columns: meta_file.parsed_columns,
-        streams,
         meta_bytes: meta_str.len() as u64,
         integrity: meta_file.integrity,
     };
@@ -402,29 +331,6 @@ fn validate_meta_file(dir: &Path, meta: &MetaFile) -> Result<(), String> {
         }
     }
     validate_tenant_segments(meta)?;
-
-    let mut expected_labels = BTreeSet::new();
-    for stream in &meta.streams {
-        let mut names = BTreeSet::new();
-        for (name, _) in stream {
-            crate::label_name::validate_label_name(name)?;
-            if !names.insert(name) {
-                return Err(format!("duplicate label {name} in part stream metadata"));
-            }
-            expected_labels.insert(name.clone());
-        }
-    }
-    let actual_labels: BTreeSet<_> = meta.stream_labels.iter().cloned().collect();
-    if actual_labels.len() != meta.stream_labels.len() || actual_labels != expected_labels {
-        return Err("part stream label metadata is inconsistent".to_string());
-    }
-    // The streams list is the `_stream` ordinal table, so a duplicate entry
-    // would silently split one stream across two ordinals — corruption, not a
-    // cosmetic redundancy.
-    let distinct: BTreeSet<&Vec<(String, String)>> = meta.streams.iter().collect();
-    if distinct.len() != meta.streams.len() {
-        return Err("part stream metadata contains duplicate streams".to_string());
-    }
     Ok(())
 }
 
@@ -463,11 +369,8 @@ fn validate_tenant_segments(meta: &MetaFile) -> Result<(), String> {
         if segment.min_ts_ns != segment_min || segment.max_ts_ns != segment_max {
             return Err("part tenant segment timestamps do not match its row groups".to_string());
         }
-        // A row group holds a run of whole streams, each ordered by time
-        // inside itself, so neither the group nor the segment is one
-        // timestamp-ordered run — a later group can start earlier than an
-        // earlier one ends. The reader relies only on the weaker property
-        // checked here: a group's own bounds are consistent.
+        // A group's own bounds must be consistent; whether the group is one
+        // ordered run is recorded per group in `row_group_ts_monotonic`.
         for row_group in groups.clone() {
             if meta.row_group_min_ts[row_group] > meta.row_group_max_ts[row_group] {
                 return Err("part row group timestamps are inverted".to_string());

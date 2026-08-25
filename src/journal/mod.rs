@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use crate::config::Config;
-use crate::memtable::{Labels, LogEntry, MemTable, MemTableSnapshot};
+use crate::memtable::{LogEntry, MemTable, MemTableSnapshot};
 use crate::metrics::LatencyHistogram;
 use crate::tenant::TenantId;
 use crate::trace::{ExportTraceServiceRequest, TraceMemTable, TraceSpan, normalize_request};
@@ -168,7 +168,7 @@ enum JournalCmd {
         kind: u8,
         payload: Vec<u8>,
         tenant: TenantId,
-        streams: Vec<(Labels, Vec<LogEntry>)>,
+        entries: Vec<LogEntry>,
         traces: Vec<TraceSpan>,
         /// When the pushing task handed this to the channel. Every push in the
         /// process funnels through one writer task, so the interval between
@@ -191,7 +191,7 @@ type AppendBatchItem = (
     u8,
     Vec<u8>,
     TenantId,
-    Vec<(Labels, Vec<LogEntry>)>,
+    Vec<LogEntry>,
     Vec<TraceSpan>,
     Instant,
     oneshot::Sender<Result<(), IoError>>,

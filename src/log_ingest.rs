@@ -161,29 +161,27 @@ impl OtlpLogIngest<'_> {
             Some(bytes) => bytes,
             None => request.encode_to_vec(),
         };
-        let streams = normalize_request(request)
+        let entries = normalize_request(request)
             .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
         // A record that arrives over OTLP is still bounded: a line has a size
         // limit, and a timestamp outside the window would land in a partition
         // retention has already swept.
         let window = crate::ingest::TimestampWindow::from_config(self.config, self.clock);
-        for (_labels, entries) in &streams {
-            for entry in entries {
-                if entry.line.len() > self.config.max_line_bytes {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "log line is {} bytes, exceeding the maximum of {}",
-                            entry.line.len(),
-                            self.config.max_line_bytes
-                        ),
-                    )
-                        .into());
-                }
-                window
-                    .validate(entry.timestamp_ns)
-                    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        for entry in &entries {
+            if entry.line.len() > self.config.max_line_bytes {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "log line is {} bytes, exceeding the maximum of {}",
+                        entry.line.len(),
+                        self.config.max_line_bytes
+                    ),
+                )
+                    .into());
             }
+            window
+                .validate(entry.timestamp_ns)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
         }
 
         // The WAL stores the export itself (`encoded` above). This used to
@@ -193,7 +191,7 @@ impl OtlpLogIngest<'_> {
         // invariant II's copy count. Replay decodes by the record's kind
         // instead, the way traces always have.
         self.journal
-            .append_otlp_logs(tenant, encoded, streams)
+            .append_otlp_logs(tenant, encoded, entries)
             .await
             .map_err(|error| {
                 (

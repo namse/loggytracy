@@ -28,7 +28,6 @@
             .map(|i| part::Row {
                 tenant: test_tenant(),
                 timestamp_ns: start_ts + i as i64,
-                labels: std::sync::Arc::new(labels.clone()),
                 line: format!("{}-line-{}", suffix, i),
                 structured_metadata: vec![],
             })
@@ -61,7 +60,7 @@
         assert_eq!(registry.part_count(), 1);
 
         let results = registry
-            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 1000, true)
+            .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 1000, true)
             .expect("part query");
         let total: usize = results.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 50);
@@ -173,7 +172,6 @@
                         ))
                         .unwrap(),
                         timestamp_ns: (batch * 1000) as i64 + row_index as i64,
-                        labels: std::sync::Arc::new(labels.clone()),
                         line: format!("batch {batch} row {row_index} of a log line"),
                         structured_metadata: vec![],
                     })
@@ -211,12 +209,6 @@
         assert_eq!(narrow.tenant_segments, 4, "one tenant in each of four parts");
         assert_eq!(wide.tenant_segments, 80, "twenty tenants in each of four parts");
         assert!(
-            wide.sidecar_resident_bytes > narrow.sidecar_resident_bytes,
-            "a pair carries its own blooms: {} should exceed {}",
-            wide.sidecar_resident_bytes,
-            narrow.sidecar_resident_bytes
-        );
-        assert!(
             wide.meta_bytes > narrow.meta_bytes,
             "a pair carries its own metadata segment: {} should exceed {}",
             wide.meta_bytes,
@@ -250,7 +242,6 @@
                     tenant: crate::tenant::TenantId::parse(&format!("t{:02}", row_index % 5))
                         .unwrap(),
                     timestamp_ns: (batch * 1000) as i64 + row_index as i64,
-                    labels: std::sync::Arc::new(labels.clone()),
                     line: format!("batch {batch} row {row_index}"),
                     structured_metadata: vec![],
                 })
@@ -271,7 +262,8 @@
             after.tenant_segments, 5,
             "one part holding five tenants, not the sum of what came before"
         );
-        assert!(after.sidecar_resident_bytes < before.sidecar_resident_bytes);
+        // The resident sidecar went with the stream index; only `meta.json`
+        // still shrinks when four parts become one.
         assert!(after.meta_bytes < before.meta_bytes);
     }
 
@@ -345,7 +337,7 @@
 
         assert_eq!(registry.part_count(), 1);
         let results = registry
-            .query(&test_tenant(), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 2000, true)
+            .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 2000, true)
             .expect("part query");
         assert_eq!(
             results
@@ -417,33 +409,14 @@
         // bloom prune after merge
         let f = crate::logql::LineFilter::Contains("zzzzz".to_string());
         let r = registry
-            .query(&test_tenant(), &[], &[f], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
+            .query(&test_tenant(), &[f], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 0);
 
-        // label prune after merge
-        let m = crate::logql::LabelMatcher::new(
-            "app".to_string(),
-            crate::logql::MatcherOp::Eq,
-            "missing".to_string(),
-        )
-        .unwrap();
+        // every row survives the merge
         let r = registry
-            .query(&test_tenant(), &[m], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 100, true)
-            .expect("part query");
-        let total: usize = r.iter().map(|s| s.entries.len()).sum();
-        assert_eq!(total, 0);
-
-        // label hit
-        let m = crate::logql::LabelMatcher::new(
-            "app".to_string(),
-            crate::logql::MatcherOp::Eq,
-            "test".to_string(),
-        )
-        .unwrap();
-        let r = registry
-            .query(&test_tenant(), &[m], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 1000, true)
+            .query(&test_tenant(), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 1000, true)
             .expect("part query");
         let total: usize = r.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 60);
@@ -490,12 +463,8 @@
         part::Row {
             tenant: tenant_id(owner),
             timestamp_ns,
-            labels: [("app".to_string(), owner.to_string())]
-                .into_iter()
-                .collect::<std::collections::BTreeMap<_, _>>()
-                .into(),
             line: format!("{owner}-{timestamp_ns}"),
-            structured_metadata: vec![],
+            structured_metadata: vec![("app".to_string(), owner.to_string())],
         }
     }
 
@@ -634,7 +603,7 @@
         );
 
         let surviving = registry
-            .query(&tenant_id("beta"), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+            .query(&tenant_id("beta"), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
             .unwrap();
         assert_eq!(
             surviving
@@ -646,7 +615,7 @@
         );
         assert!(
             registry
-                .query(&tenant_id("alpha"), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+                .query(&tenant_id("alpha"), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                 .unwrap()
                 .is_empty()
         );
@@ -756,7 +725,7 @@
         assert_eq!(reader.meta().row_count, 3);
         assert!(
             registry
-                .query(&tenant_id("alpha"), &[], &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
+                .query(&tenant_id("alpha"), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX), 10, true)
                 .unwrap()
                 .is_empty()
         );
@@ -813,10 +782,7 @@
 
         assert_eq!(registry.part_count(), 1);
         let survivors = registry
-            .query(
-                &tenant_id("unmentioned"),
-                &[],
-                &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            .query(&tenant_id("unmentioned"), &[], crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                 10,
                 true,
             )
@@ -844,10 +810,6 @@
             .map(|index| part::Row {
                 tenant: test_tenant(),
                 timestamp_ns: 1_700_000_000_000_000_000 + index,
-                labels: [("app".to_string(), "compressible".to_string())]
-                    .into_iter()
-                    .collect::<std::collections::BTreeMap<_, _>>()
-                    .into(),
                 line: "a".repeat(512),
                 structured_metadata: vec![],
             })
@@ -879,10 +841,6 @@
         part::Row {
             tenant: tenant_id(owner),
             timestamp_ns,
-            labels: [("app".to_string(), owner.to_string())]
-                .into_iter()
-                .collect::<std::collections::BTreeMap<_, _>>()
-                .into(),
             line: format!("{owner}-{timestamp_ns}-{}", "x".repeat(1024)),
             structured_metadata: vec![],
         }
@@ -962,7 +920,7 @@
                     .query(
                         &tenant_id("kept"),
                         &[],
-                        Default::default(), crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                        crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                         100,
                         true,
                     )

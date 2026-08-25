@@ -15,7 +15,7 @@
 //! and adds the bench-only counting allocator and scratch directory, which
 //! have no business in a library that a server binary links.
 
-use crate::memtable::{Labels, LogEntry, MemTableSnapshot, SharedLabels, TenantStreams};
+use crate::memtable::{Labels, LogEntry, MemTableSnapshot, SharedLabels};
 use crate::part::Row;
 use crate::tenant::TenantId;
 
@@ -615,6 +615,18 @@ pub fn generate(spec: &CorpusSpec) -> Corpus {
     }
 }
 
+impl Stream {
+    /// The entry with this stream's label pairs folded into its attributes —
+    /// what reaches storage, where a "stream" is only a generator grouping.
+    pub(crate) fn entry_with_labels(&self, entry: &LogEntry) -> LogEntry {
+        let mut merged = entry.clone();
+        merged
+            .structured_metadata
+            .extend(self.labels.iter().map(|(k, v)| (k.clone(), v.clone())));
+        merged
+    }
+}
+
 impl Corpus {
     pub fn entry_count(&self) -> usize {
         self.streams.iter().map(|stream| stream.entries.len()).sum()
@@ -628,15 +640,16 @@ impl Corpus {
             .sum()
     }
 
+    /// The buffered form the flush path reads. Storage has no stream concept,
+    /// so a stream's labels travel as each entry's attributes — the same fold
+    /// the OTLP intake performs on resource attributes.
     pub fn snapshot(&self) -> MemTableSnapshot {
         let mut snapshot: MemTableSnapshot = MemTableSnapshot::new();
         for stream in &self.streams {
-            let tenant_streams: &mut TenantStreams =
-                snapshot.entry(stream.tenant.clone()).or_default();
-            tenant_streams
-                .entry(stream.labels.clone())
-                .or_default()
-                .extend(stream.entries.iter().cloned());
+            let entries = snapshot.entry(stream.tenant.clone()).or_default();
+            for entry in &stream.entries {
+                entries.push(stream.entry_with_labels(entry));
+            }
         }
         snapshot
     }
@@ -650,7 +663,7 @@ impl Corpus {
         let mut rows = Vec::with_capacity(self.entry_count());
         for stream in &self.streams {
             for entry in &stream.entries {
-                let mut row = Row::from_entry(&stream.tenant, &stream.labels, entry);
+                let mut row = Row::from_entry(&stream.tenant, &stream.entry_with_labels(entry));
                 crate::memtable::canonicalize_structured_metadata(&mut row.structured_metadata);
                 rows.push(row);
             }
@@ -735,11 +748,18 @@ impl Corpus {
     }
 }
 
-/// Push-shaped `(labels, entries)` batches, which is what the journal takes.
-pub fn push_batches(corpus: &Corpus) -> Vec<(Labels, Vec<LogEntry>)> {
+/// Push-shaped entry batches, which is what the journal takes: one batch per
+/// generator stream, each entry carrying the stream's attributes itself.
+pub fn push_batches(corpus: &Corpus) -> Vec<Vec<LogEntry>> {
     corpus
         .streams
         .iter()
-        .map(|stream| ((*stream.labels).clone(), stream.entries.clone()))
+        .map(|stream| {
+            stream
+                .entries
+                .iter()
+                .map(|entry| stream.entry_with_labels(entry))
+                .collect()
+        })
         .collect()
 }

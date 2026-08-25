@@ -315,11 +315,10 @@ impl<'a> RowCollector<'a> {
 }
 
 impl RowSink for RowCollector<'_> {
-    fn accept(&mut self, labels: &SharedLabels, entry: LogEntry) -> Result<(), String> {
+    fn accept(&mut self, _labels: &SharedLabels, entry: LogEntry) -> Result<(), String> {
         self.rows.push(Row {
             tenant: self.tenant.clone(),
             timestamp_ns: entry.timestamp_ns,
-            labels: labels.clone(),
             line: entry.line,
             structured_metadata: entry.structured_metadata,
         });

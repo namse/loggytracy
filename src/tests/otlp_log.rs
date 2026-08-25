@@ -1,7 +1,8 @@
     use super::*;
-    use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+    use opentelemetry_proto::tonic::common::v1::{InstrumentationScope, KeyValue};
     use opentelemetry_proto::tonic::logs::v1::{ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
+    use std::collections::BTreeMap;
 
     fn string_value(value: &str) -> AnyValue {
         AnyValue {
@@ -49,18 +50,23 @@
         }
     }
 
-    /// The split between labels and structured metadata is the cardinality
-    /// decision. An OTLP resource carries dozens of attributes and several of
-    /// them are unique per process, so promoting all of them would make every
-    /// pod its own stream — and streams are what the plan sells a bounded
-    /// number of.
+    fn metadata_map(entry: &LogEntry) -> BTreeMap<&str, &str> {
+        entry
+            .structured_metadata
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect()
+    }
+
+    /// There is no stream concept: nothing is promoted to a label, and every
+    /// resource attribute lands in each record's metadata with a key LogQL can
+    /// name (dots become underscores, as Loki's OTLP intake normalizes too).
     #[test]
-    fn only_the_promoted_resource_attributes_become_labels() {
+    fn every_resource_attribute_becomes_metadata_with_a_normalized_key() {
         let normalized = normalize_request(request(
             vec![
                 attribute("service.name", string_value("checkout")),
                 attribute("k8s.namespace.name", string_value("prod")),
-                // Unique per process: a label here is a new stream per restart.
                 attribute("process.pid", string_value("41213")),
                 attribute("telemetry.sdk.version", string_value("1.28.0")),
             ],
@@ -68,32 +74,21 @@
         ))
         .unwrap();
 
-        assert_eq!(normalized.len(), 1, "one resource is one stream");
-        let (labels, entries) = &normalized[0];
-        assert_eq!(
-            labels.keys().collect::<Vec<_>>(),
-            vec!["k8s_namespace_name", "service_name"],
-            "dots become underscores because LogQL matches Prometheus-shaped names"
-        );
-        assert_eq!(labels["service_name"], "checkout");
-
-        let metadata: BTreeMap<&str, &str> = entries[0]
-            .structured_metadata
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-        assert_eq!(metadata["process.pid"], "41213");
-        assert_eq!(metadata["telemetry.sdk.version"], "1.28.0");
+        assert_eq!(normalized.len(), 1);
+        let metadata = metadata_map(&normalized[0]);
+        assert_eq!(metadata["service_name"], "checkout");
+        assert_eq!(metadata["k8s_namespace_name"], "prod");
+        assert_eq!(metadata["process_pid"], "41213");
+        assert_eq!(metadata["telemetry_sdk_version"], "1.28.0");
         assert_eq!(metadata["severity_text"], "INFO");
         assert_eq!(metadata["severity_number"], "9");
         assert_eq!(metadata["scope_name"], "checkout");
     }
 
-    /// Records sharing a label set are one stream. An export normally carries
-    /// many records from one resource, and a stream per record would defeat
-    /// the grouping the storage layer is built on.
+    /// An export is a flat run of records in arrival order; nothing groups
+    /// them by resource any more.
     #[test]
-    fn records_from_one_resource_are_grouped_into_one_stream() {
+    fn records_come_back_flat_in_arrival_order() {
         let normalized = normalize_request(request(
             vec![attribute("service.name", string_value("checkout"))],
             vec![
@@ -104,9 +99,13 @@
         ))
         .unwrap();
 
-        assert_eq!(normalized.len(), 1);
-        assert_eq!(normalized[0].1.len(), 3);
-        assert_eq!(normalized[0].1[2].line, "third");
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[2].line, "third");
+        assert_eq!(
+            metadata_map(&normalized[2])["service_name"],
+            "checkout",
+            "every record carries the resource attributes itself"
+        );
     }
 
     /// `time_unix_nano` is optional in OTLP and a collector leaves it at zero
@@ -121,7 +120,7 @@
             vec![without_time],
         ))
         .unwrap();
-        assert_eq!(normalized[0].1[0].timestamp_ns, 1_700_000_005_000_000_000);
+        assert_eq!(normalized[0].timestamp_ns, 1_700_000_005_000_000_000);
     }
 
     /// Trace correlation is the reason logs and traces live in one engine, so
@@ -132,11 +131,7 @@
         correlated.trace_id = vec![0x0a; 16];
         correlated.span_id = vec![0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
         let normalized = normalize_request(request(Vec::new(), vec![correlated])).unwrap();
-        let metadata: BTreeMap<&str, &str> = normalized[0].1[0]
-            .structured_metadata
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
+        let metadata = metadata_map(&normalized[0]);
         assert_eq!(metadata["trace_id"], "0a".repeat(16));
         assert_eq!(metadata["span_id"], "ff01020304050607");
     }
@@ -155,7 +150,7 @@
             )),
         });
         let normalized = normalize_request(request(Vec::new(), vec![structured])).unwrap();
-        let line = &normalized[0].1[0].line;
+        let line = &normalized[0].line;
         assert!(line.contains("checkout.completed"), "{line}");
     }
 
@@ -169,8 +164,8 @@
 
     /// The journal stores the export as it arrived and replay re-normalizes,
     /// so what must round-trip is normalization itself — the same bytes must
-    /// normalize to the same streams before and after a crash, awkward label
-    /// values included.
+    /// normalize to the same entries before and after a crash, awkward
+    /// attribute values included.
     #[test]
     fn an_awkward_export_normalizes_identically_after_a_wal_round_trip() {
         let export = request(
@@ -188,33 +183,13 @@
             .expect("the WAL payload decodes");
         let after = normalize_request(decoded).expect("and normalizes again");
         assert_eq!(before.len(), after.len());
-        for ((labels_before, entries_before), (labels_after, entries_after)) in
-            before.iter().zip(&after)
-        {
-            assert_eq!(labels_before, labels_after);
-            assert_eq!(entries_before.len(), entries_after.len());
-            for (entry_before, entry_after) in entries_before.iter().zip(entries_after) {
-                assert_eq!(entry_before.timestamp_ns, entry_after.timestamp_ns);
-                assert_eq!(entry_before.line, entry_after.line);
-                assert_eq!(
-                    entry_before.structured_metadata,
-                    entry_after.structured_metadata
-                );
-            }
+        for (entry_before, entry_after) in before.iter().zip(&after) {
+            assert_eq!(entry_before.timestamp_ns, entry_after.timestamp_ns);
+            assert_eq!(entry_before.line, entry_after.line);
+            assert_eq!(
+                entry_before.structured_metadata,
+                entry_after.structured_metadata
+            );
         }
-        assert_eq!(after[0].1[0].timestamp_ns, 1_700_000_000_000_000_000);
-    }
-
-    /// The OTLP path has no reserved-name check because it needs none: stream
-    /// labels come only from the fixed promotion list, and every sanitized
-    /// member of it must stay a valid, unreserved label name. If a name is
-    /// ever added for which this fails, the check has to move into
-    /// `split_resource_attributes` rather than this test being weakened.
-    #[test]
-    fn every_promoted_attribute_sanitizes_to_a_valid_unreserved_label_name() {
-        for name in PROMOTED_RESOURCE_ATTRIBUTES {
-            let sanitized = sanitize_label_name(name);
-            crate::label_name::validate_label_name(&sanitized)
-                .unwrap_or_else(|error| panic!("{name} -> {sanitized}: {error}"));
-        }
+        assert_eq!(after[0].timestamp_ns, 1_700_000_000_000_000_000);
     }

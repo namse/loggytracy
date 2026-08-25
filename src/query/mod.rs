@@ -457,17 +457,6 @@ fn parse_limit(limit: Option<usize>, max_limit: usize) -> Result<usize, String> 
     Ok(limit)
 }
 
-fn distinct_stream_count(
-    state: &AppState,
-    tenant: &TenantId,
-    window: crate::part::MetadataWindow,
-) -> usize {
-    let mut streams = std::collections::BTreeSet::new();
-    streams.extend(state.memtable.series(tenant, &[], window));
-    streams.extend(state.parts.series(tenant, &[], window));
-    streams.len()
-}
-
 pub(crate) fn validate_query_range(
     config: &crate::config::Config,
     start_ns: i64,

@@ -12,6 +12,17 @@
         }
     }
 
+
+    /// Selector boilerplate for pipeline tests: seeds the field map with the
+    /// pair the test's `{...}` selector names, the way a row's own attributes
+    /// would.
+    fn seeded(pairs: &[(&str, &str)]) -> Labels {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
     fn ordered_pipeline_parses_all_m3_stages() {
         let query = parse(
@@ -447,7 +458,7 @@
             line: "status=500 path=/checkout user=alice".to_string(),
             structured_metadata: vec![],
         };
-        assert!(query.process_entry(&mut entry));
+        assert!(query.process_entry_with_labels(&seeded(&[("app", "a")]), &mut entry));
         assert_eq!(entry.line, "500 /checkout");
     }
 
@@ -466,7 +477,7 @@
             line: "status=500 path=/a".to_string(),
             structured_metadata: vec![],
         };
-        assert!(query.process_entry(&mut matching));
+        assert!(query.process_entry_with_labels(&seeded(&[("app", "a")]), &mut matching));
 
         let mut other = LogEntry {
             timestamp_ns: 1,
@@ -474,7 +485,7 @@
             line: "status=200 latency=500".to_string(),
             structured_metadata: vec![],
         };
-        assert!(!query.process_entry(&mut other));
+        assert!(!query.process_entry_with_labels(&seeded(&[("app", "a")]), &mut other));
     }
 
     /// A field the template names but the entry does not have renders empty,
@@ -491,7 +502,7 @@
             line: "status=200".to_string(),
             structured_metadata: vec![],
         };
-        assert!(query.process_entry(&mut entry));
+        assert!(query.process_entry_with_labels(&seeded(&[("app", "a")]), &mut entry));
         assert_eq!(entry.line, "[]");
     }
 
@@ -509,7 +520,7 @@
             line: "status=500".to_string(),
             structured_metadata: vec![],
         };
-        assert!(query.process_entry(&mut entry));
+        assert!(query.process_entry_with_labels(&seeded(&[("app", "a")]), &mut entry));
         let fields: std::collections::BTreeMap<_, _> =
             entry.structured_metadata.iter().cloned().collect();
         assert_eq!(fields["code"], "500", "unquoted copies the field");
@@ -531,7 +542,7 @@
             line: "a=first b=second".to_string(),
             structured_metadata: vec![],
         };
-        assert!(query.process_entry(&mut entry));
+        assert!(query.process_entry_with_labels(&seeded(&[("app", "a")]), &mut entry));
         let fields: std::collections::BTreeMap<_, _> =
             entry.structured_metadata.iter().cloned().collect();
         assert_eq!(fields["a"], "second");
@@ -561,10 +572,13 @@
         else {
             panic!("expected a log query")
         };
-        assert!(
-            query.exact_field_predicates().is_empty(),
-            "a synthesized name is not an index term"
+        let predicates = query.exact_field_predicates();
+        assert_eq!(
+            predicates.len(),
+            1,
+            "the selector's own equality stays; a synthesized name is not an index term"
         );
+        assert_eq!(predicates[0].name, "app");
     }
 
     #[test]
@@ -691,7 +705,7 @@
             line: r#"{"tags":["red","green"],"nested":[{"id":7}]}"#.to_string(),
             structured_metadata: vec![],
         };
-        assert!(query.process_entry(&mut entry));
+        assert!(query.process_entry_with_labels(&seeded(&[("a", "b")]), &mut entry));
         let fields: std::collections::BTreeMap<_, _> =
             entry.structured_metadata.iter().cloned().collect();
         assert_eq!(fields["tags_0"], "red");
@@ -712,7 +726,7 @@
             line: r#"{"user":null,"id":1}"#.to_string(),
             structured_metadata: vec![],
         };
-        assert!(query.process_entry(&mut entry));
+        assert!(query.process_entry_with_labels(&seeded(&[("a", "b")]), &mut entry));
         let fields: std::collections::BTreeMap<_, _> =
             entry.structured_metadata.iter().cloned().collect();
         assert_eq!(fields.get("user"), Some(&String::new()));
@@ -731,7 +745,7 @@
             line: r#"[{"id":1},{"id":2}]"#.to_string(),
             structured_metadata: vec![],
         };
-        assert!(query.process_entry(&mut entry));
+        assert!(query.process_entry_with_labels(&seeded(&[("a", "b")]), &mut entry));
         let fields: std::collections::BTreeMap<_, _> =
             entry.structured_metadata.iter().cloned().collect();
         assert_eq!(fields["0_id"], "1");
@@ -751,7 +765,7 @@
             line: "42".to_string(),
             structured_metadata: vec![],
         };
-        assert!(query.process_entry(&mut entry));
+        assert!(query.process_entry_with_labels(&seeded(&[("a", "b")]), &mut entry));
         let fields: std::collections::BTreeMap<_, _> =
             entry.structured_metadata.iter().cloned().collect();
         assert_eq!(fields[crate::logql::PARSER_ERROR_FIELD], "JSONParserErr");

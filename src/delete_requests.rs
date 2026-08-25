@@ -85,15 +85,19 @@ struct CompiledRequest {
 }
 
 impl CompiledRequest {
-    fn covers(&self, labels: &Labels, timestamp_ns: i64, line: &str) -> bool {
+    fn covers(&self, metadata: &[(String, String)], timestamp_ns: i64, line: &str) -> bool {
         if timestamp_ns < self.request.start_ns || timestamp_ns >= self.request.end_ns {
             return false;
         }
+        // Matchers select on the row's own attributes now that no stream
+        // exists. The pairs arrive canonical (sorted, unique), so the map is a
+        // straight collect; built only while delete requests are outstanding.
+        let attributes: Labels = metadata.iter().cloned().collect();
         if !self
             .selector
             .matchers
             .iter()
-            .all(|matcher| matcher.matches(labels))
+            .all(|matcher| matcher.matches(&attributes))
         {
             return false;
         }
@@ -105,21 +109,15 @@ impl CompiledRequest {
 }
 
 impl CompiledRequest {
-    /// Whether this part could still contain a row the request covers.
+    /// Whether this part could still contain a row the request covers,
+    /// decided from the tenant segment's time span alone — with no stream
+    /// table there is nothing else `meta.json` can rule out, so the status
+    /// lags conservatively rather than ever claiming `processed` early.
     fn may_be_held_by(&self, tenant: &TenantId, meta: &crate::part::PartMeta) -> bool {
-        let overlaps = meta.tenants.iter().any(|segment| {
+        meta.tenants.iter().any(|segment| {
             &segment.tenant == tenant
                 && segment.min_ts_ns < self.request.end_ns
                 && segment.max_ts_ns >= self.request.start_ns
-        });
-        if !overlaps {
-            return false;
-        }
-        meta.streams.iter().any(|labels| {
-            self.selector
-                .matchers
-                .iter()
-                .all(|matcher| matcher.matches(labels))
         })
     }
 }
@@ -344,11 +342,10 @@ impl DeleteRequests {
     /// Promotes a request to `processed` once no part could still hold a row it
     /// covers.
     ///
-    /// Conservative in the safe direction. A part's `streams` are recorded for
-    /// the whole part rather than per tenant, so a part that holds the stream
-    /// for a *different* tenant keeps the request at `received` — the status
-    /// lags, which is a worse answer than it could be but never a wrong one.
-    /// Claiming `processed` while bytes remain is the failure that matters.
+    /// Conservative in the safe direction: only the tenant segment's time
+    /// span can rule a part out, so the status lags — a worse answer than it
+    /// could be but never a wrong one. Claiming `processed` while bytes
+    /// remain is the failure that matters.
     pub fn mark_processed(&self, metas: &[crate::part::PartMeta]) {
         if self.is_empty() {
             return;
@@ -381,10 +378,10 @@ impl DeleteMask {
         self.requests.is_empty()
     }
 
-    pub fn hides(&self, labels: &Labels, entry: &LogEntry) -> bool {
-        self.requests
-            .iter()
-            .any(|compiled| compiled.covers(labels, entry.timestamp_ns, &entry.line))
+    pub fn hides(&self, entry: &LogEntry) -> bool {
+        self.requests.iter().any(|compiled| {
+            compiled.covers(&entry.structured_metadata, entry.timestamp_ns, &entry.line)
+        })
     }
 }
 
@@ -405,14 +402,14 @@ impl DeleteMasks {
     pub fn hides_row(
         &self,
         tenant: &TenantId,
-        labels: &Labels,
         timestamp_ns: i64,
         line: &str,
+        metadata: &[(String, String)],
     ) -> bool {
         self.by_tenant.get(tenant).is_some_and(|requests| {
             requests
                 .iter()
-                .any(|compiled| compiled.covers(labels, timestamp_ns, line))
+                .any(|compiled| compiled.covers(metadata, timestamp_ns, line))
         })
     }
 
