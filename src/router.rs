@@ -40,7 +40,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // The Tempo routes were removed with the read-path decision (issue #3):
         // traces are ingested and stored but unreadable until the first-party
         // trace API (M13) ships.
-        .route("/ready", get(query::ready));
+        .route("/loggytracy/api/v1/logs", get(query::logs))
+        .route(
+            "/loggytracy/api/v1/logs/histogram",
+            get(query::logs_histogram),
+        )
+        .route("/ready", get(query::ready))
+        .fallback(query::api_fallback);
     // The admin routes carry no authentication of their own: loggytracy is
     // not built to be reachable from the outside network, and assumes every
     // request arrives through a secured channel.

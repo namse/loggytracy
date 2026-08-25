@@ -272,16 +272,20 @@ pub enum QueryEndpoint {
     Patterns,
     DetectedFields,
     Volume,
+    Logs,
+    Histogram,
 }
 
 impl QueryEndpoint {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::QueryRange,
         Self::Query,
         Self::Tail,
         Self::Patterns,
         Self::DetectedFields,
         Self::Volume,
+        Self::Logs,
+        Self::Histogram,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -292,6 +296,8 @@ impl QueryEndpoint {
             Self::Patterns => "patterns",
             Self::DetectedFields => "detected_fields",
             Self::Volume => "volume",
+            Self::Logs => "logs",
+            Self::Histogram => "logs_histogram",
         }
     }
 }

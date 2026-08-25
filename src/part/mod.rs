@@ -146,6 +146,37 @@ impl ColumnSet {
         let _ = query;
         Self::all()
     }
+
+    /// The counting scan's projection: nothing is returned, so only what the
+    /// filters read has to be decoded. A parser stage bails to the full set —
+    /// an extraction is shadowed by same-named metadata, so dropping a
+    /// metadata column would change which value wins.
+    pub fn for_count_query(query: &crate::logql::LogQuery) -> Self {
+        let mut line = !query.line_filters.is_empty();
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        for matcher in &query.matchers {
+            named.insert(matcher.name.clone());
+        }
+        for stage in &query.stages {
+            match stage {
+                crate::logql::PipelineStage::Json
+                | crate::logql::PipelineStage::Logfmt
+                | crate::logql::PipelineStage::LineFormat(_)
+                | crate::logql::PipelineStage::LabelFormat(_) => {
+                    return Self::for_log_query(query);
+                }
+                crate::logql::PipelineStage::Line(_) => line = true,
+                crate::logql::PipelineStage::Field(filter) => {
+                    named.insert(filter.name.clone());
+                }
+            }
+        }
+        Self {
+            line,
+            metadata: MetadataProjection::Named(named),
+            parsed_fields: false,
+        }
+    }
 }
 
 /// The time span a metadata lookup is allowed to see.

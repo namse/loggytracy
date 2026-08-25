@@ -3816,3 +3816,455 @@ async fn label_values_are_filtered_by_the_query_selector() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(message.contains("line filter"), "{message}");
 }
+
+// --- The first-party API: parameter grammar (`params.rs`) ---
+
+#[test]
+fn attr_operator_scan_takes_the_longest_match_at_the_first_operator() {
+    let params = parse_filter_params("attr=level=error", 0, LOGS_PARAMS).unwrap();
+    let matcher = &params.query.matchers[0];
+    assert_eq!(matcher.name, "level");
+    assert_eq!(matcher.op, logql::MatcherOp::Eq);
+    assert_eq!(matcher.value, "error");
+
+    let params = parse_filter_params("attr=level!%3Ddebug", 0, LOGS_PARAMS).unwrap();
+    assert_eq!(params.query.matchers[0].op, logql::MatcherOp::Neq);
+    assert_eq!(params.query.matchers[0].value, "debug");
+
+    let params = parse_filter_params("attr=path%3D~/api/.*", 0, LOGS_PARAMS).unwrap();
+    assert_eq!(params.query.matchers[0].op, logql::MatcherOp::Re);
+
+    let params = parse_filter_params("attr=host!~db-.*", 0, LOGS_PARAMS).unwrap();
+    assert_eq!(params.query.matchers[0].op, logql::MatcherOp::NRe);
+
+    // The value keeps any later operator characters verbatim.
+    let params = parse_filter_params("attr=formula=a%3Db", 0, LOGS_PARAMS).unwrap();
+    assert_eq!(params.query.matchers[0].name, "formula");
+    assert_eq!(params.query.matchers[0].value, "a=b");
+}
+
+#[test]
+fn attr_without_an_operator_teaches_the_form() {
+    let error = parse_filter_params("attr=level", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("has no operator"), "{error}");
+    assert!(error.contains("attr=key=value"), "{error}");
+
+    let error = parse_filter_params("attr=%3Derror", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("empty key"), "{error}");
+}
+
+#[test]
+fn unknown_parameters_name_themselves_and_the_accepted_set() {
+    let error = parse_filter_params("atr=level=error", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("unknown parameter 'atr'"), "{error}");
+    assert!(error.contains("attr"), "{error}");
+    assert!(error.contains("docs/QUERY_API.md"), "{error}");
+}
+
+#[test]
+fn relative_times_need_a_unit_and_negative_epochs_stay_epochs() {
+    let now_ns = 1_700_000_000_000_000_000;
+    assert_eq!(
+        parse_time_or_relative_ns("-1h", now_ns).unwrap(),
+        now_ns - 3_600_000_000_000
+    );
+    assert_eq!(
+        parse_time_or_relative_ns("-90s", now_ns).unwrap(),
+        now_ns - 90_000_000_000
+    );
+    assert_eq!(
+        parse_time_or_relative_ns("-5", now_ns).unwrap(),
+        -5_000_000_000
+    );
+    let error = parse_time_or_relative_ns("-1hh", now_ns).unwrap_err();
+    assert!(error.contains("invalid relative time"), "{error}");
+}
+
+#[test]
+fn parse_json_recompiles_attr_filters_into_field_stages() {
+    let params =
+        parse_filter_params("parse=json&attr=status=500&attr=path%3D~/api/.*", 0, LOGS_PARAMS)
+            .unwrap();
+    assert!(params.query.matchers.is_empty());
+    assert!(matches!(
+        params.query.stages[0],
+        logql::PipelineStage::Json
+    ));
+    let logql::PipelineStage::Field(filter) = &params.query.stages[1] else {
+        panic!("attr must become a field filter after parse=");
+    };
+    assert_eq!(filter.name, "status");
+    assert_eq!(filter.op, logql::FieldOp::Eq);
+    assert!(matches!(
+        &params.query.stages[2],
+        logql::PipelineStage::Field(filter) if filter.op == logql::FieldOp::Regex
+    ));
+
+    let error = parse_filter_params("parse=json&parse=json", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("more than once"), "{error}");
+    let error = parse_filter_params("parse=regex", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("expected json or logfmt"), "{error}");
+}
+
+#[test]
+fn scalar_parameters_refuse_duplicates() {
+    let error = parse_filter_params("start=1&start=2", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("'start' was given more than once"), "{error}");
+}
+
+// --- The first-party API: `GET /loggytracy/api/v1/logs` ---
+
+async fn first_party_logs(
+    state: Arc<AppState>,
+    query_string: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let request = axum::http::Request::builder()
+        .uri(format!("/loggytracy/api/v1/logs?{query_string}"))
+        .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = crate::build_router(state).oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8(body.to_vec()).unwrap())
+}
+
+fn ndjson_rows(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn first_party_logs_answers_ndjson_with_string_timestamps() {
+    let data_dir = temp_dir();
+    let labels: Labels = [("app".to_string(), "api".to_string())]
+        .into_iter()
+        .collect();
+    let memtable = Arc::new(MemTable::new());
+    memtable.insert(
+        test_tenant(),
+        with_attributes(
+            labels,
+            vec![
+                LogEntry {
+                    timestamp_ns: 5_000_000_000,
+                    line: "hello timeout".to_string(),
+                    structured_metadata: Vec::new(),
+                },
+                LogEntry {
+                    timestamp_ns: 6_000_000_000,
+                    line: "unrelated".to_string(),
+                    structured_metadata: Vec::new(),
+                },
+            ],
+        ),
+    );
+    let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+
+    let (status, headers, body) =
+        first_party_logs(state, "start=4&end=7&attr=app=api&contains=timeout").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers[axum::http::header::CONTENT_TYPE],
+        "application/x-ndjson"
+    );
+    assert!(headers.contains_key(SCANNED_ROWS_HEADER));
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["line"], "hello timeout");
+    assert_eq!(rows[0]["timestamp"], "5000000000");
+    assert!(rows[0]["timestamp"].is_string());
+    assert_eq!(rows[0]["attributes"]["app"], "api");
+}
+
+#[tokio::test]
+async fn first_party_logs_default_direction_is_backward_and_limit_applies() {
+    let data_dir = temp_dir();
+    let memtable = Arc::new(MemTable::new());
+    memtable.insert(
+        test_tenant(),
+        (1..=5)
+            .map(|at| LogEntry {
+                timestamp_ns: at * 1_000_000_000,
+                line: format!("row {at}"),
+                structured_metadata: vec![("app".to_string(), "api".to_string())],
+            })
+            .collect(),
+    );
+    let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+
+    let (status, _, body) = first_party_logs(state.clone(), "start=0&end=10&limit=2").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["line"], "row 5");
+    assert_eq!(rows[1]["line"], "row 4");
+
+    let (_, _, body) =
+        first_party_logs(state, "start=0&end=10&limit=2&direction=forward").await;
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows[0]["line"], "row 1");
+    assert_eq!(rows[1]["line"], "row 2");
+}
+
+#[tokio::test]
+async fn first_party_logs_selects_without_any_filter() {
+    let data_dir = temp_dir();
+    let memtable = Arc::new(MemTable::new());
+    memtable.insert(
+        test_tenant(),
+        vec![LogEntry {
+            timestamp_ns: 5_000_000_000,
+            line: "bare row".to_string(),
+            structured_metadata: Vec::new(),
+        }],
+    );
+    let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+
+    let (status, _, body) = first_party_logs(state, "start=4&end=6").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ndjson_rows(&body).len(), 1);
+}
+
+#[tokio::test]
+async fn first_party_logs_parse_json_filters_on_extracted_fields() {
+    let data_dir = temp_dir();
+    let memtable = Arc::new(MemTable::new());
+    memtable.insert(
+        test_tenant(),
+        vec![
+            LogEntry {
+                timestamp_ns: 5_000_000_000,
+                line: r#"{"status":"500","path":"/api/x"}"#.to_string(),
+                structured_metadata: vec![("app".to_string(), "api".to_string())],
+            },
+            LogEntry {
+                timestamp_ns: 6_000_000_000,
+                line: r#"{"status":"200","path":"/api/y"}"#.to_string(),
+                structured_metadata: vec![("app".to_string(), "api".to_string())],
+            },
+        ],
+    );
+    let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+
+    let (status, _, body) = first_party_logs(
+        state,
+        "start=4&end=7&parse=json&attr=app=api&attr=status=500",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["line"], r#"{"status":"500","path":"/api/x"}"#);
+}
+
+#[tokio::test]
+async fn first_party_logs_refuses_unknown_parameters_with_a_teaching_error() {
+    let data_dir = temp_dir();
+    let state = test_state(
+        &data_dir,
+        Arc::new(MemTable::new()),
+        Arc::new(PartRegistry::new()),
+        None,
+    );
+
+    let (status, _, body) = first_party_logs(state, "atr=app=api").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let message = error["error"].as_str().unwrap();
+    assert!(message.contains("unknown parameter 'atr'"), "{message}");
+    assert!(message.contains("docs/QUERY_API.md"), "{message}");
+}
+
+#[tokio::test]
+async fn unmatched_routes_answer_with_the_first_party_surface() {
+    let data_dir = temp_dir();
+    let state = test_state(
+        &data_dir,
+        Arc::new(MemTable::new()),
+        Arc::new(PartRegistry::new()),
+        None,
+    );
+    let request = axum::http::Request::builder()
+        .uri("/loggytracy/api/v1/nope")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = crate::build_router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let message = error["error"].as_str().unwrap();
+    assert!(message.contains("/loggytracy/api/v1/logs"), "{message}");
+}
+
+// --- The first-party API: `GET /loggytracy/api/v1/logs/histogram` ---
+
+async fn first_party_histogram(
+    state: Arc<AppState>,
+    query_string: &str,
+) -> (StatusCode, String) {
+    let request = axum::http::Request::builder()
+        .uri(format!("/loggytracy/api/v1/logs/histogram?{query_string}"))
+        .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = crate::build_router(state).oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+/// The boundary test the plan calls the likeliest silent bug: a row exactly on
+/// a bucket boundary belongs to the bucket it starts, `[start, end)` at every
+/// bucket, including the partial first and last.
+#[tokio::test]
+async fn histogram_buckets_are_half_open_and_epoch_aligned() {
+    const BUCKET_NS: i64 = 10_000_000_000;
+    let data_dir = temp_dir();
+    let memtable = Arc::new(MemTable::new());
+    memtable.insert(
+        test_tenant(),
+        [
+            BUCKET_NS,                  // exactly on a bucket start
+            BUCKET_NS + 1,              // inside the same bucket
+            2 * BUCKET_NS - 1,          // last instant of the same bucket
+            2 * BUCKET_NS,              // exactly on the next bucket start
+        ]
+        .into_iter()
+        .map(|timestamp_ns| LogEntry {
+            timestamp_ns,
+            line: "row".to_string(),
+            structured_metadata: Vec::new(),
+        })
+        .collect(),
+    );
+    let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+
+    // The query range is not bucket-aligned; the buckets must be.
+    let (status, body) = first_party_histogram(
+        state,
+        "start=9.999999997&end=20.000000003&bucket=10s",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["bucket_start"], (0).to_string());
+    assert_eq!(rows[0]["bucket_end"], BUCKET_NS.to_string());
+    assert_eq!(rows[0]["count"], 0);
+    assert_eq!(rows[1]["bucket_start"], BUCKET_NS.to_string());
+    assert_eq!(rows[1]["count"], 3);
+    assert_eq!(rows[2]["bucket_start"], (2 * BUCKET_NS).to_string());
+    assert_eq!(rows[2]["count"], 1);
+}
+
+/// The partial first and last buckets count only rows inside the query range.
+#[tokio::test]
+async fn histogram_clips_partial_buckets_to_the_range() {
+    const BUCKET_NS: i64 = 10_000_000_000;
+    let data_dir = temp_dir();
+    let memtable = Arc::new(MemTable::new());
+    memtable.insert(
+        test_tenant(),
+        [
+            BUCKET_NS + 2, // in the first bucket, before start
+            BUCKET_NS + 5, // in range
+            BUCKET_NS + 7, // on end: excluded
+            BUCKET_NS + 8, // after end, same bucket
+        ]
+        .into_iter()
+        .map(|timestamp_ns| LogEntry {
+            timestamp_ns,
+            line: "row".to_string(),
+            structured_metadata: Vec::new(),
+        })
+        .collect(),
+    );
+    let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+
+    let (status, body) = first_party_histogram(
+        state,
+        "start=10.000000004&end=10.000000007&bucket=10s",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["count"], 1);
+}
+
+/// The histogram and the search endpoint must agree on what the filters
+/// select: `sum(count)` equals the row count `/logs` returns.
+#[tokio::test]
+async fn histogram_counts_agree_with_the_search_endpoint() {
+    let data_dir = temp_dir();
+    let memtable = Arc::new(MemTable::new());
+    memtable.insert(
+        test_tenant(),
+        (1..=20)
+            .map(|at| LogEntry {
+                timestamp_ns: at * 1_000_000_000,
+                line: if at % 2 == 0 {
+                    format!("timeout {at}")
+                } else {
+                    format!("fine {at}")
+                },
+                structured_metadata: vec![("app".to_string(), "api".to_string())],
+            })
+            .collect(),
+    );
+    let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+
+    let filters = "start=0&end=30&attr=app=api&contains=timeout";
+    let (_, _, search_body) =
+        first_party_logs(state.clone(), &format!("{filters}&limit=1000")).await;
+    let (status, histogram_body) =
+        first_party_histogram(state, &format!("{filters}&bucket=5s")).await;
+    assert_eq!(status, StatusCode::OK, "{histogram_body}");
+    let total: u64 = ndjson_rows(&histogram_body)
+        .iter()
+        .map(|bucket| bucket["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, ndjson_rows(&search_body).len() as u64);
+    assert_eq!(total, 10);
+}
+
+#[tokio::test]
+async fn histogram_refuses_a_bucket_count_over_the_cap() {
+    let data_dir = temp_dir();
+    let state = test_state(
+        &data_dir,
+        Arc::new(MemTable::new()),
+        Arc::new(PartRegistry::new()),
+        None,
+    );
+    let (status, body) =
+        first_party_histogram(state, "start=0&end=100000&bucket=1s").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let message = error["error"].as_str().unwrap();
+    assert!(message.contains("buckets"), "{message}");
+    assert!(message.contains("widen bucket="), "{message}");
+}
+
+#[tokio::test]
+async fn histogram_rejects_search_only_parameters() {
+    let data_dir = temp_dir();
+    let state = test_state(
+        &data_dir,
+        Arc::new(MemTable::new()),
+        Arc::new(PartRegistry::new()),
+        None,
+    );
+    let (status, body) = first_party_histogram(state, "start=0&end=10&limit=5").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("unknown parameter 'limit'"), "{body}");
+}
