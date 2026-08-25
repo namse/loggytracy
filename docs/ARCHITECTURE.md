@@ -207,6 +207,10 @@ A part is one immutable directory:
 
 Bloom filters are only for pruning; the final decision always comes from scanning blocks, so the scan guarantees correctness.
 
+The format is unversioned and carries no compatibility code: nothing detects or reads parts written
+before the streamless model (the `_stream`-ordinal era). No deployment ever stored data in that
+format, so a directory holding such parts is simply not this engine's data.
+
 ### What a part keeps in memory, and what it re-reads
 
 Every structure above is durable in the part directory, which is what lets the

@@ -14,7 +14,7 @@ pub fn validate_label_name(name: &str) -> Result<(), String> {
     // Stream labels are persisted as Parquet columns, so these storage column
     // names remain reserved even though LogQL pipeline fields may use them.
     match name {
-        "_msg" | "_tenant" | "_stream" | "timestamp_ns" | "structured_metadata" => Err(format!(
+        "_msg" | "_tenant" | "timestamp_ns" | "structured_metadata" => Err(format!(
             "invalid label name '{}': reserved column name",
             name
         )),
@@ -53,7 +53,6 @@ mod tests {
     fn rejects_reserved_column_names() {
         assert!(validate_label_name("_msg").is_err());
         assert!(validate_label_name("_tenant").is_err());
-        assert!(validate_label_name("_stream").is_err());
         assert!(validate_label_name("timestamp_ns").is_err());
         assert!(validate_label_name("structured_metadata").is_err());
     }

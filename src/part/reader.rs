@@ -348,21 +348,6 @@ fn open_part_data(
         .iter()
         .map(|(key, _)| key.clone())
         .collect();
-    // Before the generic comparison: a part from the stream era carries a
-    // `_stream` ordinal column, and the failure has to name its own remedy
-    // rather than read as corruption.
-    if arrow_reader_metadata
-        .schema()
-        .fields()
-        .iter()
-        .any(|field| field.name() == "_stream")
-    {
-        return Err(format!(
-            "part {} was written with the retired _stream ordinal column; this engine \
-versions nothing, so delete the data directory and re-ingest",
-            part.meta.id
-        ));
-    }
     let expected_schema = part_schema(&metadata_keys, &parsed_keys);
     if arrow_reader_metadata.schema().fields() != expected_schema.fields() {
         return Err(format!(

@@ -2465,61 +2465,6 @@ line: format!("plain text row at {ts}"),
         );
     }
 
-    /// A part written in the stream era carries a `_stream` ordinal column
-    /// and fails at open with the remedy in the message, before any arrow
-    /// downcast could panic.
-    #[test]
-    fn an_old_format_part_fails_loudly_naming_reingest() {
-        let tmp = tempfile_dir();
-        let rows = vec![window_row(1_700_000_000_000_000_000, vec![])];
-        let part = flush_rows(rows, &tmp, 8192).unwrap().remove(0);
-
-        // Rewrite data.parquet with the stream-era schema: a `_stream`
-        // ordinal column between the timestamp and the line.
-        let old_schema = Arc::new(Schema::new(vec![
-            Field::new(TENANT_COLUMN, DataType::Utf8, false),
-            Field::new("timestamp_ns", DataType::Int64, false),
-            Field::new("_stream", DataType::Int64, false),
-            Field::new("_msg", DataType::Utf8, false),
-            Field::new("structured_metadata", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            old_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec![test_tenant().as_str().to_string()])),
-                Arc::new(Int64Array::from(vec![1_700_000_000_000_000_000i64])),
-                Arc::new(Int64Array::from(vec![0i64])),
-                Arc::new(StringArray::from(vec!["old row"])),
-                Arc::new(StringArray::from(vec![None::<&str>])),
-            ],
-        )
-        .unwrap();
-        let file = fs::File::create(part.dir.join(DATA_FILE)).unwrap();
-        let mut writer = ArrowWriter::try_new(file, old_schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        // Refresh the data checksum so the `_stream` gate — not the CRC — is
-        // what fires.
-        let meta_path = part.dir.join(META_FILE);
-        let mut meta: MetaFile =
-            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-        meta.integrity.data_crc32 = file_crc32(&part.dir.join(DATA_FILE)).unwrap();
-        meta.integrity.metadata_crc32 = 0;
-        meta.integrity.metadata_crc32 = metadata_crc32(&meta).unwrap();
-        fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
-
-        let reloaded = load_part(&part.dir).unwrap();
-        let error = match PartReader::open(reloaded) {
-            Ok(_) => panic!("old schema must refuse"),
-            Err(error) => error,
-        };
-        assert!(
-            error.contains("retired _stream ordinal column"),
-            "{error}"
-        );
-    }
-
     fn cache_enabled(part: Part, budget: u64) -> PartReader {
         let mut reader = PartReader::open(part).unwrap();
         reader.group_cache = GroupCache::new(
