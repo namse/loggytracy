@@ -938,7 +938,9 @@ mod tests {
         assert_eq!(registry.part_count(), 1, "the registry still answers");
         assert!(
             registry
-                .query(&test_tenant(), &[],
+                .query(
+                    &test_tenant(),
+                    &[],
                     crate::part::QueryTimeRange::closed(0, 2_000),
                     10,
                     true
@@ -961,7 +963,9 @@ mod tests {
         registry.register(second).unwrap();
 
         let result = registry
-            .query(&test_tenant(), &[],
+            .query(
+                &test_tenant(),
+                &[],
                 crate::part::QueryTimeRange::closed(0, 1_000),
                 2,
                 true,
@@ -1004,7 +1008,9 @@ mod tests {
 
         let newest = |limit| {
             registry
-                .query(&test_tenant(), &[],
+                .query(
+                    &test_tenant(),
+                    &[],
                     crate::part::QueryTimeRange::closed(0, 1_000),
                     limit,
                     false,
@@ -1059,7 +1065,9 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(registry.part_count(), 1);
         let results = registry
-            .query(&test_tenant(), &[],
+            .query(
+                &test_tenant(),
+                &[],
                 crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                 100,
                 true,
@@ -1135,7 +1143,9 @@ mod tests {
 
         std::fs::write(data_path, b"corrupt").unwrap();
 
-        let result = registry.query(&test_tenant(), &[],
+        let result = registry.query(
+            &test_tenant(),
+            &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             100,
             true,
@@ -1154,7 +1164,9 @@ mod tests {
         registry.register(parts).unwrap();
 
         let results = registry
-            .query(&test_tenant(), &[],
+            .query(
+                &test_tenant(),
+                &[],
                 crate::part::QueryTimeRange::closed(i64::MAX, i64::MAX),
                 100,
                 true,

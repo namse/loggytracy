@@ -916,10 +916,7 @@ mod tests {
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         assert!(!policy.is_tenant_allowed(&tenant("acme")));
 
-        policy
-            .push(&tenant("acme"), "30d", None)
-            .await
-            .unwrap();
+        policy.push(&tenant("acme"), "30d", None).await.unwrap();
         assert!(policy.is_tenant_allowed(&tenant("acme")));
         assert!(!policy.is_tenant_allowed(&tenant("stranger")));
 
@@ -936,19 +933,13 @@ mod tests {
     async fn a_push_is_durable_and_survives_a_restart() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy
-            .push(&tenant("acme"), "30d", None)
-            .await
-            .unwrap();
+        policy.push(&tenant("acme"), "30d", None).await.unwrap();
         policy
             .push(&tenant("intern"), "infinite", None)
             .await
             .unwrap();
         // A downgrade taken before the restart must still be in force after it.
-        policy
-            .push(&tenant("acme"), "7d", None)
-            .await
-            .unwrap();
+        policy.push(&tenant("acme"), "7d", None).await.unwrap();
         assert_eq!(
             policy.metrics.push_accepted.load(Ordering::Relaxed),
             3,
@@ -998,10 +989,7 @@ mod tests {
         let data_dir = tempdir("tenant-policy-local");
         let dir = data_dir.join(TENANT_POLICY_PREFIX);
         let policy = TenantPolicy::for_test_with_local_store(dir.clone());
-        policy
-            .push(&tenant("acme"), "7d", None)
-            .await
-            .unwrap();
+        policy.push(&tenant("acme"), "7d", None).await.unwrap();
         assert_eq!(
             policy.snapshot().unwrap().retention(&tenant("acme")),
             Some(TenantRetention::Finite(days(7)))
@@ -1048,10 +1036,7 @@ mod tests {
         let start_ns = 1_800_000_000_000_000_000i64;
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
-        policy
-            .push(&tenant("acme"), "7d", None)
-            .await
-            .unwrap();
+        policy.push(&tenant("acme"), "7d", None).await.unwrap();
 
         let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
         let floor = || policy.query_floor_ns(&tenant("acme")).expect("finite");
@@ -1088,10 +1073,7 @@ mod tests {
         let start_ns = 1_800_000_000_000_000_000i64;
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
-        policy
-            .push(&tenant("acme"), "1d", None)
-            .await
-            .unwrap();
+        policy.push(&tenant("acme"), "1d", None).await.unwrap();
 
         clock.advance(Duration::from_secs(2 * 24 * 60 * 60));
         assert!(
@@ -1104,10 +1086,7 @@ mod tests {
 
         // The control plane upgrades the tenant. The row is still on disk, and
         // the new plan covers it again.
-        policy
-            .push(&tenant("acme"), "30d", None)
-            .await
-            .unwrap();
+        policy.push(&tenant("acme"), "30d", None).await.unwrap();
         assert!(
             !policy
                 .cutoffs_now()
@@ -1121,16 +1100,11 @@ mod tests {
     async fn a_failing_store_changes_neither_the_map_nor_the_object() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy
-            .push(&tenant("acme"), "30d", None)
-            .await
-            .unwrap();
+        policy.push(&tenant("acme"), "30d", None).await.unwrap();
 
         // A malformed value is rejected before anything is written.
         assert!(matches!(
-            policy
-                .push(&tenant("acme"), "soon", None)
-                .await,
+            policy.push(&tenant("acme"), "soon", None).await,
             Err(PolicyError::Invalid(_))
         ));
         assert_eq!(policy.metrics.push_rejected.load(Ordering::Relaxed), 1);
@@ -1146,10 +1120,7 @@ mod tests {
     async fn a_delete_returns_the_tenant_to_unknown() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy
-            .push(&tenant("acme"), "1ms", None)
-            .await
-            .unwrap();
+        policy.push(&tenant("acme"), "1ms", None).await.unwrap();
         assert!(policy.query_floor_ns(&tenant("acme")).is_some());
 
         policy.remove(&tenant("acme")).await.unwrap();
@@ -1172,10 +1143,7 @@ mod tests {
     async fn nothing_reinterprets_a_pushed_value() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage);
-        policy
-            .push(&tenant("acme"), "3650d", None)
-            .await
-            .unwrap();
+        policy.push(&tenant("acme"), "3650d", None).await.unwrap();
         policy
             .push(&tenant("intern"), "infinite", None)
             .await

@@ -32,9 +32,7 @@ impl std::fmt::Display for OtlpLogError {
 /// WAL stores the received bytes, not the message — so every body string,
 /// attribute key and value moves into its `LogEntry` instead of being cloned
 /// per row on the ingest hot path.
-pub fn normalize_request(
-    request: ExportLogsServiceRequest,
-) -> Result<Vec<LogEntry>, OtlpLogError> {
+pub fn normalize_request(request: ExportLogsServiceRequest) -> Result<Vec<LogEntry>, OtlpLogError> {
     let mut entries = Vec::new();
     for resource_logs in request.resource_logs {
         let resource_attributes = resource_logs

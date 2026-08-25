@@ -59,7 +59,11 @@ pub async fn put_retention(
     })?;
     let view = state
         .tenant_policy
-        .push(&tenant, &request.retention, request.max_stored_bytes.as_deref())
+        .push(
+            &tenant,
+            &request.retention,
+            request.max_stored_bytes.as_deref(),
+        )
         .await
         .map_err(into_http)?;
     tracing::info!(%tenant, retention = %view.retention, "tenant policy updated");

@@ -698,7 +698,8 @@ mod tests {
         let _labels: Labels = [("app".to_string(), "test".to_string())]
             .into_iter()
             .collect();
-        memtable.insert(test_tenant(), 
+        memtable.insert(
+            test_tenant(),
             vec![LogEntry {
                 timestamp_ns: 1_700_000_000_000_000_000,
                 line: "only once".to_string(),
@@ -746,7 +747,9 @@ mod tests {
         );
         assert!(pending_checkpoint.is_none());
         let results = registry
-            .query(&test_tenant(), &[],
+            .query(
+                &test_tenant(),
+                &[],
                 crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                 100,
                 true,

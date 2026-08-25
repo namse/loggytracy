@@ -127,7 +127,6 @@ async fn retention_once(
     .await
 }
 
-
 async fn retention_once_at(
     registry: &PartRegistry,
     trace_registry: &TraceRegistry,
@@ -537,7 +536,9 @@ mod tests {
         .await
         .unwrap();
 
-        let in_memory = memtable.query(&tenant("unmentioned"), &[],
+        let in_memory = memtable.query(
+            &tenant("unmentioned"),
+            &[],
             crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
             10,
             true,

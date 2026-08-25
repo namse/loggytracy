@@ -282,9 +282,12 @@ impl LogsService for LogIngestService {
             clock: &self.clock,
         };
         ingest.admit_transport().map_err(ingest_error_to_status)?;
-        let tenant =
-            crate::tenant::from_grpc_metadata(request.metadata(), &self.config, &self.tenant_policy)
-            .map_err(crate::tenant::TenantError::into_grpc)?;
+        let tenant = crate::tenant::from_grpc_metadata(
+            request.metadata(),
+            &self.config,
+            &self.tenant_policy,
+        )
+        .map_err(crate::tenant::TenantError::into_grpc)?;
         let request = request.into_inner();
         ingest
             .admit_tenant(&tenant, request.encoded_len())

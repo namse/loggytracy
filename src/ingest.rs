@@ -110,5 +110,4 @@ mod tests {
         assert!(window.validate(i64::MIN).is_ok());
         assert!(window.validate(i64::MAX).is_ok());
     }
-
 }

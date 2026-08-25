@@ -90,7 +90,10 @@ fn entries_bytes(entries: &[LogEntry]) -> u64 {
 /// them against.
 #[cfg(test)]
 fn snapshot_bytes(snapshot: &MemTableSnapshot) -> u64 {
-    snapshot.values().map(|entries| entries_bytes(entries)).sum()
+    snapshot
+        .values()
+        .map(|entries| entries_bytes(entries))
+        .sum()
 }
 
 /// Take ownership of a shared snapshot, copying only if someone else still
@@ -413,11 +416,7 @@ impl MemTable {
     ) -> Vec<Labels> {
         let mut result: BTreeSet<Labels> = BTreeSet::new();
         self.for_each_tenant_entry(tenant, window, |entry| {
-            let set: Labels = entry
-                .structured_metadata
-                .iter()
-                .cloned()
-                .collect();
+            let set: Labels = entry.structured_metadata.iter().cloned().collect();
             if matchers.iter().all(|m| m.matches(&set)) {
                 result.insert(set);
             }

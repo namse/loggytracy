@@ -114,10 +114,7 @@ async fn admit_inflight_body(
 
 fn admin_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route(
-            "/loggytracy/api/v1/admin/tenants",
-            get(admin::list_tenants),
-        )
+        .route("/loggytracy/api/v1/admin/tenants", get(admin::list_tenants))
         .route(
             "/loggytracy/api/v1/admin/tenants/{tenant}/retention",
             put(admin::put_retention)
