@@ -3236,8 +3236,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             &state,
             "POST",
             &format!(
-                "/loki/api/v1/delete?query={}&start={}&end={}",
-                urlencoding(r#"{app="drop"}"#),
+                "/loggytracy/api/v1/logs/delete?attr=app%3Ddrop&start={}&end={}",
                 (base_ns - 1_000_000_000) / 1_000_000_000,
                 (base_ns + 1_000_000_000) / 1_000_000_000
             ),
@@ -3261,8 +3260,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             &state,
             "POST",
             &format!(
-                "/loki/api/v1/delete?query={}&start={}&end={}",
-                urlencoding(r#"{app="drop"}"#),
+                "/loggytracy/api/v1/logs/delete?attr=app%3Ddrop&start={}&end={}",
                 (base_ns / 1_000_000_000) + 10,
                 (base_ns / 1_000_000_000) + 20
             ),
@@ -3285,37 +3283,37 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         send(
             &state,
             "POST",
-            &format!(
-                "/loki/api/v1/delete?query={}&{window}",
-                urlencoding(r#"{app="drop"}"#)
-            ),
+            &format!("/loggytracy/api/v1/logs/delete?attr=app%3Ddrop&{window}"),
         )
         .await;
 
-        let (status, body) = send(&state, "GET", "/loki/api/v1/delete").await;
+        let (status, body) =
+            first_party_get(state.clone(), "/loggytracy/api/v1/logs/delete").await;
         assert_eq!(status, StatusCode::OK);
-        let listed = body.as_array().unwrap();
+        let listed = ndjson_rows(&body);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["status"], "received");
-        assert_eq!(listed[0]["query"], r#"{app="drop"}"#);
+        // The listed query is the persisted canonical form — resubmittable
+        // as-is.
+        assert_eq!(listed[0]["query"], "attr=app%3Ddrop");
         let request_id = listed[0]["request_id"].as_str().unwrap().to_string();
 
         let (status, _) = send(
             &state,
             "DELETE",
-            &format!("/loki/api/v1/delete?request_id={request_id}"),
+            &format!("/loggytracy/api/v1/logs/delete?request_id={request_id}"),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(lines_for(&state, r#"{app=~".+"}"#).await.len(), 2);
 
-        let (_, body) = send(&state, "GET", "/loki/api/v1/delete").await;
-        assert!(body.as_array().unwrap().is_empty());
+        let (_, body) = first_party_get(state.clone(), "/loggytracy/api/v1/logs/delete").await;
+        assert!(ndjson_rows(&body).is_empty());
 
         let (status, _) = send(
             &state,
             "DELETE",
-            "/loki/api/v1/delete?request_id=never-existed",
+            "/loggytracy/api/v1/logs/delete?request_id=never-existed",
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -3332,32 +3330,41 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             base_ns / 1_000_000_000,
             base_ns / 1_000_000_000 + 1
         );
-        for query in [
-            r#"{app="drop"} | json | status="500""#,
-            r#"rate({app="drop"}[1m])"#,
-            r#"{}"#,
+        for query_string in [
+            // A parsed field would change meaning whenever the parser does;
+            // `parse` is simply not in this endpoint's grammar.
+            "parse=json&attr=app%3Ddrop&attr=status%3D500",
+            // Line filters alone name no attribute; at least one attr is
+            // required.
+            "contains=secret",
+            // An empty selector deletes everything, which is refused.
+            "",
         ] {
             let (status, _) = send(
                 &state,
                 "POST",
-                &format!(
-                    "/loki/api/v1/delete?query={}&{window}",
-                    urlencoding(query)
-                ),
+                &format!("/loggytracy/api/v1/logs/delete?{query_string}&{window}"),
             )
             .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query_string}");
         }
+
+        // A deletion without an explicit start is refused rather than guessed
+        // at.
+        let (status, _) = send(
+            &state,
+            "POST",
+            "/loggytracy/api/v1/logs/delete?attr=app%3Ddrop",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
 
         // A window that ends before it starts deletes an empty set, which is
         // far more likely to be a mistake than an intent.
         let (status, _) = send(
             &state,
             "POST",
-            &format!(
-                "/loki/api/v1/delete?query={}&start=1700000010&end=1700000000",
-                urlencoding(r#"{app="drop"}"#)
-            ),
+            "/loggytracy/api/v1/logs/delete?attr=app%3Ddrop&start=1700000010&end=1700000000",
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -4510,4 +4517,27 @@ async fn first_party_tail_refuses_what_a_tail_cannot_honour() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert!(body.contains("live tail connections"), "{body}");
     drop(held);
+}
+
+/// The persisted delete selector is the canonical flat form, and the shared
+/// parser reads it back to the same query — the round trip the startup load
+/// depends on.
+#[test]
+fn the_canonical_filter_form_round_trips_through_the_shared_parser() {
+    let original = parse_filter_params(
+        "attr=app=drop&attr=host!~db-.*&contains=secret%20word&not_regex=a%7Cb",
+        0,
+        DELETE_PARAMS,
+    )
+    .unwrap()
+    .query;
+    let canonical = canonical_filter_query(&original);
+    let reparsed = parse_filter_params(&canonical, 0, DELETE_FILTER_PARAMS)
+        .unwrap()
+        .query;
+    assert_eq!(canonical_filter_query(&reparsed), canonical);
+    assert_eq!(reparsed.matchers.len(), 2);
+    assert_eq!(reparsed.matchers[0].value, "drop");
+    assert_eq!(reparsed.matchers[1].op, logql::MatcherOp::NRe);
+    assert_eq!(reparsed.line_filters.len(), 2);
 }

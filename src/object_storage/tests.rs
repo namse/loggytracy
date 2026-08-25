@@ -1797,7 +1797,7 @@ opens a connection per part"
 
         let accepted = crate::delete_requests::DeleteRequests::new(Some(storage));
         let request = accepted
-            .submit(&tenant, r#"{app="drop"}"#, 0, 1_000, 500)
+            .submit(&tenant, "attr=app%3Ddrop", 0, 1_000, 500)
             .await
             .expect("a valid request");
 

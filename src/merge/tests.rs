@@ -1230,7 +1230,7 @@
 
         let requests = crate::delete_requests::DeleteRequests::new(None);
         requests
-            .submit(&tenant_id("alpha"), r#"{app="alpha"}"#, 0, 1_500, 1_500)
+            .submit(&tenant_id("alpha"), "attr=app%3Dalpha", 0, 1_500, 1_500)
             .await
             .expect("a valid request");
 
@@ -1380,7 +1380,7 @@
 
         let requests = crate::delete_requests::DeleteRequests::new(None);
         requests
-            .submit(&tenant_id("alpha"), r#"{app="alpha"}"#, 0, 2_000, 2_000)
+            .submit(&tenant_id("alpha"), "attr=app%3Dalpha", 0, 2_000, 2_000)
             .await
             .expect("a valid request");
 

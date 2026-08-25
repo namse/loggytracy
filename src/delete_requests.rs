@@ -429,28 +429,19 @@ impl DeleteMasks {
     }
 }
 
-/// A delete selector is a log selector, not a pipeline.
-///
-/// Matchers and line filters both name rows that exist; a pipeline stage names
-/// a value derived from them, and deleting "the lines whose parsed `status` was
-/// 500" would mean the deletion changes meaning whenever the parser does.
-/// Refusing is better than accepting a request that cannot be honoured
-/// consistently.
+/// A delete selector is the flat filter grammar's canonical form
+/// (`crate::query::canonical_filter_query`): attr filters and line filters
+/// name rows that exist. `parse=` is not in the grammar here — a value a
+/// parser derives would make the deletion change meaning whenever the parser
+/// does. A stored request from before the flat form fails this parse, and
+/// that failure is fatal to startup by design: the fix is to delete the
+/// stored request object and re-submit it in the flat form.
 fn parse_selector(query: &str) -> Result<logql::LogQuery, String> {
-    let parsed = match logql::parse_expr(query)? {
-        logql::QueryExpr::Logs(logs) => logs,
-        logql::QueryExpr::Metric(_) => {
-            return Err("a delete query selects log lines, not a metric".to_string());
-        }
-    };
-    if !parsed.stages.is_empty() {
+    let params = crate::query::parse_filter_params(query, 0, crate::query::DELETE_FILTER_PARAMS)?;
+    if params.query.matchers.is_empty() {
         return Err(
-            "a delete query may use label matchers and line filters, but not pipeline stages"
-                .to_string(),
+            "a delete query must name at least one attr filter, like attr=app=api".to_string(),
         );
     }
-    if parsed.matchers.is_empty() {
-        return Err("a delete query must select at least one label".to_string());
-    }
-    Ok(parsed)
+    Ok(params.query)
 }

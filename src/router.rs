@@ -30,12 +30,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/loki/api/v1/detected_labels", get(query::detected_labels))
         .route("/loki/api/v1/detected_fields", get(query::detected_fields))
         .route("/loki/api/v1/patterns", get(query::patterns))
-        .route(
-            "/loki/api/v1/delete",
-            post(query::submit_delete_request)
-                .get(query::list_delete_requests)
-                .delete(query::cancel_delete_request),
-        )
         .route("/metrics", get(query::metrics))
         // The Tempo routes were removed with the read-path decision (issue #3):
         // traces are ingested and stored but unreadable until the first-party
@@ -54,6 +48,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(query::logs_attribute_values),
         )
         .route("/loggytracy/api/v1/logs/tail", get(query::logs_tail))
+        // Moved from /loki/api/v1/delete with the selector grammar: the old
+        // route and the new one could not share one parser, and one parser is
+        // the point.
+        .route(
+            "/loggytracy/api/v1/logs/delete",
+            post(query::submit_delete_request)
+                .get(query::list_delete_requests)
+                .delete(query::cancel_delete_request),
+        )
         .route("/ready", get(query::ready))
         .fallback(query::api_fallback);
     // The admin routes carry no authentication of their own: loggytracy is

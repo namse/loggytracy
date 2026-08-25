@@ -43,6 +43,24 @@ pub(crate) const TAIL_PARAMS: &[&str] = &[
     "delay",
 ];
 
+/// What a delete request may select by: filters that name rows that exist.
+/// `parse=` is absent deliberately — deleting "the lines whose parsed status
+/// was 500" would change meaning whenever the parser does.
+pub(crate) const DELETE_PARAMS: &[&str] = &[
+    "start",
+    "end",
+    "attr",
+    "contains",
+    "not_contains",
+    "regex",
+    "not_regex",
+];
+
+/// The persisted form of a delete selector: `DELETE_PARAMS` minus the time
+/// bounds, which are stored as their own fields.
+pub(crate) const DELETE_FILTER_PARAMS: &[&str] =
+    &["attr", "contains", "not_contains", "regex", "not_regex"];
+
 pub(crate) const ATTRIBUTE_KEYS_PARAMS: &[&str] = &["start", "end"];
 
 /// Line filters are deliberately absent: this endpoint samples metadata
@@ -59,6 +77,7 @@ pub(crate) const ROUTES: &[&str] = &[
     "/loggytracy/api/v1/logs/attributes",
     "/loggytracy/api/v1/logs/attributes/{key}/values",
     "/loggytracy/api/v1/logs/tail",
+    "/loggytracy/api/v1/logs/delete",
 ];
 
 #[derive(Debug)]
@@ -276,4 +295,30 @@ fn build_log_query(
 fn anchored_regex(value: &str) -> Result<regex::Regex, String> {
     regex::Regex::new(&format!("^(?:{value})$"))
         .map_err(|error| format!("invalid regular expression '{value}': {error}"))
+}
+
+/// The canonical serialized form of a filter-only query — what a delete
+/// request persists, and exactly what `parse_filter_params` reads back: one
+/// parser total, and the stored form is the documented form.
+pub(crate) fn canonical_filter_query(query: &logql::LogQuery) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for matcher in &query.matchers {
+        let op = match matcher.op {
+            logql::MatcherOp::Eq => "=",
+            logql::MatcherOp::Neq => "!=",
+            logql::MatcherOp::Re => "=~",
+            logql::MatcherOp::NRe => "!~",
+        };
+        serializer.append_pair("attr", &format!("{}{op}{}", matcher.name, matcher.value));
+    }
+    for filter in &query.line_filters {
+        let (name, value) = match filter {
+            logql::LineFilter::Contains(value) => ("contains", value.as_str()),
+            logql::LineFilter::NotContains(value) => ("not_contains", value.as_str()),
+            logql::LineFilter::Regex(regex) => ("regex", regex.as_str()),
+            logql::LineFilter::NotRegex(regex) => ("not_regex", regex.as_str()),
+        };
+        serializer.append_pair(name, value);
+    }
+    serializer.finish()
 }
