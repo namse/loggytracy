@@ -53,6 +53,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/loggytracy/api/v1/logs/attributes/{key}/values",
             get(query::logs_attribute_values),
         )
+        .route("/loggytracy/api/v1/logs/tail", get(query::logs_tail))
         .route("/ready", get(query::ready))
         .fallback(query::api_fallback);
     // The admin routes carry no authentication of their own: loggytracy is

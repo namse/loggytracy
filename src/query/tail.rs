@@ -165,11 +165,17 @@ async fn run_tail(
         }
 
         let end_ns = state.clock.now_ns().saturating_sub(duration_to_i64_ns(delay));
-        let Some(payload) =
+        let Some(fresh) =
             tail_poll(&state, &tenant, &query, &mut cursor, end_ns, limit).await
         else {
             continue;
         };
+        let payload = serde_json::json!({
+            // `forward`: the poll asked for the oldest entries after the
+            // cursor, so a tail delivers in ascending time.
+            "streams": build_stream_data(fresh, true),
+            "dropped_entries": [],
+        });
         if socket
             .send(Message::Text(payload.to_string().into()))
             .await
@@ -178,6 +184,123 @@ async fn run_tail(
             return;
         }
     }
+}
+
+/// How long a quiet tail waits before saying it is alive. A keep-alive for
+/// proxies that reap idle streaming responses, and a liveness signal a client
+/// can time out on.
+const TAIL_HEARTBEAT: Duration = Duration::from_secs(15);
+const TAIL_HEARTBEAT_LINE: &[u8] = b"{\"heartbeat\":true}\n";
+
+/// The first-party tail: the same poll loop, streamed as chunked NDJSON.
+///
+/// Rows are ordinary `/logs` row lines in ascending time; a heartbeat line is
+/// not data. There is no socket to watch — a client that goes away drops the
+/// body stream, and the loop is simply never polled again. On drain the
+/// stream ends cleanly and the client reconnects to whatever replaces this
+/// instance.
+pub async fn logs_tail(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Result<axum::response::Response, ApiError> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
+        .map_err(ApiError::from_tenant)?;
+    let now_ns = state.clock.now_ns();
+    let params = parse_filter_params(raw.as_deref().unwrap_or(""), now_ns, TAIL_PARAMS)
+        .map_err(ApiError::bad_request)?;
+    let delay = Duration::from_secs(
+        params
+            .delay_seconds
+            .unwrap_or(0)
+            .min(MAX_TAIL_DELAY_SECONDS),
+    );
+    let limit = parse_limit(
+        params.limit.or(Some(DEFAULT_TAIL_LIMIT)),
+        state.config.max_log_limit.min(MAX_LOG_LIMIT),
+    )
+    .map_err(ApiError::bad_request)?;
+    let start_ns = params.start_ns.unwrap_or(now_ns);
+
+    let permit = Arc::clone(&state.tail_semaphore)
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "too many live tail connections; the limit is {} — retry when one closes",
+                    state.config.max_concurrent_tails
+                ),
+            )
+        })?;
+
+    let mut ticker = tokio::time::interval(state.config.tail_poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let drain = state.shutdown.subscribe();
+    let stream = futures_util::stream::unfold(
+        TailStream {
+            state,
+            tenant,
+            query: params.query,
+            cursor: TailCursor::new(start_ns.saturating_sub(1)),
+            ticker,
+            drain,
+            delay,
+            limit,
+            last_sent: std::time::Instant::now(),
+            _permit: permit,
+        },
+        |mut tail| async move {
+            loop {
+                tokio::select! {
+                    _ = tail.ticker.tick() => {}
+                    _ = crate::shutdown::wait_for_drain(&mut tail.drain) => return None,
+                }
+                let end_ns = tail
+                    .state
+                    .clock
+                    .now_ns()
+                    .saturating_sub(duration_to_i64_ns(tail.delay));
+                if let Some(fresh) = tail_poll(
+                    &tail.state,
+                    &tail.tenant,
+                    &tail.query,
+                    &mut tail.cursor,
+                    end_ns,
+                    tail.limit,
+                )
+                .await
+                {
+                    tail.last_sent = std::time::Instant::now();
+                    let chunk = log_rows_ndjson(fresh, true);
+                    return Some((Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)), tail));
+                }
+                if tail.last_sent.elapsed() >= TAIL_HEARTBEAT {
+                    tail.last_sent = std::time::Instant::now();
+                    return Some((Ok(bytes::Bytes::from_static(TAIL_HEARTBEAT_LINE)), tail));
+                }
+            }
+        },
+    );
+    let mut response = axum::response::Response::new(axum::body::Body::from_stream(stream));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(NDJSON_CONTENT_TYPE),
+    );
+    Ok(response)
+}
+
+struct TailStream {
+    state: Arc<AppState>,
+    tenant: TenantId,
+    query: logql::LogQuery,
+    cursor: TailCursor,
+    ticker: tokio::time::Interval,
+    drain: tokio::sync::watch::Receiver<bool>,
+    delay: Duration,
+    limit: usize,
+    last_sent: std::time::Instant,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// One poll: everything the tail sends, decided without a socket in sight.
@@ -194,7 +317,7 @@ async fn tail_poll(
     cursor: &mut TailCursor,
     end_ns: i64,
     limit: usize,
-) -> Option<serde_json::Value> {
+) -> Option<Vec<StreamResult>> {
     if end_ns < cursor.since_ns {
         return None;
     }
@@ -253,16 +376,11 @@ async fn tail_poll(
         return None;
     }
 
-    // `dropped_entries` is always empty, and that is a claim rather than a
-    // stub. Each poll asks for the *oldest* entries after the cursor, and the
-    // cursor advances only over what was sent, so a burst larger than `limit`
-    // is left for the next poll rather than skipped. A tail that cannot keep
-    // up falls behind — visibly, in the timestamps it delivers — instead of
+    // Nothing is ever dropped, and that is a claim rather than a stub. Each
+    // poll asks for the *oldest* entries after the cursor, and the cursor
+    // advances only over what was sent, so a burst larger than `limit` is
+    // left for the next poll rather than skipped. A tail that cannot keep up
+    // falls behind — visibly, in the timestamps it delivers — instead of
     // losing lines, which is the failure an operator can actually act on.
-    Some(serde_json::json!({
-        // `forward`: the scan above asked for the oldest entries after the
-        // cursor, so a tail delivers in ascending time.
-        "streams": build_stream_data(fresh, true),
-        "dropped_entries": [],
-    }))
+    Some(fresh)
 }

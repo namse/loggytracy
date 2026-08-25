@@ -2458,7 +2458,6 @@
             .await
             .expect("the oldest two arrive first");
         assert_eq!(tail_lines(&first), vec!["line-0", "line-1"]);
-        assert_eq!(first["dropped_entries"].as_array().unwrap().len(), 0);
 
         let second = tail_poll(&state, &test_tenant(), &query, &mut cursor, end_ns, 2)
             .await
@@ -2471,14 +2470,18 @@
         assert_eq!(tail_lines(&third), vec!["line-4"]);
     }
 
-    fn tail_lines(payload: &serde_json::Value) -> Vec<String> {
-        payload["streams"]
-            .as_array()
-            .unwrap()
+    fn tail_lines(fresh: &[StreamResult]) -> Vec<String> {
+        let mut rows: Vec<(i64, String)> = fresh
             .iter()
-            .flat_map(|stream| stream["values"].as_array().unwrap().iter())
-            .map(|value| value[1].as_str().unwrap().to_string())
-            .collect()
+            .flat_map(|stream| {
+                stream
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.timestamp_ns, entry.line.clone()))
+            })
+            .collect();
+        rows.sort_by_key(|(timestamp_ns, _)| *timestamp_ns);
+        rows.into_iter().map(|(_, line)| line).collect()
     }
 
     /// Perform a real WebSocket handshake against a real listener and return
@@ -4398,4 +4401,113 @@ async fn attribute_values_refuse_line_filters_by_the_unknown_parameter_rule() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("unknown parameter 'contains'"), "{body}");
+}
+
+// --- The first-party API: `GET /loggytracy/api/v1/logs/tail` ---
+
+#[tokio::test]
+async fn first_party_tail_streams_the_backlog_as_ndjson_rows() {
+    use futures_util::StreamExt;
+
+    let data_dir = temp_dir();
+    let memtable = Arc::new(MemTable::new());
+    let now_ns = 1_700_000_000_000_000_000;
+    memtable.insert(
+        test_tenant(),
+        vec![
+            LogEntry {
+                timestamp_ns: now_ns,
+                line: "tailed line".to_string(),
+                structured_metadata: vec![("app".to_string(), "api".to_string())],
+            },
+            LogEntry {
+                timestamp_ns: now_ns + 1,
+                line: "second line".to_string(),
+                structured_metadata: vec![("app".to_string(), "api".to_string())],
+            },
+        ],
+    );
+    let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+
+    let request = axum::http::Request::builder()
+        .uri(format!(
+            "/loggytracy/api/v1/logs/tail?start={now_ns}&attr=app=api"
+        ))
+        .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = crate::build_router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_TYPE],
+        "application/x-ndjson"
+    );
+    let mut body = response.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("the first poll is immediate")
+        .expect("the stream is open")
+        .expect("the chunk is data");
+    let text = String::from_utf8(chunk.to_vec()).unwrap();
+    let rows = ndjson_rows(&text);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["line"], "tailed line");
+    assert_eq!(rows[0]["attributes"]["app"], "api");
+    assert_eq!(rows[1]["line"], "second line");
+}
+
+#[tokio::test]
+async fn first_party_tail_ends_cleanly_on_drain() {
+    let data_dir = temp_dir();
+    let state = test_state(
+        &data_dir,
+        Arc::new(MemTable::new()),
+        Arc::new(PartRegistry::new()),
+        None,
+    );
+    state.shutdown.begin_drain();
+
+    let request = axum::http::Request::builder()
+        .uri("/loggytracy/api/v1/logs/tail")
+        .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = crate::build_router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 1024 * 1024),
+    )
+    .await
+    .expect("a draining tail closes its stream")
+    .unwrap();
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn first_party_tail_refuses_what_a_tail_cannot_honour() {
+    let data_dir = temp_dir();
+    let state = test_state(
+        &data_dir,
+        Arc::new(MemTable::new()),
+        Arc::new(PartRegistry::new()),
+        None,
+    );
+
+    let (status, body) =
+        first_party_get(state.clone(), "/loggytracy/api/v1/logs/tail?direction=forward").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("unknown parameter 'direction'"), "{body}");
+
+    let held: Vec<_> = (0..state.config.max_concurrent_tails)
+        .map(|_| {
+            Arc::clone(&state.tail_semaphore)
+                .try_acquire_owned()
+                .expect("the limit is not reached yet")
+        })
+        .collect();
+    let (status, body) = first_party_get(state, "/loggytracy/api/v1/logs/tail").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(body.contains("live tail connections"), "{body}");
+    drop(held);
 }

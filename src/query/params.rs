@@ -30,6 +30,19 @@ pub(crate) const HISTOGRAM_PARAMS: &[&str] = &[
     "bucket",
 ];
 
+/// No `end` and no `direction`: a tail follows now, forward, by definition.
+pub(crate) const TAIL_PARAMS: &[&str] = &[
+    "start",
+    "attr",
+    "contains",
+    "not_contains",
+    "regex",
+    "not_regex",
+    "parse",
+    "limit",
+    "delay",
+];
+
 pub(crate) const ATTRIBUTE_KEYS_PARAMS: &[&str] = &["start", "end"];
 
 /// Line filters are deliberately absent: this endpoint samples metadata
@@ -45,6 +58,7 @@ pub(crate) const ROUTES: &[&str] = &[
     "/loggytracy/api/v1/logs/histogram",
     "/loggytracy/api/v1/logs/attributes",
     "/loggytracy/api/v1/logs/attributes/{key}/values",
+    "/loggytracy/api/v1/logs/tail",
 ];
 
 #[derive(Debug)]
@@ -55,6 +69,7 @@ pub(crate) struct FilterParams {
     pub limit: Option<usize>,
     pub forward: bool,
     pub bucket_ns: Option<i64>,
+    pub delay_seconds: Option<u64>,
 }
 
 pub(crate) fn parse_filter_params(
@@ -67,6 +82,7 @@ pub(crate) fn parse_filter_params(
     let mut limit = None;
     let mut direction: Option<String> = None;
     let mut bucket_ns = None;
+    let mut delay_seconds = None;
     let mut attrs: Vec<(String, logql::MatcherOp, String)> = Vec::new();
     let mut line_filters: Vec<logql::LineFilter> = Vec::new();
     let mut parse_stages: Vec<logql::PipelineStage> = Vec::new();
@@ -101,6 +117,13 @@ pub(crate) fn parse_filter_params(
                 }
                 set_once("bucket", &mut bucket_ns, parsed)?
             }
+            "delay" => set_once(
+                "delay",
+                &mut delay_seconds,
+                value.parse::<u64>().map_err(|_| {
+                    format!("invalid delay '{value}': expected whole seconds, like delay=2")
+                })?,
+            )?,
             "attr" => attrs.push(split_attr(&value)?),
             "contains" => line_filters.push(logql::LineFilter::Contains(value)),
             "not_contains" => line_filters.push(logql::LineFilter::NotContains(value)),
@@ -139,6 +162,7 @@ pub(crate) fn parse_filter_params(
         limit,
         forward,
         bucket_ns,
+        delay_seconds,
     })
 }
 
