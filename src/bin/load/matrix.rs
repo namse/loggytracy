@@ -500,7 +500,64 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                     Shape::Rate => format!("sum(rate({selector}[{}s]))", cfg.verify.step_seconds),
                 };
                 let path = match cfg.target {
-                    Target::Loggytracy | Target::Loki => {
+                    // The first-party API: the same six questions as flat
+                    // filters. `attr` compiles to the same matcher/field-filter
+                    // semantics the LogQL forms had, and the histogram's
+                    // `[start, end)` buckets are the tumbling buckets the
+                    // LogsQL translation already pinned the rate shape to.
+                    Target::Loggytracy => {
+                        let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+                        match shape {
+                            Shape::LabelOnly => {
+                                encoded.append_pair("attr", &format!("service_name={app}"));
+                            }
+                            Shape::LineFilter => {
+                                encoded.append_pair("attr", &format!("service_name={app}"));
+                                encoded.append_pair("contains", PHRASES[variant % PHRASES.len()]);
+                            }
+                            Shape::JsonField => {
+                                encoded.append_pair("parse", "json");
+                                encoded.append_pair("attr", &format!("service_name={app}"));
+                                if variant.is_multiple_of(2) {
+                                    encoded.append_pair(
+                                        "attr",
+                                        &format!("status={}", STATUSES[variant % STATUSES.len()]),
+                                    );
+                                } else {
+                                    encoded.append_pair(
+                                        "attr",
+                                        &format!("level={}", LEVELS[variant % LEVELS.len()]),
+                                    );
+                                }
+                            }
+                            Shape::JsonFieldRare => {
+                                encoded.append_pair("parse", "json");
+                                encoded.append_pair("attr", "service_name=~.+");
+                                encoded.append_pair("attr", &format!("trace_id={}", rare.trace_id));
+                            }
+                            Shape::MetadataRare | Shape::TraceWindow => {
+                                encoded.append_pair("attr", "service_name=~.+");
+                                encoded.append_pair("attr", &format!("trace_id={}", rare.trace_id));
+                            }
+                            Shape::Rate => {
+                                encoded.append_pair("attr", &format!("service_name={app}"));
+                                encoded.append_pair(
+                                    "bucket",
+                                    &format!("{}s", cfg.verify.step_seconds),
+                                );
+                            }
+                        }
+                        encoded.append_pair("start", &ns_to_sample_seconds(start_ns));
+                        encoded.append_pair("end", &ns_to_sample_seconds(end_ns));
+                        if shape == Shape::Rate {
+                            format!("/loggytracy/api/v1/logs/histogram?{}", encoded.finish())
+                        } else {
+                            encoded.append_pair("limit", &cfg.verify.limit.to_string());
+                            encoded.append_pair("direction", "backward");
+                            format!("/loggytracy/api/v1/logs?{}", encoded.finish())
+                        }
+                    }
+                    Target::Loki => {
                         // A rate evaluation at `t` covers `(t - step, t]`, so
                         // the point at `t = start` reaches before the window —
                         // rows no `_time` bucket of the same window holds. The
@@ -1075,9 +1132,121 @@ fn values_of(entry: &Value) -> Result<Vec<Value>, String> {
 /// against a strict digest from elsewhere.
 pub fn digest_for(target: Target, body: &[u8], query: &Query) -> Result<Answer, String> {
     match target {
-        Target::Loggytracy | Target::Loki => digest_response(body, &query.basis_fields),
+        Target::Loggytracy => digest_first_party_response(body, &query.basis_fields),
+        Target::Loki => digest_response(body, &query.basis_fields),
         Target::VictoriaLogs => digest_logsql_response(body, &query.basis_fields, query.step_ns),
     }
+}
+
+/// loggytracy's first-party answer: NDJSON — log rows
+/// (`timestamp`/`line`/`attributes`) from `/logs`, or dense buckets
+/// (`bucket_start`/`bucket_end`/`count`) from `/logs/histogram`.
+///
+/// Like the LogsQL reader, the strict digest is set equal to the reduced one:
+/// the full-response digest lost its cross-target meaning when the response
+/// schema stopped being Loki's, and the reduced basis is the comparison that
+/// makes the timing tables citable. A histogram bucket becomes the sample the
+/// other systems label the same instant with: the count divided by the bucket
+/// width in seconds (the rate), timestamped at the bucket's end.
+pub fn digest_first_party_response(body: &[u8], basis: &[String]) -> Result<Answer, String> {
+    let text =
+        std::str::from_utf8(body).map_err(|error| format!("response is not UTF-8: {error}"))?;
+    let mut state = DigestState {
+        ordered: true,
+        ..DigestState::default()
+    };
+    let mut label_keys: BTreeSet<String> = BTreeSet::new();
+    let mut series_seen: BTreeSet<String> = BTreeSet::new();
+    let mut is_metric = false;
+    let mut previous: Option<i64> = None;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(line)
+            .map_err(|error| format!("response line is not JSON: {error}"))?;
+        let object = row
+            .as_object()
+            .ok_or_else(|| "a response line is not a JSON object".to_string())?;
+        if object.contains_key("bucket_start") {
+            is_metric = true;
+            let bucket_end: i64 = object
+                .get("bucket_end")
+                .and_then(Value::as_str)
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(|| "a bucket has no nanosecond bucket_end string".to_string())?;
+            let bucket_start: i64 = object
+                .get("bucket_start")
+                .and_then(Value::as_str)
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(|| "a bucket has no nanosecond bucket_start string".to_string())?;
+            let count = object
+                .get("count")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "a bucket has no integer count".to_string())?;
+            let width_seconds = (bucket_end - bucket_start) as f64 / 1_000_000_000.0;
+            let rate = Value::from(count as f64 / width_seconds);
+            let identity = basis_projection(&BTreeMap::new(), basis);
+            if series_seen.insert(identity.clone()) {
+                state.reduced.push(format!("series\u{1}{identity}"));
+            }
+            state.reduced.push(format!(
+                "{identity}\u{1}{}\u{1}{}",
+                ns_to_sample_seconds(bucket_end),
+                canonical_sample(&rate),
+            ));
+            state.rows += 1;
+            continue;
+        }
+        let timestamp: i64 = object
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| "a log row has no nanosecond timestamp string".to_string())?;
+        // `direction=backward`, so time must not increase across the answer.
+        if previous.is_some_and(|previous| timestamp > previous) {
+            state.ordered = false;
+        }
+        previous = Some(timestamp);
+        let mut fields: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(attributes) = object.get("attributes").and_then(Value::as_object) {
+            for (name, value) in attributes {
+                let text = match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                let text = if UNMATCHABLE_VALUE_LABELS.contains(&name.as_str()) {
+                    UNMATCHABLE_VALUE.to_string()
+                } else {
+                    text
+                };
+                label_keys.insert(name.clone());
+                fields.insert(name.clone(), text);
+            }
+        }
+        state.reduced.push(format!(
+            "{timestamp}\u{1}{}",
+            basis_projection(&fields, basis)
+        ));
+        state.rows += 1;
+    }
+    let reduced = reduced_digest(&mut state);
+    Ok(Answer {
+        kind: if is_metric { "matrix" } else { "streams" }.to_string(),
+        rows: state.rows,
+        series: if is_metric {
+            series_seen.len() as u64
+        } else {
+            state.rows
+        },
+        digest: reduced.clone(),
+        label_keys: label_keys.into_iter().collect(),
+        dropped_label_keys: Vec::new(),
+        ordered: state.ordered,
+        lines_processed: None,
+        reduced_digest: reduced,
+        sample: state.reduced.iter().take(3).cloned().collect(),
+    })
 }
 
 pub fn digest_logsql_response(
@@ -1886,6 +2055,68 @@ different one"
             repeats: 2,
             limit: 100,
             step_seconds: 10,
+        }
+    }
+
+    /// The check that keeps the port honest: the same log rows, answered in
+    /// Loki's response schema and in the first-party NDJSON, reduce to the
+    /// same digest — the cross-schema basis the timing tables cite.
+    #[test]
+    fn the_first_party_log_shape_reduces_to_the_same_digest_as_lokis() {
+        let loki = br#"{"status":"success","data":{"resultType":"streams","result":[{"stream":{"service_name":"api","level":"error","trace_id":"abc"},"values":[["1700000000000000002","boom"],["1700000000000000001","earlier"]]}]}}"#;
+        let ndjson = br#"{"timestamp":"1700000000000000002","line":"boom","attributes":{"service_name":"api","level":"error","trace_id":"abc"}}
+{"timestamp":"1700000000000000001","line":"earlier","attributes":{"service_name":"api","level":"error","trace_id":"abc"}}"#;
+        let basis = vec!["service_name".to_string(), "level".to_string()];
+        let from_loki = digest_response(loki, &basis).unwrap();
+        let first_party = digest_first_party_response(ndjson, &basis).unwrap();
+        assert_eq!(from_loki.reduced_digest, first_party.reduced_digest);
+        assert_eq!(first_party.rows, 2);
+        assert!(first_party.ordered, "backward order holds");
+    }
+
+    /// A histogram bucket is the matrix sample the other systems label the
+    /// same instant with: count over width, timestamped at the bucket's end.
+    #[test]
+    fn a_histogram_bucket_reduces_to_the_matrix_sample_it_answers() {
+        let loki = br#"{"status":"success","data":{"resultType":"matrix","result":[{"metric":{},"values":[[1700000010,"0.5"],[1700000020,"0"]]}]}}"#;
+        let ndjson =
+            br#"{"bucket_start":"1700000000000000000","bucket_end":"1700000010000000000","count":5}
+{"bucket_start":"1700000010000000000","bucket_end":"1700000020000000000","count":0}"#;
+        let basis: Vec<String> = Vec::new();
+        let from_loki = digest_response(loki, &basis).unwrap();
+        let first_party = digest_first_party_response(ndjson, &basis).unwrap();
+        assert_eq!(from_loki.reduced_digest, first_party.reduced_digest);
+        assert_eq!(first_party.kind, "matrix");
+        assert_eq!(first_party.series, 1);
+    }
+
+    /// Every first-party matrix path is a flat query the shared parameter
+    /// grammar accepts — no LogQL text survives in a loggytracy URL.
+    #[test]
+    fn first_party_matrix_paths_are_flat_queries() {
+        let mut cfg = crate::config::Config::from_env().expect("the env defaults build a config");
+        cfg.target = Target::Loggytracy;
+        cfg.verify = verify_for_test();
+        let corpus = verify_corpus(&cfg);
+        let queries = build_queries(&cfg, &corpus);
+        assert!(!queries.is_empty());
+        for query in &queries {
+            if query.shape == Shape::Rate {
+                assert!(
+                    query.path.starts_with("/loggytracy/api/v1/logs/histogram?"),
+                    "{}",
+                    query.path
+                );
+                assert!(query.path.contains("bucket=10s"), "{}", query.path);
+            } else {
+                assert!(
+                    query.path.starts_with("/loggytracy/api/v1/logs?"),
+                    "{}",
+                    query.path
+                );
+                assert!(query.path.contains("direction=backward"), "{}", query.path);
+            }
+            assert!(!query.path.contains("query="), "{}", query.path);
         }
     }
 }

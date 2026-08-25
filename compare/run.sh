@@ -181,7 +181,9 @@ diff -U0 \
   <(sed 's/[[:space:]]*$//' "$OUT/loki_config.yaml") \
   >"$OUT/loki_config.diff" || true
 curl -s "http://127.0.0.1:$LOKI_PORT/loki/api/v1/status/buildinfo" -o "$OUT/loki_buildinfo.json"
-curl -s "http://127.0.0.1:$LOGGYTRACY_PORT/loki/api/v1/status/buildinfo" -o "$OUT/loggytracy_buildinfo.json"
+# loggytracy has no buildinfo endpoint since the first-party API replaced the
+# Loki surface; the image digest recorded below is its build identity.
+curl -s "http://127.0.0.1:$LOGGYTRACY_PORT/ready" -o "$OUT/loggytracy_ready.txt"
 curl -s "http://127.0.0.1:$VICTORIALOGS_PORT/flags" -o "$OUT/victorialogs_flags.txt"
 # loggytracy's side of the same disclosure: the container's environment is its
 # whole configuration surface, and it logs the derived numbers at startup.

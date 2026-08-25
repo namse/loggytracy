@@ -287,7 +287,48 @@ impl QueryGenerator {
             _ => self.limit,
         };
         let (expression, path) = match self.target {
-            crate::config::Target::Loggytracy | crate::config::Target::Loki => {
+            // The first-party API's flat form of the same five questions.
+            crate::config::Target::Loggytracy => {
+                let mut query = url::form_urlencoded::Serializer::new(String::new());
+                match shape {
+                    QueryShape::LabelOnly | QueryShape::RestoreProbe => {
+                        query.append_pair("attr", &format!("service_name={app}"));
+                    }
+                    QueryShape::LineFilter => {
+                        query.append_pair("attr", &format!("service_name={app}"));
+                        query.append_pair("contains", phrase);
+                    }
+                    QueryShape::JsonField => {
+                        let (field, value) = &json_field;
+                        query.append_pair("parse", "json");
+                        query.append_pair("attr", &format!("service_name={app}"));
+                        query.append_pair("attr", &format!("{field}={value}"));
+                    }
+                    QueryShape::Rate => {
+                        query.append_pair("attr", &format!("service_name={app}"));
+                        query.append_pair("bucket", "1m");
+                    }
+                    QueryShape::Heavy => {
+                        query.append_pair("attr", "service_name=~.+");
+                        query.append_pair("contains", phrase);
+                    }
+                }
+                query.append_pair("start", &start.to_string());
+                query.append_pair("end", &end.to_string());
+                let path = if shape == QueryShape::Rate {
+                    format!("/loggytracy/api/v1/logs/histogram?{}", query.finish())
+                } else {
+                    query.append_pair("limit", &limit.to_string());
+                    query.append_pair("direction", direction);
+                    format!("/loggytracy/api/v1/logs?{}", query.finish())
+                };
+                let expression = path
+                    .split_once('?')
+                    .map(|(_, expression)| expression.to_string())
+                    .unwrap_or_default();
+                (expression, path)
+            }
+            crate::config::Target::Loki => {
                 // The OTLP encoder sends `app` as `service.name`, so the
                 // promoted stream label both systems answer under is
                 // `service_name`.
@@ -543,7 +584,11 @@ mod tests {
         for _ in 0..400 {
             let plan = generator.next_plan(1_772_000_000);
             seen.insert(plan.shape.name());
-            assert!(plan.path.starts_with("/loki/api/v1/query_range?query="));
+            if plan.shape == QueryShape::Rate {
+                assert!(plan.path.starts_with("/loggytracy/api/v1/logs/histogram?"));
+            } else {
+                assert!(plan.path.starts_with("/loggytracy/api/v1/logs?"));
+            }
             assert!(
                 corpus
                     .tenant_ids
@@ -553,14 +598,14 @@ mod tests {
             if plan.shape == QueryShape::Heavy {
                 // The heavy shape deliberately selects every stream and asks
                 // for its own, larger limit.
-                assert!(plan.expression.starts_with("{service_name=~\".+\"}"));
+                assert!(plan.expression.starts_with("attr=service_name%3D%7E.%2B"));
                 assert!(plan.path.contains("limit=20000"));
                 continue;
             }
             let app = plan
                 .expression
-                .split_once("service_name=\"")
-                .and_then(|(_, rest)| rest.split_once('"'))
+                .split_once("attr=service_name%3D")
+                .and_then(|(_, rest)| rest.split_once('&'))
                 .map(|(value, _)| value.to_string())
                 .expect("every shape selects on service_name");
             assert!(
