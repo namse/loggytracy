@@ -4541,3 +4541,38 @@ fn the_canonical_filter_form_round_trips_through_the_shared_parser() {
     assert_eq!(reparsed.matchers[1].op, logql::MatcherOp::NRe);
     assert_eq!(reparsed.line_filters.len(), 2);
 }
+
+/// An API reference that silently falls behind the code is worse than none —
+/// especially here, where an agent's only knowledge of the surface may be
+/// this document. Adding a route or parameter without documenting it breaks
+/// this test rather than shipping quietly.
+#[test]
+fn every_query_api_route_and_param_is_documented() {
+    let reference = include_str!("../../docs/QUERY_API.md");
+    let mut missing: Vec<String> = Vec::new();
+    for route in ROUTES {
+        if !reference.contains(route) {
+            missing.push((*route).to_string());
+        }
+    }
+    for params in [
+        LOGS_PARAMS,
+        HISTOGRAM_PARAMS,
+        TAIL_PARAMS,
+        ATTRIBUTE_KEYS_PARAMS,
+        ATTRIBUTE_VALUES_PARAMS,
+        DELETE_PARAMS,
+        DELETE_FILTER_PARAMS,
+    ] {
+        for name in params {
+            let documented = format!("`{name}`");
+            if !reference.contains(&documented) && !missing.contains(&documented) {
+                missing.push(documented);
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "undocumented in docs/QUERY_API.md: {missing:?}"
+    );
+}

@@ -207,11 +207,15 @@ assumption true lives in front of it.
   not onboarded gets 403 — a second line behind the gateway, for the day
   something reaches the port that should not have, and it never needs a restart
   to change.
+- **Pass `/loggytracy/api/v1/logs/tail` through unbuffered.** It is a
+  chunked streaming response ([`QUERY_API.md`](QUERY_API.md)); a proxy that
+  buffers response bodies turns a live tail into silence, and an idle timeout
+  shorter than its ~15 s heartbeat interval reaps healthy connections.
 
 Verify it, rather than assuming it, once the gateway is up:
 
 ```
-curl -H 'X-Scope-OrgID: someone-elses-tenant' https://your-gateway/loki/api/v1/push -d '{}'
+curl -H 'X-Scope-OrgID: someone-elses-tenant' https://your-gateway/loggytracy/api/v1/logs?start=-1m
 ```
 
 The engine should see your own tenant, not that one.
