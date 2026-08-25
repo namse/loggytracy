@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use loggytracy::bloom::BloomFilter;
-use loggytracy::logql;
 use loggytracy::memtable::LogEntry;
 
 use corpus::{CorpusSpec, Shape};
@@ -182,12 +181,15 @@ fn bench_parse_pass(c: &mut Criterion) {
         .warm_up_time(WARM_UP)
         .measurement_time(Duration::from_secs(2));
     for (name, shape, query) in [
-        ("json", Shape::Json, "{app=\"api-gateway\"} | json"),
-        ("logfmt", Shape::Logfmt, "{app=\"api-gateway\"} | logfmt"),
+        ("json", Shape::Json, "parse=json&attr=app=api-gateway"),
+        ("logfmt", Shape::Logfmt, "parse=logfmt&attr=app=api-gateway"),
     ] {
         let corpus = corpus::generate(&CorpusSpec::default().rows(5_000).streams(8).only(shape));
         let pairs = corpus.labelled_entries();
-        let parsed = logql::parse(query).expect("bench query parses");
+        let parsed =
+            loggytracy::query::parse_filter_params(query, 0, loggytracy::query::LOGS_PARAMS)
+                .expect("bench query parses")
+                .query;
         group.throughput(Throughput::Elements(pairs.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(name), &pairs, |b, pairs| {
             b.iter(|| {

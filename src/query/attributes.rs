@@ -1,3 +1,81 @@
+/// Rows the sampled metadata answers read at most. The value index went with
+/// the stream concept, so values come from the newest rows in the window
+/// rather than from a catalog.
+pub(crate) const METADATA_SAMPLE_ROWS: usize = 1000;
+
+/// What every metadata endpoint has to acquire before it touches a registry.
+///
+/// These four used to have none of it: no concurrency bound, no deadline, and
+/// no time range, so each call read every part of every tenant it was allowed
+/// to see. They share the log scan semaphore rather than getting their own,
+/// because they compete for the same thing a log query does — the part readers.
+struct MetadataGuard {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _occupancy: crate::metrics::ScanOccupancy,
+    window: crate::part::MetadataWindow,
+    deadline: std::time::Instant,
+}
+
+impl MetadataGuard {
+    async fn acquire_window(
+        state: &Arc<AppState>,
+        tenant: &crate::tenant::TenantId,
+        window: crate::part::MetadataWindow,
+    ) -> Result<Option<Self>, (StatusCode, String)> {
+        let window = window.clamped_to(state.tenant_policy.query_floor_ns(tenant));
+        // An empty window is a valid question with an empty answer, not an
+        // error: a tenant whose retention already passed the requested range
+        // asks this on every dashboard refresh.
+        if window.is_empty() {
+            return Ok(None);
+        }
+        let permit = match state.query_scan_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "query semaphore closed".to_string(),
+                ));
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                let queued_at = std::time::Instant::now();
+                let permit = state
+                    .query_scan_semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "query semaphore closed".to_string(),
+                        )
+                    })?;
+                state.metrics.record_scan_queue_wait(queued_at.elapsed());
+                permit
+            }
+        };
+        Ok(Some(Self {
+            _permit: permit,
+            _occupancy: crate::metrics::ScanOccupancy::enter(state.metrics.clone()),
+            window,
+            deadline: std::time::Instant::now() + state.config.max_query_runtime,
+        }))
+    }
+
+    /// Checked between units of work rather than enforced by a timer: these
+    /// lookups are synchronous walks, so the only place a deadline can act is
+    /// where the walk yields control back.
+    fn check_deadline(&self) -> Result<(), (StatusCode, String)> {
+        if std::time::Instant::now() > self.deadline {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "metadata query exceeded its time budget".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The first-party autocomplete endpoints (`docs/QUERY_API.md`): attribute
 /// keys in a window, and a key's values, both bounded — keys come from the
 /// memtable and the part metadata census, values from the newest

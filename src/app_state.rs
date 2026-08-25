@@ -21,8 +21,6 @@ pub struct AppState {
     /// The shared byte budget every query materialization reserves from —
     /// the aggregate bound the slot×cap product never actually was.
     pub query_memory_pool: Arc<crate::query_memory::QueryMemoryPool>,
-    pub metric_evaluation_semaphore: Arc<tokio::sync::Semaphore>,
-    pub trace_scan_semaphore: Arc<tokio::sync::Semaphore>,
     /// Bounds live tail connections. Held for the life of a socket, unlike the
     /// scan semaphores, which a tail borrows per poll.
     pub tail_semaphore: Arc<tokio::sync::Semaphore>,
@@ -120,12 +118,6 @@ impl AppState {
             )),
             query_memory_pool: Arc::new(crate::query_memory::QueryMemoryPool::new(
                 config.query_memory_budget_bytes,
-            )),
-            metric_evaluation_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                config.max_concurrent_metric_evaluations,
-            )),
-            trace_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                config.max_concurrent_trace_scans,
             )),
             tail_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_tails)),
             config,

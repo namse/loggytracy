@@ -2782,6 +2782,12 @@ Read path:
 
 ## P1 — LogQL improvements
 
+**Historical record.** LogQL was removed with the read-path decision (issue
+#3): the text parser, the metric evaluator and the format stages are gone, and
+the first-party flat filters (`docs/QUERY_API.md`) are the query surface. The
+engine capabilities this list built — parser stages, field filters, the
+counting fast path, exact-field pruning — survive under the new grammar.
+
 - [x] Support `line_format`, `label_format` — a deliberate subset of Go templates
       (literal text and `{{.field}}`), refusing what it cannot render rather than approximating
 - [x] Support `unwrap` (bare field and `duration(field)`) plus `sum_over_time`,
@@ -2973,10 +2979,17 @@ Read path:
 
 ## P2 — Loki API surface
 
-- [ ] **`query_range`'s `end` is inclusive and Loki's is exclusive**, and **`| json` does not promote extracted
-      fields into a log response's stream labels**. Both are tracked in "Open correctness defects" at the top of
-      this file, which is the copy to keep current — these are wrong answers and do not belong on an API-surface
-      wishlist
+**The surface this section tracked was removed** with the read-path decision
+(issue #3, `docs/M12_IMPLEMENTATION_PLAN.md`): the first-party API replaced
+every `/loki/api/v1/*` route, and the Tempo routes went with it. The whole
+class of Loki-compatibility work — matching another system's parameter
+semantics, response quirks and boundary conventions — died with the surface.
+The items below stay as the record of what was done while the surface lived.
+
+- [x] ~~**`query_range`'s `end` is inclusive and Loki's is exclusive**, and **`| json` does not promote extracted
+      fields into a log response's stream labels**.~~ Both were fixed while the surface lived (see "Open
+      correctness defects"); the boundary contract (`[start, end)`) and the field-merge semantics survive in
+      the first-party `/logs` endpoint and its tests
 
 - [x] `patterns` — a read-time miner over a bounded sample of the window, reporting the lines it
       looked at. No index is added to the write path

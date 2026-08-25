@@ -16,7 +16,6 @@ pub const PARSER_ERROR_DETAILS_FIELD: &str = "__error_details__";
 
 include!("field_filters.rs");
 include!("ast.rs");
-include!("parser.rs");
 include!("pipeline.rs");
 
 #[cfg(test)]

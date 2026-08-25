@@ -266,36 +266,20 @@ pub const LATENCY_BUCKET_BOUNDS_MS: [f64; 12] = [
 /// cannot be told from a slow `query_range` without this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryEndpoint {
-    QueryRange,
     Query,
     Tail,
-    Patterns,
-    DetectedFields,
-    Volume,
     Logs,
     Histogram,
 }
 
 impl QueryEndpoint {
-    pub const ALL: [Self; 8] = [
-        Self::QueryRange,
-        Self::Query,
-        Self::Tail,
-        Self::Patterns,
-        Self::DetectedFields,
-        Self::Volume,
-        Self::Logs,
-        Self::Histogram,
-    ];
+    pub const ALL: [Self; 4] = [Self::Query, Self::Tail, Self::Logs, Self::Histogram];
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::QueryRange => "query_range",
+            // The internal unified-query path (restore probes and the like).
             Self::Query => "query",
             Self::Tail => "tail",
-            Self::Patterns => "patterns",
-            Self::DetectedFields => "detected_fields",
-            Self::Volume => "volume",
             Self::Logs => "logs",
             Self::Histogram => "logs_histogram",
         }

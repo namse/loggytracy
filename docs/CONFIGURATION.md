@@ -243,41 +243,22 @@ Small catalog files such as `meta.json` are not evicted; the data body and the b
 | `LOGGYTRACY_SIDECAR_CACHE_MAX_BYTES` | unbounded (`off`; budget-derived) | Byte cap on the resident blooms of part sidecars, evicted LRU across parts. The blooms are durable in `index.bin`, so an evicted part's next pruning query pays one re-read. Unbounded, residency is ~2 MiB per live part and grows with ingest rate × retention window — the term that killed the first 24-hour soak (`todo.md`) |
 | `LOGGYTRACY_MAX_LOG_LIMIT` | 100,000 | Maximum `limit` parameter |
 | `LOGGYTRACY_MAX_QUERY_RUNTIME` | `30s` | Also the timeout for metadata endpoints |
-| `LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS` | 8 | Shared with metadata endpoints |
-| `LOGGYTRACY_MAX_SERIES_MATCHERS` | 32 | Number of `match[]` entries for `series`. Each matcher is a full pass |
-| `LOGGYTRACY_MAX_CONCURRENT_TAILS` | 8 | Live tail (`/loki/api/v1/tail`) connections held at once. Over the limit the upgrade is refused with 429 rather than accepted and dropped |
+| `LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS` | 8 | Shared with the attribute (autocomplete) endpoints |
+| `LOGGYTRACY_MAX_HISTOGRAM_BUCKETS` | 10,000 | Most buckets one `/logs/histogram` answer may hold; over it the request is refused with the count and the fix |
+| `LOGGYTRACY_MAX_CONCURRENT_TAILS` | 8 | Live tail (`/loggytracy/api/v1/logs/tail`) streams held at once. Over the limit the request is refused with 429 rather than accepted and dropped |
 | `LOGGYTRACY_TAIL_POLL_INTERVAL` | `1s` | How often a live tail asks for new lines. This is both its latency floor and its cost per connection |
 | `LOGGYTRACY_MAX_RESTORE_RUNTIME` | `25s` | Cache-miss restore timeout |
 
-### Metric queries
-
-| Variable | Default |
-|---|---|
-| `LOGGYTRACY_MAX_METRIC_EVALUATION_POINTS` | 10,000 |
-| `LOGGYTRACY_MAX_METRIC_SERIES` | 100,000 |
-| `LOGGYTRACY_MAX_METRIC_SAMPLES` | (see `config.rs`) |
-| `LOGGYTRACY_MAX_CONCURRENT_METRIC_EVALUATIONS` | 4 |
-
-`LOGGYTRACY_MAX_METRIC_ROWS` **was removed and is now ignored.** It capped an
-intermediate rather than an answer: the scan handed the evaluator every matching
-line and the evaluator reduced them to `(timestamp, value)` per series one step
-later, discarding the text. So a `rate()` over a busy stream was refused for
-materializing something the client would never receive. The rows are now folded
-into per-series samples as they are scanned, and what a metric query costs is
-bounded by `LOGGYTRACY_MAX_QUERY_SCAN_BYTES` for the read, `MAX_QUERY_RUNTIME`
-for the wall clock, and `MAX_METRIC_SERIES` / `MAX_METRIC_SAMPLES` for the
-answer — all of which bound something real. An instance that still sets the
-variable starts normally and ignores it.
-
-### Trace queries
-
-| Variable | Default |
-|---|---|
-| `LOGGYTRACY_MAX_TRACE_SPANS` | 100,000 |
-| `LOGGYTRACY_MAX_TRACE_SEARCH_LIMIT` | 1,000 |
-| `LOGGYTRACY_MAX_CONCURRENT_TRACE_SCANS` | 8 |
-| `LOGGYTRACY_MAX_TRACE_QUERY_RUNTIME` | `30s` |
-| `LOGGYTRACY_MAX_TRACE_RESTORE_RUNTIME` | `25s` |
+The LogQL metric evaluator and the Tempo trace surface left with the
+read-path decision (issue #3), and their knobs left with them:
+`LOGGYTRACY_MAX_METRIC_EVALUATION_POINTS` (renamed
+`LOGGYTRACY_MAX_HISTOGRAM_BUCKETS` — the histogram grid is its one remaining
+meaning), `MAX_METRIC_SERIES`, `MAX_METRIC_SAMPLES`, `MAX_SERIES_MATCHERS`,
+`MAX_CONCURRENT_METRIC_EVALUATIONS`, `MAX_TRACE_SPANS`,
+`MAX_TRACE_SEARCH_LIMIT`, `MAX_CONCURRENT_TRACE_SCANS`,
+`MAX_TRACE_QUERY_RUNTIME`, and `MAX_TRACE_RESTORE_RUNTIME`. An instance that
+still sets one starts normally and ignores it; the trace knobs return with the
+first-party trace API (M13) in whatever form its read shapes need.
 
 ## Startup and shutdown
 
@@ -426,9 +407,8 @@ products:
 | **Peak materialized** | **1.5 GiB** |
 
 The process logs this number once at startup (`peak_materialized_bytes`), because
-there is nowhere else to learn it. Trace scans still sit outside it
-(`MAX_TRACE_SPANS` is a count, not bytes), and so do the memtable and the flush
-chunk — the startup log names what is excluded.
+there is nowhere else to learn it. The memtable and the flush chunk sit outside
+it — the startup log names what is excluded.
 
 An instance sized from its idle footprint is still sized **far** too small: peak
 RSS is reached within about a minute of load starting and returns to idle when
@@ -449,9 +429,8 @@ read path is not where this engine's memory goes.
 
 Not in the number, and why:
 
-- **Trace scans.** `MAX_TRACE_SPANS` is a count, not a byte budget, so there is
-  no honest term to add. `MAX_CONCURRENT_TRACE_SCANS` × the span size of the
-  workload is the missing product.
+- **Trace reads.** Removed with the Tempo surface (issue #3); when the
+  first-party trace API (M13) lands, its scan budget joins this table.
 - **The memtable.** Bounded by backpressure rather than by a constant: ingest is
   refused before it grows without limit. Note that `MAX_MEMTABLE_BYTES` is
   enforced against an accounting that undercounts what a line actually occupies,

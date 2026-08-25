@@ -180,12 +180,14 @@ The read-path decision (issue #3) and the implementation plan are recorded in
 [`docs/M12_IMPLEMENTATION_PLAN.md`](M12_IMPLEMENTATION_PLAN.md). The
 acceptance checklist lives there; this file tracks execution state.
 
-- [ ] Phase 2 — Tempo surface removed.
-- [ ] Phases 3–8 — first-party log API (`params`, `/logs`, histogram,
+- [x] Phase 2 — Tempo surface removed.
+- [x] Phases 3–8 — first-party log API (`params`, `/logs`, histogram,
   attributes, tail, delete move).
-- [ ] Phase 9 — `docs/QUERY_API.md` + pinning test.
-- [ ] Phase 10 — comparison bed ported.
-- [ ] Phases 11–12 — Loki surface removed, docs swept.
+- [x] Phase 9 — `docs/QUERY_API.md` + pinning test.
+- [x] Phase 10 — comparison bed ported (a live `compare/run.sh` smoke run is
+  deferred to the next real bed rerun).
+- [x] Phases 11–12 — Loki surface removed (LogQL parser, metric evaluator,
+  format stages, dead knobs — the trace query knobs included), docs swept.
 
 ## Completion protocol
 

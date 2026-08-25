@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use loggytracy::log_scan::LogScan;
-use loggytracy::logql::{self, LogQuery};
+use loggytracy::logql::LogQuery;
 use loggytracy::memtable::MemTable;
 use loggytracy::part::{QueryTimeRange, flush_rows};
 use loggytracy::part_registry::PartRegistry;
@@ -142,7 +142,13 @@ fn bed(rows: usize, row_group_size: usize) -> Bed {
 
 /// The bed's own `line_filter` phrase, which the corpus plants in every shape.
 fn query_of(bed: &Bed) -> LogQuery {
-    logql::parse(&format!("{{app=\"{}\"}} |= \"timeout\"", bed.app)).expect("bench query parses")
+    loggytracy::query::parse_filter_params(
+        &format!("attr=app={}&contains=timeout", bed.app),
+        0,
+        loggytracy::query::LOGS_PARAMS,
+    )
+    .expect("bench query parses")
+    .query
 }
 
 fn run(bed: &Bed, query: &LogQuery) -> loggytracy::log_scan::LogScanResult {

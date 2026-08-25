@@ -25,7 +25,7 @@ elsewhere in these docs.
 | Local disk | Cache (LRU eviction) |
 | Memory | **One declared budget** (`LOGGYTRACY_MEMORY_BUDGET`) divided into ingest/flush/merge/query/sidecar arenas, each with its own accounting and its own refusal. Not a set of independent limits whose product is discovered afterwards — see [`VISION.md`](VISION.md) invariant I |
 | Format versioning | **None.** Nothing on disk or on the wire is versioned and no build reads another's data — see [`VISION.md`](VISION.md), "What is deliberately not built". Changing a format means changing it; a stale data directory is deleted |
-| Execution engine | **Hand-written.** DataFusion is rejected: its memory is not accountable at arena granularity, and the LogQL surface is small enough that a planner for it is smaller than the integration |
+| Execution engine | **Hand-written.** DataFusion is rejected: its memory is not accountable at arena granularity, and the flat filter surface is small enough that a planner for it is smaller than the integration |
 | Durability | Journal (append-only) + group commit + ack after fsync. Alloy WAL is assumed as a safety net |
 | Replication | No replicas. For unexpected server or disk loss, the accepted loss window (RPO) is determined by the flush interval (`flush_max_bytes`/`flush_max_interval`, whichever comes first: 1 MiB/5 s by default), and this is intentionally accepted |
 
@@ -47,10 +47,10 @@ elsewhere in these docs.
 
 | Physical format | Parquet (dictionary + zstd) + sidecar index files |
 | Indexes | Stream index + per-block trigram bloom filter (no inverted index) |
-| Query language | LogQL — high-usage subset only, with clear errors for unsupported syntax |
-| API | Loki HTTP API compatible (direct Grafana Loki data source) for logs. The Tempo API was removed with the read-path decision (issue #3, M12): traces are ingested and stored but unreadable until the first-party trace API (M13) |
+| Query language | None — a query is a flat AND of URL filters; refusals teach the accepted set |
+| API | First-party flat-filter query API ([`QUERY_API.md`](QUERY_API.md)); the Loki and Tempo compatibility surfaces were removed with the read-path decision (issue #3, M12). Traces are ingested and stored but unreadable until the first-party trace API (M13) |
 | Ingest protocols | **OTLP only**, over gRPC (`:4317`) or HTTP (`POST /v1/logs`, `/v1/traces`), traces and logs. Loki push is removed — see [`VISION.md`](VISION.md), "Ingest is OTLP" |
-| Query protocol | **Loki HTTP API, unchanged.** The ingest decision above does not touch it: Grafana's Loki data source is how anyone reads this engine, and a query protocol and an ingest protocol are separate choices |
+| Query protocol | **First-party HTTP API** (GET + URL filters, NDJSON out). The viewer is the fn0 control plane behind the gateway; agents drive the same endpoints with `curl` |
 | Transport security | **TLS is unsupported.** Only plain HTTP/gRPC is provided; a reverse proxy or service mesh handles end-to-end encryption |
 | Multi-tenancy | Multi-tenant. `X-Scope-OrgID` identifies tenants, and tenants are the unit of quota and retention |
 | Validation environment | **Do not test against S3** (neither real cloud nor local MinIO). Trust the `object_store` crate and test our code closely up to the crate boundary |
@@ -163,7 +163,7 @@ Logs and spans are unified as wide events consisting of "timestamp + field set"
 (following the OTel data model). Every attribute — resource and record alike —
 lives in the row's own structured metadata under a normalized key
 (`service.name` → `service_name`); nothing is promoted to a label, and no
-label-set grouping exists anywhere in storage. LogQL's `{k="v"}` selector is a
+label-set grouping exists anywhere in storage. An `attr=k=v` filter is a
 filter over those attributes, accelerated by per-row-group exact-field blooms
 and the `_sm:` columns rather than by a stream index. High-cardinality
 attributes (`user_id`, `trace_id`) are ordinary attributes — the cardinality
@@ -241,11 +241,11 @@ younger than the rest of this document:
 
 ## Read path
 
-LogQL parsing (chumsky) → plan → pruning in this order:
+Flat-filter parsing (`query/params.rs`) → plan → pruning in this order:
 
 1. Time range → partition/part selection (manifest + part metadata)
-2. Selector equalities and structured-field filters → row-group and window pruning with exact-field blooms
-3. Line filters (`|=`, `|~`) → row-group pruning with trigram blooms
+2. `attr` equalities and structured-field filters → row-group and window pruning with exact-field blooms
+3. Line filters (`contains`, `regex`) → row-group pruning with trigram blooms
 4. Scan only remaining row groups (MemTable + local parts; a part evicted from the local cache is
    restored whole from object storage first — range reads were measured and decided against, `todo.md`)
 
@@ -262,9 +262,9 @@ LogQL parsing (chumsky) → plan → pruning in this order:
   passes the request's own `limit` into the scan alongside a scan-row budget, a scanned-byte ceiling and a
   memory reservation (`query/execution.rs`, `LogScan::new(..., limit, ...)`) — the `usize::MAX` this
   document used to name as invariant III's worst violation is gone from it. One `usize::MAX` remains and is
-  a different thing: a metric query has no `limit` to stop at, since every matching row in the window
-  contributes to a sample, so that path is bounded by `max_query_scan_rows`, `max_query_scan_bytes` and
-  `max_metric_rows` instead of by a row count the client chose.
+  a different thing: a histogram has no `limit` to stop at, since every matching row in the window
+  contributes to a bucket, so the counting scan is bounded by `max_query_scan_rows`,
+  `max_query_scan_bytes` and `max_histogram_buckets` instead of by a row count the client chose.
 
 ## S3 and manifest
 
@@ -311,19 +311,18 @@ Policies are **not** on the ingest or query hot path. Writes do not look them up
 the range of a tenant without a policy unchanged (fail open).
 
 
-## LogQL support (subset)
+## Query API
 
-Supported (highest usage):
-
-- Label matchers: `{app="x", env=~"prod|stage"}`
-- Line filters: `|=`, `!=`, `|~`, `!~`
-- Parsers: `| json`, `| logfmt`
-- Label filters: comparison operators such as `| field="x"` and `| duration > 100ms`
-- `| line_format`, `| label_format` (later)
-- Metric queries: `rate`, `count_over_time`, `bytes_over_time`, `sum/avg/max/min by (...)`, `topk`
-- `unwrap` + `quantile_over_time` (later)
-
-Unsupported syntax is rejected during parsing with a clear error message.
+The read surface is first-party ([`QUERY_API.md`](QUERY_API.md) is the
+authoritative reference, pinned by a test): GET + flat URL filters in
+(`attr=level=error`, `contains=timeout`, `parse=json`, `start=-1h`), NDJSON
+out, under `/loggytracy/api/v1/`. Endpoints: `/logs` (search),
+`/logs/histogram` (bucketed counts over the counting sink),
+`/logs/attributes[/{key}/values]` (bounded autocomplete), `/logs/tail`
+(chunked NDJSON streaming), `/logs/delete` (deletion requests, persisting the
+same flat form). LogQL and the Loki/Tempo compatibility surfaces were removed
+with the read-path decision (issue #3); an unknown parameter or route is
+refused with a message that teaches the accepted set.
 
 ## Milestones
 
@@ -353,4 +352,4 @@ Unsupported syntax is rejected during parsing with a clear error message.
 
 ## Main crates
 
-`tokio`, `axum`, `tonic`/`prost` (OTLP), `arrow`/`parquet`, `datafusion` (under consideration), `object_store`, `chumsky` (LogQL), `roaring`, `opentelemetry-proto`
+`tokio`, `axum`, `tonic`/`prost` (OTLP), `arrow`/`parquet`, `object_store`, `roaring`, `opentelemetry-proto`

@@ -5,7 +5,7 @@
 /// refusal here must teach — name the offending input, list what the endpoint
 /// accepts, show a correct form — which is the contract that makes the API
 /// usable by an agent that only sees the error text.
-pub(crate) const LOGS_PARAMS: &[&str] = &[
+pub const LOGS_PARAMS: &[&str] = &[
     "start",
     "end",
     "attr",
@@ -81,7 +81,7 @@ pub(crate) const ROUTES: &[&str] = &[
 ];
 
 #[derive(Debug)]
-pub(crate) struct FilterParams {
+pub struct FilterParams {
     pub start_ns: Option<i64>,
     pub end_ns: Option<i64>,
     pub query: logql::LogQuery,
@@ -91,7 +91,7 @@ pub(crate) struct FilterParams {
     pub delay_seconds: Option<u64>,
 }
 
-pub(crate) fn parse_filter_params(
+pub fn parse_filter_params(
     raw: &str,
     now_ns: i64,
     allowed: &'static [&'static str],
@@ -321,4 +321,18 @@ pub(crate) fn canonical_filter_query(query: &logql::LogQuery) -> String {
         serializer.append_pair(name, value);
     }
     serializer.finish()
+}
+
+/// `effective_start = max(requested_start, now - retention(tenant))`.
+fn clamp_to_retention(start_ns: i64, retention_floor_ns: Option<i64>) -> i64 {
+    match retention_floor_ns {
+        Some(floor_ns) => start_ns.max(floor_ns),
+        None => start_ns,
+    }
+}
+
+fn duration_to_i64_ns(duration: std::time::Duration) -> i64 {
+    duration
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
 }

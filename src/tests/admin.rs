@@ -396,7 +396,7 @@
     async fn read_labels_as(state: &Arc<AppState>, tenant: &str) -> StatusCode {
         let request = axum::http::Request::builder()
             .method("GET")
-            .uri("/loki/api/v1/labels")
+            .uri("/loggytracy/api/v1/logs/attributes")
             .header(crate::tenant::TENANT_HEADER, tenant)
             .body(axum::body::Body::empty())
             .unwrap();

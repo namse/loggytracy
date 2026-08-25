@@ -159,10 +159,7 @@ impl ColumnSet {
         }
         for stage in &query.stages {
             match stage {
-                crate::logql::PipelineStage::Json
-                | crate::logql::PipelineStage::Logfmt
-                | crate::logql::PipelineStage::LineFormat(_)
-                | crate::logql::PipelineStage::LabelFormat(_) => {
+                crate::logql::PipelineStage::Json | crate::logql::PipelineStage::Logfmt => {
                     return Self::for_log_query(query);
                 }
                 crate::logql::PipelineStage::Line(_) => line = true,

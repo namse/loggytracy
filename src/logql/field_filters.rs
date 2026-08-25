@@ -50,10 +50,9 @@ pub struct Decimal {
 }
 
 const MAX_DECIMAL_SCALE: i64 = 1_024;
-const MAX_METRIC_AST_DEPTH: usize = 64;
 
 impl Decimal {
-    fn parse(input: &str) -> Result<Self, ()> {
+    pub(crate) fn parse(input: &str) -> Result<Self, ()> {
         let input = input.trim();
         if input.is_empty() {
             return Err(());

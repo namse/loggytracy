@@ -1,13 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::AppState;
 use crate::logql::{self};
@@ -15,9 +15,7 @@ use crate::memtable::{Labels, LogEntry, SharedLabels, StreamResult};
 use crate::part;
 use crate::tenant::TenantId;
 
-const MAX_METRIC_EVALUATION_POINTS: usize = 10_000;
-const MAX_METRIC_SERIES: usize = 100_000;
-const MAX_METRIC_SAMPLES: usize = 5_000_000;
+const MAX_HISTOGRAM_BUCKETS: usize = 10_000;
 const MAX_LOG_LIMIT: usize = 100_000;
 const MAX_LOG_SCAN_ROWS: usize = 5_000_000;
 
@@ -51,48 +49,6 @@ fn metric_error_status(error: &str) -> StatusCode {
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     }
-}
-
-#[derive(Serialize)]
-pub struct LokiResponse<T: Serialize> {
-    pub status: &'static str,
-    pub data: T,
-}
-
-#[derive(Serialize)]
-pub struct QueryRangeData {
-    #[serde(rename = "resultType")]
-    pub result_type: &'static str,
-    pub result: ResultPayload,
-    pub stats: Stats,
-}
-
-/// The log path's result serializes straight from the structs; routing it
-/// through a `serde_json::Value` tree first cost a second full pass over
-/// megabytes of response — `label_only` returns thousands of rows and the
-/// tree was ~40% of its latency. Metric results are small; they keep the
-/// `Value` convenience.
-#[derive(Serialize)]
-#[serde(untagged)]
-pub enum ResultPayload {
-    Streams(Vec<StreamData>),
-    Value(serde_json::Value),
-}
-
-impl ResultPayload {
-    /// The tree form, for tests that inspect rather than serialize; the
-    /// response path never goes through this.
-    #[cfg(test)]
-    pub fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("result payloads serialize")
-    }
-}
-
-#[derive(Serialize)]
-pub struct StreamData {
-    pub stream: StreamKey,
-    /// `(timestamp, line)`, serialized as the wire's two-string array.
-    pub values: Vec<(String, String)>,
 }
 
 /// A stream's label set on the wire, never materialized as one map.
@@ -175,20 +131,6 @@ impl StreamKey {
         })
     }
 
-    fn union_hash(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for (name, value) in self.merged() {
-            name.hash(&mut hasher);
-            value.hash(&mut hasher);
-        }
-        hasher.finish()
-    }
-
-    fn union_eq(&self, other: &StreamKey) -> bool {
-        self.merged().eq(other.merged())
-    }
-
     #[cfg(test)]
     pub fn get(&self, name: &str) -> Option<&str> {
         self.merged()
@@ -197,7 +139,7 @@ impl StreamKey {
     }
 
     #[cfg(test)]
-    pub fn to_map(&self) -> BTreeMap<String, String> {
+    pub fn to_map(&self) -> std::collections::BTreeMap<String, String> {
         self.merged()
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect()
@@ -213,48 +155,6 @@ impl Serialize for StreamKey {
         }
         map.end()
     }
-}
-
-#[derive(Serialize)]
-pub struct Stats {
-    pub summary: StatsSummary,
-}
-
-#[derive(Serialize)]
-pub struct StatsSummary {
-    #[serde(rename = "totalLinesProcessed")]
-    pub total_lines_processed: u64,
-}
-
-#[derive(serde::Deserialize)]
-pub struct QueryRangeParams {
-    query: String,
-    start: Option<String>,
-    end: Option<String>,
-    limit: Option<usize>,
-    direction: Option<String>,
-    step: Option<String>,
-}
-
-/// The `start`/`end` every Grafana metadata call sends and these endpoints
-/// used to ignore.
-#[derive(Default, serde::Deserialize)]
-pub struct MetadataParams {
-    pub start: Option<String>,
-    pub end: Option<String>,
-    /// Loki's stream-selector filter on `label/{name}/values`. Absent on the
-    /// other metadata endpoints, which is why it is optional here rather than
-    /// a second parameter type: `labels` and `index_stats` deserialize the
-    /// same struct and simply never carry it.
-    pub query: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct QueryParams {
-    query: String,
-    time: Option<String>,
-    limit: Option<usize>,
-    direction: Option<String>,
 }
 
 pub(crate) fn parse_time_ns(s: &str) -> Result<i64, String> {
@@ -299,145 +199,6 @@ pub(crate) fn parse_time_ns(s: &str) -> Result<i64, String> {
     }
 }
 
-/// A log response's rows, grouped the way Loki groups them.
-///
-/// Everything a row carries — its stream labels, the structured metadata the
-/// push sent, and whatever the pipeline extracted — goes into the stream's
-/// label set, and each `values` tuple is `[timestamp, line]`. This is measured
-/// against `grafana/loki:3.3.2` rather than inferred: for a stream pushed with
-/// `trace_id` metadata, `{app="probe"}` answers with `trace_id` among the
-/// `stream` labels and a two-element tuple, and `{app="probe"} | json` adds the
-/// extracted fields to the same set. The three-element tuple is Loki's
-/// *opt-in* shape, requested with `X-Loki-Response-Encoding-Flags:
-/// categorize-labels`, and there it is an object of categories
-/// (`{"structuredMetadata": {...}, "parsed": {...}}`) rather than a flat map.
-/// loggytracy returned the flat map unconditionally, so pushed metadata and
-/// extracted fields both landed in a slot Loki's default response does not use
-/// (`todo.md`, "Open correctness defects").
-///
-/// One output stream per distinct label set, which is why the grouping is
-/// global rather than per input stream: two input streams whose labels a
-/// `label_format` collapsed onto each other are one stream to Loki. The
-/// direction has to be passed in because merging two inputs into one group
-/// interleaves their rows, and the response order is part of the contract.
-fn build_stream_data(results: Vec<StreamResult>, forward: bool) -> Vec<StreamData> {
-    // Streams come out in first-occurrence order — the scan's order — rather
-    // than sorted by label set as they once were. Nothing reads the stream
-    // order: the comparison bed's digest is order-independent and its
-    // ordering check is per stream, over the values. What *is* still the
-    // contract is the grouping (one output stream per distinct union — two
-    // input streams a `label_format` collapsed are one stream to Loki) and
-    // each stream's values in query direction, timestamp-sorted, stable.
-    let mut streams: Vec<(StreamKey, Vec<(i64, String)>)> = Vec::new();
-    let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
-    for result in results {
-        for entry in result.entries {
-            let key = StreamKey::new(result.labels.clone(), entry.structured_metadata);
-            let candidates = index.entry(key.union_hash()).or_default();
-            match candidates
-                .iter()
-                .copied()
-                .find(|&at| streams[at].0.union_eq(&key))
-            {
-                Some(at) => streams[at].1.push((entry.timestamp_ns, entry.line)),
-                None => {
-                    candidates.push(streams.len());
-                    streams.push((key, vec![(entry.timestamp_ns, entry.line)]));
-                }
-            }
-        }
-    }
-    streams
-        .into_iter()
-        .map(|(stream, mut rows)| {
-            // Stable, so rows sharing a timestamp keep the order the scan
-            // produced them in rather than being reshuffled by the grouping.
-            if forward {
-                rows.sort_by_key(|(timestamp_ns, _)| *timestamp_ns);
-            } else {
-                rows.sort_by_key(|(timestamp_ns, _)| std::cmp::Reverse(*timestamp_ns));
-            }
-            StreamData {
-                stream,
-                values: rows
-                    .into_iter()
-                    .map(|(timestamp_ns, line)| (timestamp_ns.to_string(), line))
-                    .collect(),
-            }
-        })
-        .collect()
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct MetricSeries {
-    labels: SharedLabels,
-    samples: Vec<(i64, f64)>,
-}
-
-fn metric_series_json(series: Vec<MetricSeries>, instant: bool) -> serde_json::Value {
-    serde_json::Value::Array(
-        series
-            .into_iter()
-            .map(|series| {
-                let metric: serde_json::Map<String, serde_json::Value> = series
-                    .labels
-                    .iter()
-                    .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
-                    .collect();
-                let mut object = serde_json::Map::new();
-                object.insert("metric".to_string(), serde_json::Value::Object(metric));
-                if instant {
-                    let (timestamp_ns, value) = series.samples.into_iter().next().unwrap();
-                    object.insert("value".to_string(), metric_sample_json(timestamp_ns, value));
-                } else {
-                    object.insert(
-                        "values".to_string(),
-                        serde_json::Value::Array(
-                            series
-                                .samples
-                                .into_iter()
-                                .map(|(timestamp_ns, value)| {
-                                    metric_sample_json(timestamp_ns, value)
-                                })
-                                .collect(),
-                        ),
-                    );
-                }
-                serde_json::Value::Object(object)
-            })
-            .collect(),
-    )
-}
-
-fn metric_sample_json(timestamp_ns: i64, value: f64) -> serde_json::Value {
-    serde_json::Value::Array(vec![
-        timestamp_seconds_json(timestamp_ns),
-        serde_json::Value::String(format_metric_value(value)),
-    ])
-}
-
-fn timestamp_seconds_json(timestamp_ns: i64) -> serde_json::Value {
-    let magnitude = i128::from(timestamp_ns).unsigned_abs();
-    let seconds = magnitude / 1_000_000_000;
-    let nanos = magnitude % 1_000_000_000;
-    let sign = if timestamp_ns < 0 { "-" } else { "" };
-    let text = if nanos == 0 {
-        format!("{sign}{seconds}")
-    } else {
-        let fraction = format!("{nanos:09}").trim_end_matches('0').to_string();
-        format!("{sign}{seconds}.{fraction}")
-    };
-    serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
-}
-
-fn format_metric_value(value: f64) -> String {
-    if value == 0.0 {
-        "0".to_string()
-    } else {
-        value.to_string()
-    }
-}
-
 fn parse_direction(direction: &Option<String>) -> Result<bool, String> {
     match direction.as_deref() {
         None => Ok(false),
@@ -478,24 +239,6 @@ pub(crate) fn validate_query_range(
     Ok(())
 }
 
-pub(crate) fn validate_metric_lookback(
-    config: &crate::config::Config,
-    expr: &logql::MetricExpr,
-) -> Result<(), String> {
-    if expr.lookback_ns() <= 0 {
-        return Err("metric lookback must be greater than zero".to_string());
-    }
-    if let Some(max_range) = config.max_query_range
-        && (expr.lookback_ns() as u128) > max_range.as_nanos()
-    {
-        return Err(format!(
-            "metric lookback exceeds the maximum of {} seconds",
-            max_range.as_secs()
-        ));
-    }
-    Ok(())
-}
-
 fn estimated_query_memory_bytes(results: &[StreamResult]) -> u64 {
     results
         .iter()
@@ -526,10 +269,7 @@ include!("params.rs");
 include!("logs.rs");
 include!("attributes.rs");
 include!("restore.rs");
-include!("metrics.rs");
-include!("handlers.rs");
-include!("loki_extra.rs");
-include!("patterns.rs");
+include!("prometheus.rs");
 include!("delete_api.rs");
 include!("tail.rs");
 

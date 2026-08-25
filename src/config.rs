@@ -205,21 +205,11 @@ pub struct Config {
     /// that killed the first 24-hour soak at t≈1834 s (todo.md).
     pub sidecar_cache_max_bytes: Option<u64>,
     pub max_log_limit: usize,
-    pub max_metric_evaluation_points: usize,
-    pub max_metric_series: usize,
-    pub max_metric_samples: usize,
-    /// How many `match[]` selectors one `series` request may carry. Each one
-    /// is a separate full pass, so this bounds a multiplier the client picks.
-    pub max_series_matchers: usize,
+    /// Most buckets one `/logs/histogram` answer may hold.
+    pub max_histogram_buckets: usize,
     pub max_concurrent_query_scans: usize,
-    pub max_concurrent_metric_evaluations: usize,
     pub max_query_runtime: Duration,
     pub max_restore_runtime: Duration,
-    pub max_trace_spans: usize,
-    pub max_trace_search_limit: usize,
-    pub max_concurrent_trace_scans: usize,
-    pub max_trace_query_runtime: Duration,
-    pub max_trace_restore_runtime: Duration,
     /// How long the shutdown force-flush retries silently before it starts
     /// warning on stdout and enabling operator-initiated abort.
     pub shutdown_flush_warn_after: Duration,
@@ -306,19 +296,10 @@ impl Default for Config {
             row_group_cache_max_bytes: Some(256 * 1024 * 1024),
             sidecar_cache_max_bytes: None,
             max_log_limit: 100_000,
-            max_metric_evaluation_points: 10_000,
-            max_metric_series: 100_000,
-            max_metric_samples: 5_000_000,
-            max_series_matchers: 32,
+            max_histogram_buckets: 10_000,
             max_concurrent_query_scans: 8,
-            max_concurrent_metric_evaluations: 4,
             max_query_runtime: Duration::from_secs(30),
             max_restore_runtime: Duration::from_secs(25),
-            max_trace_spans: 100_000,
-            max_trace_search_limit: 1_000,
-            max_concurrent_trace_scans: 8,
-            max_trace_query_runtime: Duration::from_secs(30),
-            max_trace_restore_runtime: Duration::from_secs(25),
             shutdown_flush_warn_after: Duration::from_secs(30),
             startup_retry_budget: Duration::from_secs(300),
             malloc_trim_interval: Some(Duration::from_secs(60)),
@@ -675,29 +656,13 @@ impl Config {
                 defaults.max_query_memory_bytes,
             )?,
             max_log_limit: env_positive_usize("LOGGYTRACY_MAX_LOG_LIMIT", defaults.max_log_limit)?,
-            max_metric_evaluation_points: env_positive_usize(
-                "LOGGYTRACY_MAX_METRIC_EVALUATION_POINTS",
-                defaults.max_metric_evaluation_points,
-            )?,
-            max_metric_series: env_positive_usize(
-                "LOGGYTRACY_MAX_METRIC_SERIES",
-                defaults.max_metric_series,
-            )?,
-            max_metric_samples: env_positive_usize(
-                "LOGGYTRACY_MAX_METRIC_SAMPLES",
-                defaults.max_metric_samples,
-            )?,
-            max_series_matchers: env_positive_usize(
-                "LOGGYTRACY_MAX_SERIES_MATCHERS",
-                defaults.max_series_matchers,
+            max_histogram_buckets: env_positive_usize(
+                "LOGGYTRACY_MAX_HISTOGRAM_BUCKETS",
+                defaults.max_histogram_buckets,
             )?,
             max_concurrent_query_scans: env_positive_usize(
                 "LOGGYTRACY_MAX_CONCURRENT_QUERY_SCANS",
                 defaults.max_concurrent_query_scans,
-            )?,
-            max_concurrent_metric_evaluations: env_positive_usize(
-                "LOGGYTRACY_MAX_CONCURRENT_METRIC_EVALUATIONS",
-                defaults.max_concurrent_metric_evaluations,
             )?,
             max_query_runtime: env_required_duration(
                 "LOGGYTRACY_MAX_QUERY_RUNTIME",
@@ -706,26 +671,6 @@ impl Config {
             max_restore_runtime: env_required_duration(
                 "LOGGYTRACY_MAX_RESTORE_RUNTIME",
                 defaults.max_restore_runtime,
-            )?,
-            max_trace_spans: env_positive_usize(
-                "LOGGYTRACY_MAX_TRACE_SPANS",
-                defaults.max_trace_spans,
-            )?,
-            max_trace_search_limit: env_positive_usize(
-                "LOGGYTRACY_MAX_TRACE_SEARCH_LIMIT",
-                defaults.max_trace_search_limit,
-            )?,
-            max_concurrent_trace_scans: env_positive_usize(
-                "LOGGYTRACY_MAX_CONCURRENT_TRACE_SCANS",
-                defaults.max_concurrent_trace_scans,
-            )?,
-            max_trace_query_runtime: env_required_duration(
-                "LOGGYTRACY_MAX_TRACE_QUERY_RUNTIME",
-                defaults.max_trace_query_runtime,
-            )?,
-            max_trace_restore_runtime: env_required_duration(
-                "LOGGYTRACY_MAX_TRACE_RESTORE_RUNTIME",
-                defaults.max_trace_restore_runtime,
             )?,
             startup_retry_budget: env_required_duration(
                 "LOGGYTRACY_STARTUP_RETRY_BUDGET",
@@ -749,9 +694,8 @@ impl Config {
     /// process actually holds itself to rather than a product it hopes never
     /// multiplies out.
     ///
-    /// Still an upper bound rather than an estimate for the whole: trace
-    /// scans carry no byte budget of their own (`max_trace_spans` is a
-    /// count), and the log says so.
+    /// Still an upper bound rather than an estimate for the whole, and the
+    /// log says so.
     pub fn peak_materialized_bytes(&self) -> u64 {
         self.query_memory_budget_bytes
             .saturating_add(self.merge_max_memory_bytes)
@@ -893,30 +837,13 @@ selected above the read budget can never be merged",
             ));
         }
         positive_usize("max_log_limit", self.max_log_limit)?;
-        positive_usize(
-            "max_metric_evaluation_points",
-            self.max_metric_evaluation_points,
-        )?;
-        positive_usize("max_metric_series", self.max_metric_series)?;
-        positive_usize("max_metric_samples", self.max_metric_samples)?;
+        positive_usize("max_histogram_buckets", self.max_histogram_buckets)?;
         positive_usize(
             "max_concurrent_query_scans",
             self.max_concurrent_query_scans,
         )?;
-        positive_usize(
-            "max_concurrent_metric_evaluations",
-            self.max_concurrent_metric_evaluations,
-        )?;
         positive_duration("max_query_runtime", self.max_query_runtime)?;
         positive_duration("max_restore_runtime", self.max_restore_runtime)?;
-        positive_usize("max_trace_spans", self.max_trace_spans)?;
-        positive_usize("max_trace_search_limit", self.max_trace_search_limit)?;
-        positive_usize(
-            "max_concurrent_trace_scans",
-            self.max_concurrent_trace_scans,
-        )?;
-        positive_duration("max_trace_query_runtime", self.max_trace_query_runtime)?;
-        positive_duration("max_trace_restore_runtime", self.max_trace_restore_runtime)?;
         positive_duration("shutdown_flush_warn_after", self.shutdown_flush_warn_after)
     }
 }

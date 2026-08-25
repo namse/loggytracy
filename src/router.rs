@@ -11,29 +11,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // separate router rather than layered onto this one. `Router::layer`
     // applies to every route registered before it, which would leave the
     // effective limit of a route depending on where in this chain it sits.
+    // The read surface is the first-party API alone: the Loki routes went
+    // with the read-path decision (issue #3), the Tempo routes with the same
+    // decision — traces are ingested and stored but unreadable until the
+    // first-party trace API (M13) ships.
     let router = Router::new()
         .merge(ingest_router(state.clone()))
-        .route("/loki/api/v1/query_range", get(query::query_range))
-        .route("/loki/api/v1/tail", get(query::tail))
-        .route("/loki/api/v1/query", get(query::query))
-        .route("/loki/api/v1/series", get(query::series))
-        .route("/loki/api/v1/labels", get(query::labels))
-        .route("/loki/api/v1/label/{name}/values", get(query::label_values))
-        .route("/loki/api/v1/status/buildinfo", get(query::buildinfo))
-        .route("/loki/api/v1/index/stats", get(query::index_stats))
-        .route("/loki/api/v1/index/volume", get(query::index_volume))
-        .route(
-            "/loki/api/v1/index/volume_range",
-            get(query::index_volume_range),
-        )
-        .route("/loki/api/v1/format_query", get(query::format_query))
-        .route("/loki/api/v1/detected_labels", get(query::detected_labels))
-        .route("/loki/api/v1/detected_fields", get(query::detected_fields))
-        .route("/loki/api/v1/patterns", get(query::patterns))
         .route("/metrics", get(query::metrics))
-        // The Tempo routes were removed with the read-path decision (issue #3):
-        // traces are ingested and stored but unreadable until the first-party
-        // trace API (M13) ships.
         .route("/loggytracy/api/v1/logs", get(query::logs))
         .route(
             "/loggytracy/api/v1/logs/histogram",
@@ -68,9 +52,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// The write routes, with the body limit they enforce.
 ///
 /// Ingest is OTLP only — the Loki push route was removed with the rest of
-/// that ingest (`todo.md`, "Next — OTLP only"); the Loki **query** API above
-/// stays, because Grafana reads through it. Without an explicit limit these
-/// routes inherit axum's 2 MiB default, so a collector tuned to larger
+/// that ingest (`todo.md`, "Next — OTLP only"). Without an explicit limit
+/// these routes inherit axum's 2 MiB default, so a collector tuned to larger
 /// batches would get an unexplained 413 with no knob to turn. The limit
 /// matches what the gRPC services accept, so a collector sees one size
 /// whichever transport it picks.

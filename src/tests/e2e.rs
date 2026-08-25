@@ -681,12 +681,6 @@
         otlp_body(&format!("{tenant}-app"), &[(line, now)])
     }
 
-    async fn json_body(response: axum::response::Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
 
     /// Two tenants pushing through the real router must not be able to read,
     /// enumerate, or count each other's data — before or after a flush turns
@@ -742,16 +736,17 @@
                     .unwrap();
                 let response = crate::build_router(state).oneshot(request).await.unwrap();
                 assert_eq!(response.status(), axum::http::StatusCode::OK, "{uri}");
-                json_body(response).await
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                String::from_utf8(body.to_vec()).unwrap()
             }
         };
 
-        let query_uri = "/loki/api/v1/query_range?query=%7B%7D&start=0&limit=100&direction=forward";
+        let query_uri = "/loggytracy/api/v1/logs?start=0&limit=100&direction=forward";
         for stage in ["memtable", "part"] {
-            let acme = get("acme", query_uri).await;
-            let globex = get("globex", query_uri).await;
-            let acme_lines = acme["data"]["result"].to_string();
-            let globex_lines = globex["data"]["result"].to_string();
+            let acme_lines = get("acme", query_uri).await;
+            let globex_lines = get("globex", query_uri).await;
             assert!(acme_lines.contains("acme secret"), "{stage}: {acme_lines}");
             assert!(
                 !acme_lines.contains("globex secret"),
@@ -762,19 +757,16 @@
                 "{stage}: globex read acme's line: {globex_lines}"
             );
 
-            let values = get("acme", "/loki/api/v1/label/service_name/values").await;
+            let values = get(
+                "acme",
+                "/loggytracy/api/v1/logs/attributes/service_name/values",
+            )
+            .await;
             assert_eq!(
-                values["data"],
-                serde_json::json!(["acme-app"]),
-                "{stage}: label values leaked another tenant"
+                values.trim(),
+                serde_json::json!({"value": "acme-app"}).to_string(),
+                "{stage}: attribute values leaked another tenant"
             );
-
-            let stats = get("acme", "/loki/api/v1/index/stats").await;
-            assert_eq!(stats["data"]["streams"], 0, "{stage}: streams are gone");
-            assert_eq!(stats["data"]["entries"], 1, "{stage}");
-
-            let series = get("acme", "/loki/api/v1/series?match%5B%5D=%7B%7D").await;
-            assert_eq!(series["data"].as_array().unwrap().len(), 1, "{stage}");
 
             if stage == "memtable" {
                 // Flush both tenants into one shared part and repeat every
@@ -799,7 +791,7 @@
 
         // A tenant that has never written sees nothing at all.
         let stranger = get("initech", query_uri).await;
-        assert_eq!(stranger["data"]["result"], serde_json::json!([]));
+        assert_eq!(stranger, "");
     }
 
     /// Delivery is at-least-once, so a restart between flush and checkpoint

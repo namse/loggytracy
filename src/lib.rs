@@ -27,7 +27,7 @@ mod otlp_log;
 pub(crate) mod page_cache;
 pub mod part;
 pub mod part_registry;
-mod query;
+pub mod query;
 pub mod query_memory;
 mod remote_lifecycle;
 pub mod restore_meter;

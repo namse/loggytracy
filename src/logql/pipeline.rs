@@ -627,3 +627,9 @@ pub(crate) fn canonical_index_values(value: &str) -> Vec<String> {
 }
 
 
+
+fn skip_space(line: &str, pos: &mut usize) {
+    while *pos < line.len() && line.as_bytes()[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+}

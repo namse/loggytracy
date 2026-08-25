@@ -4,7 +4,8 @@
 /// NDJSON, one row per line. The whole top-K is collected before the first
 /// byte is written, so this endpoint has no mid-stream failure mode — an
 /// error is always a plain HTTP status with a JSON body.
-pub(crate) struct ApiError(pub StatusCode, pub String);
+#[derive(Debug)]
+pub struct ApiError(pub StatusCode, pub String);
 
 impl ApiError {
     fn bad_request(message: String) -> Self {
@@ -151,10 +152,7 @@ pub async fn logs_histogram(
     let bucket_count = (i128::from(last_bucket_start) - i128::from(first_bucket_start))
         / i128::from(bucket_ns)
         + 1;
-    let max_buckets = state
-        .config
-        .max_metric_evaluation_points
-        .min(MAX_METRIC_EVALUATION_POINTS);
+    let max_buckets = state.config.max_histogram_buckets.min(MAX_HISTOGRAM_BUCKETS);
     if bucket_count > max_buckets as i128 {
         return Err(ApiError::bad_request(format!(
             "histogram would have {bucket_count} buckets over this range, more than the maximum \

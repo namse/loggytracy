@@ -462,7 +462,25 @@
         let reader = PartReader::open(part).unwrap();
         let range = QueryTimeRange::closed(i64::MIN, i64::MAX);
 
-        let numeric = crate::logql::parse("{} | json | value=9007199254740993").unwrap();
+        let field_query = |name: &str, value: crate::logql::FieldValue| {
+            let mut query = crate::query::parse_filter_params("parse=json", 0, crate::query::LOGS_PARAMS)
+                .unwrap()
+                .query;
+            query
+                .stages
+                .push(crate::logql::PipelineStage::Field(crate::logql::FieldFilter {
+                    name: name.to_string(),
+                    op: crate::logql::FieldOp::Eq,
+                    value,
+                }));
+            query
+        };
+        let numeric = field_query(
+            "value",
+            crate::logql::FieldValue::Number(
+                crate::logql::Decimal::parse("9007199254740993").unwrap(),
+            ),
+        );
         assert_eq!(
             reader.select_row_groups_with_exact_fields(&test_tenant(),
                 &[],
@@ -472,7 +490,10 @@
             vec![1]
         );
 
-        let duration = crate::logql::parse("{} | json | elapsed=1s").unwrap();
+        let duration = field_query(
+            "elapsed",
+            crate::logql::FieldValue::Duration(crate::logql::parse_duration_ns("1s").unwrap()),
+        );
         assert_eq!(
             reader.select_row_groups_with_exact_fields(&test_tenant(),
                 &[],

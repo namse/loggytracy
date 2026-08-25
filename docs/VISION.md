@@ -8,11 +8,12 @@ records what it is *for*, which of its properties are load-bearing, and what
 would prove the claim wrong. Where the two disagree, this one is the intent and
 the other is the implementation.
 
-The feature surface is done. Logs and traces ingest over Loki push and OTLP, the
-Loki and Tempo HTTP APIs answer Grafana, LogQL covers the high-usage subset,
-tenants are isolated and their retention is enforced, and the durability
-protocol survives crashes, restarts and a split writer. What remains is not
-features. It is that this engine does not yet keep the promise its shape implies.
+The feature surface is done. Logs and traces ingest over OTLP, the first-party
+query API answers the fn0 console and any agent driving `curl`
+([`QUERY_API.md`](QUERY_API.md)), tenants are isolated and their retention is
+enforced, and the durability protocol survives crashes, restarts and a split
+writer. What remains is not features. It is that this engine does not yet keep
+the promise its shape implies.
 
 ---
 
@@ -390,10 +391,12 @@ private scans.
 
 ## Ingest is OTLP
 
-**Logs and traces arrive over OTLP and nothing else.** The Loki push endpoint is
-removed. The Loki *query* API is not — it is how Grafana reads this engine, and
-an ingest protocol and a query protocol are separate decisions that happened to
-share a name.
+**Logs and traces arrive over OTLP and nothing else.** The Loki push endpoint
+was removed first; the Loki *query* API followed with the read-path decision
+(issue #3). An ingest protocol and a query protocol are separate decisions that
+happened to share a name, and both went the same way once the viewer stopped
+being Grafana: the engine answers the fn0 control plane and curl-driving agents
+over its own flat-filter API ([`QUERY_API.md`](QUERY_API.md)).
 
 **Why.** loggytracy has one intended consumer, and everything it would store
 already arrives as OTLP there: guest traces, guest logs (stdout, converted to
@@ -412,11 +415,11 @@ only because two ingest protocols had to converge on one WAL record. With one
 protocol it has nothing to do, and [invariant II](#ii-a-lines-bytes-are-copied-a-bounded-number-of-times-and-label-sets-are-never-de-shared)
 gets the copies back.
 
-**What stays.** The `| json` parser stays and is not deprecated. A guest's
-`println!` becomes the *body* of an OTLP log record as a plain string, and
-nothing in that chain parses it — so a guest that logs JSON still needs a parser
-stage at query time. What changes is that this stops being the headline; see the
-claim below.
+**What stays.** The JSON parser stage stays and is not deprecated — spelled
+`parse=json` on the first-party API now. A guest's `println!` becomes the
+*body* of an OTLP log record as a plain string, and nothing in that chain
+parses it — so a guest that logs JSON still needs a parser stage at query time.
+What changes is that this stops being the headline; see the claim below.
 
 **A consequence worth knowing before it surprises someone.** Which OTLP
 attributes become stream labels is a schema decision, and loggytracy currently
@@ -458,10 +461,11 @@ prints JSON produces exactly it. It is no longer what the engine is *for*.
 The claim is therefore stated as a falsifiable one:
 
 > At an equal container memory limit, on the same corpus and the same machine,
-> loggytracy answers `{...} | field="value"` over structured metadata — the shape
-> an OTLP attribute produces — in materially less time than Loki, which does not
-> index it, and not materially worse than VictoriaLogs, which columnizes it,
-> without giving up ingest throughput or disk footprint.
+> loggytracy answers an attribute-equality query over structured metadata — the
+> shape an OTLP attribute produces, `attr=field=value` over its own query API —
+> in materially less time than Loki, which does not index it, and not
+> materially worse than VictoriaLogs, which columnizes it, without giving up
+> ingest throughput or disk footprint.
 
 **Both halves hold now, on the wire the claim was always about — and the
 VictoriaLogs half holds past its own wording.** The bed ingests OTLP on all
@@ -573,7 +577,15 @@ written down for the shape that is no longer the headline.
 
 ## What is deliberately not built
 
-- **No cluster, no replication, no query frontend, no separate index store.**
+- **No Loki, no LogQL, no Grafana compatibility.** The read-path decision
+  (issue #3): the viewer is the fn0 control plane speaking the first-party API,
+  and a compatibility surface with no remaining consumer was an obligation with
+  no customer. The Tempo surface went with it — traces are write-only until the
+  first-party trace API (M13). If external demand ever materializes, a Grafana
+  datasource plugin over the first-party API is the cheap insurance; the compat
+  endpoints do not come back.
+- **No cluster, no replication, no in-process query UI, no separate index
+  store.**
   Single writer is the design, and writer fencing enforces it. Every guarantee
   here — the manifest CAS commit, merge input revalidation, the flush
   transaction — rests on there being exactly one.
@@ -581,8 +593,8 @@ written down for the shape that is no longer the headline.
   [`ARCHITECTURE.md`](ARCHITECTURE.md); closed here as rejected. It conflicts with
   invariant I — its memory is not accountable at arena granularity — and with
   invariant III, where the bounded top-K stream is a specific execution shape
-  rather than a general one. The LogQL surface is small enough that a planner for
-  it is smaller than the integration.
+  rather than a general one. The flat filter surface is small enough that a
+  planner for it is smaller than the integration.
 - **No TLS, no authentication.** Already decided; unchanged.
 - **No per-tenant object paths.** Already decided on cost grounds; unchanged.
 - **No format versioning.** Nothing on disk or on the wire carries a version, and
@@ -597,8 +609,7 @@ written down for the shape that is no longer the headline.
 
   Two things that resemble versioning and are not: `object_store`'s
   `UpdateVersion`, which is the compare-and-swap ETag every durability guarantee
-  here rests on, and `CARGO_PKG_VERSION` in `/metrics` and the Loki `buildinfo`
-  endpoint, which is API surface.
+  here rests on, and `CARGO_PKG_VERSION` in `/metrics`, which is API surface.
 
 ---
 

@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use loggytracy::log_scan::LogScan;
-use loggytracy::logql::{self, LogQuery};
+use loggytracy::logql::LogQuery;
 use loggytracy::memtable::MemTable;
 use loggytracy::part::{QueryTimeRange, flush_rows};
 use loggytracy::part_registry::PartRegistry;
@@ -132,20 +132,22 @@ fn bed() -> Bed {
 fn shapes(bed: &Bed) -> Vec<(&'static str, LogQuery)> {
     let app = &bed.app;
     vec![
-        ("label_only", parse(&format!("{{app=\"{app}\"}}"))),
+        ("label_only", parse(&format!("attr=app={app}"))),
         (
             "line_filter",
-            parse(&format!("{{app=\"{app}\"}} |= \"timeout\"")),
+            parse(&format!("attr=app={app}&contains=timeout")),
         ),
         (
             "json_field",
-            parse(&format!("{{app=\"{app}\"}} | json | status=\"500\"")),
+            parse(&format!("parse=json&attr=app={app}&attr=status=500")),
         ),
     ]
 }
 
 fn parse(query: &str) -> LogQuery {
-    logql::parse(query).expect("bench query parses")
+    loggytracy::query::parse_filter_params(query, 0, loggytracy::query::LOGS_PARAMS)
+        .expect("bench query parses")
+        .query
 }
 
 fn run(bed: &Bed, query: &LogQuery, forward: bool) -> loggytracy::log_scan::LogScanResult {
@@ -228,16 +230,8 @@ fn bench_rate(c: &mut Criterion, bed: &Bed) {
         .sample_size(10)
         .warm_up_time(WARM_UP)
         .measurement_time(Duration::from_secs(2));
-    let query = parse(&format!("{{app=\"{}\"}}", bed.app));
-    let columns = {
-        let expr = match logql::parse_expr(&format!("sum(rate({{app=\"{}\"}}[10s]))", bed.app))
-            .expect("bench metric parses")
-        {
-            logql::QueryExpr::Metric(expr) => expr,
-            _ => unreachable!(),
-        };
-        expr.required_columns()
-    };
+    let query = parse(&format!("attr=app={}", bed.app));
+    let columns = loggytracy::part::ColumnSet::for_count_query(&query);
     let times: Vec<i64> = (1..=20)
         .map(|step| 1_772_000_000_000_000_000i64 + step * 10_000_000_000)
         .collect();
