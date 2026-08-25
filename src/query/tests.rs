@@ -4268,3 +4268,134 @@ async fn histogram_rejects_search_only_parameters() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("unknown parameter 'limit'"), "{body}");
 }
+
+// --- The first-party API: attribute autocomplete ---
+
+async fn first_party_get(state: Arc<AppState>, path_and_query: &str) -> (StatusCode, String) {
+    let request = axum::http::Request::builder()
+        .uri(path_and_query)
+        .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = crate::build_router(state).oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn attribute_keys_come_from_the_memtable_and_the_parts() {
+    let data_dir = temp_dir();
+    let memtable = Arc::new(MemTable::new());
+    memtable.insert(
+        test_tenant(),
+        vec![LogEntry {
+            timestamp_ns: 5_000_000_000,
+            line: "row".to_string(),
+            structured_metadata: vec![
+                ("app".to_string(), "api".to_string()),
+                ("level".to_string(), "error".to_string()),
+            ],
+        }],
+    );
+    let parts = Arc::new(PartRegistry::new());
+    parts
+        .register(
+            part::flush_rows(
+                vec![Row {
+                    tenant: test_tenant(),
+                    timestamp_ns: 6_000_000_000,
+                    line: "part row".to_string(),
+                    structured_metadata: vec![("host".to_string(), "db-1".to_string())],
+                }],
+                &data_dir.join("parts"),
+                8,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let state = test_state(&data_dir, memtable, parts, None);
+
+    let (status, body) =
+        first_party_get(state, "/loggytracy/api/v1/logs/attributes?start=4&end=7").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let keys: Vec<String> = ndjson_rows(&body)
+        .iter()
+        .map(|row| row["key"].as_str().unwrap().to_string())
+        .collect();
+    assert!(keys.contains(&"app".to_string()), "{keys:?}");
+    assert!(keys.contains(&"level".to_string()), "{keys:?}");
+    assert!(keys.contains(&"host".to_string()), "{keys:?}");
+}
+
+#[tokio::test]
+async fn attribute_values_narrow_by_attr_filters() {
+    let data_dir = temp_dir();
+    let memtable = Arc::new(MemTable::new());
+    memtable.insert(
+        test_tenant(),
+        vec![
+            LogEntry {
+                timestamp_ns: 5_000_000_000,
+                line: "row".to_string(),
+                structured_metadata: vec![
+                    ("app".to_string(), "api".to_string()),
+                    ("level".to_string(), "error".to_string()),
+                ],
+            },
+            LogEntry {
+                timestamp_ns: 6_000_000_000,
+                line: "row".to_string(),
+                structured_metadata: vec![
+                    ("app".to_string(), "worker".to_string()),
+                    ("level".to_string(), "info".to_string()),
+                ],
+            },
+        ],
+    );
+    let state = test_state(&data_dir, memtable, Arc::new(PartRegistry::new()), None);
+
+    let (status, body) = first_party_get(
+        state.clone(),
+        "/loggytracy/api/v1/logs/attributes/level/values?start=4&end=7",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let values: Vec<String> = ndjson_rows(&body)
+        .iter()
+        .map(|row| row["value"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(values, vec!["error".to_string(), "info".to_string()]);
+
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/logs/attributes/level/values?start=4&end=7&attr=app=api",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let values: Vec<String> = ndjson_rows(&body)
+        .iter()
+        .map(|row| row["value"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(values, vec!["error".to_string()]);
+}
+
+#[tokio::test]
+async fn attribute_values_refuse_line_filters_by_the_unknown_parameter_rule() {
+    let data_dir = temp_dir();
+    let state = test_state(
+        &data_dir,
+        Arc::new(MemTable::new()),
+        Arc::new(PartRegistry::new()),
+        None,
+    );
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/logs/attributes/level/values?contains=x",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("unknown parameter 'contains'"), "{body}");
+}

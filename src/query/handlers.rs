@@ -296,7 +296,18 @@ impl MetadataGuard {
         tenant: &crate::tenant::TenantId,
         params: &crate::query::MetadataParams,
     ) -> Result<Option<Self>, (StatusCode, String)> {
-        let window = metadata_window(state, params)?.clamped_to(state.tenant_policy.query_floor_ns(tenant));
+        let window = metadata_window(state, params)?;
+        Self::acquire_window(state, tenant, window).await
+    }
+
+    /// The same admission for a caller that already resolved its window — the
+    /// first-party attribute endpoints parse their own parameters.
+    async fn acquire_window(
+        state: &Arc<AppState>,
+        tenant: &crate::tenant::TenantId,
+        window: crate::part::MetadataWindow,
+    ) -> Result<Option<Self>, (StatusCode, String)> {
+        let window = window.clamped_to(state.tenant_policy.query_floor_ns(tenant));
         // An empty window is a valid question with an empty answer, not an
         // error: a tenant whose retention already passed the requested range
         // asks this on every dashboard refresh.

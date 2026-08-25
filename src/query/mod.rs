@@ -524,6 +524,7 @@ fn estimated_query_memory_bytes(results: &[StreamResult]) -> u64 {
 include!("execution.rs");
 include!("params.rs");
 include!("logs.rs");
+include!("attributes.rs");
 include!("restore.rs");
 include!("metrics.rs");
 include!("handlers.rs");

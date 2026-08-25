@@ -30,11 +30,21 @@ pub(crate) const HISTOGRAM_PARAMS: &[&str] = &[
     "bucket",
 ];
 
+pub(crate) const ATTRIBUTE_KEYS_PARAMS: &[&str] = &["start", "end"];
+
+/// Line filters are deliberately absent: this endpoint samples metadata
+/// without evaluating line content, and answering as though it did would be
+/// the silent approximation this engine refuses elsewhere. The unknown-
+/// parameter refusal is what says so.
+pub(crate) const ATTRIBUTE_VALUES_PARAMS: &[&str] = &["start", "end", "attr"];
+
 /// The first-party routes, listed by the router fallback so one wrong request
 /// teaches the whole surface. Grows with each endpoint that lands.
 pub(crate) const ROUTES: &[&str] = &[
     "/loggytracy/api/v1/logs",
     "/loggytracy/api/v1/logs/histogram",
+    "/loggytracy/api/v1/logs/attributes",
+    "/loggytracy/api/v1/logs/attributes/{key}/values",
 ];
 
 #[derive(Debug)]
