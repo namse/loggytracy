@@ -27,6 +27,7 @@ pub struct TenantQuota {
     /// failure the two transports were split apart to prevent.
     parts: Arc<crate::part_registry::PartRegistry>,
     trace_parts: Arc<crate::trace_registry::TraceRegistry>,
+    series_parts: Arc<crate::series_registry::SeriesRegistry>,
     /// Queries a tenant currently has in flight.
     ///
     /// Without it one tenant issuing many concurrent scans takes every permit
@@ -80,6 +81,7 @@ impl TenantQuota {
         policy: Arc<TenantPolicy>,
         parts: Arc<crate::part_registry::PartRegistry>,
         trace_parts: Arc<crate::trace_registry::TraceRegistry>,
+        series_parts: Arc<crate::series_registry::SeriesRegistry>,
     ) -> Self {
         Self {
             config,
@@ -87,6 +89,7 @@ impl TenantQuota {
             policy,
             parts,
             trace_parts,
+            series_parts,
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -102,6 +105,7 @@ impl TenantQuota {
             Arc::new(TenantPolicy::disabled()),
             Arc::new(crate::part_registry::PartRegistry::new()),
             Arc::new(crate::trace_registry::TraceRegistry::standalone()),
+            Arc::new(crate::series_registry::SeriesRegistry::standalone()),
         ))
     }
 
@@ -164,7 +168,8 @@ impl TenantQuota {
         let stored = self
             .parts
             .tenant_stored_bytes(tenant)
-            .saturating_add(self.trace_parts.tenant_stored_bytes(tenant));
+            .saturating_add(self.trace_parts.tenant_stored_bytes(tenant))
+            .saturating_add(self.series_parts.tenant_stored_bytes(tenant));
         if stored < limit {
             return Ok(());
         }

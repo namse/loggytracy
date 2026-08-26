@@ -96,6 +96,7 @@ fn state_inner(
             journal,
             parts,
             trace_parts,
+            series_parts: Arc::new(crate::series_registry::SeriesRegistry::standalone()),
             flush_healthy: Arc::new(AtomicBool::new(true)),
             merge_healthy: Arc::new(AtomicBool::new(true)),
             retention_healthy: Arc::new(AtomicBool::new(true)),

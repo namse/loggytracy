@@ -35,6 +35,7 @@ pub struct AppState {
     pub disk: Arc<crate::disk::DiskSpace>,
     pub parts: Arc<PartRegistry>,
     pub trace_parts: Arc<TraceRegistry>,
+    pub series_parts: Arc<crate::series_registry::SeriesRegistry>,
     pub flush_healthy: Arc<AtomicBool>,
     pub merge_healthy: Arc<AtomicBool>,
     pub retention_healthy: Arc<AtomicBool>,
@@ -68,6 +69,7 @@ pub struct AppStateDependencies {
     pub journal: Arc<Journal>,
     pub parts: Arc<PartRegistry>,
     pub trace_parts: Arc<TraceRegistry>,
+    pub series_parts: Arc<crate::series_registry::SeriesRegistry>,
     pub flush_healthy: Arc<AtomicBool>,
     pub merge_healthy: Arc<AtomicBool>,
     pub retention_healthy: Arc<AtomicBool>,
@@ -110,6 +112,7 @@ impl AppState {
             dependencies.tenant_policy.clone(),
             dependencies.parts.clone(),
             dependencies.trace_parts.clone(),
+            dependencies.series_parts.clone(),
         ));
         Self {
             ingest_gate,
@@ -132,6 +135,7 @@ impl AppState {
             journal: dependencies.journal,
             parts: dependencies.parts,
             trace_parts: dependencies.trace_parts,
+            series_parts: dependencies.series_parts,
             flush_healthy: dependencies.flush_healthy,
             merge_healthy: dependencies.merge_healthy,
             retention_healthy: dependencies.retention_healthy,

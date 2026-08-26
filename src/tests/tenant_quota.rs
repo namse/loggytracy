@@ -25,6 +25,7 @@
             policy,
             parts,
             Arc::new(crate::trace_registry::TraceRegistry::standalone()),
+            Arc::new(crate::series_registry::SeriesRegistry::standalone()),
         )
     }
 

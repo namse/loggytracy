@@ -78,6 +78,7 @@ pub struct CheckpointSnapshot {
     pub offset: u64,
     pub snapshot: Arc<MemTableSnapshot>,
     pub trace_snapshot: Arc<Vec<TraceSpan>>,
+    pub series_snapshot: Arc<crate::series::SeriesSnapshot>,
 }
 
 /// A decoded tenant-framed WAL record: who wrote it, what kind it is, and the

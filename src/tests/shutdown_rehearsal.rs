@@ -249,6 +249,7 @@ async fn m6_machine_replacement_force_flush_is_lossless() {
         journal: journal.clone(),
         registry: parts.clone(),
         trace_registry: trace_registry.clone(),
+        series_registry: Arc::new(crate::series_registry::SeriesRegistry::standalone()),
         remote_cache: remote_cache.clone(),
         config: config_a.clone(),
     })
@@ -372,6 +373,7 @@ async fn m6_force_flush_retries_until_object_store_recovers() {
         journal: journal.clone(),
         registry: parts.clone(),
         trace_registry: trace_registry.clone(),
+        series_registry: Arc::new(crate::series_registry::SeriesRegistry::standalone()),
         remote_cache: remote_cache.clone(),
         config: config.clone(),
     })
@@ -453,6 +455,7 @@ async fn m6_a_fenced_writer_stops_instead_of_retrying_forever() {
                 journal: journal.clone(),
                 registry: parts.clone(),
                 trace_registry: trace_registry.clone(),
+                series_registry: Arc::new(crate::series_registry::SeriesRegistry::standalone()),
                 remote_cache: remote_cache.clone(),
                 config: config.clone(),
             },
@@ -533,6 +536,7 @@ async fn m6_operator_abort_preserves_wal_for_restart_recovery() {
             journal: journal.clone(),
             registry: parts.clone(),
             trace_registry: trace_registry.clone(),
+            series_registry: Arc::new(crate::series_registry::SeriesRegistry::standalone()),
             remote_cache: remote_cache.clone(),
             config: config.clone(),
         },

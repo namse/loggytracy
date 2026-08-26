@@ -497,6 +497,7 @@ mod tests {
             journal.clone(),
             parts.clone(),
             trace_parts.clone(),
+            Arc::new(crate::series_registry::SeriesRegistry::standalone()),
             None,
             Arc::new(config.clone()),
             healthy,

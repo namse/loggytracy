@@ -20,6 +20,8 @@ use crate::object_storage::{
 };
 use crate::part::{self};
 use crate::part_registry::PartRegistry;
+use crate::series_part;
+use crate::series_registry::SeriesRegistry;
 use crate::trace::TraceMemTable;
 use crate::trace_part;
 use crate::trace_registry::TraceRegistry;
@@ -31,12 +33,16 @@ pub async fn flush_loop(
     journal: Arc<Journal>,
     registry: Arc<PartRegistry>,
     trace_registry: Arc<TraceRegistry>,
+    series_registry: Arc<SeriesRegistry>,
     remote_cache: Option<Arc<RemoteCache>>,
     config: Arc<Config>,
     healthy: Arc<AtomicBool>,
     metrics: Arc<RuntimeMetrics>,
     mut drain_rx: watch::Receiver<bool>,
 ) {
+    // The third memtable rides with the journal rather than the parameter
+    // list: the journal already owns it for replay and the writer inserts.
+    let series_memtable = journal.series_memtable();
     healthy.store(true, Ordering::Release);
     let mut ticker = interval(config.flush_check_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -88,12 +94,13 @@ pub async fn flush_loop(
                 }
             }
         }
-        if memtable.is_empty() && trace_memtable.is_empty() {
+        if memtable.is_empty() && trace_memtable.is_empty() && series_memtable.is_empty() {
             continue;
         }
         let size = memtable
             .approximate_size()
-            .saturating_add(trace_memtable.approximate_size());
+            .saturating_add(trace_memtable.approximate_size())
+            .saturating_add(series_memtable.approximate_size());
         let elapsed = last_flush.elapsed();
         if (size as u64) < config.flush_max_bytes && elapsed < config.flush_max_interval {
             continue;
@@ -104,6 +111,7 @@ pub async fn flush_loop(
             &journal,
             &registry,
             &trace_registry,
+            &series_registry,
             remote_cache.as_deref(),
             &config,
             &mut pending_checkpoint,
@@ -115,6 +123,21 @@ pub async fn flush_loop(
                 metrics.flush_success.fetch_add(1, Ordering::Relaxed);
                 healthy.store(true, Ordering::Release);
                 last_flush = Instant::now();
+                // The scheduled half of the idle sweep (M14 ladder rung 2):
+                // series whose samples just flushed and whose newest sample is
+                // past the horizon leave the index here, on the flush cadence
+                // the design promised. The lazy half runs under admission
+                // pressure.
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0);
+                let cutoff =
+                    now_ns.saturating_sub(config.metric_series_idle_timeout.as_nanos() as i64);
+                let evicted = series_memtable.evict_idle(cutoff);
+                if evicted > 0 {
+                    tracing::info!(evicted, "idle metric series left the index");
+                }
             }
             Err(e) => {
                 metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
@@ -133,6 +156,7 @@ pub struct ForceFlush<'a> {
     pub journal: &'a Journal,
     pub registry: &'a PartRegistry,
     pub trace_registry: &'a TraceRegistry,
+    pub series_registry: &'a SeriesRegistry,
     pub remote_cache: Option<&'a RemoteCache>,
     pub config: &'a Config,
     pub pending_checkpoint: &'a mut Option<u64>,
@@ -151,10 +175,12 @@ pub async fn force_flush_pass(pass: ForceFlush<'_>) -> Result<bool, String> {
         journal,
         registry,
         trace_registry,
+        series_registry,
         remote_cache,
         config,
         pending_checkpoint,
     } = pass;
+    let series_memtable = journal.series_memtable();
 
     if pending_checkpoint.is_some() {
         retry_pending_checkpoint(
@@ -178,6 +204,7 @@ pub async fn force_flush_pass(pass: ForceFlush<'_>) -> Result<bool, String> {
         journal,
         registry,
         trace_registry,
+        series_registry,
         remote_cache,
         config,
         pending_checkpoint,
@@ -185,7 +212,10 @@ pub async fn force_flush_pass(pass: ForceFlush<'_>) -> Result<bool, String> {
     )
     .await?;
 
-    Ok(memtable.is_empty() && trace_memtable.is_empty() && pending_checkpoint.is_none())
+    Ok(memtable.is_empty()
+        && trace_memtable.is_empty()
+        && series_memtable.is_empty()
+        && pending_checkpoint.is_none())
 }
 
 async fn retry_pending_checkpoint(
@@ -218,20 +248,24 @@ async fn flush_once(
     journal: &Journal,
     registry: &PartRegistry,
     trace_registry: &TraceRegistry,
+    series_registry: &SeriesRegistry,
     remote_cache: Option<&RemoteCache>,
     config: &Config,
     pending_checkpoint: &mut Option<u64>,
     metrics: Option<&RuntimeMetrics>,
 ) -> Result<(), String> {
+    let series_memtable = journal.series_memtable();
     let checkpoint_started = std::time::Instant::now();
     let ckpt = journal.checkpoint().await.map_err(|e| e.to_string())?;
     let checkpoint_wait = checkpoint_started.elapsed();
     if let Some(metrics) = metrics {
         metrics.flush.checkpoint_wait.observe(checkpoint_wait);
     }
-    if ckpt.snapshot.is_empty() && ckpt.trace_snapshot.is_empty() {
+    if ckpt.snapshot.is_empty() && ckpt.trace_snapshot.is_empty() && ckpt.series_snapshot.is_empty()
+    {
         memtable.commit_flush();
         trace_memtable.commit_flush();
+        series_memtable.commit_flush();
         if let Err(error) = advance_checkpoint(
             journal,
             ckpt.offset,
@@ -262,6 +296,8 @@ async fn flush_once(
     let snapshot_for_flush = ckpt.snapshot.clone();
     let trace_spans = ckpt.trace_snapshot;
     let trace_spans_for_flush = trace_spans.clone();
+    let series_snapshot = ckpt.series_snapshot;
+    let series_snapshot_for_flush = series_snapshot.clone();
     // Prevent eviction from observing a freshly committed directory before
     // it has been published and installed in the registry.
     let cache_guard = match remote_cache {
@@ -272,6 +308,7 @@ async fn flush_once(
     if let Err(error) = std::fs::create_dir_all(&parts_root) {
         memtable.abort_flush(ckpt.snapshot);
         trace_memtable.abort_flush(trace_spans);
+        series_memtable.abort_flush(series_snapshot);
         return Err(error.to_string());
     }
 
@@ -280,6 +317,7 @@ async fn flush_once(
     let result = match tokio::task::spawn_blocking({
         let parts_root = parts_root.clone();
         let traces_root = config.data_dir.join("traces");
+        let metrics_root = config.data_dir.join("metrics");
         move || {
             let _arena = crate::memprof::enter(crate::memprof::Arena::Flush);
             let build_started = std::time::Instant::now();
@@ -297,7 +335,7 @@ async fn flush_once(
                 Ok(parts) => parts,
                 Err(error) => {
                     let log_dirs = part_dirs(&log_parts);
-                    let cleanup = cleanup_part_directories(&log_dirs, &[]);
+                    let cleanup = cleanup_part_directories(&log_dirs, &[], &[]);
                     return Err(match cleanup {
                         Ok(()) => std::io::Error::other(format!("trace flush failed: {error}")),
                         Err(cleanup_error) => std::io::Error::other(format!(
@@ -311,32 +349,60 @@ async fn flush_once(
             // written, and a chunked flush leaves many parts. Under the
             // exclusive lifecycle lock that I/O was a stall every queued
             // query paid for.
-            let rollback =
-                |error: String, log_parts: &[part::Part], trace_parts: &[trace_part::TracePart]| {
-                    let log_dirs = part_dirs(log_parts);
-                    let trace_dirs: Vec<_> = trace_parts.iter().map(|p| p.dir.clone()).collect();
-                    match cleanup_part_directories(&log_dirs, &trace_dirs) {
-                        Ok(()) => std::io::Error::other(error),
-                        Err(cleanup_error) => std::io::Error::other(format!(
-                            "{error}; part rollback failed: {cleanup_error}"
-                        )),
+            let rollback = |error: String,
+                            log_parts: &[part::Part],
+                            trace_parts: &[trace_part::TracePart],
+                            series_parts: &[series_part::SeriesPart]| {
+                let log_dirs = part_dirs(log_parts);
+                let trace_dirs: Vec<_> = trace_parts.iter().map(|p| p.dir.clone()).collect();
+                let series_dirs: Vec<_> = series_parts.iter().map(|p| p.dir.clone()).collect();
+                match cleanup_part_directories(&log_dirs, &trace_dirs, &series_dirs) {
+                    Ok(()) => std::io::Error::other(error),
+                    Err(cleanup_error) => std::io::Error::other(format!(
+                        "{error}; part rollback failed: {cleanup_error}"
+                    )),
+                }
+            };
+            let series_parts =
+                match series_part::flush_series_snapshot(&series_snapshot_for_flush, &metrics_root)
+                {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        return Err(rollback(
+                            format!("metric flush failed: {error}"),
+                            &log_parts,
+                            &trace_parts,
+                            &[],
+                        ));
                     }
                 };
             let build = build_started.elapsed();
             let open_started = std::time::Instant::now();
             let opened_log = match PartRegistry::open_parts(log_parts.clone()) {
                 Ok(opened) => opened,
-                Err(error) => return Err(rollback(error, &log_parts, &trace_parts)),
+                Err(error) => {
+                    return Err(rollback(error, &log_parts, &trace_parts, &series_parts));
+                }
             };
             let opened_traces = match TraceRegistry::open_parts(trace_parts.clone()) {
                 Ok(opened) => opened,
-                Err(error) => return Err(rollback(error, &log_parts, &trace_parts)),
+                Err(error) => {
+                    return Err(rollback(error, &log_parts, &trace_parts, &series_parts));
+                }
+            };
+            let opened_series = match SeriesRegistry::open_parts(series_parts.clone()) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    return Err(rollback(error, &log_parts, &trace_parts, &series_parts));
+                }
             };
             Ok::<_, std::io::Error>((
                 log_parts,
                 trace_parts,
+                series_parts,
                 opened_log,
                 opened_traces,
+                opened_series,
                 build,
                 open_started.elapsed(),
             ))
@@ -348,12 +414,22 @@ async fn flush_once(
         Err(error) => {
             memtable.abort_flush(ckpt.snapshot);
             trace_memtable.abort_flush(trace_spans);
+            series_memtable.abort_flush(series_snapshot);
             return Err(format!("flush task join failed: {}", error));
         }
     };
 
     match result {
-        Ok((new_parts, new_trace_parts, opened_log, opened_traces, build, open)) => {
+        Ok((
+            new_parts,
+            new_trace_parts,
+            new_series_parts,
+            opened_log,
+            opened_traces,
+            opened_series,
+            build,
+            open,
+        )) => {
             if let Some(metrics) = metrics {
                 metrics.flush.build.observe(build);
                 metrics.flush.open.observe(open);
@@ -363,9 +439,19 @@ async fn flush_once(
                 .iter()
                 .map(|part| part.meta.row_count)
                 .sum::<u64>()
-                .saturating_add(trace_spans.len() as u64);
+                .saturating_add(trace_spans.len() as u64)
+                .saturating_add(
+                    new_series_parts
+                        .iter()
+                        .map(|part| part.meta.sample_count)
+                        .sum::<u64>(),
+                );
             let new_part_dirs: Vec<_> = new_parts.iter().map(|part| part.dir.clone()).collect();
             let new_trace_part_dirs: Vec<_> = new_trace_parts
+                .iter()
+                .map(|part| part.dir.clone())
+                .collect();
+            let new_series_part_dirs: Vec<_> = new_series_parts
                 .iter()
                 .map(|part| part.dir.clone())
                 .collect();
@@ -374,9 +460,15 @@ async fn flush_once(
                     match crate::journal::read_checkpoint(&config.data_dir.join("journal.ckpt")) {
                         Ok(checkpoint) => checkpoint,
                         Err(error) => {
-                            cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).ok();
+                            cleanup_part_directories(
+                                &new_part_dirs,
+                                &new_trace_part_dirs,
+                                &new_series_part_dirs,
+                            )
+                            .ok();
                             memtable.abort_flush(ckpt.snapshot);
                             trace_memtable.abort_flush(trace_spans);
+                            series_memtable.abort_flush(series_snapshot);
                             return Err(error.to_string());
                         }
                     };
@@ -385,9 +477,15 @@ async fn flush_once(
                     .reconcile_flush_transaction(&config.data_dir, checkpoint)
                     .await
                 {
-                    cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).ok();
+                    cleanup_part_directories(
+                        &new_part_dirs,
+                        &new_trace_part_dirs,
+                        &new_series_part_dirs,
+                    )
+                    .ok();
                     memtable.abort_flush(ckpt.snapshot);
                     trace_memtable.abort_flush(trace_spans);
+                    series_memtable.abort_flush(series_snapshot);
                     return Err(format!("failed to reconcile flush transaction: {error}"));
                 }
                 let transaction = FlushTransaction {
@@ -402,9 +500,15 @@ async fn flush_once(
                         .collect(),
                 };
                 if let Err(error) = write_flush_transaction(&config.data_dir, &transaction) {
-                    cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).ok();
+                    cleanup_part_directories(
+                        &new_part_dirs,
+                        &new_trace_part_dirs,
+                        &new_series_part_dirs,
+                    )
+                    .ok();
                     memtable.abort_flush(ckpt.snapshot);
                     trace_memtable.abort_flush(trace_spans);
+                    series_memtable.abort_flush(series_snapshot);
                     return Err(format!("failed to record flush transaction: {error}"));
                 }
                 if let Err(error) = cache.storage.publish(&new_parts, &[]).await {
@@ -414,10 +518,15 @@ async fn flush_once(
                         .rollback_flush_transaction(&config.data_dir)
                         .await
                         .err();
-                    let cleanup_error =
-                        cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).err();
+                    let cleanup_error = cleanup_part_directories(
+                        &new_part_dirs,
+                        &new_trace_part_dirs,
+                        &new_series_part_dirs,
+                    )
+                    .err();
                     memtable.abort_flush(ckpt.snapshot);
                     trace_memtable.abort_flush(trace_spans);
+                    series_memtable.abort_flush(series_snapshot);
                     return Err(match cleanup_error {
                         Some(cleanup_error) => format!(
                             "object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
@@ -437,10 +546,15 @@ async fn flush_once(
                         .rollback_flush_transaction(&config.data_dir)
                         .await
                         .err();
-                    let cleanup_error =
-                        cleanup_part_directories(&new_part_dirs, &new_trace_part_dirs).err();
+                    let cleanup_error = cleanup_part_directories(
+                        &new_part_dirs,
+                        &new_trace_part_dirs,
+                        &new_series_part_dirs,
+                    )
+                    .err();
                     memtable.abort_flush(ckpt.snapshot);
                     trace_memtable.abort_flush(trace_spans);
+                    series_memtable.abort_flush(series_snapshot);
                     return Err(match cleanup_error {
                         Some(cleanup_error) => format!(
                             "trace object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
@@ -476,8 +590,10 @@ async fn flush_once(
                 .await;
                 registry.register_opened(opened_log);
                 trace_registry.register_opened(opened_traces);
+                series_registry.register_opened(opened_series);
                 memtable.commit_flush();
                 trace_memtable.commit_flush();
+                series_memtable.commit_flush();
             }
             let visibility = visibility_started.elapsed();
             let advance_started = std::time::Instant::now();
@@ -538,6 +654,7 @@ async fn flush_once(
             tracing::error!(error = %e, "flush_rows failed, reinserting into memtable");
             memtable.abort_flush(ckpt.snapshot);
             trace_memtable.abort_flush(trace_spans);
+            series_memtable.abort_flush(series_snapshot);
             Err(e.to_string())
         }
     }
@@ -594,9 +711,11 @@ fn part_dirs(parts: &[part::Part]) -> Vec<std::path::PathBuf> {
 fn cleanup_part_directories(
     log_dirs: &[std::path::PathBuf],
     trace_dirs: &[std::path::PathBuf],
+    series_dirs: &[std::path::PathBuf],
 ) -> Result<(), String> {
     let mut dirs = log_dirs.to_vec();
     dirs.extend_from_slice(trace_dirs);
+    dirs.extend_from_slice(series_dirs);
     part::remove_part_dirs(&dirs)
 }
 
@@ -643,6 +762,7 @@ mod tests {
             Journal::spawn_with_traces(&config, memtable.clone(), trace_memtable.clone()).unwrap();
         let registry = PartRegistry::new();
         let trace_registry = TraceRegistry::new(registry.operation_lock());
+        let series_registry = SeriesRegistry::new(registry.operation_lock());
         let metrics = RuntimeMetrics::new();
         let mut pending_checkpoint = None;
 
@@ -665,6 +785,7 @@ mod tests {
             &journal,
             &registry,
             &trace_registry,
+            &series_registry,
             None,
             &config,
             &mut pending_checkpoint,
@@ -710,6 +831,7 @@ mod tests {
         let registry = PartRegistry::new();
         let trace_memtable = journal.trace_memtable();
         let trace_registry = TraceRegistry::new(registry.operation_lock());
+        let series_registry = SeriesRegistry::new(registry.operation_lock());
         let mut pending_checkpoint = None;
 
         // Force write_checkpoint's temporary-file creation to fail.
@@ -722,6 +844,7 @@ mod tests {
             &journal,
             &registry,
             &trace_registry,
+            &series_registry,
             None,
             &config,
             &mut pending_checkpoint,

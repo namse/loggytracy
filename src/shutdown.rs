@@ -158,6 +158,7 @@ pub struct FinalizeContext {
     pub journal: Arc<Journal>,
     pub registry: Arc<PartRegistry>,
     pub trace_registry: Arc<TraceRegistry>,
+    pub series_registry: Arc<crate::series_registry::SeriesRegistry>,
     pub remote_cache: Option<Arc<RemoteCache>>,
     pub config: Arc<Config>,
 }
@@ -224,7 +225,8 @@ where
         let pending_bytes = context
             .memtable
             .approximate_size()
-            .saturating_add(context.trace_memtable.approximate_size());
+            .saturating_add(context.trace_memtable.approximate_size())
+            .saturating_add(context.journal.series_memtable().approximate_size());
         context
             .shutdown
             .set_pending_flush_bytes(pending_bytes as u64);
@@ -235,6 +237,7 @@ where
             journal: &context.journal,
             registry: &context.registry,
             trace_registry: &context.trace_registry,
+            series_registry: &context.series_registry,
             remote_cache: context.remote_cache.as_deref(),
             config: &context.config,
             pending_checkpoint: &mut pending_checkpoint,

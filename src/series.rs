@@ -54,6 +54,13 @@ impl SeriesLabels {
         Self(bytes.into())
     }
 
+    /// Rehydrate from stored canonical bytes (a part's catalog). The bytes
+    /// crossed a checksum, not a validator — callers that read them from disk
+    /// decode `pairs()` once to fail early on corruption.
+    pub fn from_canonical(bytes: Vec<u8>) -> Self {
+        Self(bytes.into())
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }

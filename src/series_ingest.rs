@@ -1586,6 +1586,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_flushes_to_a_metric_part_and_reloads_after_restart() {
+        let config = Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("loggytracy-metric-flush-{}", uuid::Uuid::new_v4())),
+            ..Config::default()
+        };
+        let (service, series_memtable, journal) = service_over(config.clone());
+        service
+            .export(tenant_request(small_request()))
+            .await
+            .unwrap();
+        let live = series_memtable.sorted_samples(&test_tenant()).unwrap();
+
+        let registry = crate::part_registry::PartRegistry::new();
+        let trace_registry = crate::trace_registry::TraceRegistry::new(registry.operation_lock());
+        let series_registry =
+            crate::series_registry::SeriesRegistry::new(registry.operation_lock());
+        let mut pending_checkpoint = None;
+        crate::flush::force_flush_pass(crate::flush::ForceFlush {
+            memtable: &crate::memtable::MemTable::new(),
+            trace_memtable: &journal.trace_memtable(),
+            journal: &journal,
+            registry: &registry,
+            trace_registry: &trace_registry,
+            series_registry: &series_registry,
+            remote_cache: None,
+            config: &config,
+            pending_checkpoint: &mut pending_checkpoint,
+        })
+        .await
+        .unwrap();
+        assert!(series_memtable.is_empty(), "the samples left for the part");
+        assert_eq!(
+            series_memtable.active_series(&test_tenant()),
+            1,
+            "the series state survives its samples' flush"
+        );
+        assert_eq!(series_registry.part_count(), 1);
+        assert!(
+            series_registry.tenant_stored_bytes(&test_tenant()) > 0,
+            "the quota census sees the metric bytes"
+        );
+
+        // A restart discovers the part from disk and can read the samples back.
+        let restored = crate::series_registry::SeriesRegistry::load_from_disk(
+            &config.data_dir.join("metrics"),
+            registry.operation_lock(),
+        )
+        .unwrap();
+        assert_eq!(restored.part_count(), 1);
+        let reader = restored.snapshot().into_iter().next().unwrap();
+        let catalog = reader.tenant_catalog(&test_tenant());
+        assert_eq!(catalog.len(), 1);
+        let stored = reader.read_series(&catalog[0]).unwrap();
+        assert_eq!(&stored, live.values().next().unwrap());
+        // And the WAL was retired: a replay after the flush puts nothing back.
+        let replayed = SeriesMemTable::new();
+        crate::journal::replay_with_signals(
+            journal.wal_path(),
+            journal.ckpt_path(),
+            &crate::memtable::MemTable::new(),
+            &crate::trace::TraceMemTable::new(),
+            &replayed,
+        )
+        .unwrap();
+        assert!(replayed.is_empty());
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[tokio::test]
     async fn export_rejects_a_timestamp_outside_the_window() {
         let config = Config {
             data_dir: std::env::temp_dir()

@@ -153,12 +153,9 @@ impl Journal {
 
     /// An OTLP metrics export: `data` is the encoded
     /// `ExportMetricsServiceRequest`, `samples` what `series_ingest` already
-    /// decomposed for the memtable.
-    ///
-    /// Durability caveat until the M14 flush threading lands (Phase 5): the
-    /// checkpoint/flush cycle does not yet know about metric parts, so a WAL
-    /// compaction can retire metric records whose samples exist only in
-    /// memory. That is why Phase 5 precedes any deployment of the signal.
+    /// decomposed for the memtable. The checkpoint snapshots the series
+    /// memtable with the other two, so a WAL prefix is only retired once the
+    /// samples in it are durable in metric parts.
     pub async fn append_metrics(
         &self,
         tenant: TenantId,
@@ -553,11 +550,13 @@ async fn writer_loop(
             let offset = good_len;
             let snapshot = memtable.begin_flush();
             let trace_snapshot = trace_memtable.begin_flush();
+            let series_snapshot = series_memtable.begin_flush();
             metrics.checkpoint.observe(checkpoint_started.elapsed());
             let _ = done.send(Ok(CheckpointSnapshot {
                 offset,
                 snapshot,
                 trace_snapshot,
+                series_snapshot,
             }));
         }
 

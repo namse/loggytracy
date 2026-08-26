@@ -37,6 +37,8 @@ mod router;
 mod runtime_error;
 pub mod series;
 mod series_ingest;
+mod series_part;
+pub mod series_registry;
 mod shutdown;
 mod startup;
 pub mod tenant;

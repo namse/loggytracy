@@ -102,6 +102,9 @@ pub fn recover_with_signals(
     let traces_root = config.data_dir.join("traces");
     std::fs::create_dir_all(&traces_root).map_err(|e| e.to_string())?;
     cleanup_tmp(&traces_root)?;
+    let metrics_root = config.data_dir.join("metrics");
+    std::fs::create_dir_all(&metrics_root).map_err(|e| e.to_string())?;
+    cleanup_tmp(&metrics_root)?;
 
     let wal_path = config.data_dir.join("journal.wal");
     let ckpt_path = config.data_dir.join("journal.ckpt");
@@ -249,6 +252,15 @@ pub async fn run(config: Arc<Config>) {
         }
         .unwrap_or_else(|e| panic!("failed to load trace parts: {e}")),
     );
+    // Local discovery only until the metric object-storage lifecycle lands
+    // (M14 Phase 6); the manifest arm joins then.
+    let series_registry = Arc::new(
+        crate::series_registry::SeriesRegistry::load_from_disk(
+            &config.data_dir.join("metrics"),
+            parts.operation_lock(),
+        )
+        .unwrap_or_else(|e| panic!("failed to load metric parts: {e}")),
+    );
     let remote_cache = object_storage
         .as_ref()
         .map(|storage| Arc::new(RemoteCache::new(storage.clone(), parts_root.clone())));
@@ -316,6 +328,7 @@ pub async fn run(config: Arc<Config>) {
     let finalize_journal = journal.clone();
     let finalize_parts = parts.clone();
     let finalize_trace_registry = trace_registry.clone();
+    let finalize_series_registry = series_registry.clone();
     let finalize_remote_cache = remote_cache.clone();
     let finalize_config = config.clone();
     let finalize_shutdown = shutdown.clone();
@@ -326,6 +339,7 @@ pub async fn run(config: Arc<Config>) {
         let registry = parts.clone();
         let trace_memtable = journal.trace_memtable();
         let trace_registry = trace_registry.clone();
+        let series_registry = series_registry.clone();
         let config = config.clone();
         let task_health = flush_healthy.clone();
         let monitor_health = flush_healthy.clone();
@@ -339,6 +353,7 @@ pub async fn run(config: Arc<Config>) {
                 journal,
                 registry,
                 trace_registry,
+                series_registry,
                 cache,
                 config,
                 task_health,
@@ -530,6 +545,7 @@ pub async fn run(config: Arc<Config>) {
             journal,
             parts: parts.clone(),
             trace_parts: trace_registry,
+            series_parts: series_registry,
             flush_healthy,
             merge_healthy,
             retention_healthy,
@@ -658,6 +674,7 @@ pub async fn run(config: Arc<Config>) {
         journal: finalize_journal,
         registry: finalize_parts,
         trace_registry: finalize_trace_registry,
+        series_registry: finalize_series_registry,
         remote_cache: finalize_remote_cache,
         config: finalize_config,
     })

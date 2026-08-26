@@ -228,7 +228,9 @@ tracks execution state per phase.
   `max_active_series` decided per datapoint, refused datapoints filtered out
   of the WAL bytes so replay cannot resurrect them, idle eviction lazy under
   pressure and on demand, ladder counters on `/metrics`.
-- [ ] Phase 5 — parts, registry, flush threading, recovery.
+- [x] Phase 5 — parts (`LMS1`/`LMI1` + bloom + meta), registry with the
+  quota census, the flush/checkpoint/force-flush threading, local recovery;
+  the WAL retires only once metric samples are durable in parts.
 - [ ] Phase 6 — object storage, retention, the compactor.
 - [ ] Phase 7 — the read path and its `QUERY_API.md` sections.
 - [ ] Phase 8 — bed completion and the memory-gate scenario.
