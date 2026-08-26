@@ -187,6 +187,17 @@ run_metric_phase() {
     "$LOAD_BIN" >/dev/null || echo "  ($phase verdict was not PASS for $target; the result file says why)" >&2
 }
 
+# Tenant lifecycle goes through the admin API — the pushed policy *is* the
+# registry, and an instance with no pushed tenants serves nobody. Onboard the
+# verification tenant with infinite retention so nothing expires mid-run.
+if [[ " $METRICS_TARGETS " == *" loggytracy "* ]]; then
+  say "onboarding tenant verify-metrics"
+  curl -sf -X PUT \
+    -d '{"retention":"infinite"}' \
+    "http://127.0.0.1:$(port_of loggytracy)/loggytracy/api/v1/admin/tenants/verify-metrics/retention" \
+    >/dev/null
+fi
+
 for TARGET in $METRICS_TARGETS; do
   run_metric_phase metric-seed "$TARGET"
 done

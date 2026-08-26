@@ -73,6 +73,7 @@ fn ingest_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/logs", post(otlp_http::logs))
         .route("/v1/traces", post(otlp_http::traces))
+        .route("/v1/metrics", post(otlp_http::metrics))
         .layer(DefaultBodyLimit::max(otlp_http::MAX_OTLP_HTTP_BODY_BYTES))
         // Outside the body limit deliberately, so it runs *before* the body is
         // collected. A handler takes `body: Bytes`, which means axum has already

@@ -197,10 +197,13 @@ over the limit of {limit}; too many pushes are in flight at once"
         }
     }
 
-    /// Bytes accepted but not yet in a part, across both memtables.
+    /// Bytes accepted but not yet in a part, across all three memtables. One
+    /// process, one memory budget: a signal missing from this sum could
+    /// overrun the limit while the gate reported room.
     pub fn buffered_bytes(&self) -> u64 {
         (self.journal.log_memtable().approximate_size() as u64)
             .saturating_add(self.journal.trace_memtable().approximate_size() as u64)
+            .saturating_add(self.journal.series_memtable().approximate_size() as u64)
     }
 
     /// Refuse the write when the durable path is already behind.

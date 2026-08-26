@@ -82,6 +82,20 @@ pub fn recover_with_traces(
     memtable: &MemTable,
     trace_memtable: &trace::TraceMemTable,
 ) -> Result<journal::ReplayReport, String> {
+    recover_with_signals(
+        config,
+        memtable,
+        trace_memtable,
+        &crate::series::SeriesMemTable::new(),
+    )
+}
+
+pub fn recover_with_signals(
+    config: &Config,
+    memtable: &MemTable,
+    trace_memtable: &trace::TraceMemTable,
+    series_memtable: &crate::series::SeriesMemTable,
+) -> Result<journal::ReplayReport, String> {
     let parts_root = config.data_dir.join("parts");
     std::fs::create_dir_all(&parts_root).map_err(|e| e.to_string())?;
     cleanup_tmp(&parts_root)?;
@@ -91,7 +105,13 @@ pub fn recover_with_traces(
 
     let wal_path = config.data_dir.join("journal.wal");
     let ckpt_path = config.data_dir.join("journal.ckpt");
-    let replay = journal::replay_reporting(&wal_path, &ckpt_path, memtable, trace_memtable)?;
+    let replay = journal::replay_reporting(
+        &wal_path,
+        &ckpt_path,
+        memtable,
+        trace_memtable,
+        series_memtable,
+    )?;
     let (ckpt_start, replay_end) = (replay.checkpoint, replay.end_offset);
     if replay.records > 0 {
         // Said at WARN rather than INFO. Delivery is at-least-once, so these
@@ -146,8 +166,9 @@ pub async fn run(config: Arc<Config>) {
     let clock = crate::clock::Clock::system();
     let memtable = Arc::new(MemTable::new());
     let trace_memtable = Arc::new(trace::TraceMemTable::new());
+    let series_memtable = Arc::new(crate::series::SeriesMemTable::new());
 
-    let replay = recover_with_traces(&config, &memtable, &trace_memtable)
+    let replay = recover_with_signals(&config, &memtable, &trace_memtable, &series_memtable)
         .unwrap_or_else(|e| panic!("recovery failed: {e}"));
 
     let object_storage = config
@@ -233,7 +254,7 @@ pub async fn run(config: Arc<Config>) {
         .map(|storage| Arc::new(RemoteCache::new(storage.clone(), parts_root.clone())));
 
     let journal = Arc::new(
-        Journal::spawn_with_traces(&config, memtable.clone(), trace_memtable)
+        Journal::spawn_with_signals(&config, memtable.clone(), trace_memtable, series_memtable)
             .expect("failed to initialize journal"),
     );
 
@@ -561,11 +582,20 @@ pub async fn run(config: Arc<Config>) {
         tenant_quota.clone(),
         tenant_policy.clone(),
     );
-    // Logs and traces share the listener, the journal and the drain signal.
-    // `ARCHITECTURE.md` has described OTLP as an ingest protocol from the
-    // start; until this was registered, a collector exporting logs to it got
-    // `UNIMPLEMENTED`.
+    // Logs, traces and metrics share the listener, the journal and the drain
+    // signal. `ARCHITECTURE.md` has described OTLP as an ingest protocol from
+    // the start; until each service was registered, a collector exporting that
+    // signal got `UNIMPLEMENTED`.
     let otlp_log_service = log_ingest::LogIngestService::new(
+        otlp_journal.clone(),
+        shutdown.clone(),
+        config.clone(),
+        ingest_gate.clone(),
+        tenant_quota.clone(),
+        tenant_policy.clone(),
+        clock.clone(),
+    );
+    let otlp_metric_service = crate::series_ingest::MetricsIngestService::new(
         otlp_journal,
         shutdown.clone(),
         config.clone(),
@@ -580,6 +610,7 @@ pub async fn run(config: Arc<Config>) {
         let result = tonic::transport::Server::builder()
             .add_service(otlp_service.into_server())
             .add_service(otlp_log_service.into_server())
+            .add_service(otlp_metric_service.into_server())
             .serve_with_shutdown(otlp_addr, async move {
                 crate::shutdown::wait_for_drain(&mut otlp_drain).await;
             })

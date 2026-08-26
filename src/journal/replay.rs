@@ -8,6 +8,17 @@ pub fn replay(
     replay_with_traces(wal_path, ckpt_path, memtable, &traces)
 }
 
+pub fn replay_with_signals(
+    wal_path: &Path,
+    ckpt_path: &Path,
+    memtable: &MemTable,
+    trace_memtable: &TraceMemTable,
+    series_memtable: &SeriesMemTable,
+) -> Result<(u64, u64), String> {
+    replay_reporting(wal_path, ckpt_path, memtable, trace_memtable, series_memtable)
+        .map(|report| (report.checkpoint, report.end_offset))
+}
+
 /// What a replay put back, so a restart can be told from a clean start.
 ///
 /// Delivery is at-least-once by design: the checkpoint advances after a flush,
@@ -31,8 +42,8 @@ pub fn replay_with_traces(
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
 ) -> Result<(u64, u64), String> {
-    replay_reporting(wal_path, ckpt_path, memtable, trace_memtable)
-        .map(|report| (report.checkpoint, report.end_offset))
+    let series = SeriesMemTable::new();
+    replay_with_signals(wal_path, ckpt_path, memtable, trace_memtable, &series)
 }
 
 pub fn replay_reporting(
@@ -40,6 +51,7 @@ pub fn replay_reporting(
     ckpt_path: &Path,
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
+    series_memtable: &SeriesMemTable,
 ) -> Result<ReplayReport, String> {
     recover_unfinished_compaction(wal_path, ckpt_path).map_err(|e| e.to_string())?;
     let checkpoint = read_checkpoint(ckpt_path).map_err(|e| e.to_string())?;
@@ -52,6 +64,7 @@ pub fn replay_reporting(
         checkpoint,
         memtable,
         trace_memtable,
+        series_memtable,
         &mut report,
     )?;
     report.end_offset = end;
@@ -88,6 +101,7 @@ fn replay_from(
     checkpoint: u64,
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
+    series_memtable: &SeriesMemTable,
     report: &mut ReplayReport,
 ) -> Result<u64, String> {
     if !wal_path.exists() {
@@ -194,6 +208,15 @@ compression, delete the data directory and re-ingest"
                     report.entries +=
                         replay_otlp_log_record(&tenant, &payload, offset, memtable)?;
                 }
+                TENANT_RECORD_KIND_OTLP_METRICS => {
+                    let payload = decompress_payload(payload).map_err(|e| {
+                        format!(
+                            "{e} at offset {offset}; if this WAL predates journal \
+compression, delete the data directory and re-ingest"
+                        )
+                    })?;
+                    replay_otlp_metric_record(&tenant, &payload, offset, series_memtable)?;
+                }
                 other => {
                     return Err(format!(
                         "unsupported tenant journal record kind {other} at offset {offset}"
@@ -255,6 +278,32 @@ fn replay_trace_record(
     let spans = normalize_request(tenant, request)
         .map_err(|e| format!("trace record invalid at offset {offset}: {e}"))?;
     trace_memtable.insert(spans);
+    Ok(())
+}
+
+/// The payload is the export as it arrived, re-run through the same pure
+/// decomposition live ingest used, then inserted in WAL order — which is what
+/// makes the delta-to-cumulative fold reproduce the totals it produced the
+/// first time. An `EmptyRequest` is a logged bug, not a refused startup, on
+/// the same reasoning as the log record's.
+fn replay_otlp_metric_record(
+    tenant: &TenantId,
+    payload: &[u8],
+    offset: u64,
+    series_memtable: &SeriesMemTable,
+) -> Result<(), String> {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    let request = ExportMetricsServiceRequest::decode(payload)
+        .map_err(|e| format!("OTLP metrics protobuf decode failed at offset {offset}: {e}"))?;
+    let samples = match crate::series_ingest::normalize_request(tenant, &request) {
+        Ok(samples) => samples,
+        Err(crate::series_ingest::MetricIngestError::EmptyRequest) => {
+            tracing::warn!(offset, "empty OTLP metrics record in journal, skipping");
+            return Ok(());
+        }
+        Err(e) => return Err(format!("OTLP metrics record invalid at offset {offset}: {e}")),
+    };
+    series_memtable.insert(samples);
     Ok(())
 }
 

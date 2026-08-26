@@ -8,6 +8,20 @@ impl Journal {
         memtable: Arc<MemTable>,
         trace_memtable: Arc<TraceMemTable>,
     ) -> Result<Self, IoError> {
+        Self::spawn_with_signals(
+            config,
+            memtable,
+            trace_memtable,
+            Arc::new(SeriesMemTable::new()),
+        )
+    }
+
+    pub fn spawn_with_signals(
+        config: &Config,
+        memtable: Arc<MemTable>,
+        trace_memtable: Arc<TraceMemTable>,
+        series_memtable: Arc<SeriesMemTable>,
+    ) -> Result<Self, IoError> {
         let dir = &config.data_dir;
         std::fs::create_dir_all(dir)?;
         let wal_path = dir.join(WAL_FILE);
@@ -39,6 +53,7 @@ impl Journal {
         let ckpt_path_clone = ckpt_path.clone();
         let writer_health = healthy.clone();
         let trace_memtable_clone = trace_memtable.clone();
+        let series_memtable_clone = series_memtable.clone();
         let writer_backlog = backlog.clone();
         let writer_memtable = memtable.clone();
         let writer_metrics = metrics.clone();
@@ -49,6 +64,7 @@ impl Journal {
                 &ckpt_path_clone,
                 writer_memtable,
                 trace_memtable_clone,
+                series_memtable_clone,
                 max_batch_bytes,
                 max_batch_ms,
                 &writer_backlog,
@@ -69,6 +85,7 @@ impl Journal {
             metrics,
             memtable,
             trace_memtable,
+            series_memtable,
             backlog,
         })
     }
@@ -105,8 +122,15 @@ impl Journal {
         entries: Vec<LogEntry>,
     ) -> Result<(), IoError> {
         let payload = compress_payload(&data)?;
-        self.send_append(TENANT_RECORD_KIND_OTLP_LOGS, payload, tenant, entries, Vec::new())
-            .await
+        self.send_append(
+            TENANT_RECORD_KIND_OTLP_LOGS,
+            payload,
+            tenant,
+            entries,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
     }
 
     pub async fn append_trace(
@@ -116,8 +140,41 @@ impl Journal {
         spans: Vec<TraceSpan>,
     ) -> Result<(), IoError> {
         let payload = compress_payload(&data)?;
-        self.send_append(TENANT_RECORD_KIND_TRACES, payload, tenant, Vec::new(), spans)
-            .await
+        self.send_append(
+            TENANT_RECORD_KIND_TRACES,
+            payload,
+            tenant,
+            Vec::new(),
+            spans,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// An OTLP metrics export: `data` is the encoded
+    /// `ExportMetricsServiceRequest`, `samples` what `series_ingest` already
+    /// decomposed for the memtable.
+    ///
+    /// Durability caveat until the M14 flush threading lands (Phase 5): the
+    /// checkpoint/flush cycle does not yet know about metric parts, so a WAL
+    /// compaction can retire metric records whose samples exist only in
+    /// memory. That is why Phase 5 precedes any deployment of the signal.
+    pub async fn append_metrics(
+        &self,
+        tenant: TenantId,
+        data: Vec<u8>,
+        samples: Vec<MetricSample>,
+    ) -> Result<(), IoError> {
+        let payload = compress_payload(&data)?;
+        self.send_append(
+            TENANT_RECORD_KIND_OTLP_METRICS,
+            payload,
+            tenant,
+            Vec::new(),
+            Vec::new(),
+            samples,
+        )
+        .await
     }
 
     async fn send_append(
@@ -127,6 +184,7 @@ impl Journal {
         tenant: TenantId,
         entries: Vec<LogEntry>,
         traces: Vec<TraceSpan>,
+        metric_samples: Vec<MetricSample>,
     ) -> Result<(), IoError> {
         let framed_len =
             TENANT_RECORD_PREFIX_SIZE + tenant.as_str().len() + payload.len();
@@ -150,6 +208,7 @@ impl Journal {
                 tenant,
                 entries,
                 traces,
+                metric_samples,
                 queued_at,
                 done: done_tx,
             })
@@ -166,6 +225,10 @@ impl Journal {
 
     pub fn trace_memtable(&self) -> Arc<TraceMemTable> {
         self.trace_memtable.clone()
+    }
+
+    pub fn series_memtable(&self) -> Arc<SeriesMemTable> {
+        self.series_memtable.clone()
     }
 
     pub async fn checkpoint(&self) -> Result<CheckpointSnapshot, IoError> {
@@ -230,6 +293,7 @@ async fn writer_loop(
     ckpt_path: &Path,
     memtable: Arc<MemTable>,
     trace_memtable: Arc<TraceMemTable>,
+    series_memtable: Arc<SeriesMemTable>,
     max_batch_bytes: usize,
     max_batch_ms: u64,
     backlog: &WalBacklog,
@@ -265,11 +329,21 @@ async fn writer_loop(
                 tenant,
                 entries,
                 traces,
+                metric_samples,
                 queued_at,
                 done,
             } => {
                 batch_bytes += framed_record_len(&tenant, &payload);
-                batch.push((kind, payload, tenant, entries, traces, queued_at, done));
+                batch.push((
+                    kind,
+                    payload,
+                    tenant,
+                    entries,
+                    traces,
+                    metric_samples,
+                    queued_at,
+                    done,
+                ));
                 // Take what has already arrived and write it. Waiting for more
                 // charged every push the full linger even when the channel was
                 // empty, which fixed single-connection throughput at
@@ -302,11 +376,21 @@ async fn writer_loop(
                             tenant,
                             entries,
                             traces,
+                            metric_samples,
                             queued_at,
                             done,
                         })) => {
                             batch_bytes += framed_record_len(&tenant, &payload);
-                            batch.push((kind, payload, tenant, entries, traces, queued_at, done));
+                            batch.push((
+                                kind,
+                                payload,
+                                tenant,
+                                entries,
+                                traces,
+                                metric_samples,
+                                queued_at,
+                                done,
+                            ));
                         }
                         Ok(Some(JournalCmd::Checkpoint { done })) => {
                             pending_checkpoint = Some(done);
@@ -338,7 +422,7 @@ async fn writer_loop(
             // against the same instant.
             let batch_started = Instant::now();
             let mut oldest_queued = batch_started;
-            for (_, _, _, _, _, queued_at, _) in &batch {
+            for (_, _, _, _, _, _, queued_at, _) in &batch {
                 metrics
                     .append_queue_wait
                     .observe(batch_started.saturating_duration_since(*queued_at));
@@ -350,7 +434,7 @@ async fn writer_loop(
                 .fetch_add(batch.len() as u64, Ordering::Relaxed);
             let wal_arena = crate::memprof::enter(crate::memprof::Arena::Wal);
             let mut buf = Vec::with_capacity(batch_bytes + batch.len() * RECORD_HEADER_SIZE);
-            for (kind, payload, tenant, _, _, _, _) in &batch {
+            for (kind, payload, tenant, _, _, _, _, _) in &batch {
                 // Framed here, straight into the batch buffer. The frame used
                 // to be its own prefix+tenant+payload Vec built on the ingest
                 // task, which copied every export once more than the write
@@ -409,9 +493,11 @@ async fn writer_loop(
                     // charged to the same arena its contents already are.
                     let _arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
                     let records = batch.len();
-                    for (_, _, tenant, entries, traces, _, done) in batch.drain(..) {
+                    for (_, _, tenant, entries, traces, metric_samples, _, done) in batch.drain(..)
+                    {
                         memtable.insert(tenant.clone(), entries);
                         trace_memtable.insert(traces);
+                        series_memtable.insert(metric_samples);
                         let _ = done.send(Ok(()));
                     }
                     let inserted = Instant::now();
@@ -441,7 +527,7 @@ async fn writer_loop(
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "journal write failed, truncating partial record");
-                    for (_, _, _, _, _, _, done) in batch.drain(..) {
+                    for (_, _, _, _, _, _, _, done) in batch.drain(..) {
                         let _ = done.send(Err(IoError::new(e.kind(), e.to_string())));
                     }
                     let recovered = async {

@@ -7,6 +7,9 @@ use axum::response::{IntoResponse, Response};
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
@@ -15,6 +18,7 @@ use prost014::Message;
 use crate::AppState;
 use crate::backpressure::IngestError;
 use crate::log_ingest::OtlpLogIngest;
+use crate::series_ingest::OtlpMetricIngest;
 use crate::trace_ingest::{MAX_OTLP_REQUEST_BYTES, OtlpTraceIngest};
 
 /// OTLP over HTTP.
@@ -175,6 +179,29 @@ pub async fn traces(
     let request: ExportTraceServiceRequest = encoding.decode(&body)?;
     ingest.accept(tenant, request).await?;
     Ok(encoding.encode(&ExportTraceServiceResponse::default()))
+}
+
+pub async fn metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, IngestError> {
+    let ingest = OtlpMetricIngest {
+        journal: &state.journal,
+        shutdown: &state.shutdown,
+        config: &state.config,
+        ingest_gate: &state.ingest_gate,
+        tenant_quota: &state.tenant_quota,
+        clock: &state.clock,
+    };
+    ingest.admit_transport()?;
+    let encoding = OtlpEncoding::from_headers(&headers)?;
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
+        .map_err(crate::tenant::TenantError::into_http)?;
+    ingest.admit_tenant(&tenant, body.len())?;
+    let request: ExportMetricsServiceRequest = encoding.decode(&body)?;
+    ingest.accept(tenant, request).await?;
+    Ok(encoding.encode(&ExportMetricsServiceResponse::default()))
 }
 
 /// Body limit for the OTLP HTTP routes, matching what the gRPC services accept

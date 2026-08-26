@@ -15,6 +15,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use crate::config::Config;
 use crate::memtable::{LogEntry, MemTable, MemTableSnapshot};
 use crate::metrics::LatencyHistogram;
+use crate::series::{MetricSample, SeriesMemTable};
 use crate::tenant::TenantId;
 use crate::trace::{ExportTraceServiceRequest, TraceMemTable, TraceSpan, normalize_request};
 
@@ -31,6 +32,9 @@ const TENANT_RECORD_KIND_TRACES: u8 = 1;
 /// pattern traces have used from the start: replay re-normalizes instead of
 /// the ingest path materializing a second message just so the WAL can hold it.
 const TENANT_RECORD_KIND_OTLP_LOGS: u8 = 2;
+/// The third signal (M14, issue #8): the raw `ExportMetricsServiceRequest`,
+/// replayed through the same pure decomposition live ingest uses.
+const TENANT_RECORD_KIND_OTLP_METRICS: u8 = 3;
 const TENANT_RECORD_PREFIX_SIZE: usize = TENANT_RECORD_MAGIC.len() + 2;
 
 /// Where a compaction crash is simulated.
@@ -170,6 +174,7 @@ enum JournalCmd {
         tenant: TenantId,
         entries: Vec<LogEntry>,
         traces: Vec<TraceSpan>,
+        metric_samples: Vec<MetricSample>,
         /// When the pushing task handed this to the channel. Every push in the
         /// process funnels through one writer task, so the interval between
         /// this and the batch that carries it is the queue in front of that
@@ -193,6 +198,7 @@ type AppendBatchItem = (
     TenantId,
     Vec<LogEntry>,
     Vec<TraceSpan>,
+    Vec<MetricSample>,
     Instant,
     oneshot::Sender<Result<(), IoError>>,
 );
@@ -250,6 +256,7 @@ pub struct Journal {
     metrics: Arc<JournalMetrics>,
     memtable: Arc<MemTable>,
     trace_memtable: Arc<TraceMemTable>,
+    series_memtable: Arc<SeriesMemTable>,
     backlog: Arc<WalBacklog>,
 }
 

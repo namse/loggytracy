@@ -218,8 +218,9 @@ tracks execution state per phase.
 - [x] Phase 1 — the ruler's paper half: the plan document, the `VISION.md`
   metrics claim (the "does not do metrics at all" sentence retired), the
   `ARCHITECTURE.md` M14 row, this section, the `todo.md` M14 section.
-- [ ] Phase 2 — the ruler's iron half: metric workload generator,
-  `MetricShape` matrix, digest classes, VictoriaMetrics compose target,
+- [x] Phase 2 — the ruler's iron half: metric workload generator,
+  `MetricShape` matrix, digest classes, VictoriaMetrics compose target
+  (v1.150.0, behavior pinned by a live one-sided smoke run),
   `compare/run_metrics.sh` one-sided.
 - [ ] Phase 3 — model, Gorilla, ingest, journal kind 3, replay-equals-live.
 - [ ] Phase 4 — series index and the degradation ladder.

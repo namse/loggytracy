@@ -206,6 +206,14 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
       decided with the user, 2026-08-26). Revisiting this means revisiting the bed's exact-agreement
       digests, so it does not happen casually.
 
+Found while building the metrics bed, and not a metrics defect: **the log bed's next rerun will 403 at
+the seed phase.** The env tenant allowlist was removed after the last published run — the pushed policy
+is now the registry and an instance with no pushed tenants serves nobody — and `compare/run.sh` never
+onboards `verify-tenant-000` through the admin API. `run_metrics.sh` onboards its tenant explicitly
+(measured: metric-seed against a fresh instance answered `403 tenant verify-metrics is not served`
+until it did); `run.sh` needs the same call before its next rerun, which M12's deferred smoke run will
+hit first.
+
 ## M8 — the ruler (precondition for everything after it)
 
 No optimization starts before this. Every performance number currently in the repository was produced by a
