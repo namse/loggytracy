@@ -3468,3 +3468,82 @@ async fn trace_attribute_values_respect_the_window_and_are_narrowed_by_filters()
         .collect();
     assert_eq!(values, ["/items"]);
 }
+
+// --- Trace budgets and refusals, end to end ---
+
+#[tokio::test]
+async fn a_trace_scan_that_finds_no_pool_memory_is_a_429_and_counts_exhaustion() {
+    let data_dir = temp_dir();
+    // One reservation chunk of shared budget; the spans below estimate past it.
+    let state = trace_state(&data_dir, |config| {
+        config.query_memory_budget_bytes = crate::query_memory::RESERVATION_CHUNK_BYTES;
+    });
+    let trace_id = "ab".repeat(16);
+    let spans: Vec<_> = (0..12)
+        .map(|at| {
+            let mut span = trace_span_at(&trace_id, &format!("s{at:02}"), 1_000 + at, ("k", "v"));
+            span.span.name = "n".repeat(1024 * 1024);
+            span
+        })
+        .collect();
+    state.journal.trace_memtable().insert(spans);
+
+    let (status, body) =
+        first_party_get(state.clone(), "/loggytracy/api/v1/traces?start=0&end=10").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(body.contains(crate::query_memory::EXHAUSTED_PREFIX), "{body}");
+    assert_eq!(
+        state.query_memory_pool.exhausted(),
+        1,
+        "the refusal stays visible after the client was told the right thing"
+    );
+}
+
+#[tokio::test]
+async fn a_search_past_the_span_budget_is_a_413_too() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |config| config.max_trace_spans = 2);
+    state.journal.trace_memtable().insert(vec![
+        trace_span_at(&"aa".repeat(16), "s1", 1_000, ("k", "v")),
+        trace_span_at(&"bb".repeat(16), "s2", 2_000, ("k", "v")),
+        trace_span_at(&"cc".repeat(16), "s3", 3_000, ("k", "v")),
+    ]);
+    let (status, body) =
+        first_party_get(state, "/loggytracy/api/v1/traces?start=0&end=10").await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.contains("trace query exceeds"), "{body}");
+}
+
+#[tokio::test]
+async fn a_tenant_without_a_pushed_policy_is_refused_on_every_trace_path() {
+    let data_dir = temp_dir();
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    let memtable = Arc::new(MemTable::new());
+    let parts = Arc::new(PartRegistry::new());
+    let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+        parts.operation_lock(),
+    ));
+    let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+    let state = crate::test_support::state_with_tenant_policy(
+        config,
+        memtable,
+        journal,
+        parts,
+        trace_parts,
+        None,
+        Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test()),
+    );
+
+    for path in [
+        "/loggytracy/api/v1/traces?start=0&end=10".to_string(),
+        format!("/loggytracy/api/v1/traces/{}", "ab".repeat(16)),
+        "/loggytracy/api/v1/traces/attributes?start=0&end=10".to_string(),
+        "/loggytracy/api/v1/traces/attributes/k/values?start=0&end=10".to_string(),
+    ] {
+        let (status, body) = first_party_get(state.clone(), &path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+    }
+}

@@ -48,7 +48,7 @@ elsewhere in these docs.
 | Physical format | Parquet (dictionary + zstd) + sidecar index files |
 | Indexes | Stream index + per-block trigram bloom filter (no inverted index) |
 | Query language | None — a query is a flat AND of URL filters; refusals teach the accepted set |
-| API | First-party flat-filter query API ([`QUERY_API.md`](QUERY_API.md)); the Loki and Tempo compatibility surfaces were removed with the read-path decision (issue #3, M12). Traces are ingested and stored but unreadable until the first-party trace API (M13) |
+| API | First-party flat-filter query API for logs and traces ([`QUERY_API.md`](QUERY_API.md)); the Loki and Tempo compatibility surfaces were removed with the read-path decision (issue #3, M12), and the first-party trace endpoints (M13, issue #7) are their replacement |
 | Ingest protocols | **OTLP only**, over gRPC (`:4317`) or HTTP (`POST /v1/logs`, `/v1/traces`), traces and logs. Loki push is removed — see [`VISION.md`](VISION.md), "Ingest is OTLP" |
 | Query protocol | **First-party HTTP API** (GET + URL filters, NDJSON out). The viewer is the fn0 control plane behind the gateway; agents drive the same endpoints with `curl` |
 | Transport security | **TLS is unsupported.** Only plain HTTP/gRPC is provided; a reverse proxy or service mesh handles end-to-end encryption |
@@ -341,7 +341,7 @@ refused with a message that teaches the accepted set.
 | M10 | **Declared memory budget** ([`VISION.md`](VISION.md) I). One budget knob, arena accounting, honest memtable metering, sidecars inside the budget, admission by budget rather than by slot | The engine runs a sustained mixed load under a declared budget and a test asserts peak RSS stays under it |
 | M11 | **Bounded copies and deep pruning** ([`VISION.md`](VISION.md) II, III). `Arc<Labels>` end to end, the two free memcpys removed, single sort and single parse; streaming top-K execution, projection pushdown, cached Parquet footers, regex literal extraction | The M8 benchmarks move, and M9's table is regenerated against the same Loki build |
 | M12 | **The first-party read path** (issue #3, [`M12_IMPLEMENTATION_PLAN.md`](M12_IMPLEMENTATION_PLAN.md)). Flat-filter GET + NDJSON log query API (`/logs`, histogram, attributes, tail, delete); Loki and Tempo surfaces removed; comparison bed ported; `QUERY_API.md` pinned by tests | Every read goes through the first-party API, no `/loki` or Tempo route remains, and the reduced digests still agree on a bed smoke run |
-| M13 | **Trace read path.** First-party trace query API (search + trace-by-id, same parameter grammar) for the fn0 console; ends the trace read gap opened by the M12 Tempo removal | Traces are queryable again through the first-party API |
+| M13 | **Trace read path** (issue #7). First-party trace query API (search, trace-by-id, autocomplete — same parameter grammar, plus the reserved duration comparison); trace scans joined the shared query memory pool; ended the trace read gap opened by the M12 Tempo removal | Traces are queryable again through the first-party API |
 
 ## References
 

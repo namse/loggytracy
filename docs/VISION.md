@@ -580,10 +580,10 @@ written down for the shape that is no longer the headline.
 - **No Loki, no LogQL, no Grafana compatibility.** The read-path decision
   (issue #3): the viewer is the fn0 control plane speaking the first-party API,
   and a compatibility surface with no remaining consumer was an obligation with
-  no customer. The Tempo surface went with it — traces are write-only until the
-  first-party trace API (M13). If external demand ever materializes, a Grafana
-  datasource plugin over the first-party API is the cheap insurance; the compat
-  endpoints do not come back.
+  no customer. The Tempo surface went with it, and the first-party trace API
+  (M13, issue #7) is its replacement. If external demand ever materializes, a
+  Grafana datasource plugin over the first-party API is the cheap insurance;
+  the compat endpoints do not come back.
 - **No cluster, no replication, no in-process query UI, no separate index
   store.**
   Single writer is the design, and writer fencing enforces it. Every guarantee

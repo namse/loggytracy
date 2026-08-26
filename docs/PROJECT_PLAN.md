@@ -189,6 +189,26 @@ acceptance checklist lives there; this file tracks execution state.
 - [x] Phases 11–12 — Loki surface removed (LogQL parser, metric evaluator,
   format stages, dead knobs — the trace query knobs included), docs swept.
 
+## M13 acceptance checklist
+
+The scope is issue #7; the executed plan and its design decisions are in the
+issue and the commit messages of the five phases.
+
+- [x] Phase 1 — the shared `attr` grammar learns `>=`, `<=`, `>`, `<`; every
+  log endpoint refuses comparisons with a teaching error.
+- [x] Phase 2 — the trace engine plumbing returns (five knobs, scan
+  semaphore, `RemoteDomain::Traces`, `canonical_trace_id`) and
+  `GET /traces/{trace_id}` answers flat span NDJSON; trace scans reserve from
+  the shared query memory pool.
+- [x] Phase 3 — `GET /traces` search: one overlap rule for both scan halves,
+  per-span duration comparisons (`duration`-only, unit required), newest-first
+  summaries built from the windowed spans.
+- [x] Phase 4 — autocomplete (`/traces/attributes`, values), answered from
+  the same bounded window scan and priced honestly in `QUERY_API.md`.
+- [x] Phase 5 — budget refusals proven end to end (pool exhaustion 429 with
+  the counter, span budget 413, per-tenant policy refusal on all four
+  routes); docs swept of the "unreadable until M13" gap.
+
 ## Completion protocol
 
 For each pending milestone, replace broad outcome text with a concrete
