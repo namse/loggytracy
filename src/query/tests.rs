@@ -2869,6 +2869,8 @@ fn every_query_api_route_and_param_is_documented() {
         DELETE_PARAMS,
         DELETE_FILTER_PARAMS,
         TRACE_SEARCH_PARAMS,
+        TRACE_ATTRIBUTE_KEYS_PARAMS,
+        TRACE_ATTRIBUTE_VALUES_PARAMS,
     ] {
         for name in params {
             let documented = format!("`{name}`");
@@ -3386,4 +3388,83 @@ async fn trace_search_reads_the_memtable_and_the_parts_through_one_window_rule()
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["span_count"], 2);
     assert_eq!(rows[0]["start"], (3 * SECOND_NS).to_string().as_str());
+}
+
+// --- The first-party API: `/traces/attributes` and `/traces/attributes/{key}/values` ---
+
+#[tokio::test]
+async fn trace_attribute_keys_come_from_the_window_and_include_the_intrinsics() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    let mut span = trace_span_at(&"aa".repeat(16), "s1", 1_000, ("http.route", "/items"));
+    span.resource = Some(opentelemetry_proto::tonic::resource::v1::Resource {
+        attributes: vec![otlp_kv("service.name", "api"), otlp_kv("env", "prod")],
+        ..Default::default()
+    });
+    state.journal.trace_memtable().insert(vec![
+        span,
+        // Outside the window: its attribute key must not appear.
+        trace_span_at(&"bb".repeat(16), "s2", 20_000_000_000_000, ("outside", "x")),
+    ]);
+
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/traces/attributes?start=0&end=10",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let keys: Vec<String> = ndjson_rows(&body)
+        .iter()
+        .map(|row| row["key"].as_str().unwrap().to_string())
+        .collect();
+    for expected in ["duration", "name", "status", "service.name", "http.route", "env"] {
+        assert!(keys.contains(&expected.to_string()), "{keys:?}");
+    }
+    assert!(!keys.contains(&"outside".to_string()), "{keys:?}");
+}
+
+#[tokio::test]
+async fn trace_attribute_values_respect_the_window_and_are_narrowed_by_filters() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    let mut api_span = trace_span_at(&"aa".repeat(16), "s1", 1_000, ("http.route", "/items"));
+    api_span.resource = Some(opentelemetry_proto::tonic::resource::v1::Resource {
+        attributes: vec![otlp_kv("service.name", "api")],
+        ..Default::default()
+    });
+    let mut worker_span = trace_span_at(&"bb".repeat(16), "s2", 2_000, ("http.route", "/jobs"));
+    worker_span.resource = Some(opentelemetry_proto::tonic::resource::v1::Resource {
+        attributes: vec![otlp_kv("service.name", "worker")],
+        ..Default::default()
+    });
+    state.journal.trace_memtable().insert(vec![
+        api_span,
+        worker_span,
+        trace_span_at(&"cc".repeat(16), "s3", 20_000_000_000_000, ("http.route", "/outside")),
+    ]);
+
+    let (status, body) = first_party_get(
+        state.clone(),
+        "/loggytracy/api/v1/traces/attributes/http.route/values?start=0&end=10",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let values: Vec<String> = ndjson_rows(&body)
+        .iter()
+        .map(|row| row["value"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(values, ["/items", "/jobs"]);
+
+    // A placed filter narrows the offer to traces it matches.
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/traces/attributes/http.route/values?start=0&end=10&attr=service.name=api",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let values: Vec<String> = ndjson_rows(&body)
+        .iter()
+        .map(|row| row["value"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(values, ["/items"]);
 }

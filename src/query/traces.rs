@@ -83,27 +83,14 @@ pub async fn traces_search(
         parse_trace_filter_params(raw.as_deref().unwrap_or(""), now_ns, TRACE_SEARCH_PARAMS)
             .map_err(ApiError::bad_request)?;
 
-    let end_ns = params.end_ns.unwrap_or(now_ns);
-    let start_ns = params.start_ns.unwrap_or_else(|| {
-        state
-            .config
-            .max_query_range
-            .map(duration_to_i64_ns)
-            .map(|range| end_ns.saturating_sub(range))
-            .unwrap_or(i64::MIN)
-    });
-    validate_query_range(&state.config, start_ns, end_ns).map_err(ApiError::bad_request)?;
     let limit = parse_limit(
         params.limit,
         state.config.max_trace_search_limit.min(MAX_TRACE_SEARCH_LIMIT),
     )
     .map_err(ApiError::bad_request)?;
-
-    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
-    let start_ns = clamp_to_retention(start_ns, retention_floor_ns);
-    if start_ns > end_ns {
+    let Some((start_ns, end_ns)) = trace_window(&state, &tenant, &params, now_ns)? else {
         return Ok(ndjson_response(String::new(), 0, 0));
-    }
+    };
 
     let _slot = state.tenant_quota.begin_query(&tenant).map_err(|error| {
         ApiError::from_engine(format!("{TENANT_QUOTA_PREFIX}{}", error.message))
@@ -134,6 +121,158 @@ pub async fn traces_search(
         .fetch_add(outcome.estimated_bytes, std::sync::atomic::Ordering::Relaxed);
 
     let body = trace_summaries_ndjson(&outcome.spans, &params.filters, limit);
+    Ok(ndjson_response(
+        body,
+        outcome.spans.len() as u64,
+        outcome.estimated_bytes,
+    ))
+}
+
+/// The shared window arithmetic of every windowed trace endpoint: the same
+/// defaults as the log endpoints, the range validated, and the retention
+/// floor applied logically before any scan. `None` means the floor swallowed
+/// the whole window — the empty answer, not an error, exactly as on ranges
+/// it merely shortens.
+fn trace_window(
+    state: &AppState,
+    tenant: &TenantId,
+    params: &TraceFilterParams,
+    now_ns: i64,
+) -> Result<Option<(i64, i64)>, ApiError> {
+    let end_ns = params.end_ns.unwrap_or(now_ns);
+    let start_ns = params.start_ns.unwrap_or_else(|| {
+        state
+            .config
+            .max_query_range
+            .map(duration_to_i64_ns)
+            .map(|range| end_ns.saturating_sub(range))
+            .unwrap_or(i64::MIN)
+    });
+    validate_query_range(&state.config, start_ns, end_ns).map_err(ApiError::bad_request)?;
+    let start_ns = clamp_to_retention(start_ns, state.tenant_policy.query_floor_ns(tenant));
+    if start_ns > end_ns {
+        return Ok(None);
+    }
+    Ok(Some((start_ns, end_ns)))
+}
+
+/// Trace autocomplete answers from a bounded window scan — unlike the log
+/// autocomplete there is no catalog to read instead, because a span's
+/// attributes live inside its stored payload. The scan pays the same
+/// admission as any trace scan (its semaphore, the byte pool, the span
+/// budget), and QUERY_API.md says so.
+pub async fn traces_attributes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Result<axum::response::Response, ApiError> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
+        .map_err(ApiError::from_tenant)?;
+    let now_ns = state.clock.now_ns();
+    let params = parse_trace_filter_params(
+        raw.as_deref().unwrap_or(""),
+        now_ns,
+        TRACE_ATTRIBUTE_KEYS_PARAMS,
+    )
+    .map_err(ApiError::bad_request)?;
+    let Some((start_ns, end_ns)) = trace_window(&state, &tenant, &params, now_ns)? else {
+        return Ok(ndjson_response(String::new(), 0, 0));
+    };
+    let _slot = state.tenant_quota.begin_query(&tenant).map_err(|error| {
+        ApiError::from_engine(format!("{TENANT_QUOTA_PREFIX}{}", error.message))
+    })?;
+    let outcome =
+        scan_trace_spans(state, tenant, TraceScanTarget::Window { start_ns, end_ns }).await?;
+
+    let mut keys = std::collections::BTreeSet::new();
+    if !outcome.spans.is_empty() {
+        // The intrinsics every span answers, in the same list the grammar
+        // filters on.
+        keys.extend(["duration".to_string(), "name".to_string(), "status".to_string()]);
+    }
+    for span in &outcome.spans {
+        if span.service_name().is_some() {
+            keys.insert("service.name".to_string());
+        }
+        for attribute in &span.span.attributes {
+            keys.insert(attribute.key.clone());
+        }
+        if let Some(resource) = &span.resource {
+            for attribute in &resource.attributes {
+                keys.insert(attribute.key.clone());
+            }
+        }
+    }
+    let mut body = String::new();
+    for key in keys {
+        body.push_str(
+            &serde_json::to_string(&serde_json::json!({ "key": key }))
+                .expect("a key serializes infallibly"),
+        );
+        body.push('\n');
+    }
+    Ok(ndjson_response(
+        body,
+        outcome.spans.len() as u64,
+        outcome.estimated_bytes,
+    ))
+}
+
+pub async fn traces_attribute_values(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<axum::response::Response, ApiError> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
+        .map_err(ApiError::from_tenant)?;
+    let now_ns = state.clock.now_ns();
+    let params = parse_trace_filter_params(
+        raw.as_deref().unwrap_or(""),
+        now_ns,
+        TRACE_ATTRIBUTE_VALUES_PARAMS,
+    )
+    .map_err(ApiError::bad_request)?;
+    let Some((start_ns, end_ns)) = trace_window(&state, &tenant, &params, now_ns)? else {
+        return Ok(ndjson_response(String::new(), 0, 0));
+    };
+    let _slot = state.tenant_quota.begin_query(&tenant).map_err(|error| {
+        ApiError::from_engine(format!("{TENANT_QUOTA_PREFIX}{}", error.message))
+    })?;
+    let outcome =
+        scan_trace_spans(state, tenant, TraceScanTarget::Window { start_ns, end_ns }).await?;
+
+    // Values come from the traces the already-placed filters match — search
+    // semantics, per trace — so a dropdown offers only values whose click
+    // still returns something.
+    let mut traces: std::collections::BTreeMap<&str, Vec<&crate::trace::TraceSpan>> =
+        std::collections::BTreeMap::new();
+    for span in &outcome.spans {
+        traces.entry(&span.trace_id).or_default().push(span);
+    }
+    let mut values = std::collections::BTreeSet::new();
+    for trace_spans in traces.values() {
+        if !params
+            .filters
+            .iter()
+            .all(|filter| trace_spans.iter().any(|span| filter.matches(span)))
+        {
+            continue;
+        }
+        for span in trace_spans {
+            if let Some(value) = span.tag_value(&key) {
+                values.insert(value);
+            }
+        }
+    }
+    let mut body = String::new();
+    for value in values {
+        body.push_str(
+            &serde_json::to_string(&serde_json::json!({ "value": value }))
+                .expect("a value serializes infallibly"),
+        );
+        body.push('\n');
+    }
     Ok(ndjson_response(
         body,
         outcome.spans.len() as u64,

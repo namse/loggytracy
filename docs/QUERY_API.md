@@ -33,6 +33,8 @@ curl -sH 'X-Scope-OrgID: acme' \
 | POST/GET/DELETE | `/loggytracy/api/v1/logs/delete` | submit / list / cancel deletion requests |
 | GET | `/loggytracy/api/v1/traces` | trace summaries matching the filters, newest first |
 | GET | `/loggytracy/api/v1/traces/{trace_id}` | every span of one trace, flat rows for a timeline |
+| GET | `/loggytracy/api/v1/traces/attributes` | span/resource attribute keys in the window (autocomplete) |
+| GET | `/loggytracy/api/v1/traces/attributes/{key}/values` | a key's values in the window (autocomplete) |
 
 Unchanged and outside this document's scope: `/metrics` (Prometheus text),
 `/ready`, the admin routes under `/loggytracy/api/v1/admin`, and OTLP ingest.
@@ -240,6 +242,25 @@ that never existed here, because this engine cannot tell the two apart.
 curl -sH 'X-Scope-OrgID: acme' \
   'http://127.0.0.1:3100/loggytracy/api/v1/traces/0af7651916cd43dd8448eb211c80319c'
 ```
+
+## `GET /traces/attributes` and `/traces/attributes/{key}/values` — autocomplete
+
+Keys accept `start`, `end`. Values accept `start`, `end`, `attr`.
+
+Same record shapes as the log autocomplete — `{"key":…}` / `{"value":…}`
+lines, sorted. Keys are the union over the window's spans of the intrinsics
+`duration`, `name`, `status`, plus `service.name` where a span carries it,
+span attribute keys, and resource attribute keys. Values are read through the
+same flattened view the filters use, and the optional `attr` filters narrow
+them to traces the already-placed filters match — search semantics, per
+trace — so a filter chip dropdown offers only values whose click still
+returns something.
+
+Unlike the log autocomplete there is no catalog to read: a span's attributes
+live inside its stored payload, so these endpoints answer from a bounded
+window scan and pay the same admission as any trace scan (its scan slots, the
+shared memory pool, the span budget). Keep the window as narrow as the
+dropdown allows.
 
 ## `/logs/delete` — deletion requests
 

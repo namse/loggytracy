@@ -74,6 +74,12 @@ pub(crate) const ATTRIBUTE_VALUES_PARAMS: &[&str] = &["start", "end", "attr"];
 /// comparisons only this surface accepts.
 pub(crate) const TRACE_SEARCH_PARAMS: &[&str] = &["start", "end", "attr", "limit"];
 
+pub(crate) const TRACE_ATTRIBUTE_KEYS_PARAMS: &[&str] = &["start", "end"];
+
+/// `attr` narrows the values to traces the already-placed filters match, so a
+/// dropdown offers only values whose click still returns something.
+pub(crate) const TRACE_ATTRIBUTE_VALUES_PARAMS: &[&str] = &["start", "end", "attr"];
+
 /// The first-party routes, listed by the router fallback so one wrong request
 /// teaches the whole surface. Grows with each endpoint that lands.
 pub(crate) const ROUTES: &[&str] = &[
@@ -85,6 +91,8 @@ pub(crate) const ROUTES: &[&str] = &[
     "/loggytracy/api/v1/logs/delete",
     "/loggytracy/api/v1/traces",
     "/loggytracy/api/v1/traces/{trace_id}",
+    "/loggytracy/api/v1/traces/attributes",
+    "/loggytracy/api/v1/traces/attributes/{key}/values",
 ];
 
 #[derive(Debug)]
