@@ -102,7 +102,7 @@ pub fn parse_filter_params(
     let mut direction: Option<String> = None;
     let mut bucket_ns = None;
     let mut delay_seconds = None;
-    let mut attrs: Vec<(String, logql::MatcherOp, String)> = Vec::new();
+    let mut attrs: Vec<(String, AttrOp, String)> = Vec::new();
     let mut line_filters: Vec<logql::LineFilter> = Vec::new();
     let mut parse_stages: Vec<logql::PipelineStage> = Vec::new();
 
@@ -208,17 +208,45 @@ pub(crate) fn parse_time_or_relative_ns(input: &str, now_ns: i64) -> Result<i64,
     parse_time_ns(trimmed)
 }
 
-/// The key ends at the first operator: `!=`, `!~`, `=~`, or `=`, longest match
-/// at that position. Operators are ASCII, so splitting there is always a char
-/// boundary however non-ASCII the key or value.
-fn split_attr(input: &str) -> Result<(String, logql::MatcherOp, String), String> {
+/// An `attr` filter's operator: one of the four matchers every endpoint
+/// accepts, or a comparison, which only the trace endpoints do — the log
+/// surface refuses comparisons in `build_log_query`, so the refusal is
+/// inherited by every handler that builds a `LogQuery`.
+#[derive(Debug, Clone)]
+pub(crate) enum AttrOp {
+    Match(logql::MatcherOp),
+    Compare(logql::FieldOp),
+}
+
+/// Only the four comparison operators reach this: `split_attr` never
+/// constructs `AttrOp::Compare` from anything else.
+pub(crate) fn compare_symbol(op: logql::FieldOp) -> &'static str {
+    match op {
+        logql::FieldOp::Gte => ">=",
+        logql::FieldOp::Lte => "<=",
+        logql::FieldOp::Gt => ">",
+        logql::FieldOp::Lt => "<",
+        _ => unreachable!("split_attr only constructs comparison operators"),
+    }
+}
+
+/// The key ends at the first operator: `!=`, `!~`, `=~`, `=`, `>=`, `<=`, `>`,
+/// or `<`, longest match at that position — the two-byte forms are checked
+/// before their one-byte prefixes, so `duration>=1.5s` splits at `>=`, never at
+/// `>` with `=1.5s` as the value. Operators are ASCII, so splitting there is
+/// always a char boundary however non-ASCII the key or value.
+fn split_attr(input: &str) -> Result<(String, AttrOp, String), String> {
     let bytes = input.as_bytes();
     for at in 0..bytes.len() {
         let (op, op_len) = match bytes[at] {
-            b'!' if bytes.get(at + 1) == Some(&b'=') => (logql::MatcherOp::Neq, 2),
-            b'!' if bytes.get(at + 1) == Some(&b'~') => (logql::MatcherOp::NRe, 2),
-            b'=' if bytes.get(at + 1) == Some(&b'~') => (logql::MatcherOp::Re, 2),
-            b'=' => (logql::MatcherOp::Eq, 1),
+            b'!' if bytes.get(at + 1) == Some(&b'=') => (AttrOp::Match(logql::MatcherOp::Neq), 2),
+            b'!' if bytes.get(at + 1) == Some(&b'~') => (AttrOp::Match(logql::MatcherOp::NRe), 2),
+            b'=' if bytes.get(at + 1) == Some(&b'~') => (AttrOp::Match(logql::MatcherOp::Re), 2),
+            b'=' => (AttrOp::Match(logql::MatcherOp::Eq), 1),
+            b'>' if bytes.get(at + 1) == Some(&b'=') => (AttrOp::Compare(logql::FieldOp::Gte), 2),
+            b'>' => (AttrOp::Compare(logql::FieldOp::Gt), 1),
+            b'<' if bytes.get(at + 1) == Some(&b'=') => (AttrOp::Compare(logql::FieldOp::Lte), 2),
+            b'<' => (AttrOp::Compare(logql::FieldOp::Lt), 1),
             _ => continue,
         };
         if at == 0 {
@@ -233,7 +261,7 @@ fn split_attr(input: &str) -> Result<(String, logql::MatcherOp, String), String>
         ));
     }
     Err(format!(
-        "attr filter '{input}' has no operator: write attr=key=value (also !=, =~, !~)"
+        "attr filter '{input}' has no operator: write attr=key=value (also !=, =~, !~, and >=, <=, >, < on the trace endpoints)"
     ))
 }
 
@@ -248,10 +276,20 @@ fn line_regex(param: &str, value: &str) -> Result<regex::Regex, String> {
 /// see pushed attributes and extracted fields alike (pushed attributes shadow
 /// same-named extractions — `merge_extracted`'s rule, stated in QUERY_API.md).
 fn build_log_query(
-    attrs: Vec<(String, logql::MatcherOp, String)>,
+    attrs: Vec<(String, AttrOp, String)>,
     line_filters: Vec<logql::LineFilter>,
     parse_stages: Vec<logql::PipelineStage>,
 ) -> Result<logql::LogQuery, String> {
+    let attrs = attrs
+        .into_iter()
+        .map(|(name, op, value)| match op {
+            AttrOp::Match(op) => Ok((name, op, value)),
+            AttrOp::Compare(op) => Err(format!(
+                "attr filter '{name}{symbol}{value}' uses a comparison: log filters support =, !=, =~, !~ — duration comparisons belong to the trace endpoints, see docs/QUERY_API.md",
+                symbol = compare_symbol(op)
+            )),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     if parse_stages.is_empty() {
         let matchers = attrs
             .into_iter()

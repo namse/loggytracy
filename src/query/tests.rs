@@ -2112,6 +2112,32 @@ fn attr_without_an_operator_teaches_the_form() {
 }
 
 #[test]
+fn comparison_operators_split_at_the_longest_match_and_logs_refuse_them() {
+    // The refusal text carries the reassembled filter, which is the proof the
+    // operator scan split key, operator and value correctly — `>=` before `>`.
+    let error = parse_filter_params("attr=duration>=1.5s", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("'duration>=1.5s' uses a comparison"), "{error}");
+    assert!(error.contains("trace endpoints"), "{error}");
+    let error = parse_filter_params("attr=duration<=2s", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("'duration<=2s'"), "{error}");
+    let error = parse_filter_params("attr=k>v", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("'k>v'"), "{error}");
+    let error = parse_filter_params("attr=k<v", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("'k<v'"), "{error}");
+
+    // A comparison character after a matcher operator stays in the value.
+    let params = parse_filter_params("attr=formula=a>b", 0, LOGS_PARAMS).unwrap();
+    assert_eq!(params.query.matchers[0].value, "a>b");
+
+    let error = parse_filter_params("attr=>=v", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("empty key"), "{error}");
+
+    // The refusal is the parser's, so `parse=` endpoints inherit it too.
+    let error = parse_filter_params("parse=json&attr=duration>=1s", 0, LOGS_PARAMS).unwrap_err();
+    assert!(error.contains("uses a comparison"), "{error}");
+}
+
+#[test]
 fn unknown_parameters_name_themselves_and_the_accepted_set() {
     let error = parse_filter_params("atr=level=error", 0, LOGS_PARAMS).unwrap_err();
     assert!(error.contains("unknown parameter 'atr'"), "{error}");
@@ -2359,6 +2385,24 @@ async fn unmatched_routes_answer_with_the_first_party_surface() {
     let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let message = error["error"].as_str().unwrap();
     assert!(message.contains("/loggytracy/api/v1/logs"), "{message}");
+}
+
+#[tokio::test]
+async fn a_comparison_operator_on_a_log_endpoint_is_refused_with_the_fix() {
+    let data_dir = temp_dir();
+    let state = test_state(
+        &data_dir,
+        Arc::new(MemTable::new()),
+        Arc::new(PartRegistry::new()),
+        None,
+    );
+    let (status, _, body) = first_party_logs(state.clone(), "attr=duration%3E%3D1s").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("trace endpoints"), "{body}");
+
+    let (status, body) = first_party_histogram(state, "attr=duration%3E%3D1s&bucket=30s").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("trace endpoints"), "{body}");
 }
 
 // --- The first-party API: `GET /loggytracy/api/v1/logs/histogram` ---

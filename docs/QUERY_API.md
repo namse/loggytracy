@@ -44,7 +44,7 @@ its section, and an unknown parameter is a 400 that names the accepted set.
 | Parameter | Repeatable | Meaning |
 |---|---|---|
 | `start`, `end` | no | Absolute time — unix seconds (`1756100000`), milliseconds (13 digits), microseconds (16), nanoseconds (19), decimal seconds (`1756100000.123`), or RFC3339 (`2026-08-25T14:00:00+09:00`) — or relative: `-1h`, `-30m`, `-90s` is that long before now. The unit suffix is what makes it relative; a bare negative integer stays a negative epoch. Defaults: `end` = now, `start` = `end` − `LOGGYTRACY_MAX_QUERY_RANGE`. |
-| `attr` | yes | An attribute filter with the operator embedded in the value: `attr=level=error`, `attr=level!=debug`, `attr=path=~/api/.*`, `attr=host!~db-.*`. The key ends at the first `!=`, `!~`, `=~`, or `=`. Regexes are anchored: the value must match whole. Repeated filters AND. |
+| `attr` | yes | An attribute filter with the operator embedded in the value: `attr=level=error`, `attr=level!=debug`, `attr=path=~/api/.*`, `attr=host!~db-.*`. The key ends at the first `!=`, `!~`, `=~`, `=`, `>=`, `<=`, `>`, or `<`. Regexes are anchored: the value must match whole. Repeated filters AND. The comparison operators exist for the trace endpoints' `duration` intrinsic only (`attr=duration>=250ms`); a log endpoint refuses them with an error that says so. |
 | `contains` | yes | The line must contain this substring. |
 | `not_contains` | yes | The line must not contain this substring. |
 | `regex` | yes | The line must match this regex (unanchored, like `grep`). |
@@ -56,10 +56,11 @@ its section, and an unknown parameter is a 400 that names the accepted set.
 | `delay` | no | Tail only: whole seconds (≤ 5) to hold rows back, for writers whose clocks trail the server's. |
 | `request_id` | no | Cancelling a delete request: the id from the GET listing. |
 
-All filters AND. There is deliberately no OR, no attribute-exists, and no
-numeric comparison — the flat model stays flat until a real consumer hits the
-wall. Percent-encode values (`curl --get --data-urlencode` does it for you);
-a practical URL stays far under the ~8 KB proxies allow.
+All filters AND. There is deliberately no OR and no attribute-exists, and the
+only numeric comparison is the trace endpoints' `duration` — the flat model
+stays flat until a real consumer hits the wall. Percent-encode values
+(`curl --get --data-urlencode` does it for you); a practical URL stays far
+under the ~8 KB proxies allow.
 
 ## `GET /logs` — search
 
