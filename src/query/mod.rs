@@ -41,9 +41,16 @@ fn metric_error_status(error: &str) -> StatusCode {
         StatusCode::TOO_MANY_REQUESTS
     } else if error.starts_with("metric query exceeds") || error.starts_with("query exceeds") {
         StatusCode::BAD_REQUEST
+    } else if error.starts_with("trace query exceeds") {
+        // A refusal about the trace's size, not the request's shape: the same
+        // request against a smaller trace succeeds, so 400 would blame the
+        // client for the data and 429 would promise a retry can help.
+        StatusCode::PAYLOAD_TOO_LARGE
     } else if error == "query timed out"
         || error == "metric query timed out"
         || error == "object store restore timed out"
+        || error == "trace query timed out"
+        || error == "trace object store restore timed out"
     {
         StatusCode::GATEWAY_TIMEOUT
     } else {
@@ -272,6 +279,8 @@ include!("restore.rs");
 include!("prometheus.rs");
 include!("delete_api.rs");
 include!("tail.rs");
+include!("traces.rs");
+include!("trace_scan.rs");
 
 #[cfg(test)]
 mod tests {

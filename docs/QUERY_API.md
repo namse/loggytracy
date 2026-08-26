@@ -31,6 +31,7 @@ curl -sH 'X-Scope-OrgID: acme' \
 | GET | `/loggytracy/api/v1/logs/attributes/{key}/values` | a key's values in the window (autocomplete) |
 | GET | `/loggytracy/api/v1/logs/tail` | a live chunked-NDJSON stream of new rows |
 | POST/GET/DELETE | `/loggytracy/api/v1/logs/delete` | submit / list / cancel deletion requests |
+| GET | `/loggytracy/api/v1/traces/{trace_id}` | every span of one trace, flat rows for a timeline |
 
 Unchanged and outside this document's scope: `/metrics` (Prometheus text),
 `/ready`, the admin routes under `/loggytracy/api/v1/admin`, and OTLP ingest.
@@ -161,6 +162,36 @@ curl -sNH 'X-Scope-OrgID: acme' \
 The proxy in front must pass streaming responses through unbuffered and not
 apply an idle timeout shorter than the heartbeat interval.
 
+## `GET /traces/{trace_id}` — the trace timeline
+
+Takes **no query parameters** — the trace id in the path is the whole
+request, and a query string is a 400 that says so. The id is 32 hexadecimal
+characters, exactly as ingest stored it and as log rows carry it in their
+`trace_id` attribute.
+
+One span per line, `application/x-ndjson`, sorted by start time then span id:
+
+```json
+{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","parent_span_id":"","name":"GET /items","kind":"server","service":"api","status":"ok","start":"1756100000123456789","end":"1756100000273456789","duration":"150000000","attributes":{"http.method":"GET","service.name":"api"},"events":[{"timestamp":"1756100000200000000","name":"exception","attributes":{"exception.type":"IOError"}}]}
+```
+
+`start`, `end`, and `duration` are nanoseconds as strings, like every
+timestamp this API emits. `kind` is one of `unspecified`, `internal`,
+`server`, `client`, `producer`, `consumer`; `status` is `unset`, `ok`, or
+`error`. `attributes` is one merged map — resource attributes first, span
+attributes overwriting same-named keys — with every value stringified;
+non-scalar values (arrays, kvlists) appear as compact JSON rather than being
+dropped. An empty `parent_span_id` marks a root span.
+
+Retention holds span by span: spans below the tenant's retention floor are
+omitted, and a trace with none left answers 404 — the same answer as an id
+that never existed here, because this engine cannot tell the two apart.
+
+```sh
+curl -sH 'X-Scope-OrgID: acme' \
+  'http://127.0.0.1:3100/loggytracy/api/v1/traces/0af7651916cd43dd8448eb211c80319c'
+```
+
 ## `/logs/delete` — deletion requests
 
 Deletion semantics — hide immediately, remove at the next rewrite — are in
@@ -195,9 +226,10 @@ Refusals are `application/json`:
 | 400 | The request is malformed or over-broad; the message names the input and the governing limit | No — fix the request |
 | 401/403 | Tenant refusals from `X-Scope-OrgID` handling ([`MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md)) | No |
 | 404 | Unknown route (the body lists the real ones) or unknown delete request | No |
+| 413 | The trace holds more spans or bytes than one response may carry (`LOGGYTRACY_MAX_TRACE_SPANS`, `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES`) | No — raise the knob or accept the refusal |
 | 429 | Tenant query quota, tail cap, delete cap, or this instance's query memory pool is momentarily full | Yes — these clear on their own |
 | 503 | Draining for shutdown, or a deletion could not be made durable | Yes, against the replacement instance |
-| 504 | The query ran past `LOGGYTRACY_MAX_QUERY_RUNTIME` | Narrow the range or filters |
+| 504 | The query ran past `LOGGYTRACY_MAX_QUERY_RUNTIME` (`LOGGYTRACY_MAX_TRACE_QUERY_RUNTIME` on the trace routes) | Narrow the range or filters |
 
 ## Limits
 

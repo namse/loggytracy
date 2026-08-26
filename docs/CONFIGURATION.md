@@ -248,17 +248,20 @@ Small catalog files such as `meta.json` are not evicted; the data body and the b
 | `LOGGYTRACY_MAX_CONCURRENT_TAILS` | 8 | Live tail (`/loggytracy/api/v1/logs/tail`) streams held at once. Over the limit the request is refused with 429 rather than accepted and dropped |
 | `LOGGYTRACY_TAIL_POLL_INTERVAL` | `1s` | How often a live tail asks for new lines. This is both its latency floor and its cost per connection |
 | `LOGGYTRACY_MAX_RESTORE_RUNTIME` | `25s` | Cache-miss restore timeout |
+| `LOGGYTRACY_MAX_TRACE_SPANS` | 100,000 | Most spans one trace scan may materialize; over it the request is refused with 413 |
+| `LOGGYTRACY_MAX_TRACE_SEARCH_LIMIT` | 1,000 | Maximum `limit` on trace search |
+| `LOGGYTRACY_MAX_CONCURRENT_TRACE_SCANS` | 8 | The trace surface's own scan slots — a trace scan decodes whole-span payloads, so it does not compete for the log scanner's |
+| `LOGGYTRACY_MAX_TRACE_QUERY_RUNTIME` | `30s` | |
+| `LOGGYTRACY_MAX_TRACE_RESTORE_RUNTIME` | `25s` | Cache-miss restore timeout for trace parts |
 
-The LogQL metric evaluator and the Tempo trace surface left with the
-read-path decision (issue #3), and their knobs left with them:
-`LOGGYTRACY_MAX_METRIC_EVALUATION_POINTS` (renamed
+The LogQL metric evaluator left with the read-path decision (issue #3), and
+its knobs left with it: `LOGGYTRACY_MAX_METRIC_EVALUATION_POINTS` (renamed
 `LOGGYTRACY_MAX_HISTOGRAM_BUCKETS` — the histogram grid is its one remaining
 meaning), `MAX_METRIC_SERIES`, `MAX_METRIC_SAMPLES`, `MAX_SERIES_MATCHERS`,
-`MAX_CONCURRENT_METRIC_EVALUATIONS`, `MAX_TRACE_SPANS`,
-`MAX_TRACE_SEARCH_LIMIT`, `MAX_CONCURRENT_TRACE_SCANS`,
-`MAX_TRACE_QUERY_RUNTIME`, and `MAX_TRACE_RESTORE_RUNTIME`. An instance that
-still sets one starts normally and ignores it; the trace knobs return with the
-first-party trace API (M13) in whatever form its read shapes need.
+and `MAX_CONCURRENT_METRIC_EVALUATIONS`. An instance that still sets one
+starts normally and ignores it. The trace knobs above left with the Tempo
+surface at the same decision and returned with the first-party trace API
+(issue #7).
 
 ## Startup and shutdown
 
@@ -427,10 +430,16 @@ shape of query, so the bound above stays an upper bound rather than becoming a
 sizing target — 850 MB with merge running is still the larger figure, and the
 read path is not where this engine's memory goes.
 
+Trace reads are **in** the number: a trace scan reserves from
+`LOGGYTRACY_QUERY_MEMORY_BUDGET_BYTES` like every other query — charged from a
+per-span byte estimate as parts accumulate — is span-capped by
+`LOGGYTRACY_MAX_TRACE_SPANS`, and is per-query byte-capped by
+`LOGGYTRACY_MAX_QUERY_MEMORY_BYTES`. The open note that once stood here (trace
+scans carried only a span count and no byte budget) closed with the
+first-party trace API (issue #7).
+
 Not in the number, and why:
 
-- **Trace reads.** Removed with the Tempo surface (issue #3); when the
-  first-party trace API (M13) lands, its scan budget joins this table.
 - **The memtable.** Bounded by backpressure rather than by a constant: ingest is
   refused before it grows without limit. Note that `MAX_MEMTABLE_BYTES` is
   enforced against an accounting that undercounts what a line actually occupies,

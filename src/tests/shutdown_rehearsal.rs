@@ -318,7 +318,7 @@ async fn m6_machine_replacement_force_flush_is_lossless() {
         registry_b.operation_lock(),
     )
     .unwrap();
-    let spans = trace_registry_b.query_trace_id(&test_tenant(), &trace_id, None, None).unwrap();
+    let spans = trace_registry_b.query_trace_id(&test_tenant(), &trace_id, None, None, None).unwrap();
     assert_eq!(
         spans.len(),
         1,

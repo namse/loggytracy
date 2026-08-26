@@ -18,6 +18,10 @@ use crate::trace_registry::TraceRegistry;
 pub struct AppState {
     pub config: Arc<Config>,
     pub query_scan_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Trace scans have their own slots: a trace scan decodes whole-span JSON
+    /// payloads, so its cost profile is unlike a log scan's, and sharing the
+    /// log semaphore would let either surface starve the other.
+    pub trace_scan_semaphore: Arc<tokio::sync::Semaphore>,
     /// The shared byte budget every query materialization reserves from —
     /// the aggregate bound the slot×cap product never actually was.
     pub query_memory_pool: Arc<crate::query_memory::QueryMemoryPool>,
@@ -115,6 +119,9 @@ impl AppState {
             clock: dependencies.clock,
             query_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_query_scans,
+            )),
+            trace_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                config.max_concurrent_trace_scans,
             )),
             query_memory_pool: Arc::new(crate::query_memory::QueryMemoryPool::new(
                 config.query_memory_budget_bytes,

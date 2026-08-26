@@ -210,6 +210,11 @@ pub struct Config {
     pub max_concurrent_query_scans: usize,
     pub max_query_runtime: Duration,
     pub max_restore_runtime: Duration,
+    pub max_trace_spans: usize,
+    pub max_trace_search_limit: usize,
+    pub max_concurrent_trace_scans: usize,
+    pub max_trace_query_runtime: Duration,
+    pub max_trace_restore_runtime: Duration,
     /// How long the shutdown force-flush retries silently before it starts
     /// warning on stdout and enabling operator-initiated abort.
     pub shutdown_flush_warn_after: Duration,
@@ -300,6 +305,11 @@ impl Default for Config {
             max_concurrent_query_scans: 8,
             max_query_runtime: Duration::from_secs(30),
             max_restore_runtime: Duration::from_secs(25),
+            max_trace_spans: 100_000,
+            max_trace_search_limit: 1_000,
+            max_concurrent_trace_scans: 8,
+            max_trace_query_runtime: Duration::from_secs(30),
+            max_trace_restore_runtime: Duration::from_secs(25),
             shutdown_flush_warn_after: Duration::from_secs(30),
             startup_retry_budget: Duration::from_secs(300),
             malloc_trim_interval: Some(Duration::from_secs(60)),
@@ -672,6 +682,26 @@ impl Config {
                 "LOGGYTRACY_MAX_RESTORE_RUNTIME",
                 defaults.max_restore_runtime,
             )?,
+            max_trace_spans: env_positive_usize(
+                "LOGGYTRACY_MAX_TRACE_SPANS",
+                defaults.max_trace_spans,
+            )?,
+            max_trace_search_limit: env_positive_usize(
+                "LOGGYTRACY_MAX_TRACE_SEARCH_LIMIT",
+                defaults.max_trace_search_limit,
+            )?,
+            max_concurrent_trace_scans: env_positive_usize(
+                "LOGGYTRACY_MAX_CONCURRENT_TRACE_SCANS",
+                defaults.max_concurrent_trace_scans,
+            )?,
+            max_trace_query_runtime: env_required_duration(
+                "LOGGYTRACY_MAX_TRACE_QUERY_RUNTIME",
+                defaults.max_trace_query_runtime,
+            )?,
+            max_trace_restore_runtime: env_required_duration(
+                "LOGGYTRACY_MAX_TRACE_RESTORE_RUNTIME",
+                defaults.max_trace_restore_runtime,
+            )?,
             startup_retry_budget: env_required_duration(
                 "LOGGYTRACY_STARTUP_RETRY_BUDGET",
                 defaults.startup_retry_budget,
@@ -722,7 +752,7 @@ impl Config {
             // process chose or what it read to choose it.
             detected_memory_limit_bytes = host.limit_bytes,
             detected_memory_source = host.source,
-            "configured peak materialized memory, excluding trace scans and allocator retention"
+            "configured peak materialized memory, excluding allocator retention"
         );
     }
 
@@ -844,6 +874,14 @@ selected above the read budget can never be merged",
         )?;
         positive_duration("max_query_runtime", self.max_query_runtime)?;
         positive_duration("max_restore_runtime", self.max_restore_runtime)?;
+        positive_usize("max_trace_spans", self.max_trace_spans)?;
+        positive_usize("max_trace_search_limit", self.max_trace_search_limit)?;
+        positive_usize(
+            "max_concurrent_trace_scans",
+            self.max_concurrent_trace_scans,
+        )?;
+        positive_duration("max_trace_query_runtime", self.max_trace_query_runtime)?;
+        positive_duration("max_trace_restore_runtime", self.max_trace_restore_runtime)?;
         positive_duration("shutdown_flush_warn_after", self.shutdown_flush_warn_after)
     }
 }

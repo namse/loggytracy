@@ -270,10 +270,17 @@ pub enum QueryEndpoint {
     Tail,
     Logs,
     Histogram,
+    TraceById,
 }
 
 impl QueryEndpoint {
-    pub const ALL: [Self; 4] = [Self::Query, Self::Tail, Self::Logs, Self::Histogram];
+    pub const ALL: [Self; 5] = [
+        Self::Query,
+        Self::Tail,
+        Self::Logs,
+        Self::Histogram,
+        Self::TraceById,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -282,6 +289,7 @@ impl QueryEndpoint {
             Self::Tail => "tail",
             Self::Logs => "logs",
             Self::Histogram => "logs_histogram",
+            Self::TraceById => "trace_by_id",
         }
     }
 }

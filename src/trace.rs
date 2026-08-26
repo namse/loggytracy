@@ -151,6 +151,29 @@ pub fn normalize_request(
     Ok(spans)
 }
 
+/// A trace id as a URL path segment, parsed into the canonical stored form.
+/// The stored form is what ingest's `normalize_id` produced, so a lookup that
+/// goes through this can compare strings byte-for-byte.
+pub fn canonical_trace_id(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if input.len() != TRACE_ID_BYTES * 2 {
+        return Err("trace ID must contain exactly 32 hexadecimal characters".to_string());
+    }
+    let mut bytes = Vec::with_capacity(TRACE_ID_BYTES);
+    let chars: Vec<char> = input.chars().collect();
+    for pair in chars.chunks_exact(2) {
+        let high = pair[0]
+            .to_digit(16)
+            .ok_or_else(|| "trace ID must contain only hexadecimal characters".to_string())?;
+        let low = pair[1]
+            .to_digit(16)
+            .ok_or_else(|| "trace ID must contain only hexadecimal characters".to_string())?;
+        bytes.push(((high << 4) | low) as u8);
+    }
+    normalize_id(&bytes, TRACE_ID_BYTES, TraceError::InvalidTraceId)
+        .map_err(|error| error.to_string())
+}
+
 fn normalize_span(
     tenant: &TenantId,
     span: Span,
@@ -214,6 +237,16 @@ fn any_value_json(value: &opentelemetry_proto::tonic::common::v1::AnyValue) -> s
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
+/// One attribute value as the string a viewer shows: scalars the way
+/// `tag_value` stringifies them, everything else (arrays, kvlists) as compact
+/// JSON — so no attribute silently disappears from a timeline.
+pub(crate) fn attr_display_string(
+    value: &opentelemetry_proto::tonic::common::v1::AnyValue,
+) -> String {
+    let json = any_value_json(value);
+    json_scalar_string(&json).unwrap_or_else(|| json.to_string())
+}
+
 fn json_scalar_string(value: &serde_json::Value) -> Option<String> {
     if let Some(object) = value.as_object() {
         if let Some(value) = object.get("stringValue").and_then(|v| v.as_str()) {
@@ -251,6 +284,32 @@ fn span_bytes(span: &TraceSpan) -> u64 {
 
 fn spans_bytes(spans: &[TraceSpan]) -> u64 {
     spans.iter().map(span_bytes).sum()
+}
+
+/// What one span costs a query that holds it materialized — an estimate in
+/// the `span_bytes` spirit, but sized for the read side, where the whole
+/// decoded span is resident. Charged against the shared query memory pool,
+/// whose chunk granularity is what the estimate has to stay under, not the
+/// allocator's truth.
+pub(crate) fn span_query_bytes(span: &TraceSpan) -> u64 {
+    fn attr_bytes(attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue]) -> usize {
+        attributes
+            .iter()
+            .map(|attribute| attribute.key.len() + 16)
+            .sum()
+    }
+    (std::mem::size_of::<TraceSpan>()
+        + span.trace_id.len()
+        + span.span_id.len()
+        + span.span.parent_span_id.len()
+        + span.span.name.len()
+        + attr_bytes(&span.span.attributes)
+        + span
+            .resource
+            .as_ref()
+            .map(|resource| attr_bytes(&resource.attributes))
+            .unwrap_or(0)
+        + span.span.events.len() * 64) as u64
 }
 
 /// See `memtable::unwrap_snapshot`.
@@ -402,6 +461,35 @@ impl TraceMemTable {
             .iter()
             .chain(flushing.as_deref().into_iter().flatten())
             .filter(|span| span.tenant == *tenant)
+        {
+            if spans.len() >= limit {
+                return Err(format!("trace query exceeds the maximum of {limit} spans"));
+            }
+            spans.push(span.clone());
+        }
+        Ok(spans)
+    }
+
+    /// The window scan's memtable half. The overlap predicate is
+    /// [`crate::trace_part::span_overlaps`] — the same one the part side and
+    /// its row-group pruning answer — applied before the limit is charged, so
+    /// an out-of-window span costs neither budget nor a clone.
+    pub fn snapshot_range_limited(
+        &self,
+        tenant: &TenantId,
+        start_ns: i64,
+        end_ns: i64,
+        limit: usize,
+    ) -> Result<Vec<TraceSpan>, String> {
+        let inner = self.inner.read();
+        let flushing = self.flushing.read();
+        let mut spans = Vec::new();
+        for span in inner
+            .iter()
+            .chain(flushing.as_deref().into_iter().flatten())
+            .filter(|span| {
+                span.tenant == *tenant && crate::trace_part::span_overlaps(span, start_ns, end_ns)
+            })
         {
             if spans.len() >= limit {
                 return Err(format!("trace query exceeds the maximum of {limit} spans"));

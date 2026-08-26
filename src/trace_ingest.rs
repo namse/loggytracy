@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(trace_parts.part_count(), 1);
         assert_eq!(
             trace_parts
-                .query_trace_id(&test_tenant(), &"01".repeat(16), None, None)
+                .query_trace_id(&test_tenant(), &"01".repeat(16), None, None, None)
                 .unwrap()
                 .len(),
             1
@@ -535,7 +535,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             restored
-                .query_trace_id(&test_tenant(), &"01".repeat(16), None, None)
+                .query_trace_id(&test_tenant(), &"01".repeat(16), None, None, None)
                 .unwrap()
                 .len(),
             1

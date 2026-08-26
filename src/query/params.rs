@@ -78,6 +78,7 @@ pub(crate) const ROUTES: &[&str] = &[
     "/loggytracy/api/v1/logs/attributes/{key}/values",
     "/loggytracy/api/v1/logs/tail",
     "/loggytracy/api/v1/logs/delete",
+    "/loggytracy/api/v1/traces/{trace_id}",
 ];
 
 #[derive(Debug)]

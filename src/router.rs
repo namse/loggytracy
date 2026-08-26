@@ -11,10 +11,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // separate router rather than layered onto this one. `Router::layer`
     // applies to every route registered before it, which would leave the
     // effective limit of a route depending on where in this chain it sits.
-    // The read surface is the first-party API alone: the Loki routes went
-    // with the read-path decision (issue #3), the Tempo routes with the same
-    // decision — traces are ingested and stored but unreadable until the
-    // first-party trace API (M13) ships.
+    // The read surface is the first-party API alone: the Loki and Tempo
+    // compatibility routes went with the read-path decision (issue #3), and
+    // the trace routes below are their first-party replacement.
     let router = Router::new()
         .merge(ingest_router(state.clone()))
         .route("/metrics", get(query::metrics))
@@ -40,6 +39,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(query::submit_delete_request)
                 .get(query::list_delete_requests)
                 .delete(query::cancel_delete_request),
+        )
+        .route(
+            "/loggytracy/api/v1/traces/{trace_id}",
+            get(query::trace_by_id),
         )
         .route("/ready", get(query::ready))
         .fallback(query::api_fallback);

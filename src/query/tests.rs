@@ -1969,6 +1969,19 @@ fn a_refusal_is_never_reported_as_a_server_fault() {
         StatusCode::GATEWAY_TIMEOUT
     );
     assert_eq!(
+        metric_error_status("trace query exceeds the maximum of 100000 spans"),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a trace too large to carry is about the data, not the request or the load"
+    );
+    assert_eq!(
+        metric_error_status("trace query timed out"),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+    assert_eq!(
+        metric_error_status("trace object store restore timed out"),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+    assert_eq!(
         metric_error_status("part reader returned garbage"),
         StatusCode::INTERNAL_SERVER_ERROR,
         "and something nobody recognizes is still a fault"
@@ -2867,4 +2880,238 @@ fn every_query_api_route_and_param_is_documented() {
         missing.is_empty(),
         "undocumented in docs/QUERY_API.md: {missing:?}"
     );
+}
+
+// --- The first-party API: `GET /loggytracy/api/v1/traces/{trace_id}` ---
+
+fn trace_state(
+    data_dir: &std::path::Path,
+    mutate: impl FnOnce(&mut Config),
+) -> Arc<AppState> {
+    let mut config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    mutate(&mut config);
+    let memtable = Arc::new(MemTable::new());
+    let parts = Arc::new(PartRegistry::new());
+    let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+        parts.operation_lock(),
+    ));
+    crate::test_support::state(
+        config.clone(),
+        memtable.clone(),
+        Arc::new(Journal::spawn(&config, memtable).unwrap()),
+        parts,
+        trace_parts,
+        None,
+    )
+}
+
+fn otlp_kv(key: &str, value: &str) -> opentelemetry_proto::tonic::common::v1::KeyValue {
+    opentelemetry_proto::tonic::common::v1::KeyValue {
+        key: key.to_string(),
+        value: Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+            value: Some(
+                opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                    value.to_string(),
+                ),
+            ),
+        }),
+        ..Default::default()
+    }
+}
+
+fn trace_span_at(
+    trace_id: &str,
+    span_id: &str,
+    start_time_ns: i64,
+    attribute: (&str, &str),
+) -> crate::trace::TraceSpan {
+    crate::trace::TraceSpan {
+        tenant: test_tenant(),
+        trace_id: trace_id.to_string(),
+        span_id: span_id.to_string(),
+        start_time_ns,
+        end_time_ns: start_time_ns + 1_000,
+        span: opentelemetry_proto::tonic::trace::v1::Span {
+            name: format!("span-{span_id}"),
+            attributes: vec![otlp_kv(attribute.0, attribute.1)],
+            ..Default::default()
+        },
+        resource: None,
+        resource_schema_url: String::new(),
+        scope: None,
+        scope_schema_url: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn trace_by_id_returns_flat_span_rows_sorted_by_start() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    let trace_id = "ab".repeat(16);
+    let mut child = trace_span_at(&trace_id, "cc".repeat(8).as_str(), 2_000, ("env", "span-wins"));
+    child.span.parent_span_id = vec![0xbb; 8];
+    child.span.kind = opentelemetry_proto::tonic::trace::v1::span::SpanKind::Client as i32;
+    let mut root = trace_span_at(&trace_id, "bb".repeat(8).as_str(), 1_000, ("env", "span-wins"));
+    root.span.kind = opentelemetry_proto::tonic::trace::v1::span::SpanKind::Server as i32;
+    root.span.status = Some(opentelemetry_proto::tonic::trace::v1::Status {
+        code: opentelemetry_proto::tonic::trace::v1::status::StatusCode::Ok as i32,
+        ..Default::default()
+    });
+    root.span.events = vec![opentelemetry_proto::tonic::trace::v1::span::Event {
+        time_unix_nano: 1_500,
+        name: "exception".to_string(),
+        attributes: vec![otlp_kv("exception.type", "IOError")],
+        ..Default::default()
+    }];
+    root.resource = Some(opentelemetry_proto::tonic::resource::v1::Resource {
+        attributes: vec![
+            otlp_kv("service.name", "api"),
+            otlp_kv("env", "resource-loses"),
+        ],
+        ..Default::default()
+    });
+    // Inserted child-first: the response order must come from the sort.
+    state.journal.trace_memtable().insert(vec![child, root]);
+
+    let (status, body) =
+        first_party_get(state, &format!("/loggytracy/api/v1/traces/{trace_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 2);
+
+    let root_row = &rows[0];
+    assert_eq!(root_row["trace_id"], trace_id.as_str());
+    assert_eq!(root_row["span_id"], "bb".repeat(8).as_str());
+    assert_eq!(root_row["parent_span_id"], "");
+    assert_eq!(root_row["name"], "span-bbbbbbbbbbbbbbbb");
+    assert_eq!(root_row["kind"], "server");
+    assert_eq!(root_row["service"], "api");
+    assert_eq!(root_row["status"], "ok");
+    assert_eq!(root_row["start"], "1000");
+    assert_eq!(root_row["end"], "2000");
+    assert_eq!(root_row["duration"], "1000");
+    // One merged map: the span attribute shadows the resource's same-named key.
+    assert_eq!(root_row["attributes"]["env"], "span-wins");
+    assert_eq!(root_row["attributes"]["service.name"], "api");
+    assert_eq!(root_row["events"][0]["name"], "exception");
+    assert_eq!(root_row["events"][0]["timestamp"], "1500");
+    assert_eq!(root_row["events"][0]["attributes"]["exception.type"], "IOError");
+
+    let child_row = &rows[1];
+    assert_eq!(child_row["parent_span_id"], "bb".repeat(8).as_str());
+    assert_eq!(child_row["kind"], "client");
+    assert_eq!(child_row["status"], "unset");
+    assert_eq!(child_row["service"], "");
+}
+
+#[tokio::test]
+async fn trace_by_id_rejects_a_malformed_id_and_any_parameter() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+
+    let (status, body) = first_party_get(state.clone(), "/loggytracy/api/v1/traces/nope").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("32 hexadecimal characters"), "{body}");
+
+    let uri = format!("/loggytracy/api/v1/traces/{}?start=-1h", "ab".repeat(16));
+    let (status, body) = first_party_get(state, &uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("takes no parameters"), "{body}");
+}
+
+#[tokio::test]
+async fn an_unknown_trace_id_is_a_404_that_names_retention() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    let (status, body) = first_party_get(
+        state,
+        &format!("/loggytracy/api/v1/traces/{}", "ab".repeat(16)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("retention"), "{body}");
+}
+
+/// A trace lookup carries no window, so the floor is applied span by span: a
+/// wholly expired trace is a 404 and a straddling one keeps only the spans
+/// that are still retained.
+#[tokio::test]
+async fn trace_by_id_drops_spans_below_the_retention_floor() {
+    const HOUR_NS: i64 = 60 * 60 * 1_000_000_000;
+    let now_ns = crate::tenant_policy::now_ns();
+    let data_dir = temp_dir();
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    let memtable = Arc::new(MemTable::new());
+    let parts = Arc::new(PartRegistry::new());
+    let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+        parts.operation_lock(),
+    ));
+    let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+    journal.trace_memtable().insert(vec![
+        trace_span_at(&"aa".repeat(16), "old-only", now_ns - 2 * HOUR_NS, ("k", "v")),
+        trace_span_at(&"bb".repeat(16), "straddle-old", now_ns - 2 * HOUR_NS, ("k", "v")),
+        trace_span_at(&"bb".repeat(16), "straddle-new", now_ns - 60_000_000_000, ("k", "v")),
+    ]);
+    let policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test());
+    policy.install_for_test(
+        [(
+            test_tenant(),
+            crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_secs(
+                60 * 60,
+            )),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let state = crate::test_support::state_with_tenant_policy(
+        config, memtable, journal, parts, trace_parts, None, policy,
+    );
+
+    let (status, _) = first_party_get(
+        state.clone(),
+        &format!("/loggytracy/api/v1/traces/{}", "aa".repeat(16)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = first_party_get(
+        state,
+        &format!("/loggytracy/api/v1/traces/{}", "bb".repeat(16)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "span-straddle-new");
+}
+
+#[tokio::test]
+async fn a_trace_with_more_spans_than_the_budget_is_a_413() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |config| config.max_trace_spans = 2);
+    let trace_id = "ab".repeat(16);
+    state.journal.trace_memtable().insert(vec![
+        trace_span_at(&trace_id, "s1", 1_000, ("k", "v")),
+        trace_span_at(&trace_id, "s2", 2_000, ("k", "v")),
+        trace_span_at(&trace_id, "s3", 3_000, ("k", "v")),
+    ]);
+    let (status, body) =
+        first_party_get(state, &format!("/loggytracy/api/v1/traces/{trace_id}")).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.contains("trace query exceeds"), "{body}");
+}
+
+#[tokio::test]
+async fn the_api_fallback_lists_the_trace_routes() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    let (status, body) = first_party_get(state, "/loggytracy/api/v1/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("/loggytracy/api/v1/traces/{trace_id}"), "{body}");
 }

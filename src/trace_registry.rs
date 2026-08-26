@@ -259,10 +259,12 @@ impl TraceRegistry {
         trace_id: &str,
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
+        reservation: Option<&crate::query_memory::QueryMemoryReservation>,
     ) -> Result<Vec<TraceSpan>, String> {
         let mut readers = self.snapshot();
         readers.sort_by_key(|reader| reader.part().meta.min_ts_ns);
         let mut spans = Vec::new();
+        let mut charged = ByteCharge::new(reservation);
         for reader in readers {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Err("trace query timed out".to_string());
@@ -279,6 +281,7 @@ impl TraceRegistry {
                 remaining,
                 cancellation,
             )?);
+            charged.ensure(&spans)?;
         }
         spans.sort_by(|left, right| {
             left.start_time_ns
@@ -293,8 +296,9 @@ impl TraceRegistry {
         tenant: &TenantId,
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
+        reservation: Option<&crate::query_memory::QueryMemoryReservation>,
     ) -> Result<Vec<TraceSpan>, String> {
-        self.query_range(tenant, None, scan_limit, cancellation)
+        self.query_range(tenant, None, scan_limit, cancellation, reservation)
     }
 
     /// Every span for the tenant, or only those starting inside `range`.
@@ -304,8 +308,10 @@ impl TraceRegistry {
         range: Option<(i64, i64)>,
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
+        reservation: Option<&crate::query_memory::QueryMemoryReservation>,
     ) -> Result<Vec<TraceSpan>, String> {
         let mut spans = Vec::new();
+        let mut charged = ByteCharge::new(reservation);
         for reader in self.snapshot() {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Err("trace query timed out".to_string());
@@ -320,6 +326,7 @@ impl TraceRegistry {
                 None => reader.query_all_limited(tenant, remaining, cancellation)?,
             };
             spans.extend(part_spans);
+            charged.ensure(&spans)?;
         }
         spans.sort_by(|left, right| {
             left.start_time_ns
@@ -331,6 +338,36 @@ impl TraceRegistry {
 
     pub fn part_count(&self) -> usize {
         self.inner.read().len()
+    }
+}
+
+/// Charges a growing span collection against the shared query memory pool at
+/// part granularity — bounded between charges by the span budget the caller
+/// already enforces. Each span is estimated once, however many parts follow.
+struct ByteCharge<'a> {
+    reservation: Option<&'a crate::query_memory::QueryMemoryReservation>,
+    estimated_bytes: u64,
+    counted: usize,
+}
+
+impl<'a> ByteCharge<'a> {
+    fn new(reservation: Option<&'a crate::query_memory::QueryMemoryReservation>) -> Self {
+        Self {
+            reservation,
+            estimated_bytes: 0,
+            counted: 0,
+        }
+    }
+
+    fn ensure(&mut self, spans: &[TraceSpan]) -> Result<(), String> {
+        let Some(reservation) = self.reservation else {
+            return Ok(());
+        };
+        for span in &spans[self.counted..] {
+            self.estimated_bytes += crate::trace::span_query_bytes(span);
+        }
+        self.counted = spans.len();
+        reservation.ensure(self.estimated_bytes)
     }
 }
 
