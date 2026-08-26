@@ -209,6 +209,27 @@ issue and the commit messages of the five phases.
   the counter, span budget 413, per-tenant policy refusal on all four
   routes); docs swept of the "unreadable until M13" gap.
 
+## M14 acceptance checklist
+
+The scope is issue #8; the plan and its acceptance checklist live in
+[`docs/M14_IMPLEMENTATION_PLAN.md`](M14_IMPLEMENTATION_PLAN.md). This file
+tracks execution state per phase.
+
+- [x] Phase 1 — the ruler's paper half: the plan document, the `VISION.md`
+  metrics claim (the "does not do metrics at all" sentence retired), the
+  `ARCHITECTURE.md` M14 row, this section, the `todo.md` M14 section.
+- [ ] Phase 2 — the ruler's iron half: metric workload generator,
+  `MetricShape` matrix, digest classes, VictoriaMetrics compose target,
+  `compare/run_metrics.sh` one-sided.
+- [ ] Phase 3 — model, Gorilla, ingest, journal kind 3, replay-equals-live.
+- [ ] Phase 4 — series index and the degradation ladder.
+- [ ] Phase 5 — parts, registry, flush threading, recovery.
+- [ ] Phase 6 — object storage, retention, the compactor.
+- [ ] Phase 7 — the read path and its `QUERY_API.md` sections.
+- [ ] Phase 8 — bed completion and the memory-gate scenario.
+- [ ] Phase 9 — run, regenerate, publish `COMPARISON_METRICS.md` win or
+  lose.
+
 ## Completion protocol
 
 For each pending milestone, replace broad outcome text with a concrete

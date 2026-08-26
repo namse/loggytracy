@@ -391,7 +391,8 @@ private scans.
 
 ## Ingest is OTLP
 
-**Logs and traces arrive over OTLP and nothing else.** The Loki push endpoint
+**Logs, traces, and — with M14 — metrics arrive over OTLP and nothing
+else.** The Loki push endpoint
 was removed first; the Loki *query* API followed with the read-path decision
 (issue #3). An ingest protocol and a query protocol are separate decisions that
 happened to share a name, and both went the same way once the viewer stopped
@@ -401,10 +402,14 @@ over its own flat-filter API ([`QUERY_API.md`](QUERY_API.md)).
 **Why.** loggytracy has one intended consumer, and everything it would store
 already arrives as OTLP there: guest traces, guest logs (stdout, converted to
 OTLP log records by the host), and the worker's own telemetry. Two things in that
-deployment are not OTLP and neither is loggytracy's business — node metrics go
-by Prometheus remote_write, and this engine does not do metrics at all; and
-systemd journal currently goes by Loki push, which the collector can convert,
-because `otelcol.receiver.loki` exists precisely for that.
+deployment are not OTLP today, and only one of them stays out of loggytracy's
+business: systemd journal currently goes by Loki push, which the collector can
+convert, because `otelcol.receiver.loki` exists precisely for that. Node
+metrics went by Prometheus remote_write while this engine did not do metrics;
+that sentence is retired by M14 (issue #8,
+[`M14_IMPLEMENTATION_PLAN.md`](M14_IMPLEMENTATION_PLAN.md)) — metrics become
+the third signal, and they arrive the way everything else does, as OTLP, with
+the collector converting what the node exporters emit.
 
 **What it buys is larger than one endpoint.** An OTLP record is re-encoded into
 a Loki `PushRequest` before it reaches the WAL, so that replay has a single
@@ -573,6 +578,56 @@ bed**, and one shape got worse in the same change (`json_field` backward, see
 None of that is retracted by this section. What it establishes is that
 invariant III was unbuilt and is now half built, and that the number to beat is
 written down for the shape that is no longer the headline.
+
+---
+
+## The metrics claim (M14, issue #8) — stated before the engine exists
+
+Metrics are the third signal an fn0 console needs, and the axis this engine
+can own there is the same one it claims for logs: the declared memory budget.
+The Prometheus family's chronic failure mode is cardinality explosion —
+per-pod, per-request labels minting unbounded new series until the process
+OOMs or refuses queries at a hard limit. Nobody in metrics owns the axis "a
+series-churn explosion inside a 2 GiB container degrades instead of dying."
+On the axes VictoriaMetrics has spent a decade tuning — compression, ingest,
+query throughput — parity is success and winning is not the plan.
+
+The claim, in the same falsifiable form as the log claim above:
+
+> At an equal container memory limit, on the same corpus and the same
+> machine, loggytracy answers the fn0 dashboard shapes — a windowed counter
+> `rate` and its label-grouped `sum`, over its own flat-parameter API — not
+> materially worse than VictoriaMetrics, which has spent a decade on exactly
+> this; and when a series-churn workload pushes active series past what the
+> limit can index, loggytracy keeps ingesting every known series and
+> answering every query, refusing only the *new* series with a named
+> `partial_success` that publishes how many it refused — rather than
+> slowing, swapping, or dying. Without giving up ingest throughput or disk
+> footprint in the steady phase.
+
+The two halves differ by design, not by tuning. The steady half concedes
+VictoriaMetrics its maturity — Gorilla-family sample encoding runs near the
+encoding family's entropy limit, and there is no headroom worth chasing. The
+churn half names the structural difference: VictoriaMetrics sizes its index
+to the workload, loggytracy sizes the workload to its budget — idle series
+leave the index at a declared horizon, and past `max_active_series` the
+refusal is per new series, named, counted, and published, while known series
+never notice.
+
+It is abandoned if VictoriaMetrics inside the same limit both survives the
+same churn with at least the same sample acceptance *and* beats loggytracy
+materially on the steady shapes — then the budget axis bought nothing, the
+metrics engine remains a convenience of the one-binary packaging rather than
+a differentiator, and the document publishes the loss.
+
+**Nothing below this claim is measured yet.** It is stated before the engine
+exists because the ruler comes before the work: the workload, the query
+shapes, and the comparison bed against VictoriaMetrics
+(`compare/run_metrics.sh` regenerating `COMPARISON_METRICS.md` from result
+JSON, published win or lose) are built first, the same order M8/M9 imposed on
+logs. The design that must survive that bed is recorded in
+[`M14_IMPLEMENTATION_PLAN.md`](M14_IMPLEMENTATION_PLAN.md).
+
 ---
 
 ## What is deliberately not built
@@ -583,7 +638,9 @@ written down for the shape that is no longer the headline.
   no customer. The Tempo surface went with it, and the first-party trace API
   (M13, issue #7) is its replacement. If external demand ever materializes, a
   Grafana datasource plugin over the first-party API is the cheap insurance;
-  the compat endpoints do not come back.
+  the compat endpoints do not come back. The same decision extends to the
+  metrics signal before it is built: **no PromQL** — M14's read surface is
+  first-party flat parameters, for the same reason the Loki surface went.
 - **No cluster, no replication, no in-process query UI, no separate index
   store.**
   Single writer is the design, and writer fencing enforces it. Every guarantee

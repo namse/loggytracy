@@ -183,6 +183,29 @@ reason expires now — the bed is built and its baseline is published.
       shrinks what "whole group" costs. A slower right answer over a faster wrong one is not a trade this
       repository debates.
 
+## M14 — the metrics engine (issue #8)
+
+**In progress.** The plan is [`docs/M14_IMPLEMENTATION_PLAN.md`](docs/M14_IMPLEMENTATION_PLAN.md); execution
+state is the phase list in [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md). The claim is in
+[`docs/VISION.md`](docs/VISION.md) and nothing under it is measured yet — the ruler (workload, shapes,
+VictoriaMetrics bed) is built before the engine, the order M8/M9 imposed on logs.
+
+Deferred items this plan minted, so they are not re-litigated mid-build:
+
+- [ ] **Compactor tier constants are constants, not knobs** (8 parts per tier, ~16 MiB / ~256 MiB
+      promotion), until a load run says otherwise. If the bed's object-store counts or query fan-in blame
+      the tiers, that measurement is the reason to promote them to configuration — not before.
+- [ ] **Exponential histograms are downscaled to ≤ 64 `le` buckets at ingest** (decided with the user,
+      2026-08-26). Lossy and irreversible for stored data; native storage is the recorded future work if
+      fn0 ever needs tighter tail quantiles than bucket boundaries give.
+- [ ] **OTLP exemplars are dropped** at the decomposition, documented in `QUERY_API.md` when Phase 7
+      writes it.
+- [ ] **Retention stays per-tenant, not per-signal.** Metrics reuse the tenant's single period via a
+      `metric_part_fully_expired` predicate; a per-signal period is future work with no current consumer.
+- [ ] **`rate`/`increase` are the VictoriaMetrics definition** (positive-delta sum, no extrapolation —
+      decided with the user, 2026-08-26). Revisiting this means revisiting the bed's exact-agreement
+      digests, so it does not happen casually.
+
 ## M8 — the ruler (precondition for everything after it)
 
 No optimization starts before this. Every performance number currently in the repository was produced by a
