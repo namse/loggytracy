@@ -72,7 +72,26 @@ services:
       - victorialogs-data:/victoria-logs-data
     stop_grace_period: 120s
 
+  # The metrics bed's competitor (M14, issue #8), driven by run_metrics.sh.
+  # Same fairness contract as the log targets: the shared memory limit, one
+  # volume, and the single non-default flag that names where the data lives —
+  # everything else at its own defaults, captured from /flags by the run.
+  victoriametrics:
+    <<: *memory
+    # Profiled so the log bed's `docker compose up -d` does not start a fourth
+    # container on the same cores it is measuring the other three on;
+    # run_metrics.sh opts in with `--profile metrics`.
+    profiles: ["metrics"]
+    image: victoriametrics/victoria-metrics:v1.150.0
+    command: -storageDataPath=/victoria-metrics-data
+    ports:
+      - "${VICTORIAMETRICS_PORT:-3140}:8428"
+    volumes:
+      - victoriametrics-data:/victoria-metrics-data
+    stop_grace_period: 120s
+
 volumes:
   loggytracy-data:
   loki-data:
   victorialogs-data:
+  victoriametrics-data:

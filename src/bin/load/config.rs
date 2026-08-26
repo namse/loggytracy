@@ -52,6 +52,12 @@ pub enum Target {
     /// parsed differently; that asymmetry is why the two halves of this adapter
     /// look so unalike.
     VictoriaLogs,
+    /// The metrics bed's one competitor (issue #8, M14).
+    ///
+    /// It answers only the metric phases: the log phases refuse it in `main`
+    /// before any workload is built, because a log run against a metrics
+    /// engine would measure nothing either claim is about.
+    VictoriaMetrics,
 }
 
 impl Target {
@@ -60,8 +66,10 @@ impl Target {
             "loggytracy" => Ok(Target::Loggytracy),
             "loki" => Ok(Target::Loki),
             "victorialogs" | "victoria-logs" | "vl" => Ok(Target::VictoriaLogs),
+            "victoriametrics" | "victoria-metrics" | "vm" => Ok(Target::VictoriaMetrics),
             other => Err(format!(
-                "LOGGYTRACY_LOAD_TARGET must be loggytracy, loki or victorialogs, got {other:?}"
+                "LOGGYTRACY_LOAD_TARGET must be loggytracy, loki, victorialogs or \
+victoriametrics, got {other:?}"
             )),
         }
     }
@@ -71,6 +79,7 @@ impl Target {
             Target::Loggytracy => "loggytracy",
             Target::Loki => "loki",
             Target::VictoriaLogs => "victorialogs",
+            Target::VictoriaMetrics => "victoriametrics",
         }
     }
 
@@ -86,7 +95,10 @@ impl Target {
     pub fn tenant_header(self, tenant: &str) -> String {
         match self {
             Target::Loggytracy | Target::Loki => tenant.to_string(),
-            Target::VictoriaLogs => "0".to_string(),
+            // Single-node VictoriaMetrics has no tenancy at all and ignores the
+            // header; "0" keeps the request identical to the VictoriaLogs one
+            // rather than inventing a third spelling.
+            Target::VictoriaLogs | Target::VictoriaMetrics => "0".to_string(),
         }
     }
 
@@ -94,23 +106,36 @@ impl Target {
     /// loggytracy serves the collector path bare, Loki nests it under `/otlp`,
     /// VictoriaLogs under `/insert/opentelemetry` — all measured accepting the
     /// identical protobuf body (2026-08-02, Loki 3.3.2 / VictoriaLogs v1.52.0).
+    /// VictoriaMetrics is the metric phases' target and takes OTLP *metrics*
+    /// at its own spelling of the collector path.
     pub fn push_path(self) -> &'static str {
         match self {
             Target::Loggytracy => "/v1/logs",
             Target::Loki => "/otlp/v1/logs",
             Target::VictoriaLogs => "/insert/opentelemetry/v1/logs",
+            Target::VictoriaMetrics => "/opentelemetry/v1/metrics",
+        }
+    }
+
+    /// Where OTLP metrics are POSTed, for the metric phases. `None` is the
+    /// refusal: a target with no metrics ingest cannot join the metrics bed.
+    pub fn metric_push_path(self) -> Option<&'static str> {
+        match self {
+            Target::Loggytracy => Some("/v1/metrics"),
+            Target::VictoriaMetrics => Some("/opentelemetry/v1/metrics"),
+            Target::Loki | Target::VictoriaLogs => None,
         }
     }
 
     /// Where a run waits for the system to answer before it starts.
     ///
-    /// Not `/ready` everywhere: VictoriaLogs exposes `/health` and has no
+    /// Not `/ready` everywhere: the Victoria* line exposes `/health` and has no
     /// separate readiness notion, so asking for one would wait out a timeout on
     /// a system that was up the whole time.
     pub fn ready_path(self) -> &'static str {
         match self {
             Target::Loggytracy | Target::Loki => "/ready",
-            Target::VictoriaLogs => "/health",
+            Target::VictoriaLogs | Target::VictoriaMetrics => "/health",
         }
     }
 }
@@ -125,11 +150,18 @@ impl Target {
 /// timestamps, so both systems end up holding byte-identical entries, and
 /// `matrix` then times and compares queries over that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Phase {
     Load,
     Seed,
     Matrix,
+    /// The metric analogue of `seed`: the fixed metric dataset, identical OTLP
+    /// bodies at identical timestamps on every side (M14, issue #8).
+    MetricSeed,
+    /// The metric analogue of `matrix`: the fn0 metric shapes over the seeded
+    /// dataset, cold and warm, with a per-answer record set the report's
+    /// agreement check runs on.
+    MetricMatrix,
 }
 
 impl Phase {
@@ -138,8 +170,11 @@ impl Phase {
             "load" => Ok(Phase::Load),
             "seed" => Ok(Phase::Seed),
             "matrix" => Ok(Phase::Matrix),
+            "metric-seed" => Ok(Phase::MetricSeed),
+            "metric-matrix" => Ok(Phase::MetricMatrix),
             other => Err(format!(
-                "LOGGYTRACY_LOAD_PHASE must be load, seed or matrix, got {other:?}"
+                "LOGGYTRACY_LOAD_PHASE must be load, seed, matrix, metric-seed or \
+metric-matrix, got {other:?}"
             )),
         }
     }
@@ -194,6 +229,7 @@ pub struct Config {
     pub otlp_eps: f64,
 
     pub verify: Verify,
+    pub metric_verify: MetricVerify,
     pub targets: Targets,
 }
 
@@ -229,6 +265,51 @@ pub struct Verify {
     /// windows are aligned to it — consecutive lookbacks then tile the range
     /// exactly like buckets do.
     pub step_seconds: i64,
+}
+
+/// The fixed metric dataset the metrics comparison runs on, and the query
+/// matrix over it (M14, issue #8).
+///
+/// The vocabulary knobs are deliberately few: the dataset's shape is part of
+/// the ruler, and a knob per axis would invite tuning the corpus toward
+/// whichever engine the run is flattering. What varies is scale (scrapes,
+/// services, instances) and the matrix mechanics; the instrument names, the
+/// histogram bounds and the churn layout are constants in
+/// `metric_workload.rs`.
+#[derive(Clone, Debug, Serialize)]
+pub struct MetricVerify {
+    pub tenant: String,
+    /// Unix nanoseconds of the first scrape. Zero is refused for the same
+    /// reason the log anchor's zero is: two runs deriving it from their own
+    /// clocks would seed different datasets.
+    pub anchor_ns: i64,
+    /// Scrapes per active series. The dataset spans
+    /// `scrapes * scrape_interval_seconds`.
+    pub scrapes: usize,
+    pub scrape_interval_seconds: i64,
+    /// Steady services × instances is the steady series population; every
+    /// (service, instance) pair carries the full instrument vocabulary.
+    pub services: usize,
+    pub instances_per_service: usize,
+    pub gauges: usize,
+    pub counters: usize,
+    /// Generations the churn service's instances are replaced across: each
+    /// generation's series report only in its slice of the scrape range, which
+    /// is the pod-restart shape the `churned_selector` query must cross.
+    pub churn_generations: usize,
+    pub churn_instances: usize,
+    pub push_connections: usize,
+    /// Sub-windows the span is cut into, per shape — what makes a cold query
+    /// cold, exactly as in the log matrix.
+    pub windows: usize,
+    pub repeats: usize,
+    /// The range-query step. A multiple of the scrape interval, and the query
+    /// windows are aligned to it, so both engines evaluate on the same grid.
+    pub step_seconds: i64,
+    /// The `rate`/`increase`/quantile window. One knob for every windowed
+    /// shape so a ratio difference is never the two engines being asked
+    /// different windows.
+    pub range_seconds: i64,
 }
 
 impl Config {
@@ -309,6 +390,25 @@ impl Config {
                 step_seconds: env_u64("LOGGYTRACY_LOAD_MATRIX_STEP_SECONDS", 10).max(1) as i64,
             },
 
+            metric_verify: MetricVerify {
+                tenant: env_string("LOGGYTRACY_LOAD_METRIC_TENANT", "verify-metrics"),
+                anchor_ns: env_u64("LOGGYTRACY_LOAD_METRIC_ANCHOR_NS", 0) as i64,
+                scrapes: env_usize("LOGGYTRACY_LOAD_METRIC_SCRAPES", 360).max(4),
+                scrape_interval_seconds: env_u64("LOGGYTRACY_LOAD_METRIC_SCRAPE_SECONDS", 10).max(1)
+                    as i64,
+                services: env_usize("LOGGYTRACY_LOAD_METRIC_SERVICES", 8).max(1),
+                instances_per_service: env_usize("LOGGYTRACY_LOAD_METRIC_INSTANCES", 4).max(1),
+                gauges: env_usize("LOGGYTRACY_LOAD_METRIC_GAUGES", 4).max(1),
+                counters: env_usize("LOGGYTRACY_LOAD_METRIC_COUNTERS", 4).max(1),
+                churn_generations: env_usize("LOGGYTRACY_LOAD_METRIC_CHURN_GENERATIONS", 4).max(1),
+                churn_instances: env_usize("LOGGYTRACY_LOAD_METRIC_CHURN_INSTANCES", 4).max(1),
+                push_connections: env_usize("LOGGYTRACY_LOAD_METRIC_CONNECTIONS", 4).max(1),
+                windows: env_usize("LOGGYTRACY_LOAD_METRIC_WINDOWS", 3).max(1),
+                repeats: env_usize("LOGGYTRACY_LOAD_METRIC_REPEATS", 5).max(1),
+                step_seconds: env_u64("LOGGYTRACY_LOAD_METRIC_STEP_SECONDS", 30).max(1) as i64,
+                range_seconds: env_u64("LOGGYTRACY_LOAD_METRIC_RANGE_SECONDS", 60).max(1) as i64,
+            },
+
             targets: Targets {
                 push_response_p95_ms: env_f64("LOGGYTRACY_TARGET_PUSH_RESPONSE_P95_MS", 250.0),
                 push_response_p99_ms: env_f64("LOGGYTRACY_TARGET_PUSH_RESPONSE_P99_MS", 1000.0),
@@ -346,6 +446,15 @@ server memory could be watched"
     /// Log-time span the verification dataset covers, in nanoseconds.
     pub fn verify_span_ns(&self) -> i64 {
         self.verify.rows as i64 * self.verify.step_ns
+    }
+
+    /// Metric-time span the metric verification dataset covers, in
+    /// nanoseconds: the scrape grid from the anchor to one interval past the
+    /// last scrape.
+    pub fn metric_span_ns(&self) -> i64 {
+        self.metric_verify.scrapes as i64
+            * self.metric_verify.scrape_interval_seconds
+            * 1_000_000_000
     }
 
     pub fn request_timeout(&self) -> Duration {

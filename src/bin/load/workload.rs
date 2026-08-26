@@ -408,6 +408,9 @@ impl QueryGenerator {
                     .finish();
                 (expression, format!("/select/logsql/query?{query}"))
             }
+            crate::config::Target::VictoriaMetrics => {
+                unreachable!("main refuses the log load phase for victoriametrics")
+            }
         };
         QueryPlan {
             shape,
@@ -460,6 +463,9 @@ pub fn result_rows(target: crate::config::Target, body: &[u8]) -> u64 {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .count() as u64,
+        crate::config::Target::VictoriaMetrics => {
+            unreachable!("main refuses the log load phase for victoriametrics")
+        }
     }
 }
 

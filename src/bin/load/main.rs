@@ -27,6 +27,8 @@
 mod config;
 mod http;
 mod matrix;
+mod metric_matrix;
+mod metric_workload;
 mod otlp;
 mod probe;
 mod stats;
@@ -187,10 +189,158 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    // Phase and target are validated together before any workload is built:
+    // the log phases against a metrics engine, or the metric phases against a
+    // logs-only engine, would measure nothing either claim is about — and the
+    // refusal here is what lets the per-target code below treat the wrong
+    // pairing as unreachable instead of half-supporting it.
+    let target_fits = match cfg.phase {
+        Phase::Load | Phase::Seed | Phase::Matrix => cfg.target != Target::VictoriaMetrics,
+        Phase::MetricSeed | Phase::MetricMatrix => {
+            matches!(cfg.target, Target::Loggytracy | Target::VictoriaMetrics)
+        }
+    };
+    if !target_fits {
+        eprintln!(
+            "target {} does not answer the {:?} phase: the log phases accept loggytracy, loki \
+and victorialogs; the metric phases accept loggytracy and victoriametrics",
+            cfg.target.name(),
+            cfg.phase
+        );
+        std::process::exit(2);
+    }
     match cfg.phase {
         Phase::Load => run_load(cfg).await,
         Phase::Seed | Phase::Matrix => run_verify(cfg).await,
+        Phase::MetricSeed | Phase::MetricMatrix => run_metric_verify(cfg).await,
     }
+}
+
+/// The metric analogue of `run_verify`: the fixed metric dataset and the fn0
+/// shape matrix over it (M14, issue #8).
+async fn run_metric_verify(cfg: Config) {
+    if let Err(error) = metric_workload::require_metric_anchor(&cfg.metric_verify) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
+    if let Err(error) = wait_for_ready(&cfg).await {
+        eprintln!("server at {} is not ready: {error}", cfg.http_address);
+        std::process::exit(1);
+    }
+    let memory_source = cfg.memory_source();
+    let corpus = metric_workload::metric_corpus(cfg.seed, &cfg.metric_verify);
+    eprintln!(
+        "{} phase {:?}: {} instruments, {} decomposed series, {} scrapes",
+        cfg.target.name(),
+        cfg.phase,
+        corpus.instruments.len(),
+        corpus.decomposed_series_count(),
+        corpus.scrapes
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let anon_peak = Arc::new(AtomicU64::new(0));
+    let anon_watch = tokio::spawn({
+        let stop = stop.clone();
+        let anon_peak = anon_peak.clone();
+        let source = cfg.memory_source();
+        async move {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(source) = source.as_ref()
+                    && let Ok(memory) = source.read()
+                    && let Some(anon) = memory.anon_bytes
+                {
+                    anon_peak.fetch_max(anon, Ordering::Relaxed);
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    });
+
+    let mut report = json!({
+        "phase": if cfg.phase == Phase::MetricSeed { "metric-seed" } else { "metric-matrix" },
+        "target": cfg.target.name(),
+        "run": {
+            "build_revision": config::build_revision(),
+            "machine_profile": config::machine_profile(),
+            "seed": cfg.seed,
+        },
+        "metric_verify": {
+            "tenant": corpus.tenant,
+            "anchor_ns": cfg.metric_verify.anchor_ns,
+            "span_ns": cfg.metric_span_ns(),
+            "scrapes": corpus.scrapes,
+            "instruments": corpus.instruments.len(),
+            "datapoints": corpus.datapoint_count(),
+            "decomposed_samples": corpus.decomposed_sample_count(),
+            "decomposed_series": corpus.decomposed_series_count(),
+        },
+    });
+
+    let ok;
+    match cfg.phase {
+        Phase::MetricSeed => {
+            let outcome = metric_workload::run_metric_seed(&cfg, &corpus).await;
+            ok = outcome.errors == 0 && outcome.datapoints == corpus.datapoint_count();
+            report["seed"] = json!({
+                "pushes": outcome.pushes,
+                "datapoints": outcome.datapoints,
+                "decomposed_samples": outcome.decomposed_samples,
+                "wire_bytes": outcome.wire_bytes,
+                "retries": outcome.retries,
+                "errors": outcome.errors,
+                "rejected_datapoints": outcome.rejected_datapoints,
+                "statuses": outcome
+                    .statuses
+                    .iter()
+                    .map(|(status, count)| (status.to_string(), *count))
+                    .collect::<BTreeMap<_, _>>(),
+                "first_error": outcome.first_error,
+                "elapsed_seconds": outcome.elapsed_seconds,
+                "complete": ok,
+            });
+        }
+        Phase::MetricMatrix => {
+            let outcome = metric_matrix::run_metric_matrix(&cfg).await;
+            ok = outcome["shapes"]
+                .as_object()
+                .is_some_and(|shapes| shapes.values().all(|shape| shape["errors"] == json!(0)));
+            report["matrix"] = outcome;
+        }
+        Phase::Load | Phase::Seed | Phase::Matrix => {
+            unreachable!("run_metric_verify is only reached for the metric phases")
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = anon_watch.await;
+    let memory_after = memory_source
+        .as_ref()
+        .ok()
+        .and_then(|source| source.read().ok());
+    report["memory"] = json!({
+        "source": memory_source.as_ref().map(|source| source.describe()).ok(),
+        "error": memory_source.as_ref().err(),
+        "peak_bytes": memory_after.as_ref().map(|memory| memory.vm_hwm_bytes),
+        "current_bytes": memory_after.as_ref().map(|memory| memory.vm_rss_bytes),
+        "anon_peak_bytes": match anon_peak.load(Ordering::Relaxed) {
+            0 => Value::Null,
+            peak => json!(peak),
+        },
+        "anon_bytes_end": memory_after.as_ref().and_then(|memory| memory.anon_bytes),
+        "file_bytes_end": memory_after.as_ref().and_then(|memory| memory.file_bytes),
+    });
+    report["config"] = serde_json::to_value(&cfg).expect("config serialization");
+    report["verdict"] = json!(if ok { "PASS" } else { "FAIL" });
+
+    let rendered = serde_json::to_string_pretty(&report).expect("report serialization");
+    if let Some(path) = cfg.result_path.as_ref()
+        && let Err(error) = std::fs::write(path, format!("{rendered}\n"))
+    {
+        eprintln!("could not write {path}: {error}");
+    }
+    println!("{rendered}");
+    std::process::exit(if ok { 0 } else { 1 });
 }
 
 /// The seed and matrix phases, which drive the fixed dataset the comparison's
@@ -288,7 +438,9 @@ async fn run_verify(cfg: Config) {
                 .is_some_and(|shapes| shapes.values().all(|shape| shape["errors"] == json!(0)));
             report["matrix"] = outcome;
         }
-        Phase::Load => unreachable!("run_verify is only reached for the seed and matrix phases"),
+        Phase::Load | Phase::MetricSeed | Phase::MetricMatrix => {
+            unreachable!("run_verify is only reached for the seed and matrix phases")
+        }
     }
 
     stop.store(true, Ordering::Relaxed);
@@ -860,6 +1012,9 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
                         probe::sum_by_prefix(&metrics, "vl_storage_file_parts") as u64,
                     );
                 }
+                Target::VictoriaMetrics => {
+                    unreachable!("main refuses the log load phase for victoriametrics")
+                }
             },
             None => outcome.scrape_errors += 1,
         }
@@ -1197,6 +1352,9 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 }),
                 rows > 0 && dropped == 0,
             )
+        }
+        Target::VictoriaMetrics => {
+            unreachable!("main refuses the log load phase for victoriametrics")
         }
     };
 

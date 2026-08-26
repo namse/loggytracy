@@ -34,7 +34,7 @@ tonic = { version = "0.14.6", features = ["transport"] }
 # `type_url` or details encoding still round-trips through a test that decodes
 # with the same definitions, and only a real collector would notice.
 tonic-types = "0.14.6"
-opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic", "trace", "logs", "with-serde"] }
+opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic", "trace", "logs", "metrics", "with-serde"] }
 regex = "1"
 regex-syntax = "0.8"
 serde = { version = "1", features = ["derive"] }

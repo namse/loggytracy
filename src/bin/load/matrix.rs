@@ -589,6 +589,9 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                             .finish();
                         format!("/select/logsql/query?{encoded}")
                     }
+                    Target::VictoriaMetrics => {
+                        unreachable!("main refuses the log phases for victoriametrics")
+                    }
                 };
                 let basis_fields: Vec<String> = match shape {
                     Shape::LabelOnly | Shape::LineFilter => vec!["service_name".to_string()],
@@ -950,7 +953,7 @@ fn rfc3339_to_ns(text: &str) -> Result<i64, String> {
 
 /// Nanoseconds as the six-decimal seconds string `canonical_sample` produces,
 /// without a float division that would wobble in the last microsecond.
-fn ns_to_sample_seconds(ns: i64) -> String {
+pub(crate) fn ns_to_sample_seconds(ns: i64) -> String {
     format!(
         "{}.{:06}",
         ns.div_euclid(1_000_000_000),
@@ -1135,6 +1138,10 @@ pub fn digest_for(target: Target, body: &[u8], query: &Query) -> Result<Answer, 
         Target::Loggytracy => digest_first_party_response(body, &query.basis_fields),
         Target::Loki => digest_response(body, &query.basis_fields),
         Target::VictoriaLogs => digest_logsql_response(body, &query.basis_fields, query.step_ns),
+        Target::VictoriaMetrics => Err(format!(
+            "target {} answers the metric matrix, not the log one",
+            target.name()
+        )),
     }
 }
 
