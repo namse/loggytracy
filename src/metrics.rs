@@ -270,15 +270,17 @@ pub enum QueryEndpoint {
     Tail,
     Logs,
     Histogram,
+    Traces,
     TraceById,
 }
 
 impl QueryEndpoint {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Query,
         Self::Tail,
         Self::Logs,
         Self::Histogram,
+        Self::Traces,
         Self::TraceById,
     ];
 
@@ -289,6 +291,7 @@ impl QueryEndpoint {
             Self::Tail => "tail",
             Self::Logs => "logs",
             Self::Histogram => "logs_histogram",
+            Self::Traces => "traces",
             Self::TraceById => "trace_by_id",
         }
     }

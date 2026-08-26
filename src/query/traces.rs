@@ -71,6 +71,147 @@ floor — it may have expired or never existed here"
     ))
 }
 
+pub async fn traces_search(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Result<axum::response::Response, ApiError> {
+    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
+        .map_err(ApiError::from_tenant)?;
+    let now_ns = state.clock.now_ns();
+    let params =
+        parse_trace_filter_params(raw.as_deref().unwrap_or(""), now_ns, TRACE_SEARCH_PARAMS)
+            .map_err(ApiError::bad_request)?;
+
+    let end_ns = params.end_ns.unwrap_or(now_ns);
+    let start_ns = params.start_ns.unwrap_or_else(|| {
+        state
+            .config
+            .max_query_range
+            .map(duration_to_i64_ns)
+            .map(|range| end_ns.saturating_sub(range))
+            .unwrap_or(i64::MIN)
+    });
+    validate_query_range(&state.config, start_ns, end_ns).map_err(ApiError::bad_request)?;
+    let limit = parse_limit(
+        params.limit,
+        state.config.max_trace_search_limit.min(MAX_TRACE_SEARCH_LIMIT),
+    )
+    .map_err(ApiError::bad_request)?;
+
+    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
+    let start_ns = clamp_to_retention(start_ns, retention_floor_ns);
+    if start_ns > end_ns {
+        return Ok(ndjson_response(String::new(), 0, 0));
+    }
+
+    let _slot = state.tenant_quota.begin_query(&tenant).map_err(|error| {
+        ApiError::from_engine(format!("{TENANT_QUOTA_PREFIX}{}", error.message))
+    })?;
+    let metrics = state.metrics.clone();
+    let started = std::time::Instant::now();
+    let result = scan_trace_spans(state, tenant, TraceScanTarget::Window { start_ns, end_ns }).await;
+    metrics.observe_query(crate::metrics::QueryEndpoint::Traces, started.elapsed());
+    let outcome = match result {
+        Ok(outcome) => {
+            metrics
+                .query_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            outcome
+        }
+        Err(error) => {
+            metrics
+                .query_errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(error);
+        }
+    };
+    metrics
+        .query_scanned_rows
+        .fetch_add(outcome.spans.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .query_scanned_bytes
+        .fetch_add(outcome.estimated_bytes, std::sync::atomic::Ordering::Relaxed);
+
+    let body = trace_summaries_ndjson(&outcome.spans, &params.filters, limit);
+    Ok(ndjson_response(
+        body,
+        outcome.spans.len() as u64,
+        outcome.estimated_bytes,
+    ))
+}
+
+#[derive(Serialize)]
+struct TraceSummaryRow<'a> {
+    trace_id: &'a str,
+    root_service: String,
+    root_name: &'a str,
+    start: String,
+    end: String,
+    duration: String,
+    span_count: usize,
+}
+
+/// One summary per matching trace, newest first. A trace matches when every
+/// filter is matched by at least one of its spans in the window — including
+/// the duration comparisons, which are per-span, not per-trace. The summary
+/// is built from the windowed spans only: reading the rest of the trace would
+/// mean restoring the parts the window was pruned to avoid, and the full
+/// extent is what the by-id fetch shows.
+fn trace_summaries_ndjson(
+    spans: &[crate::trace::TraceSpan],
+    filters: &[TraceFilter],
+    limit: usize,
+) -> String {
+    // The scan's `(start_time_ns, span_id)` order survives the grouping, so
+    // each trace's spans arrive sorted by start.
+    let mut traces: std::collections::BTreeMap<&str, Vec<&crate::trace::TraceSpan>> =
+        std::collections::BTreeMap::new();
+    for span in spans {
+        traces.entry(&span.trace_id).or_default().push(span);
+    }
+
+    let mut summaries: Vec<(i64, TraceSummaryRow)> = Vec::new();
+    for (trace_id, trace_spans) in &traces {
+        if !filters
+            .iter()
+            .all(|filter| trace_spans.iter().any(|span| filter.matches(span)))
+        {
+            continue;
+        }
+        let root = trace_spans
+            .iter()
+            .find(|span| span.span.parent_span_id.is_empty())
+            .unwrap_or(&trace_spans[0]);
+        let start = trace_spans[0].start_time_ns;
+        let end = trace_spans
+            .iter()
+            .map(|span| span.end_time_ns)
+            .max()
+            .unwrap_or(root.end_time_ns);
+        summaries.push((
+            start,
+            TraceSummaryRow {
+                trace_id,
+                root_service: root.service_name().unwrap_or_default().to_string(),
+                root_name: &root.span.name,
+                start: start.to_string(),
+                end: end.to_string(),
+                duration: end.saturating_sub(start).to_string(),
+                span_count: trace_spans.len(),
+            },
+        ));
+    }
+    // Newest first; the BTreeMap already ordered equal starts by trace id.
+    summaries.sort_by_key(|(start, _)| std::cmp::Reverse(*start));
+    let mut body = String::new();
+    for (_, row) in summaries.into_iter().take(limit) {
+        body.push_str(&serde_json::to_string(&row).expect("a summary row serializes infallibly"));
+        body.push('\n');
+    }
+    body
+}
+
 #[derive(Serialize)]
 struct TraceSpanRow {
     trace_id: String,

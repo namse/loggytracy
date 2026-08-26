@@ -69,6 +69,11 @@ pub(crate) const ATTRIBUTE_KEYS_PARAMS: &[&str] = &["start", "end"];
 /// parameter refusal is what says so.
 pub(crate) const ATTRIBUTE_VALUES_PARAMS: &[&str] = &["start", "end", "attr"];
 
+/// Line filters and `parse` are deliberately absent: a span is not a line,
+/// and every trace predicate goes through `attr` — including the duration
+/// comparisons only this surface accepts.
+pub(crate) const TRACE_SEARCH_PARAMS: &[&str] = &["start", "end", "attr", "limit"];
+
 /// The first-party routes, listed by the router fallback so one wrong request
 /// teaches the whole surface. Grows with each endpoint that lands.
 pub(crate) const ROUTES: &[&str] = &[
@@ -78,6 +83,7 @@ pub(crate) const ROUTES: &[&str] = &[
     "/loggytracy/api/v1/logs/attributes/{key}/values",
     "/loggytracy/api/v1/logs/tail",
     "/loggytracy/api/v1/logs/delete",
+    "/loggytracy/api/v1/traces",
     "/loggytracy/api/v1/traces/{trace_id}",
 ];
 
@@ -92,11 +98,47 @@ pub struct FilterParams {
     pub delay_seconds: Option<u64>,
 }
 
+/// Everything the one parsing loop collects, before an endpoint family's
+/// finisher shapes it: `build_log_query` for the log endpoints,
+/// `build_trace_filters` for the trace ones. The unknown-parameter refusal
+/// lives in the loop, so both surfaces refuse with the same sentence.
+#[derive(Default)]
+struct RawParams {
+    start_ns: Option<i64>,
+    end_ns: Option<i64>,
+    limit: Option<usize>,
+    direction: Option<String>,
+    bucket_ns: Option<i64>,
+    delay_seconds: Option<u64>,
+    attrs: Vec<(String, AttrOp, String)>,
+    line_filters: Vec<logql::LineFilter>,
+    parse_stages: Vec<logql::PipelineStage>,
+}
+
 pub fn parse_filter_params(
     raw: &str,
     now_ns: i64,
     allowed: &'static [&'static str],
 ) -> Result<FilterParams, String> {
+    let raw = parse_raw_params(raw, now_ns, allowed)?;
+    let forward = parse_direction(&raw.direction)?;
+    let query = build_log_query(raw.attrs, raw.line_filters, raw.parse_stages)?;
+    Ok(FilterParams {
+        start_ns: raw.start_ns,
+        end_ns: raw.end_ns,
+        query,
+        limit: raw.limit,
+        forward,
+        bucket_ns: raw.bucket_ns,
+        delay_seconds: raw.delay_seconds,
+    })
+}
+
+fn parse_raw_params(
+    raw: &str,
+    now_ns: i64,
+    allowed: &'static [&'static str],
+) -> Result<RawParams, String> {
     let mut start_ns = None;
     let mut end_ns = None;
     let mut limit = None;
@@ -173,16 +215,137 @@ pub fn parse_filter_params(
         }
     }
 
-    let forward = parse_direction(&direction)?;
-    let query = build_log_query(attrs, line_filters, parse_stages)?;
-    Ok(FilterParams {
+    Ok(RawParams {
         start_ns,
         end_ns,
-        query,
         limit,
-        forward,
+        direction,
         bucket_ns,
         delay_seconds,
+        attrs,
+        line_filters,
+        parse_stages,
+    })
+}
+
+pub(crate) struct TraceFilterParams {
+    pub start_ns: Option<i64>,
+    pub end_ns: Option<i64>,
+    pub filters: Vec<TraceFilter>,
+    pub limit: Option<usize>,
+}
+
+pub(crate) fn parse_trace_filter_params(
+    raw: &str,
+    now_ns: i64,
+    allowed: &'static [&'static str],
+) -> Result<TraceFilterParams, String> {
+    let raw = parse_raw_params(raw, now_ns, allowed)?;
+    let filters = build_trace_filters(raw.attrs)?;
+    Ok(TraceFilterParams {
+        start_ns: raw.start_ns,
+        end_ns: raw.end_ns,
+        filters,
+        limit: raw.limit,
+    })
+}
+
+/// A trace-side `attr` filter, evaluated per span over `tag_value` — the
+/// flattened lookup whose intrinsics are `name`, `duration`, and `status`. An
+/// absent key behaves as the empty string, mirroring `LabelMatcher::matches`,
+/// so `attr=k!=v` matches spans without `k` exactly as it does on logs.
+pub(crate) enum TraceFilter {
+    Eq { key: String, value: String },
+    Neq { key: String, value: String },
+    Re { key: String, regex: regex::Regex },
+    NRe { key: String, regex: regex::Regex },
+    Duration { op: logql::FieldOp, threshold_ns: u64 },
+}
+
+impl TraceFilter {
+    pub(crate) fn matches(&self, span: &crate::trace::TraceSpan) -> bool {
+        match self {
+            Self::Eq { key, value } => span.tag_value(key).unwrap_or_default() == *value,
+            Self::Neq { key, value } => span.tag_value(key).unwrap_or_default() != *value,
+            Self::Re { key, regex } => regex.is_match(&span.tag_value(key).unwrap_or_default()),
+            Self::NRe { key, regex } => !regex.is_match(&span.tag_value(key).unwrap_or_default()),
+            Self::Duration { op, threshold_ns } => {
+                let duration = span.duration_ns();
+                match op {
+                    logql::FieldOp::Eq => duration == *threshold_ns,
+                    logql::FieldOp::Neq => duration != *threshold_ns,
+                    logql::FieldOp::Lt => duration < *threshold_ns,
+                    logql::FieldOp::Lte => duration <= *threshold_ns,
+                    logql::FieldOp::Gt => duration > *threshold_ns,
+                    logql::FieldOp::Gte => duration >= *threshold_ns,
+                    logql::FieldOp::Regex | logql::FieldOp::NotRegex => {
+                        unreachable!("build_trace_filters never builds a regex duration")
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Comparisons are `duration`-only, deliberately: every other value is stored
+/// stringified, and a lexicographic `>=` over strings would answer wrongly
+/// without saying so. Equality on `duration` parses the value as a duration
+/// too — `attr=duration=150ms` compares nanoseconds, not the string "150ms"
+/// against "150000000".
+fn build_trace_filters(attrs: Vec<(String, AttrOp, String)>) -> Result<Vec<TraceFilter>, String> {
+    attrs
+        .into_iter()
+        .map(|(key, op, value)| match op {
+            AttrOp::Compare(op) => {
+                if key != "duration" {
+                    return Err(format!(
+                        "attr filter '{key}{symbol}{value}' compares a key that is not duration: \
+>=, <=, >, < apply to the duration intrinsic only, like attr=duration>=250ms — \
+see docs/QUERY_API.md",
+                        symbol = compare_symbol(op)
+                    ));
+                }
+                Ok(TraceFilter::Duration {
+                    op,
+                    threshold_ns: trace_duration_threshold(compare_symbol(op), &value)?,
+                })
+            }
+            AttrOp::Match(logql::MatcherOp::Eq) if key == "duration" => Ok(TraceFilter::Duration {
+                op: logql::FieldOp::Eq,
+                threshold_ns: trace_duration_threshold("=", &value)?,
+            }),
+            AttrOp::Match(logql::MatcherOp::Neq) if key == "duration" => {
+                Ok(TraceFilter::Duration {
+                    op: logql::FieldOp::Neq,
+                    threshold_ns: trace_duration_threshold("!=", &value)?,
+                })
+            }
+            AttrOp::Match(logql::MatcherOp::Eq) => Ok(TraceFilter::Eq { key, value }),
+            AttrOp::Match(logql::MatcherOp::Neq) => Ok(TraceFilter::Neq { key, value }),
+            AttrOp::Match(logql::MatcherOp::Re) => Ok(TraceFilter::Re {
+                regex: anchored_regex(&value)?,
+                key,
+            }),
+            AttrOp::Match(logql::MatcherOp::NRe) => Ok(TraceFilter::NRe {
+                regex: anchored_regex(&value)?,
+                key,
+            }),
+        })
+        .collect()
+}
+
+fn trace_duration_threshold(symbol: &str, value: &str) -> Result<u64, String> {
+    let ns = logql::parse_duration_ns(value).map_err(|_| {
+        format!(
+            "invalid duration '{value}' in attr filter 'duration{symbol}{value}': \
+write a unit, like attr=duration>=250ms"
+        )
+    })?;
+    u64::try_from(ns).map_err(|_| {
+        format!(
+            "invalid duration '{value}' in attr filter 'duration{symbol}{value}': \
+the duration must not be negative"
+        )
     })
 }
 

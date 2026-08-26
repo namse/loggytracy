@@ -2868,6 +2868,7 @@ fn every_query_api_route_and_param_is_documented() {
         ATTRIBUTE_VALUES_PARAMS,
         DELETE_PARAMS,
         DELETE_FILTER_PARAMS,
+        TRACE_SEARCH_PARAMS,
     ] {
         for name in params {
             let documented = format!("`{name}`");
@@ -3114,4 +3115,275 @@ async fn the_api_fallback_lists_the_trace_routes() {
     let (status, body) = first_party_get(state, "/loggytracy/api/v1/nope").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body.contains("/loggytracy/api/v1/traces/{trace_id}"), "{body}");
+}
+
+// --- The first-party API: `GET /loggytracy/api/v1/traces` ---
+
+/// A span with an explicit end, for duration and overlap cases.
+fn trace_span_between(
+    trace_id: &str,
+    span_id: &str,
+    start_time_ns: i64,
+    end_time_ns: i64,
+) -> crate::trace::TraceSpan {
+    let mut span = trace_span_at(trace_id, span_id, start_time_ns, ("k", "v"));
+    span.end_time_ns = end_time_ns;
+    span
+}
+
+#[tokio::test]
+async fn trace_search_returns_newest_first_summaries() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    let older = "aa".repeat(16);
+    let newer = "bb".repeat(16);
+    let mut root = trace_span_at(&older, "a-root", 1_000, ("env", "prod"));
+    root.resource = Some(opentelemetry_proto::tonic::resource::v1::Resource {
+        attributes: vec![otlp_kv("service.name", "api")],
+        ..Default::default()
+    });
+    state.journal.trace_memtable().insert(vec![
+        root,
+        trace_span_at(&newer, "b-root", 5_000, ("env", "prod")),
+    ]);
+
+    let (status, body) = first_party_get(state, "/loggytracy/api/v1/traces?start=0&end=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["trace_id"], newer.as_str());
+    assert_eq!(rows[1]["trace_id"], older.as_str());
+    assert_eq!(rows[1]["root_service"], "api");
+    assert_eq!(rows[1]["root_name"], "span-a-root");
+    assert_eq!(rows[1]["start"], "1000");
+    assert_eq!(rows[1]["end"], "2000");
+    assert_eq!(rows[1]["duration"], "1000");
+    assert_eq!(rows[1]["span_count"], 1);
+}
+
+#[tokio::test]
+async fn trace_search_matches_on_a_child_span_but_summarizes_the_full_window() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    let trace_id = "ab".repeat(16);
+    let mut child = trace_span_at(&trace_id, "child", 2_000, ("http.route", "/items"));
+    child.span.parent_span_id = vec![0xbb; 8];
+    state.journal.trace_memtable().insert(vec![
+        trace_span_at(&trace_id, "root", 1_000, ("env", "prod")),
+        child,
+    ]);
+
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/traces?start=0&end=10&attr=http.route=/items",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["root_name"], "span-root");
+    assert_eq!(rows[0]["start"], "1000");
+    assert_eq!(rows[0]["span_count"], 2);
+}
+
+#[tokio::test]
+async fn a_span_that_began_before_the_window_and_ran_into_it_still_matches() {
+    const SECOND_NS: i64 = 1_000_000_000;
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    state.journal.trace_memtable().insert(vec![
+        // Began at 3s, still running at 8s: overlaps the [5s, 10s] window.
+        trace_span_between(&"aa".repeat(16), "running", 3 * SECOND_NS, 8 * SECOND_NS),
+        // Over before the window opened.
+        trace_span_between(&"bb".repeat(16), "finished", 3 * SECOND_NS, 4 * SECOND_NS),
+    ]);
+
+    let (status, body) = first_party_get(state, "/loggytracy/api/v1/traces?start=5&end=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["trace_id"], "aa".repeat(16).as_str());
+}
+
+/// `bb` straddles the floor: one span expired, one retained. It belongs in
+/// the results because the tenant still holds activity inside the clamped
+/// window, and its summary must be built from the retained span alone — a
+/// trace that survives the floor must not carry expired timestamps out.
+#[tokio::test]
+async fn trace_search_clamps_its_window_to_the_retention_floor() {
+    const HOUR_NS: i64 = 60 * 60 * 1_000_000_000;
+    let now_ns = crate::tenant_policy::now_ns();
+    let data_dir = temp_dir();
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    let memtable = Arc::new(MemTable::new());
+    let parts = Arc::new(PartRegistry::new());
+    let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+        parts.operation_lock(),
+    ));
+    let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+    let fresh_ns = now_ns - 60_000_000_000;
+    journal.trace_memtable().insert(vec![
+        trace_span_at(&"aa".repeat(16), "old-only", now_ns - 2 * HOUR_NS, ("k", "v")),
+        trace_span_at(&"bb".repeat(16), "straddle-old", now_ns - 2 * HOUR_NS, ("k", "v")),
+        trace_span_at(&"bb".repeat(16), "straddle-new", fresh_ns, ("k", "v")),
+    ]);
+    let policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test());
+    policy.install_for_test(
+        [(
+            test_tenant(),
+            crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_secs(
+                60 * 60,
+            )),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let state = crate::test_support::state_with_tenant_policy(
+        config, memtable, journal, parts, trace_parts, None, policy,
+    );
+
+    let (status, body) =
+        first_party_get(state.clone(), "/loggytracy/api/v1/traces?start=-3h").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["trace_id"], "bb".repeat(16).as_str());
+    assert_eq!(rows[0]["span_count"], 1);
+    assert_eq!(rows[0]["start"], fresh_ns.to_string().as_str());
+
+    // A window that ends below the floor is empty, not an error.
+    let (status, body) =
+        first_party_get(state, "/loggytracy/api/v1/traces?start=-3h&end=-2h").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn duration_comparisons_select_traces_by_their_spans_own_durations() {
+    const MS_NS: i64 = 1_000_000;
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    state.journal.trace_memtable().insert(vec![
+        trace_span_between(&"aa".repeat(16), "fast", 1_000, 1_000 + 100 * MS_NS),
+        trace_span_between(&"bb".repeat(16), "slow", 1_000, 1_000 + 1_000 * MS_NS),
+        trace_span_between(&"cc".repeat(16), "slower", 1_000, 1_000 + 5_000 * MS_NS),
+    ]);
+
+    let (status, body) = first_party_get(
+        state.clone(),
+        "/loggytracy/api/v1/traces?start=0&end=10&attr=duration%3E%3D1s",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ndjson_rows(&body).len(), 2);
+
+    let (status, body) = first_party_get(
+        state.clone(),
+        "/loggytracy/api/v1/traces?start=0&end=10&attr=duration%3E%3D1s&attr=duration%3C%3D2s",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["trace_id"], "bb".repeat(16).as_str());
+
+    // Equality parses the unit too: nanoseconds, not the string "100ms".
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/traces?start=0&end=10&attr=duration=100ms",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["trace_id"], "aa".repeat(16).as_str());
+}
+
+#[tokio::test]
+async fn a_comparison_on_a_non_duration_key_is_refused_with_the_fix() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/traces?attr=latency%3E%3D1s",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("duration intrinsic only"), "{body}");
+}
+
+#[tokio::test]
+async fn a_bare_number_duration_threshold_is_refused_with_the_unit_hint() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/traces?attr=duration%3E%3D1000",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("write a unit"), "{body}");
+}
+
+#[tokio::test]
+async fn trace_search_respects_its_limit_and_its_cap() {
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |config| config.max_trace_search_limit = 2);
+    state.journal.trace_memtable().insert(vec![
+        trace_span_at(&"aa".repeat(16), "s1", 1_000, ("k", "v")),
+        trace_span_at(&"bb".repeat(16), "s2", 2_000, ("k", "v")),
+        trace_span_at(&"cc".repeat(16), "s3", 3_000, ("k", "v")),
+    ]);
+
+    let (status, body) = first_party_get(
+        state.clone(),
+        "/loggytracy/api/v1/traces?start=0&end=10&limit=1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["trace_id"], "cc".repeat(16).as_str(), "newest first");
+
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/traces?start=0&end=10&limit=3",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("limit exceeds the maximum of 2"), "{body}");
+}
+
+/// Both halves of the scan answer the same overlap rule: a part-side span
+/// that began before the window and ran into it, and a memtable span inside
+/// it, join in one summary.
+#[tokio::test]
+async fn trace_search_reads_the_memtable_and_the_parts_through_one_window_rule() {
+    const SECOND_NS: i64 = 1_000_000_000;
+    let data_dir = temp_dir();
+    let state = trace_state(&data_dir, |_| {});
+    let trace_id = "ab".repeat(16);
+    let flushed = crate::trace_part::flush_trace_spans(
+        &[trace_span_between(&trace_id, "flushed", 3 * SECOND_NS, 6 * SECOND_NS)],
+        &data_dir.join("traces"),
+        8192,
+    )
+    .unwrap();
+    state.trace_parts.register(flushed).unwrap();
+    state.journal.trace_memtable().insert(vec![trace_span_between(
+        &trace_id,
+        "buffered",
+        7 * SECOND_NS,
+        8 * SECOND_NS,
+    )]);
+
+    let (status, body) = first_party_get(state, "/loggytracy/api/v1/traces?start=5&end=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["span_count"], 2);
+    assert_eq!(rows[0]["start"], (3 * SECOND_NS).to_string().as_str());
 }

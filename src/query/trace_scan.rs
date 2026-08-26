@@ -7,10 +7,11 @@
 /// whole-span JSON payloads, a cost profile that would let either surface
 /// starve the other if they shared slots.
 const MAX_TRACE_SPANS: usize = 100_000;
+const MAX_TRACE_SEARCH_LIMIT: usize = 1_000;
 
-// Search's `Window` variant joins with the `/traces` endpoint.
 enum TraceScanTarget {
     ById(String),
+    Window { start_ns: i64, end_ns: i64 },
 }
 
 struct TraceScanOutcome {
@@ -30,6 +31,9 @@ async fn scan_trace_spans(
     let max_runtime = state.config.max_trace_query_runtime;
     let guard = match &target {
         TraceScanTarget::ById(trace_id) => pin_trace_parts(&state, &tenant, trace_id).await?,
+        TraceScanTarget::Window { start_ns, end_ns } => {
+            pin_all_trace_parts(&state, &tenant, Some((*start_ns, *end_ns))).await?
+        }
     };
     let scan_permit = tokio::time::timeout(
         max_runtime,
@@ -60,6 +64,9 @@ async fn scan_trace_spans(
             TraceScanTarget::ById(trace_id) => {
                 memtable.query_trace_id_limited(&tenant, trace_id, max_spans)?
             }
+            TraceScanTarget::Window { start_ns, end_ns } => {
+                memtable.snapshot_range_limited(&tenant, *start_ns, *end_ns, max_spans)?
+            }
         };
         let mut estimated_bytes: u64 = spans.iter().map(crate::trace::span_query_bytes).sum();
         memory_reservation.ensure(estimated_bytes)?;
@@ -68,6 +75,13 @@ async fn scan_trace_spans(
             TraceScanTarget::ById(trace_id) => task_state.trace_parts.query_trace_id(
                 &tenant,
                 trace_id,
+                Some(remaining),
+                Some(&task_cancellation),
+                Some(&memory_reservation),
+            )?,
+            TraceScanTarget::Window { start_ns, end_ns } => task_state.trace_parts.query_range(
+                &tenant,
+                Some((*start_ns, *end_ns)),
                 Some(remaining),
                 Some(&task_cancellation),
                 Some(&memory_reservation),
@@ -125,6 +139,33 @@ async fn pin_trace_parts(
         state.parts.operation_lock(),
         state.remote_cache.clone(),
         || state.trace_parts.candidate_part_ids(tenant, trace_id),
+        |required| state.trace_parts.missing_data_ids(required),
+        crate::remote_lifecycle::RemoteDomain::Traces,
+        state.config.max_trace_restore_runtime,
+        || Ok(()),
+        Some(state.metrics.clone()),
+    )
+    .await
+    .map_err(pin_error)
+}
+
+/// Pin the tenant's trace parts, narrowed to a time range when the caller has
+/// one. Pinning is what downloads a part body, so the range has to reach this
+/// far or the scan-side pruning saves nothing.
+async fn pin_all_trace_parts(
+    state: &AppState,
+    tenant: &TenantId,
+    range: Option<(i64, i64)>,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, ApiError> {
+    crate::remote_lifecycle::pin_remote_parts(
+        state.parts.operation_lock(),
+        state.remote_cache.clone(),
+        || match range {
+            Some((start_ns, end_ns)) => state
+                .trace_parts
+                .tenant_part_ids_in_range(tenant, start_ns, end_ns),
+            None => state.trace_parts.tenant_part_ids(tenant),
+        },
         |required| state.trace_parts.missing_data_ids(required),
         crate::remote_lifecycle::RemoteDomain::Traces,
         state.config.max_trace_restore_runtime,

@@ -31,6 +31,7 @@ curl -sH 'X-Scope-OrgID: acme' \
 | GET | `/loggytracy/api/v1/logs/attributes/{key}/values` | a key's values in the window (autocomplete) |
 | GET | `/loggytracy/api/v1/logs/tail` | a live chunked-NDJSON stream of new rows |
 | POST/GET/DELETE | `/loggytracy/api/v1/logs/delete` | submit / list / cancel deletion requests |
+| GET | `/loggytracy/api/v1/traces` | trace summaries matching the filters, newest first |
 | GET | `/loggytracy/api/v1/traces/{trace_id}` | every span of one trace, flat rows for a timeline |
 
 Unchanged and outside this document's scope: `/metrics` (Prometheus text),
@@ -51,7 +52,7 @@ its section, and an unknown parameter is a 400 that names the accepted set.
 | `regex` | yes | The line must match this regex (unanchored, like `grep`). |
 | `not_regex` | yes | The line must not match this regex. |
 | `parse` | `json` and/or `logfmt`, once each | Run that parser over the stored line first; `attr` filters then see pushed attributes *and* extracted fields. One non-obvious rule, inherited from the pipeline: a pushed attribute **shadows** an extracted field of the same name. |
-| `limit` | no | Rows to return (`/logs`) or per poll (`/logs/tail`). Default 100, capped by `LOGGYTRACY_MAX_LOG_LIMIT`. |
+| `limit` | no | Rows to return (`/logs`), rows per poll (`/logs/tail`), or traces to return (`/traces`). Default 100, capped by `LOGGYTRACY_MAX_LOG_LIMIT` (`LOGGYTRACY_MAX_TRACE_SEARCH_LIMIT` on `/traces`). |
 | `direction` | no | `forward` or `backward` (default) — ascending or descending time. |
 | `bucket` | no | Histogram bucket width, duration syntax: `30s`, `5m`, `1h`. |
 | `delay` | no | Tail only: whole seconds (≤ 5) to hold rows back, for writers whose clocks trail the server's. |
@@ -161,6 +162,54 @@ curl -sNH 'X-Scope-OrgID: acme' \
 
 The proxy in front must pass streaming responses through unbuffered and not
 apply an idle timeout shorter than the heartbeat interval.
+
+## `GET /traces` — search
+
+Accepts `start`, `end`, `attr`, `limit`.
+
+One summary per matching trace, `application/x-ndjson`, newest first (by the
+trace's first windowed span, descending):
+
+```json
+{"trace_id":"0af7651916cd43dd8448eb211c80319c","root_service":"api","root_name":"GET /items","start":"1756100000123456789","end":"1756100000273456789","duration":"150000000","span_count":3}
+```
+
+Three rules decide what matches and what the summary says, and each exists
+for the same reason — the scan must be prunable to the window:
+
+- **A trace matches when any of its spans overlaps the window.** A request
+  that began before the window and was still running inside it is exactly
+  what an operator searches for, and overlap is the predicate the storage's
+  row-group bounds already answer, so the scan reads only the row groups that
+  can contribute.
+- **Every `attr` filter must be matched by at least one span of the trace**
+  (not necessarily the same span for all filters). Filters read the span's
+  flattened view: the intrinsics `name`, `duration`, `status`
+  (`unset`/`ok`/`error`), then `service.name`, span attributes, resource
+  attributes. An absent key compares as the empty string, exactly as on logs.
+- **The summary is built from the windowed spans only** — `root_*` from the
+  first windowed span without a parent (or the earliest), `start`/`end`/
+  `duration`/`span_count` from what the window holds. Reading the rest of
+  the trace would mean restoring the parts the window was pruned to avoid;
+  the full extent is what the by-id fetch shows.
+
+`duration` is where the comparison operators apply, and they are **per
+span**: `attr=duration>=1.5s` means "some span ran at least 1.5s", not "the
+trace's extent is at least 1.5s" — a deliberate difference from Tempo's
+`minDuration`. Values need a unit (`250ms`, `1.5s`); equality parses the
+unit too, so `attr=duration=150ms` compares nanoseconds rather than strings.
+A comparison on any other key is refused: every other value is stored
+stringified, and a lexicographic `>=` would answer wrongly without saying so.
+
+```sh
+# Slow error traces from the api service, last hour
+curl -sH 'X-Scope-OrgID: acme' --get \
+  --data-urlencode 'start=-1h' \
+  --data-urlencode 'attr=service.name=api' \
+  --data-urlencode 'attr=status=error' \
+  --data-urlencode 'attr=duration>=1.5s' \
+  'http://127.0.0.1:3100/loggytracy/api/v1/traces'
+```
 
 ## `GET /traces/{trace_id}` — the trace timeline
 

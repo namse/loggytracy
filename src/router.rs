@@ -40,6 +40,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .get(query::list_delete_requests)
                 .delete(query::cancel_delete_request),
         )
+        .route("/loggytracy/api/v1/traces", get(query::traces_search))
         .route(
             "/loggytracy/api/v1/traces/{trace_id}",
             get(query::trace_by_id),
