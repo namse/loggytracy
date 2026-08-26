@@ -136,6 +136,43 @@ pub struct MetricSample {
     pub ts_ns: i64,
     pub value: f64,
     pub kind: SampleKind,
+    /// Which OTLP datapoint of its request this sample came from, in the
+    /// deterministic traversal order `series_ingest` assigns. The admission
+    /// ladder decides per datapoint — a histogram's bucket family is admitted
+    /// or refused whole — and the WAL filter drops refused datapoints by this
+    /// index, so replay cannot resurrect a refused series.
+    pub datapoint_index: u32,
+}
+
+/// What the `max_active_series` ladder rung did with one export's samples.
+pub struct AdmitOutcome {
+    /// Datapoint indices whose series were all admitted. Samples and WAL
+    /// bytes for the rest must be dropped by the caller.
+    pub admitted: std::collections::HashSet<u32>,
+    pub rejected_datapoints: u64,
+    pub rejected_samples: u64,
+    pub rejected_new_series: u64,
+}
+
+impl AdmitOutcome {
+    pub fn rejected_any(&self) -> bool {
+        self.rejected_datapoints > 0
+    }
+}
+
+/// The ladder's observability: every rung moves a counter, because a
+/// degradation nobody can see is indistinguishable from a bug. Rendered under
+/// `loggytracy_*` names by `/metrics`.
+#[derive(Default)]
+pub struct SeriesCounters {
+    /// Live series index entries across all tenants — a gauge.
+    pub active_series: AtomicU64,
+    pub series_created_total: AtomicU64,
+    pub series_evicted_idle_total: AtomicU64,
+    /// New series refused at the `max_active_series` boundary.
+    pub series_rejected_total: AtomicU64,
+    pub metric_datapoints_rejected_total: AtomicU64,
+    pub metric_samples_rejected_total: AtomicU64,
 }
 
 /// Fixed overhead charged per live series beyond its canonical bytes: map
@@ -212,6 +249,7 @@ pub struct SeriesMemTable {
     flushing: RwLock<Option<Arc<SeriesSnapshot>>>,
     inner_bytes: AtomicU64,
     flushing_bytes: AtomicU64,
+    counters: SeriesCounters,
 }
 
 impl SeriesMemTable {
@@ -221,7 +259,142 @@ impl SeriesMemTable {
             flushing: RwLock::new(None),
             inner_bytes: AtomicU64::new(0),
             flushing_bytes: AtomicU64::new(0),
+            counters: SeriesCounters::default(),
         }
+    }
+
+    pub fn counters(&self) -> &SeriesCounters {
+        &self.counters
+    }
+
+    /// The `max_active_series` rung, decided per datapoint under one write
+    /// lock so two concurrent exports cannot both reserve the last capacity.
+    ///
+    /// A datapoint whose series are all known is admitted unconditionally —
+    /// steady traffic never notices an explosion. A datapoint needing new
+    /// series gets them only if the tenant has capacity; when it does not,
+    /// idle series are evicted first (the lazy half of the idle sweep: their
+    /// capacity returns exactly when someone asks for it), and only then is
+    /// the datapoint refused. Admitted new series are reserved here as empty
+    /// state entries, so the reservation holds even though the samples land
+    /// later via the journal writer.
+    pub fn admit_datapoints(
+        &self,
+        tenant: &TenantId,
+        samples: &[MetricSample],
+        max_active: usize,
+        idle_cutoff_ns: i64,
+    ) -> AdmitOutcome {
+        let mut outcome = AdmitOutcome {
+            admitted: std::collections::HashSet::new(),
+            rejected_datapoints: 0,
+            rejected_samples: 0,
+            rejected_new_series: 0,
+        };
+        let mut inner = self.inner.write();
+        let tenant_series = inner.entry(tenant.clone()).or_default();
+        let mut evicted_for_pressure = false;
+        let mut index = 0;
+        while index < samples.len() {
+            let datapoint = samples[index].datapoint_index;
+            let mut end = index;
+            while end < samples.len() && samples[end].datapoint_index == datapoint {
+                end += 1;
+            }
+            let group = &samples[index..end];
+            let mut new_labels: Vec<&SeriesLabels> = group
+                .iter()
+                .map(|sample| &sample.labels)
+                .filter(|labels| !tenant_series.contains_key(*labels))
+                .collect();
+            new_labels.sort();
+            new_labels.dedup();
+            if !new_labels.is_empty() && tenant_series.len() + new_labels.len() > max_active {
+                // One eviction pass per export: a second would find nothing
+                // new, and the refusal below must not degrade into a scan per
+                // datapoint.
+                if !evicted_for_pressure {
+                    evicted_for_pressure = true;
+                    let evicted =
+                        Self::evict_idle_locked(tenant_series, idle_cutoff_ns, &self.counters);
+                    self.inner_bytes.fetch_sub(evicted, Ordering::Relaxed);
+                }
+                if tenant_series.len() + new_labels.len() > max_active {
+                    outcome.rejected_datapoints += 1;
+                    outcome.rejected_samples += group.len() as u64;
+                    outcome.rejected_new_series += new_labels.len() as u64;
+                    self.counters
+                        .series_rejected_total
+                        .fetch_add(new_labels.len() as u64, Ordering::Relaxed);
+                    self.counters
+                        .metric_datapoints_rejected_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.counters
+                        .metric_samples_rejected_total
+                        .fetch_add(group.len() as u64, Ordering::Relaxed);
+                    index = end;
+                    continue;
+                }
+            }
+            let mut reserved = 0u64;
+            for labels in new_labels {
+                reserved += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                tenant_series.insert((*labels).clone(), SeriesBuffer::new());
+                self.counters
+                    .series_created_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.active_series.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner_bytes.fetch_add(reserved, Ordering::Relaxed);
+            outcome.admitted.insert(datapoint);
+            index = end;
+        }
+        outcome
+    }
+
+    /// Evict every series whose samples are all flushed and whose newest
+    /// sample is older than the cutoff — the idle-timeout rung, called on the
+    /// flush cadence and lazily under admission pressure. The evicted series'
+    /// history stays in its parts; if it returns it is simply re-created, and
+    /// the one artifact — a delta counter restarting — is exactly a counter
+    /// reset, which `rate` absorbs.
+    pub fn evict_idle(&self, idle_cutoff_ns: i64) -> u64 {
+        let mut inner = self.inner.write();
+        let mut evicted = 0u64;
+        let mut freed = 0u64;
+        for tenant_series in inner.values_mut() {
+            let before = tenant_series.len() as u64;
+            freed += Self::evict_idle_locked(tenant_series, idle_cutoff_ns, &self.counters);
+            evicted += before - tenant_series.len() as u64;
+        }
+        self.inner_bytes.fetch_sub(freed, Ordering::Relaxed);
+        evicted
+    }
+
+    fn evict_idle_locked(
+        tenant_series: &mut HashMap<SeriesLabels, SeriesBuffer>,
+        idle_cutoff_ns: i64,
+        counters: &SeriesCounters,
+    ) -> u64 {
+        let mut freed = 0u64;
+        let mut evicted = 0u64;
+        tenant_series.retain(|labels, buffer| {
+            let idle =
+                !buffer.has_samples() && buffer.last_ts.is_none_or(|last| last < idle_cutoff_ns);
+            if idle {
+                freed += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                evicted += 1;
+            }
+            !idle
+        });
+        counters
+            .series_evicted_idle_total
+            .fetch_add(evicted, Ordering::Relaxed);
+        let current = counters.active_series.load(Ordering::Relaxed);
+        counters
+            .active_series
+            .fetch_sub(evicted.min(current), Ordering::Relaxed);
+        freed
     }
 
     pub fn insert(&self, samples: Vec<MetricSample>) {
@@ -235,7 +408,14 @@ impl SeriesMemTable {
             let buffer = match tenant_series.get_mut(&sample.labels) {
                 Some(buffer) => buffer,
                 None => {
+                    // Reached by replay, whose WAL was already filtered by
+                    // admission; live ingest reserves its entries in
+                    // `admit_datapoints` and lands here on the Some arm.
                     added += sample.labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                    self.counters
+                        .series_created_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.counters.active_series.fetch_add(1, Ordering::Relaxed);
                     tenant_series
                         .entry(sample.labels.clone())
                         .or_insert_with(SeriesBuffer::new)
@@ -483,6 +663,7 @@ mod tests {
             ts_ns: ts,
             value,
             kind,
+            datapoint_index: 0,
         }
     }
 
@@ -628,6 +809,115 @@ mod tests {
         assert!(
             after < before,
             "committed samples leave the accounting ({after} >= {before})"
+        );
+    }
+
+    fn indexed(
+        labels: &SeriesLabels,
+        ts: i64,
+        value: f64,
+        kind: SampleKind,
+        datapoint: u32,
+    ) -> MetricSample {
+        MetricSample {
+            datapoint_index: datapoint,
+            ..sample(labels, ts, value, kind)
+        }
+    }
+
+    #[test]
+    fn admission_refuses_only_datapoints_needing_new_series_past_the_cap() {
+        let memtable = SeriesMemTable::new();
+        let known = labels("queue_depth", "a");
+        let other_known = labels("queue_depth", "b");
+        memtable.insert(vec![
+            sample(&known, 100, 1.0, SampleKind::Gauge),
+            sample(&other_known, 100, 1.0, SampleKind::Gauge),
+        ]);
+        let fresh = labels("queue_depth", "c");
+        let samples = vec![
+            indexed(&known, 200, 2.0, SampleKind::Gauge, 0),
+            indexed(&fresh, 200, 9.0, SampleKind::Gauge, 1),
+        ];
+        let outcome = memtable.admit_datapoints(&test_tenant(), &samples, 2, i64::MIN);
+        assert!(
+            outcome.admitted.contains(&0),
+            "the known series' datapoint passes"
+        );
+        assert!(
+            !outcome.admitted.contains(&1),
+            "the new series' datapoint is refused"
+        );
+        assert_eq!(outcome.rejected_datapoints, 1);
+        assert_eq!(outcome.rejected_new_series, 1);
+        assert_eq!(
+            memtable.active_series(&test_tenant()),
+            2,
+            "nothing was reserved for the refusal"
+        );
+        assert_eq!(
+            memtable
+                .counters()
+                .series_rejected_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(memtable.counters().active_series.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn idle_flushed_series_return_their_capacity_under_pressure() {
+        let memtable = SeriesMemTable::new();
+        let old = labels("queue_depth", "old");
+        memtable.insert(vec![sample(&old, 100, 1.0, SampleKind::Gauge)]);
+        let fresh = labels("queue_depth", "fresh");
+        let samples = vec![indexed(&fresh, 1_000, 2.0, SampleKind::Gauge, 0)];
+        // Still buffered: the idle series cannot be evicted without losing
+        // samples, so the newcomer is refused.
+        let outcome = memtable.admit_datapoints(&test_tenant(), &samples, 1, 500);
+        assert!(outcome.admitted.is_empty());
+        // Flushed: the idle state is evictable, and admission reclaims it.
+        memtable.begin_flush();
+        memtable.commit_flush();
+        let outcome = memtable.admit_datapoints(&test_tenant(), &samples, 1, 500);
+        assert!(outcome.admitted.contains(&0));
+        assert_eq!(memtable.active_series(&test_tenant()), 1);
+        assert_eq!(
+            memtable
+                .counters()
+                .series_evicted_idle_total
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn a_series_still_fresh_at_the_horizon_is_not_evicted() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "a");
+        memtable.insert(vec![sample(&series, 1_000, 1.0, SampleKind::Gauge)]);
+        memtable.begin_flush();
+        memtable.commit_flush();
+        assert_eq!(memtable.evict_idle(500), 0, "newer than the cutoff");
+        assert_eq!(memtable.evict_idle(2_000), 1, "idle past the cutoff");
+        assert_eq!(memtable.active_series(&test_tenant()), 0);
+    }
+
+    #[test]
+    fn eviction_resets_the_delta_total_which_is_exactly_a_counter_reset() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("churn_requests_total", "a");
+        memtable.insert(vec![sample(&series, 100, 5.0, SampleKind::Delta)]);
+        memtable.begin_flush();
+        memtable.commit_flush();
+        memtable.evict_idle(i64::MAX);
+        memtable.insert(vec![sample(&series, 200, 3.0, SampleKind::Delta)]);
+        let sorted = memtable.sorted_samples(&test_tenant()).unwrap();
+        assert_eq!(
+            sorted.get(&series).unwrap(),
+            &vec![(200, 3.0)],
+            "the total restarts at the delta — the counter-reset shape rate's \
+positive-delta sum is defined to absorb"
         );
     }
 

@@ -200,8 +200,12 @@ pub async fn metrics(
         .map_err(crate::tenant::TenantError::into_http)?;
     ingest.admit_tenant(&tenant, body.len())?;
     let request: ExportMetricsServiceRequest = encoding.decode(&body)?;
-    ingest.accept(tenant, request).await?;
-    Ok(encoding.encode(&ExportMetricsServiceResponse::default()))
+    let outcome = ingest.accept(tenant, request).await?;
+    // A partial acceptance answers 200 with the OTLP `partial_success` naming
+    // what was refused and why; only an all-refused export is an error.
+    Ok(encoding.encode(&ExportMetricsServiceResponse {
+        partial_success: outcome.partial_success(),
+    }))
 }
 
 /// Body limit for the OTLP HTTP routes, matching what the gRPC services accept

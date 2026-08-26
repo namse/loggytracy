@@ -99,9 +99,22 @@ pub fn format_boundary(value: f64) -> String {
 
 struct Decomposition {
     samples: Vec<MetricSample>,
+    /// The next datapoint's index in the request's deterministic traversal
+    /// order — the same order [`filter_request`] walks, which is what lets an
+    /// admission verdict made over samples drop the right datapoints from the
+    /// WAL bytes.
+    next_datapoint: u32,
+    datapoint: u32,
 }
 
 impl Decomposition {
+    /// Every datapoint consumes exactly one index, whether or not it produces
+    /// samples, so the two traversals cannot drift on a skipped point.
+    fn begin_datapoint(&mut self) {
+        self.datapoint = self.next_datapoint;
+        self.next_datapoint += 1;
+    }
+
     fn push(
         &mut self,
         tenant: &TenantId,
@@ -119,6 +132,7 @@ impl Decomposition {
             ts_ns,
             value,
             kind,
+            datapoint_index: self.datapoint,
         });
         Ok(())
     }
@@ -197,6 +211,8 @@ pub fn normalize_request(
 ) -> Result<Vec<MetricSample>, MetricIngestError> {
     let mut out = Decomposition {
         samples: Vec::new(),
+        next_datapoint: 0,
+        datapoint: 0,
     };
     for resource_metrics in &request.resource_metrics {
         let promoted: Vec<(String, String)> = resource_metrics
@@ -225,6 +241,7 @@ pub fn normalize_request(
                 match &metric.data {
                     Some(metric::Data::Gauge(gauge)) => {
                         for point in &gauge.data_points {
+                            out.begin_datapoint();
                             let Some(value) = number_value(point) else {
                                 continue;
                             };
@@ -241,6 +258,7 @@ pub fn normalize_request(
                     Some(metric::Data::Sum(sum)) => {
                         let kind = temporality_kind(sum.aggregation_temporality);
                         for point in &sum.data_points {
+                            out.begin_datapoint();
                             let Some(value) = number_value(point) else {
                                 continue;
                             };
@@ -257,6 +275,7 @@ pub fn normalize_request(
                     Some(metric::Data::Histogram(histogram)) => {
                         let kind = temporality_kind(histogram.aggregation_temporality);
                         for point in &histogram.data_points {
+                            out.begin_datapoint();
                             decompose_histogram(
                                 tenant,
                                 &metric.name,
@@ -270,6 +289,7 @@ pub fn normalize_request(
                     Some(metric::Data::ExponentialHistogram(histogram)) => {
                         let kind = temporality_kind(histogram.aggregation_temporality);
                         for point in &histogram.data_points {
+                            out.begin_datapoint();
                             decompose_exponential(
                                 tenant,
                                 &metric.name,
@@ -282,6 +302,7 @@ pub fn normalize_request(
                     }
                     Some(metric::Data::Summary(summary)) => {
                         for point in &summary.data_points {
+                            out.begin_datapoint();
                             let ts = datapoint_ts(point.time_unix_nano)?;
                             let base = base_pairs(&metric.name, &point.attributes, &promoted);
                             for quantile in &point.quantile_values {
@@ -335,6 +356,69 @@ pub fn normalize_request(
         return Err(MetricIngestError::EmptyRequest);
     }
     Ok(out.samples)
+}
+
+/// The request minus the datapoints admission refused, walked in the same
+/// traversal order [`normalize_request`] assigns indices — every datapoint
+/// consumes one index whether kept or not, and the pin test asserts the two
+/// walks agree. This is what the WAL stores on a partial acceptance, so
+/// replay decomposes into exactly the admitted samples and a refused series
+/// cannot be resurrected by a restart.
+pub fn filter_request(
+    request: &ExportMetricsServiceRequest,
+    admitted: &std::collections::HashSet<u32>,
+) -> ExportMetricsServiceRequest {
+    let mut next: u32 = 0;
+    let mut keep = move || {
+        let index = next;
+        next += 1;
+        admitted.contains(&index)
+    };
+    let mut filtered = ExportMetricsServiceRequest::default();
+    for resource_metrics in &request.resource_metrics {
+        let mut kept_resource = resource_metrics.clone();
+        kept_resource.scope_metrics.clear();
+        for scope_metrics in &resource_metrics.scope_metrics {
+            let mut kept_scope = scope_metrics.clone();
+            kept_scope.metrics.clear();
+            for metric in &scope_metrics.metrics {
+                let mut kept_metric = metric.clone();
+                let has_points = match &mut kept_metric.data {
+                    Some(metric::Data::Gauge(gauge)) => {
+                        gauge.data_points.retain(|_| keep());
+                        !gauge.data_points.is_empty()
+                    }
+                    Some(metric::Data::Sum(sum)) => {
+                        sum.data_points.retain(|_| keep());
+                        !sum.data_points.is_empty()
+                    }
+                    Some(metric::Data::Histogram(histogram)) => {
+                        histogram.data_points.retain(|_| keep());
+                        !histogram.data_points.is_empty()
+                    }
+                    Some(metric::Data::ExponentialHistogram(histogram)) => {
+                        histogram.data_points.retain(|_| keep());
+                        !histogram.data_points.is_empty()
+                    }
+                    Some(metric::Data::Summary(summary)) => {
+                        summary.data_points.retain(|_| keep());
+                        !summary.data_points.is_empty()
+                    }
+                    None => false,
+                };
+                if has_points {
+                    kept_scope.metrics.push(kept_metric);
+                }
+            }
+            if !kept_scope.metrics.is_empty() {
+                kept_resource.scope_metrics.push(kept_scope);
+            }
+        }
+        if !kept_resource.scope_metrics.is_empty() {
+            filtered.resource_metrics.push(kept_resource);
+        }
+    }
+    filtered
 }
 
 /// Explicit-bounds histogram → Prometheus-style cumulative `_bucket{le=}`
@@ -535,7 +619,7 @@ impl OtlpMetricIngest<'_> {
         &self,
         tenant: crate::tenant::TenantId,
         request: ExportMetricsServiceRequest,
-    ) -> Result<(), IngestError> {
+    ) -> Result<MetricAcceptOutcome, IngestError> {
         // The cheap pre-check: every datapoint decomposes into at least one
         // sample, so a request past the cap on datapoints alone is refused
         // before any decomposition work.
@@ -565,8 +649,44 @@ impl OtlpMetricIngest<'_> {
                 .validate(sample.ts_ns)
                 .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
         }
+        // The max_active_series rung. Decided before anything is journaled,
+        // per datapoint, with idle capacity reclaimed under pressure — see
+        // `SeriesMemTable::admit_datapoints`.
+        let series_memtable = self.journal.series_memtable();
+        let idle_cutoff = self
+            .clock
+            .now_ns()
+            .saturating_sub(self.config.metric_series_idle_timeout.as_nanos() as i64);
+        let admission = series_memtable.admit_datapoints(
+            &tenant,
+            &samples,
+            self.config.max_active_series,
+            idle_cutoff,
+        );
+        if admission.rejected_any() && admission.admitted.is_empty() {
+            // Everything was refused: a 429, because capacity does return —
+            // at the idle horizon — and the collector should retry then.
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                self.refusal_message(&admission),
+            )
+                .into());
+        }
+        // On a partial acceptance the WAL gets the *filtered* request, so a
+        // replay cannot resurrect the refused series and blow the budget the
+        // refusal defended.
+        let (wire_request, samples) = if admission.rejected_any() {
+            let filtered = filter_request(&request, &admission.admitted);
+            let samples: Vec<_> = samples
+                .into_iter()
+                .filter(|sample| admission.admitted.contains(&sample.datapoint_index))
+                .collect();
+            (filtered, samples)
+        } else {
+            (request, samples)
+        };
         let mut encoded = Vec::new();
-        request.encode(&mut encoded).map_err(|error| {
+        wire_request.encode(&mut encoded).map_err(|error| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("failed to encode request: {error}"),
@@ -581,7 +701,48 @@ impl OtlpMetricIngest<'_> {
                     format!("journal write failed: {error}"),
                 )
             })?;
-        Ok(())
+        Ok(MetricAcceptOutcome {
+            rejected_data_points: admission.rejected_datapoints,
+            rejection: admission
+                .rejected_any()
+                .then(|| self.refusal_message(&admission)),
+        })
+    }
+
+    /// The teaching refusal: the count, the limit, the knob, and the horizon
+    /// at which capacity returns.
+    fn refusal_message(&self, admission: &crate::series::AdmitOutcome) -> String {
+        format!(
+            "{} new series across {} datapoints refused: the tenant holds its \
+max_active_series limit of {} live series (LOGGYTRACY_MAX_ACTIVE_SERIES). Known series are \
+still accepted; capacity returns as series idle past {:?} \
+(LOGGYTRACY_METRIC_SERIES_IDLE_TIMEOUT)",
+            admission.rejected_new_series,
+            admission.rejected_datapoints,
+            self.config.max_active_series,
+            self.config.metric_series_idle_timeout,
+        )
+    }
+}
+
+/// What `accept` answered on the success path: everything a transport needs
+/// to build the OTLP `partial_success`.
+pub struct MetricAcceptOutcome {
+    pub rejected_data_points: u64,
+    pub rejection: Option<String>,
+}
+
+impl MetricAcceptOutcome {
+    pub fn partial_success(
+        &self,
+    ) -> Option<opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsPartialSuccess>
+    {
+        (self.rejected_data_points > 0).then(|| {
+            opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsPartialSuccess {
+                rejected_data_points: self.rejected_data_points.min(i64::MAX as u64) as i64,
+                error_message: self.rejection.clone().unwrap_or_default(),
+            }
+        })
     }
 }
 
@@ -676,11 +837,13 @@ impl MetricsService for MetricsIngestService {
         ingest
             .admit_tenant(&tenant, request.encoded_len())
             .map_err(ingest_error_to_status)?;
-        ingest
+        let outcome = ingest
             .accept(tenant, request)
             .await
             .map_err(ingest_error_to_status)?;
-        Ok(Response::new(ExportMetricsServiceResponse::default()))
+        Ok(Response::new(ExportMetricsServiceResponse {
+            partial_success: outcome.partial_success(),
+        }))
     }
 }
 
@@ -1226,6 +1389,200 @@ mod tests {
         let status = service.export(tenant_request(request)).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(series_memtable.is_empty());
+    }
+
+    /// The traversal pin: filtering by an admitted set and re-decomposing
+    /// yields exactly the admitted samples. If `filter_request` and
+    /// `normalize_request` ever walked datapoints in different orders, this
+    /// is the test that catches it before a replay resurrects a refusal.
+    #[test]
+    fn filtering_then_decomposing_equals_decomposing_then_filtering() {
+        let request = request_with(
+            vec![
+                Metric {
+                    name: "queue_depth".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![
+                            gauge_point(100, 1.0, vec![attr("instance", "a")]),
+                            gauge_point(100, 2.0, vec![attr("instance", "b")]),
+                        ],
+                    })),
+                    ..Default::default()
+                },
+                Metric {
+                    name: "http_request_duration_seconds".to_string(),
+                    data: Some(metric::Data::Histogram(Histogram {
+                        data_points: vec![HistogramDataPoint {
+                            time_unix_nano: 100,
+                            count: 3,
+                            sum: Some(0.3),
+                            bucket_counts: vec![1, 2],
+                            explicit_bounds: vec![0.1],
+                            ..Default::default()
+                        }],
+                        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                    })),
+                    ..Default::default()
+                },
+                Metric {
+                    name: "http_requests_total".to_string(),
+                    data: Some(metric::Data::Sum(Sum {
+                        data_points: vec![gauge_point(100, 5.0, vec![])],
+                        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                        is_monotonic: true,
+                    })),
+                    ..Default::default()
+                },
+            ],
+            None,
+        );
+        let all = normalize_request(&test_tenant(), &request).unwrap();
+        // Admit datapoints 1 (second gauge) and 2 (the histogram); refuse 0 and 3.
+        let admitted: std::collections::HashSet<u32> = [1, 2].into_iter().collect();
+        let filtered = filter_request(&request, &admitted);
+        let refiltered = normalize_request(&test_tenant(), &filtered).unwrap();
+        let expected: Vec<_> = all
+            .iter()
+            .filter(|sample| admitted.contains(&sample.datapoint_index))
+            .collect();
+        assert_eq!(refiltered.len(), expected.len());
+        for (kept, original) in refiltered.iter().zip(expected) {
+            assert_eq!(kept.labels, original.labels);
+            assert_eq!(kept.ts_ns, original.ts_ns);
+            assert_eq!(kept.value, original.value);
+        }
+        assert!(
+            refiltered
+                .iter()
+                .any(|sample| sample.labels.metric_name().as_deref()
+                    == Some("http_request_duration_seconds_bucket")),
+            "the whole admitted histogram family survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn past_the_cap_known_series_keep_landing_and_new_ones_get_partial_success() {
+        let config = Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("loggytracy-metric-ladder-{}", uuid::Uuid::new_v4())),
+            max_active_series: 2,
+            ..Config::default()
+        };
+        let (service, series_memtable, journal) = service_over(config);
+        let base = now_ns();
+        let known = request_with(
+            vec![Metric {
+                name: "queue_depth".to_string(),
+                data: Some(metric::Data::Gauge(Gauge {
+                    data_points: vec![
+                        gauge_point(base, 1.0, vec![attr("instance", "a")]),
+                        gauge_point(base, 2.0, vec![attr("instance", "b")]),
+                    ],
+                })),
+                ..Default::default()
+            }],
+            None,
+        );
+        let response = service.export(tenant_request(known)).await.unwrap();
+        assert!(response.into_inner().partial_success.is_none());
+
+        let mixed = request_with(
+            vec![Metric {
+                name: "queue_depth".to_string(),
+                data: Some(metric::Data::Gauge(Gauge {
+                    data_points: vec![
+                        gauge_point(base + 1_000_000_000, 3.0, vec![attr("instance", "a")]),
+                        gauge_point(base + 1_000_000_000, 9.0, vec![attr("instance", "new-1")]),
+                        gauge_point(base + 1_000_000_000, 9.0, vec![attr("instance", "new-2")]),
+                    ],
+                })),
+                ..Default::default()
+            }],
+            None,
+        );
+        let response = service.export(tenant_request(mixed)).await.unwrap();
+        let partial = response
+            .into_inner()
+            .partial_success
+            .expect("a partial acceptance names what it refused");
+        assert_eq!(partial.rejected_data_points, 2);
+        assert!(
+            partial
+                .error_message
+                .contains("LOGGYTRACY_MAX_ACTIVE_SERIES"),
+            "{}",
+            partial.error_message
+        );
+        assert!(
+            partial
+                .error_message
+                .contains("LOGGYTRACY_METRIC_SERIES_IDLE_TIMEOUT"),
+            "{}",
+            partial.error_message
+        );
+
+        let live = series_memtable.sorted_samples(&test_tenant()).unwrap();
+        assert_eq!(live.len(), 2, "no refused series exists");
+        assert!(
+            live.values().any(|samples| samples.len() == 2),
+            "the known series took its second sample"
+        );
+
+        // The WAL was filtered: replay reproduces the admitted state, not the
+        // refusal-inflated one — the budget survives a restart mid-explosion.
+        let replayed = SeriesMemTable::new();
+        crate::journal::replay_with_signals(
+            journal.wal_path(),
+            journal.ckpt_path(),
+            &crate::memtable::MemTable::new(),
+            &crate::trace::TraceMemTable::new(),
+            &replayed,
+        )
+        .unwrap();
+        assert_eq!(replayed.sorted_samples(&test_tenant()).unwrap(), live);
+        assert_eq!(replayed.active_series(&test_tenant()), 2);
+    }
+
+    #[tokio::test]
+    async fn an_export_of_only_new_series_past_the_cap_is_refused_whole() {
+        let config = Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("loggytracy-metric-429-{}", uuid::Uuid::new_v4())),
+            max_active_series: 1,
+            ..Config::default()
+        };
+        let (service, series_memtable, _journal) = service_over(config);
+        let base = now_ns();
+        service
+            .export(tenant_request(request_with(
+                vec![Metric {
+                    name: "queue_depth".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![gauge_point(base, 1.0, vec![attr("instance", "a")])],
+                    })),
+                    ..Default::default()
+                }],
+                None,
+            )))
+            .await
+            .unwrap();
+        let all_new = request_with(
+            vec![Metric {
+                name: "queue_depth".to_string(),
+                data: Some(metric::Data::Gauge(Gauge {
+                    data_points: vec![gauge_point(base, 9.0, vec![attr("instance", "b")])],
+                })),
+                ..Default::default()
+            }],
+            None,
+        );
+        let status = service.export(tenant_request(all_new)).await.unwrap_err();
+        assert_eq!(
+            status.code(),
+            tonic::Code::ResourceExhausted,
+            "capacity returns at the idle horizon, so the refusal is retryable"
+        );
+        assert_eq!(series_memtable.active_series(&test_tenant()), 1);
     }
 
     #[tokio::test]

@@ -215,6 +215,14 @@ pub struct Config {
     pub max_concurrent_trace_scans: usize,
     pub max_trace_query_runtime: Duration,
     pub max_trace_restore_runtime: Duration,
+    /// Live metric series a tenant may hold before a datapoint for an
+    /// *unknown* series is refused — the cardinality defence of the M14
+    /// degradation ladder. Known series are accepted unconditionally.
+    pub max_active_series: usize,
+    /// How long a series may go without a new sample before its index state
+    /// is evicted (once its samples are flushed). This is the horizon at
+    /// which churned-away series return their capacity.
+    pub metric_series_idle_timeout: Duration,
     /// How long the shutdown force-flush retries silently before it starts
     /// warning on stdout and enabling operator-initiated abort.
     pub shutdown_flush_warn_after: Duration,
@@ -310,6 +318,10 @@ impl Default for Config {
             max_concurrent_trace_scans: 8,
             max_trace_query_runtime: Duration::from_secs(30),
             max_trace_restore_runtime: Duration::from_secs(25),
+            // A guess until memprof measures the per-series cost; the memory
+            // gate calibrates it before the M14 comparison publishes.
+            max_active_series: 500_000,
+            metric_series_idle_timeout: Duration::from_secs(600),
             shutdown_flush_warn_after: Duration::from_secs(30),
             startup_retry_budget: Duration::from_secs(300),
             malloc_trim_interval: Some(Duration::from_secs(60)),
@@ -702,6 +714,14 @@ impl Config {
                 "LOGGYTRACY_MAX_TRACE_RESTORE_RUNTIME",
                 defaults.max_trace_restore_runtime,
             )?,
+            max_active_series: env_positive_usize(
+                "LOGGYTRACY_MAX_ACTIVE_SERIES",
+                defaults.max_active_series,
+            )?,
+            metric_series_idle_timeout: env_required_duration(
+                "LOGGYTRACY_METRIC_SERIES_IDLE_TIMEOUT",
+                defaults.metric_series_idle_timeout,
+            )?,
             startup_retry_budget: env_required_duration(
                 "LOGGYTRACY_STARTUP_RETRY_BUDGET",
                 defaults.startup_retry_budget,
@@ -882,6 +902,11 @@ selected above the read budget can never be merged",
         )?;
         positive_duration("max_trace_query_runtime", self.max_trace_query_runtime)?;
         positive_duration("max_trace_restore_runtime", self.max_trace_restore_runtime)?;
+        positive_usize("max_active_series", self.max_active_series)?;
+        positive_duration(
+            "metric_series_idle_timeout",
+            self.metric_series_idle_timeout,
+        )?;
         positive_duration("shutdown_flush_warn_after", self.shutdown_flush_warn_after)
     }
 }

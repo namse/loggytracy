@@ -222,8 +222,12 @@ tracks execution state per phase.
   `MetricShape` matrix, digest classes, VictoriaMetrics compose target
   (v1.150.0, behavior pinned by a live one-sided smoke run),
   `compare/run_metrics.sh` one-sided.
-- [ ] Phase 3 — model, Gorilla, ingest, journal kind 3, replay-equals-live.
-- [ ] Phase 4 — series index and the degradation ladder.
+- [x] Phase 3 — model, Gorilla, ingest, journal kind 3, replay-equals-live
+  (plus a live HTTP seed of the running binary: 2 640 datapoints, PASS).
+- [x] Phase 4 — series index and the degradation ladder: per-tenant
+  `max_active_series` decided per datapoint, refused datapoints filtered out
+  of the WAL bytes so replay cannot resurrect them, idle eviction lazy under
+  pressure and on demand, ladder counters on `/metrics`.
 - [ ] Phase 5 — parts, registry, flush threading, recovery.
 - [ ] Phase 6 — object storage, retention, the compactor.
 - [ ] Phase 7 — the read path and its `QUERY_API.md` sections.

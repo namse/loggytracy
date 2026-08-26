@@ -314,6 +314,7 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
     body.push_str(&restore_economics_metrics());
     body.push_str(&delete_request_metrics(&state));
     body.push_str(&journal_writer_metrics(&state));
+    body.push_str(&series_ladder_metrics(&state));
     body.push_str(&crate::memprof::render());
     body
 }
@@ -326,6 +327,47 @@ loggytracy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
 /// a p50 of 12 ms beside a p95 that moves between 40 and 106 ms with nothing
 /// but the client's connection count (`todo.md`, 2026-08-12) is a queue, and
 /// until these there was no number in the process that could say so.
+/// The M14 degradation ladder's observability: every rung moves one of these,
+/// and the comparison bed's churn table is built from them.
+fn series_ladder_metrics(state: &AppState) -> String {
+    use std::sync::atomic::Ordering;
+    let series = state.journal.series_memtable();
+    let counters = series.counters();
+    format!(
+        "# HELP loggytracy_active_series Live metric series index entries across tenants. \
+Bounded per tenant by LOGGYTRACY_MAX_ACTIVE_SERIES.\n\
+# TYPE loggytracy_active_series gauge\n\
+loggytracy_active_series {}\n\
+# TYPE loggytracy_series_created_total counter\n\
+loggytracy_series_created_total {}\n\
+# HELP loggytracy_series_evicted_idle_total Series whose index state left at the idle \
+horizon (LOGGYTRACY_METRIC_SERIES_IDLE_TIMEOUT); their history stays in parts.\n\
+# TYPE loggytracy_series_evicted_idle_total counter\n\
+loggytracy_series_evicted_idle_total {}\n\
+# HELP loggytracy_series_rejected_total New series refused at the max_active_series \
+boundary. Known series are never refused by this rung.\n\
+# TYPE loggytracy_series_rejected_total counter\n\
+loggytracy_series_rejected_total {}\n\
+# TYPE loggytracy_metric_datapoints_rejected_total counter\n\
+loggytracy_metric_datapoints_rejected_total {}\n\
+# TYPE loggytracy_metric_samples_rejected_total counter\n\
+loggytracy_metric_samples_rejected_total {}\n\
+# TYPE loggytracy_series_memtable_bytes gauge\n\
+loggytracy_series_memtable_bytes {}\n",
+        counters.active_series.load(Ordering::Relaxed),
+        counters.series_created_total.load(Ordering::Relaxed),
+        counters.series_evicted_idle_total.load(Ordering::Relaxed),
+        counters.series_rejected_total.load(Ordering::Relaxed),
+        counters
+            .metric_datapoints_rejected_total
+            .load(Ordering::Relaxed),
+        counters
+            .metric_samples_rejected_total
+            .load(Ordering::Relaxed),
+        series.approximate_size(),
+    )
+}
+
 fn journal_writer_metrics(state: &AppState) -> String {
     let metrics = state.journal.metrics();
     let mut out = String::new();

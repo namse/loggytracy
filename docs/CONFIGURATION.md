@@ -253,6 +253,8 @@ Small catalog files such as `meta.json` are not evicted; the data body and the b
 | `LOGGYTRACY_MAX_CONCURRENT_TRACE_SCANS` | 8 | The trace surface's own scan slots — a trace scan decodes whole-span payloads, so it does not compete for the log scanner's |
 | `LOGGYTRACY_MAX_TRACE_QUERY_RUNTIME` | `30s` | |
 | `LOGGYTRACY_MAX_TRACE_RESTORE_RUNTIME` | `25s` | Cache-miss restore timeout for trace parts |
+| `LOGGYTRACY_MAX_ACTIVE_SERIES` | 500,000 | Live metric series per tenant (M14). At the limit a datapoint for an *unknown* series is refused via OTLP `partial_success` naming the count, the limit and the horizon; known series are always accepted. The default is a guess until the memory gate calibrates the per-series cost |
+| `LOGGYTRACY_METRIC_SERIES_IDLE_TIMEOUT` | `600s` | How long a metric series may go without a sample before its index state is evicted (once flushed) and its capacity returns. History stays in parts; a returning series is re-created, and the one artifact — a delta counter restarting — is a counter reset `rate` absorbs |
 
 The LogQL metric evaluator left with the read-path decision (issue #3), and
 its knobs left with it: `LOGGYTRACY_MAX_METRIC_EVALUATION_POINTS` (renamed
