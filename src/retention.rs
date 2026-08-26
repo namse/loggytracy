@@ -7,9 +7,10 @@ use tokio::time::interval;
 
 use crate::config::Config;
 use crate::metrics::RuntimeMetrics;
-use crate::object_storage::{ManifestPart, RemoteCache, TraceManifestPart};
+use crate::object_storage::{ManifestPart, MetricManifestPart, RemoteCache, TraceManifestPart};
 use crate::part;
 use crate::part_registry::PartRegistry;
+use crate::series_registry::SeriesRegistry;
 use crate::shutdown::wait_for_drain;
 use crate::tenant_policy::TenantPolicy;
 use crate::trace_registry::TraceRegistry;
@@ -18,6 +19,7 @@ use crate::trace_registry::TraceRegistry;
 pub async fn retention_loop(
     registry: Arc<PartRegistry>,
     trace_registry: Arc<TraceRegistry>,
+    series_registry: Arc<SeriesRegistry>,
     remote_cache: Option<Arc<RemoteCache>>,
     config: Arc<Config>,
     tenant_policy: Arc<TenantPolicy>,
@@ -37,12 +39,19 @@ pub async fn retention_loop(
             _ = wait_for_drain(&mut drain_rx) => return,
         }
         metrics.unknown_tenants.store(
-            unknown_tenant_count(&registry, &trace_registry, &journal, &tenant_policy) as u64,
+            unknown_tenant_count(
+                &registry,
+                &trace_registry,
+                &series_registry,
+                &journal,
+                &tenant_policy,
+            ) as u64,
             Ordering::Relaxed,
         );
         if let Err(error) = retention_once(
             &registry,
             &trace_registry,
+            &series_registry,
             remote_cache.as_deref(),
             &config,
             &tenant_policy,
@@ -81,6 +90,7 @@ pub async fn retention_loop(
 fn unknown_tenant_count(
     registry: &PartRegistry,
     trace_registry: &TraceRegistry,
+    series_registry: &SeriesRegistry,
     journal: &crate::journal::Journal,
     tenant_policy: &TenantPolicy,
 ) -> usize {
@@ -96,10 +106,14 @@ fn unknown_tenant_count(
     };
     registry.visit_tenants(&mut note);
     trace_registry.visit_tenants(&mut note);
+    series_registry.visit_tenants(&mut note);
     for tenant in journal.log_memtable().tenants() {
         note(&tenant);
     }
     for tenant in journal.trace_memtable().tenants() {
+        note(&tenant);
+    }
+    for tenant in journal.series_memtable().tenants() {
         note(&tenant);
     }
     unknown.len()
@@ -108,6 +122,7 @@ fn unknown_tenant_count(
 async fn retention_once(
     registry: &PartRegistry,
     trace_registry: &TraceRegistry,
+    series_registry: &SeriesRegistry,
     remote_cache: Option<&RemoteCache>,
     config: &Config,
     tenant_policy: &TenantPolicy,
@@ -119,6 +134,7 @@ async fn retention_once(
     retention_once_at(
         registry,
         trace_registry,
+        series_registry,
         remote_cache,
         config,
         tenant_policy,
@@ -127,9 +143,11 @@ async fn retention_once(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn retention_once_at(
     registry: &PartRegistry,
     trace_registry: &TraceRegistry,
+    series_registry: &SeriesRegistry,
     remote_cache: Option<&RemoteCache>,
     config: &Config,
     tenant_policy: &TenantPolicy,
@@ -176,12 +194,28 @@ async fn retention_once_at(
             )
         })
         .collect();
+    let mut metric_parts: Vec<_> = series_registry
+        .snapshot()
+        .into_iter()
+        .filter(|reader| cutoffs.metric_part_fully_expired(&reader.part().meta))
+        .map(|reader| {
+            (
+                MetricManifestPart {
+                    id: reader.part().meta.id.clone(),
+                    partition: reader.part().meta.partition.clone(),
+                },
+                reader.part().dir.clone(),
+            )
+        })
+        .collect();
     log_parts.sort_by_key(|(part, _)| part.id.clone());
     trace_parts.sort_by_key(|(part, _)| part.id.clone());
+    metric_parts.sort_by_key(|(part, _)| part.id.clone());
     log_parts.truncate(batch_size);
     trace_parts.truncate(batch_size);
+    metric_parts.truncate(batch_size);
 
-    if log_parts.is_empty() && trace_parts.is_empty() {
+    if log_parts.is_empty() && trace_parts.is_empty() && metric_parts.is_empty() {
         return Ok(());
     }
     drop(guard);
@@ -193,6 +227,7 @@ async fn retention_once_at(
     let mut removed = 0usize;
     let mut removed_log_ids = Vec::new();
     let mut removed_trace_ids = Vec::new();
+    let mut removed_metric_ids = Vec::new();
     {
         // Deletion lock first, and the wait for it happens here rather than one
         // line later. This pass has to wait: a merge rewrite holds the deletion
@@ -236,6 +271,12 @@ async fn retention_once_at(
                 .into_iter()
                 .map(|reader| (reader.part().meta.id.clone(), reader.part().dir.clone()))
                 .collect();
+        let active_metric_dirs: std::collections::HashMap<String, std::path::PathBuf> =
+            series_registry
+                .snapshot()
+                .into_iter()
+                .map(|reader| (reader.part().meta.id.clone(), reader.part().dir.clone()))
+                .collect();
         for (descriptor, dir) in &log_parts {
             if active_log_dirs.get(&descriptor.id) == Some(dir) {
                 part::remove_part_dirs(std::slice::from_ref(dir))?;
@@ -250,9 +291,17 @@ async fn retention_once_at(
                 removed += 1;
             }
         }
+        for (descriptor, dir) in &metric_parts {
+            if active_metric_dirs.get(&descriptor.id) == Some(dir) {
+                part::remove_part_dirs(std::slice::from_ref(dir))?;
+                removed_metric_ids.push(descriptor.id.clone());
+                removed += 1;
+            }
+        }
         if remote_cache.is_none() {
             registry.unregister(&removed_log_ids);
             trace_registry.unregister(&removed_trace_ids);
+            series_registry.unregister(&removed_metric_ids);
         }
     }
 
@@ -312,6 +361,37 @@ async fn retention_once_at(
                 crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
                     .await;
             trace_registry.unregister(&removed_trace_ids);
+        }
+        // The metric manifest last, extending the log-then-trace ordering:
+        // each signal's descriptors retire as soon as their own manifest write
+        // lands, so a failure in a later signal cannot leave an earlier one
+        // registered but unservable.
+        if !removed_metric_ids.is_empty() {
+            let descriptors: Vec<_> = metric_parts
+                .iter()
+                .filter(|(part, _)| removed_metric_ids.iter().any(|id| id == &part.id))
+                .map(|(part, _)| part.clone())
+                .collect();
+            match tokio::time::timeout(
+                config.max_retention_runtime,
+                cache.storage.remove_metric_parts(&descriptors),
+            )
+            .await
+            {
+                Ok(Ok(_)) => cache.record_remote_success(),
+                Ok(Err(error)) => {
+                    cache.record_remote_failure();
+                    return Err(error);
+                }
+                Err(_) => {
+                    cache.record_remote_failure();
+                    return Err("metric object-store retention timed out".to_string());
+                }
+            }
+            let _guard =
+                crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
+                    .await;
+            series_registry.unregister(&removed_metric_ids);
         }
     }
 
@@ -419,7 +499,13 @@ mod tests {
         let policy = policy_with(&[("acme", TenantRetention::Finite(Duration::from_secs(60)))]);
 
         assert_eq!(
-            unknown_tenant_count(&registry, &trace_registry, &journal, &policy),
+            unknown_tenant_count(
+                &registry,
+                &trace_registry,
+                &SeriesRegistry::standalone(),
+                &journal,
+                &policy
+            ),
             0
         );
 
@@ -432,7 +518,13 @@ mod tests {
             }],
         );
         assert_eq!(
-            unknown_tenant_count(&registry, &trace_registry, &journal, &policy),
+            unknown_tenant_count(
+                &registry,
+                &trace_registry,
+                &SeriesRegistry::standalone(),
+                &journal,
+                &policy
+            ),
             1
         );
 
@@ -442,7 +534,13 @@ mod tests {
             1_000,
         )]);
         assert_eq!(
-            unknown_tenant_count(&registry, &trace_registry, &journal, &policy),
+            unknown_tenant_count(
+                &registry,
+                &trace_registry,
+                &SeriesRegistry::standalone(),
+                &journal,
+                &policy
+            ),
             2
         );
 
@@ -451,7 +549,13 @@ mod tests {
             part::flush_rows(vec![row_for("brand-new", 1_000)], &root.join("parts"), 100).unwrap();
         registry.register(parts).unwrap();
         assert_eq!(
-            unknown_tenant_count(&registry, &trace_registry, &journal, &policy),
+            unknown_tenant_count(
+                &registry,
+                &trace_registry,
+                &SeriesRegistry::standalone(),
+                &journal,
+                &policy
+            ),
             2
         );
 
@@ -460,6 +564,7 @@ mod tests {
             unknown_tenant_count(
                 &registry,
                 &trace_registry,
+                &SeriesRegistry::standalone(),
                 &journal,
                 &TenantPolicy::disabled()
             ),
@@ -487,6 +592,7 @@ mod tests {
         retention_once_at(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &per_tenant_config(root),
             &policy,
@@ -528,6 +634,7 @@ mod tests {
         retention_once_at(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &config,
             &policy,
@@ -556,6 +663,7 @@ mod tests {
         retention_once_at(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &config,
             &policy,
@@ -589,6 +697,7 @@ mod tests {
         retention_once_at(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &per_tenant_config(root),
             &policy,
@@ -614,6 +723,7 @@ mod tests {
         retention_once_at(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &per_tenant_config(root),
             &policy,
@@ -639,6 +749,7 @@ mod tests {
         retention_once_at(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &per_tenant_config(root),
             &policy,
@@ -668,6 +779,7 @@ mod tests {
         retention_once_at(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &per_tenant_config(root.clone()),
             &policy_with(&[("alpha", TenantRetention::Finite(Duration::from_nanos(1)))]),
@@ -681,6 +793,7 @@ mod tests {
         retention_once_at(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &per_tenant_config(root),
             &policy_with(&[
@@ -693,6 +806,87 @@ mod tests {
         .unwrap();
         assert_eq!(trace_registry.part_count(), 0);
         assert!(!parts[0].dir.exists());
+    }
+
+    fn metric_part_for(
+        root: &std::path::Path,
+        owner: &str,
+        ts: i64,
+    ) -> crate::series_part::SeriesPart {
+        use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
+        let memtable = crate::series::SeriesMemTable::new();
+        memtable.insert(vec![MetricSample {
+            tenant: tenant(owner),
+            labels: SeriesLabels::from_pairs(vec![(
+                METRIC_NAME_LABEL.to_string(),
+                "queue_depth".to_string(),
+            )]),
+            ts_ns: ts,
+            value: 1.0,
+            kind: SampleKind::Gauge,
+            datapoint_index: 0,
+        }]);
+        let snapshot = memtable.begin_flush();
+        let parts = crate::series_part::flush_series_snapshot(&snapshot, root).unwrap();
+        memtable.commit_flush();
+        parts.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn metrics_follow_the_same_per_tenant_rules_and_leave_the_remote_manifest() {
+        let root = temp_root("retention-metrics");
+        let metrics_root = root.join("metrics");
+        let part = metric_part_for(&metrics_root, "alpha", 1_000);
+        let registry = Arc::new(PartRegistry::new());
+        let trace_registry = Arc::new(TraceRegistry::standalone());
+        let series_registry = Arc::new(SeriesRegistry::standalone());
+        series_registry.register(vec![part.clone()]).unwrap();
+        let storage = Arc::new(crate::object_storage::ObjectStorage::in_memory());
+        storage
+            .publish_metric_parts(std::slice::from_ref(&part), &[])
+            .await
+            .unwrap();
+        let remote = RemoteCache::new(storage.clone(), root.join("parts"));
+
+        // Unknown means keep, for metrics exactly as for the others.
+        retention_once_at(
+            &registry,
+            &trace_registry,
+            &series_registry,
+            Some(&remote),
+            &per_tenant_config(root.clone()),
+            &policy_with(&[(
+                "someone-else",
+                TenantRetention::Finite(Duration::from_nanos(1)),
+            )]),
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(series_registry.part_count(), 1);
+
+        retention_once_at(
+            &registry,
+            &trace_registry,
+            &series_registry,
+            Some(&remote),
+            &per_tenant_config(root),
+            &policy_with(&[("alpha", TenantRetention::Finite(Duration::from_nanos(1)))]),
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(series_registry.part_count(), 0, "the registry let it go");
+        assert!(!part.dir.exists(), "the local files are gone");
+        assert!(
+            storage
+                .load_metric_manifest()
+                .await
+                .unwrap()
+                .parts
+                .is_empty(),
+            "the manifest no longer exposes it"
+        );
     }
 
     #[tokio::test]
@@ -714,6 +908,7 @@ mod tests {
         retention_once_at(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &config,
             &upgraded,
@@ -728,6 +923,7 @@ mod tests {
         retention_once_at(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &config,
             &downgraded,
@@ -751,6 +947,7 @@ mod tests {
         retention_once(
             &registry,
             &trace_registry,
+            &SeriesRegistry::standalone(),
             None,
             &config,
             &TenantPolicy::disabled(),
@@ -789,9 +986,16 @@ mod tests {
             crate::tenant::test_tenant().as_str(),
             TenantRetention::Finite(Duration::from_secs(1)),
         )]);
-        retention_once(&registry, &trace_registry, None, &config, &policy)
-            .await
-            .unwrap();
+        retention_once(
+            &registry,
+            &trace_registry,
+            &SeriesRegistry::standalone(),
+            None,
+            &config,
+            &policy,
+        )
+        .await
+        .unwrap();
         assert_eq!(registry.part_count(), 0);
         assert!(!parts[0].dir.exists());
     }
@@ -840,8 +1044,16 @@ mod tests {
         // The merge rewrite, holding its inputs against deletion.
         let rewrite_guard = registry.deletion_lock().read_owned().await;
 
+        let series_registry = SeriesRegistry::standalone();
         let (pass, query_served) = tokio::join!(
-            retention_once(&registry, &trace_registry, None, &config, &policy),
+            retention_once(
+                &registry,
+                &trace_registry,
+                &series_registry,
+                None,
+                &config,
+                &policy,
+            ),
             async {
                 // Long enough for the pass to reach its wait, short enough that
                 // the test stays fast.
@@ -901,9 +1113,16 @@ mod tests {
             TenantRetention::Finite(Duration::from_secs(1)),
         )]);
 
-        retention_once(&registry, &trace_registry, Some(&remote), &config, &policy)
-            .await
-            .unwrap();
+        retention_once(
+            &registry,
+            &trace_registry,
+            &SeriesRegistry::standalone(),
+            Some(&remote),
+            &config,
+            &policy,
+        )
+        .await
+        .unwrap();
 
         assert!(storage.load_manifest().await.unwrap().parts.is_empty());
         assert_eq!(registry.part_count(), 0);
@@ -940,9 +1159,17 @@ mod tests {
             TenantRetention::Finite(Duration::from_nanos(10)),
         )]);
 
-        retention_once_at(&registry, &trace_registry, None, &config, &policy, 100)
-            .await
-            .unwrap();
+        retention_once_at(
+            &registry,
+            &trace_registry,
+            &SeriesRegistry::standalone(),
+            None,
+            &config,
+            &policy,
+            100,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(registry.part_count(), 1);
         assert!(parts[0].dir.exists());

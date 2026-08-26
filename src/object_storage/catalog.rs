@@ -132,6 +132,13 @@ impl RemoteCache {
             .unwrap_or_else(|| PathBuf::from("traces"))
     }
 
+    pub fn metric_parts_root(&self) -> PathBuf {
+        self.parts_root
+            .parent()
+            .map(|parent| parent.join("metrics"))
+            .unwrap_or_else(|| PathBuf::from("metrics"))
+    }
+
     /// Drive the remote to unhealthy in one call, for tests that need the
     /// state rather than the path into it.
     #[cfg(test)]
@@ -279,6 +286,17 @@ production or on shared/network storage."
     fn trace_part_path(&self, part: &TraceManifestPart, file: &str) -> ObjectPath {
         self.path(&format!(
             "trace_parts/{}/{}/{}",
+            part.partition, part.id, file
+        ))
+    }
+
+    fn metric_manifest_path(&self) -> ObjectPath {
+        self.path(METRIC_MANIFEST_FILE)
+    }
+
+    fn metric_part_path(&self, part: &MetricManifestPart, file: &str) -> ObjectPath {
+        self.path(&format!(
+            "metric_parts/{}/{}/{}",
             part.partition, part.id, file
         ))
     }
@@ -493,8 +511,10 @@ single-process development store use a file:// URL, which opts out of CAS delibe
                 .await
             {
                 Ok(_) => {
-                    // Published only once both manifests agree: a half-claimed
-                    // prefix would fence this instance off its own trace writes.
+                    self.claim_metric_writer_epoch(epoch).await?;
+                    // Published only once all three manifests agree: a
+                    // half-claimed prefix would fence this instance off its
+                    // own trace or metric writes.
                     self.writer_epoch.store(epoch, Ordering::Release);
                     tracing::info!(epoch, "claimed the object-store writer epoch");
                     return Ok(epoch);
@@ -505,6 +525,42 @@ single-process development store use a file:// URL, which opts out of CAS delibe
             }
         }
         Err("trace writer epoch claim CAS retry limit exceeded".to_string())
+    }
+
+    /// The metric half of the claim, run after the other two manifests carry
+    /// the epoch. Split from `claim_writer_epoch` only so the publish order in
+    /// that function stays readable; a caller always runs both.
+    async fn claim_metric_writer_epoch(&self, epoch: u64) -> Result<(), String> {
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let (loaded, version) = self.load_metric_manifest_versioned().await?;
+            let mut next = loaded.clone();
+            next.writer_epoch = epoch;
+            next.generation = next
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| "metric manifest generation overflow".to_string())?;
+            let body = serde_json::to_vec_pretty(&next)
+                .map_err(|error| format!("failed to encode metric manifest: {error}"))?;
+            let mode = self.put_mode(version);
+            match self
+                .store
+                .put_opts(
+                    &self.metric_manifest_path(),
+                    body.into(),
+                    PutOptions {
+                        mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(object_store::Error::Precondition { .. })
+                | Err(object_store::Error::AlreadyExists { .. }) => continue,
+                Err(error) => return Err(format!("failed to claim the metric manifest: {error}")),
+            }
+        }
+        Err("metric writer epoch claim CAS retry limit exceeded".to_string())
     }
 
     fn put_mode(&self, version: Option<UpdateVersion>) -> PutMode {
@@ -721,6 +777,162 @@ single-process development store use a file:// URL, which opts out of CAS delibe
         Err("trace manifest retention CAS retry limit exceeded".to_string())
     }
 
+    async fn load_metric_manifest_versioned(
+        &self,
+    ) -> Result<(MetricManifest, Option<UpdateVersion>), String> {
+        match self.store.get(&self.metric_manifest_path()).await {
+            Ok(result) => {
+                let version = Some(UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                });
+                let bytes = result
+                    .bytes()
+                    .await
+                    .map_err(|error| format!("failed to read metric manifest body: {error}"))?;
+                let manifest: MetricManifest = serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("invalid metric object-store manifest: {error}"))?;
+                validate_metric_manifest(&manifest)?;
+                Ok((manifest, version))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok((MetricManifest::default(), None)),
+            Err(error) => Err(format!(
+                "failed to load metric object-store manifest: {error}"
+            )),
+        }
+    }
+
+    pub async fn load_metric_manifest(&self) -> Result<MetricManifest, String> {
+        Ok(self.load_metric_manifest_versioned().await?.0)
+    }
+
+    /// Uploads immutable metric part files, then atomically adds and removes
+    /// their descriptors in one manifest CAS. Modeled on the log `publish`
+    /// rather than the trace one because the metric compactor replaces its
+    /// inputs, and a replacement whose add and remove land in two generations
+    /// has a window where both the inputs and the output answer queries.
+    pub async fn publish_metric_parts(
+        &self,
+        added: &[SeriesPart],
+        removed: &[MetricManifestPart],
+    ) -> Result<MetricManifest, String> {
+        for part in added {
+            let id = part.meta.id.clone();
+            SeriesPartReader::open(part.clone()).map_err(|error| {
+                format!("refusing to publish invalid metric part {id}: {error}")
+            })?;
+        }
+        for part in added {
+            self.upload_metric_part(part).await?;
+        }
+
+        let _guard = self.manifest_update.lock().await;
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let (loaded, version) = self.load_metric_manifest_versioned().await?;
+            self.check_epoch(loaded.writer_epoch)?;
+            let removed_ids: HashSet<&str> = removed.iter().map(|part| part.id.as_str()).collect();
+            // The same replacement discipline as the log publish: a retry that
+            // observes its inputs already gone accepts only the exact
+            // idempotent end state, and a compaction whose inputs another
+            // writer touched is refused rather than reapplied.
+            if !removed_ids.is_empty() {
+                let present_removed = loaded
+                    .parts
+                    .iter()
+                    .filter(|part| removed_ids.contains(part.id.as_str()))
+                    .count();
+                let all_added_present = added.iter().all(|part| {
+                    let descriptor = MetricManifestPart::from(part);
+                    loaded.parts.iter().any(|existing| existing == &descriptor)
+                });
+                if present_removed == 0 && all_added_present {
+                    return Ok(loaded);
+                }
+                if !added.is_empty() && present_removed != removed_ids.len() {
+                    return Err(format!(
+                        "{INPUTS_CHANGED_ERROR}: expected {} input metric parts, found {present_removed}",
+                        removed_ids.len()
+                    ));
+                }
+            }
+            let mut next = loaded.clone();
+            next.parts
+                .retain(|part| !removed_ids.contains(part.id.as_str()));
+            for part in added.iter().map(MetricManifestPart::from) {
+                if let Some(existing) = next.parts.iter().find(|item| item.id == part.id) {
+                    if existing != &part {
+                        return Err(format!("metric manifest part ID collision: {}", part.id));
+                    }
+                } else {
+                    next.parts.push(part);
+                }
+            }
+            next.parts.sort_by(|left, right| {
+                (&left.partition, &left.id).cmp(&(&right.partition, &right.id))
+            });
+            if next.parts == loaded.parts {
+                return Ok(loaded);
+            }
+            next.generation = loaded
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| "metric manifest generation overflow".to_string())?;
+            let body = serde_json::to_vec_pretty(&next)
+                .map_err(|error| format!("failed to encode metric manifest: {error}"))?;
+            let mode = self.put_mode(version);
+            match self
+                .store
+                .put_opts(
+                    &self.metric_manifest_path(),
+                    body.into(),
+                    PutOptions {
+                        mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => return Ok(next),
+                Err(object_store::Error::Precondition { .. })
+                | Err(object_store::Error::AlreadyExists { .. }) => continue,
+                Err(error) => return Err(format!("failed to update metric manifest: {error}")),
+            }
+        }
+        Err("metric manifest compare-and-swap retry limit exceeded".to_string())
+    }
+
+    /// Removal alone, idempotent per id for the same reason the trace removal
+    /// is: retention retries must remove what is left rather than wedge.
+    pub async fn remove_metric_parts(
+        &self,
+        removed: &[MetricManifestPart],
+    ) -> Result<MetricManifest, String> {
+        if removed.is_empty() {
+            return self.load_metric_manifest().await;
+        }
+        self.publish_metric_parts(&[], removed).await
+    }
+
+    pub async fn delete_metric_part_objects(
+        &self,
+        parts: &[MetricManifestPart],
+    ) -> Result<(), String> {
+        for part in parts {
+            for file in METRIC_PART_FILES {
+                match self.store.delete(&self.metric_part_path(part, file)).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to delete remote metric part {}/{} file {file}: {error}",
+                            part.partition, part.id
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn delete_part_objects(&self, parts: &[ManifestPart]) -> Result<(), String> {
         for part in parts {
             for file in PART_FILES {
@@ -891,6 +1103,7 @@ single-process development store use a file:// URL, which opts out of CAS delibe
 
         let manifest = self.load_manifest().await?;
         let trace_manifest = self.load_trace_manifest().await?;
+        let metric_manifest = self.load_metric_manifest().await?;
         let mut active = HashSet::new();
         for part in &manifest.parts {
             for file in PART_FILES {
@@ -902,11 +1115,20 @@ single-process development store use a file:// URL, which opts out of CAS delibe
                 active.insert(self.trace_part_path(part, file).to_string());
             }
         }
+        for part in &metric_manifest.parts {
+            for file in METRIC_PART_FILES {
+                active.insert(self.metric_part_path(part, file).to_string());
+            }
+        }
         let cutoff = chrono::Utc::now()
             - chrono::Duration::from_std(grace_period)
                 .map_err(|error| format!("invalid garbage-collection grace period: {error}"))?;
         let mut candidates = Vec::new();
-        for prefix in [self.path("parts"), self.path("trace_parts")] {
+        for prefix in [
+            self.path("parts"),
+            self.path("trace_parts"),
+            self.path("metric_parts"),
+        ] {
             let mut stream = self.store.list(Some(&prefix));
             while let Some(item) = stream.next().await {
                 let meta = item.map_err(|error| format!("failed to list object store: {error}"))?;

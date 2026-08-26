@@ -105,6 +105,9 @@ pub fn recover_with_signals(
     let metrics_root = config.data_dir.join("metrics");
     std::fs::create_dir_all(&metrics_root).map_err(|e| e.to_string())?;
     cleanup_tmp(&metrics_root)?;
+    // Before any registry looks at the directory: a compaction that crashed
+    // between its commit record and its input removal must resolve one way.
+    crate::series_merge::recover_local_compactions(&metrics_root)?;
 
     let wal_path = config.data_dir.join("journal.wal");
     let ckpt_path = config.data_dir.join("journal.ckpt");
@@ -229,6 +232,22 @@ pub async fn run(config: Arc<Config>) {
     } else {
         None
     };
+    let remote_metric_manifest = if let Some(storage) = &object_storage {
+        let metrics_root = config.data_dir.join("metrics");
+        let restored =
+            with_object_store_retry("metric cache reconciliation", startup_budget, || {
+                storage.reconcile_metric_local_cache(&metrics_root)
+            })
+            .await;
+        tracing::info!(
+            generation = restored.generation,
+            parts = restored.parts.len(),
+            "restored metric object-store manifest"
+        );
+        Some(restored)
+    } else {
+        None
+    };
 
     let parts_root = config.data_dir.join("parts");
     let parts = Arc::new(
@@ -252,13 +271,18 @@ pub async fn run(config: Arc<Config>) {
         }
         .unwrap_or_else(|e| panic!("failed to load trace parts: {e}")),
     );
-    // Local discovery only until the metric object-storage lifecycle lands
-    // (M14 Phase 6); the manifest arm joins then.
     let series_registry = Arc::new(
-        crate::series_registry::SeriesRegistry::load_from_disk(
-            &config.data_dir.join("metrics"),
-            parts.operation_lock(),
-        )
+        match &remote_metric_manifest {
+            Some(manifest) => crate::series_registry::SeriesRegistry::load_from_manifest(
+                &config.data_dir.join("metrics"),
+                manifest,
+                parts.operation_lock(),
+            ),
+            None => crate::series_registry::SeriesRegistry::load_from_disk(
+                &config.data_dir.join("metrics"),
+                parts.operation_lock(),
+            ),
+        }
         .unwrap_or_else(|e| panic!("failed to load metric parts: {e}")),
     );
     let remote_cache = object_storage
@@ -403,10 +427,32 @@ pub async fn run(config: Arc<Config>) {
         }));
     }
 
+    {
+        // The metric compactor, on the merge cadence: both answer "how often
+        // does background rewriting look for debt", and its health rides the
+        // merge flag because a stuck compactor is the same operational fact.
+        let series_registry = series_registry.clone();
+        let cache = remote_cache.clone();
+        let config = config.clone();
+        let task_health = merge_healthy.clone();
+        let drain_rx = shutdown.subscribe();
+        worker_handles.push(tokio::spawn(async move {
+            crate::series_merge::compact_loop(
+                series_registry,
+                cache,
+                config,
+                task_health,
+                drain_rx,
+            )
+            .await;
+        }));
+    }
+
     if let Some(cache) = remote_cache.clone() {
         let config = config.clone();
         let registry = parts.clone();
         let trace_registry = trace_registry.clone();
+        let series_registry = series_registry.clone();
         let metrics = metrics.clone();
         let mut drain_rx = shutdown.subscribe();
         worker_handles.push(tokio::spawn(async move {
@@ -431,6 +477,7 @@ pub async fn run(config: Arc<Config>) {
                 let guard = registry.operation_lock().write_owned().await;
                 let eligible = registry.part_dirs();
                 let trace_eligible = trace_registry.part_dirs();
+                let metric_eligible = series_registry.part_dirs();
                 // Eviction walks the whole parts tree with `read_dir` and a
                 // `symlink_metadata` per entry. That is synchronous work, and
                 // running it inline blocked a runtime worker for as long as the
@@ -458,30 +505,43 @@ pub async fn run(config: Arc<Config>) {
                                 trace_budget,
                                 &trace_eligible,
                             );
-                            (Ok(bytes), result)
+                            match result {
+                                Ok(trace_bytes) => {
+                                    let metric_budget = trace_budget.saturating_sub(trace_bytes);
+                                    let metric_result =
+                                        cache_for_eviction.storage.evict_metric_cache(
+                                            &cache_for_eviction.metric_parts_root(),
+                                            metric_budget,
+                                            &metric_eligible,
+                                        );
+                                    (Ok(bytes), Ok(trace_bytes), metric_result)
+                                }
+                                Err(error) => (Ok(bytes), Err(error), Ok(0)),
+                            }
                         }
-                        Err(error) => (Err(error), Ok(0)),
+                        Err(error) => (Err(error), Ok(0), Ok(0)),
                     }
                 })
                 .await;
-                let (log_result, trace_result) = match evicted {
+                let (log_result, trace_result, metric_result) = match evicted {
                     Ok(results) => results,
                     // The blocking pool is shared, so a panic in another task
                     // cannot reach here; this is a join failure, which means
                     // the eviction did not run rather than that it half ran.
-                    Err(error) => (Err(format!("eviction task failed: {error}")), Ok(0)),
+                    Err(error) => (Err(format!("eviction task failed: {error}")), Ok(0), Ok(0)),
                 };
-                match (log_result, trace_result) {
-                    (Ok(bytes), Ok(trace_bytes)) => {
+                match (log_result, trace_result, metric_result) {
+                    (Ok(bytes), Ok(trace_bytes), Ok(metric_bytes)) => {
                         metrics.cache_evictions.fetch_add(1, Ordering::Relaxed);
                         cache.mark_cache_healthy();
                         tracing::debug!(
                             bytes,
                             trace_bytes,
-                            "local log and trace cache eviction complete"
+                            metric_bytes,
+                            "local log, trace and metric cache eviction complete"
                         );
                     }
-                    (Err(error), _) | (_, Err(error)) => {
+                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                         cache.mark_cache_unhealthy();
                         tracing::warn!(%error, "local part cache eviction failed");
                     }
@@ -493,6 +553,7 @@ pub async fn run(config: Arc<Config>) {
     {
         let registry = parts.clone();
         let trace_registry = trace_registry.clone();
+        let series_registry = series_registry.clone();
         let remote_cache = remote_cache.clone();
         let config = config.clone();
         let metrics = metrics.clone();
@@ -504,6 +565,7 @@ pub async fn run(config: Arc<Config>) {
             retention::retention_loop(
                 registry,
                 trace_registry,
+                series_registry,
                 remote_cache,
                 config,
                 policy,

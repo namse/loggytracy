@@ -85,11 +85,15 @@ impl ObjectStorage {
             .collect();
         self.publish(&[], &log_ids).await?;
         self.remove_trace_parts(&transaction.trace_parts).await?;
+        self.remove_metric_parts(&transaction.metric_parts).await?;
         self.delete_part_objects(&transaction.log_parts).await?;
         self.delete_trace_part_objects(&transaction.trace_parts).await?;
+        self.delete_metric_part_objects(&transaction.metric_parts)
+            .await?;
 
         let parts_root = data_dir.join("parts");
         let traces_root = data_dir.join("traces");
+        let metrics_root = data_dir.join("metrics");
         let log_dirs = transaction
             .log_parts
             .iter()
@@ -100,8 +104,14 @@ impl ObjectStorage {
             .iter()
             .map(|part| transaction_part_dir(&traces_root, &part.partition, &part.id))
             .collect::<Result<Vec<_>, _>>()?;
+        let metric_dirs = transaction
+            .metric_parts
+            .iter()
+            .map(|part| transaction_part_dir(&metrics_root, &part.partition, &part.id))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut dirs = log_dirs;
         dirs.extend(trace_dirs);
+        dirs.extend(metric_dirs);
         crate::part::remove_part_dirs(&dirs)?;
         clear_flush_transaction(data_dir)
     }
@@ -365,6 +375,86 @@ fn validate_trace_manifest(manifest: &TraceManifest) -> Result<(), String> {
             || !ids.insert(part.id.as_str())
         {
             return Err("trace manifest contains an invalid or duplicate part".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_metric_manifest(manifest: &MetricManifest) -> Result<(), String> {
+    let mut ids = HashSet::new();
+    for part in &manifest.parts {
+        if !is_safe_path_component(&part.id)
+            || !is_safe_path_component(&part.partition)
+            || !ids.insert(part.id.as_str())
+        {
+            return Err("metric manifest contains an invalid or duplicate part".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn metric_cache_part_dir(
+    metrics_root: &Path,
+    descriptor: &MetricManifestPart,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(metrics_root).map_err(|error| error.to_string())?;
+    let canonical_root = validate_cache_root(metrics_root)?;
+    let mut current = metrics_root.to_path_buf();
+    for component in [&descriptor.partition, &descriptor.id] {
+        if !is_safe_path_component(component) {
+            return Err(format!("unsafe metric cache path component {component:?}"));
+        }
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked metric cache directory {}",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "metric cache path is not a directory: {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|error| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        let canonical = std::fs::canonicalize(&current).map_err(|error| error.to_string())?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(format!(
+                "metric cache directory escapes root: {}",
+                current.display()
+            ));
+        }
+    }
+    validate_metric_cache_files(&current)?;
+    Ok(current)
+}
+
+fn validate_metric_cache_files(dir: &Path) -> Result<(), String> {
+    for file in [
+        SERIES_DATA_FILE,
+        SERIES_INDEX_FILE,
+        SERIES_BLOOM_FILE,
+        SERIES_META_FILE,
+        ".access",
+    ] {
+        let path = dir.join(file);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked metric cache file {}",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
         }
     }
     Ok(())

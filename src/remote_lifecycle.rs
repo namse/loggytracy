@@ -10,6 +10,10 @@ use crate::runtime_error::RuntimeError;
 pub(crate) enum RemoteDomain {
     Logs,
     Traces,
+    // Constructed by the metric read path (M14 Phase 7); the restore arm it
+    // selects is live from Phase 6 so the two land decoupled.
+    #[allow(dead_code)]
+    Metrics,
 }
 
 /// Pin local immutable bodies for one query while preserving the shared
@@ -65,6 +69,15 @@ where
                 )
                 .await
             }
+            RemoteDomain::Metrics => {
+                tokio::time::timeout(
+                    timeout,
+                    remote
+                        .storage
+                        .restore_metric_parts(&remote.metric_parts_root(), &missing),
+                )
+                .await
+            }
         };
         match result {
             Ok(Ok(())) => {
@@ -114,6 +127,7 @@ where
                 return Err(RuntimeError::Timeout(match domain {
                     RemoteDomain::Logs => "object store restore timed out".to_string(),
                     RemoteDomain::Traces => "trace object store restore timed out".to_string(),
+                    RemoteDomain::Metrics => "metric object store restore timed out".to_string(),
                 }));
             }
         }

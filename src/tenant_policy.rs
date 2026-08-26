@@ -237,6 +237,19 @@ impl Cutoffs {
             self.is_expired(&segment.tenant, segment_max)
         })
     }
+
+    /// The metric part's whole-delete predicate. Metric tenant segments carry
+    /// no per-segment time bounds, so every tenant is judged against the
+    /// part's own `max_ts_ns` — conservative in exactly the trace predicate's
+    /// direction: a part lives until its newest sample has expired for every
+    /// tenant holding series in it.
+    pub fn metric_part_fully_expired(&self, meta: &crate::series_part::SeriesPartMeta) -> bool {
+        !meta.tenants.is_empty()
+            && meta
+                .tenants
+                .iter()
+                .all(|segment| self.is_expired(&segment.tenant, meta.max_ts_ns))
+    }
 }
 
 #[derive(Default)]

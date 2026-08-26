@@ -1,4 +1,286 @@
 impl ObjectStorage {
+    async fn upload_metric_part(&self, part: &SeriesPart) -> Result<(), String> {
+        let descriptor = MetricManifestPart::from(part);
+        for file in METRIC_PART_FILES {
+            let local_path = part.dir.join(file);
+            let metadata = std::fs::symlink_metadata(&local_path).map_err(|error| {
+                format!(
+                    "failed to inspect metric part file {}: {error}",
+                    local_path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "refusing unsafe metric part file {}",
+                    local_path.display()
+                ));
+            }
+            let bytes = tokio::fs::read(&local_path).await.map_err(|error| {
+                format!(
+                    "failed to read metric part file {}: {error}",
+                    local_path.display()
+                )
+            })?;
+            match self
+                .store
+                .put_opts(
+                    &self.metric_part_path(&descriptor, file),
+                    bytes.clone().into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    let remote = self
+                        .store
+                        .get(&self.metric_part_path(&descriptor, file))
+                        .await
+                        .map_err(|error| {
+                            format!("failed to verify existing metric object: {error}")
+                        })?
+                        .bytes()
+                        .await
+                        .map_err(|error| {
+                            format!("failed to read existing metric object: {error}")
+                        })?;
+                    if remote.as_ref() != bytes.as_slice() {
+                        return Err(format!(
+                            "immutable object collision for metric part {} file {file}",
+                            part.meta.id
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "failed to upload metric part {} file {file}: {error}",
+                        part.meta.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn restore_metric_catalog(
+        &self,
+        metrics_root: &Path,
+    ) -> Result<MetricManifest, String> {
+        let manifest = self.load_metric_manifest().await?;
+        std::fs::create_dir_all(metrics_root).map_err(|error| error.to_string())?;
+        for descriptor in &manifest.parts {
+            let dir = metric_cache_part_dir(metrics_root, descriptor)?;
+            if crate::series_part::load_series_part(&dir)
+                .ok()
+                .and_then(|part| SeriesPartReader::open_cached(part).ok())
+                .is_some()
+            {
+                continue;
+            }
+            self.download_metric_part(descriptor, metrics_root, false)
+                .await?;
+        }
+        Ok(manifest)
+    }
+
+    /// The metric side of `reconcile_trace_local_cache`, on the same terms:
+    /// metric parts are immutable, so an interrupted upload retries safely
+    /// against byte-verified existing objects. Interrupted compactions replay
+    /// first — their manifest replacement is idempotent, so every crash
+    /// window converges before the local-only publish scan can see a
+    /// half-replaced tier.
+    pub async fn reconcile_metric_local_cache(
+        &self,
+        metrics_root: &Path,
+    ) -> Result<MetricManifest, String> {
+        self.replay_metric_compactions(metrics_root).await?;
+        let manifest = self.restore_metric_catalog(metrics_root).await?;
+        validate_cache_tree_no_symlinks(metrics_root)?;
+        let active: HashMap<&str, &MetricManifestPart> = manifest
+            .parts
+            .iter()
+            .map(|part| (part.id.as_str(), part))
+            .collect();
+        let mut unpublished = Vec::new();
+        for part in discover_series_parts(metrics_root)? {
+            let descriptor = MetricManifestPart::from(&part);
+            if let Some(existing) = active.get(descriptor.id.as_str()) {
+                if **existing != descriptor {
+                    return Err(format!(
+                        "local metric part {} conflicts with the remote manifest",
+                        descriptor.id
+                    ));
+                }
+                continue;
+            }
+            SeriesPartReader::open(part.clone()).map_err(|error| {
+                format!(
+                    "local metric part {} is not fully cached and is absent from the remote manifest: {error}",
+                    descriptor.id
+                )
+            })?;
+            unpublished.push(part);
+        }
+        if !unpublished.is_empty() {
+            self.publish_metric_parts(&unpublished, &[]).await?;
+        }
+        self.restore_metric_catalog(metrics_root).await
+    }
+
+    /// Replays every pending compaction commit record against the remote
+    /// manifest, then finishes it locally the way the crashed pass would
+    /// have: replacement published (idempotently), inputs deleted, record
+    /// cleared. A record whose replacement never became durable only clears.
+    async fn replay_metric_compactions(&self, metrics_root: &Path) -> Result<(), String> {
+        for (path, record) in crate::series_merge::read_records(metrics_root)? {
+            let mut new_parts = Vec::new();
+            let mut durable = true;
+            for relative in &record.new {
+                let dir = crate::series_merge::record_dir(metrics_root, relative)?;
+                match crate::series_part::load_series_part(&dir) {
+                    Ok(part) => new_parts.push(part),
+                    Err(_) => {
+                        durable = false;
+                        break;
+                    }
+                }
+            }
+            if durable {
+                let mut input_descriptors = Vec::new();
+                let mut input_dirs = Vec::new();
+                for relative in &record.inputs {
+                    let dir = crate::series_merge::record_dir(metrics_root, relative)?;
+                    let (partition, id) = relative
+                        .split_once('/')
+                        .ok_or_else(|| format!("malformed compaction input {relative:?}"))?;
+                    input_descriptors.push(MetricManifestPart {
+                        id: id.to_string(),
+                        partition: partition.to_string(),
+                    });
+                    input_dirs.push(dir);
+                }
+                self.publish_metric_parts(&new_parts, &input_descriptors)
+                    .await?;
+                self.delete_metric_part_objects(&input_descriptors).await?;
+                crate::part::remove_part_dirs(&input_dirs)?;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn restore_metric_parts(
+        &self,
+        metrics_root: &Path,
+        ids: &HashSet<String>,
+    ) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let manifest = self.load_metric_manifest().await?;
+        let mut restored = HashSet::new();
+        for descriptor in &manifest.parts {
+            if !ids.contains(&descriptor.id) {
+                continue;
+            }
+            let dir = metric_cache_part_dir(metrics_root, descriptor)?;
+            if crate::series_part::load_series_part(&dir)
+                .ok()
+                .and_then(|part| SeriesPartReader::open(part).ok())
+                .is_none()
+            {
+                self.download_metric_part(descriptor, metrics_root, true)
+                    .await?;
+            }
+            restored.insert(descriptor.id.clone());
+        }
+        let missing: Vec<_> = ids.difference(&restored).cloned().collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "metric parts are no longer present in the object-store manifest: {}",
+                missing.join(", ")
+            ))
+        }
+    }
+
+    async fn download_metric_part(
+        &self,
+        descriptor: &MetricManifestPart,
+        metrics_root: &Path,
+        include_data: bool,
+    ) -> Result<(), String> {
+        let final_dir = metric_cache_part_dir(metrics_root, descriptor)?;
+        let staging = StagingDir::create(metrics_root, &descriptor.partition, &descriptor.id)?;
+        let temp_dir = staging.path();
+        let files: &[&str] = if include_data {
+            &METRIC_PART_FILES
+        } else {
+            &METRIC_CATALOG_FILES
+        };
+        for file in files {
+            let bytes = self
+                .store
+                .get(&self.metric_part_path(descriptor, file))
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to download metric part {} file {file}: {error}",
+                        descriptor.id
+                    )
+                })?
+                .bytes()
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to read metric part {} file {file}: {error}",
+                        descriptor.id
+                    )
+                })?;
+            tokio::fs::write(temp_dir.join(file), bytes)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to cache metric part {} file {file}: {error}",
+                        descriptor.id
+                    )
+                })?;
+        }
+        let downloaded = crate::series_part::load_series_part(temp_dir)?;
+        if downloaded.meta.id != descriptor.id || downloaded.meta.partition != descriptor.partition
+        {
+            return Err(format!(
+                "downloaded metric part {} metadata mismatch",
+                descriptor.id
+            ));
+        }
+        SeriesPartReader::open_cached(downloaded)?;
+        if include_data {
+            SeriesPartReader::open(crate::series_part::load_series_part(temp_dir)?)?;
+        }
+        match std::fs::remove_dir_all(&final_dir) {
+            Ok(()) => {}
+            // Either nothing was cached here yet, or a concurrent restore of
+            // the same immutable part committed first; both are the state this
+            // line wanted.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if let Some(parent) = final_dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        std::fs::rename(temp_dir, &final_dir).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     async fn upload_trace_part(&self, part: &TracePart) -> Result<(), String> {
         let descriptor = TraceManifestPart {
             id: part.meta.id.clone(),

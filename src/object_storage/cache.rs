@@ -556,4 +556,21 @@ impl ObjectStorage {
             "trace cache",
         )
     }
+
+    /// The metric side, same discipline: bodies leave, the catalog stays so
+    /// selection keeps planning without a restore.
+    pub fn evict_metric_cache(
+        &self,
+        metrics_root: &Path,
+        max_bytes: u64,
+        part_dirs: &[PathBuf],
+    ) -> Result<u64, String> {
+        self.evict_bodies(
+            metrics_root,
+            max_bytes,
+            part_dirs,
+            SERIES_DATA_FILE,
+            "metric cache",
+        )
+    }
 }

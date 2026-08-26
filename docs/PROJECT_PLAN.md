@@ -231,7 +231,12 @@ tracks execution state per phase.
 - [x] Phase 5 — parts (`LMS1`/`LMI1` + bloom + meta), registry with the
   quota census, the flush/checkpoint/force-flush threading, local recovery;
   the WAL retires only once metric samples are durable in parts.
-- [ ] Phase 6 — object storage, retention, the compactor.
+- [x] Phase 6 — object storage (`metric-manifest.json` under the shared
+  writer epoch, offload/restore/evict/reconcile, the flush transaction's
+  third list), retention's third expired list with the
+  `metric_part_fully_expired` predicate, and the size-tiered metric
+  compactor with a commit-record replay for every crash window, local and
+  remote.
 - [ ] Phase 7 — the read path and its `QUERY_API.md` sections.
 - [ ] Phase 8 — bed completion and the memory-gate scenario.
 - [ ] Phase 9 — run, regenerate, publish `COMPARISON_METRICS.md` win or

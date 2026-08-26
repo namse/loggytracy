@@ -37,6 +37,7 @@ mod router;
 mod runtime_error;
 pub mod series;
 mod series_ingest;
+mod series_merge;
 mod series_part;
 pub mod series_registry;
 mod shutdown;

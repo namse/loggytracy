@@ -9,6 +9,10 @@ use object_store::{ObjectStore, PutMode, PutOptions, PutResult, UpdateVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::part::{self, DATA_FILE, INDEX_FILE, META_FILE, Part};
+use crate::series_part::{
+    SERIES_BLOOM_FILE, SERIES_DATA_FILE, SERIES_INDEX_FILE, SERIES_META_FILE, SeriesPart,
+    SeriesPartReader, discover_series_parts,
+};
 use crate::trace_part::{
     TRACE_BLOOM_FILE, TRACE_DATA_FILE, TRACE_META_FILE, TracePart, TracePartReader,
     discover_trace_parts,
@@ -36,6 +40,16 @@ pub const TENANT_POLICY_PREFIX: &str = "tenant_policies";
 pub const DELETE_REQUEST_PREFIX: &str = "delete_requests";
 const TRACE_PART_FILES: [&str; 3] = [TRACE_DATA_FILE, TRACE_BLOOM_FILE, TRACE_META_FILE];
 const TRACE_CATALOG_FILES: [&str; 2] = [TRACE_BLOOM_FILE, TRACE_META_FILE];
+const METRIC_MANIFEST_FILE: &str = "metric-manifest.json";
+const METRIC_PART_FILES: [&str; 4] = [
+    SERIES_DATA_FILE,
+    SERIES_INDEX_FILE,
+    SERIES_BLOOM_FILE,
+    SERIES_META_FILE,
+];
+/// Everything metric selection needs without the body: the catalog, the
+/// label-pair bloom, and the metadata the registry census reads.
+const METRIC_CATALOG_FILES: [&str; 3] = [SERIES_INDEX_FILE, SERIES_BLOOM_FILE, SERIES_META_FILE];
 /// Distinguishes one restore attempt's staging directory from another's.
 ///
 /// The staging directory used to be named for the part alone, which is correct
@@ -189,6 +203,29 @@ pub struct TraceManifest {
     pub parts: Vec<TraceManifestPart>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MetricManifestPart {
+    pub id: String,
+    pub partition: String,
+}
+
+impl From<&SeriesPart> for MetricManifestPart {
+    fn from(part: &SeriesPart) -> Self {
+        Self {
+            id: part.meta.id.clone(),
+            partition: part.meta.partition.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MetricManifest {
+    pub generation: u64,
+    #[serde(default)]
+    pub writer_epoch: u64,
+    pub parts: Vec<MetricManifestPart>,
+}
+
 /// Durable intent for the cross-domain flush boundary. The journal
 /// checkpoint is the commit record: before it advances, startup removes both
 /// manifest additions; after it advances, startup only clears this intent.
@@ -197,6 +234,10 @@ pub(crate) struct FlushTransaction {
     pub offset: u64,
     pub log_parts: Vec<ManifestPart>,
     pub trace_parts: Vec<TraceManifestPart>,
+    /// `default` so an intent written before the metrics signal existed still
+    /// parses — an empty list is exactly what that transaction meant.
+    #[serde(default)]
+    pub metric_parts: Vec<MetricManifestPart>,
 }
 
 struct LoadedManifest {

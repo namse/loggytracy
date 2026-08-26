@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::object_storage::MetricManifest;
 use crate::series_part::{SeriesPart, SeriesPartReader, discover_series_parts};
 use crate::tenant::TenantId;
 
@@ -86,6 +87,56 @@ impl SeriesRegistry {
         *self.stored_bytes.write() = census_of(&readers);
         *inner = readers;
         Ok(())
+    }
+
+    pub fn load_from_manifest(
+        metrics_root: &Path,
+        manifest: &MetricManifest,
+        operation_lock: Arc<tokio::sync::RwLock<()>>,
+    ) -> Result<Self, String> {
+        let registry = Self::new(operation_lock);
+        let mut readers = HashMap::new();
+        for descriptor in &manifest.parts {
+            let dir = metrics_root
+                .join(&descriptor.partition)
+                .join(&descriptor.id);
+            let part = crate::series_part::load_series_part(&dir).map_err(|error| {
+                format!(
+                    "failed to load metric manifest part {}: {error}",
+                    descriptor.id
+                )
+            })?;
+            if part.meta.id != descriptor.id || part.meta.partition != descriptor.partition {
+                return Err(format!(
+                    "cached metric part metadata does not match manifest descriptor {}/{}",
+                    descriptor.partition, descriptor.id
+                ));
+            }
+            let reader = SeriesPartReader::open_cached(part).map_err(|error| {
+                format!(
+                    "failed to open metric manifest part {}: {error}",
+                    descriptor.id
+                )
+            })?;
+            readers.insert(descriptor.id.clone(), Arc::new(reader));
+        }
+        *registry.stored_bytes.write() = census_of(&readers);
+        *registry.inner.write() = readers;
+        Ok(registry)
+    }
+
+    /// Registered parts among `ids` whose data body is not local — what a
+    /// read's pin must restore before it can decode.
+    pub fn missing_data_ids(
+        &self,
+        ids: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        self.inner
+            .read()
+            .iter()
+            .filter(|(id, reader)| ids.contains(*id) && !reader.part().data_path().exists())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Open readers for freshly written parts, without touching the registry —

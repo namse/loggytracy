@@ -2,7 +2,7 @@
     use crate::tenant::test_tenant;
     use crate::memtable::Labels;
     use crate::part::Row;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -40,6 +40,7 @@
             offset: 10,
             log_parts: parts.iter().map(ManifestPart::from).collect(),
             trace_parts: Vec::new(),
+            metric_parts: Vec::new(),
         };
         write_flush_transaction(&root, &transaction).unwrap();
 
@@ -61,6 +62,7 @@
             offset: 10,
             log_parts: parts.iter().map(ManifestPart::from).collect(),
             trace_parts: Vec::new(),
+            metric_parts: Vec::new(),
         };
         write_flush_transaction(&root, &transaction).unwrap();
 
@@ -69,6 +71,95 @@
         assert_eq!(storage.load_manifest().await.unwrap().parts.len(), 1);
         assert!(parts[0].dir.exists());
         assert!(!root.join(FLUSH_TRANSACTION_FILE).exists());
+    }
+
+    fn metric_parts_for(root: &Path, base_ts: i64) -> Vec<crate::series_part::SeriesPart> {
+        use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
+        let memtable = crate::series::SeriesMemTable::new();
+        let labels = SeriesLabels::from_pairs(vec![
+            (METRIC_NAME_LABEL.to_string(), "queue_depth".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ]);
+        memtable.insert(
+            (0..3)
+                .map(|index| MetricSample {
+                    tenant: test_tenant(),
+                    labels: labels.clone(),
+                    ts_ns: base_ts + index * 1_000_000_000,
+                    value: index as f64,
+                    kind: SampleKind::Gauge,
+                    datapoint_index: 0,
+                })
+                .collect(),
+        );
+        let snapshot = memtable.begin_flush();
+        let parts = crate::series_part::flush_series_snapshot(&snapshot, root).unwrap();
+        memtable.commit_flush();
+        parts
+    }
+
+    #[tokio::test]
+    async fn metric_parts_offload_restore_and_evict_like_the_other_signals() {
+        let root = temp_dir("metric-offload");
+        let storage = ObjectStorage::in_memory();
+        let parts = metric_parts_for(&root, 1_700_000_000_000_000_000);
+        let manifest = storage.publish_metric_parts(&parts, &[]).await.unwrap();
+        assert_eq!(manifest.parts.len(), 1);
+        let id = manifest.parts[0].id.clone();
+
+        // The body leaves; the catalog restore plans without it, the body
+        // restore brings the samples back byte-identical.
+        std::fs::remove_file(parts[0].data_path()).unwrap();
+        storage.restore_metric_catalog(&root).await.unwrap();
+        storage
+            .restore_metric_parts(&root, &std::iter::once(id).collect())
+            .await
+            .unwrap();
+        let reader = crate::series_part::SeriesPartReader::open(
+            crate::series_part::load_series_part(&parts[0].dir).unwrap(),
+        )
+        .unwrap();
+        let catalog = reader.tenant_catalog(&test_tenant());
+        assert_eq!(reader.read_series(&catalog[0]).unwrap().len(), 3);
+
+        storage
+            .evict_metric_cache(&root, 0, &[parts[0].dir.clone()])
+            .unwrap();
+        assert!(!parts[0].data_path().exists());
+        assert!(parts[0].index_path().exists(), "the catalog stays local");
+    }
+
+    #[tokio::test]
+    async fn flush_transaction_rolls_back_uncommitted_metric_additions() {
+        let root = temp_dir("metric-flush-transaction");
+        let metrics_root = root.join("metrics");
+        let storage = ObjectStorage::in_memory();
+        let parts = metric_parts_for(&metrics_root, 1_700_000_000_000_000_000);
+        storage.publish_metric_parts(&parts, &[]).await.unwrap();
+        let transaction = FlushTransaction {
+            offset: 10,
+            log_parts: Vec::new(),
+            trace_parts: Vec::new(),
+            metric_parts: parts.iter().map(MetricManifestPart::from).collect(),
+        };
+        write_flush_transaction(&root, &transaction).unwrap();
+
+        storage.reconcile_flush_transaction(&root, 0).await.unwrap();
+
+        assert!(storage.load_metric_manifest().await.unwrap().parts.is_empty());
+        assert!(!parts[0].dir.exists());
+        assert!(!root.join(FLUSH_TRANSACTION_FILE).exists());
+    }
+
+    /// An intent file written before the metrics signal existed carries no
+    /// `metric_parts` key, and must parse as the empty list it meant.
+    #[test]
+    fn a_pre_metrics_flush_transaction_still_parses() {
+        let parsed: FlushTransaction = serde_json::from_str(
+            r#"{"offset":7,"log_parts":[],"trace_parts":[]}"#,
+        )
+        .unwrap();
+        assert!(parsed.metric_parts.is_empty());
     }
 
     // ---------------------------------------------------------------------
