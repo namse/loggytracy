@@ -6,11 +6,13 @@
 
 - `signy/` — 저장·질의 엔진. 크레이트 루트가 여기이므로 빌드와 테스트는
   `cd signy && cargo test`로 한다
-- `collecty/` — collector. 아직 없다
+- `collecty/` — collector. UDS로 OTLP를 받아 zstd로 압축해 append-only 디스크
+  큐에 쌓고, 모아서 signy로 보낸다. 빌드와 테스트는 `cd collecty && cargo test`
 
-루트에는 Cargo workspace가 없다. obsy는 빌드·런타임에 등장하지 않는 이름이다:
-바이너리, 크레이트, env 접두사, 메트릭 패밀리, 이미지 이름은 전부 컴포넌트
-이름을 쓴다.
+루트에는 Cargo workspace가 없다. 컴포넌트마다 자기 `Cargo.lock`과
+`rust-toolchain.toml`을 들고 따로 빌드한다. obsy는 빌드·런타임에 등장하지 않는
+이름이다: 바이너리, 크레이트, env 접두사, 메트릭 패밀리, 이미지 이름은 전부
+컴포넌트 이름을 쓴다.
 
 ## 커밋 메시지
 
