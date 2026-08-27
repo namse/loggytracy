@@ -196,7 +196,7 @@ async fn main() {
     // pairing as unreachable instead of half-supporting it.
     let target_fits = match cfg.phase {
         Phase::Load | Phase::Seed | Phase::Matrix => cfg.target != Target::VictoriaMetrics,
-        Phase::MetricSeed | Phase::MetricMatrix => {
+        Phase::MetricSeed | Phase::MetricMatrix | Phase::MetricLoad => {
             matches!(cfg.target, Target::Loggytracy | Target::VictoriaMetrics)
         }
     };
@@ -212,7 +212,7 @@ and victorialogs; the metric phases accept loggytracy and victoriametrics",
     match cfg.phase {
         Phase::Load => run_load(cfg).await,
         Phase::Seed | Phase::Matrix => run_verify(cfg).await,
-        Phase::MetricSeed | Phase::MetricMatrix => run_metric_verify(cfg).await,
+        Phase::MetricSeed | Phase::MetricMatrix | Phase::MetricLoad => run_metric_verify(cfg).await,
     }
 }
 
@@ -258,7 +258,11 @@ async fn run_metric_verify(cfg: Config) {
     });
 
     let mut report = json!({
-        "phase": if cfg.phase == Phase::MetricSeed { "metric-seed" } else { "metric-matrix" },
+        "phase": match cfg.phase {
+            Phase::MetricSeed => "metric-seed",
+            Phase::MetricLoad => "metric-load",
+            _ => "metric-matrix",
+        },
         "target": cfg.target.name(),
         "run": {
             "build_revision": config::build_revision(),
@@ -306,6 +310,49 @@ async fn run_metric_verify(cfg: Config) {
                 .as_object()
                 .is_some_and(|shapes| shapes.values().all(|shape| shape["errors"] == json!(0)));
             report["matrix"] = outcome;
+        }
+        Phase::MetricLoad => {
+            let outcome = metric_workload::run_metric_load(&cfg).await;
+            // The steady phase is the gate: a budget met by refusing the
+            // offered load was never exercised. The churn and explosion
+            // phases' refusals are the designed behavior and are reported,
+            // not gated.
+            let steady = outcome
+                .phases
+                .iter()
+                .find(|(phase, _)| *phase == metric_workload::LoadPhase::Steady)
+                .map(|(_, tally)| tally);
+            ok = outcome.phases.iter().all(|(_, tally)| tally.errors == 0)
+                && steady.is_some_and(|tally| tally.acceptance() >= 0.9);
+            report["load"] = json!({
+                "elapsed_seconds": outcome.elapsed_seconds,
+                "series_offered": outcome.series_offered,
+                "phases": outcome
+                    .phases
+                    .iter()
+                    .map(|(phase, tally)| {
+                        (
+                            phase.name().to_string(),
+                            json!({
+                                "scrapes": tally.scrapes,
+                                "datapoints_offered": tally.datapoints_offered,
+                                "datapoints_accepted": tally.datapoints_accepted,
+                                "datapoints_rejected": tally.datapoints_rejected,
+                                "requests_refused": tally.requests_refused,
+                                "acceptance": tally.acceptance(),
+                                "errors": tally.errors,
+                                "first_error": tally.first_error,
+                                "statuses": tally
+                                    .statuses
+                                    .iter()
+                                    .map(|(status, count)| (status.to_string(), *count))
+                                    .collect::<BTreeMap<_, _>>(),
+                                "latency_ms": tally.latency.clone().summary(),
+                            }),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>(),
+            });
         }
         Phase::Load | Phase::Seed | Phase::Matrix => {
             unreachable!("run_metric_verify is only reached for the metric phases")
@@ -438,7 +485,7 @@ async fn run_verify(cfg: Config) {
                 .is_some_and(|shapes| shapes.values().all(|shape| shape["errors"] == json!(0)));
             report["matrix"] = outcome;
         }
-        Phase::Load | Phase::MetricSeed | Phase::MetricMatrix => {
+        Phase::Load | Phase::MetricSeed | Phase::MetricMatrix | Phase::MetricLoad => {
             unreachable!("run_verify is only reached for the seed and matrix phases")
         }
     }

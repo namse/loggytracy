@@ -162,6 +162,11 @@ pub enum Phase {
     /// dataset, cold and warm, with a per-answer record set the report's
     /// agreement check runs on.
     MetricMatrix,
+    /// The paced metric ingest: steady, then rolling series churn, then a
+    /// cardinality burst. This is the phase the M14 claim's own half is
+    /// measured in — what an engine does when active series outgrow the
+    /// budget it was given.
+    MetricLoad,
 }
 
 impl Phase {
@@ -172,9 +177,10 @@ impl Phase {
             "matrix" => Ok(Phase::Matrix),
             "metric-seed" => Ok(Phase::MetricSeed),
             "metric-matrix" => Ok(Phase::MetricMatrix),
+            "metric-load" => Ok(Phase::MetricLoad),
             other => Err(format!(
-                "LOGGYTRACY_LOAD_PHASE must be load, seed, matrix, metric-seed or \
-metric-matrix, got {other:?}"
+                "LOGGYTRACY_LOAD_PHASE must be load, seed, matrix, metric-seed, \
+metric-matrix or metric-load, got {other:?}"
             )),
         }
     }
@@ -310,6 +316,26 @@ pub struct MetricVerify {
     /// shape so a ratio difference is never the two engines being asked
     /// different windows.
     pub range_seconds: i64,
+
+    // The paced ingest phases (`metric-load`), which are a different
+    // experiment from the seeded dataset above: these run in wall-clock and
+    // measure what an engine does to a *rate* of series, not what it answers
+    // about a fixed corpus.
+    /// Seconds of the fixed series population, before any churn.
+    pub steady_seconds: u64,
+    /// Seconds of rolling instance replacement — the pod-restart shape, the
+    /// claim's own axis.
+    pub churn_seconds: u64,
+    /// Instances replaced per scrape during the churn phase. Sized so
+    /// `churn_seconds / scrape_interval * this` pushes active + idle series
+    /// past what the container's budget can index.
+    pub churn_replace_per_scrape: usize,
+    /// Seconds after the burst, so the recovery is measured rather than
+    /// assumed.
+    pub explosion_seconds: u64,
+    /// Distinct new series minted in one scrape at the start of the
+    /// explosion phase.
+    pub explosion_series: usize,
 }
 
 impl Config {
@@ -407,6 +433,11 @@ impl Config {
                 repeats: env_usize("LOGGYTRACY_LOAD_METRIC_REPEATS", 5).max(1),
                 step_seconds: env_u64("LOGGYTRACY_LOAD_METRIC_STEP_SECONDS", 30).max(1) as i64,
                 range_seconds: env_u64("LOGGYTRACY_LOAD_METRIC_RANGE_SECONDS", 60).max(1) as i64,
+                steady_seconds: env_u64("LOGGYTRACY_LOAD_METRIC_STEADY_SECONDS", 60),
+                churn_seconds: env_u64("LOGGYTRACY_LOAD_METRIC_CHURN_SECONDS", 120),
+                churn_replace_per_scrape: env_usize("LOGGYTRACY_LOAD_METRIC_CHURN_REPLACE", 64),
+                explosion_seconds: env_u64("LOGGYTRACY_LOAD_METRIC_EXPLOSION_SECONDS", 60),
+                explosion_series: env_usize("LOGGYTRACY_LOAD_METRIC_EXPLOSION_SERIES", 50_000),
             },
 
             targets: Targets {

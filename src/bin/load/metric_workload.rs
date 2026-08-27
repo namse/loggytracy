@@ -683,6 +683,11 @@ mod tests {
             repeats: 2,
             step_seconds: 30,
             range_seconds: 60,
+            steady_seconds: 2,
+            churn_seconds: 2,
+            churn_replace_per_scrape: 2,
+            explosion_seconds: 2,
+            explosion_series: 4,
         }
     }
 
@@ -847,6 +852,106 @@ mod tests {
     }
 
     #[test]
+    fn the_phase_boundaries_tile_the_run_and_then_end_it() {
+        let verify = verify_for_test();
+        assert_eq!(phase_at(0, &verify), Some(LoadPhase::Steady));
+        assert_eq!(phase_at(1, &verify), Some(LoadPhase::Steady));
+        assert_eq!(phase_at(2, &verify), Some(LoadPhase::Churn));
+        assert_eq!(phase_at(3, &verify), Some(LoadPhase::Churn));
+        assert_eq!(phase_at(4, &verify), Some(LoadPhase::Explosion));
+        assert_eq!(phase_at(5, &verify), Some(LoadPhase::Explosion));
+        assert_eq!(
+            phase_at(6, &verify),
+            None,
+            "the run ends rather than looping"
+        );
+    }
+
+    #[test]
+    fn churning_replaces_a_generation_and_the_burst_mints_series_once() {
+        let verify = verify_for_test();
+        let mut population = LivePopulation::new(7, &verify);
+        let steady = population.steady.len();
+        assert!(steady > 0);
+        let before = population.minted;
+
+        population.churn(7, verify.churn_replace_per_scrape);
+        let first_generation: Vec<String> = population
+            .churned
+            .iter()
+            .map(|instrument| format!("{:?}", instrument.labels))
+            .collect();
+        assert_eq!(
+            population.churned.len(),
+            verify.churn_replace_per_scrape * 2,
+            "a counter and a gauge per replaced instance"
+        );
+        population.churn(7, verify.churn_replace_per_scrape);
+        let second_generation: Vec<String> = population
+            .churned
+            .iter()
+            .map(|instrument| format!("{:?}", instrument.labels))
+            .collect();
+        assert_ne!(
+            first_generation, second_generation,
+            "a generation's instances are replaced, not re-reported"
+        );
+        assert_eq!(
+            population.instruments().count(),
+            steady + verify.churn_replace_per_scrape * 2,
+            "only the live generation reports"
+        );
+
+        population.explode(7, verify.explosion_series);
+        assert_eq!(population.exploded.len(), verify.explosion_series);
+        assert!(
+            population.minted > before,
+            "the census counts every identity the run offered"
+        );
+    }
+
+    #[test]
+    fn a_live_scrape_encodes_every_live_instrument_once() {
+        let verify = verify_for_test();
+        let mut population = LivePopulation::new(7, &verify);
+        population.churn(7, verify.churn_replace_per_scrape);
+        let (bytes, datapoints) = live_scrape_body(&population, 3, 1_772_000_000_000_000_000);
+        assert_eq!(datapoints, population.instruments().count() as u64);
+        let decoded =
+            ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let encoded: u64 = decoded
+            .resource_metrics
+            .iter()
+            .flat_map(|resource| resource.scope_metrics.iter())
+            .flat_map(|scope| scope.metrics.iter())
+            .map(|metric| match &metric.data {
+                Some(metric::Data::Gauge(gauge)) => gauge.data_points.len() as u64,
+                Some(metric::Data::Sum(sum)) => sum.data_points.len() as u64,
+                Some(metric::Data::Histogram(histogram)) => histogram.data_points.len() as u64,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(encoded, datapoints);
+    }
+
+    #[test]
+    fn a_phase_tally_reads_acceptance_from_what_partial_success_refused() {
+        let mut tally = PhaseTally::default();
+        tally.record(200, 100, 0, 1.0);
+        assert_eq!(tally.acceptance(), 1.0);
+        tally.record(200, 100, 50, 1.0);
+        assert_eq!(tally.datapoints_rejected, 50);
+        assert_eq!(tally.acceptance(), 150.0 / 200.0);
+        tally.record(429, 100, 0, 1.0);
+        assert_eq!(tally.requests_refused, 1);
+        assert_eq!(
+            tally.acceptance(),
+            150.0 / 300.0,
+            "a whole-request refusal counts against acceptance like any unaccepted offer"
+        );
+    }
+
+    #[test]
     fn an_unset_metric_anchor_is_refused() {
         let mut verify = verify_for_test();
         verify.anchor_ns = 0;
@@ -854,4 +959,413 @@ mod tests {
         verify.anchor_ns = 1;
         assert!(require_metric_anchor(&verify).is_ok());
     }
+}
+
+// --- The paced ingest phases: steady, churn, explosion (M14 Phase 8) ---
+
+/// Which sub-phase a scrape belongs to. The claim's own half lives in the
+/// second and third: an engine that sizes its index to the workload and one
+/// that sizes the workload to its budget diverge exactly here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoadPhase {
+    Steady,
+    Churn,
+    Explosion,
+}
+
+impl LoadPhase {
+    pub fn name(self) -> &'static str {
+        match self {
+            LoadPhase::Steady => "steady",
+            LoadPhase::Churn => "churn",
+            LoadPhase::Explosion => "explosion",
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct PhaseTally {
+    pub scrapes: u64,
+    pub datapoints_offered: u64,
+    pub datapoints_accepted: u64,
+    /// What OTLP `partial_success` said was refused — the designed behavior
+    /// under cardinality pressure, counted rather than hidden.
+    pub datapoints_rejected: u64,
+    /// Requests refused whole (429), which is the all-new-series case.
+    pub requests_refused: u64,
+    pub errors: u64,
+    pub first_error: Option<String>,
+    pub statuses: BTreeMap<u16, u64>,
+    pub latency: crate::stats::Series,
+}
+
+impl PhaseTally {
+    /// The fraction of offered datapoints the engine took. The gate reads the
+    /// steady phase's: a budget met by refusing the load was never exercised.
+    pub fn acceptance(&self) -> f64 {
+        if self.datapoints_offered == 0 {
+            return 0.0;
+        }
+        self.datapoints_accepted as f64 / self.datapoints_offered as f64
+    }
+
+    fn record(&mut self, status: u16, offered: u64, rejected: u64, elapsed_ms: f64) {
+        self.scrapes += 1;
+        self.datapoints_offered += offered;
+        *self.statuses.entry(status).or_default() += 1;
+        self.latency.push(elapsed_ms);
+        if (200..300).contains(&status) {
+            self.datapoints_rejected += rejected;
+            self.datapoints_accepted += offered.saturating_sub(rejected);
+        } else if status == 429 {
+            self.requests_refused += 1;
+        }
+    }
+}
+
+pub struct MetricLoadOutcome {
+    pub phases: Vec<(LoadPhase, PhaseTally)>,
+    pub elapsed_seconds: f64,
+    /// Distinct series the generator minted across the run, which is what the
+    /// engine's own `active_series` gauge is read against.
+    pub series_offered: u64,
+}
+
+/// One scrape's worth of instruments: the live steady set plus whatever the
+/// churn and explosion phases have added.
+struct LivePopulation {
+    steady: Vec<Instrument>,
+    churned: Vec<Instrument>,
+    exploded: Vec<Instrument>,
+    generation: usize,
+    minted: u64,
+}
+
+impl LivePopulation {
+    fn new(seed: u64, verify: &MetricVerify) -> Self {
+        let services = service_names(verify.services);
+        let mut steady = Vec::new();
+        for service in &services {
+            for index in 0..verify.instances_per_service {
+                let instance = format!("instance-{index}");
+                let env = if index % 2 == 0 { "prod" } else { "staging" };
+                let labels: [(&str, &str); 3] = [
+                    ("service", service.as_str()),
+                    ("instance", instance.as_str()),
+                    ("env", env),
+                ];
+                for gauge in GAUGE_NAMES.iter().take(verify.gauges) {
+                    steady.push(instrument(seed, gauge, InstrumentKind::Gauge, &labels));
+                }
+                for counter in COUNTER_NAMES.iter().take(verify.counters) {
+                    steady.push(instrument(seed, counter, InstrumentKind::Counter, &labels));
+                }
+                steady.push(instrument(
+                    seed,
+                    HISTOGRAM_NAME,
+                    InstrumentKind::Histogram,
+                    &labels,
+                ));
+            }
+        }
+        let minted = steady.len() as u64;
+        Self {
+            steady,
+            churned: Vec::new(),
+            exploded: Vec::new(),
+            generation: 0,
+            minted,
+        }
+    }
+
+    /// Replace the churn block: the previous generation's instances stop
+    /// reporting and an equal number of fresh ones appear. Their history stays
+    /// in the engine, which is the point — the cost of churn is what the dead
+    /// generations leave behind.
+    fn churn(&mut self, seed: u64, count: usize) {
+        self.generation += 1;
+        self.churned.clear();
+        for index in 0..count {
+            let instance = format!("churn-{}-{index}", self.generation);
+            let labels: [(&str, &str); 3] = [
+                ("service", CHURN_SERVICE),
+                ("instance", instance.as_str()),
+                ("env", "prod"),
+            ];
+            self.churned.push(instrument(
+                seed,
+                CHURN_COUNTER,
+                InstrumentKind::Counter,
+                &labels,
+            ));
+            self.churned.push(instrument(
+                seed,
+                CHURN_GAUGE,
+                InstrumentKind::Gauge,
+                &labels,
+            ));
+        }
+        self.minted += self.churned.len() as u64;
+    }
+
+    /// The burst: one scrape mints `count` distinct series that never repeat,
+    /// which is the cardinality explosion an engine either contains or dies
+    /// of.
+    fn explode(&mut self, seed: u64, count: usize) {
+        self.exploded.clear();
+        for index in 0..count {
+            let instance = format!("burst-{index}");
+            let labels: [(&str, &str); 3] = [
+                ("service", "burstsvc"),
+                ("instance", instance.as_str()),
+                ("env", "prod"),
+            ];
+            self.exploded.push(instrument(
+                seed,
+                CHURN_GAUGE,
+                InstrumentKind::Gauge,
+                &labels,
+            ));
+        }
+        self.minted += self.exploded.len() as u64;
+    }
+
+    fn instruments(&self) -> impl Iterator<Item = &Instrument> {
+        self.steady
+            .iter()
+            .chain(self.churned.iter())
+            .chain(self.exploded.iter())
+    }
+}
+
+/// One scrape as an OTLP body at wall-clock `ts_ns`, plus the datapoints it
+/// carries. Every instrument reports cumulative totals from `scrape`, the same
+/// arithmetic the seeded corpus uses.
+fn live_scrape_body(population: &LivePopulation, scrape: usize, ts_ns: i64) -> (Vec<u8>, u64) {
+    let mut gauges: BTreeMap<&str, Vec<NumberDataPoint>> = BTreeMap::new();
+    let mut sums: BTreeMap<&str, Vec<NumberDataPoint>> = BTreeMap::new();
+    let mut hists: BTreeMap<&str, Vec<HistogramDataPoint>> = BTreeMap::new();
+    let mut datapoints = 0u64;
+    let ts = ts_ns.max(0) as u64;
+
+    for instrument in population.instruments() {
+        let attributes: Vec<KeyValue> = instrument
+            .labels
+            .iter()
+            .map(|(name, value)| string_attribute(name, value))
+            .collect();
+        datapoints += 1;
+        match instrument.kind {
+            InstrumentKind::Gauge => {
+                gauges
+                    .entry(instrument.metric.as_str())
+                    .or_default()
+                    .push(NumberDataPoint {
+                        attributes,
+                        time_unix_nano: ts,
+                        value: Some(number_data_point::Value::AsDouble(
+                            instrument.gauge_value(scrape),
+                        )),
+                        ..Default::default()
+                    });
+            }
+            InstrumentKind::Counter => {
+                // The running total from the run's own start, so a paced
+                // scrape is a cumulative counter like a real exporter's.
+                let total: u64 = (0..=scrape)
+                    .map(|at| instrument.counter_increment(at))
+                    .sum();
+                sums.entry(instrument.metric.as_str())
+                    .or_default()
+                    .push(NumberDataPoint {
+                        attributes,
+                        time_unix_nano: ts,
+                        value: Some(number_data_point::Value::AsDouble(total as f64)),
+                        ..Default::default()
+                    });
+            }
+            InstrumentKind::Histogram => {
+                let mut buckets = vec![0u64; HISTOGRAM_BOUNDS.len() + 1];
+                let mut sum = 0.0;
+                for at in 0..=scrape {
+                    for (bucket, total) in buckets.iter_mut().enumerate() {
+                        *total += instrument.bucket_increment(at, bucket);
+                    }
+                    sum += instrument.sum_increment(at);
+                }
+                let count = buckets.iter().sum();
+                hists
+                    .entry(instrument.metric.as_str())
+                    .or_default()
+                    .push(HistogramDataPoint {
+                        attributes,
+                        time_unix_nano: ts,
+                        count,
+                        sum: Some(sum),
+                        bucket_counts: buckets,
+                        explicit_bounds: HISTOGRAM_BOUNDS.to_vec(),
+                        ..Default::default()
+                    });
+            }
+        }
+    }
+
+    let mut metrics: Vec<Metric> = Vec::new();
+    for (name, data_points) in gauges {
+        metrics.push(Metric {
+            name: name.to_string(),
+            data: Some(metric::Data::Gauge(Gauge { data_points })),
+            ..Default::default()
+        });
+    }
+    for (name, data_points) in sums {
+        metrics.push(Metric {
+            name: name.to_string(),
+            data: Some(metric::Data::Sum(Sum {
+                data_points,
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                is_monotonic: true,
+            })),
+            ..Default::default()
+        });
+    }
+    for (name, data_points) in hists {
+        metrics.push(Metric {
+            name: name.to_string(),
+            data: Some(metric::Data::Histogram(Histogram {
+                data_points,
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+            })),
+            ..Default::default()
+        });
+    }
+    let request = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                metrics,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    (request.encode_to_vec(), datapoints)
+}
+
+/// The phase a scrape at `elapsed` seconds belongs to, or `None` past the run.
+fn phase_at(elapsed: u64, verify: &MetricVerify) -> Option<LoadPhase> {
+    let churn_end = verify.steady_seconds + verify.churn_seconds;
+    if elapsed < verify.steady_seconds {
+        Some(LoadPhase::Steady)
+    } else if elapsed < churn_end {
+        Some(LoadPhase::Churn)
+    } else if elapsed < churn_end + verify.explosion_seconds {
+        Some(LoadPhase::Explosion)
+    } else {
+        None
+    }
+}
+
+/// Drive the three phases in wall-clock, one scrape per interval, on one
+/// connection: this measures how an engine's *index* behaves under series
+/// pressure, not how many connections it can saturate — the throughput axis
+/// belongs to the log bed's load phase.
+pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
+    let verify = &cfg.metric_verify;
+    let mut outcome = MetricLoadOutcome {
+        phases: vec![
+            (LoadPhase::Steady, PhaseTally::default()),
+            (LoadPhase::Churn, PhaseTally::default()),
+            (LoadPhase::Explosion, PhaseTally::default()),
+        ],
+        elapsed_seconds: 0.0,
+        series_offered: 0,
+    };
+    let Some(push_path) = cfg.target.metric_push_path() else {
+        outcome.phases[0].1.errors = 1;
+        outcome.phases[0].1.first_error = Some(format!(
+            "target {} has no OTLP metrics ingest",
+            cfg.target.name()
+        ));
+        return outcome;
+    };
+    let tenant = cfg.target.tenant_header(&verify.tenant);
+    let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
+    let mut population = LivePopulation::new(cfg.seed, verify);
+    let interval = std::time::Duration::from_secs(verify.scrape_interval_seconds.max(1) as u64);
+    let started = Instant::now();
+    let mut exploded = false;
+
+    for scrape in 0.. {
+        let elapsed = started.elapsed().as_secs();
+        let Some(phase) = phase_at(elapsed, verify) else {
+            break;
+        };
+        match phase {
+            LoadPhase::Steady => {}
+            LoadPhase::Churn => population.churn(cfg.seed, verify.churn_replace_per_scrape),
+            LoadPhase::Explosion => {
+                if !exploded {
+                    exploded = true;
+                    population.explode(cfg.seed, verify.explosion_series);
+                } else {
+                    // The burst's series are minted once and never repeat: the
+                    // recovery is what the rest of the phase measures.
+                    population.exploded.clear();
+                }
+            }
+        }
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
+        let (body, datapoints) = live_scrape_body(&population, scrape, now_ns);
+        let sent = Instant::now();
+        let result = client
+            .request(&Request {
+                method: "POST",
+                path: push_path,
+                body: &body,
+                content_type: PUSH_CONTENT_TYPE,
+                tenant: Some(&tenant),
+            })
+            .await;
+        let elapsed_ms = sent.elapsed().as_secs_f64() * 1000.0;
+        let tally = &mut outcome
+            .phases
+            .iter_mut()
+            .find(|(name, _)| *name == phase)
+            .expect("every phase has a tally")
+            .1;
+        match result {
+            Ok(response) => {
+                let rejected = rejected_datapoints(&response.body);
+                tally.record(response.status, datapoints, rejected, elapsed_ms);
+                if !(200..300).contains(&response.status) && response.status != 429 {
+                    tally.errors += 1;
+                    tally.first_error.get_or_insert_with(|| {
+                        format!(
+                            "{}: {}",
+                            response.status,
+                            String::from_utf8_lossy(&response.body)
+                                .chars()
+                                .take(300)
+                                .collect::<String>()
+                        )
+                    });
+                }
+            }
+            Err(error) => {
+                tally.scrapes += 1;
+                tally.datapoints_offered += datapoints;
+                tally.errors += 1;
+                tally.latency.push(elapsed_ms);
+                tally.first_error.get_or_insert(error);
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
+    outcome.elapsed_seconds = started.elapsed().as_secs_f64();
+    outcome.series_offered = population.minted;
+    outcome
 }
