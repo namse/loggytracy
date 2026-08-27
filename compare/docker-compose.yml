@@ -45,6 +45,12 @@ services:
       LOGGYTRACY_LISTEN_ADDR: 0.0.0.0:3100
       LOGGYTRACY_OTLP_GRPC_ADDR: 0.0.0.0:4317
       LOGGYTRACY_DATA_DIR: /var/lib/loggytracy
+      # The cardinality ladder's one variable. At its default this engine
+      # refuses new series at a *policy* number long before the container's
+      # memory is the thing that binds — which is what the first published run
+      # measured and what makes "who dies first in 2 GiB" unanswerable. Raising
+      # it out of the way is how that question gets asked.
+      LOGGYTRACY_MAX_ACTIVE_SERIES: ${LOGGYTRACY_MAX_ACTIVE_SERIES:-500000}
     stop_grace_period: 120s
 
   loki:
