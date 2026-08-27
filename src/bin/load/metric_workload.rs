@@ -915,23 +915,58 @@ mod tests {
         let verify = verify_for_test();
         let mut population = LivePopulation::new(7, &verify);
         population.churn(7, verify.churn_replace_per_scrape);
-        let (bytes, datapoints) = live_scrape_body(&population, 3, 1_772_000_000_000_000_000);
-        assert_eq!(datapoints, population.instruments().count() as u64);
-        let decoded =
-            ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
-        let encoded: u64 = decoded
-            .resource_metrics
+        let bodies = live_scrape_bodies(&population, 3, 1_772_000_000_000_000_000);
+        let offered: u64 = bodies.iter().map(|(_, datapoints)| *datapoints).sum();
+        assert_eq!(offered, population.instruments().count() as u64);
+        let encoded: u64 = bodies
             .iter()
-            .flat_map(|resource| resource.scope_metrics.iter())
-            .flat_map(|scope| scope.metrics.iter())
-            .map(|metric| match &metric.data {
-                Some(metric::Data::Gauge(gauge)) => gauge.data_points.len() as u64,
-                Some(metric::Data::Sum(sum)) => sum.data_points.len() as u64,
-                Some(metric::Data::Histogram(histogram)) => histogram.data_points.len() as u64,
-                _ => 0,
+            .map(|(bytes, _)| {
+                let decoded =
+                    ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+                decoded
+                    .resource_metrics
+                    .iter()
+                    .flat_map(|resource| resource.scope_metrics.iter())
+                    .flat_map(|scope| scope.metrics.iter())
+                    .map(|metric| match &metric.data {
+                        Some(metric::Data::Gauge(gauge)) => gauge.data_points.len() as u64,
+                        Some(metric::Data::Sum(sum)) => sum.data_points.len() as u64,
+                        Some(metric::Data::Histogram(histogram)) => {
+                            histogram.data_points.len() as u64
+                        }
+                        _ => 0,
+                    })
+                    .sum::<u64>()
             })
             .sum();
-        assert_eq!(encoded, datapoints);
+        assert_eq!(encoded, offered);
+    }
+
+    /// A burst larger than one export may carry is split, because an engine
+    /// refusing the *request* is a different refusal from an engine refusing
+    /// the new series in it — and the second is the one the claim is about.
+    #[test]
+    fn a_scrape_past_one_exports_worth_is_split_into_several() {
+        let mut verify = verify_for_test();
+        verify.explosion_series = SCRAPE_CHUNK_INSTRUMENTS * 2 + 1;
+        let mut population = LivePopulation::new(7, &verify);
+        population.explode(7, verify.explosion_series);
+        let bodies = live_scrape_bodies(&population, 0, 1_772_000_000_000_000_000);
+        assert!(bodies.len() >= 3, "{} bodies", bodies.len());
+        for (_, datapoints) in &bodies {
+            assert!(
+                *datapoints as usize <= SCRAPE_CHUNK_INSTRUMENTS,
+                "no body carries more instruments than one export's worth"
+            );
+        }
+        assert_eq!(
+            bodies
+                .iter()
+                .map(|(_, datapoints)| *datapoints)
+                .sum::<u64>(),
+            population.instruments().count() as u64,
+            "splitting drops nothing"
+        );
     }
 
     #[test]
@@ -1138,17 +1173,37 @@ impl LivePopulation {
     }
 }
 
-/// One scrape as an OTLP body at wall-clock `ts_ns`, plus the datapoints it
+/// Instruments per request. A real collector batches, and so must this: one
+/// export past the engine's own decomposed-sample cap is refused *whole*, by
+/// the request limit rather than by the cardinality ladder — which would
+/// measure the wrong refusal and call it the claim's. Sized well under
+/// `MAX_OTLP_METRIC_SAMPLES` because a histogram instrument fans out to
+/// `bounds + 3` samples.
+const SCRAPE_CHUNK_INSTRUMENTS: usize = 5_000;
+
+/// One scrape as OTLP bodies at wall-clock `ts_ns`, plus the datapoints each
 /// carries. Every instrument reports cumulative totals from `scrape`, the same
 /// arithmetic the seeded corpus uses.
-fn live_scrape_body(population: &LivePopulation, scrape: usize, ts_ns: i64) -> (Vec<u8>, u64) {
+fn live_scrape_bodies(
+    population: &LivePopulation,
+    scrape: usize,
+    ts_ns: i64,
+) -> Vec<(Vec<u8>, u64)> {
+    let instruments: Vec<&Instrument> = population.instruments().collect();
+    instruments
+        .chunks(SCRAPE_CHUNK_INSTRUMENTS.max(1))
+        .map(|chunk| live_scrape_body(chunk, scrape, ts_ns))
+        .collect()
+}
+
+fn live_scrape_body(instruments: &[&Instrument], scrape: usize, ts_ns: i64) -> (Vec<u8>, u64) {
     let mut gauges: BTreeMap<&str, Vec<NumberDataPoint>> = BTreeMap::new();
     let mut sums: BTreeMap<&str, Vec<NumberDataPoint>> = BTreeMap::new();
     let mut hists: BTreeMap<&str, Vec<HistogramDataPoint>> = BTreeMap::new();
     let mut datapoints = 0u64;
     let ts = ts_ns.max(0) as u64;
 
-    for instrument in population.instruments() {
+    for instrument in instruments {
         let attributes: Vec<KeyValue> = instrument
             .labels
             .iter()
@@ -1319,48 +1374,49 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
-        let (body, datapoints) = live_scrape_body(&population, scrape, now_ns);
-        let sent = Instant::now();
-        let result = client
-            .request(&Request {
-                method: "POST",
-                path: push_path,
-                body: &body,
-                content_type: PUSH_CONTENT_TYPE,
-                tenant: Some(&tenant),
-            })
-            .await;
-        let elapsed_ms = sent.elapsed().as_secs_f64() * 1000.0;
-        let tally = &mut outcome
-            .phases
-            .iter_mut()
-            .find(|(name, _)| *name == phase)
-            .expect("every phase has a tally")
-            .1;
-        match result {
-            Ok(response) => {
-                let rejected = rejected_datapoints(&response.body);
-                tally.record(response.status, datapoints, rejected, elapsed_ms);
-                if !(200..300).contains(&response.status) && response.status != 429 {
-                    tally.errors += 1;
-                    tally.first_error.get_or_insert_with(|| {
-                        format!(
-                            "{}: {}",
-                            response.status,
-                            String::from_utf8_lossy(&response.body)
-                                .chars()
-                                .take(300)
-                                .collect::<String>()
-                        )
-                    });
+        for (body, datapoints) in live_scrape_bodies(&population, scrape, now_ns) {
+            let sent = Instant::now();
+            let result = client
+                .request(&Request {
+                    method: "POST",
+                    path: push_path,
+                    body: &body,
+                    content_type: PUSH_CONTENT_TYPE,
+                    tenant: Some(&tenant),
+                })
+                .await;
+            let elapsed_ms = sent.elapsed().as_secs_f64() * 1000.0;
+            let tally = &mut outcome
+                .phases
+                .iter_mut()
+                .find(|(name, _)| *name == phase)
+                .expect("every phase has a tally")
+                .1;
+            match result {
+                Ok(response) => {
+                    let rejected = rejected_datapoints(&response.body);
+                    tally.record(response.status, datapoints, rejected, elapsed_ms);
+                    if !(200..300).contains(&response.status) && response.status != 429 {
+                        tally.errors += 1;
+                        tally.first_error.get_or_insert_with(|| {
+                            format!(
+                                "{}: {}",
+                                response.status,
+                                String::from_utf8_lossy(&response.body)
+                                    .chars()
+                                    .take(300)
+                                    .collect::<String>()
+                            )
+                        });
+                    }
                 }
-            }
-            Err(error) => {
-                tally.scrapes += 1;
-                tally.datapoints_offered += datapoints;
-                tally.errors += 1;
-                tally.latency.push(elapsed_ms);
-                tally.first_error.get_or_insert(error);
+                Err(error) => {
+                    tally.scrapes += 1;
+                    tally.datapoints_offered += datapoints;
+                    tally.errors += 1;
+                    tally.latency.push(elapsed_ms);
+                    tally.first_error.get_or_insert(error);
+                }
             }
         }
         tokio::time::sleep(interval).await;
