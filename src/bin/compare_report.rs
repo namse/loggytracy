@@ -1708,12 +1708,38 @@ const METRIC_SHAPES: [&str; 6] = [
 const METRIC_TARGETS: [&str; 2] = ["loggytracy", "victoriametrics"];
 const CHURN_PHASES: [&str; 3] = ["steady", "churn", "explosion"];
 
-/// The tolerance the `tolerance`-class shapes are compared under. Their
-/// window arithmetic is each engine's own — the rate *definitions* agree by
-/// decision, the floating-point path does not have to — so a digest equality
-/// would manufacture disagreement out of the last bits.
-const METRIC_TOLERANCE_RELATIVE: f64 = 0.005;
+/// What each agreement class licenses, as a relative difference.
+///
+/// **`stored`** covers the shapes that only read numbers back. The one
+/// difference an engine is allowed there is its storage fidelity, and the
+/// first published run measured what that costs: VictoriaMetrics returns a
+/// decimal approximation of the double it was given — `250.07999999999998`
+/// in, `250.08` out, one ULP apart — while this engine's Gorilla XOR is
+/// bit-exact. So bit-equality was the wrong rule (unsatisfiable by
+/// construction), and this is the tightest rule that is satisfiable: four
+/// orders of magnitude of headroom over the ~2e-16 observed, and still ten
+/// orders tighter than the computed class, so a genuinely wrong sample
+/// cannot hide inside it.
+const METRIC_STORED_RELATIVE: f64 = 1e-12;
+/// **`computed`** covers the shapes that fold a window. The rate definitions
+/// agree by decision; each engine's floating-point path does not have to.
+const METRIC_COMPUTED_RELATIVE: f64 = 0.005;
 const METRIC_TOLERANCE_ABSOLUTE: f64 = 1e-9;
+
+/// The relative difference a class licenses.
+///
+/// A class this build does not know falls to the *tight* rule, not the loose
+/// one. A checker that meets an unrecognized label and reaches for its widest
+/// tolerance can only fail one way — silently agreeing — and a silent
+/// agreement is the failure this whole section exists to prevent. Failing
+/// closed turns the same mistake into a visible disagreement someone
+/// investigates.
+fn class_tolerance(class: &str) -> f64 {
+    match class {
+        "computed" => METRIC_COMPUTED_RELATIVE,
+        _ => METRIC_STORED_RELATIVE,
+    }
+}
 
 /// One shape's agreement between the two engines, and on which rule.
 struct MetricAgreement {
@@ -1735,9 +1761,9 @@ impl MetricAgreement {
             return "no answers".to_string();
         }
         if self.agrees() {
-            return format!("{}/{} ({})", self.same, self.total, self.class);
+            return format!("{}/{}", self.same, self.total);
         }
-        format!("**{}/{}** ({})", self.same, self.total, self.class)
+        format!("**{}/{}**", self.same, self.total)
     }
 }
 
@@ -1766,22 +1792,19 @@ fn split_record(record: &str) -> (String, Option<f64>) {
     }
 }
 
-fn within_tolerance(left: f64, right: f64) -> bool {
-    let allowed = METRIC_TOLERANCE_ABSOLUTE.max(METRIC_TOLERANCE_RELATIVE * right.abs());
+fn within_tolerance(left: f64, right: f64, relative: f64) -> bool {
+    let allowed = METRIC_TOLERANCE_ABSOLUTE.max(relative * right.abs());
     (left - right).abs() <= allowed
 }
 
-/// Two answers agree when their record sets do — exactly for the exact
-/// class, pointwise within tolerance for the other. Either way the identities
-/// must line up: a shape that returned a different *series set* disagrees
-/// however close its numbers are.
-fn answers_agree(left: &Value, right: &Value, exact: bool) -> bool {
+/// Two answers agree when their record sets do: identities equal and values
+/// pointwise within what the shape's class licenses. The identities must line
+/// up whichever class applies — a shape that returned a different *series
+/// set* disagrees however close its numbers are.
+fn answers_agree(left: &Value, right: &Value, relative: f64) -> bool {
     let (left, right) = (metric_records(left), metric_records(right));
     if left.len() != right.len() {
         return false;
-    }
-    if exact {
-        return left == right;
     }
     left.iter().zip(&right).all(|(left, right)| {
         let (left_key, left_value) = split_record(left);
@@ -1790,7 +1813,7 @@ fn answers_agree(left: &Value, right: &Value, exact: bool) -> bool {
             return false;
         }
         match (left_value, right_value) {
-            (Some(left), Some(right)) => within_tolerance(left, right),
+            (Some(left), Some(right)) => within_tolerance(left, right, relative),
             (None, None) => true,
             _ => false,
         }
@@ -1803,7 +1826,7 @@ fn compute_metric_agreements(matrix: &BTreeMap<&str, Value>) -> BTreeMap<String,
         let mut same = 0usize;
         let mut total = 0usize;
         let mut example: Option<String> = None;
-        let mut class = "exact".to_string();
+        let mut class = "computed".to_string();
         let empty = Vec::new();
         let left_answers = matrix
             .get("loggytracy")
@@ -1827,7 +1850,7 @@ fn compute_metric_agreements(matrix: &BTreeMap<&str, Value>) -> BTreeMap<String,
                 continue;
             };
             total += 1;
-            if answers_agree(left, right, class == "exact") {
+            if answers_agree(left, right, class_tolerance(&class)) {
                 same += 1;
             } else if example.is_none() {
                 example = Some(format!(
@@ -2028,28 +2051,38 @@ fn metrics_agreement(page: &mut String, agreements: &BTreeMap<String, MetricAgre
         r#"## Agreement, before any timing
 
 A fast wrong answer is not a win, so every ratio below prints only for a shape
-whose answers the two engines agreed on. Two rules, declared per shape rather
-than chosen per result:
+whose answers the two engines agreed on. Identities must match exactly under
+both rules — a shape that returned a different *series set* disagrees however
+close its numbers are — and the values are held to what the shape's class
+licenses:
 
-- **exact** — every record equal, values at their full rendering. The raw and
-  summed shapes, where both engines return the floats the corpus stored.
-- **tolerance** — identities equal and values pointwise within
-  `max({absolute:e}, {relative} * |b|)`. The rate and quantile shapes: the two
-  definitions agree by decision, but each engine's floating-point path is its
-  own and a bit-equality would manufacture disagreement.
+- **stored** (`{stored:e}` relative) — the shapes that only read numbers back.
+  The one difference an engine is allowed here is its storage fidelity, and
+  the first published run measured what that costs: VictoriaMetrics returns a
+  decimal approximation of the double it was given (`250.07999999999998` in,
+  `250.08` out — one representable double apart), where this engine's Gorilla
+  XOR is bit-exact. Bit-equality was therefore the wrong rule, unsatisfiable
+  by construction; this is the tightest rule that is satisfiable, and still
+  ten orders of magnitude tighter than the class below, so a genuinely wrong
+  sample cannot hide inside it.
+- **computed** (`{computed}` relative, floor `{absolute:e}`) — the shapes that
+  fold a window. The rate definitions agree by decision; each engine's
+  floating-point path does not have to.
 
 A shape that disagrees has its ratios **withheld** below.
 
-| shape | agreed | first disagreement |
-|---|---|---|
+| shape | class | agreed | first disagreement |
+|---|---|---|---|
 "#,
+        stored = METRIC_STORED_RELATIVE,
+        computed = METRIC_COMPUTED_RELATIVE,
         absolute = METRIC_TOLERANCE_ABSOLUTE,
-        relative = METRIC_TOLERANCE_RELATIVE,
     ));
     for shape in METRIC_SHAPES {
         let agreement = &agreements[shape];
         page.push_str(&format!(
-            "| `{shape}` | {cell} | {example} |\n",
+            "| `{shape}` | {class} | {cell} | {example} |\n",
+            class = agreement.class,
             cell = agreement.cell(),
             example = agreement.example.as_deref().unwrap_or("—"),
         ));

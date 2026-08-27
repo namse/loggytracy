@@ -43,14 +43,31 @@ The decisions, recorded here because they dictate everything else:
   keys), or a histogram quantile as its own route. Anything else is a 400 that
   teaches what the surface does support — ratios are two requests composed
   client-side.
-- **Rate uses the VictoriaMetrics definition, not Prometheus extrapolation.**
+- **Rate answers what arrived, and scales nothing.** (Amended 2026-08-27,
+  after the first published run measured what the neighbours actually do.)
   `increase` = the sum of positive deltas over the window, counter resets
-  folded in; `rate` = `increase / window_seconds`. The only competitor in the
-  bed is VictoriaMetrics, which deliberately dropped Prometheus's
-  extrapolation; matching its definition keeps the rate shapes inside the
-  exact agreement digest instead of a tolerance comparison, and the
-  definition is simpler. Documented in `QUERY_API.md` as a deviation from
-  Prometheus.
+  folded in; `rate` = `increase / window_seconds`. Prometheus extrapolates to
+  the window boundaries. VictoriaMetrics does not extrapolate past the data
+  but *does* scale a partially-covered window up to the full range — so the
+  original decision record below, which said VictoriaMetrics "does not
+  extrapolate", was half right and is corrected here. The three agree wherever
+  a window is fully covered; they diverge only where a window reaches past the
+  last sample, which is exactly where a target has stopped reporting, and
+  inventing traffic there is the one place a scaled answer does real harm — an
+  alert evaluated on `/metrics/instant` would keep firing on a rate the dead
+  target is no longer producing. So this engine keeps answering what arrived,
+  and `QUERY_API.md` says when that differs from the neighbours.
+
+  *Superseded, kept because a moved target does not retract what was believed
+  when it was set:* the original record read "**Rate uses the VictoriaMetrics
+  definition, not Prometheus extrapolation** — the only competitor in the bed
+  is VictoriaMetrics, which deliberately dropped Prometheus's extrapolation;
+  matching its definition keeps the rate shapes inside the exact agreement
+  digest instead of a tolerance comparison." Two halves of that were wrong and
+  the run found both: VictoriaMetrics scales a partially-covered window, and
+  the "exact" digest was unsatisfiable against it for an unrelated reason
+  (decimal storage). The arithmetic the engine implements did not change; what
+  changed is the claim about whose behaviour it matches.
 - **The ruler comes first.** Phase 1 is documents (claim, shapes, this plan);
   Phase 2 builds the workload generator, the VictoriaMetrics bed target, and
   the shape matrix *before* the engine can answer a single query — so the

@@ -92,13 +92,26 @@ impl MetricShape {
     }
 
     /// Which agreement rule the report must apply to this shape's answers.
+    ///
+    /// The names say what the class is *about*, because the first published
+    /// run showed the obvious pair of names to be wrong. `exact` promised
+    /// bit-equality on the shapes that only read stored numbers back — and
+    /// bit-equality is unsatisfiable against VictoriaMetrics, which returns a
+    /// decimal approximation of the double it was given (measured 2026-08-27:
+    /// `250.07999999999998` in, `250.08` out, one ULP apart). So the two
+    /// classes are now the two *sources* of difference: what an engine stored,
+    /// and what an engine computed.
     pub fn digest_class(self) -> &'static str {
         match self {
-            MetricShape::RawRange | MetricShape::AggSumBy => "exact",
+            // Read back, not computed: the only licensed difference is each
+            // engine's storage fidelity.
+            MetricShape::RawRange | MetricShape::AggSumBy => "stored",
+            // Each engine's own window arithmetic, which the rate definitions
+            // agree on by decision but the floating-point path need not.
             MetricShape::RateRange
             | MetricShape::InstantAlert
             | MetricShape::QuantileP99
-            | MetricShape::ChurnedSelector => "tolerance",
+            | MetricShape::ChurnedSelector => "computed",
         }
     }
 }
@@ -147,10 +160,27 @@ pub fn build_metric_queries(cfg: &Config) -> Vec<MetricQuery> {
         .copied()
         .collect();
 
+    // No evaluation point may sit past the last sample.
+    //
+    // The corpus spans `scrapes * interval`, but its final *sample* is one
+    // interval before that end, so a window ending at the span's end holds
+    // less data than it asks for — and the two engines disagree there by
+    // design: this one answers the increase that arrived, VictoriaMetrics
+    // scales it up to the full window. Measured 2026-08-27: 40 of the 41
+    // steps in such an answer agreed and only the last differed, by exactly
+    // `range / covered`. That is a real semantic difference and it belongs in
+    // `QUERY_API.md`, not in a bed that keeps asking a question whose answer
+    // depends on which engine's edge convention you prefer. So the matrix
+    // stops at the last sample — the same move the log bed makes for its
+    // `rate` shape, and for the same reason.
+    let last_sample_ns = verify.anchor_ns
+        + (verify.scrapes.saturating_sub(1)) as i64
+            * verify.scrape_interval_seconds
+            * 1_000_000_000;
     let window_bounds = |window: i64| {
         let start = align_to_step(verify.anchor_ns + span * window / windows, step_ns);
         let end = align_to_step(verify.anchor_ns + span * (window + 1) / windows, step_ns);
-        (start, end)
+        (start, end.min(align_to_step(last_sample_ns, step_ns)))
     };
 
     let mut queries = Vec::new();
@@ -346,7 +376,7 @@ pub fn build_metric_queries(cfg: &Config) -> Vec<MetricQuery> {
             }
             MetricShape::ChurnedSelector => {
                 let start = align_to_step(verify.anchor_ns, step_ns) + range_ns;
-                let end = align_to_step(verify.anchor_ns + span, step_ns);
+                let end = align_to_step(last_sample_ns, step_ns);
                 let expression = format!("sum by (instance) (rate({CHURN_COUNTER}[{range}]))");
                 let (description, path) = match cfg.target {
                     Target::Loggytracy => first_party_range(
@@ -1087,6 +1117,32 @@ mod tests {
         );
     }
 
+    /// The bed must not ask a question whose window reaches past the last
+    /// sample: that is where the two engines' edge conventions differ, and a
+    /// difference in conventions is not a difference in engines.
+    #[test]
+    fn no_evaluation_point_sits_past_the_last_sample() {
+        let cfg = config_for(Target::Loggytracy);
+        let verify = &cfg.metric_verify;
+        let last_sample_ns = verify.anchor_ns
+            + (verify.scrapes as i64 - 1) * verify.scrape_interval_seconds * 1_000_000_000;
+        let queries = build_metric_queries(&cfg);
+        assert!(!queries.is_empty());
+        for query in &queries {
+            assert!(
+                query.end_ns <= last_sample_ns,
+                "{} evaluates at {} which is past the last sample at {last_sample_ns}",
+                query.id,
+                query.end_ns
+            );
+            assert!(
+                query.start_ns <= query.end_ns,
+                "{} has an inverted window",
+                query.id
+            );
+        }
+    }
+
     #[test]
     fn the_shape_list_and_its_classes_are_frozen() {
         let names: Vec<&str> = METRIC_SHAPES.iter().map(|shape| shape.name()).collect();
@@ -1101,15 +1157,15 @@ mod tests {
                 "churned_selector"
             ]
         );
-        assert_eq!(MetricShape::RawRange.digest_class(), "exact");
-        assert_eq!(MetricShape::AggSumBy.digest_class(), "exact");
+        assert_eq!(MetricShape::RawRange.digest_class(), "stored");
+        assert_eq!(MetricShape::AggSumBy.digest_class(), "stored");
         for shape in [
             MetricShape::RateRange,
             MetricShape::InstantAlert,
             MetricShape::QuantileP99,
             MetricShape::ChurnedSelector,
         ] {
-            assert_eq!(shape.digest_class(), "tolerance");
+            assert_eq!(shape.digest_class(), "computed");
         }
     }
 }

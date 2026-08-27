@@ -260,7 +260,21 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
       extrapolate past the data, but it does scale a partially-covered window, and the document has been
       corrected to what was measured.
 
-- [ ] **Decide whether a partially-covered window scales, and make the bed's rule match.** Two changes
+- [x] **Decided: a partially-covered window does not scale, and the bed stops asking about one.**
+      Two changes, 2026-08-27. The digest classes are now named for the two *sources* of difference —
+      `stored` (1e-12 relative, licensing VictoriaMetrics' decimal storage against this engine's
+      bit-exact Gorilla) and `computed` (0.5%, licensing each engine's own window arithmetic) — and an
+      unrecognized class falls to the tight rule, because a checker that reaches for its widest
+      tolerance on a label it does not know can only fail by silently agreeing. And the rate semantics
+      stay as they are: the two engines agreed at 40 of the 41 steps in the disagreeing answer, and the
+      one that differed was the only step whose window reached past the last sample. That is where a
+      target has stopped reporting, and scaling there would keep an alert firing on traffic the dead
+      target is no longer producing. The bed now clamps every evaluation point to the last sample
+      (`no_evaluation_point_sits_past_the_last_sample`), which is the move `matrix.rs` already makes for
+      the log `rate` shape: a difference in edge conventions is not a difference in engines, and it
+      belongs in `QUERY_API.md` rather than in a table.
+
+  *Superseded, kept for the reasoning it was decided against:* Two changes
       fall out of the diagnosis above and neither should be made blind. The digest class for
       `raw_range`/`agg_sum_by` has to move to `tolerance` or the bed will withhold those ratios forever
       over a difference no engine can avoid. And the rate semantics is a product decision the way the
