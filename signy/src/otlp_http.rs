@@ -326,16 +326,11 @@ async fn collect_inner(
         };
         match outcome {
             Ok(()) => {}
-            // Retryable: the batch is fine and this instance is not. Answering
-            // with it stops the batch here, because everything after would be
-            // refused too and everything before is already written — collecty
-            // resends the whole batch either way.
-            Err(error) if error.status.is_server_error() => return Err(error),
-            // Permanent: a decode failure, a tenant over its stored quota, a
-            // body past a limit. Sending these back would only have collecty
-            // halve the batch to find them and drop them anyway, one wasted
-            // round trip at a time, so they are dropped here and counted.
-            Err(error) => {
+            // Permanent: a decode failure, a body past a limit, a tenant over
+            // what it stores. Sending these back would only have collecty halve
+            // the batch to find them and drop them anyway, one wasted round
+            // trip at a time, so they are dropped here and counted.
+            Err(error) if never_acceptable(error.status) => {
                 tracing::warn!(
                     signal = signal.as_str(),
                     status = error.status.as_u16(),
@@ -353,10 +348,36 @@ async fn collect_inner(
                     .collect_dropped_bytes
                     .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
             }
+            // Everything else is this instance's problem, not the batch's — it
+            // is behind, draining, or configured against the tenant that sent
+            // this. Answering with it stops the batch here and collecty holds
+            // the whole thing until the answer changes.
+            Err(error) => return Err(error),
         }
     }
 
     Ok(StatusCode::OK.into_response())
+}
+
+/// Whether an answer means "this body, forever", so that dropping it loses
+/// nothing a retry would have saved.
+///
+/// The four client errors are the same four collecty treats as permanent, and
+/// `403` is deliberately not among them: an unknown tenant is a policy mistake
+/// to fix, not data to destroy. `429` is here for one reason only — the tenant
+/// is storing everything its plan sells, which clears when retention retires
+/// parts and not before. The other `429`, the one an overloaded instance
+/// answers, cannot reach this: it comes from the gate, and the gate is checked
+/// once for the whole batch before any of this runs.
+fn never_acceptable(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_REQUEST
+            | StatusCode::PAYLOAD_TOO_LARGE
+            | StatusCode::UNSUPPORTED_MEDIA_TYPE
+            | StatusCode::UNPROCESSABLE_ENTITY
+            | StatusCode::TOO_MANY_REQUESTS
+    )
 }
 
 fn split_collected_records(body: &[u8]) -> Result<Vec<(CollectSignal, &[u8])>, IngestError> {

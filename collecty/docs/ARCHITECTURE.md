@@ -213,10 +213,19 @@ signal itself, and a signal it will never accept — an undecodable body, a tena
 at its storage limit — is dropped there, logged, counted in
 `signy_collect_dropped_records_total`, and answered `200`. Sending it back would
 only have collecty halve the batch to rediscover what signy already knew, one
-round trip at a time, and drop it anyway. What still reaches the table is a batch
-that is wrong as a *whole*: not zstd, framing that does not add up, or more
-uncompressed bytes than signy will hold — and that last one halving genuinely
-fixes.
+round trip at a time, and drop it anyway.
+
+signy drops on the same four statuses this table calls permanent, plus the `429`
+that means a tenant is storing everything its plan sells. **A `403` is not one of
+them on either side.** An unknown tenant is a policy mistake an operator fixes in
+seconds, so signy answers it, collecty backs off, and the batch waits in the
+queue until the answer changes — which is what the row above has always promised
+and what an end-to-end run confirms: onboard the tenant and the whole backlog
+drains.
+
+What still reaches the table as a refusal is a batch that is wrong as a *whole*:
+not zstd, framing that does not add up, or more uncompressed bytes than signy
+will hold — and that last one halving genuinely fixes.
 
 ### Poison isolation
 

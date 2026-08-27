@@ -381,6 +381,16 @@
         declared: usize,
         frames: Vec<u8>,
     ) -> (StatusCode, String) {
+        post_collected_as(state, test_tenant().as_str(), encoding, declared, frames).await
+    }
+
+    async fn post_collected_as(
+        state: &Arc<AppState>,
+        tenant: &str,
+        encoding: &str,
+        declared: usize,
+        frames: Vec<u8>,
+    ) -> (StatusCode, String) {
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/signy/api/v1/collect")
@@ -390,7 +400,7 @@
                 crate::otlp_http::COLLECT_UNCOMPRESSED_BYTES_HEADER,
                 declared.to_string(),
             )
-            .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
+            .header(crate::tenant::TENANT_HEADER, tenant)
             .body(axum::body::Body::from(frames))
             .unwrap();
         let response = crate::build_router(state.clone())
@@ -563,4 +573,55 @@
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("not a signal tag"), "{body}");
+    }
+
+    /// The one client error that must never be dropped. A tenant nothing was
+    /// pushed for is a policy mistake an operator fixes in seconds; the batch
+    /// waits in collecty's queue until they do.
+    #[tokio::test]
+    async fn a_tenant_this_instance_does_not_serve_holds_the_batch_rather_than_dropping_it() {
+        let config = Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("signy-otlp-http-collect-{}", uuid::Uuid::new_v4())),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let memtable = Arc::new(MemTable::new());
+        let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+        let parts = Arc::new(PartRegistry::new());
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            parts.operation_lock(),
+        ));
+        let tenant_policy = Arc::new(crate::tenant_policy::TenantPolicy::enabled_with_clock(
+            crate::clock::Clock::system(),
+        ));
+        tenant_policy
+            .push(&test_tenant(), "30d", None)
+            .await
+            .expect("the test tenant is onboarded by pushing a policy");
+        let state = crate::test_support::state_with_tenant_policy(
+            config,
+            memtable.clone(),
+            journal,
+            parts,
+            trace_parts,
+            None,
+            tenant_policy,
+        );
+
+        let records = vec![(LOGS_TAG, log_request("held, not lost").encode_to_vec())];
+        let (frames, declared) = zstd_frames(&records);
+
+        let (status, body) = post_collected_as(&state, "stranger", "zstd", declared, frames).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(lines(&memtable).is_empty());
+        assert_eq!(
+            state
+                .metrics
+                .collect_dropped_records
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a policy mistake must not destroy the batch"
+        );
     }
