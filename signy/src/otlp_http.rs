@@ -359,25 +359,28 @@ async fn collect_inner(
     Ok(StatusCode::OK.into_response())
 }
 
-/// Whether an answer means "this body, forever", so that dropping it loses
-/// nothing a retry would have saved.
+/// Whether an answer means "not this body, however long it waits", so that
+/// dropping it loses nothing a retry would have saved.
 ///
-/// The four client errors are the same four collecty treats as permanent, and
-/// `403` is deliberately not among them: an unknown tenant is a policy mistake
-/// to fix, not data to destroy. `429` is here for one reason only — the tenant
-/// is storing everything its plan sells, which clears when retention retires
-/// parts and not before. The other `429`, the one an overloaded instance
-/// answers, cannot reach this: it comes from the gate, and the gate is checked
-/// once for the whole batch before any of this runs.
+/// Every client error is here, and the two that are judgement calls are `403`
+/// and `429`.
+///
+/// **`403`, a tenant this instance does not serve.** Holding it would be the
+/// kinder answer if the collector had a queue per tenant, or even per signal.
+/// It has one queue for the whole machine, so a single application exporting
+/// under an unknown tenant stops every other application's logs, spans and
+/// metrics behind it — a policy mistake with a blast radius of one process
+/// becomes an outage for the host. Dropping keeps the loss where the mistake
+/// is, and `signy_collect_dropped_records_total` with the warning beside it is
+/// how an operator finds out.
+///
+/// **`429`, a tenant storing everything its plan sells.** It clears when
+/// retention retires parts, which is not a timescale a disk queue can wait out.
+/// The other `429`, the one an overloaded instance answers, cannot reach here:
+/// it comes from the gate, and the gate is checked once for the whole batch
+/// before any of this runs.
 fn never_acceptable(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::BAD_REQUEST
-            | StatusCode::PAYLOAD_TOO_LARGE
-            | StatusCode::UNSUPPORTED_MEDIA_TYPE
-            | StatusCode::UNPROCESSABLE_ENTITY
-            | StatusCode::TOO_MANY_REQUESTS
-    )
+    status.is_client_error()
 }
 
 fn split_collected_records(body: &[u8]) -> Result<Vec<(CollectSignal, &[u8])>, IngestError> {

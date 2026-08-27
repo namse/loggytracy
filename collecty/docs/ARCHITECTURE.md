@@ -215,17 +215,20 @@ at its storage limit — is dropped there, logged, counted in
 only have collecty halve the batch to rediscover what signy already knew, one
 round trip at a time, and drop it anyway.
 
-signy drops on the same four statuses this table calls permanent, plus the `429`
-that means a tenant is storing everything its plan sells. **A `403` is not one of
-them on either side.** An unknown tenant is a policy mistake an operator fixes in
-seconds, so signy answers it, collecty backs off, and the batch waits in the
-queue until the answer changes — which is what the row above has always promised
-and what an end-to-end run confirms: onboard the tenant and the whole backlog
-drains.
+**signy drops on every client error, including `403`.** That is wider than this
+table, and the queue being shared is the reason. One application exporting under
+a tenant signy does not serve would otherwise stop every other application's
+logs, spans and metrics behind it on that machine — a mistake in one process
+becomes an outage for the host. The same goes for a tenant at its storage limit,
+whose `429` clears only when retention retires parts. Both are real data loss and
+both are visible: a warning per drop and
+`signy_collect_dropped_records_total`, which the runbook alerts on.
 
 What still reaches the table as a refusal is a batch that is wrong as a *whole*:
 not zstd, framing that does not add up, or more uncompressed bytes than signy
-will hold — and that last one halving genuinely fixes.
+will hold — and that last one halving genuinely fixes. The statuses this table
+calls retryable stay retryable, because they are answered before a batch is ever
+split: a fenced or draining instance, and a gate that is behind.
 
 ### Poison isolation
 
@@ -284,7 +287,8 @@ else does.
 - signy must drop a record it will never accept rather than refusing the batch
   that carries it. collecty cannot tell one record from another without decoding,
   so a refusal it cannot act on becomes a halving search it should not have to
-  run.
+  run — and with one queue for the machine, a batch that can never be accepted
+  blocks every application on it.
 - signy's admission ceilings and collecty's batch ceiling are coupled by nothing
   but these documents. That coupling, and whether the ceilings should exist in
   their current form at all, is obsy issue #10.

@@ -575,11 +575,12 @@
         assert!(body.contains("not a signal tag"), "{body}");
     }
 
-    /// The one client error that must never be dropped. A tenant nothing was
-    /// pushed for is a policy mistake an operator fixes in seconds; the batch
-    /// waits in collecty's queue until they do.
+    /// A tenant nothing was pushed for is a policy mistake, and the batch
+    /// carrying it is still dropped: the collector has one queue for the whole
+    /// machine, so holding it would stop every other application on the host
+    /// behind one misconfigured process.
     #[tokio::test]
-    async fn a_tenant_this_instance_does_not_serve_holds_the_batch_rather_than_dropping_it() {
+    async fn a_tenant_this_instance_does_not_serve_is_dropped_rather_than_held() {
         let config = Config {
             data_dir: std::env::temp_dir()
                 .join(format!("signy-otlp-http-collect-{}", uuid::Uuid::new_v4())),
@@ -614,14 +615,13 @@
 
         let (status, body) = post_collected_as(&state, "stranger", "zstd", declared, frames).await;
 
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
         assert!(lines(&memtable).is_empty());
         assert_eq!(
             state
                 .metrics
                 .collect_dropped_records
                 .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "a policy mistake must not destroy the batch"
+            1
         );
     }

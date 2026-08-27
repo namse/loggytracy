@@ -44,11 +44,13 @@ groups:
           summary: "The collect route is dropping records it will never accept"
           description: >-
             A batch from the collector carried records this instance cannot
-            take -- an undecodable body, a tenant at its storage limit -- and
-            they were dropped here. Deliberate: sending them back only makes
-            the collector halve the batch to find them and drop them itself.
-            But it is still data loss, and this counter and
-            signy_collect_dropped_bytes_total are the only places it shows.
+            take -- an undecodable body, a tenant it does not serve, a tenant at
+            its storage limit -- and they were dropped here. Deliberate: the
+            collector keeps one queue per machine, so holding them would stop
+            every other application on that host. But it is still data loss, and
+            this counter, signy_collect_dropped_bytes_total and the warning log
+            beside them are the only places it shows. The log carries the reason;
+            an unserved tenant is usually a policy nobody pushed.
           runbook: docs/RUNBOOK.md#what-to-alert-on
 
       - alert: SignyWalBacklogGrowing
