@@ -18,6 +18,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: signy
     steps:
       - uses: actions/checkout@v4
 
@@ -36,6 +39,8 @@ jobs:
       # The tree pulls in arrow, parquet, tonic and object_store; uncached, a
       # run spends most of its time compiling code that did not change.
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: signy
 
       - name: cargo fmt
         run: cargo fmt --check
@@ -59,7 +64,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-output-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/test-output.log
+          path: signy/target/test-output.log
           if-no-files-found: ignore
 
       - name: Load-harness smoke run
@@ -79,12 +84,12 @@ jobs:
         env:
           # `debug` reuses the artifacts `cargo test` just built. A debug harness
           # measures the harness, which is fine when nothing is being measured.
-          LOGGYTRACY_LOAD_PROFILE: debug
-          LOGGYTRACY_LOAD_SECONDS: '20'
-          LOGGYTRACY_LOAD_WARMUP_SECONDS: '2'
-          LOGGYTRACY_LOAD_CORPUS_ROWS: '2000'
-          LOGGYTRACY_LOAD_STREAMS: '32'
-          LOGGYTRACY_LOAD_TARGET_EPS: '200'
+          SIGNY_LOAD_PROFILE: debug
+          SIGNY_LOAD_SECONDS: '20'
+          SIGNY_LOAD_WARMUP_SECONDS: '2'
+          SIGNY_LOAD_CORPUS_ROWS: '2000'
+          SIGNY_LOAD_STREAMS: '32'
+          SIGNY_LOAD_TARGET_EPS: '200'
         run: |
           set -uo pipefail
           status=0
@@ -106,6 +111,9 @@ jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: signy
     steps:
       - uses: actions/checkout@v4
 
@@ -117,6 +125,8 @@ jobs:
           rustc --version && cargo --version
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: signy
 
       - name: cargo bench --no-run
         # `benches/` is a separate crate against the `[lib]` target, so nothing
@@ -141,6 +151,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      IMAGE: ghcr.io/namse/signy
     steps:
       - uses: actions/checkout@v4
 
@@ -153,15 +165,15 @@ jobs:
       - name: Build
         run: |
           docker build \
-            --build-arg LOGGYTRACY_BUILD_REVISION="${GITHUB_SHA}" \
-            --build-arg LOGGYTRACY_BUILD_BRANCH="${GITHUB_REF_NAME}" \
-            --tag "ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" \
-            --tag "ghcr.io/${GITHUB_REPOSITORY,,}:latest" \
-            .
+            --build-arg SIGNY_BUILD_REVISION="${GITHUB_SHA}" \
+            --build-arg SIGNY_BUILD_BRANCH="${GITHUB_REF_NAME}" \
+            --tag "${IMAGE}:${GITHUB_SHA}" \
+            --tag "${IMAGE}:latest" \
+            signy
 
       # Both tags, because the immutable one is what a deployment should pin to
       # and the moving one is what a person types.
       - name: Push
         run: |
-          docker push "ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
-          docker push "ghcr.io/${GITHUB_REPOSITORY,,}:latest"
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:latest"

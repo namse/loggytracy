@@ -1,0 +1,261 @@
+/// The metric read path's scan orchestrator. Admission runs in the fixed
+/// order every read surface uses (`trace_scan.rs` states it): pin — a restore
+/// is network wait and must not hold a scan slot — then a permit from the
+/// metric surface's own semaphore (Gorilla decode plus per-step folds is a
+/// third cost profile), then admission to the shared byte pool, then the
+/// blocking scan under an outer timeout. What is new here is that the cost is
+/// **bounded before any chunk is decoded**: selection runs over the memtable
+/// index and the part catalogs alone, and a selection past the caps is
+/// refused with the matched count and the knob, never scanned.
+///
+/// Refused fixes deliberately do not offer `agg`: the scan decodes every
+/// matched series whether or not the fold aggregates, so aggregation changes
+/// the answer's size, not the scan's.
+pub(crate) struct MetricScanRequest {
+    pub metric: Option<String>,
+    pub filters: Vec<MetricFilter>,
+    /// The evaluation window; decoding reaches back a further
+    /// `decode_margin_ns` so windowed folds have their bases.
+    pub start_ns: i64,
+    pub end_ns: i64,
+    pub steps: u64,
+    pub decode_margin_ns: i64,
+}
+
+pub(crate) struct MetricSeriesData {
+    pub labels: SeriesLabels,
+    /// Time-sorted, exact-timestamp duplicates collapsed (memtable and part
+    /// may briefly both hold a sample around a flush; one survives).
+    pub samples: Vec<(i64, f64)>,
+}
+
+pub(crate) struct MetricScanOutcome {
+    pub series: Vec<MetricSeriesData>,
+    pub decoded_samples: u64,
+    pub estimated_bytes: u64,
+    /// Held with the series it paid for; the handler drops both together
+    /// after the NDJSON body is built (the `QueryExecution` precedent).
+    _memory_reservation: crate::query_memory::QueryMemoryReservation,
+}
+
+/// Whether a series identity passes the request's name and label filters.
+fn metric_labels_match(
+    labels: &SeriesLabels,
+    metric: &Option<String>,
+    filters: &[MetricFilter],
+) -> Result<bool, String> {
+    let pairs = labels.pairs()?;
+    let lookup = |key: &str| -> Option<String> {
+        pairs
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
+    if let Some(metric) = metric
+        && lookup(crate::series::METRIC_NAME_LABEL).as_deref() != Some(metric.as_str())
+    {
+        return Ok(false);
+    }
+    Ok(filters.iter().all(|filter| filter.matches(&lookup)))
+}
+
+async fn scan_metric_series(
+    state: Arc<AppState>,
+    tenant: TenantId,
+    request: MetricScanRequest,
+) -> Result<MetricScanOutcome, ApiError> {
+    let max_runtime = state.config.max_metric_query_runtime;
+    let decode_start_ns = request.start_ns.saturating_sub(request.decode_margin_ns);
+    let guard =
+        pin_metric_parts(&state, &tenant, &request, decode_start_ns, request.end_ns).await?;
+    let scan_permit = tokio::time::timeout(
+        max_runtime,
+        state.metric_scan_semaphore.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| ApiError::from_engine("metric query timed out".to_string()))?
+    .map_err(|error| ApiError::from_engine(format!("metric scan scheduler is closed: {error}")))?;
+    let memory_reservation = tokio::time::timeout(max_runtime, state.query_memory_pool.reserve())
+        .await
+        .map_err(|_| ApiError::from_engine("metric query timed out".to_string()))?
+        .map_err(ApiError::from_engine)?;
+
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let task_cancellation = cancellation.clone();
+    let max_series = state.config.max_metric_series_per_query;
+    let max_points = state.config.max_metric_points_per_query;
+    let task_state = state.clone();
+    let mut task = tokio::task::spawn_blocking(move || {
+        // Keep the permit until the blocking task actually exits; a cancelled
+        // request must not admit a second scan while this one still burns CPU.
+        let _scan_permit = scan_permit;
+        let _guard = guard;
+        let _arena = crate::memprof::enter(crate::memprof::Arena::Query);
+
+        // Selection: the memtable index and the part catalogs, no chunk read.
+        let memtable = task_state.journal.series_memtable();
+        struct Sources {
+            in_memtable: bool,
+            parts: Vec<(
+                Arc<crate::series_part::SeriesPartReader>,
+                crate::series_part::CatalogEntry,
+            )>,
+        }
+        let mut selected: std::collections::BTreeMap<SeriesLabels, Sources> =
+            std::collections::BTreeMap::new();
+        for labels in memtable.series_labels(&tenant) {
+            if metric_labels_match(&labels, &request.metric, &request.filters)? {
+                selected.entry(labels).or_insert(Sources {
+                    in_memtable: true,
+                    parts: Vec::new(),
+                });
+            }
+        }
+        for reader in task_state.series_parts.snapshot() {
+            if task_cancellation.load(Ordering::Acquire) {
+                return Err("metric query timed out".to_string());
+            }
+            if !reader
+                .part()
+                .meta
+                .overlaps_range(decode_start_ns, request.end_ns)
+            {
+                continue;
+            }
+            for entry in reader.tenant_catalog(&tenant) {
+                if !entry.overlaps_range(decode_start_ns, request.end_ns) {
+                    continue;
+                }
+                if !metric_labels_match(&entry.labels, &request.metric, &request.filters)? {
+                    continue;
+                }
+                let sources = selected.entry(entry.labels.clone()).or_insert(Sources {
+                    in_memtable: false,
+                    parts: Vec::new(),
+                });
+                sources.parts.push((reader.clone(), entry.clone()));
+            }
+        }
+
+        // The bound, enforced while nothing has been decoded.
+        let matched = selected.len();
+        if matched > max_series {
+            return Err(format!(
+                "metric selection exceeds the maximum of {max_series} series: the selector \
+matched {matched} (SIGNY_MAX_METRIC_SERIES_PER_QUERY) — narrow the selector with more \
+attr filters"
+            ));
+        }
+        let points = (matched as u64).saturating_mul(request.steps);
+        if points > max_points as u64 {
+            return Err(format!(
+                "metric selection exceeds the maximum of {max_points} output points: {matched} \
+series over {} steps is {points} (SIGNY_MAX_METRIC_POINTS_PER_QUERY) — narrow the \
+selector, shorten the window, or coarsen step",
+                request.steps
+            ));
+        }
+        let label_bytes: u64 = selected
+            .keys()
+            .map(|labels| labels.byte_len() as u64)
+            .sum();
+        let mut estimated_bytes = points.saturating_mul(16).saturating_add(label_bytes);
+        memory_reservation.ensure(estimated_bytes)?;
+
+        let mut series = Vec::with_capacity(selected.len());
+        let mut decoded_samples = 0u64;
+        for (labels, sources) in selected {
+            if task_cancellation.load(Ordering::Acquire) {
+                return Err("metric query timed out".to_string());
+            }
+            let mut samples = if sources.in_memtable {
+                memtable.sorted_samples_of(&tenant, &labels)?
+            } else {
+                Vec::new()
+            };
+            for (reader, entry) in &sources.parts {
+                samples.extend(reader.read_series(entry)?);
+            }
+            samples.retain(|(ts, _)| *ts >= decode_start_ns && *ts <= request.end_ns);
+            samples.sort_by_key(|(ts, _)| *ts);
+            samples.dedup_by_key(|(ts, _)| *ts);
+            decoded_samples += samples.len() as u64;
+            estimated_bytes = estimated_bytes.saturating_add(samples.len() as u64 * 16);
+            memory_reservation.ensure(estimated_bytes)?;
+            series.push(MetricSeriesData { labels, samples });
+        }
+        Ok::<_, String>(MetricScanOutcome {
+            series,
+            decoded_samples,
+            estimated_bytes,
+            _memory_reservation: memory_reservation,
+        })
+    });
+
+    let outcome = match tokio::time::timeout(max_runtime, &mut task).await {
+        Ok(result) => result
+            .map_err(|error| ApiError::from_engine(format!("metric query task failed: {error}")))?
+            .map_err(ApiError::from_engine)?,
+        Err(_) => {
+            cancellation.store(true, Ordering::Release);
+            let _ = task.await;
+            return Err(ApiError::from_engine("metric query timed out".to_string()));
+        }
+    };
+    Ok(outcome)
+}
+
+/// Pin the metric parts the scan will read: the tenant's parts overlapping
+/// the decode window, pruned by the bloom for every equality the selector
+/// states — pinning is what downloads a body, so the pruning has to reach
+/// this far or the catalog-side pruning saves nothing.
+async fn pin_metric_parts(
+    state: &AppState,
+    tenant: &TenantId,
+    request: &MetricScanRequest,
+    decode_start_ns: i64,
+    end_ns: i64,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, ApiError> {
+    let metric = request.metric.clone();
+    let equalities: Vec<(String, String)> = request
+        .filters
+        .iter()
+        .filter_map(|filter| match filter {
+            MetricFilter::Eq { key, value } => Some((key.clone(), value.clone())),
+            _ => None,
+        })
+        .collect();
+    let series_parts = state.series_parts.clone();
+    let tenant = tenant.clone();
+    crate::remote_lifecycle::pin_remote_parts(
+        state.parts.operation_lock(),
+        state.remote_cache.clone(),
+        move || {
+            series_parts
+                .snapshot()
+                .into_iter()
+                .filter(|reader| {
+                    let meta = &reader.part().meta;
+                    meta.tenant_segment(&tenant).is_some()
+                        && meta.overlaps_range(decode_start_ns, end_ns)
+                        && metric
+                            .as_ref()
+                            .is_none_or(|name| {
+                                reader.may_match_pair(crate::series::METRIC_NAME_LABEL, name)
+                            })
+                        && equalities
+                            .iter()
+                            .all(|(key, value)| reader.may_match_pair(key, value))
+                })
+                .map(|reader| reader.part().meta.id.clone())
+                .collect()
+        },
+        |required| state.series_parts.missing_data_ids(required),
+        crate::remote_lifecycle::RemoteDomain::Metrics,
+        state.config.max_metric_restore_runtime,
+        || Ok(()),
+        Some(state.metrics.clone()),
+    )
+    .await
+    .map_err(pin_error)
+}
