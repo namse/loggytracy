@@ -145,14 +145,15 @@ fn a_reopened_queue_keeps_what_signy_has_not_answered_for() {
 
     let queue = open(&scratch, eager());
     assert_eq!(queue.sender_id(), sender, "the id outlives the process");
-    assert_eq!(queue.acked(), 1);
     assert_eq!(drain(&queue), vec![b"still owed".to_vec()]);
 }
 
-/// A crash between signy's answer and the unlink leaves an answered segment on
-/// disk. It is dead weight, and reopening is where it goes.
+/// Nothing is written down about how far signy has got: an answered segment is
+/// unlinked, so what is on disk is what is still owed. A crash between the
+/// answer and the unlink leaves the file behind, and it is simply offered
+/// again — signy answers that one without reading it.
 #[test]
-fn a_segment_signy_already_answered_for_is_removed_on_open() {
+fn a_segment_left_behind_by_a_crash_is_offered_again() {
     let scratch = Scratch::new("stale");
     {
         let queue = open(&scratch, eager());
@@ -160,14 +161,12 @@ fn a_segment_signy_already_answered_for_is_removed_on_open() {
         queue.seal_if_due().expect("a seal");
         queue.append(&record(b"owed")).expect("an append");
         queue.sync().expect("a sync");
-        // The cursor moves without the unlink that normally follows it.
-        cursor::store(scratch.path(), queue.sender_id(), 1).expect("a stored cursor");
     }
     assert!(path_of(&scratch, 1).exists());
 
     let queue = open(&scratch, eager());
-    assert!(!path_of(&scratch, 1).exists());
-    assert_eq!(queue.stats().segments, 1);
+    assert_eq!(queue.oldest_sealed(), Some(1));
+    assert_eq!(drain(&queue), vec![b"answered".to_vec(), b"owed".to_vec()]);
 }
 
 #[test]
@@ -266,12 +265,12 @@ fn a_record_larger_than_the_whole_queue_is_refused() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
-/// Both the numbering and the name it is kept under restart together. Keeping
-/// the name while the segments went back to one would have signy skip every
-/// segment under the mark it still held.
+/// A name that cannot be read is replaced rather than repaired. Keeping it
+/// while the segments went back to one would have signy skip every segment
+/// under the high-water mark it still held for that name.
 #[test]
-fn a_corrupt_cursor_takes_the_sender_id_with_it() {
-    let scratch = Scratch::new("cursor-identity");
+fn an_unreadable_identity_is_replaced() {
+    let scratch = Scratch::new("identity");
     let before = {
         let queue = open(&scratch, eager());
         queue.append(&record(b"first")).expect("an append");
@@ -281,11 +280,10 @@ fn a_corrupt_cursor_takes_the_sender_id_with_it() {
         queue.sender_id()
     };
 
-    std::fs::write(scratch.path().join("cursor"), b"junk").expect("a corrupt cursor");
+    std::fs::write(scratch.path().join("identity"), b"junk").expect("a damaged identity");
 
     let queue = open(&scratch, eager());
     assert_ne!(queue.sender_id(), before);
-    assert_eq!(queue.acked(), 0);
 }
 
 #[tokio::test]
@@ -305,8 +303,10 @@ async fn a_waiter_wakes_when_a_segment_closes() {
         .expect("the task finished");
 }
 
+/// What the queue occupies is what it still owes: an answered segment is gone
+/// from disk, so there is no second number to keep.
 #[test]
-fn the_backlog_counts_what_signy_has_not_answered_for() {
+fn an_answered_segment_leaves_the_queue_smaller() {
     let scratch = Scratch::new("backlog");
     let queue = open(&scratch, eager());
     queue.append(&record(&[1u8; 100])).expect("an append");
@@ -314,12 +314,10 @@ fn the_backlog_counts_what_signy_has_not_answered_for() {
     queue.append(&record(&[2u8; 100])).expect("an append");
     queue.seal_if_due().expect("a seal");
 
-    let before = queue.stats();
-    assert_eq!(before.backlog_bytes, before.queued_bytes);
-
+    let before = queue.stats().queued_bytes;
     queue.commit(1, 1).expect("a commit");
-    let after = queue.stats();
-    assert!(after.backlog_bytes < before.backlog_bytes);
+
+    assert!(queue.stats().queued_bytes < before);
 }
 
 use std::sync::Arc;

@@ -16,11 +16,11 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Ingest protocol | **OTLP over gRPC on a Unix domain socket**, all three signals |
 | Payload handling | **Never decoded.** The bytes that arrive are the bytes that are stored and the bytes that are sent |
 | Acknowledgement | After `write(2)`, before `fsync`. See "What an acknowledgement means" |
-| Durability | Append-only segments, crc32 per record, periodic `fsync`, cursor on disk |
+| Durability | Append-only segments, crc32 per record, periodic `fsync`. **How far signy has got is not written down** — a segment it answered for is unlinked, so what is on disk is what is still owed |
 | When the queue is full | **Drop the oldest segment.** The application is never refused for lack of disk |
 | Delivery | One closed segment in flight at a time, in queue order. A resend after a crash is **suppressed by signy**, not duplicated — see "Sending twice" |
 | Transport to signy | `POST /signy/api/v1/collect` with `Content-Encoding: zstd`, one route for all three signals |
-| Sender identity | Random 16 bytes made with the queue directory, kept in the cursor file. Not configurable, and not the hostname — it names the queue, not the machine |
+| Sender identity | Random 16 bytes made with the queue directory, in a file of their own. Not configurable, and not the hostname — it names the queue, not the machine |
 | What a request carries | **One closed segment, from its first record.** Never part of one, and never the segment still being written |
 | Tenancy | **None.** The tenant travels inside the payload as a resource attribute (obsy issue #9), so a collector that does not decode has nothing to do |
 | Self-observation | `collecty_*` metrics encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr |
@@ -129,11 +129,12 @@ One queue for every signal, under `{data_dir}/queue/`.
 ```
 00000000000000000000.seg   append-only segment, rolls at COLLECTY_QUEUE_SEGMENT_BYTES
 00000000000000000001.seg
-cursor                     28 bytes: acknowledged segment u64, sender id, crc32
+identity                   20 bytes: sender id, crc32
 ```
 
-Segments are numbered from one, so zero in the cursor means signy has none of
-them.
+That file is the whole of what the queue writes about itself. There is no
+cursor: a segment signy has answered for is unlinked on the spot, so the oldest
+file that is not still being written is the next one to send.
 
 A record is a 12-byte header and a zstd frame:
 
@@ -171,20 +172,17 @@ later, while reading, ends that segment and the reader moves to the next one.
 Trusting a bad length field to find the next boundary would be worse than losing
 the tail of one segment.
 
-**The cursor is advisory.** It is overwritten in place with no rename, because
-losing it costs a resend and a resend is cheap. A torn write fails its crc, and
-a queue whose cursor will not load offers every segment it still holds.
+**Nothing records how far signy has got.** An earlier design kept the answered
+segment number beside the identity, and it said nothing the directory did not:
+answering unlinks the file. The only case the number changed was a crash between
+signy's answer and the unlink, and there the file is simply offered again —
+signy answers that one from the headers without reading it. One wasted request
+against a number to keep consistent with the files.
 
-**The segment number and the sender id share the cursor's fate.** signy
-remembers the last segment it has whole under the sender id. If the id survived
-a cursor that did not, the numbering would restart under a name signy still held
-a high-water mark for, and every segment under that mark would be skipped as one
-it had already stored. So a cursor that will not load takes the id with it: the
-queue comes back as a sender signy has never heard of, and nothing is skipped.
-
-**A segment answered for is unlinked, and one still owed is not.** Reopening
-removes anything at or below the acknowledged number, which is what a crash
-between signy's answer and the unlink leaves behind.
+**The identity is replaced rather than repaired.** signy holds a high-water mark
+under it, so a name that outlived the segment numbering would have every segment
+under that mark skipped as one already stored. A file that fails its crc yields
+a new name, and the queue comes back as a sender signy has never heard of.
 
 **Drop-oldest works in whole segments.** Rewriting a file to remove its head is
 expensive; unlinking is one syscall. If the cursor was inside the segment being
@@ -195,10 +193,10 @@ mean walking every segment at startup to know how many each holds, which is a
 full read of the backlog on every restart. Bytes are free and answer the question
 an operator actually asks.
 
-**Backlog and disk usage are separate numbers.** `collecty_queue_bytes` is what
-the segments occupy; `collecty_queue_backlog_bytes` is what has not reached signy
-yet. They differ because a delivered segment is not unlinked until a later one
-exists, and only the second one means "signy is behind".
+**Backlog and disk usage are one number.** `collecty_queue_bytes` is both: a
+delivered segment is unlinked as it is answered for, so everything on disk is
+still owed. The separate backlog gauge went with the byte cursor that made the
+two differ.
 
 ## Sending
 

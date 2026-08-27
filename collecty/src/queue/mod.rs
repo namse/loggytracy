@@ -1,4 +1,4 @@
-mod cursor;
+mod identity;
 mod segment;
 #[cfg(test)]
 mod tests;
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-pub use cursor::SenderId;
+pub use identity::SenderId;
 use segment::{SegmentFile, SegmentMeta};
 
 pub const RECORD_HEADER_BYTES: usize = 12;
@@ -45,8 +45,9 @@ impl Default for QueueLimits {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QueueStats {
+    /// Everything on disk, which is also everything still owed: a segment
+    /// signy has answered for is unlinked, so nothing here has reached it.
     pub queued_bytes: u64,
-    pub backlog_bytes: u64,
     pub segments: usize,
     pub appended_records: u64,
     pub appended_bytes: u64,
@@ -69,7 +70,6 @@ struct Inner {
     /// When the open segment took its first record. `None` while it is empty,
     /// so an idle collector does not roll empty segments forever.
     active_since: Option<Instant>,
-    acked: u64,
     unsynced: bool,
     stats: QueueStats,
 }
@@ -108,43 +108,39 @@ impl Queue {
         last.bytes = segment::truncate_torn_tail(dir, last.seq)?;
 
         let active = SegmentFile::open_for_append(dir, last.seq)?;
-        // A cursor file that cannot be read takes the sender id with it.
-        // Recovering the id alone would restart the segment numbering under a
-        // name signy already holds a high-water mark for, and every segment
-        // under that mark would be skipped as one it had already stored.
-        let (sender, acked) = match cursor::load(dir)? {
-            Some(committed) => (committed.sender, committed.acked),
+        // An identity file that cannot be read is replaced rather than
+        // repaired. Keeping the name while the segment numbering restarted
+        // would have signy skip every segment under the high-water mark it
+        // still held for that name.
+        let sender = match identity::load(dir)? {
+            Some(sender) => sender,
             None => {
                 let sender = SenderId::generate()?;
-                cursor::store(dir, sender, 0)?;
-                (sender, 0)
+                identity::store(dir, sender)?;
+                sender
             }
         };
 
-        // Anything signy already answered for is dead weight; a crash between
-        // the answer and the unlink leaves it behind.
-        let active_seq = metas.last().expect("just ensured non-empty").seq;
-        let mut kept = VecDeque::new();
-        for meta in metas {
-            if meta.seq <= acked && meta.seq != active_seq {
-                segment::remove(dir, meta.seq)?;
-                continue;
-            }
-            kept.push_back(meta);
-        }
-
-        let queued_bytes = kept.iter().map(|meta| meta.bytes).sum();
-        let active_since = (kept.back().expect("the active segment is kept").bytes > 0)
+        // How far signy has got is not read back from anywhere, because the
+        // files say it: one it has answered for was unlinked on the spot. A
+        // crash between the answer and the unlink leaves a segment behind, and
+        // offering it again costs one request that signy answers unread.
+        let queued_bytes = metas.iter().map(|meta| meta.bytes).sum();
+        let segments: VecDeque<SegmentMeta> = metas.into();
+        let active_since = (segments
+            .back()
+            .expect("a queue always holds its active segment")
+            .bytes
+            > 0)
             .then(Instant::now);
         Ok(Queue {
             dir: dir.to_path_buf(),
             sender,
             limits,
             inner: Mutex::new(Inner {
-                segments: kept,
+                segments,
                 active,
                 active_since,
-                acked,
                 unsynced: false,
                 stats: QueueStats {
                     queued_bytes,
@@ -238,7 +234,8 @@ impl Queue {
         self.roll(&mut inner)
     }
 
-    /// The lowest-numbered closed segment signy has not answered for.
+    /// The lowest-numbered closed segment. Everything on disk is still owed,
+    /// so this is simply the oldest one that is not still being written.
     pub fn oldest_sealed(&self) -> Option<u64> {
         let inner = self.inner.lock();
         let active = inner
@@ -250,7 +247,7 @@ impl Queue {
             .segments
             .iter()
             .map(|meta| meta.seq)
-            .find(|seq| *seq > inner.acked && *seq != active)
+            .find(|seq| *seq != active)
     }
 
     pub fn has_sealed(&self) -> bool {
@@ -311,14 +308,11 @@ impl Queue {
         Ok(sealed)
     }
 
-    /// signy has every segment up to and including this one. Everything at or
-    /// below it can go.
+    /// signy has every segment up to and including this one, so they are
+    /// unlinked. That is the whole of the bookkeeping: nothing is written down
+    /// about how far signy has got, because what is left on disk says it.
     pub fn commit(&self, acked: u64, records: u64) -> io::Result<()> {
         let mut inner = self.inner.lock();
-        if acked <= inner.acked {
-            return Ok(());
-        }
-        inner.acked = acked;
         inner.stats.sent_records += records;
         let active = inner
             .segments
@@ -333,7 +327,6 @@ impl Queue {
             segment::remove(&self.dir, meta.seq)?;
             inner.stats.queued_bytes -= meta.bytes;
         }
-        cursor::store(&self.dir, self.sender, acked)?;
         Ok(())
     }
 
@@ -341,13 +334,8 @@ impl Queue {
         let inner = self.inner.lock();
         QueueStats {
             segments: inner.segments.len(),
-            backlog_bytes: backlog_bytes(&inner),
             ..inner.stats
         }
-    }
-
-    pub fn acked(&self) -> u64 {
-        self.inner.lock().acked
     }
 
     fn roll(&self, inner: &mut Inner) -> io::Result<()> {
@@ -396,15 +384,6 @@ impl Queue {
         inner.stats.dropped_segments += 1;
         Ok(())
     }
-}
-
-fn backlog_bytes(inner: &Inner) -> u64 {
-    inner
-        .segments
-        .iter()
-        .filter(|meta| meta.seq > inner.acked)
-        .map(|meta| meta.bytes)
-        .sum()
 }
 
 fn read_record(file: &mut std::fs::File, remaining: u64) -> io::Result<Option<Vec<u8>>> {

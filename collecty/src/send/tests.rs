@@ -170,9 +170,8 @@ async fn shutdown_stops_a_retry_loop_without_advancing_the_cursor() {
     });
     sender.deliver(segment, &mut rx).await;
 
-    assert_eq!(queue.acked(), 0);
+    assert_eq!(queue.oldest_sealed(), Some(1), "the segment is still owed");
     assert_eq!(sender.stats().sent_records.load(Ordering::Relaxed), 0);
-    assert!(queue.has_sealed());
 }
 
 #[tokio::test(start_paused = true)]
@@ -213,8 +212,7 @@ async fn an_answer_beyond_the_segment_clears_everything_under_it() {
     deliver_all(&sender, &queue).await;
 
     assert_eq!(transport.segments(), vec![1], "the rest were already stored");
-    assert_eq!(queue.acked(), 3);
-    assert!(!queue.has_sealed());
+    assert!(!queue.has_sealed(), "segments two and three went with the answer");
 }
 
 type SeenRequest = (String, String, String, String);

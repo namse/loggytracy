@@ -17,7 +17,6 @@ use crate::send::SenderStats;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Observation {
     pub queued_bytes: u64,
-    pub backlog_bytes: u64,
     pub segments: u64,
     pub appended_records: u64,
     pub appended_bytes: u64,
@@ -43,12 +42,9 @@ struct Family {
 }
 
 const FAMILIES: &[Family] = &[
-    Family {
-        name: "collecty_queue_backlog_bytes",
-        unit: "By",
-        kind: Kind::Gauge,
-        read: |observation| observation.backlog_bytes,
-    },
+    // There is no separate backlog gauge any more. A segment signy has
+    // answered for is unlinked on the spot, so what the queue occupies and
+    // what it still owes are the same number.
     Family {
         name: "collecty_queue_bytes",
         unit: "By",
@@ -136,7 +132,6 @@ impl Reporter {
         let queued = self.queue.stats();
         Observation {
             queued_bytes: queued.queued_bytes,
-            backlog_bytes: queued.backlog_bytes,
             segments: queued.segments as u64,
             appended_records: queued.appended_records,
             appended_bytes: queued.appended_bytes,
@@ -156,7 +151,6 @@ impl Reporter {
 
     pub fn log(&self, observed: &Observation) {
         tracing::info!(
-            backlog_bytes = observed.backlog_bytes,
             queued_bytes = observed.queued_bytes,
             segments = observed.segments,
             appended_records = observed.appended_records,
