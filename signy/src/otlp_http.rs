@@ -212,6 +212,122 @@ pub async fn metrics(
 /// so a collector sees one size whichever transport it picks.
 pub const MAX_OTLP_HTTP_BODY_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
 
+pub const COLLECT_UNCOMPRESSED_BYTES_HEADER: &str = "x-collecty-uncompressed-bytes";
+
+pub const MAX_COLLECT_COMPRESSED_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
+
+pub async fn decompress_collected_body(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let (mut parts, body) = request.into_parts();
+
+    let encoding = parts
+        .headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !encoding.eq_ignore_ascii_case("zstd") {
+        return IngestError::from((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("the collect route takes Content-Encoding: zstd, not {encoding:?}"),
+        ))
+        .into_response();
+    }
+
+    let declared = parts
+        .headers
+        .get(COLLECT_UNCOMPRESSED_BYTES_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(MAX_OTLP_REQUEST_BYTES);
+    if declared > MAX_OTLP_REQUEST_BYTES {
+        return IngestError::from((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "the batch declares {declared} uncompressed bytes, \
+over the maximum of {MAX_OTLP_REQUEST_BYTES}"
+            ),
+        ))
+        .into_response();
+    }
+
+    let _permit = match state.ingest_gate.admit_body(declared as u64) {
+        Ok(permit) => permit,
+        Err(error) => return error.into_response(),
+    };
+
+    let compressed = match axum::body::to_bytes(body, MAX_COLLECT_COMPRESSED_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return IngestError::from((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("the compressed batch could not be read: {error}"),
+            ))
+            .into_response();
+        }
+    };
+
+    let plain = match decompress_batch(&compressed, declared) {
+        Ok(plain) => plain,
+        Err(error) => return error.into_response(),
+    };
+
+    parts.headers.remove(header::CONTENT_ENCODING);
+    parts.headers.remove(COLLECT_UNCOMPRESSED_BYTES_HEADER);
+    parts.headers.insert(
+        header::CONTENT_LENGTH,
+        axum::http::HeaderValue::from(plain.len()),
+    );
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        axum::body::Body::from(plain),
+    ))
+    .await
+}
+
+fn decompress_batch(compressed: &[u8], declared: usize) -> Result<Vec<u8>, IngestError> {
+    use std::io::Read;
+
+    let mut plain = Vec::with_capacity(declared.min(MAX_OTLP_REQUEST_BYTES));
+    let decoder = zstd::stream::read::Decoder::new(compressed).map_err(|error| {
+        IngestError::from((
+            StatusCode::BAD_REQUEST,
+            format!("the batch is not a zstd stream: {error}"),
+        ))
+    })?;
+    decoder
+        .take(MAX_OTLP_REQUEST_BYTES as u64 + 1)
+        .read_to_end(&mut plain)
+        .map_err(|error| {
+            IngestError::from((
+                StatusCode::BAD_REQUEST,
+                format!("the batch could not be decompressed: {error}"),
+            ))
+        })?;
+
+    if plain.len() > MAX_OTLP_REQUEST_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("the batch decompresses past the maximum of {MAX_OTLP_REQUEST_BYTES} bytes"),
+        )
+            .into());
+    }
+    if plain.len() > declared {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the batch declared {declared} uncompressed bytes and produced {}",
+                plain.len()
+            ),
+        )
+            .into());
+    }
+    Ok(plain)
+}
+
 #[cfg(test)]
 mod tests {
     include!("tests/otlp_http.rs");

@@ -16,6 +16,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // the trace routes below are their first-party replacement.
     let router = Router::new()
         .merge(ingest_router(state.clone()))
+        .merge(collect_router(state.clone()))
         .route("/metrics", get(query::metrics))
         .route("/signy/api/v1/logs", get(query::logs))
         .route("/signy/api/v1/logs/histogram", get(query::logs_histogram))
@@ -87,6 +88,18 @@ fn ingest_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .layer(axum::middleware::from_fn_with_state(
             state,
             admit_inflight_body,
+        ))
+}
+
+fn collect_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/signy/api/v1/collect/logs", post(otlp_http::logs))
+        .route("/signy/api/v1/collect/traces", post(otlp_http::traces))
+        .route("/signy/api/v1/collect/metrics", post(otlp_http::metrics))
+        .layer(DefaultBodyLimit::max(otlp_http::MAX_OTLP_HTTP_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            otlp_http::decompress_collected_body,
         ))
 }
 

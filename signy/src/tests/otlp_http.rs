@@ -326,3 +326,169 @@
             1
         );
     }
+
+    fn zstd_frames(bodies: &[Vec<u8>]) -> (Vec<u8>, usize) {
+        let mut frames = Vec::new();
+        let mut plain_bytes = 0;
+        for body in bodies {
+            plain_bytes += body.len();
+            frames.extend_from_slice(&zstd::bulk::compress(body, 3).unwrap());
+        }
+        (frames, plain_bytes)
+    }
+
+    async fn post_collected(
+        state: &Arc<AppState>,
+        uri: &str,
+        encoding: &str,
+        declared: usize,
+        frames: Vec<u8>,
+    ) -> (StatusCode, String) {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/x-protobuf")
+            .header(header::CONTENT_ENCODING, encoding)
+            .header(
+                crate::otlp_http::COLLECT_UNCOMPRESSED_BYTES_HEADER,
+                declared.to_string(),
+            )
+            .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
+            .body(axum::body::Body::from(frames))
+            .unwrap();
+        let response = crate::build_router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn a_collected_batch_of_separate_exports_lands_as_every_line_it_carried() {
+        let (memtable, state) = fixture();
+        let bodies: Vec<Vec<u8>> = ["first", "second", "third"]
+            .iter()
+            .map(|line| log_request(line).encode_to_vec())
+            .collect();
+        let (frames, declared) = zstd_frames(&bodies);
+
+        let (status, body) = post_collected(
+            &state,
+            "/signy/api/v1/collect/logs",
+            "zstd",
+            declared,
+            frames,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut lines = lines(&memtable);
+        lines.sort();
+        assert_eq!(lines, vec!["first", "second", "third"]);
+    }
+
+    #[tokio::test]
+    async fn a_collected_batch_of_spans_reaches_the_trace_memtable() {
+        let (_memtable, state) = fixture();
+        let span = |trace: u8| ExportTraceServiceRequest {
+            resource_spans: vec![opentelemetry_proto::tonic::trace::v1::ResourceSpans {
+                resource: None,
+                scope_spans: vec![opentelemetry_proto::tonic::trace::v1::ScopeSpans {
+                    scope: None,
+                    spans: vec![opentelemetry_proto::tonic::trace::v1::Span {
+                        trace_id: vec![trace; 16],
+                        span_id: vec![trace; 8],
+                        start_time_unix_nano: 10,
+                        end_time_unix_nano: 20,
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let bodies = vec![span(1).encode_to_vec(), span(2).encode_to_vec()];
+        let (frames, declared) = zstd_frames(&bodies);
+
+        let (status, body) = post_collected(
+            &state,
+            "/signy/api/v1/collect/traces",
+            "zstd",
+            declared,
+            frames,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            state
+                .journal
+                .trace_memtable()
+                .snapshot_limited(&test_tenant(), 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_collected_batch_that_is_not_zstd_is_refused_without_writing() {
+        let (memtable, state) = fixture();
+        let body = log_request("never stored").encode_to_vec();
+        let declared = body.len();
+
+        let (status, _) = post_collected(
+            &state,
+            "/signy/api/v1/collect/logs",
+            "gzip",
+            declared,
+            body,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(lines(&memtable).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_batch_declaring_more_than_the_maximum_is_refused_before_it_is_read() {
+        let (memtable, state) = fixture();
+        let bodies = vec![log_request("never stored").encode_to_vec()];
+        let (frames, _) = zstd_frames(&bodies);
+
+        let (status, _) = post_collected(
+            &state,
+            "/signy/api/v1/collect/logs",
+            "zstd",
+            crate::trace_ingest::MAX_OTLP_REQUEST_BYTES + 1,
+            frames,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(lines(&memtable).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_decompresses_past_what_it_declared_is_refused() {
+        let (memtable, state) = fixture();
+        let bodies = vec![log_request("never stored").encode_to_vec()];
+        let (frames, declared) = zstd_frames(&bodies);
+
+        let (status, body) = post_collected(
+            &state,
+            "/signy/api/v1/collect/logs",
+            "zstd",
+            declared / 2,
+            frames,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("declared"), "{body}");
+        assert!(lines(&memtable).is_empty());
+    }
