@@ -121,8 +121,20 @@ impl Journal {
         data: Vec<u8>,
         entries: Vec<LogEntry>,
     ) -> Result<(), IoError> {
+        self.enqueue_otlp_logs(tenant, data, entries)
+            .await?
+            .settle()
+            .await
+    }
+
+    pub async fn enqueue_otlp_logs(
+        &self,
+        tenant: TenantId,
+        data: Vec<u8>,
+        entries: Vec<LogEntry>,
+    ) -> Result<PendingAppend, IoError> {
         let payload = compress_payload(&data)?;
-        self.send_append(
+        self.enqueue_append(
             TENANT_RECORD_KIND_OTLP_LOGS,
             payload,
             tenant,
@@ -139,8 +151,17 @@ impl Journal {
         data: Vec<u8>,
         spans: Vec<TraceSpan>,
     ) -> Result<(), IoError> {
+        self.enqueue_trace(tenant, data, spans).await?.settle().await
+    }
+
+    pub async fn enqueue_trace(
+        &self,
+        tenant: TenantId,
+        data: Vec<u8>,
+        spans: Vec<TraceSpan>,
+    ) -> Result<PendingAppend, IoError> {
         let payload = compress_payload(&data)?;
-        self.send_append(
+        self.enqueue_append(
             TENANT_RECORD_KIND_TRACES,
             payload,
             tenant,
@@ -162,8 +183,20 @@ impl Journal {
         data: Vec<u8>,
         samples: Vec<MetricSample>,
     ) -> Result<(), IoError> {
+        self.enqueue_metrics(tenant, data, samples)
+            .await?
+            .settle()
+            .await
+    }
+
+    pub async fn enqueue_metrics(
+        &self,
+        tenant: TenantId,
+        data: Vec<u8>,
+        samples: Vec<MetricSample>,
+    ) -> Result<PendingAppend, IoError> {
         let payload = compress_payload(&data)?;
-        self.send_append(
+        self.enqueue_append(
             TENANT_RECORD_KIND_OTLP_METRICS,
             payload,
             tenant,
@@ -174,7 +207,7 @@ impl Journal {
         .await
     }
 
-    async fn send_append(
+    async fn enqueue_append(
         &self,
         kind: u8,
         payload: Vec<u8>,
@@ -182,7 +215,7 @@ impl Journal {
         entries: Vec<LogEntry>,
         traces: Vec<TraceSpan>,
         metric_samples: Vec<MetricSample>,
-    ) -> Result<(), IoError> {
+    ) -> Result<PendingAppend, IoError> {
         let framed_len =
             TENANT_RECORD_PREFIX_SIZE + tenant.as_str().len() + payload.len();
         if framed_len > MAX_RECORD_BYTES {
@@ -211,13 +244,7 @@ impl Journal {
             })
             .await
             .map_err(|_| IoError::new(std::io::ErrorKind::BrokenPipe, "journal writer closed"))?;
-        match done_rx.await {
-            Ok(result) => result,
-            Err(_) => Err(IoError::new(
-                std::io::ErrorKind::BrokenPipe,
-                "journal writer dropped",
-            )),
-        }
+        Ok(PendingAppend(done_rx))
     }
 
     pub fn trace_memtable(&self) -> Arc<TraceMemTable> {

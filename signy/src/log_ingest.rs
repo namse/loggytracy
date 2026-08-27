@@ -134,6 +134,23 @@ impl OtlpLogIngest<'_> {
         request: ExportLogsServiceRequest,
         wire: Option<Vec<u8>>,
     ) -> Result<(), IngestError> {
+        self.enqueue(tenant, request, wire)
+            .await?
+            .settle()
+            .await
+            .map_err(journal_write_failed)
+    }
+
+    /// The same admission and normalization, stopping at the point the writer
+    /// has the record and has not yet fsynced it. A caller with a run of
+    /// records to write hands them over back to back and awaits them
+    /// afterwards, so one fsync covers the run instead of one each.
+    pub async fn enqueue(
+        &self,
+        tenant: crate::tenant::TenantId,
+        request: ExportLogsServiceRequest,
+        wire: Option<Vec<u8>>,
+    ) -> Result<crate::journal::PendingAppend, IngestError> {
         let record_count = request
             .resource_logs
             .iter()
@@ -191,16 +208,18 @@ impl OtlpLogIngest<'_> {
         // invariant II's copy count. Replay decodes by the record's kind
         // instead, the way traces always have.
         self.journal
-            .append_otlp_logs(tenant, encoded, entries)
+            .enqueue_otlp_logs(tenant, encoded, entries)
             .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("journal write failed: {error}"),
-                )
-            })?;
-        Ok(())
+            .map_err(journal_write_failed)
     }
+}
+
+pub fn journal_write_failed(error: std::io::Error) -> IngestError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("journal write failed: {error}"),
+    )
+        .into()
 }
 
 /// An HTTP-shaped refusal, spelled for a gRPC client.

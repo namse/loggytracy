@@ -16,7 +16,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // the trace routes below are their first-party replacement.
     let router = Router::new()
         .merge(ingest_router(state.clone()))
-        .merge(collect_router(state.clone()))
+        .merge(collect_router())
         .route("/metrics", get(query::metrics))
         .route("/signy/api/v1/logs", get(query::logs))
         .route("/signy/api/v1/logs/histogram", get(query::logs_histogram))
@@ -91,14 +91,17 @@ fn ingest_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         ))
 }
 
-fn collect_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
+/// The collect route, with no body limit at all.
+///
+/// The handler reads the body as it arrives and holds one record, so there is
+/// nothing here for a limit to protect: what a batch may contain is bounded
+/// per record, inside the handler, and how large a batch may be is collecty's
+/// decision. A `DefaultBodyLimit` would put that decision back here, and put
+/// it back as a number nothing on the collector's side can see.
+fn collect_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/signy/api/v1/collect", post(otlp_http::collect))
-        .layer(DefaultBodyLimit::max(otlp_http::MAX_COLLECT_PLAIN_BYTES))
-        .layer(axum::middleware::from_fn_with_state(
-            state,
-            otlp_http::decompress_collected_body,
-        ))
+        .layer(DefaultBodyLimit::disable())
 }
 
 /// Charge a push against the in-flight body ceiling for as long as it runs.

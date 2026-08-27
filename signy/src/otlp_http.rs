@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -15,8 +17,11 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 };
 use prost014::Message;
 
+use futures_util::StreamExt;
+
 use crate::AppState;
-use crate::backpressure::IngestError;
+use crate::backpressure::{IngestError, InflightBody};
+use crate::journal::PendingAppend;
 use crate::log_ingest::OtlpLogIngest;
 use crate::series_ingest::OtlpMetricIngest;
 use crate::trace_ingest::{MAX_OTLP_REQUEST_BYTES, OtlpTraceIngest};
@@ -212,23 +217,39 @@ pub async fn metrics(
 /// so a collector sees one size whichever transport it picks.
 pub const MAX_OTLP_HTTP_BODY_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
 
-pub const COLLECT_UNCOMPRESSED_BYTES_HEADER: &str = "x-collecty-uncompressed-bytes";
-
-pub const MAX_COLLECT_COMPRESSED_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
-
 /// The header collecty writes in front of each record's payload: one signal
 /// tag and the payload's length, little-endian.
 const COLLECT_RECORD_HEADER_BYTES: usize = 5;
 
-/// Ceiling on a collected batch's *decompressed* size.
+/// The one ceiling the collect route still has: a single record's payload,
+/// which is one OTLP export and is bounded exactly as one is on the push
+/// routes.
 ///
-/// A batch of n records decompresses to `5n + Σ payload`, so allowing the
-/// framing of a single record on top of the request maximum is what keeps a
-/// maximal export shippable — and it is also all that can be allowed: any
-/// batch under this ceiling has every signal's merged payload at or under
-/// `MAX_OTLP_REQUEST_BYTES`, so no group can be built that the ingest path
-/// would then refuse as too large.
-pub const MAX_COLLECT_PLAIN_BYTES: usize = MAX_OTLP_REQUEST_BYTES + COLLECT_RECORD_HEADER_BYTES;
+/// The batch around it has no ceiling any more. The body is decompressed and
+/// ingested as it arrives, so what this server holds at any moment is one
+/// record and the handful behind it still waiting on an fsync — not the batch.
+/// How much a collecty ships in one request is now its own decision, made on
+/// how long it is willing to wait for an answer, rather than on what this
+/// route would agree to hold in memory.
+pub const MAX_COLLECT_RECORD_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
+
+/// Records handed to the journal writer and not yet fsynced.
+///
+/// Awaiting each record before reading the next would put a whole fsync round
+/// trip between one record and the next, and a batch of a thousand would pay a
+/// thousand of them. The writer already groups whatever is in its channel into
+/// one write and one `sync_all`, so handing records over back to back is what
+/// lets a batch share fsyncs the way the merged path used to. The bound is
+/// what stops a long stream from holding an unbounded number of decoded
+/// exports.
+const MAX_INFLIGHT_RECORDS: usize = 32;
+
+/// Compressed bytes fed to the decoder before its output is drained.
+///
+/// Small on purpose: a decoder handed a whole chunk at once can produce every
+/// record in it before any is taken away, and the point of reading this way is
+/// that the server never holds the batch.
+const DECODER_FEED_BYTES: usize = 16 * 1024;
 
 /// The signals a collected batch may carry, in the order they are ingested.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -239,12 +260,6 @@ enum CollectSignal {
 }
 
 impl CollectSignal {
-    const ALL: [CollectSignal; 3] = [
-        CollectSignal::Logs,
-        CollectSignal::Traces,
-        CollectSignal::Metrics,
-    ];
-
     fn from_tag(tag: u8) -> Option<CollectSignal> {
         match tag {
             1 => Some(CollectSignal::Logs),
@@ -261,27 +276,19 @@ impl CollectSignal {
             CollectSignal::Metrics => "metrics",
         }
     }
-
-    fn index(self) -> usize {
-        match self {
-            CollectSignal::Logs => 0,
-            CollectSignal::Traces => 1,
-            CollectSignal::Metrics => 2,
-        }
-    }
 }
 
-/// One collected batch, every signal.
+/// One collected batch, every signal, read as it arrives.
 ///
 /// collecty keeps a single queue, so what arrives here is a mix: records in
-/// arrival order, each naming its signal. Records of one signal concatenate
-/// into that signal's merged export, exactly as they did when each signal had
-/// a route of its own, so this walks the batch once and hands each signal's
-/// bytes to the ingest path it already had.
+/// arrival order, each naming its signal, each its own zstd frame. Every
+/// record is a complete export on its own, which is what makes reading the
+/// body a record at a time possible at all — nothing has to be held back
+/// waiting for a later part of the batch to make sense of it.
 pub async fn collect(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Result<Response, IngestError> {
     // Ahead of the request counter, and once for the whole batch: the checks
     // behind it are the instance's, not a signal's, so a fenced or overloaded
@@ -291,7 +298,7 @@ pub async fn collect(
         .metrics
         .ingest_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let result = collect_inner(&state, &headers, &body).await;
+    let result = collect_inner(&state, &headers, body).await;
     if result.is_err() {
         state
             .metrics
@@ -304,59 +311,128 @@ pub async fn collect(
 async fn collect_inner(
     state: &Arc<AppState>,
     headers: &HeaderMap,
-    body: &Bytes,
+    body: axum::body::Body,
 ) -> Result<Response, IngestError> {
-    let mut payloads: [Vec<u8>; 3] = Default::default();
-    let mut records = [0u64; 3];
-    for (signal, payload) in split_collected_records(body)? {
-        payloads[signal.index()].extend_from_slice(payload);
-        records[signal.index()] += 1;
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !encoding.eq_ignore_ascii_case("zstd") {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("the collect route takes Content-Encoding: zstd, not {encoding:?}"),
+        )
+            .into());
     }
 
-    for signal in CollectSignal::ALL {
-        let payload = std::mem::take(&mut payloads[signal.index()]);
-        if payload.is_empty() {
-            continue;
+    // Resolved once and carried as a result: a tenant this instance does not
+    // serve is a per-record refusal like any other, and the loop below already
+    // knows what to do with one.
+    let tenant = crate::tenant::from_headers(headers, &state.config, &state.tenant_policy)
+        .map_err(crate::tenant::TenantError::into_http);
+
+    let mut records = CollectedRecords::new(body)?;
+    let mut inflight: VecDeque<(InflightBody, PendingAppend)> = VecDeque::new();
+
+    while let Some((signal, payload)) = records.next().await? {
+        while inflight.len() >= MAX_INFLIGHT_RECORDS {
+            settle_oldest(&mut inflight).await?;
         }
         let bytes = payload.len();
-        let outcome = match signal {
-            CollectSignal::Logs => collect_logs(state, headers, payload).await,
-            CollectSignal::Traces => collect_traces(state, headers, payload).await,
-            CollectSignal::Metrics => collect_metrics(state, headers, payload).await,
-        };
-        match outcome {
-            Ok(()) => {}
+        let permit = admit_record(state, &mut inflight, bytes as u64).await?;
+        match enqueue_record(state, &tenant, signal, payload).await {
+            Ok(pending) => inflight.push_back((permit, pending)),
             // Permanent: a decode failure, a body past a limit, a tenant over
-            // what it stores. Sending these back would only have collecty halve
-            // the batch to find them and drop them anyway, one wasted round
-            // trip at a time, so they are dropped here and counted.
+            // what it stores. Sending these back would only have collecty
+            // halve the batch to find them and drop them anyway, one wasted
+            // round trip at a time, so they are dropped here and counted.
             Err(error) if never_acceptable(error.status) => {
                 tracing::warn!(
                     signal = signal.as_str(),
                     status = error.status.as_u16(),
-                    records = records[signal.index()],
                     bytes,
                     reason = error.message,
-                    "dropping collected records signy will not take"
+                    "dropping a collected record signy will not take"
                 );
-                state.metrics.collect_dropped_records.fetch_add(
-                    records[signal.index()],
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                state
+                    .metrics
+                    .collect_dropped_records
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 state
                     .metrics
                     .collect_dropped_bytes
                     .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
             }
-            // Everything else is this instance's problem, not the batch's — it
-            // is behind, draining, or configured against the tenant that sent
-            // this. Answering with it stops the batch here and collecty holds
-            // the whole thing until the answer changes.
+            // Everything else is this instance's problem, not the record's —
+            // it is behind, draining, or configured against the tenant that
+            // sent this. Answering with it stops the batch here, and whatever
+            // is already durable stays durable.
             Err(error) => return Err(error),
         }
     }
 
+    while !inflight.is_empty() {
+        settle_oldest(&mut inflight).await?;
+    }
+
     Ok(StatusCode::OK.into_response())
+}
+
+/// Charge one record against the in-flight ceiling, waiting on this batch's
+/// own records before deciding the server is full.
+///
+/// The gate refuses rather than queues, and a long stream is its own biggest
+/// contributor: without this it would eventually refuse itself while holding
+/// everything it had admitted. Draining one record frees its charge, so the
+/// batch throttles itself down to whatever the ceiling allows instead of
+/// answering an overload it caused.
+async fn admit_record(
+    state: &Arc<AppState>,
+    inflight: &mut VecDeque<(InflightBody, PendingAppend)>,
+    bytes: u64,
+) -> Result<InflightBody, IngestError> {
+    loop {
+        match state.ingest_gate.admit_body(bytes) {
+            Ok(permit) => return Ok(permit),
+            Err(error) => {
+                if inflight.is_empty() {
+                    return Err(error);
+                }
+                settle_oldest(inflight).await?;
+            }
+        }
+    }
+}
+
+async fn settle_oldest(
+    inflight: &mut VecDeque<(InflightBody, PendingAppend)>,
+) -> Result<(), IngestError> {
+    let Some((permit, pending)) = inflight.pop_front() else {
+        return Ok(());
+    };
+    let settled = pending
+        .settle()
+        .await
+        .map_err(crate::log_ingest::journal_write_failed);
+    drop(permit);
+    settled
+}
+
+async fn enqueue_record(
+    state: &Arc<AppState>,
+    tenant: &Result<crate::tenant::TenantId, (StatusCode, String)>,
+    signal: CollectSignal,
+    payload: Vec<u8>,
+) -> Result<PendingAppend, IngestError> {
+    let tenant = match tenant {
+        Ok(tenant) => tenant.clone(),
+        Err((status, message)) => return Err((*status, message.clone()).into()),
+    };
+    match signal {
+        CollectSignal::Logs => collect_logs(state, tenant, payload).await,
+        CollectSignal::Traces => collect_traces(state, tenant, payload).await,
+        CollectSignal::Metrics => collect_metrics(state, tenant, payload).await,
+    }
 }
 
 /// Whether an answer means "not this body, however long it waits", so that
@@ -383,43 +459,136 @@ fn never_acceptable(status: StatusCode) -> bool {
     status.is_client_error()
 }
 
-fn split_collected_records(body: &[u8]) -> Result<Vec<(CollectSignal, &[u8])>, IngestError> {
-    let mut records = Vec::new();
-    let mut at = 0;
-    while at < body.len() {
-        let Some(header) = body.get(at..at + COLLECT_RECORD_HEADER_BYTES) else {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "a record header needs {COLLECT_RECORD_HEADER_BYTES} bytes and {} are left",
-                    body.len() - at
-                ),
-            )
-                .into());
-        };
-        let Some(signal) = CollectSignal::from_tag(header[0]) else {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("{} is not a signal tag", header[0]),
-            )
-                .into());
-        };
-        let len = u32::from_le_bytes(header[1..5].try_into().expect("four bytes")) as usize;
-        at += COLLECT_RECORD_HEADER_BYTES;
-        let Some(payload) = body.get(at..at + len) else {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "a record claims {len} bytes and {} are left",
-                    body.len() - at
-                ),
-            )
-                .into());
-        };
-        at += len;
-        records.push((signal, payload));
+/// The batch's records, handed out as the socket produces them.
+///
+/// Two layers unwrap here, neither of which needs the whole body. The frames
+/// are decompressed into whatever the decoder has been able to produce, and
+/// the plain bytes behind them are `tag | length | payload` repeated, so a
+/// record can be taken as soon as its last byte has arrived. What is buffered
+/// is one record at most.
+struct CollectedRecords {
+    body: axum::body::BodyDataStream,
+    decoder: zstd::stream::write::Decoder<'static, Vec<u8>>,
+    pending: Bytes,
+    ended: bool,
+}
+
+impl CollectedRecords {
+    fn new(body: axum::body::Body) -> Result<CollectedRecords, IngestError> {
+        let decoder = zstd::stream::write::Decoder::new(Vec::new()).map_err(|error| {
+            IngestError::from((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("a zstd decoder could not be made: {error}"),
+            ))
+        })?;
+        Ok(CollectedRecords {
+            body: body.into_data_stream(),
+            decoder,
+            pending: Bytes::new(),
+            ended: false,
+        })
     }
-    Ok(records)
+
+    async fn next(&mut self) -> Result<Option<(CollectSignal, Vec<u8>)>, IngestError> {
+        loop {
+            if let Some(record) = self.take()? {
+                return Ok(Some(record));
+            }
+            if !self.pending.is_empty() {
+                let take = self.pending.len().min(DECODER_FEED_BYTES);
+                let chunk = self.pending.split_to(take);
+                self.decoder.write_all(&chunk).map_err(|error| {
+                    IngestError::from((
+                        StatusCode::BAD_REQUEST,
+                        format!("the batch could not be decompressed: {error}"),
+                    ))
+                })?;
+                continue;
+            }
+            if self.ended {
+                let left = self.decoder.get_ref().len();
+                if left == 0 {
+                    return Ok(None);
+                }
+                return Err(self.truncated(left));
+            }
+            match self.body.next().await {
+                Some(Ok(chunk)) => self.pending = chunk,
+                Some(Err(error)) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("the batch stopped arriving: {error}"),
+                    )
+                        .into());
+                }
+                None => {
+                    self.ended = true;
+                    self.decoder.flush().map_err(|error| {
+                        IngestError::from((
+                            StatusCode::BAD_REQUEST,
+                            format!("the batch could not be decompressed: {error}"),
+                        ))
+                    })?;
+                }
+            }
+        }
+    }
+
+    /// The record at the front of the decoded bytes, if all of it has arrived.
+    fn take(&mut self) -> Result<Option<(CollectSignal, Vec<u8>)>, IngestError> {
+        let plain = self.decoder.get_ref();
+        if plain.len() < COLLECT_RECORD_HEADER_BYTES {
+            return Ok(None);
+        }
+        let Some(signal) = CollectSignal::from_tag(plain[0]) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{} is not a signal tag", plain[0]),
+            )
+                .into());
+        };
+        let len = u32::from_le_bytes(plain[1..5].try_into().expect("four bytes")) as usize;
+        // Checked before the bytes are waited for, not after they arrive: the
+        // length is what says how much to buffer, so trusting it first is what
+        // an unbounded buffer would look like.
+        if len > MAX_COLLECT_RECORD_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "a record claims {len} bytes, over the maximum of {MAX_COLLECT_RECORD_BYTES}"
+                ),
+            )
+                .into());
+        }
+        let record_end = COLLECT_RECORD_HEADER_BYTES + len;
+        if plain.len() < record_end {
+            return Ok(None);
+        }
+        let plain = self.decoder.get_mut();
+        let payload = plain[COLLECT_RECORD_HEADER_BYTES..record_end].to_vec();
+        plain.drain(..record_end);
+        Ok(Some((signal, payload)))
+    }
+
+    fn truncated(&self, left: usize) -> IngestError {
+        let plain = self.decoder.get_ref();
+        if left < COLLECT_RECORD_HEADER_BYTES {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("a record header needs {COLLECT_RECORD_HEADER_BYTES} bytes and {left} are left"),
+            )
+                .into();
+        }
+        let len = u32::from_le_bytes(plain[1..5].try_into().expect("four bytes"));
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "a record claims {len} bytes and {} are left",
+                left - COLLECT_RECORD_HEADER_BYTES
+            ),
+        )
+            .into()
+    }
 }
 
 fn log_ingest(state: &Arc<AppState>) -> OtlpLogIngest<'_> {
@@ -435,12 +604,10 @@ fn log_ingest(state: &Arc<AppState>) -> OtlpLogIngest<'_> {
 
 async fn collect_logs(
     state: &Arc<AppState>,
-    headers: &HeaderMap,
+    tenant: crate::tenant::TenantId,
     payload: Vec<u8>,
-) -> Result<(), IngestError> {
+) -> Result<PendingAppend, IngestError> {
     let ingest = log_ingest(state);
-    let tenant = crate::tenant::from_headers(headers, &state.config, &state.tenant_policy)
-        .map_err(crate::tenant::TenantError::into_http)?;
     ingest.admit_tenant(&tenant, payload.len())?;
     let request = ExportLogsServiceRequest::decode(payload.as_slice()).map_err(|error| {
         IngestError::from((
@@ -448,22 +615,20 @@ async fn collect_logs(
             format!("OTLP protobuf decode failed: {error}"),
         ))
     })?;
-    ingest.accept(tenant, request, Some(payload)).await
+    ingest.enqueue(tenant, request, Some(payload)).await
 }
 
 async fn collect_traces(
     state: &Arc<AppState>,
-    headers: &HeaderMap,
+    tenant: crate::tenant::TenantId,
     payload: Vec<u8>,
-) -> Result<(), IngestError> {
+) -> Result<PendingAppend, IngestError> {
     let ingest = OtlpTraceIngest {
         journal: &state.journal,
         shutdown: &state.shutdown,
         ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
     };
-    let tenant = crate::tenant::from_headers(headers, &state.config, &state.tenant_policy)
-        .map_err(crate::tenant::TenantError::into_http)?;
     ingest.admit_tenant(&tenant, payload.len())?;
     let request = ExportTraceServiceRequest::decode(payload.as_slice()).map_err(|error| {
         IngestError::from((
@@ -471,14 +636,14 @@ async fn collect_traces(
             format!("OTLP protobuf decode failed: {error}"),
         ))
     })?;
-    ingest.accept(tenant, request).await
+    ingest.enqueue(tenant, request).await
 }
 
 async fn collect_metrics(
     state: &Arc<AppState>,
-    headers: &HeaderMap,
+    tenant: crate::tenant::TenantId,
     payload: Vec<u8>,
-) -> Result<(), IngestError> {
+) -> Result<PendingAppend, IngestError> {
     let ingest = OtlpMetricIngest {
         journal: &state.journal,
         shutdown: &state.shutdown,
@@ -487,8 +652,6 @@ async fn collect_metrics(
         tenant_quota: &state.tenant_quota,
         clock: &state.clock,
     };
-    let tenant = crate::tenant::from_headers(headers, &state.config, &state.tenant_policy)
-        .map_err(crate::tenant::TenantError::into_http)?;
     ingest.admit_tenant(&tenant, payload.len())?;
     let request = ExportMetricsServiceRequest::decode(payload.as_slice()).map_err(|error| {
         IngestError::from((
@@ -496,7 +659,7 @@ async fn collect_metrics(
             format!("OTLP protobuf decode failed: {error}"),
         ))
     })?;
-    let outcome = ingest.accept(tenant, request).await?;
+    let (pending, outcome) = ingest.enqueue(tenant, request).await?;
     // The collect route answers a bare 200 — collecty reads the status and
     // nothing else — so a partial refusal has only the log to land in.
     if let Some(partial) = outcome.partial_success() {
@@ -506,119 +669,7 @@ async fn collect_metrics(
             "collected metrics were partially refused"
         );
     }
-    Ok(())
-}
-
-pub async fn decompress_collected_body(
-    State(state): State<Arc<AppState>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let (mut parts, body) = request.into_parts();
-
-    let encoding = parts
-        .headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    if !encoding.eq_ignore_ascii_case("zstd") {
-        return IngestError::from((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            format!("the collect route takes Content-Encoding: zstd, not {encoding:?}"),
-        ))
-        .into_response();
-    }
-
-    let declared = parts
-        .headers
-        .get(COLLECT_UNCOMPRESSED_BYTES_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(MAX_COLLECT_PLAIN_BYTES);
-    if declared > MAX_COLLECT_PLAIN_BYTES {
-        return IngestError::from((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "the batch declares {declared} uncompressed bytes, \
-over the maximum of {MAX_COLLECT_PLAIN_BYTES}"
-            ),
-        ))
-        .into_response();
-    }
-
-    let _permit = match state.ingest_gate.admit_body(declared as u64) {
-        Ok(permit) => permit,
-        Err(error) => return error.into_response(),
-    };
-
-    let compressed = match axum::body::to_bytes(body, MAX_COLLECT_COMPRESSED_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return IngestError::from((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("the compressed batch could not be read: {error}"),
-            ))
-            .into_response();
-        }
-    };
-
-    let plain = match decompress_batch(&compressed, declared) {
-        Ok(plain) => plain,
-        Err(error) => return error.into_response(),
-    };
-
-    parts.headers.remove(header::CONTENT_ENCODING);
-    parts.headers.remove(COLLECT_UNCOMPRESSED_BYTES_HEADER);
-    parts.headers.insert(
-        header::CONTENT_LENGTH,
-        axum::http::HeaderValue::from(plain.len()),
-    );
-    next.run(axum::extract::Request::from_parts(
-        parts,
-        axum::body::Body::from(plain),
-    ))
-    .await
-}
-
-fn decompress_batch(compressed: &[u8], declared: usize) -> Result<Vec<u8>, IngestError> {
-    use std::io::Read;
-
-    let mut plain = Vec::with_capacity(declared.min(MAX_COLLECT_PLAIN_BYTES));
-    let decoder = zstd::stream::read::Decoder::new(compressed).map_err(|error| {
-        IngestError::from((
-            StatusCode::BAD_REQUEST,
-            format!("the batch is not a zstd stream: {error}"),
-        ))
-    })?;
-    decoder
-        .take(MAX_COLLECT_PLAIN_BYTES as u64 + 1)
-        .read_to_end(&mut plain)
-        .map_err(|error| {
-            IngestError::from((
-                StatusCode::BAD_REQUEST,
-                format!("the batch could not be decompressed: {error}"),
-            ))
-        })?;
-
-    if plain.len() > MAX_COLLECT_PLAIN_BYTES {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("the batch decompresses past the maximum of {MAX_COLLECT_PLAIN_BYTES} bytes"),
-        )
-            .into());
-    }
-    if plain.len() > declared {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "the batch declared {declared} uncompressed bytes and produced {}",
-                plain.len()
-            ),
-        )
-            .into());
-    }
-    Ok(plain)
+    Ok(pending)
 }
 
 #[cfg(test)]

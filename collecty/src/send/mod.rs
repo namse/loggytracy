@@ -32,7 +32,6 @@ pub enum Outcome {
 /// `i` of the body is `start_sequence + i`.
 pub struct Shipment {
     pub frames: Bytes,
-    pub plain_bytes: usize,
     pub sender: SenderId,
     pub start_sequence: u64,
 }
@@ -150,7 +149,6 @@ impl<T: Transport> Sender<T> {
 
                 let shipment = Shipment {
                     frames: frames.slice(span.clone()),
-                    plain_bytes,
                     sender: self.queue.sender_id(),
                     start_sequence: records[from].end.sequence,
                 };

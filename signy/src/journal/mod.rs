@@ -74,6 +74,26 @@ fn take_compaction_fault(wal_path: &Path, fault: CompactionFault) -> bool {
     true
 }
 
+/// An append the writer has taken and not yet made durable.
+///
+/// Handed back so a caller with more than one record to write can keep them
+/// moving instead of paying a whole fsync round trip each. The commands reach
+/// the writer in the order they were sent, and a batch is written or not at
+/// all, so awaiting these in the same order walks the durable prefix.
+pub struct PendingAppend(oneshot::Receiver<Result<(), IoError>>);
+
+impl PendingAppend {
+    pub async fn settle(self) -> Result<(), IoError> {
+        match self.0.await {
+            Ok(result) => result,
+            Err(_) => Err(IoError::new(
+                std::io::ErrorKind::BrokenPipe,
+                "journal writer dropped",
+            )),
+        }
+    }
+}
+
 pub struct CheckpointSnapshot {
     pub offset: u64,
     pub snapshot: Arc<MemTableSnapshot>,

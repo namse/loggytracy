@@ -43,10 +43,9 @@ impl Transport for Scripted {
     }
 }
 
-fn shipment(frames: &'static [u8], plain_bytes: usize) -> Shipment {
+fn shipment(frames: &'static [u8]) -> Shipment {
     Shipment {
         frames: Bytes::from_static(frames),
-        plain_bytes,
         sender: crate::queue::SenderId::generate().expect("an id"),
         start_sequence: 1,
     }
@@ -195,7 +194,7 @@ async fn the_run_loop_delivers_what_arrives_and_stops_on_shutdown() {
     assert!(!queue.has_records());
 }
 
-type SeenRequest = (String, String, String, String, String);
+type SeenRequest = (String, String, String, String);
 
 async fn fake_signy(
     status: http::StatusCode,
@@ -228,7 +227,6 @@ async fn fake_signy(
                             seen.lock().push((
                                 request.uri().path().to_string(),
                                 header("content-encoding"),
-                                header(super::transport::UNCOMPRESSED_BYTES_HEADER),
                                 header(super::transport::SENDER_HEADER),
                                 header(super::transport::START_SEQUENCE_HEADER),
                             ));
@@ -249,11 +247,11 @@ async fn fake_signy(
 }
 
 #[tokio::test]
-async fn a_success_over_http_carries_the_encoding_the_size_and_who_sent_it() {
+async fn a_success_over_http_carries_the_encoding_and_who_sent_it() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let address = fake_signy(http::StatusCode::NO_CONTENT, seen.clone()).await;
     let transport = HttpTransport::new(format!("http://{address}"), Duration::from_secs(5));
-    let mut shipment = shipment(b"frames", 4096);
+    let mut shipment = shipment(b"frames");
     shipment.start_sequence = 91;
     let sender = shipment.sender.to_string();
 
@@ -265,7 +263,6 @@ async fn a_success_over_http_carries_the_encoding_the_size_and_who_sent_it() {
         [(
             "/signy/api/v1/collect".to_string(),
             "zstd".to_string(),
-            "4096".to_string(),
             sender,
             "91".to_string()
         )]
@@ -280,7 +277,7 @@ async fn a_bad_request_refuses_the_payload_and_a_server_error_asks_for_a_retry()
     )
     .await;
     let transport = HttpTransport::new(format!("http://{refusing}"), Duration::from_secs(5));
-    let outcome = transport.deliver(shipment(b"frames", 1)).await;
+    let outcome = transport.deliver(shipment(b"frames")).await;
     assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
 
     let unavailable = fake_signy(
@@ -289,7 +286,7 @@ async fn a_bad_request_refuses_the_payload_and_a_server_error_asks_for_a_retry()
     )
     .await;
     let transport = HttpTransport::new(format!("http://{unavailable}"), Duration::from_secs(5));
-    let outcome = transport.deliver(shipment(b"frames", 1)).await;
+    let outcome = transport.deliver(shipment(b"frames")).await;
     assert!(matches!(outcome, Outcome::Retry(_)), "{outcome:?}");
 }
 
@@ -302,7 +299,7 @@ async fn a_refused_connection_asks_for_a_retry_rather_than_dropping() {
     drop(listener);
 
     let transport = HttpTransport::new(format!("http://{address}"), Duration::from_secs(5));
-    let outcome = transport.deliver(shipment(b"frames", 1)).await;
+    let outcome = transport.deliver(shipment(b"frames")).await;
 
     assert!(matches!(outcome, Outcome::Retry(_)), "{outcome:?}");
 }

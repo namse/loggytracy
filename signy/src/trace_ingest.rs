@@ -103,6 +103,18 @@ impl OtlpTraceIngest<'_> {
         tenant: crate::tenant::TenantId,
         request: ExportTraceServiceRequest,
     ) -> Result<(), IngestError> {
+        self.enqueue(tenant, request)
+            .await?
+            .settle()
+            .await
+            .map_err(crate::log_ingest::journal_write_failed)
+    }
+
+    pub async fn enqueue(
+        &self,
+        tenant: crate::tenant::TenantId,
+        request: ExportTraceServiceRequest,
+    ) -> Result<crate::journal::PendingAppend, IngestError> {
         let span_count = request
             .resource_spans
             .iter()
@@ -132,15 +144,9 @@ impl OtlpTraceIngest<'_> {
             )
         })?;
         self.journal
-            .append_trace(tenant, encoded, spans)
+            .enqueue_trace(tenant, encoded, spans)
             .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("journal write failed: {error}"),
-                )
-            })?;
-        Ok(())
+            .map_err(crate::log_ingest::journal_write_failed)
     }
 }
 

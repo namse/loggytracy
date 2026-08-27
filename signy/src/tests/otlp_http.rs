@@ -361,34 +361,30 @@
 
     /// The batch collecty ships: each payload behind its own record header,
     /// each record its own zstd frame, all of it concatenated.
-    fn zstd_frames(records: &[(u8, Vec<u8>)]) -> (Vec<u8>, usize) {
+    fn zstd_frames(records: &[(u8, Vec<u8>)]) -> Vec<u8> {
         let mut frames = Vec::new();
-        let mut plain_bytes = 0;
         for (tag, payload) in records {
             let mut plain = Vec::with_capacity(5 + payload.len());
             plain.push(*tag);
             plain.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             plain.extend_from_slice(payload);
-            plain_bytes += plain.len();
             frames.extend_from_slice(&zstd::bulk::compress(&plain, 3).unwrap());
         }
-        (frames, plain_bytes)
+        frames
     }
 
     async fn post_collected(
         state: &Arc<AppState>,
         encoding: &str,
-        declared: usize,
         frames: Vec<u8>,
     ) -> (StatusCode, String) {
-        post_collected_as(state, test_tenant().as_str(), encoding, declared, frames).await
+        post_collected_as(state, test_tenant().as_str(), encoding, frames).await
     }
 
     async fn post_collected_as(
         state: &Arc<AppState>,
         tenant: &str,
         encoding: &str,
-        declared: usize,
         frames: Vec<u8>,
     ) -> (StatusCode, String) {
         let request = axum::http::Request::builder()
@@ -396,10 +392,6 @@
             .uri("/signy/api/v1/collect")
             .header(header::CONTENT_TYPE, "application/x-protobuf")
             .header(header::CONTENT_ENCODING, encoding)
-            .header(
-                crate::otlp_http::COLLECT_UNCOMPRESSED_BYTES_HEADER,
-                declared.to_string(),
-            )
             .header(crate::tenant::TENANT_HEADER, tenant)
             .body(axum::body::Body::from(frames))
             .unwrap();
@@ -421,9 +413,9 @@
             .iter()
             .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
             .collect();
-        let (frames, declared) = zstd_frames(&records);
+        let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected(&state, "zstd", declared, frames).await;
+        let (status, body) = post_collected(&state, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         let mut lines = lines(&memtable);
@@ -438,9 +430,9 @@
             (TRACES_TAG, span_request(1).encode_to_vec()),
             (TRACES_TAG, span_request(2).encode_to_vec()),
         ];
-        let (frames, declared) = zstd_frames(&records);
+        let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected(&state, "zstd", declared, frames).await;
+        let (status, body) = post_collected(&state, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
@@ -458,43 +450,67 @@
     async fn a_collected_batch_that_is_not_zstd_is_refused_without_writing() {
         let (memtable, state) = fixture();
         let body = log_request("never stored").encode_to_vec();
-        let declared = body.len();
 
-        let (status, _) = post_collected(&state, "gzip", declared, body).await;
+        let (status, _) = post_collected(&state, "gzip", body).await;
 
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert!(lines(&memtable).is_empty());
     }
 
+    /// The batch itself has no ceiling any more, so the one left is a record's
+    /// own payload, and it is refused on what the header claims rather than
+    /// after the bytes have been waited for.
     #[tokio::test]
-    async fn a_batch_declaring_more_than_the_maximum_is_refused_before_it_is_read() {
+    async fn a_record_claiming_more_than_one_export_is_refused_before_it_arrives() {
         let (memtable, state) = fixture();
-        let records = vec![(LOGS_TAG, log_request("never stored").encode_to_vec())];
-        let (frames, _) = zstd_frames(&records);
+        let mut plain = vec![LOGS_TAG];
+        plain.extend_from_slice(
+            &((crate::otlp_http::MAX_COLLECT_RECORD_BYTES + 1) as u32).to_le_bytes(),
+        );
+        plain.extend_from_slice(b"and nothing like that much behind it");
+        let frames = zstd::bulk::compress(&plain, 3).unwrap();
 
-        let (status, _) = post_collected(
-            &state,
-            "zstd",
-            crate::otlp_http::MAX_COLLECT_PLAIN_BYTES + 1,
-            frames,
-        )
-        .await;
+        let (status, body) = post_collected(&state, "zstd", frames).await;
 
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
         assert!(lines(&memtable).is_empty());
     }
 
+    /// A batch larger than anything the old ceiling would have taken, landing
+    /// whole. Nothing here holds the batch, so its size is collecty's business.
     #[tokio::test]
-    async fn a_batch_that_decompresses_past_what_it_declared_is_refused() {
+    async fn a_batch_past_the_old_ceiling_lands_whole() {
         let (memtable, state) = fixture();
-        let records = vec![(LOGS_TAG, log_request("never stored").encode_to_vec())];
-        let (frames, declared) = zstd_frames(&records);
+        let filler = "x".repeat(64 * 1024);
+        let records: Vec<(u8, Vec<u8>)> = (0..400)
+            .map(|index| {
+                (
+                    LOGS_TAG,
+                    log_request(&format!("{index} {filler}")).encode_to_vec(),
+                )
+            })
+            .collect();
+        let plain_bytes: usize = records
+            .iter()
+            .map(|(_, payload)| 5 + payload.len())
+            .sum();
+        assert!(plain_bytes > crate::trace_ingest::MAX_OTLP_REQUEST_BYTES);
 
-        let (status, body) = post_collected(&state, "zstd", declared / 2, frames).await;
+        let (status, body) = post_collected(&state, "zstd", zstd_frames(&records)).await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("declared"), "{body}");
-        assert!(lines(&memtable).is_empty());
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let stored: usize = memtable
+            .query(
+                &test_tenant(),
+                &[],
+                crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                1000,
+                true,
+            )
+            .iter()
+            .map(|stream| stream.entries.len())
+            .sum();
+        assert_eq!(stored, 400);
     }
 
     #[tokio::test]
@@ -505,9 +521,9 @@
             (TRACES_TAG, span_request(7).encode_to_vec()),
             (LOGS_TAG, log_request("second").encode_to_vec()),
         ];
-        let (frames, declared) = zstd_frames(&records);
+        let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected(&state, "zstd", declared, frames).await;
+        let (status, body) = post_collected(&state, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         let mut lines = lines(&memtable);
@@ -524,9 +540,9 @@
             (LOGS_TAG, poison.clone()),
             (TRACES_TAG, span_request(9).encode_to_vec()),
         ];
-        let (frames, declared) = zstd_frames(&records);
+        let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected(&state, "zstd", declared, frames).await;
+        let (status, body) = post_collected(&state, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(lines(&memtable).is_empty());
@@ -555,7 +571,7 @@
         plain.extend_from_slice(b"eight...");
         let frames = zstd::bulk::compress(&plain, 3).unwrap();
 
-        let (status, body) = post_collected(&state, "zstd", plain.len(), frames).await;
+        let (status, body) = post_collected(&state, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("claims 64 bytes"), "{body}");
@@ -569,7 +585,7 @@
         plain.extend_from_slice(&0u32.to_le_bytes());
         let frames = zstd::bulk::compress(&plain, 3).unwrap();
 
-        let (status, body) = post_collected(&state, "zstd", plain.len(), frames).await;
+        let (status, body) = post_collected(&state, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("not a signal tag"), "{body}");
@@ -611,9 +627,9 @@
         );
 
         let records = vec![(LOGS_TAG, log_request("held, not lost").encode_to_vec())];
-        let (frames, declared) = zstd_frames(&records);
+        let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected_as(&state, "stranger", "zstd", declared, frames).await;
+        let (status, body) = post_collected_as(&state, "stranger", "zstd", frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(lines(&memtable).is_empty());

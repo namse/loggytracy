@@ -10,7 +10,6 @@ use hyper_util::rt::TokioExecutor;
 
 use super::{DeliverFuture, Outcome, Shipment, Transport};
 
-pub const UNCOMPRESSED_BYTES_HEADER: &str = "x-collecty-uncompressed-bytes";
 /// Which collecty the batch came from, and where the batch starts in that
 /// collecty's numbering. Together they are what signy needs to skip a record
 /// it has already stored, so a resend after a crash costs bandwidth and
@@ -50,7 +49,6 @@ impl Transport for HttpTransport {
                 .uri(&uri)
                 .header(CONTENT_TYPE, "application/x-protobuf")
                 .header(CONTENT_ENCODING, "zstd")
-                .header(UNCOMPRESSED_BYTES_HEADER, shipment.plain_bytes.to_string())
                 .header(SENDER_HEADER, shipment.sender.to_string())
                 .header(START_SEQUENCE_HEADER, shipment.start_sequence.to_string())
                 .body(Full::new(shipment.frames))

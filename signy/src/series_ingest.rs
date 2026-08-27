@@ -620,6 +620,19 @@ impl OtlpMetricIngest<'_> {
         tenant: crate::tenant::TenantId,
         request: ExportMetricsServiceRequest,
     ) -> Result<MetricAcceptOutcome, IngestError> {
+        let (pending, outcome) = self.enqueue(tenant, request).await?;
+        pending
+            .settle()
+            .await
+            .map_err(crate::log_ingest::journal_write_failed)?;
+        Ok(outcome)
+    }
+
+    pub async fn enqueue(
+        &self,
+        tenant: crate::tenant::TenantId,
+        request: ExportMetricsServiceRequest,
+    ) -> Result<(crate::journal::PendingAppend, MetricAcceptOutcome), IngestError> {
         // The cheap pre-check: every datapoint decomposes into at least one
         // sample, so a request past the cap on datapoints alone is refused
         // before any decomposition work.
@@ -692,21 +705,20 @@ impl OtlpMetricIngest<'_> {
                 format!("failed to encode request: {error}"),
             )
         })?;
-        self.journal
-            .append_metrics(tenant, encoded, samples)
+        let pending = self
+            .journal
+            .enqueue_metrics(tenant, encoded, samples)
             .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("journal write failed: {error}"),
-                )
-            })?;
-        Ok(MetricAcceptOutcome {
-            rejected_data_points: admission.rejected_datapoints,
-            rejection: admission
-                .rejected_any()
-                .then(|| self.refusal_message(&admission)),
-        })
+            .map_err(crate::log_ingest::journal_write_failed)?;
+        Ok((
+            pending,
+            MetricAcceptOutcome {
+                rejected_data_points: admission.rejected_datapoints,
+                rejection: admission
+                    .rejected_any()
+                    .then(|| self.refusal_message(&admission)),
+            },
+        ))
     }
 
     /// The teaching refusal: the count, the limit, the knob, and the horizon
