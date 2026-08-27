@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-pub use cursor::Cursor;
+pub use cursor::{Cursor, SenderId};
 use segment::{SegmentFile, SegmentMeta};
 
 pub const RECORD_HEADER_BYTES: usize = 12;
@@ -44,6 +44,7 @@ pub struct QueueStats {
 
 pub struct Queue {
     dir: PathBuf,
+    sender: SenderId,
     limits: QueueLimits,
     inner: Mutex<Inner>,
     appended: Notify,
@@ -115,24 +116,35 @@ impl Queue {
         let active = SegmentFile::open_for_append(dir, last.seq)?;
         let oldest = metas.first().expect("just ensured non-empty").seq;
         let newest = metas.last().expect("just ensured non-empty");
-        let tail = Cursor {
-            segment: newest.seq,
-            offset: newest.bytes,
+        let tail = (newest.seq, newest.bytes);
+        // A cursor file that cannot be read takes the sender id with it.
+        // Recovering the id alone would restart the numbering under a name
+        // signy already holds a high-water mark for, and every record under
+        // that mark would be skipped as one it had already seen.
+        let restored = cursor::load(dir)?.filter(|committed| {
+            let cursor = committed.cursor;
+            cursor.segment >= oldest
+                && (cursor.segment, cursor.offset) <= tail
+                && metas.iter().any(|meta| meta.seq == cursor.segment)
+        });
+        let (sender, cursor) = match restored {
+            Some(committed) => (committed.sender, committed.cursor),
+            None => {
+                let sender = SenderId::generate()?;
+                let cursor = Cursor {
+                    segment: oldest,
+                    offset: 0,
+                    sequence: 0,
+                };
+                cursor::store(dir, sender, cursor)?;
+                (sender, cursor)
+            }
         };
-        let cursor = cursor::load(dir)?
-            .filter(|loaded| {
-                loaded.segment >= oldest
-                    && *loaded <= tail
-                    && metas.iter().any(|meta| meta.seq == loaded.segment)
-            })
-            .unwrap_or(Cursor {
-                segment: oldest,
-                offset: 0,
-            });
 
         let queued_bytes = metas.iter().map(|meta| meta.bytes).sum();
         Ok(Queue {
             dir: dir.to_path_buf(),
+            sender,
             limits,
             inner: Mutex::new(Inner {
                 segments: metas.into(),
@@ -237,6 +249,7 @@ impl Queue {
                 position = Cursor {
                     segment: next.seq,
                     offset: 0,
+                    sequence: position.sequence,
                 };
                 batch.end = position;
                 reader = None;
@@ -265,6 +278,7 @@ impl Queue {
                     batch.frames.extend_from_slice(&frame);
                     batch.plain_bytes += plain_len as usize;
                     position.offset += (RECORD_HEADER_BYTES + frame.len()) as u64;
+                    position.sequence += 1;
                     batch.end = position;
                     batch.records.push(BatchRecord {
                         span: start..batch.frames.len(),
@@ -283,6 +297,7 @@ impl Queue {
                     position = Cursor {
                         segment: next.seq,
                         offset: 0,
+                        sequence: position.sequence,
                     };
                     batch.end = position;
                     reader = None;
@@ -315,7 +330,7 @@ impl Queue {
             segment::remove(&self.dir, meta.seq)?;
             inner.stats.queued_bytes -= meta.bytes;
         }
-        cursor::store(&self.dir, upto)?;
+        cursor::store(&self.dir, self.sender, upto)?;
         Ok(())
     }
 
@@ -330,6 +345,10 @@ impl Queue {
 
     pub fn cursor(&self) -> Cursor {
         self.inner.lock().cursor
+    }
+
+    pub fn sender_id(&self) -> SenderId {
+        self.sender
     }
 
     pub fn has_records(&self) -> bool {
@@ -387,8 +406,9 @@ impl Queue {
                     .expect("roll guarantees a second segment")
                     .seq,
                 offset: 0,
+                sequence: inner.cursor.sequence,
             };
-            cursor::store(&self.dir, inner.cursor)?;
+            cursor::store(&self.dir, self.sender, inner.cursor)?;
         }
         Ok(())
     }

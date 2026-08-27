@@ -298,3 +298,98 @@ fn the_backlog_counts_what_is_unsent_rather_than_what_is_on_disk() {
     assert_eq!(empty.backlog_bytes, 0);
     assert_eq!(empty.queued_bytes, full.queued_bytes);
 }
+
+#[test]
+fn records_are_numbered_from_one_and_the_numbering_survives_a_reopen() {
+    let scratch = Scratch::new("sequence");
+    let sender = {
+        let queue = open(&scratch, QueueLimits::default());
+        for index in 0..3u8 {
+            queue.append(&record(&[index; 16])).expect("an append");
+        }
+        let batch = queue
+            .read_batch(usize::MAX, usize::MAX)
+            .expect("a batch")
+            .expect("records");
+        let numbers: Vec<u64> = batch
+            .records
+            .iter()
+            .map(|record| record.end.sequence)
+            .collect();
+        assert_eq!(numbers, vec![1, 2, 3]);
+        queue.commit(batch.end, 3).expect("a commit");
+        queue.sync().expect("a sync");
+        queue.sender_id()
+    };
+
+    let queue = open(&scratch, QueueLimits::default());
+    assert_eq!(queue.sender_id(), sender, "the id outlives the process");
+    queue.append(&record(b"fourth")).expect("an append");
+    let batch = queue
+        .read_batch(usize::MAX, usize::MAX)
+        .expect("a batch")
+        .expect("records");
+    assert_eq!(batch.records[0].end.sequence, 4);
+}
+
+#[test]
+fn a_corrupt_cursor_takes_the_sender_id_with_it() {
+    let scratch = Scratch::new("cursor-identity");
+    let before = {
+        let queue = open(&scratch, QueueLimits::default());
+        queue.append(&record(b"first")).expect("an append");
+        let batch = queue
+            .read_batch(usize::MAX, usize::MAX)
+            .expect("a batch")
+            .expect("records");
+        queue.commit(batch.end, 1).expect("a commit");
+        queue.sync().expect("a sync");
+        queue.sender_id()
+    };
+
+    std::fs::write(scratch.path().join("cursor"), b"junk").expect("a corrupt cursor");
+
+    // Both the numbering and the name it is kept under restart together.
+    // Keeping the name while the numbering went back to one would have signy
+    // skip every record under the mark it still held.
+    let queue = open(&scratch, QueueLimits::default());
+    assert_ne!(queue.sender_id(), before);
+    let batch = queue
+        .read_batch(usize::MAX, usize::MAX)
+        .expect("a batch")
+        .expect("records");
+    assert_eq!(batch.records[0].end.sequence, 1);
+}
+
+#[test]
+fn a_dropped_segment_does_not_rewind_the_numbering() {
+    let scratch = Scratch::new("drop-sequence");
+    let queue = open(
+        &scratch,
+        QueueLimits {
+            max_bytes: 200,
+            max_segment_bytes: 60,
+        },
+    );
+    queue.append(&record(&[0u8; 30])).expect("an append");
+    let batch = queue
+        .read_batch(usize::MAX, usize::MAX)
+        .expect("a batch")
+        .expect("records");
+    assert_eq!(batch.records[0].end.sequence, 1);
+    queue.commit(batch.end, 1).expect("a commit");
+
+    for index in 1..12u8 {
+        queue.append(&record(&[index; 30])).expect("an append");
+    }
+    assert!(queue.stats().dropped_segments > 0);
+
+    // Numbers are handed out when a record is read for sending, so records
+    // dropped under a full queue never took one. What matters is that the
+    // count only ever goes up.
+    let batch = queue
+        .read_batch(usize::MAX, usize::MAX)
+        .expect("a batch")
+        .expect("records");
+    assert_eq!(batch.records[0].end.sequence, 2);
+}

@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::sync::watch;
 
-use crate::queue::{Batch, BatchRecord, Queue};
+use crate::queue::{Batch, BatchRecord, Queue, SenderId};
 
 pub use transport::HttpTransport;
 
@@ -24,8 +24,21 @@ pub enum Outcome {
     Refused(String),
 }
 
+/// One attempt's worth of a batch, and who it belongs to.
+///
+/// The frames are unchanged from what the queue holds. The sender and the
+/// number of the first record are what let signy place every record without
+/// the wire carrying a number per record: it counts as it reads, so record
+/// `i` of the body is `start_sequence + i`.
+pub struct Shipment {
+    pub frames: Bytes,
+    pub plain_bytes: usize,
+    pub sender: SenderId,
+    pub start_sequence: u64,
+}
+
 pub trait Transport: Send + Sync + 'static {
-    fn deliver<'a>(&'a self, frames: Bytes, plain_bytes: usize) -> DeliverFuture<'a>;
+    fn deliver<'a>(&'a self, shipment: Shipment) -> DeliverFuture<'a>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -135,10 +148,14 @@ impl<T: Transport> Sender<T> {
                     .map(|record| record.plain_len as usize)
                     .sum();
 
-                match self
-                    .attempt(frames.slice(span.clone()), plain_bytes, shutdown)
-                    .await
-                {
+                let shipment = Shipment {
+                    frames: frames.slice(span.clone()),
+                    plain_bytes,
+                    sender: self.queue.sender_id(),
+                    start_sequence: records[from].end.sequence,
+                };
+
+                match self.attempt(shipment, shutdown).await {
                     Attempt::Accepted => {
                         self.stats.sent_batches.fetch_add(1, Ordering::Relaxed);
                         self.stats
@@ -176,18 +193,17 @@ impl<T: Transport> Sender<T> {
         }
     }
 
-    async fn attempt(
-        &self,
-        frames: Bytes,
-        plain_bytes: usize,
-        shutdown: &mut watch::Receiver<bool>,
-    ) -> Attempt {
+    async fn attempt(&self, shipment: Shipment, shutdown: &mut watch::Receiver<bool>) -> Attempt {
         let mut backoff = self.config.retry_initial;
         loop {
             if *shutdown.borrow() {
                 return Attempt::Aborted;
             }
-            match self.transport.deliver(frames.clone(), plain_bytes).await {
+            let attempt = Shipment {
+                frames: shipment.frames.clone(),
+                ..shipment
+            };
+            match self.transport.deliver(attempt).await {
                 Outcome::Accepted => return Attempt::Accepted,
                 Outcome::Refused(reason) => return Attempt::Refused(reason),
                 Outcome::Retry(reason) => {

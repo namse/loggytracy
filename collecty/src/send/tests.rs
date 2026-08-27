@@ -12,6 +12,7 @@ const POISON: u8 = 0xFF;
 struct Scripted {
     respond: Box<dyn Fn(&Bytes) -> Outcome + Send + Sync>,
     calls: Mutex<Vec<usize>>,
+    sequences: Mutex<Vec<u64>>,
 }
 
 impl Scripted {
@@ -19,20 +20,35 @@ impl Scripted {
         Arc::new(Scripted {
             respond: Box::new(respond),
             calls: Mutex::new(Vec::new()),
+            sequences: Mutex::new(Vec::new()),
         })
     }
 
     fn calls(&self) -> Vec<usize> {
         self.calls.lock().clone()
     }
+
+    fn sequences(&self) -> Vec<u64> {
+        self.sequences.lock().clone()
+    }
 }
 
 impl Transport for Scripted {
-    fn deliver<'a>(&'a self, frames: Bytes, _plain_bytes: usize) -> DeliverFuture<'a> {
+    fn deliver<'a>(&'a self, shipment: Shipment) -> DeliverFuture<'a> {
         Box::pin(async move {
-            self.calls.lock().push(frames.len());
-            (self.respond)(&frames)
+            self.calls.lock().push(shipment.frames.len());
+            self.sequences.lock().push(shipment.start_sequence);
+            (self.respond)(&shipment.frames)
         })
+    }
+}
+
+fn shipment(frames: &'static [u8], plain_bytes: usize) -> Shipment {
+    Shipment {
+        frames: Bytes::from_static(frames),
+        plain_bytes,
+        sender: crate::queue::SenderId::generate().expect("an id"),
+        start_sequence: 1,
     }
 }
 
@@ -131,6 +147,9 @@ async fn a_refused_batch_is_halved_until_the_one_bad_record_is_dropped() {
         .map(|records| records * 32)
         .collect();
     assert_eq!(transport.calls(), halving);
+    // Every attempt names the first record it carries, halved slices
+    // included, so signy can number what it reads without the body saying so.
+    assert_eq!(transport.sequences(), vec![1, 1, 5, 5, 5, 6, 6, 7]);
     assert!(!queue.has_records());
 }
 
@@ -176,9 +195,11 @@ async fn the_run_loop_delivers_what_arrives_and_stops_on_shutdown() {
     assert!(!queue.has_records());
 }
 
+type SeenRequest = (String, String, String, String, String);
+
 async fn fake_signy(
     status: http::StatusCode,
-    seen: Arc<Mutex<Vec<(String, String, String)>>>,
+    seen: Arc<Mutex<Vec<SeenRequest>>>,
 ) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -208,6 +229,8 @@ async fn fake_signy(
                                 request.uri().path().to_string(),
                                 header("content-encoding"),
                                 header(super::transport::UNCOMPRESSED_BYTES_HEADER),
+                                header(super::transport::SENDER_HEADER),
+                                header(super::transport::START_SEQUENCE_HEADER),
                             ));
                             http::Response::builder()
                                 .status(status)
@@ -226,12 +249,15 @@ async fn fake_signy(
 }
 
 #[tokio::test]
-async fn a_success_over_http_carries_the_encoding_and_the_uncompressed_size() {
+async fn a_success_over_http_carries_the_encoding_the_size_and_who_sent_it() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let address = fake_signy(http::StatusCode::NO_CONTENT, seen.clone()).await;
     let transport = HttpTransport::new(format!("http://{address}"), Duration::from_secs(5));
+    let mut shipment = shipment(b"frames", 4096);
+    shipment.start_sequence = 91;
+    let sender = shipment.sender.to_string();
 
-    let outcome = transport.deliver(Bytes::from_static(b"frames"), 4096).await;
+    let outcome = transport.deliver(shipment).await;
 
     assert_eq!(outcome, Outcome::Accepted);
     assert_eq!(
@@ -239,7 +265,9 @@ async fn a_success_over_http_carries_the_encoding_and_the_uncompressed_size() {
         [(
             "/signy/api/v1/collect".to_string(),
             "zstd".to_string(),
-            "4096".to_string()
+            "4096".to_string(),
+            sender,
+            "91".to_string()
         )]
     );
 }
@@ -252,7 +280,7 @@ async fn a_bad_request_refuses_the_payload_and_a_server_error_asks_for_a_retry()
     )
     .await;
     let transport = HttpTransport::new(format!("http://{refusing}"), Duration::from_secs(5));
-    let outcome = transport.deliver(Bytes::from_static(b"frames"), 1).await;
+    let outcome = transport.deliver(shipment(b"frames", 1)).await;
     assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
 
     let unavailable = fake_signy(
@@ -261,7 +289,7 @@ async fn a_bad_request_refuses_the_payload_and_a_server_error_asks_for_a_retry()
     )
     .await;
     let transport = HttpTransport::new(format!("http://{unavailable}"), Duration::from_secs(5));
-    let outcome = transport.deliver(Bytes::from_static(b"frames"), 1).await;
+    let outcome = transport.deliver(shipment(b"frames", 1)).await;
     assert!(matches!(outcome, Outcome::Retry(_)), "{outcome:?}");
 }
 
@@ -274,7 +302,7 @@ async fn a_refused_connection_asks_for_a_retry_rather_than_dropping() {
     drop(listener);
 
     let transport = HttpTransport::new(format!("http://{address}"), Duration::from_secs(5));
-    let outcome = transport.deliver(Bytes::from_static(b"frames"), 1).await;
+    let outcome = transport.deliver(shipment(b"frames", 1)).await;
 
     assert!(matches!(outcome, Outcome::Retry(_)), "{outcome:?}");
 }
