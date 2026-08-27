@@ -52,6 +52,14 @@ fn chunk_bytes(meta: &crate::series_part::SeriesPartMeta) -> u64 {
     meta.tenants.iter().map(|segment| segment.bytes.len()).sum()
 }
 
+/// The inclusive timestamp span of a merged series, which the snapshot the
+/// writer takes carries so nothing downstream has to decode to learn it.
+fn sample_bounds(samples: &[(i64, f64)]) -> Option<(i64, i64)> {
+    let first = samples.first()?.0;
+    let last = samples.last()?.0;
+    Some((first.min(last), first.max(last)))
+}
+
 fn tier_of(bytes: u64) -> u8 {
     if bytes < L0_MAX_BYTES {
         0
@@ -230,6 +238,7 @@ pub async fn compact_once(
                         .into_iter()
                         .map(|(labels, spill)| SnapshotSeries {
                             labels,
+                            bounds: sample_bounds(&spill),
                             chunks: Vec::new(),
                             spill,
                         })
@@ -535,6 +544,7 @@ mod tests {
                     .into_iter()
                     .map(|(labels, spill)| SnapshotSeries {
                         labels,
+                        bounds: sample_bounds(&spill),
                         chunks: Vec::new(),
                         spill,
                     })

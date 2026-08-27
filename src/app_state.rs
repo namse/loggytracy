@@ -22,6 +22,10 @@ pub struct AppState {
     /// payloads, so its cost profile is unlike a log scan's, and sharing the
     /// log semaphore would let either surface starve the other.
     pub trace_scan_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Metric scans likewise: a metric scan is Gorilla decode plus per-step
+    /// folds, and sharing slots with either other surface would let one cost
+    /// profile starve the others.
+    pub metric_scan_semaphore: Arc<tokio::sync::Semaphore>,
     /// The shared byte budget every query materialization reserves from —
     /// the aggregate bound the slot×cap product never actually was.
     pub query_memory_pool: Arc<crate::query_memory::QueryMemoryPool>,
@@ -125,6 +129,9 @@ impl AppState {
             )),
             trace_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_trace_scans,
+            )),
+            metric_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                config.max_concurrent_metric_scans,
             )),
             query_memory_pool: Arc::new(crate::query_memory::QueryMemoryPool::new(
                 config.query_memory_budget_bytes,

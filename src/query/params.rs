@@ -80,6 +80,34 @@ pub(crate) const TRACE_ATTRIBUTE_KEYS_PARAMS: &[&str] = &["start", "end"];
 /// dropdown offers only values whose click still returns something.
 pub(crate) const TRACE_ATTRIBUTE_VALUES_PARAMS: &[&str] = &["start", "end", "attr"];
 
+/// One operation per request, no expression language: an optional per-series
+/// `func` with its `range`, then an optional one-level `agg` grouped `by` —
+/// ratios are two requests composed client-side, and the refusals say so.
+pub(crate) const METRIC_QUERY_PARAMS: &[&str] = &[
+    "metric", "attr", "start", "end", "step", "func", "range", "agg", "by", "lookback", "limit",
+];
+
+/// The alert evaluation: the range grammar at a single instant, `at`.
+pub(crate) const METRIC_INSTANT_PARAMS: &[&str] = &[
+    "metric", "attr", "at", "func", "range", "agg", "by", "lookback", "limit",
+];
+
+/// `metric` names the *base* histogram — the engine selects `<metric>_bucket`
+/// and groups by labels-minus-`le` — and `range` is the per-bucket increase
+/// window, required because a bucket count without a window is a lifetime
+/// total.
+pub(crate) const METRIC_QUANTILE_PARAMS: &[&str] = &[
+    "metric", "q", "attr", "start", "end", "step", "range", "by", "limit",
+];
+
+pub(crate) const METRIC_NAMES_PARAMS: &[&str] = &["start", "end"];
+
+pub(crate) const METRIC_LABELS_PARAMS: &[&str] = &["start", "end", "metric", "attr"];
+
+pub(crate) const METRIC_LABEL_VALUES_PARAMS: &[&str] = &["start", "end", "metric", "attr"];
+
+pub(crate) const METRIC_SERIES_PARAMS: &[&str] = &["metric", "attr", "start", "end", "limit"];
+
 /// The first-party routes, listed by the router fallback so one wrong request
 /// teaches the whole surface. Grows with each endpoint that lands.
 pub(crate) const ROUTES: &[&str] = &[
@@ -93,6 +121,13 @@ pub(crate) const ROUTES: &[&str] = &[
     "/loggytracy/api/v1/traces/{trace_id}",
     "/loggytracy/api/v1/traces/attributes",
     "/loggytracy/api/v1/traces/attributes/{key}/values",
+    "/loggytracy/api/v1/metrics/query",
+    "/loggytracy/api/v1/metrics/instant",
+    "/loggytracy/api/v1/metrics/quantile",
+    "/loggytracy/api/v1/metrics/names",
+    "/loggytracy/api/v1/metrics/labels",
+    "/loggytracy/api/v1/metrics/labels/{key}/values",
+    "/loggytracy/api/v1/metrics/series",
 ];
 
 #[derive(Debug)]
@@ -121,6 +156,15 @@ struct RawParams {
     attrs: Vec<(String, AttrOp, String)>,
     line_filters: Vec<logql::LineFilter>,
     parse_stages: Vec<logql::PipelineStage>,
+    metric: Option<String>,
+    at_ns: Option<i64>,
+    step_ns: Option<i64>,
+    func: Option<MetricFunc>,
+    range_ns: Option<i64>,
+    agg: Option<MetricAgg>,
+    by: Vec<String>,
+    lookback_ns: Option<i64>,
+    q: Option<f64>,
 }
 
 pub fn parse_filter_params(
@@ -156,6 +200,15 @@ fn parse_raw_params(
     let mut attrs: Vec<(String, AttrOp, String)> = Vec::new();
     let mut line_filters: Vec<logql::LineFilter> = Vec::new();
     let mut parse_stages: Vec<logql::PipelineStage> = Vec::new();
+    let mut metric: Option<String> = None;
+    let mut at_ns: Option<i64> = None;
+    let mut step_ns: Option<i64> = None;
+    let mut func: Option<MetricFunc> = None;
+    let mut range_ns: Option<i64> = None;
+    let mut agg: Option<MetricAgg> = None;
+    let mut by: Vec<String> = Vec::new();
+    let mut lookback_ns: Option<i64> = None;
+    let mut q: Option<f64> = None;
 
     for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
         let key = key.as_ref();
@@ -219,6 +272,67 @@ fn parse_raw_params(
                 }
                 parse_stages.push(stage);
             }
+            "metric" => set_once("metric", &mut metric, value)?,
+            "at" => set_once("at", &mut at_ns, parse_time_or_relative_ns(&value, now_ns)?)?,
+            "step" => set_once(
+                "step",
+                &mut step_ns,
+                positive_duration_param("step", &value)?,
+            )?,
+            "range" => set_once(
+                "range",
+                &mut range_ns,
+                positive_duration_param("range", &value)?,
+            )?,
+            "lookback" => set_once(
+                "lookback",
+                &mut lookback_ns,
+                positive_duration_param("lookback", &value)?,
+            )?,
+            "func" => set_once(
+                "func",
+                &mut func,
+                match value.as_str() {
+                    "rate" => MetricFunc::Rate,
+                    "increase" => MetricFunc::Increase,
+                    other => {
+                        return Err(format!(
+                            "invalid func '{other}': expected rate or increase — see \
+docs/QUERY_API.md"
+                        ));
+                    }
+                },
+            )?,
+            "agg" => set_once(
+                "agg",
+                &mut agg,
+                match value.as_str() {
+                    "sum" => MetricAgg::Sum,
+                    "avg" => MetricAgg::Avg,
+                    "min" => MetricAgg::Min,
+                    "max" => MetricAgg::Max,
+                    "count" => MetricAgg::Count,
+                    other => {
+                        return Err(format!(
+                            "invalid agg '{other}': expected sum, avg, min, max or count"
+                        ));
+                    }
+                },
+            )?,
+            "by" => by.push(value),
+            "q" => set_once(
+                "q",
+                &mut q,
+                value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|quantile| (0.0..=1.0).contains(quantile))
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid q '{value}': expected a quantile between 0 and 1, like q=0.99"
+                        )
+                    })?,
+            )?,
             _ => unreachable!("every allowed parameter is matched above"),
         }
     }
@@ -233,7 +347,27 @@ fn parse_raw_params(
         attrs,
         line_filters,
         parse_stages,
+        metric,
+        at_ns,
+        step_ns,
+        func,
+        range_ns,
+        agg,
+        by,
+        lookback_ns,
+        q,
     })
+}
+
+fn positive_duration_param(name: &str, value: &str) -> Result<i64, String> {
+    let parsed = logql::parse_duration_ns(value)
+        .map_err(|error| format!("invalid {name} '{value}': {error}"))?;
+    if parsed <= 0 {
+        return Err(format!(
+            "invalid {name} '{value}': the duration must be positive, like {name}=30s"
+        ));
+    }
+    Ok(parsed)
 }
 
 pub(crate) struct TraceFilterParams {
@@ -335,6 +469,137 @@ see docs/QUERY_API.md",
                 key,
             }),
             AttrOp::Match(logql::MatcherOp::NRe) => Ok(TraceFilter::NRe {
+                regex: anchored_regex(&value)?,
+                key,
+            }),
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MetricFunc {
+    Rate,
+    Increase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MetricAgg {
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Count,
+}
+
+/// A metric-side `attr` filter, evaluated over a series' label values. An
+/// absent key behaves as the empty string — `LabelMatcher::matches`' rule, so
+/// `attr=k!=v` matches series without `k` exactly as it does on logs.
+pub(crate) enum MetricFilter {
+    Eq { key: String, value: String },
+    Neq { key: String, value: String },
+    Re { key: String, regex: regex::Regex },
+    NRe { key: String, regex: regex::Regex },
+}
+
+impl MetricFilter {
+    pub(crate) fn matches(&self, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+        match self {
+            Self::Eq { key, value } => lookup(key).unwrap_or_default() == *value,
+            Self::Neq { key, value } => lookup(key).unwrap_or_default() != *value,
+            Self::Re { key, regex } => regex.is_match(&lookup(key).unwrap_or_default()),
+            Self::NRe { key, regex } => !regex.is_match(&lookup(key).unwrap_or_default()),
+        }
+    }
+}
+
+pub(crate) struct MetricParams {
+    pub metric: Option<String>,
+    pub filters: Vec<MetricFilter>,
+    pub start_ns: Option<i64>,
+    pub end_ns: Option<i64>,
+    pub at_ns: Option<i64>,
+    pub step_ns: Option<i64>,
+    pub func: Option<MetricFunc>,
+    pub range_ns: Option<i64>,
+    pub agg: Option<MetricAgg>,
+    pub by: Vec<String>,
+    pub lookback_ns: Option<i64>,
+    pub limit: Option<usize>,
+    pub q: Option<f64>,
+}
+
+/// The metric finisher. The cross-field rules live here rather than per
+/// handler so every metric endpoint refuses with the same sentence: a `func`
+/// without its window, a window without its `func`, and grouping without an
+/// aggregation are each one teaching refusal.
+pub(crate) fn parse_metric_params(
+    raw: &str,
+    now_ns: i64,
+    allowed: &'static [&'static str],
+) -> Result<MetricParams, String> {
+    let raw = parse_raw_params(raw, now_ns, allowed)?;
+    let filters = build_metric_filters(raw.attrs)?;
+    if raw.func.is_some() && raw.range_ns.is_none() {
+        return Err(
+            "func was given without range: a rate needs its window, like func=rate&range=60s — \
+see docs/QUERY_API.md"
+                .to_string(),
+        );
+    }
+    if raw.range_ns.is_some() && raw.func.is_none() && !allowed.contains(&"q") {
+        return Err(
+            "range was given without func: the window belongs to rate or increase, like \
+func=rate&range=60s — see docs/QUERY_API.md"
+                .to_string(),
+        );
+    }
+    if !raw.by.is_empty() && raw.agg.is_none() {
+        return Err(
+            "by was given without agg: grouping is a property of the aggregation, like \
+agg=sum&by=service — see docs/QUERY_API.md"
+                .to_string(),
+        );
+    }
+    Ok(MetricParams {
+        metric: raw.metric,
+        filters,
+        start_ns: raw.start_ns,
+        end_ns: raw.end_ns,
+        at_ns: raw.at_ns,
+        step_ns: raw.step_ns,
+        func: raw.func,
+        range_ns: raw.range_ns,
+        agg: raw.agg,
+        by: raw.by,
+        lookback_ns: raw.lookback_ns,
+        limit: raw.limit,
+        q: raw.q,
+    })
+}
+
+/// Metric labels are stored stringified, so a lexicographic comparison would
+/// answer wrongly without saying so — the same reasoning that keeps
+/// comparisons `duration`-only on the trace surface keeps them out entirely
+/// here.
+fn build_metric_filters(
+    attrs: Vec<(String, AttrOp, String)>,
+) -> Result<Vec<MetricFilter>, String> {
+    attrs
+        .into_iter()
+        .map(|(key, op, value)| match op {
+            AttrOp::Compare(op) => Err(format!(
+                "attr filter '{key}{symbol}{value}' uses a comparison: metric label filters \
+support =, !=, =~, !~ — duration comparisons belong to the trace endpoints, see \
+docs/QUERY_API.md",
+                symbol = compare_symbol(op)
+            )),
+            AttrOp::Match(logql::MatcherOp::Eq) => Ok(MetricFilter::Eq { key, value }),
+            AttrOp::Match(logql::MatcherOp::Neq) => Ok(MetricFilter::Neq { key, value }),
+            AttrOp::Match(logql::MatcherOp::Re) => Ok(MetricFilter::Re {
+                regex: anchored_regex(&value)?,
+                key,
+            }),
+            AttrOp::Match(logql::MatcherOp::NRe) => Ok(MetricFilter::NRe {
                 regex: anchored_regex(&value)?,
                 key,
             }),

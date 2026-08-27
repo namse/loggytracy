@@ -35,6 +35,13 @@ curl -sH 'X-Scope-OrgID: acme' \
 | GET | `/loggytracy/api/v1/traces/{trace_id}` | every span of one trace, flat rows for a timeline |
 | GET | `/loggytracy/api/v1/traces/attributes` | span/resource attribute keys in the window (autocomplete) |
 | GET | `/loggytracy/api/v1/traces/attributes/{key}/values` | a key's values in the window (autocomplete) |
+| GET | `/loggytracy/api/v1/metrics/query` | per-series samples on a step grid, optionally rated and aggregated |
+| GET | `/loggytracy/api/v1/metrics/instant` | one value per series at a single instant (the alert evaluation) |
+| GET | `/loggytracy/api/v1/metrics/quantile` | a quantile interpolated from a histogram's `_bucket` series |
+| GET | `/loggytracy/api/v1/metrics/names` | metric names in the window (autocomplete) |
+| GET | `/loggytracy/api/v1/metrics/labels` | metric label keys in the window (autocomplete) |
+| GET | `/loggytracy/api/v1/metrics/labels/{key}/values` | a metric label key's values (autocomplete) |
+| GET | `/loggytracy/api/v1/metrics/series` | matching series identities, `__name__` included |
 
 Unchanged and outside this document's scope: `/metrics` (Prometheus text),
 `/ready`, the admin routes under `/loggytracy/api/v1/admin`, and OTLP ingest.
@@ -59,6 +66,14 @@ its section, and an unknown parameter is a 400 that names the accepted set.
 | `bucket` | no | Histogram bucket width, duration syntax: `30s`, `5m`, `1h`. |
 | `delay` | no | Tail only: whole seconds (≤ 5) to hold rows back, for writers whose clocks trail the server's. |
 | `request_id` | no | Cancelling a delete request: the id from the GET listing. |
+| `metric` | no | Metric endpoints: the exact `__name__` to read, like `metric=http_requests_total`. On `/metrics/quantile` it is the histogram's *base* name — the engine selects `<metric>_bucket` itself. |
+| `step` | no | Metric range endpoints: the evaluation grid's spacing, duration syntax. Samples land at `start + k*step`. Required. |
+| `func` | no | `rate` or `increase`, applied per series before any aggregation. Needs `range`. |
+| `range` | no | The window `func` (or a quantile) reads per evaluation point, duration syntax: `range=60s`. |
+| `agg` | no | `sum`, `avg`, `min`, `max`, or `count`, folding the per-series values at each step. |
+| `by` | yes | Label keys the aggregation groups by, like `agg=sum&by=service`. Grouping is a property of the aggregation, so `by` without `agg` is refused. |
+| `lookback` | no | How far behind an evaluation point a raw sample may be and still answer for it (default `5m`). |
+| `q` | no | `/metrics/quantile` only: the quantile in `[0, 1]`, like `q=0.99`. |
 
 All filters AND. There is deliberately no OR and no attribute-exists, and the
 only numeric comparison is the trace endpoints' `duration` — the flat model
@@ -262,6 +277,147 @@ window scan and pay the same admission as any trace scan (its scan slots, the
 shared memory pool, the span budget). Keep the window as narrow as the
 dropdown allows.
 
+## `GET /metrics/query` — the dashboard panel
+
+Accepts `metric`, `attr`, `start`, `end`, `step`, `func`, `range`, `agg`,
+`by`, `lookback`, `limit`.
+
+One line per output series, `application/x-ndjson`: the series' labels
+(`__name__` omitted — the query names the metric) and its samples on the
+grid, ascending:
+
+```json
+{"labels":{"instance":"instance-0","service_name":"api"},"samples":[["1756100000000000000",12.5],["1756100030000000000",13.0]]}
+```
+
+Selection is `metric=` (exact `__name__` equality, required) plus repeated
+`attr` filters with the four matchers — the same grammar as everywhere else,
+and a comparison operator is refused the same way the log surface refuses it.
+`start` is required (the step grid is aligned to it); `end` defaults to now.
+At each `t = start + k*step`:
+
+- Without `func`, a series answers its newest sample in `(t − lookback, t]`;
+  a step with no sample within the lookback is **omitted**, not zeroed.
+- `func=increase` answers the sum of the **positive deltas** over
+  `(t − range, t]`, walking from the last sample at or before the window's
+  start; a counter reset contributes the post-reset value. `func=rate` is
+  that divided by the window in seconds. This is the VictoriaMetrics
+  definition, adopted deliberately — **not** Prometheus's, which extrapolates
+  to the window boundaries; the numbers differ by a few percent on sparse
+  windows, and `increase` here counts what actually arrived.
+- `agg` then folds the per-series values at each step across the series,
+  grouped by the `by` projection of their labels (no `by`: one group, empty
+  labels; a key a series lacks is omitted from its group's labels rather
+  than materialized empty). `count` counts contributing series.
+
+One function and one aggregation per request — there is no expression
+language. A ratio is two requests composed client-side, and the refusal for
+anything more says exactly that.
+
+A selector matching more series than
+`LOGGYTRACY_MAX_METRIC_SERIES_PER_QUERY`, or `series × steps` past
+`LOGGYTRACY_MAX_METRIC_POINTS_PER_QUERY`, is refused **before any chunk is
+decoded**, with the matched count and the knob. The fixes are narrowing the
+selector, shortening the window, or coarsening `step` — aggregation is not
+one of them, because the scan decodes every matched series whether or not the
+fold aggregates.
+
+```sh
+# Request rate per service, last hour, 30s grid
+curl -sH 'X-Scope-OrgID: acme' --get \
+  --data-urlencode 'metric=http_requests_total' \
+  --data-urlencode 'start=-1h' \
+  --data-urlencode 'step=30s' \
+  --data-urlencode 'func=rate' \
+  --data-urlencode 'range=60s' \
+  --data-urlencode 'agg=sum' \
+  --data-urlencode 'by=service' \
+  'http://127.0.0.1:3100/loggytracy/api/v1/metrics/query'
+```
+
+What ingest already decided, visible on this surface: exponential OTLP
+histograms are downscaled to at most 64 `le` buckets at ingest (quantile
+precision is boundary-limited, like any bucketed histogram); OTLP summaries
+become `{quantile="…"}` gauge series plus `_sum`/`_count`; delta-temporality
+sums are accumulated into running totals at ingest, and a series that churns
+away and returns restarts its total — a counter reset, which `rate` absorbs;
+OTLP exemplars are dropped.
+
+## `GET /metrics/instant` — the alert evaluation
+
+Accepts `metric`, `attr`, `at`, `func`, `range`, `agg`, `by`, `lookback`,
+`limit`.
+
+The `/metrics/query` grammar at a single instant `at` (default now). One
+line per output series:
+
+```json
+{"labels":{"service_name":"api"},"timestamp":"1756100000000000000","value":0.97}
+```
+
+This is the shape fn0's alert rules evaluate: compare `value` against the
+threshold; `agg=max` gives the worst instance in one line.
+
+```sh
+curl -sH 'X-Scope-OrgID: acme' --get \
+  --data-urlencode 'metric=http_errors_total' \
+  --data-urlencode 'func=rate' --data-urlencode 'range=60s' \
+  --data-urlencode 'agg=max' \
+  'http://127.0.0.1:3100/loggytracy/api/v1/metrics/instant'
+```
+
+## `GET /metrics/quantile` — the latency panel
+
+Accepts `metric`, `q`, `attr`, `start`, `end`, `step`, `range`, `by`,
+`limit`.
+
+`metric` names the histogram's **base** name — the engine selects
+`<metric>_bucket` and groups by the series' labels minus `le` (or by the
+`by` projection when given). Per group and step, each bucket's `increase`
+over `(t − range, t]` is taken (`range` is required: a bucket count without
+a window is a lifetime total), the cumulative counts are monotone-fixed, and
+the quantile is interpolated linearly within the bracketing bucket — the
+`histogram_quantile` convention, the `+Inf` bracket answering the highest
+finite bound. The response is the `/metrics/query` samples shape.
+
+A summary-backed name is refused with the reason: summary quantiles were
+computed by the client and cannot be re-aggregated — query the
+`<metric>{quantile="0.99"}` series with `/metrics/query` instead.
+
+```sh
+curl -sH 'X-Scope-OrgID: acme' --get \
+  --data-urlencode 'metric=http_request_duration_seconds' \
+  --data-urlencode 'q=0.99' \
+  --data-urlencode 'start=-1h' --data-urlencode 'step=30s' \
+  --data-urlencode 'range=60s' \
+  --data-urlencode 'attr=service_name=api' \
+  'http://127.0.0.1:3100/loggytracy/api/v1/metrics/quantile'
+```
+
+## `GET /metrics/names`, `/metrics/labels`, `/metrics/labels/{key}/values`, `/metrics/series` — autocomplete
+
+Names accept `start`, `end`. Labels and values accept `start`, `end`,
+`metric`, `attr`. Series accepts `metric`, `attr`, `start`, `end`, `limit`.
+
+```json
+{"name":"http_requests_total"}
+{"key":"service_name"}
+{"value":"api"}
+{"labels":{"__name__":"http_requests_total","service_name":"api"}}
+```
+
+Unlike the log attribute endpoints these are **exact**, not sampled: a
+series' identity lives in the memtable index and the part catalogs, so the
+answers come from catalogs alone and no sample body is read. Both halves obey
+the window — the memtable from the timestamp span it records per series, the
+parts from their catalogs — so a key whose samples all sit outside the window
+is not offered. `/metrics/series` is
+the one metric surface whose labels objects keep `__name__`: it enumerates
+identities, and without the name two metrics' series would be
+indistinguishable. The optional `metric`/`attr` narrowing on labels, values
+and series means a filter chip dropdown offers only values that co-occur
+with the chips already placed.
+
 ## `/logs/delete` — deletion requests
 
 Deletion semantics — hide immediately, remove at the next rewrite — are in
@@ -296,10 +452,10 @@ Refusals are `application/json`:
 | 400 | The request is malformed or over-broad; the message names the input and the governing limit | No — fix the request |
 | 401/403 | Tenant refusals from `X-Scope-OrgID` handling ([`MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md)) | No |
 | 404 | Unknown route (the body lists the real ones) or unknown delete request | No |
-| 413 | The trace holds more spans or bytes than one response may carry (`LOGGYTRACY_MAX_TRACE_SPANS`, `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES`) | No — raise the knob or accept the refusal |
+| 413 | The trace holds more spans or bytes than one response may carry (`LOGGYTRACY_MAX_TRACE_SPANS`, `LOGGYTRACY_MAX_QUERY_MEMORY_BYTES`), or a metric selector matched more than `LOGGYTRACY_MAX_METRIC_SERIES_PER_QUERY` series / `LOGGYTRACY_MAX_METRIC_POINTS_PER_QUERY` points | No — narrow the request or raise the knob |
 | 429 | Tenant query quota, tail cap, delete cap, or this instance's query memory pool is momentarily full | Yes — these clear on their own |
 | 503 | Draining for shutdown, or a deletion could not be made durable | Yes, against the replacement instance |
-| 504 | The query ran past `LOGGYTRACY_MAX_QUERY_RUNTIME` (`LOGGYTRACY_MAX_TRACE_QUERY_RUNTIME` on the trace routes) | Narrow the range or filters |
+| 504 | The query ran past `LOGGYTRACY_MAX_QUERY_RUNTIME` (`LOGGYTRACY_MAX_TRACE_QUERY_RUNTIME` on the trace routes, `LOGGYTRACY_MAX_METRIC_QUERY_RUNTIME` on the metric ones) | Narrow the range or filters |
 
 ## Limits
 

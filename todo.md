@@ -206,6 +206,17 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
       decided with the user, 2026-08-26). Revisiting this means revisiting the bed's exact-agreement
       digests, so it does not happen casually.
 
+- [ ] **The two exact-class shapes return two fewer points than VictoriaMetrics, and the digest has not
+      adjudicated it yet.** Measured 2026-08-27 on the Phase 7 smoke, same anchor and knobs on both
+      sides: `raw_range` and `agg_sum_by` answered 44 points where VictoriaMetrics answered 46
+      (`churned_selector`, `instant_alert`, `quantile_p99` and `rate_range` matched exactly at
+      88/6/84/84). Six queries per shape over three windows, so two of them carry one point fewer —
+      the suspects are how each side treats a window whose span is not a whole multiple of `step` and
+      whether VictoriaMetrics aligns `start` down to a step boundary. It is a count difference, not yet
+      a value difference: the per-answer records both sides already emit are what settles it, so Phase 8
+      wires the comparison and Phase 9 publishes whichever way it falls. Not fixed blind before then —
+      guessing at the boundary rule is how a bed starts measuring its author.
+
 Found while building the metrics bed, and not a metrics defect: **the log bed's next rerun will 403 at
 the seed phase.** The env tenant allowlist was removed after the last published run — the pushed policy
 is now the registry and an instance with no pushed tenants serves nobody — and `compare/run.sh` never

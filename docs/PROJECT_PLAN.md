@@ -237,7 +237,10 @@ tracks execution state per phase.
   `metric_part_fully_expired` predicate, and the size-tiered metric
   compactor with a commit-record replay for every crash window, local and
   remote.
-- [ ] Phase 7 — the read path and its `QUERY_API.md` sections.
+- [x] Phase 7 — the read path: seven first-party routes, the executor that
+  bounds a selection before decoding a chunk, `QUERY_API.md` under the
+  pinning test, and the bed's frozen parser accepting every answer from a
+  live server (six shapes, zero errors).
 - [ ] Phase 8 — bed completion and the memory-gate scenario.
 - [ ] Phase 9 — run, regenerate, publish `COMPARISON_METRICS.md` win or
   lose.

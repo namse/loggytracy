@@ -272,16 +272,30 @@ pub enum QueryEndpoint {
     Histogram,
     Traces,
     TraceById,
+    MetricQuery,
+    MetricInstant,
+    MetricQuantile,
+    MetricNames,
+    MetricLabels,
+    MetricLabelValues,
+    MetricSeries,
 }
 
 impl QueryEndpoint {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 13] = [
         Self::Query,
         Self::Tail,
         Self::Logs,
         Self::Histogram,
         Self::Traces,
         Self::TraceById,
+        Self::MetricQuery,
+        Self::MetricInstant,
+        Self::MetricQuantile,
+        Self::MetricNames,
+        Self::MetricLabels,
+        Self::MetricLabelValues,
+        Self::MetricSeries,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -293,6 +307,13 @@ impl QueryEndpoint {
             Self::Histogram => "logs_histogram",
             Self::Traces => "traces",
             Self::TraceById => "trace_by_id",
+            Self::MetricQuery => "metrics_query",
+            Self::MetricInstant => "metrics_instant",
+            Self::MetricQuantile => "metrics_quantile",
+            Self::MetricNames => "metrics_names",
+            Self::MetricLabels => "metrics_labels",
+            Self::MetricLabelValues => "metrics_label_values",
+            Self::MetricSeries => "metrics_series",
         }
     }
 }

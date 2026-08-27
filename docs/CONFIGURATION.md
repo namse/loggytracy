@@ -255,6 +255,11 @@ Small catalog files such as `meta.json` are not evicted; the data body and the b
 | `LOGGYTRACY_MAX_TRACE_RESTORE_RUNTIME` | `25s` | Cache-miss restore timeout for trace parts |
 | `LOGGYTRACY_MAX_ACTIVE_SERIES` | 500,000 | Live metric series per tenant (M14). At the limit a datapoint for an *unknown* series is refused via OTLP `partial_success` naming the count, the limit and the horizon; known series are always accepted. The default is a guess until the memory gate calibrates the per-series cost |
 | `LOGGYTRACY_METRIC_SERIES_IDLE_TIMEOUT` | `600s` | How long a metric series may go without a sample before its index state is evicted (once flushed) and its capacity returns. History stays in parts; a returning series is re-created, and the one artifact — a delta counter restarting — is a counter reset `rate` absorbs |
+| `LOGGYTRACY_MAX_METRIC_SERIES_PER_QUERY` | 10,000 | Most series one metric query may select; over it the request is refused with 413 before any chunk is decoded |
+| `LOGGYTRACY_MAX_METRIC_POINTS_PER_QUERY` | 2,000,000 | Most `series × steps` output points one metric query may ask for — the bound the memory reservation is sized from |
+| `LOGGYTRACY_MAX_CONCURRENT_METRIC_SCANS` | 8 | The metric surface's own scan slots — Gorilla decode plus per-step folds is a third cost profile, so it does not compete for the log or trace scanners' |
+| `LOGGYTRACY_MAX_METRIC_QUERY_RUNTIME` | `30s` | |
+| `LOGGYTRACY_MAX_METRIC_RESTORE_RUNTIME` | `25s` | Cache-miss restore timeout for metric parts |
 
 The LogQL metric evaluator left with the read-path decision (issue #3), and
 its knobs left with it: `LOGGYTRACY_MAX_METRIC_EVALUATION_POINTS` (renamed

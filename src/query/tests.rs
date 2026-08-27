@@ -3547,3 +3547,620 @@ async fn a_tenant_without_a_pushed_policy_is_refused_on_every_trace_path() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
     }
 }
+
+// --- The first-party metric API (M14, issue #8) ---
+
+/// A metric state whose journal owns the series memtable the scan reads.
+fn metric_state(
+    data_dir: &std::path::Path,
+    mutate: impl FnOnce(&mut Config),
+) -> Arc<AppState> {
+    let mut config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    mutate(&mut config);
+    let memtable = Arc::new(MemTable::new());
+    let parts = Arc::new(PartRegistry::new());
+    let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+        parts.operation_lock(),
+    ));
+    crate::test_support::state(
+        config.clone(),
+        memtable.clone(),
+        Arc::new(Journal::spawn(&config, memtable).unwrap()),
+        parts,
+        trace_parts,
+        None,
+    )
+}
+
+/// The scrape grid every metric test reads from: whole seconds so the
+/// documented `start + k*step` alignment is checkable by eye.
+const METRIC_ANCHOR_NS: i64 = 1_772_000_000_000_000_000;
+const METRIC_SECOND_NS: i64 = 1_000_000_000;
+
+fn metric_labels(name: &str, pairs: &[(&str, &str)]) -> crate::series::SeriesLabels {
+    let mut all = vec![(
+        crate::series::METRIC_NAME_LABEL.to_string(),
+        name.to_string(),
+    )];
+    all.extend(
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+    );
+    crate::series::SeriesLabels::from_pairs(all)
+}
+
+/// Samples land through the memtable the journal owns, which is the half of
+/// the read path a unit test can reach without a flush.
+fn insert_metric_samples(
+    state: &AppState,
+    labels: &crate::series::SeriesLabels,
+    samples: &[(i64, f64)],
+) {
+    state.journal.series_memtable().insert(
+        samples
+            .iter()
+            .map(|(ts_ns, value)| crate::series::MetricSample {
+                tenant: test_tenant(),
+                labels: labels.clone(),
+                ts_ns: *ts_ns,
+                value: *value,
+                kind: crate::series::SampleKind::Gauge,
+                datapoint_index: 0,
+            })
+            .collect(),
+    );
+}
+
+/// One NDJSON series row's samples as `(nanoseconds, value)`, asserting the
+/// pinned wire shape on the way: a `[string, number]` pair per sample, which
+/// is what the comparison bed's parser requires of every answer.
+fn metric_row_samples(row: &serde_json::Value) -> Vec<(i64, f64)> {
+    row["samples"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a series row carries a samples array: {row}"))
+        .iter()
+        .map(|pair| {
+            let pair = pair.as_array().expect("a sample is a two-element array");
+            assert_eq!(pair.len(), 2, "a sample is [timestamp, value]");
+            let ts: i64 = pair[0]
+                .as_str()
+                .expect("a sample timestamp is a nanosecond string")
+                .parse()
+                .expect("a sample timestamp parses");
+            (ts, pair[1].as_f64().expect("a sample value is a number"))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_metric_route_refuses_an_unknown_parameter_with_its_own_list() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/metrics/query?metric=up&start=0&step=30s&direction=backward",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("unknown parameter 'direction'"), "{body}");
+    assert!(body.contains("lookback"), "{body}");
+    assert!(body.contains("docs/QUERY_API.md"), "{body}");
+}
+
+#[tokio::test]
+async fn a_comparison_operator_on_a_metric_label_is_refused_with_the_fix() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    let (status, body) = first_party_get(
+        state,
+        "/loggytracy/api/v1/metrics/query?metric=up&start=0&step=30s&attr=shard%3E=3",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("uses a comparison"), "{body}");
+    assert!(body.contains("=, !=, =~, !~"), "{body}");
+}
+
+#[tokio::test]
+async fn the_cross_field_metric_rules_each_teach_their_pair() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    for (query, expected) in [
+        (
+            "metric=c&start=0&step=30s&func=rate",
+            "func was given without range",
+        ),
+        (
+            "metric=c&start=0&step=30s&range=60s",
+            "range was given without func",
+        ),
+        (
+            "metric=c&start=0&step=30s&by=service",
+            "by was given without agg",
+        ),
+        ("metric=c&step=30s", "start is required"),
+        ("metric=c&start=0", "step is required"),
+        ("start=0&step=30s", "metric is required"),
+    ] {
+        let (status, body) =
+            first_party_get(state.clone(), &format!("/loggytracy/api/v1/metrics/query?{query}"))
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert!(body.contains(expected), "{query}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_gauge_range_query_answers_the_documented_ndjson_on_the_step_grid() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    let labels = metric_labels("queue_depth", &[("instance", "a"), ("service", "api")]);
+    insert_metric_samples(
+        &state,
+        &labels,
+        &[
+            (METRIC_ANCHOR_NS, 1.0),
+            (METRIC_ANCHOR_NS + 30 * METRIC_SECOND_NS, 2.0),
+            (METRIC_ANCHOR_NS + 60 * METRIC_SECOND_NS, 3.0),
+        ],
+    );
+    let (status, body) = first_party_get(
+        state,
+        &format!(
+            "/loggytracy/api/v1/metrics/query?metric=queue_depth&start={}&end={}&step=30s",
+            METRIC_ANCHOR_NS,
+            METRIC_ANCHOR_NS + 60 * METRIC_SECOND_NS
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1, "one line per output series");
+    assert_eq!(rows[0]["labels"]["instance"], "a");
+    assert_eq!(rows[0]["labels"]["service"], "api");
+    assert!(
+        rows[0]["labels"].get(crate::series::METRIC_NAME_LABEL).is_none(),
+        "the query named the metric, so the identity does not repeat it: {body}"
+    );
+    assert_eq!(
+        metric_row_samples(&rows[0]),
+        vec![
+            (METRIC_ANCHOR_NS, 1.0),
+            (METRIC_ANCHOR_NS + 30 * METRIC_SECOND_NS, 2.0),
+            (METRIC_ANCHOR_NS + 60 * METRIC_SECOND_NS, 3.0),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn lookback_carries_a_value_forward_and_then_stops() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    let labels = metric_labels("queue_depth", &[("instance", "a")]);
+    // One sample at the anchor and nothing after: a 45s lookback answers the
+    // step 30s later and leaves the step at 60s without a point.
+    insert_metric_samples(&state, &labels, &[(METRIC_ANCHOR_NS, 7.0)]);
+    let (status, body) = first_party_get(
+        state,
+        &format!(
+            "/loggytracy/api/v1/metrics/query?metric=queue_depth&start={}&end={}&step=30s&lookback=45s",
+            METRIC_ANCHOR_NS,
+            METRIC_ANCHOR_NS + 60 * METRIC_SECOND_NS
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(
+        metric_row_samples(&rows[0]),
+        vec![
+            (METRIC_ANCHOR_NS, 7.0),
+            (METRIC_ANCHOR_NS + 30 * METRIC_SECOND_NS, 7.0),
+        ],
+        "a step past the lookback horizon is omitted, not zero: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_counter_reset_is_absorbed_by_the_positive_delta_sum() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    let labels = metric_labels("http_requests_total", &[("instance", "a")]);
+    // 5 → 8 → 2 → 4: the restart contributes its post-reset value, so the
+    // window's increase is 3 + 2 + 2 = 7 — the VictoriaMetrics definition the
+    // M14 decision record chose, with no extrapolation.
+    insert_metric_samples(
+        &state,
+        &labels,
+        &[
+            (METRIC_ANCHOR_NS, 5.0),
+            (METRIC_ANCHOR_NS + 10 * METRIC_SECOND_NS, 8.0),
+            (METRIC_ANCHOR_NS + 20 * METRIC_SECOND_NS, 2.0),
+            (METRIC_ANCHOR_NS + 30 * METRIC_SECOND_NS, 4.0),
+        ],
+    );
+    let at = METRIC_ANCHOR_NS + 30 * METRIC_SECOND_NS;
+    let (status, body) = first_party_get(
+        state.clone(),
+        &format!(
+            "/loggytracy/api/v1/metrics/query?metric=http_requests_total&start={at}&end={at}\
+&step=30s&func=increase&range=60s"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(metric_row_samples(&rows[0]), vec![(at, 7.0)]);
+
+    // The same window as a rate is the increase over its seconds.
+    let (status, body) = first_party_get(
+        state,
+        &format!(
+            "/loggytracy/api/v1/metrics/query?metric=http_requests_total&start={at}&end={at}\
+&step=30s&func=rate&range=60s"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    let samples = metric_row_samples(&rows[0]);
+    assert!(
+        (samples[0].1 - 7.0 / 60.0).abs() < 1e-12,
+        "rate is increase over the window's seconds: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_aggregation_groups_by_the_named_keys_and_count_counts_series() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    for (service, instance, value) in [
+        ("api", "a", 1.0),
+        ("api", "b", 2.0),
+        ("worker", "a", 10.0),
+    ] {
+        insert_metric_samples(
+            &state,
+            &metric_labels("queue_depth", &[("service", service), ("instance", instance)]),
+            &[(METRIC_ANCHOR_NS, value)],
+        );
+    }
+    let window = format!(
+        "start={}&end={}&step=30s",
+        METRIC_ANCHOR_NS, METRIC_ANCHOR_NS
+    );
+    let (status, body) = first_party_get(
+        state.clone(),
+        &format!("/loggytracy/api/v1/metrics/query?metric=queue_depth&{window}&agg=sum&by=service"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 2, "one group per service: {body}");
+    let by_service: std::collections::BTreeMap<String, f64> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["labels"]["service"].as_str().unwrap().to_string(),
+                metric_row_samples(row)[0].1,
+            )
+        })
+        .collect();
+    assert_eq!(by_service["api"], 3.0);
+    assert_eq!(by_service["worker"], 10.0);
+
+    // `agg` without `by` folds everything into the one empty-labeled group.
+    let (status, body) = first_party_get(
+        state,
+        &format!("/loggytracy/api/v1/metrics/query?metric=queue_depth&{window}&agg=count"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["labels"].as_object().unwrap().len(), 0);
+    assert_eq!(metric_row_samples(&rows[0])[0].1, 3.0, "three series: {body}");
+}
+
+#[tokio::test]
+async fn an_instant_query_answers_one_row_per_series_at_its_instant() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    let labels = metric_labels("queue_depth", &[("instance", "a")]);
+    insert_metric_samples(
+        &state,
+        &labels,
+        &[
+            (METRIC_ANCHOR_NS, 1.0),
+            (METRIC_ANCHOR_NS + 30 * METRIC_SECOND_NS, 9.0),
+        ],
+    );
+    let at = METRIC_ANCHOR_NS + 30 * METRIC_SECOND_NS;
+    let (status, body) = first_party_get(
+        state,
+        &format!("/loggytracy/api/v1/metrics/instant?metric=queue_depth&at={at}&agg=max"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["timestamp"].as_str().unwrap(),
+        at.to_string(),
+        "the alert shape carries its instant as a nanosecond string: {body}"
+    );
+    assert_eq!(rows[0]["value"].as_f64().unwrap(), 9.0);
+}
+
+#[tokio::test]
+async fn a_quantile_interpolates_within_the_bracketing_bucket() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    // Cumulative bucket counts over the window: 0 → (2, 6, 10). The p50 of
+    // ten observations ranks at 5, inside the (0.1, 0.5] bucket whose four
+    // observations span it — 0.1 + (5-2)/4 * 0.4 = 0.4.
+    for (le, counts) in [
+        ("0.1", [0.0, 2.0]),
+        ("0.5", [0.0, 6.0]),
+        ("+Inf", [0.0, 10.0]),
+    ] {
+        insert_metric_samples(
+            &state,
+            &metric_labels(
+                "http_request_duration_seconds_bucket",
+                &[("instance", "a"), ("le", le)],
+            ),
+            &[
+                (METRIC_ANCHOR_NS, counts[0]),
+                (METRIC_ANCHOR_NS + 30 * METRIC_SECOND_NS, counts[1]),
+            ],
+        );
+    }
+    let at = METRIC_ANCHOR_NS + 30 * METRIC_SECOND_NS;
+    let (status, body) = first_party_get(
+        state,
+        &format!(
+            "/loggytracy/api/v1/metrics/quantile?metric=http_request_duration_seconds\
+&q=0.5&start={at}&end={at}&step=30s&range=60s"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1, "{body}");
+    assert!(
+        rows[0]["labels"].get("le").is_none(),
+        "the bucket label is consumed by the interpolation: {body}"
+    );
+    let value = metric_row_samples(&rows[0])[0].1;
+    assert!((value - 0.4).abs() < 1e-9, "p50 interpolates to 0.4: {value}");
+}
+
+#[tokio::test]
+async fn a_summary_backed_name_refuses_the_quantile_route_with_the_alternative() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    insert_metric_samples(
+        &state,
+        &metric_labels("gc_pause_seconds", &[("quantile", "0.99")]),
+        &[(METRIC_ANCHOR_NS, 0.25)],
+    );
+    let (status, body) = first_party_get(
+        state,
+        &format!(
+            "/loggytracy/api/v1/metrics/quantile?metric=gc_pause_seconds&q=0.99\
+&start={METRIC_ANCHOR_NS}&end={METRIC_ANCHOR_NS}&step=30s&range=60s"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("summary-backed"), "{body}");
+    assert!(body.contains("/metrics/query"), "{body}");
+}
+
+#[tokio::test]
+async fn a_selection_past_the_series_cap_is_a_413_before_any_decode() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |config| config.max_metric_series_per_query = 2);
+    for instance in ["a", "b", "c"] {
+        insert_metric_samples(
+            &state,
+            &metric_labels("queue_depth", &[("instance", instance)]),
+            &[(METRIC_ANCHOR_NS, 1.0)],
+        );
+    }
+    let (status, body) = first_party_get(
+        state,
+        &format!(
+            "/loggytracy/api/v1/metrics/query?metric=queue_depth&start={METRIC_ANCHOR_NS}\
+&end={METRIC_ANCHOR_NS}&step=30s"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.contains("metric selection exceeds"), "{body}");
+    assert!(body.contains("matched 3"), "{body}");
+    assert!(
+        body.contains("LOGGYTRACY_MAX_METRIC_SERIES_PER_QUERY"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_selection_past_the_point_cap_names_the_steps_that_made_it() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |config| config.max_metric_points_per_query = 2);
+    insert_metric_samples(
+        &state,
+        &metric_labels("queue_depth", &[("instance", "a")]),
+        &[(METRIC_ANCHOR_NS, 1.0)],
+    );
+    let (status, body) = first_party_get(
+        state,
+        &format!(
+            "/loggytracy/api/v1/metrics/query?metric=queue_depth&start={METRIC_ANCHOR_NS}\
+&end={}&step=30s",
+            METRIC_ANCHOR_NS + 90 * METRIC_SECOND_NS
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.contains("output points"), "{body}");
+    assert!(body.contains("coarsen step"), "{body}");
+}
+
+#[tokio::test]
+async fn a_metric_scan_that_finds_no_pool_memory_is_a_429_and_counts_exhaustion() {
+    let data_dir = temp_dir();
+    // One reservation chunk of shared budget; the grid below is bounded past
+    // it before a single chunk is decoded.
+    let state = metric_state(&data_dir, |config| {
+        config.query_memory_budget_bytes = crate::query_memory::RESERVATION_CHUNK_BYTES;
+    });
+    insert_metric_samples(
+        &state,
+        &metric_labels("queue_depth", &[("instance", "a")]),
+        &[(METRIC_ANCHOR_NS, 1.0)],
+    );
+    // 1 000 001 steps at 16 estimated bytes each is 16 MB against an 8 MiB
+    // pool, and stays under the point cap so the refusal is the pool's.
+    let (status, body) = first_party_get(
+        state.clone(),
+        &format!(
+            "/loggytracy/api/v1/metrics/query?metric=queue_depth&start={METRIC_ANCHOR_NS}\
+&end={}&step=1s",
+            METRIC_ANCHOR_NS + 1_000_000 * METRIC_SECOND_NS
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(body.contains(crate::query_memory::EXHAUSTED_PREFIX), "{body}");
+    assert_eq!(
+        state.query_memory_pool.exhausted(),
+        1,
+        "the refusal stays visible after the client was told the right thing"
+    );
+}
+
+#[tokio::test]
+async fn metric_discovery_answers_exactly_and_within_its_window() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    insert_metric_samples(
+        &state,
+        &metric_labels("queue_depth", &[("service", "api")]),
+        &[(METRIC_ANCHOR_NS, 1.0)],
+    );
+    insert_metric_samples(
+        &state,
+        &metric_labels("http_requests_total", &[("service", "worker")]),
+        &[(METRIC_ANCHOR_NS + 3_600 * METRIC_SECOND_NS, 5.0)],
+    );
+    let early = format!(
+        "start={}&end={}",
+        METRIC_ANCHOR_NS,
+        METRIC_ANCHOR_NS + 60 * METRIC_SECOND_NS
+    );
+
+    let (status, body) =
+        first_party_get(state.clone(), &format!("/loggytracy/api/v1/metrics/names?{early}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<String> = ndjson_rows(&body)
+        .iter()
+        .map(|row| row["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["queue_depth".to_string()],
+        "the later series is outside the window: {body}"
+    );
+
+    let (status, body) =
+        first_party_get(state.clone(), &format!("/loggytracy/api/v1/metrics/labels?{early}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let keys: Vec<String> = ndjson_rows(&body)
+        .iter()
+        .map(|row| row["key"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(keys, vec!["service".to_string()], "{body}");
+
+    let (status, body) = first_party_get(
+        state.clone(),
+        &format!("/loggytracy/api/v1/metrics/labels/service/values?{early}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let values: Vec<String> = ndjson_rows(&body)
+        .iter()
+        .map(|row| row["value"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(values, vec!["api".to_string()], "{body}");
+
+    let (status, body) = first_party_get(
+        state,
+        &format!("/loggytracy/api/v1/metrics/series?metric=queue_depth&{early}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = ndjson_rows(&body);
+    assert_eq!(rows.len(), 1, "{body}");
+    assert_eq!(rows[0]["labels"]["service"], "api");
+    assert_eq!(
+        rows[0]["labels"][crate::series::METRIC_NAME_LABEL], "queue_depth",
+        "the series route enumerates identities, so it keeps the name: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_tenant_without_a_pushed_policy_is_refused_on_every_metric_path() {
+    let data_dir = temp_dir();
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    let memtable = Arc::new(MemTable::new());
+    let parts = Arc::new(PartRegistry::new());
+    let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+        parts.operation_lock(),
+    ));
+    let journal = Arc::new(Journal::spawn(&config, memtable.clone()).unwrap());
+    let state = crate::test_support::state_with_tenant_policy(
+        config,
+        memtable,
+        journal,
+        parts,
+        trace_parts,
+        None,
+        Arc::new(crate::tenant_policy::TenantPolicy::enabled_for_test()),
+    );
+
+    for path in [
+        "/loggytracy/api/v1/metrics/query?metric=c&start=0&end=1&step=30s",
+        "/loggytracy/api/v1/metrics/instant?metric=c&at=0",
+        "/loggytracy/api/v1/metrics/quantile?metric=c&q=0.9&start=0&end=1&step=30s&range=60s",
+        "/loggytracy/api/v1/metrics/names?start=0&end=1",
+        "/loggytracy/api/v1/metrics/labels?start=0&end=1",
+        "/loggytracy/api/v1/metrics/labels/k/values?start=0&end=1",
+        "/loggytracy/api/v1/metrics/series?start=0&end=1",
+    ] {
+        let (status, body) = first_party_get(state.clone(), path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn the_api_fallback_lists_the_metric_routes() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    let (status, body) = first_party_get(state, "/loggytracy/api/v1/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("/loggytracy/api/v1/metrics/query"), "{body}");
+    assert!(
+        body.contains("/loggytracy/api/v1/metrics/labels/{key}/values"),
+        "{body}"
+    );
+}

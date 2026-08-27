@@ -219,6 +219,16 @@ pub struct Config {
     /// *unknown* series is refused — the cardinality defence of the M14
     /// degradation ladder. Known series are accepted unconditionally.
     pub max_active_series: usize,
+    /// Most series one metric query may select; over it the request is
+    /// refused before any chunk is decoded.
+    pub max_metric_series_per_query: usize,
+    /// Most `series × steps` output points one metric query may ask for —
+    /// the bound the memory reservation is sized from, enforced before the
+    /// scan starts.
+    pub max_metric_points_per_query: usize,
+    pub max_concurrent_metric_scans: usize,
+    pub max_metric_query_runtime: Duration,
+    pub max_metric_restore_runtime: Duration,
     /// How long a series may go without a new sample before its index state
     /// is evicted (once its samples are flushed). This is the horizon at
     /// which churned-away series return their capacity.
@@ -322,6 +332,11 @@ impl Default for Config {
             // gate calibrates it before the M14 comparison publishes.
             max_active_series: 500_000,
             metric_series_idle_timeout: Duration::from_secs(600),
+            max_metric_series_per_query: 10_000,
+            max_metric_points_per_query: 2_000_000,
+            max_concurrent_metric_scans: 8,
+            max_metric_query_runtime: Duration::from_secs(30),
+            max_metric_restore_runtime: Duration::from_secs(25),
             shutdown_flush_warn_after: Duration::from_secs(30),
             startup_retry_budget: Duration::from_secs(300),
             malloc_trim_interval: Some(Duration::from_secs(60)),
@@ -722,6 +737,26 @@ impl Config {
                 "LOGGYTRACY_METRIC_SERIES_IDLE_TIMEOUT",
                 defaults.metric_series_idle_timeout,
             )?,
+            max_metric_series_per_query: env_positive_usize(
+                "LOGGYTRACY_MAX_METRIC_SERIES_PER_QUERY",
+                defaults.max_metric_series_per_query,
+            )?,
+            max_metric_points_per_query: env_positive_usize(
+                "LOGGYTRACY_MAX_METRIC_POINTS_PER_QUERY",
+                defaults.max_metric_points_per_query,
+            )?,
+            max_concurrent_metric_scans: env_positive_usize(
+                "LOGGYTRACY_MAX_CONCURRENT_METRIC_SCANS",
+                defaults.max_concurrent_metric_scans,
+            )?,
+            max_metric_query_runtime: env_required_duration(
+                "LOGGYTRACY_MAX_METRIC_QUERY_RUNTIME",
+                defaults.max_metric_query_runtime,
+            )?,
+            max_metric_restore_runtime: env_required_duration(
+                "LOGGYTRACY_MAX_METRIC_RESTORE_RUNTIME",
+                defaults.max_metric_restore_runtime,
+            )?,
             startup_retry_budget: env_required_duration(
                 "LOGGYTRACY_STARTUP_RETRY_BUDGET",
                 defaults.startup_retry_budget,
@@ -906,6 +941,23 @@ selected above the read budget can never be merged",
         positive_duration(
             "metric_series_idle_timeout",
             self.metric_series_idle_timeout,
+        )?;
+        positive_usize(
+            "max_metric_series_per_query",
+            self.max_metric_series_per_query,
+        )?;
+        positive_usize(
+            "max_metric_points_per_query",
+            self.max_metric_points_per_query,
+        )?;
+        positive_usize(
+            "max_concurrent_metric_scans",
+            self.max_concurrent_metric_scans,
+        )?;
+        positive_duration("max_metric_query_runtime", self.max_metric_query_runtime)?;
+        positive_duration(
+            "max_metric_restore_runtime",
+            self.max_metric_restore_runtime,
         )?;
         positive_duration("shutdown_flush_warn_after", self.shutdown_flush_warn_after)
     }

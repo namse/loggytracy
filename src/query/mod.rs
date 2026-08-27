@@ -13,6 +13,7 @@ use crate::AppState;
 use crate::logql::{self};
 use crate::memtable::{Labels, LogEntry, SharedLabels, StreamResult};
 use crate::part;
+use crate::series::SeriesLabels;
 use crate::tenant::TenantId;
 
 const MAX_HISTOGRAM_BUCKETS: usize = 10_000;
@@ -46,11 +47,16 @@ fn metric_error_status(error: &str) -> StatusCode {
         // request against a smaller trace succeeds, so 400 would blame the
         // client for the data and 429 would promise a retry can help.
         StatusCode::PAYLOAD_TOO_LARGE
+    } else if error.starts_with("metric selection exceeds") {
+        // The trace-413 rationale again: a statement about the data's
+        // cardinality in the window, not the request's shape.
+        StatusCode::PAYLOAD_TOO_LARGE
     } else if error == "query timed out"
         || error == "metric query timed out"
         || error == "object store restore timed out"
         || error == "trace query timed out"
         || error == "trace object store restore timed out"
+        || error == "metric object store restore timed out"
     {
         StatusCode::GATEWAY_TIMEOUT
     } else {
@@ -281,6 +287,9 @@ include!("delete_api.rs");
 include!("tail.rs");
 include!("traces.rs");
 include!("trace_scan.rs");
+include!("metric_scan.rs");
+include!("metrics_query.rs");
+include!("metrics_metadata.rs");
 
 #[cfg(test)]
 mod tests {

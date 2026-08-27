@@ -198,6 +198,11 @@ struct SeriesBuffer {
     /// vector in.
     spill: Vec<(i64, f64)>,
     last_ts: Option<i64>,
+    /// The timestamps the *buffered* samples span, maintained on insert and
+    /// moved out with them at `begin_flush`. Discovery reads them to answer a
+    /// window without decoding a chunk, which is the whole reason those routes
+    /// can promise an exact answer cheaply.
+    buffered: Option<(i64, i64)>,
     /// Delta-conversion state. Survives `begin_flush` deliberately — see the
     /// module doc.
     running_total: Option<f64>,
@@ -210,6 +215,7 @@ impl SeriesBuffer {
             open: gorilla::Encoder::new(),
             spill: Vec::new(),
             last_ts: None,
+            buffered: None,
             running_total: None,
         }
     }
@@ -217,6 +223,27 @@ impl SeriesBuffer {
     fn has_samples(&self) -> bool {
         !self.closed.is_empty() || !self.open.is_empty() || !self.spill.is_empty()
     }
+
+    fn observe(&mut self, ts_ns: i64) {
+        self.buffered = Some(match self.buffered {
+            Some((min, max)) => (min.min(ts_ns), max.max(ts_ns)),
+            None => (ts_ns, ts_ns),
+        });
+    }
+
+    fn absorb(&mut self, bounds: Option<(i64, i64)>) {
+        if let Some((min, max)) = bounds {
+            self.observe(min);
+            self.observe(max);
+        }
+    }
+}
+
+/// Whether two inclusive timestamp ranges touch.
+fn ranges_overlap(bounds: Option<(i64, i64)>, start_ns: i64, end_ns: i64) -> bool {
+    // An absent bound cannot prune: metadata that cannot answer must not be
+    // able to hide data (the rule `trace_part` states for its row groups).
+    bounds.is_none_or(|(min, max)| max >= start_ns && min <= end_ns)
 }
 
 /// One series' buffered samples as `begin_flush` hands them to the flush:
@@ -225,6 +252,9 @@ pub struct SnapshotSeries {
     pub labels: SeriesLabels,
     pub chunks: Vec<Vec<u8>>,
     pub spill: Vec<(i64, f64)>,
+    /// The timestamps these samples span, carried so an abort can return them
+    /// to the buffer without decoding what it is putting back.
+    pub bounds: Option<(i64, i64)>,
 }
 
 impl SnapshotSeries {
@@ -445,6 +475,7 @@ impl SeriesMemTable {
                 added += (buffer.open.byte_len() - before) as u64;
                 buffer.last_ts = Some(sample.ts_ns);
             }
+            buffer.observe(sample.ts_ns);
         }
         drop(inner);
         self.inner_bytes.fetch_add(added, Ordering::Relaxed);
@@ -477,6 +508,7 @@ impl SeriesMemTable {
                     labels: labels.clone(),
                     chunks,
                     spill,
+                    bounds: buffer.buffered.take(),
                 });
             }
             if !list.is_empty() {
@@ -525,6 +557,7 @@ impl SeriesMemTable {
                 chunks.append(&mut buffer.closed);
                 buffer.closed = chunks;
                 buffer.spill.extend(series.spill);
+                buffer.absorb(series.bounds);
             }
         }
         drop(inner);
@@ -577,6 +610,84 @@ impl SeriesMemTable {
             .get(tenant)
             .map(|series| series.len())
             .unwrap_or(0)
+    }
+
+    /// Every live series identity a tenant holds — the memtable half of
+    /// selection and discovery. Entries whose samples have all flushed still
+    /// appear: their state is live, and their history answers from parts.
+    pub fn series_labels(&self, tenant: &TenantId) -> Vec<SeriesLabels> {
+        self.inner
+            .read()
+            .get(tenant)
+            .map(|series| series.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The tenant's series whose *buffered* samples reach `[start_ns,
+    /// end_ns]`, the in-flight flush included. Answered from the recorded
+    /// bounds alone, so a discovery request never decodes a chunk — and a
+    /// series whose samples have all been flushed is left to the part
+    /// catalogs, which is where they now are.
+    pub fn series_labels_in_range(
+        &self,
+        tenant: &TenantId,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Vec<SeriesLabels> {
+        let mut labels: BTreeSet<SeriesLabels> = BTreeSet::new();
+        if let Some(snapshot) = self.flushing.read().as_ref()
+            && let Some(list) = snapshot.tenants.get(tenant)
+        {
+            for series in list {
+                if ranges_overlap(series.bounds, start_ns, end_ns) {
+                    labels.insert(series.labels.clone());
+                }
+            }
+        }
+        if let Some(series) = self.inner.read().get(tenant) {
+            for (key, buffer) in series {
+                if buffer.has_samples() && ranges_overlap(buffer.buffered, start_ns, end_ns) {
+                    labels.insert(key.clone());
+                }
+            }
+        }
+        labels.into_iter().collect()
+    }
+
+    /// One series' buffered samples, time-sorted — the per-series read the
+    /// executor merges with the part chunks. The open encoder is cloned and
+    /// closed rather than disturbed.
+    pub fn sorted_samples_of(
+        &self,
+        tenant: &TenantId,
+        labels: &SeriesLabels,
+    ) -> Result<Vec<(i64, f64)>, String> {
+        let mut samples = Vec::new();
+        {
+            let flushing = self.flushing.read();
+            if let Some(snapshot) = flushing.as_ref()
+                && let Some(list) = snapshot.tenants.get(tenant)
+            {
+                for series in list {
+                    if series.labels == *labels {
+                        samples.extend(series.sorted_samples()?);
+                    }
+                }
+            }
+        }
+        let inner = self.inner.read();
+        if let Some(buffer) = inner.get(tenant).and_then(|series| series.get(labels)) {
+            for chunk in &buffer.closed {
+                samples.extend(gorilla::decode_all(chunk)?);
+            }
+            if !buffer.open.is_empty() {
+                samples.extend(gorilla::decode_all(&buffer.open.clone().close())?);
+            }
+            samples.extend(buffer.spill.iter().copied());
+        }
+        drop(inner);
+        samples.sort_by_key(|(ts, _)| *ts);
+        Ok(samples)
     }
 
     /// A tenant's buffered samples, time-sorted per series — the memtable
@@ -643,6 +754,7 @@ fn unwrap_snapshot(snapshot: Arc<SeriesSnapshot>) -> SeriesSnapshot {
                             labels: series.labels.clone(),
                             chunks: series.chunks.clone(),
                             spill: series.spill.clone(),
+                            bounds: series.bounds,
                         })
                         .collect(),
                 )
