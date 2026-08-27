@@ -72,10 +72,6 @@ impl Transport for HttpTransport {
                 };
 
             let status = response.status();
-            if status.is_success() {
-                return Outcome::Accepted;
-            }
-
             let explanation = response
                 .into_body()
                 .collect()
@@ -87,6 +83,11 @@ impl Transport for HttpTransport {
                     text.chars().take(REASON_LIMIT).collect::<String>()
                 })
                 .unwrap_or_default();
+
+            if status.is_success() {
+                return Outcome::Accepted(stored_number(&explanation));
+            }
+
             let reason = format!("{uri}: {status} {explanation}");
 
             if refuses_the_payload(status) {
@@ -96,6 +97,27 @@ impl Transport for HttpTransport {
             }
         })
     }
+}
+
+/// The number signy says it now holds, out of `{"stored":n}`.
+///
+/// Zero for an answer that does not say — the attempt is then committed whole,
+/// which is what happened before there was a number at all.
+fn stored_number(body: &str) -> u64 {
+    let Some(at) = body.find("\"stored\"") else {
+        return 0;
+    };
+    let rest = &body[at + "\"stored\"".len()..];
+    let Some(colon) = rest.find(':') else {
+        return 0;
+    };
+    rest[colon + 1..]
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
 }
 
 fn refuses_the_payload(status: StatusCode) -> bool {

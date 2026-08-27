@@ -88,7 +88,7 @@ async fn deliver_all<T: Transport>(sender: &Sender<T>, queue: &Queue) {
 async fn a_delivered_batch_advances_the_cursor_in_one_call() {
     let scratch = Scratch::new("send-ok");
     let queue = queue_with(&scratch, &frames(4, None));
-    let transport = Scripted::new(|_| Outcome::Accepted);
+    let transport = Scripted::new(|_| Outcome::Accepted(0));
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
 
     deliver_all(&sender, &queue).await;
@@ -111,7 +111,7 @@ async fn a_retryable_answer_is_retried_until_it_is_accepted() {
         if *seen < 3 {
             Outcome::Retry("signy is not up".to_string())
         } else {
-            Outcome::Accepted
+            Outcome::Accepted(0)
         }
     });
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
@@ -132,7 +132,7 @@ async fn a_refused_batch_is_halved_until_the_one_bad_record_is_dropped() {
         if frames.contains(&POISON) {
             Outcome::Refused("signy cannot decode this".to_string())
         } else {
-            Outcome::Accepted
+            Outcome::Accepted(0)
         }
     });
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
@@ -180,7 +180,7 @@ async fn shutdown_stops_a_retry_loop_without_advancing_the_cursor() {
 async fn the_run_loop_delivers_what_arrives_and_stops_on_shutdown() {
     let scratch = Scratch::new("send-run");
     let queue = queue_with(&scratch, &frames(3, None));
-    let transport = Scripted::new(|_| Outcome::Accepted);
+    let transport = Scripted::new(|_| Outcome::Accepted(0));
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
 
     let (tx, rx) = watch::channel(false);
@@ -232,7 +232,9 @@ async fn fake_signy(
                             ));
                             http::Response::builder()
                                 .status(status)
-                                .body(http_body_util::Full::new(Bytes::from_static(b"refused")))
+                                .body(http_body_util::Full::new(Bytes::from_static(
+                                    br#"{"stored":42}"#,
+                                )))
                         }
                     },
                 );
@@ -249,7 +251,7 @@ async fn fake_signy(
 #[tokio::test]
 async fn a_success_over_http_carries_the_encoding_and_who_sent_it() {
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let address = fake_signy(http::StatusCode::NO_CONTENT, seen.clone()).await;
+    let address = fake_signy(http::StatusCode::OK, seen.clone()).await;
     let transport = HttpTransport::new(format!("http://{address}"), Duration::from_secs(5));
     let mut shipment = shipment(b"frames");
     shipment.start_sequence = 91;
@@ -257,7 +259,11 @@ async fn a_success_over_http_carries_the_encoding_and_who_sent_it() {
 
     let outcome = transport.deliver(shipment).await;
 
-    assert_eq!(outcome, Outcome::Accepted);
+    assert_eq!(
+        outcome,
+        Outcome::Accepted(42),
+        "the answer says how far this sender got"
+    );
     assert_eq!(
         seen.lock().as_slice(),
         [(
@@ -302,4 +308,43 @@ async fn a_refused_connection_asks_for_a_retry_rather_than_dropping() {
     let outcome = transport.deliver(shipment(b"frames")).await;
 
     assert!(matches!(outcome, Outcome::Retry(_)), "{outcome:?}");
+}
+
+/// signy answers with the number it holds, and that is what the cursor moves
+/// to. An answer covering less than was sent leaves the rest in the queue
+/// rather than taking them on trust.
+#[tokio::test]
+async fn an_answer_that_covers_less_than_was_sent_commits_only_that_much() {
+    let scratch = Scratch::new("send-partial");
+    let queue = queue_with(&scratch, &frames(4, None));
+    let transport = Scripted::new(|_| Outcome::Accepted(2));
+    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
+
+    let (_tx, mut rx) = watch::channel(false);
+    let batch = queue
+        .read_batch(usize::MAX, usize::MAX)
+        .expect("a batch")
+        .expect("records");
+    sender.deliver(batch, &mut rx).await;
+
+    assert_eq!(queue.cursor().sequence, 2);
+    assert_eq!(sender.stats().sent_records.load(Ordering::Relaxed), 2);
+    assert!(queue.has_records(), "the rest wait for the next batch");
+}
+
+/// signy can be ahead: an earlier attempt got further than collecty heard.
+/// The batch is still only committed as far as it goes, and the next one
+/// starts under the answer and is skipped there.
+#[tokio::test]
+async fn an_answer_beyond_the_batch_commits_no_more_than_the_batch() {
+    let scratch = Scratch::new("send-ahead");
+    let queue = queue_with(&scratch, &frames(3, None));
+    let transport = Scripted::new(|_| Outcome::Accepted(99));
+    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
+
+    deliver_all(&sender, &queue).await;
+
+    assert_eq!(queue.cursor().sequence, 3);
+    assert_eq!(sender.stats().sent_records.load(Ordering::Relaxed), 3);
+    assert!(!queue.has_records());
 }

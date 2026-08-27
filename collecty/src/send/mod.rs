@@ -19,7 +19,14 @@ pub type DeliverFuture<'a> = Pin<Box<dyn Future<Output = Outcome> + Send + 'a>>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Accepted,
+    /// Taken, and the number signy says it now holds for this sender.
+    ///
+    /// Normally the last record's number, and then the whole attempt is
+    /// committed. It can be higher — signy remembers more than this batch
+    /// carried, because an earlier attempt got further than collecty heard —
+    /// and the next batch simply starts under it and is skipped. Zero means
+    /// the answer said nothing, and the attempt is committed whole.
+    Accepted(u64),
     Retry(String),
     Refused(String),
 }
@@ -51,8 +58,15 @@ pub struct SenderConfig {
 impl Default for SenderConfig {
     fn default() -> Self {
         Self {
-            max_batch_plain_bytes: 8 * 1024 * 1024,
-            max_batch_records: 1024,
+            // What one batch costs *this* process, not what signy will hold.
+            // signy reads a batch as it arrives and never has more than a
+            // record of it in hand, so the number that used to sit under its
+            // admission ceiling now sits under nothing but the frames kept
+            // here while an attempt is out. Raised because the only time a
+            // large batch happens is when the backlog is large, which is
+            // exactly when the round trips are worth saving.
+            max_batch_plain_bytes: 64 * 1024 * 1024,
+            max_batch_records: 8192,
             retry_initial: Duration::from_millis(100),
             retry_max: Duration::from_secs(30),
         }
@@ -76,7 +90,7 @@ pub struct Sender<T> {
 }
 
 enum Attempt {
-    Accepted,
+    Accepted(u64),
     Refused(String),
     Aborted,
 }
@@ -154,15 +168,24 @@ impl<T: Transport> Sender<T> {
                 };
 
                 match self.attempt(shipment, shutdown).await {
-                    Attempt::Accepted => {
+                    Attempt::Accepted(stored) => {
+                        let Some(taken) = taken_upto(&records[from..to], stored) else {
+                            tracing::warn!(
+                                stored,
+                                first = records[from].end.sequence,
+                                "signy took none of the attempt it answered; holding it"
+                            );
+                            return;
+                        };
+                        let to = from + taken;
                         self.stats.sent_batches.fetch_add(1, Ordering::Relaxed);
                         self.stats
                             .sent_records
-                            .fetch_add((to - from) as u64, Ordering::Relaxed);
+                            .fetch_add(taken as u64, Ordering::Relaxed);
                         self.stats
                             .sent_bytes
                             .fetch_add(span.len() as u64, Ordering::Relaxed);
-                        self.commit(&records, to, (to - from) as u64);
+                        self.commit(&records, to, taken as u64);
                         from = to;
                         break;
                     }
@@ -202,7 +225,7 @@ impl<T: Transport> Sender<T> {
                 ..shipment
             };
             match self.transport.deliver(attempt).await {
-                Outcome::Accepted => return Attempt::Accepted,
+                Outcome::Accepted(stored) => return Attempt::Accepted(stored),
                 Outcome::Refused(reason) => return Attempt::Refused(reason),
                 Outcome::Retry(reason) => {
                     self.stats.retries.fetch_add(1, Ordering::Relaxed);
@@ -226,6 +249,24 @@ impl<T: Transport> Sender<T> {
             tracing::error!(%error, "the cursor could not be advanced");
         }
     }
+}
+
+/// How many of an attempt's records the answer covers.
+///
+/// Normally all of them: signy answers with the last record's number, or with
+/// a higher one of its own. A lower answer means it stopped short of what was
+/// sent, and the rest stay in the queue rather than being taken on trust —
+/// they are offered again on the next batch and skipped there if it turns out
+/// signy had them after all.
+fn taken_upto(records: &[BatchRecord], stored: u64) -> Option<usize> {
+    if stored == 0 {
+        return Some(records.len());
+    }
+    let taken = records
+        .iter()
+        .take_while(|record| record.end.sequence <= stored)
+        .count();
+    (taken > 0).then_some(taken)
 }
 
 fn jittered(backoff: Duration) -> Duration {
