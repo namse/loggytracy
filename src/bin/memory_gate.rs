@@ -88,6 +88,45 @@ const EXIT_USAGE: i32 = 64;
 /// instruments miss the same spikes and their numbers stay comparable.
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Which workload the gate drives.
+///
+/// The log scenario is M10's: a paced mixed load whose peak the budget is
+/// compared against. The metric one is M14's, and it asks the question the
+/// metrics claim rests on — an engine given a budget and then handed more
+/// series than that budget can index must contain the churn, not die of it.
+/// Its acceptance gate reads the **steady** phase alone: the churn and
+/// explosion phases refuse new series *by design*, and gating on their
+/// acceptance would fail the engine for doing the thing being measured.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Scenario {
+    Logs,
+    Metrics,
+}
+
+impl Scenario {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "logs" | "log" => Ok(Self::Logs),
+            "metrics" | "metric" => Ok(Self::Metrics),
+            other => Err(format!("--scenario must be logs or metrics, got {other:?}")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Logs => "logs",
+            Self::Metrics => "metrics",
+        }
+    }
+
+    fn phase(self) -> &'static str {
+        match self {
+            Self::Logs => "load",
+            Self::Metrics => "metric-load",
+        }
+    }
+}
+
 /// The workload has to have actually been delivered, or the budget was never
 /// exercised. A future budget knob could otherwise pass this gate by refusing
 /// every push with a `429` and holding nothing — which is the same class of
@@ -159,6 +198,7 @@ struct Args {
     server_env: Vec<(String, String)>,
     skip_build: bool,
     keep_data: bool,
+    scenario: Scenario,
 }
 
 const USAGE: &str = "\
@@ -183,6 +223,11 @@ usage: memory_gate --budget <size> [options]
                          (default: 150, the comparison bed's settle). 0 measures
                          only the peak of accepting load, which is what this
                          gate did before it was found to miss a kill.
+  --scenario <what>      logs (default) drives the paced mixed log load; metrics
+                         drives the M14 churn phases — steady, rolling series
+                         replacement, then a cardinality burst — and gates
+                         acceptance on the steady phase alone, because the
+                         later phases refuse new series by design
   --seed <n>             corpus seed (default: 1592598566, the comparison bed's)
   --port <n>             server HTTP port (default: 3251)
   --server-env K=V       extra environment for the server, repeatable
@@ -211,6 +256,7 @@ impl Args {
         let mut port = 3251;
         let mut settle = 150;
         let mut server_env = Vec::new();
+        let mut scenario = Scenario::Logs;
         let mut skip_build = false;
         let mut keep_data = false;
 
@@ -232,6 +278,7 @@ impl Args {
                 "--connections" => connections = parse_number(&value()?)?,
                 "--query-eps" => query_eps = parse_number(&value()?)?,
                 "--query-connections" => query_connections = parse_number(&value()?)?,
+                "--scenario" => scenario = Scenario::parse(&value()?)?,
                 "--seed" => seed = parse_number(&value()?)?,
                 "--port" => port = parse_number(&value()?)?,
                 "--settle" => settle = parse_number(&value()?)?,
@@ -292,6 +339,7 @@ writes is not the workload this gate exists to measure"
             server_env,
             skip_build,
             keep_data,
+            scenario,
         })
     }
 }
@@ -577,12 +625,36 @@ fn measure(args: &Args, facts: &mut Map<String, Value>) -> Result<Outcome, Strin
         }),
     );
 
-    let delivered = harness_report
-        .as_ref()
-        .and_then(|report| report.pointer("/ingest/events_accepted"))
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let delivered_fraction = delivered / args.events.max(1) as f64;
+    // What "delivered" means is the scenario's to say. The log run counts
+    // accepted events against the offered target. The metric run reads the
+    // **steady** phase's acceptance and nothing else: the churn and explosion
+    // phases refuse new series by design, and a gate that counted those
+    // refusals as undelivered load would fail the engine for containing the
+    // explosion it was handed.
+    let (delivered, delivered_fraction) = match args.scenario {
+        Scenario::Logs => {
+            let delivered = harness_report
+                .as_ref()
+                .and_then(|report| report.pointer("/ingest/events_accepted"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            (delivered, delivered / args.events.max(1) as f64)
+        }
+        Scenario::Metrics => {
+            let steady = harness_report
+                .as_ref()
+                .and_then(|report| report.pointer("/load/phases/steady"));
+            let delivered = steady
+                .and_then(|phase| phase.get("datapoints_accepted"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let fraction = steady
+                .and_then(|phase| phase.get("acceptance"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            (delivered, fraction)
+        }
+    };
     facts.insert(
         "harness".to_string(),
         json!({
@@ -594,8 +666,15 @@ fn measure(args: &Args, facts: &mut Map<String, Value>) -> Result<Outcome, Strin
             "verdict_note": "recorded, not gated: the harness's own targets are latency and RSS \
         gates, and this gate's question is only the anonymous peak",
             "result_path": harness_result.display().to_string(),
+            "scenario": args.scenario.name(),
             "events_accepted": delivered,
             "delivered_fraction": delivered_fraction,
+            // The ladder's own numbers, so a metrics run publishes what it
+            // refused beside what it accepted rather than only a fraction.
+            "metric_phases": harness_report
+                .as_ref()
+                .and_then(|report| report.pointer("/load/phases").cloned())
+                .unwrap_or(Value::Null),
             "achieved_eps": pointer_f64(&harness_report, "/ingest/achieved_eps"),
             "throttled_rate": pointer_f64(&harness_report, "/ingest/throttled_rate"),
             "error_rate": pointer_f64(&harness_report, "/ingest/error_rate"),
@@ -908,9 +987,28 @@ fn spawn_harness(
     let errors = log
         .try_clone()
         .map_err(|error| format!("cannot dup harness.log: {error}"))?;
-    Command::new(load_bin)
+    let mut command = Command::new(load_bin);
+    if args.scenario == Scenario::Metrics {
+        // The paced metric phases size themselves from the run's duration:
+        // a fifth steady, half churn, the rest burst and recovery, so a
+        // longer gate run stretches all three rather than only the tail.
+        let steady = (args.seconds / 5).max(30);
+        let churn = (args.seconds / 2).max(60);
+        let explosion = args.seconds.saturating_sub(steady + churn).max(30);
+        command
+            .env("LOGGYTRACY_LOAD_METRIC_STEADY_SECONDS", steady.to_string())
+            .env("LOGGYTRACY_LOAD_METRIC_CHURN_SECONDS", churn.to_string())
+            .env(
+                "LOGGYTRACY_LOAD_METRIC_EXPLOSION_SECONDS",
+                explosion.to_string(),
+            )
+            // The anchor is unused by the paced phases but the harness
+            // refuses a zero one, for the seeded phases' sake.
+            .env("LOGGYTRACY_LOAD_METRIC_ANCHOR_NS", "1");
+    }
+    command
         .env("LOGGYTRACY_LOAD_TARGET", "loggytracy")
-        .env("LOGGYTRACY_LOAD_PHASE", "load")
+        .env("LOGGYTRACY_LOAD_PHASE", args.scenario.phase())
         .env("LOGGYTRACY_LOAD_ADDR", format!("127.0.0.1:{}", args.port))
         .env("LOGGYTRACY_LOAD_CGROUP", cgroup)
         .env("LOGGYTRACY_LOAD_TIER", "budget-gate")

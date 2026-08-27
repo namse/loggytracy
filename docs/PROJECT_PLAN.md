@@ -241,7 +241,10 @@ tracks execution state per phase.
   bounds a selection before decoding a chunk, `QUERY_API.md` under the
   pinning test, and the bed's frozen parser accepting every answer from a
   live server (six shapes, zero errors).
-- [ ] Phase 8 — bed completion and the memory-gate scenario.
+- [x] Phase 8 — bed completion: both engines driven through the paced churn
+  phases, both digest classes compared, `COMPARISON_METRICS.md` generated
+  from the result JSON under the same sentinel test as the log document, and
+  the memory gate's `--scenario metrics`.
 - [ ] Phase 9 — run, regenerate, publish `COMPARISON_METRICS.md` win or
   lose.
 

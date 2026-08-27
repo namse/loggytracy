@@ -11,39 +11,40 @@
 # (only the METRICS_TARGETS list), and each phase writes its JSON whether or
 # not a later phase likes it.
 #
-# **Phase 2 state (the ruler's iron half).** The default target list is
-# VictoriaMetrics alone: the loggytracy metric read surface does not exist
-# yet, and a bed that pretended otherwise would time 404s. The loggytracy
-# column is absent by declaration, not by omission — Phase 8 flips the
-# default to "loggytracy victoriametrics", adds the ingest-churn phases and
-# the document generation (`docs/COMPARISON_METRICS.md` via compare_report),
-# and the memory-limit sweep rides with them. Empirical pins this bed rests
-# on, measured against victoria-metrics v1.150.0 on 2026-08-26: OTLP protobuf
-# accepted at /opentelemetry/v1/metrics; datapoint attributes become labels
-# verbatim; metric names pass through unchanged; OTLP explicit-bounds
-# histograms are stored as `_bucket{le=}`/`_sum`/`_count` series with plain
-# decimal `le` renderings ("0.005", "+Inf").
+# Empirical pins this bed rests on, measured against victoria-metrics
+# v1.150.0 on 2026-08-26: OTLP protobuf accepted at
+# /opentelemetry/v1/metrics; datapoint attributes become labels verbatim;
+# metric names pass through unchanged; OTLP explicit-bounds histograms are
+# stored as `_bucket{le=}`/`_sum`/`_count` series with plain decimal `le`
+# renderings ("0.005", "+Inf").
 #
 # The shape of the run:
 #
 #   1. Fresh volumes, the metric targets up at the same memory limit.
-#   2. **Metric seed**, one target at a time: the fixed scrape grid, cumulative
-#      counters, the churn block's replaced generations. See
+#   2. **Metric load**, one target at a time: the paced ingest, steady then
+#      rolling series churn then a cardinality burst. This is the phase the
+#      claim's own half is measured in — what an engine does when active
+#      series outgrow the budget it was given. An OOM here is a result.
+#   3. **Metric seed**, one target at a time: the fixed scrape grid,
+#      cumulative counters, the churn block's replaced generations, so the
+#      query numbers are taken over data both systems provably hold. See
 #      src/bin/load/metric_workload.rs.
-#   3. **Settle**: VictoriaMetrics is told to flush its in-memory parts (rows
+#   4. **Settle**: VictoriaMetrics is told to flush its in-memory parts (rows
 #      are searchable before the flush, but the disk number is not a disk
 #      number until it lands), then everything is left alone. Disk and the
 #      ingest memory peak are read here.
-#   4. **Restart all**, so the cold pass is a process that just started.
-#   5. **Metric matrix**, one target at a time, six shapes, cold then warm,
+#   5. **Restart all**, so the cold pass is a process that just started.
+#   6. **Metric matrix**, one target at a time, six shapes, cold then warm,
 #      full per-answer records for the two agreement classes.
-#   6. Read the query-phase peaks and disk again, write bed_metrics.json.
+#   7. Read the query-phase peaks and disk again, write bed_metrics.json, and
+#      generate docs/COMPARISON_METRICS.md from it.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT/compare"
 
 OUT="${COMPARE_METRICS_OUT:-$ROOT/target/compare-metrics}"
+DOC="${COMPARE_METRICS_DOC:-$ROOT/docs/COMPARISON_METRICS.md}"
 mkdir -p "$OUT"
 
 export COMPARE_MEMORY="${COMPARE_MEMORY:-2g}"
@@ -52,8 +53,7 @@ export VICTORIAMETRICS_PORT="${VICTORIAMETRICS_PORT:-3140}"
 export LOGGYTRACY_BUILD_REVISION="${LOGGYTRACY_BUILD_REVISION:-$(git -C "$ROOT" rev-parse --short HEAD)}"
 export LOGGYTRACY_BUILD_BRANCH="${LOGGYTRACY_BUILD_BRANCH:-$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)}"
 
-# Phase 8 flips this default to "loggytracy victoriametrics"; see the header.
-METRICS_TARGETS="${COMPARE_METRICS_TARGETS:-victoriametrics}"
+METRICS_TARGETS="${COMPARE_METRICS_TARGETS:-loggytracy victoriametrics}"
 VICTORIAMETRICS_IMAGE="victoriametrics/victoria-metrics:v1.150.0"
 
 port_of() {
@@ -83,6 +83,15 @@ METRIC_WINDOWS="${COMPARE_METRIC_WINDOWS:-3}"
 METRIC_STEP_SECONDS="${COMPARE_METRIC_STEP_SECONDS:-30}"
 SETTLE_SECONDS="${COMPARE_METRICS_SETTLE_SECONDS:-60}"
 SEED="${COMPARE_SEED:-1592598566}"
+
+# The paced ingest phases. Sized so the churn and burst push active + idle
+# series past what a 2 GiB container can index: that boundary is the claim's
+# own axis, and a run that never reaches it has not asked the question.
+METRIC_STEADY_SECONDS="${COMPARE_METRIC_STEADY_SECONDS:-60}"
+METRIC_CHURN_SECONDS="${COMPARE_METRIC_CHURN_SECONDS:-300}"
+METRIC_CHURN_REPLACE="${COMPARE_METRIC_CHURN_REPLACE:-2000}"
+METRIC_EXPLOSION_SECONDS="${COMPARE_METRIC_EXPLOSION_SECONDS:-120}"
+METRIC_EXPLOSION_SERIES="${COMPARE_METRIC_EXPLOSION_SERIES:-500000}"
 
 # The scrape timestamps. Computed once and given to every run, for the same
 # reason the log bed's anchor is; backdated well past VictoriaMetrics'
@@ -115,7 +124,7 @@ wait_ready() {
   done
 }
 
-declare -A CGROUP
+declare -A CGROUP PEAK_CHURN
 
 read_cgroups() {
   local target
@@ -182,6 +191,11 @@ run_metric_phase() {
   LOGGYTRACY_LOAD_METRIC_REPEATS="$METRIC_REPEATS" \
   LOGGYTRACY_LOAD_METRIC_WINDOWS="$METRIC_WINDOWS" \
   LOGGYTRACY_LOAD_METRIC_STEP_SECONDS="$METRIC_STEP_SECONDS" \
+  LOGGYTRACY_LOAD_METRIC_STEADY_SECONDS="$METRIC_STEADY_SECONDS" \
+  LOGGYTRACY_LOAD_METRIC_CHURN_SECONDS="$METRIC_CHURN_SECONDS" \
+  LOGGYTRACY_LOAD_METRIC_CHURN_REPLACE="$METRIC_CHURN_REPLACE" \
+  LOGGYTRACY_LOAD_METRIC_EXPLOSION_SECONDS="$METRIC_EXPLOSION_SECONDS" \
+  LOGGYTRACY_LOAD_METRIC_EXPLOSION_SERIES="$METRIC_EXPLOSION_SERIES" \
   LOGGYTRACY_LOAD_RESULT_PATH="$OUT/${phase}_$target.json" \
   LOGGYTRACY_BUILD_REVISION="$LOGGYTRACY_BUILD_REVISION" \
     "$LOAD_BIN" >/dev/null || echo "  ($phase verdict was not PASS for $target; the result file says why)" >&2
@@ -198,6 +212,29 @@ if [[ " $METRICS_TARGETS " == *" loggytracy "* ]]; then
     >/dev/null
 fi
 
+alive() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$1")" = "true" ]
+}
+
+# The churn phases first, and one target at a time: an engine's index
+# behaviour must not be a function of what the other was doing on the same
+# cores. A container that does not survive is a *result* — recorded here,
+# published by the report, never retried past in silence.
+declare -A CHURN_ALIVE CHURN_OOM
+for TARGET in $METRICS_TARGETS; do
+  run_metric_phase metric-load "$TARGET"
+  if alive "$(container_of "$TARGET")"; then
+    CHURN_ALIVE[$TARGET]=true
+  else
+    CHURN_ALIVE[$TARGET]=false
+  fi
+  CHURN_OOM[$TARGET]=$(docker inspect -f '{{.State.OOMKilled}}' "$(container_of "$TARGET")")
+  PEAK_CHURN[$TARGET]=$(cat "${CGROUP[$TARGET]}/memory.peak" 2>/dev/null || echo 0)
+done
+
+# The query numbers are taken over the seeded dataset, not over whatever the
+# churn phases left behind: a paced run sends what it managed to send, and two
+# such runs are not the same corpus.
 for TARGET in $METRICS_TARGETS; do
   run_metric_phase metric-seed "$TARGET"
 done
@@ -242,10 +279,13 @@ done
 PEAK_JSON=""
 DISK_JSON=""
 TARGETS_JSON=""
+CHURN_JSON=""
 for TARGET in $METRICS_TARGETS; do
   TARGETS_JSON="$TARGETS_JSON${TARGETS_JSON:+,}\"$TARGET\""
   PEAK_JSON="$PEAK_JSON${PEAK_JSON:+,}
-    \"$TARGET\": { \"ingest\": ${PEAK_INGEST[$TARGET]}, \"query\": ${PEAK_QUERY[$TARGET]}, \"oom_killed\": ${OOM[$TARGET]} }"
+    \"$TARGET\": { \"ingest\": ${PEAK_INGEST[$TARGET]}, \"query\": ${PEAK_QUERY[$TARGET]}, \"churn\": ${PEAK_CHURN[$TARGET]:-0}, \"oom_killed\": ${OOM[$TARGET]} }"
+  CHURN_JSON="$CHURN_JSON${CHURN_JSON:+,}
+    \"$TARGET\": { \"survived\": ${CHURN_ALIVE[$TARGET]:-false}, \"oom_killed\": ${CHURN_OOM[$TARGET]:-false} }"
   DISK_JSON="$DISK_JSON${DISK_JSON:+,}
     \"$TARGET\": { \"settled\": ${DISK[$TARGET]}, \"after_queries\": ${DISK_END[$TARGET]} }"
 done
@@ -268,12 +308,28 @@ cat >"$OUT/bed_metrics.json" <<JSON
   "object_store": "none: every system is on its local filesystem",
   "peak_bytes": {$PEAK_JSON
   },
+  "churn_survival": {$CHURN_JSON
+  },
   "disk_bytes": {$DISK_JSON
   }
 }
 JSON
 
+# The artifacts are checked in beside the document and copied by the same run
+# that wrote it, so the two cannot drift — the rule the log bed learned when a
+# second corpus wrote its JSON over the first's.
+ARTIFACTS="${COMPARE_METRICS_ARTIFACTS:-$ROOT/docs/artifacts/m14}"
+mkdir -p "$ARTIFACTS"
+COMPARE_METRICS_ARTIFACTS_REL="$(realpath --relative-to="$(dirname "$DOC")" "$ARTIFACTS")"
+export COMPARE_METRICS_ARTIFACTS_REL
+
+say "generating $DOC"
+cargo build --manifest-path "$ROOT/Cargo.toml" --release --bin compare_report
+"$ROOT/target/release/compare_report" "$OUT" "$DOC"
+cp "$OUT"/* "$ARTIFACTS/" 2>/dev/null || true
+
 echo "results: $OUT" >&2
+echo "document: $DOC" >&2
 
 # Every seed must have landed in full: a matrix over a partial dataset is not
 # a measurement. The matrix verdict is not gated here while the bed is
