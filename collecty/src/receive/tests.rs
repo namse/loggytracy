@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -22,7 +21,7 @@ use crate::test_support::Scratch;
 
 struct Harness {
     _scratch: Scratch,
-    queues: HashMap<Signal, Arc<Queue>>,
+    queue: Arc<Queue>,
     socket: PathBuf,
     shutdown: Option<oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
@@ -31,18 +30,13 @@ struct Harness {
 impl Harness {
     async fn start(label: &str, max_request_bytes: usize) -> Harness {
         let scratch = Scratch::new(label);
-        let mut queues = HashMap::new();
-        for signal in Signal::ALL {
-            let dir = scratch.path().join(signal.as_str());
-            queues.insert(
-                signal,
-                Arc::new(Queue::open(&dir, QueueLimits::default()).expect("a queue")),
-            );
-        }
+        let queue = Arc::new(
+            Queue::open(&scratch.path().join("queue"), QueueLimits::default()).expect("a queue"),
+        );
         let socket = scratch.path().join("otlp.sock");
         let listener = bind(&socket, DEFAULT_SOCKET_MODE).expect("a bound socket");
         let intake = Intake::new(
-            queues.clone(),
+            queue.clone(),
             max_request_bytes,
             DEFAULT_MAX_INFLIGHT_BYTES,
             crate::wire::ZSTD_LEVEL,
@@ -54,7 +48,7 @@ impl Harness {
 
         Harness {
             _scratch: scratch,
-            queues,
+            queue,
             socket,
             shutdown: Some(tx),
             server,
@@ -77,19 +71,25 @@ impl Harness {
             .expect("a connected channel")
     }
 
-    fn queue(&self, signal: Signal) -> &Arc<Queue> {
-        self.queues.get(&signal).expect("a queue")
-    }
-
-    fn frames(&self, signal: Signal) -> Vec<Vec<u8>> {
-        let queue = self.queue(signal);
-        let Some(batch) = queue.read_batch(usize::MAX, usize::MAX).expect("a batch") else {
+    fn records(&self) -> Vec<(Signal, Vec<u8>)> {
+        let Some(batch) = self
+            .queue
+            .read_batch(usize::MAX, usize::MAX)
+            .expect("a batch")
+        else {
             return Vec::new();
         };
         batch
             .records
             .iter()
-            .map(|record| batch.frames[record.span.clone()].to_vec())
+            .map(|record| {
+                let frame = &batch.frames[record.span.clone()];
+                let plain = crate::wire::decompress_concatenated(frame, record.plain_len as usize)
+                    .expect("a decompressed record");
+                let split = crate::wire::split_records(&plain).expect("a framed record");
+                assert_eq!(split.len(), 1, "one frame carries one record");
+                (split[0].0, split[0].1.to_vec())
+            })
             .collect()
     }
 
@@ -128,15 +128,12 @@ async fn an_export_is_stored_as_a_frame_that_decompresses_to_the_request() {
         .await
         .expect("an accepted export");
 
-    let frames = harness.frames(Signal::Logs);
-    assert_eq!(frames.len(), 1);
-    let plain = crate::wire::decompress_concatenated(&frames[0], expected.len()).expect("plain");
-    assert_eq!(plain, expected);
+    assert_eq!(harness.records(), vec![(Signal::Logs, expected)]);
     harness.stop().await;
 }
 
 #[tokio::test]
-async fn each_signal_lands_in_its_own_queue() {
+async fn every_signal_lands_in_the_one_queue_tagged_with_itself() {
     let harness = Harness::start("receive-signals", DEFAULT_MAX_REQUEST_BYTES).await;
     let channel = harness.channel().await;
 
@@ -157,13 +154,12 @@ async fn each_signal_lands_in_its_own_queue() {
         .await
         .expect("an accepted metric export");
 
-    for signal in Signal::ALL {
-        assert_eq!(
-            harness.frames(signal).len(),
-            1,
-            "{signal} stored the wrong number of records"
-        );
-    }
+    let tags: Vec<Signal> = harness
+        .records()
+        .into_iter()
+        .map(|(signal, _)| signal)
+        .collect();
+    assert_eq!(tags, vec![Signal::Logs, Signal::Traces, Signal::Metrics]);
     harness.stop().await;
 }
 
@@ -177,29 +173,19 @@ async fn an_export_over_the_ceiling_is_refused_and_stores_nothing() {
         .expect_err("a refusal");
 
     assert_eq!(status.code(), tonic::Code::OutOfRange);
-    assert!(harness.frames(Signal::Logs).is_empty());
-    assert_eq!(harness.queue(Signal::Logs).stats().appended_records, 0);
+    assert!(harness.records().is_empty());
+    assert_eq!(harness.queue.stats().appended_records, 0);
     harness.stop().await;
 }
 
 #[tokio::test]
 async fn a_payload_over_the_ceiling_is_refused_off_the_grpc_path_too() {
     let scratch = Scratch::new("intake-ceiling");
-    let mut queues = HashMap::new();
-    for signal in Signal::ALL {
-        queues.insert(
-            signal,
-            Arc::new(
-                Queue::open(
-                    &scratch.path().join(signal.as_str()),
-                    QueueLimits::default(),
-                )
-                .expect("a queue"),
-            ),
-        );
-    }
+    let queue = Arc::new(
+        Queue::open(&scratch.path().join("queue"), QueueLimits::default()).expect("a queue"),
+    );
     let intake = Intake::new(
-        queues.clone(),
+        queue.clone(),
         64,
         DEFAULT_MAX_INFLIGHT_BYTES,
         crate::wire::ZSTD_LEVEL,
@@ -211,14 +197,7 @@ async fn a_payload_over_the_ceiling_is_refused_off_the_grpc_path_too() {
         .expect_err("a refusal");
 
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert_eq!(
-        queues
-            .get(&Signal::Logs)
-            .expect("a queue")
-            .stats()
-            .appended_records,
-        0
-    );
+    assert_eq!(queue.stats().appended_records, 0);
 }
 
 #[tokio::test]
@@ -232,7 +211,7 @@ async fn an_empty_export_succeeds_without_storing_a_record() {
         .await
         .expect("an accepted empty export");
 
-    assert_eq!(harness.queue(Signal::Logs).stats().appended_records, 0);
+    assert_eq!(harness.queue.stats().appended_records, 0);
     harness.stop().await;
 }
 
@@ -250,13 +229,18 @@ async fn separate_exports_reassemble_into_one_merged_request() {
     }
 
     let batch = harness
-        .queue(Signal::Logs)
+        .queue
         .read_batch(usize::MAX, usize::MAX)
         .expect("a batch")
         .expect("records");
     let plain =
         crate::wire::decompress_concatenated(&batch.frames, batch.plain_bytes).expect("plain");
-    let merged = ExportLogsServiceRequest::decode(plain.as_slice()).expect("a merged request");
+    let mut payloads = Vec::new();
+    for (signal, payload) in crate::wire::split_records(&plain).expect("framed records") {
+        assert_eq!(signal, Signal::Logs);
+        payloads.extend_from_slice(payload);
+    }
+    let merged = ExportLogsServiceRequest::decode(payloads.as_slice()).expect("a merged request");
 
     assert_eq!(merged.resource_logs.len(), requests.len());
     for (index, request) in requests.iter().enumerate() {

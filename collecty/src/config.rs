@@ -121,8 +121,8 @@ COLLECTY_MAX_REQUEST_BYTES ({}) export",
         Ok(())
     }
 
-    pub fn queue_dir(&self, signal: crate::signal::Signal) -> PathBuf {
-        self.data_dir.join(signal.as_str())
+    pub fn queue_dir(&self) -> PathBuf {
+        self.data_dir.join("queue")
     }
 }
 

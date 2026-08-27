@@ -2,7 +2,6 @@ mod codec;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
@@ -28,7 +27,7 @@ pub const DEFAULT_MAX_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_SOCKET_MODE: u32 = 0o666;
 
 pub struct Intake {
-    queues: HashMap<Signal, Arc<Queue>>,
+    queue: Arc<Queue>,
     inflight: Semaphore,
     max_request_bytes: usize,
     zstd_level: i32,
@@ -36,27 +35,21 @@ pub struct Intake {
 
 impl Intake {
     pub fn new(
-        queues: HashMap<Signal, Arc<Queue>>,
+        queue: Arc<Queue>,
         max_request_bytes: usize,
         max_inflight_bytes: usize,
         zstd_level: i32,
     ) -> Arc<Intake> {
         assert!(
-            max_request_bytes <= u32::MAX as usize,
+            max_request_bytes <= u32::MAX as usize - wire::RECORD_HEADER_BYTES,
             "a request ceiling above u32::MAX cannot be charged to the in-flight gate"
         );
         assert!(
             max_inflight_bytes >= max_request_bytes,
             "an in-flight ceiling below the request ceiling would refuse every large request forever"
         );
-        for signal in Signal::ALL {
-            assert!(
-                queues.contains_key(&signal),
-                "every signal needs a queue; {signal} has none"
-            );
-        }
         Arc::new(Intake {
-            queues,
+            queue,
             inflight: Semaphore::new(max_inflight_bytes),
             max_request_bytes,
             zstd_level,
@@ -85,18 +78,13 @@ impl Intake {
             .await
             .map_err(|_| Status::unavailable("collecty is shutting down"))?;
 
-        let queue = self
-            .queues
-            .get(&signal)
-            .expect("every signal has a queue")
-            .clone();
-
+        let queue = self.queue.clone();
         let level = self.zstd_level;
         tokio::task::spawn_blocking(move || {
-            let frame = wire::compress(&payload, level)?;
+            let frame = wire::compress_record(signal, &payload, level)?;
             queue.append(&Record {
                 frame,
-                plain_len: plain_len as u32,
+                plain_len: (wire::RECORD_HEADER_BYTES + plain_len) as u32,
             })
         })
         .await

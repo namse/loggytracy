@@ -31,6 +31,18 @@ impl Signal {
             .into_iter()
             .find(|signal| signal.grpc_method_path() == path)
     }
+
+    pub fn tag(self) -> u8 {
+        match self {
+            Signal::Logs => 1,
+            Signal::Traces => 2,
+            Signal::Metrics => 3,
+        }
+    }
+
+    pub fn from_tag(tag: u8) -> Option<Signal> {
+        Signal::ALL.into_iter().find(|signal| signal.tag() == tag)
+    }
 }
 
 impl fmt::Display for Signal {
@@ -52,5 +64,14 @@ mod tests {
             );
         }
         assert_eq!(Signal::from_grpc_method_path("/health/Check"), None);
+    }
+
+    #[test]
+    fn every_signal_round_trips_through_its_tag() {
+        for signal in Signal::ALL {
+            assert_eq!(Signal::from_tag(signal.tag()), Some(signal));
+        }
+        assert_eq!(Signal::from_tag(0), None);
+        assert_eq!(Signal::from_tag(4), None);
     }
 }

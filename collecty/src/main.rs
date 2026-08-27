@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use collecty::config::Config;
@@ -38,18 +37,16 @@ fn init_tracing(json: bool) {
 }
 
 async fn run(config: Config) -> Result<(), String> {
-    let mut queues = HashMap::new();
-    for signal in Signal::ALL {
-        let dir = config.queue_dir(signal);
-        let queue = Queue::open(&dir, config.queue)
-            .map_err(|error| format!("cannot open the {signal} queue at {dir:?}: {error}"))?;
-        queues.insert(signal, Arc::new(queue));
-    }
+    let dir = config.queue_dir();
+    let queue = Arc::new(
+        Queue::open(&dir, config.queue)
+            .map_err(|error| format!("cannot open the queue at {dir:?}: {error}"))?,
+    );
 
     let listener = receive::bind(&config.socket_path, config.socket_mode)
         .map_err(|error| format!("cannot serve OTLP: {error}"))?;
     let intake = Intake::new(
-        queues.clone(),
+        queue.clone(),
         config.max_request_bytes,
         config.max_inflight_bytes,
         config.zstd_level,
@@ -61,23 +58,20 @@ async fn run(config: Config) -> Result<(), String> {
         config.send_timeout,
     ));
 
-    let mut senders = Vec::new();
-    let mut watched = Vec::new();
-    for signal in Signal::ALL {
-        let queue = queues.get(&signal).expect("a queue").clone();
-        let sender = Sender::new(signal, queue.clone(), transport.clone(), config.sender);
-        watched.push((signal, queue, sender.stats()));
+    let sender = Sender::new(queue.clone(), transport, config.sender);
+    let reporter = Reporter::new(queue.clone(), sender.stats());
+    let sending = {
         let watcher = watcher.clone();
-        senders.push(tokio::spawn(async move { sender.run(watcher).await }));
-    }
+        tokio::spawn(async move { sender.run(watcher).await })
+    };
 
     let syncing = tokio::spawn(sync_loop(
-        queues.values().cloned().collect(),
+        queue.clone(),
         config.fsync_interval,
         watcher.clone(),
     ));
     let reporting = tokio::spawn(report_loop(
-        Reporter::new(watched),
+        reporter,
         intake.clone(),
         config.report_interval,
         watcher.clone(),
@@ -100,16 +94,12 @@ async fn run(config: Config) -> Result<(), String> {
     .await;
 
     let _ = shutdown.send(true);
-    for sender in senders {
-        let _ = sender.await;
-    }
+    let _ = sending.await;
     let _ = syncing.await;
     let _ = reporting.await;
 
-    for (signal, queue) in queues {
-        if let Err(error) = queue.sync() {
-            tracing::error!(%signal, %error, "the queue could not be synced on the way out");
-        }
+    if let Err(error) = queue.sync() {
+        tracing::error!(%error, "the queue could not be synced on the way out");
     }
     let _ = std::fs::remove_file(&config.socket_path);
 
@@ -133,7 +123,7 @@ async fn wait_for_a_stop_signal() {
 }
 
 async fn sync_loop(
-    queues: Vec<Arc<Queue>>,
+    queue: Arc<Queue>,
     interval: std::time::Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -144,12 +134,10 @@ async fn sync_loop(
             _ = ticker.tick() => {}
             _ = shutdown.changed() => return,
         }
-        for queue in &queues {
-            let queue = queue.clone();
-            let synced = tokio::task::spawn_blocking(move || queue.sync()).await;
-            if let Ok(Err(error)) = synced {
-                tracing::error!(%error, "a queue could not be synced");
-            }
+        let queue = queue.clone();
+        let synced = tokio::task::spawn_blocking(move || queue.sync()).await;
+        if let Ok(Err(error)) = synced {
+            tracing::error!(%error, "the queue could not be synced");
         }
     }
 }

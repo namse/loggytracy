@@ -12,7 +12,6 @@ use bytes::Bytes;
 use tokio::sync::watch;
 
 use crate::queue::{Batch, BatchRecord, Queue};
-use crate::signal::Signal;
 
 pub use transport::HttpTransport;
 
@@ -26,12 +25,7 @@ pub enum Outcome {
 }
 
 pub trait Transport: Send + Sync + 'static {
-    fn deliver<'a>(
-        &'a self,
-        signal: Signal,
-        frames: Bytes,
-        plain_bytes: usize,
-    ) -> DeliverFuture<'a>;
+    fn deliver<'a>(&'a self, frames: Bytes, plain_bytes: usize) -> DeliverFuture<'a>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -63,7 +57,6 @@ pub struct SenderStats {
 }
 
 pub struct Sender<T> {
-    signal: Signal,
     queue: Arc<Queue>,
     transport: Arc<T>,
     config: SenderConfig,
@@ -77,14 +70,8 @@ enum Attempt {
 }
 
 impl<T: Transport> Sender<T> {
-    pub fn new(
-        signal: Signal,
-        queue: Arc<Queue>,
-        transport: Arc<T>,
-        config: SenderConfig,
-    ) -> Sender<T> {
+    pub fn new(queue: Arc<Queue>, transport: Arc<T>, config: SenderConfig) -> Sender<T> {
         Sender {
-            signal,
             queue,
             transport,
             config,
@@ -118,12 +105,12 @@ impl<T: Transport> Sender<T> {
                 Ok(Ok(Some(batch))) => batch,
                 Ok(Ok(None)) => continue,
                 Ok(Err(error)) => {
-                    tracing::error!(signal = %self.signal, %error, "the queue could not be read");
+                    tracing::error!(%error, "the queue could not be read");
                     tokio::time::sleep(self.config.retry_initial).await;
                     continue;
                 }
                 Err(error) => {
-                    tracing::error!(signal = %self.signal, %error, "the queue reader did not finish");
+                    tracing::error!(%error, "the queue reader did not finish");
                     continue;
                 }
             };
@@ -166,7 +153,6 @@ impl<T: Transport> Sender<T> {
                     }
                     Attempt::Refused(reason) if to - from == 1 => {
                         tracing::error!(
-                            signal = %self.signal,
                             reason,
                             plain_bytes,
                             "dropping one record signy refuses to accept"
@@ -178,7 +164,6 @@ impl<T: Transport> Sender<T> {
                     }
                     Attempt::Refused(reason) => {
                         tracing::warn!(
-                            signal = %self.signal,
                             reason,
                             records = to - from,
                             "halving a refused batch to find the record signy will not take"
@@ -202,17 +187,12 @@ impl<T: Transport> Sender<T> {
             if *shutdown.borrow() {
                 return Attempt::Aborted;
             }
-            match self
-                .transport
-                .deliver(self.signal, frames.clone(), plain_bytes)
-                .await
-            {
+            match self.transport.deliver(frames.clone(), plain_bytes).await {
                 Outcome::Accepted => return Attempt::Accepted,
                 Outcome::Refused(reason) => return Attempt::Refused(reason),
                 Outcome::Retry(reason) => {
                     self.stats.retries.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
-                        signal = %self.signal,
                         reason,
                         backoff_ms = backoff.as_millis() as u64,
                         "signy did not take the batch"
@@ -229,7 +209,7 @@ impl<T: Transport> Sender<T> {
 
     fn commit(&self, records: &[BatchRecord], to: usize, sent: u64) {
         if let Err(error) = self.queue.commit(records[to - 1].end, sent) {
-            tracing::error!(signal = %self.signal, %error, "the cursor could not be advanced");
+            tracing::error!(%error, "the cursor could not be advanced");
         }
     }
 }

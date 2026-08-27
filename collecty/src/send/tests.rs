@@ -28,12 +28,7 @@ impl Scripted {
 }
 
 impl Transport for Scripted {
-    fn deliver<'a>(
-        &'a self,
-        _signal: Signal,
-        frames: Bytes,
-        _plain_bytes: usize,
-    ) -> DeliverFuture<'a> {
+    fn deliver<'a>(&'a self, frames: Bytes, _plain_bytes: usize) -> DeliverFuture<'a> {
         Box::pin(async move {
             self.calls.lock().push(frames.len());
             (self.respond)(&frames)
@@ -79,12 +74,7 @@ async fn a_delivered_batch_advances_the_cursor_in_one_call() {
     let scratch = Scratch::new("send-ok");
     let queue = queue_with(&scratch, &frames(4, None));
     let transport = Scripted::new(|_| Outcome::Accepted);
-    let sender = Sender::new(
-        Signal::Logs,
-        queue.clone(),
-        transport.clone(),
-        SenderConfig::default(),
-    );
+    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
 
     deliver_all(&sender, &queue).await;
 
@@ -109,12 +99,7 @@ async fn a_retryable_answer_is_retried_until_it_is_accepted() {
             Outcome::Accepted
         }
     });
-    let sender = Sender::new(
-        Signal::Logs,
-        queue.clone(),
-        transport.clone(),
-        SenderConfig::default(),
-    );
+    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
 
     deliver_all(&sender, &queue).await;
 
@@ -135,12 +120,7 @@ async fn a_refused_batch_is_halved_until_the_one_bad_record_is_dropped() {
             Outcome::Accepted
         }
     });
-    let sender = Sender::new(
-        Signal::Logs,
-        queue.clone(),
-        transport.clone(),
-        SenderConfig::default(),
-    );
+    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
 
     deliver_all(&sender, &queue).await;
 
@@ -159,12 +139,7 @@ async fn shutdown_stops_a_retry_loop_without_advancing_the_cursor() {
     let scratch = Scratch::new("send-stop");
     let queue = queue_with(&scratch, &frames(3, None));
     let transport = Scripted::new(|_| Outcome::Retry("signy is down".to_string()));
-    let sender = Sender::new(
-        Signal::Logs,
-        queue.clone(),
-        transport.clone(),
-        SenderConfig::default(),
-    );
+    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
     let before = queue.cursor();
 
     let (tx, mut rx) = watch::channel(false);
@@ -188,12 +163,7 @@ async fn the_run_loop_delivers_what_arrives_and_stops_on_shutdown() {
     let scratch = Scratch::new("send-run");
     let queue = queue_with(&scratch, &frames(3, None));
     let transport = Scripted::new(|_| Outcome::Accepted);
-    let sender = Sender::new(
-        Signal::Logs,
-        queue.clone(),
-        transport.clone(),
-        SenderConfig::default(),
-    );
+    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
 
     let (tx, rx) = watch::channel(false);
     let stop = async move {
@@ -261,15 +231,13 @@ async fn a_success_over_http_carries_the_encoding_and_the_uncompressed_size() {
     let address = fake_signy(http::StatusCode::NO_CONTENT, seen.clone()).await;
     let transport = HttpTransport::new(format!("http://{address}"), Duration::from_secs(5));
 
-    let outcome = transport
-        .deliver(Signal::Traces, Bytes::from_static(b"frames"), 4096)
-        .await;
+    let outcome = transport.deliver(Bytes::from_static(b"frames"), 4096).await;
 
     assert_eq!(outcome, Outcome::Accepted);
     assert_eq!(
         seen.lock().as_slice(),
         [(
-            "/signy/api/v1/collect/traces".to_string(),
+            "/signy/api/v1/collect".to_string(),
             "zstd".to_string(),
             "4096".to_string()
         )]
@@ -284,9 +252,7 @@ async fn a_bad_request_refuses_the_payload_and_a_server_error_asks_for_a_retry()
     )
     .await;
     let transport = HttpTransport::new(format!("http://{refusing}"), Duration::from_secs(5));
-    let outcome = transport
-        .deliver(Signal::Logs, Bytes::from_static(b"frames"), 1)
-        .await;
+    let outcome = transport.deliver(Bytes::from_static(b"frames"), 1).await;
     assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
 
     let unavailable = fake_signy(
@@ -295,9 +261,7 @@ async fn a_bad_request_refuses_the_payload_and_a_server_error_asks_for_a_retry()
     )
     .await;
     let transport = HttpTransport::new(format!("http://{unavailable}"), Duration::from_secs(5));
-    let outcome = transport
-        .deliver(Signal::Logs, Bytes::from_static(b"frames"), 1)
-        .await;
+    let outcome = transport.deliver(Bytes::from_static(b"frames"), 1).await;
     assert!(matches!(outcome, Outcome::Retry(_)), "{outcome:?}");
 }
 
@@ -310,9 +274,7 @@ async fn a_refused_connection_asks_for_a_retry_rather_than_dropping() {
     drop(listener);
 
     let transport = HttpTransport::new(format!("http://{address}"), Duration::from_secs(5));
-    let outcome = transport
-        .deliver(Signal::Logs, Bytes::from_static(b"frames"), 1)
-        .await;
+    let outcome = transport.deliver(Bytes::from_static(b"frames"), 1).await;
 
     assert!(matches!(outcome, Outcome::Retry(_)), "{outcome:?}");
 }

@@ -13,7 +13,6 @@ use prost::Message;
 
 use crate::queue::Queue;
 use crate::send::SenderStats;
-use crate::signal::Signal;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Observation {
@@ -119,84 +118,71 @@ const FAMILIES: &[Family] = &[
 ];
 
 pub struct Reporter {
-    watched: Vec<(Signal, Arc<Queue>, Arc<SenderStats>)>,
+    queue: Arc<Queue>,
+    stats: Arc<SenderStats>,
     started_unix_nanos: u64,
 }
 
 impl Reporter {
-    pub fn new(watched: Vec<(Signal, Arc<Queue>, Arc<SenderStats>)>) -> Reporter {
+    pub fn new(queue: Arc<Queue>, stats: Arc<SenderStats>) -> Reporter {
         Reporter {
-            watched,
+            queue,
+            stats,
             started_unix_nanos: unix_nanos(),
         }
     }
 
-    pub fn observe(&self) -> Vec<(Signal, Observation)> {
-        self.watched
-            .iter()
-            .map(|(signal, queue, stats)| {
-                let queued = queue.stats();
-                (
-                    *signal,
-                    Observation {
-                        queued_bytes: queued.queued_bytes,
-                        backlog_bytes: queued.backlog_bytes,
-                        segments: queued.segments as u64,
-                        appended_records: queued.appended_records,
-                        appended_bytes: queued.appended_bytes,
-                        dropped_bytes: queued.dropped_bytes,
-                        dropped_segments: queued.dropped_segments,
-                        sent_records: stats.sent_records.load(Ordering::Relaxed),
-                        sent_batches: stats.sent_batches.load(Ordering::Relaxed),
-                        sent_bytes: stats.sent_bytes.load(Ordering::Relaxed),
-                        refused_records: stats.refused_records.load(Ordering::Relaxed),
-                        retries: stats.retries.load(Ordering::Relaxed),
-                    },
-                )
-            })
-            .collect()
+    pub fn observe(&self) -> Observation {
+        let queued = self.queue.stats();
+        Observation {
+            queued_bytes: queued.queued_bytes,
+            backlog_bytes: queued.backlog_bytes,
+            segments: queued.segments as u64,
+            appended_records: queued.appended_records,
+            appended_bytes: queued.appended_bytes,
+            dropped_bytes: queued.dropped_bytes,
+            dropped_segments: queued.dropped_segments,
+            sent_records: self.stats.sent_records.load(Ordering::Relaxed),
+            sent_batches: self.stats.sent_batches.load(Ordering::Relaxed),
+            sent_bytes: self.stats.sent_bytes.load(Ordering::Relaxed),
+            refused_records: self.stats.refused_records.load(Ordering::Relaxed),
+            retries: self.stats.retries.load(Ordering::Relaxed),
+        }
     }
 
-    pub fn export(&self, observed: &[(Signal, Observation)]) -> Vec<u8> {
+    pub fn export(&self, observed: &Observation) -> Vec<u8> {
         encode(observed, self.started_unix_nanos, unix_nanos())
     }
 
-    pub fn log(&self, observed: &[(Signal, Observation)]) {
-        for (signal, observation) in observed {
-            tracing::info!(
-                %signal,
-                backlog_bytes = observation.backlog_bytes,
-                queued_bytes = observation.queued_bytes,
-                segments = observation.segments,
-                appended_records = observation.appended_records,
-                dropped_bytes = observation.dropped_bytes,
-                dropped_segments = observation.dropped_segments,
-                sent_records = observation.sent_records,
-                sent_batches = observation.sent_batches,
-                refused_records = observation.refused_records,
-                retries = observation.retries,
-                "queue report"
-            );
-        }
+    pub fn log(&self, observed: &Observation) {
+        tracing::info!(
+            backlog_bytes = observed.backlog_bytes,
+            queued_bytes = observed.queued_bytes,
+            segments = observed.segments,
+            appended_records = observed.appended_records,
+            dropped_bytes = observed.dropped_bytes,
+            dropped_segments = observed.dropped_segments,
+            sent_records = observed.sent_records,
+            sent_batches = observed.sent_batches,
+            refused_records = observed.refused_records,
+            retries = observed.retries,
+            "queue report"
+        );
     }
 }
 
-pub fn encode(observed: &[(Signal, Observation)], started: u64, now: u64) -> Vec<u8> {
+pub fn encode(observed: &Observation, started: u64, now: u64) -> Vec<u8> {
     let metrics = FAMILIES
         .iter()
         .map(|family| {
-            let points: Vec<NumberDataPoint> = observed
-                .iter()
-                .map(|(signal, observation)| NumberDataPoint {
-                    attributes: vec![attribute("signal", signal.as_str())],
-                    start_time_unix_nano: started,
-                    time_unix_nano: now,
-                    value: Some(number_data_point::Value::AsInt(
-                        (family.read)(observation) as i64
-                    )),
-                    ..Default::default()
-                })
-                .collect();
+            let points = vec![NumberDataPoint {
+                start_time_unix_nano: started,
+                time_unix_nano: now,
+                value: Some(number_data_point::Value::AsInt(
+                    (family.read)(observed) as i64
+                )),
+                ..Default::default()
+            }];
             Metric {
                 name: family.name.to_string(),
                 unit: family.unit.to_string(),
@@ -253,24 +239,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_family_is_exported_once_with_a_point_per_signal() {
-        let observed = vec![
-            (
-                Signal::Logs,
-                Observation {
-                    queued_bytes: 11,
-                    sent_records: 22,
-                    ..Observation::default()
-                },
-            ),
-            (
-                Signal::Traces,
-                Observation {
-                    queued_bytes: 33,
-                    ..Observation::default()
-                },
-            ),
-        ];
+    fn every_family_is_exported_once_with_one_point() {
+        let observed = Observation {
+            queued_bytes: 11,
+            sent_records: 22,
+            ..Observation::default()
+        };
 
         let export = ExportMetricsServiceRequest::decode(encode(&observed, 5, 9).as_slice())
             .expect("a decodable export");
@@ -283,21 +257,18 @@ mod tests {
                 metric::Data::Sum(sum) => &sum.data_points,
                 other => panic!("unexpected metric shape: {other:?}"),
             };
-            assert_eq!(points.len(), 2, "{}", metric.name);
-            assert_eq!(points[0].attributes[0].key, "signal");
+            assert_eq!(points.len(), 1, "{}", metric.name);
+            assert!(points[0].attributes.is_empty(), "{}", metric.name);
         }
     }
 
     #[test]
     fn a_gauge_carries_the_value_it_was_given_and_a_counter_is_monotonic() {
-        let observed = vec![(
-            Signal::Logs,
-            Observation {
-                queued_bytes: 4096,
-                sent_records: 7,
-                ..Observation::default()
-            },
-        )];
+        let observed = Observation {
+            queued_bytes: 4096,
+            sent_records: 7,
+            ..Observation::default()
+        };
         let export = ExportMetricsServiceRequest::decode(encode(&observed, 5, 9).as_slice())
             .expect("a decodable export");
         let scope = &export.resource_metrics[0].scope_metrics[0];
@@ -337,7 +308,8 @@ mod tests {
     #[test]
     fn the_export_names_collecty_as_the_service() {
         let export =
-            ExportMetricsServiceRequest::decode(encode(&[], 0, 0).as_slice()).expect("an export");
+            ExportMetricsServiceRequest::decode(encode(&Observation::default(), 0, 0).as_slice())
+                .expect("an export");
         let resource = export.resource_metrics[0]
             .resource
             .as_ref()

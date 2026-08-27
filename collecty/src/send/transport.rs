@@ -9,7 +9,6 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 
 use super::{DeliverFuture, Outcome, Transport};
-use crate::signal::Signal;
 
 pub const UNCOMPRESSED_BYTES_HEADER: &str = "x-collecty-uncompressed-bytes";
 const REASON_LIMIT: usize = 512;
@@ -31,20 +30,15 @@ impl HttpTransport {
         }
     }
 
-    pub fn route(&self, signal: Signal) -> String {
-        format!("{}/signy/api/v1/collect/{}", self.base, signal.as_str())
+    pub fn route(&self) -> String {
+        format!("{}/signy/api/v1/collect", self.base)
     }
 }
 
 impl Transport for HttpTransport {
-    fn deliver<'a>(
-        &'a self,
-        signal: Signal,
-        frames: Bytes,
-        plain_bytes: usize,
-    ) -> DeliverFuture<'a> {
+    fn deliver<'a>(&'a self, frames: Bytes, plain_bytes: usize) -> DeliverFuture<'a> {
         Box::pin(async move {
-            let uri = self.route(signal);
+            let uri = self.route();
             let request = match Request::builder()
                 .method(Method::POST)
                 .uri(&uri)

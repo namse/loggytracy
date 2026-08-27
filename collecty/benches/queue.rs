@@ -4,6 +4,7 @@ mod corpus;
 use std::sync::Arc;
 
 use collecty::queue::{Queue, QueueLimits, Record};
+use collecty::signal::Signal;
 use collecty::wire;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
@@ -17,7 +18,7 @@ fn scratch(label: &str) -> std::path::PathBuf {
 
 fn appending(criterion: &mut Criterion) {
     let export = corpus::export_bytes(256);
-    let frame = wire::compress(&export, wire::ZSTD_LEVEL).expect("a frame");
+    let frame = wire::compress_record(Signal::Logs, &export, wire::ZSTD_LEVEL).expect("a frame");
     let dir = scratch("append");
     let queue = Queue::open(
         &dir,
@@ -35,7 +36,7 @@ fn appending(criterion: &mut Criterion) {
             queue
                 .append(&Record {
                     frame: frame.clone(),
-                    plain_len: export.len() as u32,
+                    plain_len: (wire::RECORD_HEADER_BYTES + export.len()) as u32,
                 })
                 .expect("an append")
         })
@@ -46,7 +47,7 @@ fn appending(criterion: &mut Criterion) {
 
 fn batching(criterion: &mut Criterion) {
     let export = corpus::export_bytes(64);
-    let frame = wire::compress(&export, wire::ZSTD_LEVEL).expect("a frame");
+    let frame = wire::compress_record(Signal::Logs, &export, wire::ZSTD_LEVEL).expect("a frame");
     let dir = scratch("batch");
     let queue = Arc::new(
         Queue::open(
