@@ -1,6 +1,16 @@
+name: signy
+
+# signy is one component of this repository; a commit that does not touch it
+# has nothing to prove here. collecty gets its own workflow beside this one.
 on:
   push:
+    paths:
+      - 'signy/**'
+      - '.github/workflows/signy.yml'
   pull_request:
+    paths:
+      - 'signy/**'
+      - '.github/workflows/signy.yml'
 
 # The answer to a commit that has already been superseded is not worth a runner.
 concurrency:
@@ -15,7 +25,7 @@ env:
 jobs:
   # Format, lint and the test suite. All three share one debug build of the
   # dependency tree, which is the expensive part.
-  check:
+  signy-check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -108,7 +118,7 @@ jobs:
   # Separate job: the benches build under the `bench` profile, so they share no
   # compiled artifacts with `check` and there is nothing to gain by serializing
   # them behind it.
-  bench:
+  signy-bench:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -142,10 +152,10 @@ jobs:
         # under the bench profile.
         run: cargo bench --locked --benches -- --test
 
-  image:
+  signy-image:
     # Only after the tests pass, and only for what is actually deployed. A pull
     # request does not need a published image.
-    needs: check
+    needs: signy-check
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
