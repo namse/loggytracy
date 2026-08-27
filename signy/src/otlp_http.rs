@@ -244,14 +244,13 @@ pub const MAX_COLLECT_RECORD_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
 /// exports.
 const MAX_INFLIGHT_RECORDS: usize = 32;
 
-/// Which collecty sent the batch, and the number of the first record in it.
+/// Which collecty sent the segment, and which segment it is.
 ///
-/// The body carries no numbers of its own. Records are counted as they are
-/// read, so record `i` of the body is `start + i`, and that is enough to skip
-/// the ones this instance already stored without a per-record cost on the
-/// wire.
+/// The body carries no numbers of its own and does not need to: a segment is
+/// sent from its first record every time, so counting while reading places
+/// every record without a per-record cost on the wire.
 pub const COLLECT_SENDER_HEADER: &str = "x-collecty-sender";
-pub const COLLECT_START_SEQUENCE_HEADER: &str = "x-collecty-start-sequence";
+pub const COLLECT_SEGMENT_HEADER: &str = "x-collecty-segment";
 
 /// Compressed bytes fed to the decoder before its output is drained.
 ///
@@ -342,50 +341,65 @@ async fn collect_inner(
 
     let sender = collect_sender(headers)?;
     let marks = state.journal.collect_marks();
-    // Everything at or below this was stored on some earlier attempt. A
-    // collecty resends from its own cursor, which is behind whatever it was
-    // last told, so the overlap is expected on every restart.
-    let stored = sender.map(|(id, _)| marks.sequence(&id)).unwrap_or(0);
-    if let Some((id, start)) = sender
-        && start > stored + 1
+    let at = sender
+        .map(|(id, _)| marks.position(&id))
+        .unwrap_or(crate::journal::Position::START);
+
+    // Already stored whole, on an attempt whose answer this collecty never
+    // heard. Answered from the headers alone — the body is a copy of what is
+    // already on disk and there is nothing to learn by decompressing it.
+    if let Some((id, segment)) = sender
+        && segment < at.segment
+    {
+        tracing::debug!(sender = %id, segment, "a segment this instance already has, answered unread");
+        return Ok(answer(at));
+    }
+    if let Some((id, segment)) = sender
+        && segment > at.segment
     {
         tracing::warn!(
             sender = %id,
-            start,
-            stored,
-            "a collecty starts past what this instance has; records between the two are gone"
+            segment,
+            expected = at.segment,
+            "a collecty starts past what this instance has; the segments between are gone"
         );
     }
 
+    // How many of this segment's records were stored by an earlier attempt.
+    // Zero unless this is a resend of the one that was interrupted.
+    let already = match sender {
+        Some((_, segment)) if segment == at.segment => at.records,
+        _ => 0,
+    };
+
     let mut records = CollectedRecords::new(body)?;
     let mut inflight: VecDeque<(InflightBody, PendingAppend)> = VecDeque::new();
-    let mut number = sender.map(|(_, start)| start).unwrap_or(0);
-    let mut last_marked = 0u64;
+    let mut index = 0u64;
 
     while let Some((signal, payload)) = records.next().await? {
-        let mark = sender.map(|(id, _)| crate::journal::CollectMark {
-            sender: id,
-            sequence: number,
-        });
-        let at = number;
-        number += 1;
-        if at <= stored && sender.is_some() {
+        let seen = index;
+        index += 1;
+        if seen < already {
             state
                 .metrics
                 .collect_skipped_records
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
+        let mark = sender.map(|(id, segment)| crate::journal::CollectMark {
+            sender: id,
+            at: crate::journal::Position {
+                segment,
+                records: index,
+            },
+        });
         while inflight.len() >= MAX_INFLIGHT_RECORDS {
             settle_oldest(&mut inflight).await?;
         }
         let bytes = payload.len();
         let permit = admit_record(state, &mut inflight, bytes as u64).await?;
         match enqueue_record(state, &tenant, signal, payload, mark).await {
-            Ok(pending) => {
-                last_marked = at;
-                inflight.push_back((permit, pending));
-            }
+            Ok(pending) => inflight.push_back((permit, pending)),
             // Permanent: a decode failure, a body past a limit, a tenant over
             // what it stores. Sending these back would only have collecty
             // halve the batch to find them and drop them anyway, one wasted
@@ -419,37 +433,44 @@ async fn collect_inner(
         settle_oldest(&mut inflight).await?;
     }
 
-    // A record this instance will never accept leaves no record behind, and so
-    // no mark either. Without this the collecty that sent it would resend it
-    // forever, because nothing in the WAL says it got past it. Only written
-    // when the last records of a batch were dropped — otherwise the mark of a
-    // record that *was* stored already covers them.
-    if let Some((id, _)) = sender {
-        let last = number.saturating_sub(1);
-        if last > last_marked.max(stored) {
-            state
-                .journal
-                .enqueue_mark(crate::journal::CollectMark {
-                    sender: id,
-                    sequence: last,
-                })
-                .await
-                .map_err(crate::log_ingest::journal_write_failed)?
-                .settle()
-                .await
-                .map_err(crate::log_ingest::journal_write_failed)?;
-        }
+    // The body ended where it said it would, so the segment is done. This is
+    // the record that says so, and it is what a collecty reads as permission
+    // to unlink the file. It also covers records this instance will never
+    // accept: those leave nothing in the WAL, and without it the collecty
+    // would offer them forever.
+    if let Some((id, segment)) = sender {
+        state
+            .journal
+            .enqueue_mark(crate::journal::CollectMark {
+                sender: id,
+                at: crate::journal::Position {
+                    segment: segment + 1,
+                    records: 0,
+                },
+            })
+            .await
+            .map_err(crate::log_ingest::journal_write_failed)?
+            .settle()
+            .await
+            .map_err(crate::log_ingest::journal_write_failed)?;
     }
 
-    let stored_now = sender.map(|(id, _)| marks.sequence(&id)).unwrap_or(0);
-    Ok((
-        [(header::CONTENT_TYPE, "application/json")],
-        format!("{{\"stored\":{stored_now}}}"),
-    )
-        .into_response())
+    Ok(answer(sender.map(|(id, _)| marks.position(&id)).unwrap_or(
+        crate::journal::Position::START,
+    )))
 }
 
-/// Who sent the batch and where its numbering starts, when the batch says.
+/// The one thing a collecty reads out of a success: the last segment this
+/// instance holds whole. Everything at or below it can be unlinked.
+fn answer(at: crate::journal::Position) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        format!("{{\"stored\":{}}}", at.whole_segments()),
+    )
+        .into_response()
+}
+
+/// Who sent the segment and which segment it is, when the request says.
 ///
 /// Absent means a caller that is not a collecty — a test, or a hand-made
 /// request. Nothing is skipped and no mark is written for one: the numbering
@@ -468,18 +489,18 @@ fn collect_sender(headers: &HeaderMap) -> Result<Option<(crate::journal::SenderI
                 format!("{COLLECT_SENDER_HEADER} is not a sender id"),
             ))
         })?;
-    let start = headers
-        .get(COLLECT_START_SEQUENCE_HEADER)
+    let segment = headers
+        .get(COLLECT_SEGMENT_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|start| *start > 0)
+        .filter(|segment| *segment > 0)
         .ok_or_else(|| {
             IngestError::from((
                 StatusCode::BAD_REQUEST,
-                format!("{COLLECT_START_SEQUENCE_HEADER} must be a record number above zero"),
+                format!("{COLLECT_SEGMENT_HEADER} must be a segment number above zero"),
             ))
         })?;
-    Ok(Some((sender, start)))
+    Ok(Some((sender, segment)))
 }
 
 /// Charge one record against the in-flight ceiling, waiting on this batch's

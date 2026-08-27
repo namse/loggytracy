@@ -407,7 +407,7 @@
     async fn post_collected_from(
         state: &Arc<AppState>,
         sender: &str,
-        start: u64,
+        segment: u64,
         frames: Vec<u8>,
     ) -> (StatusCode, String) {
         post_request(
@@ -419,8 +419,8 @@
                 .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
                 .header(crate::otlp_http::COLLECT_SENDER_HEADER, sender)
                 .header(
-                    crate::otlp_http::COLLECT_START_SEQUENCE_HEADER,
-                    start.to_string(),
+                    crate::otlp_http::COLLECT_SEGMENT_HEADER,
+                    segment.to_string(),
                 )
                 .body(axum::body::Body::from(frames))
                 .unwrap(),
@@ -451,67 +451,95 @@
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The whole point of the numbering: a collecty that died before it could
-    /// record the answer resends from its own cursor, and what it already got
-    /// through is stored once.
-    #[tokio::test]
-    async fn a_batch_sent_again_from_the_same_number_is_stored_once() {
-        let (memtable, state) = fixture();
-        let records: Vec<(u8, Vec<u8>)> = ["first", "second", "third"]
+    fn logs(lines: &[&str]) -> Vec<(u8, Vec<u8>)> {
+        lines
             .iter()
             .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
-            .collect();
+            .collect()
+    }
+
+    /// The whole point of the numbering: a collecty that died before it could
+    /// write the answer down offers the same segment again, and this instance
+    /// answers it without reading a byte of the body it already has.
+    #[tokio::test]
+    async fn a_segment_sent_again_is_answered_without_being_read() {
+        let (memtable, state) = fixture();
+        let records = logs(&["first", "second", "third"]);
 
         let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, r#"{"stored":3}"#);
+        assert_eq!(body, r#"{"stored":1}"#);
 
         let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, r#"{"stored":3}"#, "the answer does not move");
+        assert_eq!(body, r#"{"stored":1}"#, "the answer does not move");
 
         let mut lines = lines(&memtable);
         lines.sort();
         assert_eq!(lines, vec!["first", "second", "third"]);
-        assert_eq!(skipped(&state), 3);
+        assert_eq!(
+            skipped(&state),
+            0,
+            "nothing was counted off because nothing was read"
+        );
     }
 
-    /// A resend that overlaps rather than repeats: the batch is longer the
-    /// second time because more had piled up behind it.
+    /// The segment after it goes on top rather than replacing anything.
     #[tokio::test]
-    async fn a_resend_that_overlaps_is_taken_up_where_it_left_off() {
+    async fn the_next_segment_carries_on_from_the_one_before() {
         let (memtable, state) = fixture();
-        let first: Vec<(u8, Vec<u8>)> = ["first", "second"]
-            .iter()
-            .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
-            .collect();
-        let again: Vec<(u8, Vec<u8>)> = ["first", "second", "third", "fourth"]
-            .iter()
-            .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
-            .collect();
+        post_collected_from(&state, SENDER, 1, zstd_frames(&logs(&["first"]))).await;
 
-        post_collected_from(&state, SENDER, 1, zstd_frames(&first)).await;
-        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&again)).await;
+        let (status, body) =
+            post_collected_from(&state, SENDER, 2, zstd_frames(&logs(&["second"]))).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, r#"{"stored":4}"#);
+        assert_eq!(body, r#"{"stored":2}"#);
         let mut lines = lines(&memtable);
         lines.sort();
-        assert_eq!(lines, vec!["first", "fourth", "second", "third"]);
+        assert_eq!(lines, vec!["first", "second"]);
+    }
+
+    /// A segment whose delivery was cut halfway. What reached the WAL is
+    /// durable and its position with it, so the resend counts those records
+    /// off and stores only the rest.
+    #[tokio::test]
+    async fn a_segment_cut_halfway_is_taken_up_where_it_left_off() {
+        let (memtable, state) = fixture();
+        // What the writer would have left behind: two of segment one's
+        // records stored, and nothing to say the segment finished.
+        state
+            .journal
+            .collect_marks()
+            .advance(crate::journal::CollectMark {
+                sender: crate::journal::SenderId::parse(SENDER).unwrap(),
+                at: crate::journal::Position {
+                    segment: 1,
+                    records: 2,
+                },
+            });
+
+        let records = logs(&["first", "second", "third", "fourth"]);
+        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#"{"stored":1}"#);
+        let mut lines = lines(&memtable);
+        lines.sort();
+        assert_eq!(lines, vec!["fourth", "third"], "only what was still owed");
         assert_eq!(skipped(&state), 2);
     }
 
-    /// Two collectys number their own records, so one's numbers say nothing
+    /// Two collectys number their own segments, so one's numbers say nothing
     /// about the other's.
     #[tokio::test]
-    async fn one_sender_s_numbers_do_not_skip_another_s() {
+    async fn one_sender_s_segments_do_not_skip_another_s() {
         let (memtable, state) = fixture();
-        let records = vec![(LOGS_TAG, log_request("mine").encode_to_vec())];
-        post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+        post_collected_from(&state, SENDER, 1, zstd_frames(&logs(&["mine"]))).await;
 
         let other = "ffffffffffffffffffffffffffffffff";
-        let theirs = vec![(LOGS_TAG, log_request("theirs").encode_to_vec())];
-        let (status, body) = post_collected_from(&state, other, 1, zstd_frames(&theirs)).await;
+        let (status, body) =
+            post_collected_from(&state, other, 1, zstd_frames(&logs(&["theirs"]))).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         let mut lines = lines(&memtable);
@@ -520,11 +548,11 @@
         assert_eq!(skipped(&state), 0);
     }
 
-    /// A record signy will never take leaves nothing in the WAL, so nothing
-    /// would say the sender got past it. Without a mark of its own the same
-    /// record would arrive, be dropped and be asked for again forever.
+    /// A record signy will never take leaves nothing in the WAL. The mark
+    /// written when the body ends is what says the segment finished anyway,
+    /// and without it the collecty would offer it forever.
     #[tokio::test]
-    async fn a_dropped_record_at_the_end_still_moves_the_sender_forward() {
+    async fn a_segment_whose_last_record_is_dropped_still_finishes() {
         let (_memtable, state) = fixture();
         let records = vec![
             (TRACES_TAG, span_request(4).encode_to_vec()),
@@ -533,27 +561,36 @@
 
         let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, r#"{"stored":2}"#);
+        assert_eq!(body, r#"{"stored":1}"#);
 
         let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(skipped(&state), 2, "the resend is skipped, not re-dropped");
         assert_eq!(
             state
                 .metrics
                 .collect_dropped_records
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
-            "and the drop is counted once"
+            "the resend is answered unread, so the drop is counted once"
         );
     }
 
     #[tokio::test]
     async fn a_sender_header_that_is_not_an_id_is_refused() {
         let (_memtable, state) = fixture();
-        let records = vec![(LOGS_TAG, log_request("never stored").encode_to_vec())];
 
-        let (status, body) = post_collected_from(&state, "not-an-id", 1, zstd_frames(&records)).await;
+        let (status, body) =
+            post_collected_from(&state, "not-an-id", 1, zstd_frames(&logs(&["never stored"]))).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_segment_number_of_zero_is_refused() {
+        let (_memtable, state) = fixture();
+
+        let (status, body) =
+            post_collected_from(&state, SENDER, 0, zstd_frames(&logs(&["never stored"]))).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }

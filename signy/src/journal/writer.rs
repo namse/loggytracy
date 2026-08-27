@@ -491,7 +491,7 @@ async fn writer_loop(
                         .iter_mut()
                         .find(|seen| seen.sender == mark.sender)
                     {
-                        Some(seen) => seen.sequence = seen.sequence.max(mark.sequence),
+                        Some(seen) => seen.at = seen.at.max(mark.at),
                         None => batch_marks.push(mark),
                     }
                 }

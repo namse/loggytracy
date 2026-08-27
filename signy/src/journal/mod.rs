@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 mod marks;
-pub use marks::{CollectMark, CollectMarks, SenderId};
+pub use marks::{CollectMark, CollectMarks, Position, SenderId};
 use marks::{MARK_RECORD_BYTES, decode_mark, frame_mark};
 
 use crate::config::Config;

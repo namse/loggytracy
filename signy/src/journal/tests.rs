@@ -827,21 +827,28 @@ can be written in"
     /// recovers it from the WAL alone. Anything less and a restart would take
     /// a collecty's resend of records the WAL still held as new.
     #[tokio::test]
-    async fn replay_recovers_how_far_each_sender_got() {
+    async fn replay_recovers_where_each_sender_got_to() {
         let h = harness("marks_replay").await;
         let id = sender(0x11);
-        for sequence in 1..=3 {
+        for records in 1..=3 {
             push_marked(
                 &h,
                 make_otlp_req(&[("api", vec![("line", 1)])]),
                 CollectMark {
                     sender: id,
-                    sequence,
+                    at: Position {
+                        segment: 4,
+                        records,
+                    },
                 },
             )
             .await;
         }
-        assert_eq!(h.journal.collect_marks().sequence(&id), 3);
+        let reached = Position {
+            segment: 4,
+            records: 3,
+        };
+        assert_eq!(h.journal.collect_marks().position(&id), reached);
 
         let recovered = CollectMarks::default();
         let memtable = MemTable::new();
@@ -855,8 +862,8 @@ can be written in"
         )
         .unwrap();
 
-        assert_eq!(recovered.sequence(&id), 3);
-        assert_eq!(recovered.sequence(&sender(0x22)), 0);
+        assert_eq!(recovered.position(&id), reached);
+        assert_eq!(recovered.position(&sender(0x22)), Position::START);
     }
 
     /// The WAL suffix is not enough on its own: a checkpoint retires the prefix
@@ -867,12 +874,16 @@ can be written in"
     async fn a_checkpoint_writes_the_marks_the_wal_prefix_would_lose() {
         let h = harness("marks_checkpoint").await;
         let id = sender(0x33);
+        let reached = Position {
+            segment: 9,
+            records: 0,
+        };
         push_marked(
             &h,
             make_otlp_req(&[("api", vec![("line", 1)])]),
             CollectMark {
                 sender: id,
-                sequence: 9,
+                at: reached,
             },
         )
         .await;
@@ -880,23 +891,29 @@ can be written in"
         assert!(checkpoint.offset > 0);
 
         let carried = CollectMarks::load(&h.dir);
-        assert_eq!(carried.sequence(&id), 9);
+        assert_eq!(carried.position(&id), reached);
+        assert_eq!(carried.position(&id).whole_segments(), 8);
     }
 
-    /// Never backwards. A batch that reaches the writer out of order, or a
-    /// resend of one already covered, must not walk the mark back over records
-    /// whose twins would then be stored again.
+    /// Never backwards, and a whole segment outranks any part of it. A mark
+    /// that reaches the writer out of order, or a resend of one already
+    /// covered, must not walk the position back over records whose twins would
+    /// then be stored again.
     #[tokio::test]
-    async fn a_mark_only_moves_forward() {
+    async fn a_position_only_moves_forward() {
         let marks = CollectMarks::default();
         let id = sender(0x44);
-        marks.advance(CollectMark {
+        let at = |segment, records| CollectMark {
             sender: id,
-            sequence: 7,
-        });
-        marks.advance(CollectMark {
-            sender: id,
-            sequence: 4,
-        });
-        assert_eq!(marks.sequence(&id), 7);
+            at: Position { segment, records },
+        };
+
+        marks.advance(at(3, 40));
+        marks.advance(at(3, 12));
+        assert_eq!(marks.position(&id), Position { segment: 3, records: 40 });
+
+        marks.advance(at(4, 0));
+        marks.advance(at(3, 90));
+        assert_eq!(marks.position(&id), Position { segment: 4, records: 0 });
+        assert_eq!(marks.position(&id).whole_segments(), 3);
     }
