@@ -96,6 +96,28 @@ pub fn recover_with_signals(
     trace_memtable: &trace::TraceMemTable,
     series_memtable: &crate::series::SeriesMemTable,
 ) -> Result<journal::ReplayReport, String> {
+    recover_with_marks(
+        config,
+        memtable,
+        trace_memtable,
+        series_memtable,
+        &journal::CollectMarks::default(),
+    )
+}
+
+/// The same recovery, filling in how far each collecty had got.
+///
+/// The marks come from two places and both are needed: the file the last
+/// checkpoint wrote, and the mark records in the WAL suffix that checkpoint
+/// did not cover. Without the second, a restart takes a resend of what the
+/// WAL still held as new and stores it twice.
+pub fn recover_with_marks(
+    config: &Config,
+    memtable: &MemTable,
+    trace_memtable: &trace::TraceMemTable,
+    series_memtable: &crate::series::SeriesMemTable,
+    collect_marks: &journal::CollectMarks,
+) -> Result<journal::ReplayReport, String> {
     let parts_root = config.data_dir.join("parts");
     std::fs::create_dir_all(&parts_root).map_err(|e| e.to_string())?;
     cleanup_tmp(&parts_root)?;
@@ -117,6 +139,7 @@ pub fn recover_with_signals(
         memtable,
         trace_memtable,
         series_memtable,
+        collect_marks,
     )?;
     let (ckpt_start, replay_end) = (replay.checkpoint, replay.end_offset);
     if replay.records > 0 {
@@ -174,7 +197,14 @@ pub async fn run(config: Arc<Config>) {
     let trace_memtable = Arc::new(trace::TraceMemTable::new());
     let series_memtable = Arc::new(crate::series::SeriesMemTable::new());
 
-    let replay = recover_with_signals(&config, &memtable, &trace_memtable, &series_memtable)
+    let collect_marks = Arc::new(journal::CollectMarks::load(&config.data_dir));
+    let replay = recover_with_marks(
+        &config,
+        &memtable,
+        &trace_memtable,
+        &series_memtable,
+        &collect_marks,
+    )
         .unwrap_or_else(|e| panic!("recovery failed: {e}"));
 
     let object_storage = config
@@ -290,8 +320,14 @@ pub async fn run(config: Arc<Config>) {
         .map(|storage| Arc::new(RemoteCache::new(storage.clone(), parts_root.clone())));
 
     let journal = Arc::new(
-        Journal::spawn_with_signals(&config, memtable.clone(), trace_memtable, series_memtable)
-            .expect("failed to initialize journal"),
+        Journal::spawn_with_marks(
+            &config,
+            memtable.clone(),
+            trace_memtable,
+            series_memtable,
+            collect_marks,
+        )
+        .expect("failed to initialize journal"),
     );
 
     let flush_healthy = Arc::new(AtomicBool::new(true));

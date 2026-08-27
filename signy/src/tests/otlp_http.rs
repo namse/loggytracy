@@ -387,14 +387,52 @@
         encoding: &str,
         frames: Vec<u8>,
     ) -> (StatusCode, String) {
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri("/signy/api/v1/collect")
-            .header(header::CONTENT_TYPE, "application/x-protobuf")
-            .header(header::CONTENT_ENCODING, encoding)
-            .header(crate::tenant::TENANT_HEADER, tenant)
-            .body(axum::body::Body::from(frames))
-            .unwrap();
+        post_request(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/signy/api/v1/collect")
+                .header(header::CONTENT_TYPE, "application/x-protobuf")
+                .header(header::CONTENT_ENCODING, encoding)
+                .header(crate::tenant::TENANT_HEADER, tenant)
+                .body(axum::body::Body::from(frames))
+                .unwrap(),
+            state,
+        )
+        .await
+    }
+
+    const SENDER: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The same post, named and numbered the way collecty makes one.
+    async fn post_collected_from(
+        state: &Arc<AppState>,
+        sender: &str,
+        start: u64,
+        frames: Vec<u8>,
+    ) -> (StatusCode, String) {
+        post_request(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/signy/api/v1/collect")
+                .header(header::CONTENT_TYPE, "application/x-protobuf")
+                .header(header::CONTENT_ENCODING, "zstd")
+                .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
+                .header(crate::otlp_http::COLLECT_SENDER_HEADER, sender)
+                .header(
+                    crate::otlp_http::COLLECT_START_SEQUENCE_HEADER,
+                    start.to_string(),
+                )
+                .body(axum::body::Body::from(frames))
+                .unwrap(),
+            state,
+        )
+        .await
+    }
+
+    async fn post_request(
+        request: axum::http::Request<axum::body::Body>,
+        state: &Arc<AppState>,
+    ) -> (StatusCode, String) {
         let response = crate::build_router(state.clone())
             .oneshot(request)
             .await
@@ -404,6 +442,120 @@
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn skipped(state: &Arc<AppState>) -> u64 {
+        state
+            .metrics
+            .collect_skipped_records
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The whole point of the numbering: a collecty that died before it could
+    /// record the answer resends from its own cursor, and what it already got
+    /// through is stored once.
+    #[tokio::test]
+    async fn a_batch_sent_again_from_the_same_number_is_stored_once() {
+        let (memtable, state) = fixture();
+        let records: Vec<(u8, Vec<u8>)> = ["first", "second", "third"]
+            .iter()
+            .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
+            .collect();
+
+        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#"{"stored":3}"#);
+
+        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#"{"stored":3}"#, "the answer does not move");
+
+        let mut lines = lines(&memtable);
+        lines.sort();
+        assert_eq!(lines, vec!["first", "second", "third"]);
+        assert_eq!(skipped(&state), 3);
+    }
+
+    /// A resend that overlaps rather than repeats: the batch is longer the
+    /// second time because more had piled up behind it.
+    #[tokio::test]
+    async fn a_resend_that_overlaps_is_taken_up_where_it_left_off() {
+        let (memtable, state) = fixture();
+        let first: Vec<(u8, Vec<u8>)> = ["first", "second"]
+            .iter()
+            .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
+            .collect();
+        let again: Vec<(u8, Vec<u8>)> = ["first", "second", "third", "fourth"]
+            .iter()
+            .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
+            .collect();
+
+        post_collected_from(&state, SENDER, 1, zstd_frames(&first)).await;
+        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&again)).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#"{"stored":4}"#);
+        let mut lines = lines(&memtable);
+        lines.sort();
+        assert_eq!(lines, vec!["first", "fourth", "second", "third"]);
+        assert_eq!(skipped(&state), 2);
+    }
+
+    /// Two collectys number their own records, so one's numbers say nothing
+    /// about the other's.
+    #[tokio::test]
+    async fn one_sender_s_numbers_do_not_skip_another_s() {
+        let (memtable, state) = fixture();
+        let records = vec![(LOGS_TAG, log_request("mine").encode_to_vec())];
+        post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+
+        let other = "ffffffffffffffffffffffffffffffff";
+        let theirs = vec![(LOGS_TAG, log_request("theirs").encode_to_vec())];
+        let (status, body) = post_collected_from(&state, other, 1, zstd_frames(&theirs)).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut lines = lines(&memtable);
+        lines.sort();
+        assert_eq!(lines, vec!["mine", "theirs"]);
+        assert_eq!(skipped(&state), 0);
+    }
+
+    /// A record signy will never take leaves nothing in the WAL, so nothing
+    /// would say the sender got past it. Without a mark of its own the same
+    /// record would arrive, be dropped and be asked for again forever.
+    #[tokio::test]
+    async fn a_dropped_record_at_the_end_still_moves_the_sender_forward() {
+        let (_memtable, state) = fixture();
+        let records = vec![
+            (TRACES_TAG, span_request(4).encode_to_vec()),
+            (LOGS_TAG, vec![0xFFu8; 16]),
+        ];
+
+        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#"{"stored":2}"#);
+
+        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(skipped(&state), 2, "the resend is skipped, not re-dropped");
+        assert_eq!(
+            state
+                .metrics
+                .collect_dropped_records
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "and the drop is counted once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sender_header_that_is_not_an_id_is_refused() {
+        let (_memtable, state) = fixture();
+        let records = vec![(LOGS_TAG, log_request("never stored").encode_to_vec())];
+
+        let (status, body) = post_collected_from(&state, "not-an-id", 1, zstd_frames(&records)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
 
     #[tokio::test]

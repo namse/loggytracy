@@ -52,17 +52,38 @@
     struct Harness {
         journal: Journal,
         memtable: Arc<MemTable>,
+        dir: PathBuf,
     }
 
     async fn harness(name: &str) -> Harness {
         let dir = tmp_dir(name);
         let config = Config {
-            data_dir: dir,
+            data_dir: dir.clone(),
             ..Config::default()
         };
         let memtable = Arc::new(MemTable::new());
         let journal = Journal::spawn(&config, memtable.clone()).unwrap();
-        Harness { journal, memtable }
+        Harness {
+            journal,
+            memtable,
+            dir,
+        }
+    }
+
+    fn sender(byte: u8) -> SenderId {
+        SenderId::parse(&format!("{byte:02x}").repeat(16)).expect("a sender id")
+    }
+
+    async fn push_marked(h: &Harness, raw: Vec<u8>, mark: CollectMark) {
+        let request = ExportLogsServiceRequest::decode(raw.as_slice()).unwrap();
+        let streams = crate::otlp_log::normalize_request(request).unwrap();
+        h.journal
+            .enqueue_otlp_logs(test_tenant(), raw, streams, Some(mark))
+            .await
+            .unwrap()
+            .settle()
+            .await
+            .unwrap();
     }
 
     async fn push(h: &Harness, raw: Vec<u8>) {
@@ -800,4 +821,82 @@ can be written in"
         )
         .expect_err("an unframed record must refuse replay");
         assert!(error.contains("delete the data directory"), "{error}");
+    }
+
+    /// A mark rides in the same batch as the records it covers, so replay
+    /// recovers it from the WAL alone. Anything less and a restart would take
+    /// a collecty's resend of records the WAL still held as new.
+    #[tokio::test]
+    async fn replay_recovers_how_far_each_sender_got() {
+        let h = harness("marks_replay").await;
+        let id = sender(0x11);
+        for sequence in 1..=3 {
+            push_marked(
+                &h,
+                make_otlp_req(&[("api", vec![("line", 1)])]),
+                CollectMark {
+                    sender: id,
+                    sequence,
+                },
+            )
+            .await;
+        }
+        assert_eq!(h.journal.collect_marks().sequence(&id), 3);
+
+        let recovered = CollectMarks::default();
+        let memtable = MemTable::new();
+        replay_reporting(
+            h.journal.wal_path(),
+            h.journal.ckpt_path(),
+            &memtable,
+            &TraceMemTable::new(),
+            &SeriesMemTable::new(),
+            &recovered,
+        )
+        .unwrap();
+
+        assert_eq!(recovered.sequence(&id), 3);
+        assert_eq!(recovered.sequence(&sender(0x22)), 0);
+    }
+
+    /// The WAL suffix is not enough on its own: a checkpoint retires the prefix
+    /// the marks were written in, and a sender that has been quiet since would
+    /// come back unknown. The file the checkpoint writes is what carries them
+    /// across.
+    #[tokio::test]
+    async fn a_checkpoint_writes_the_marks_the_wal_prefix_would_lose() {
+        let h = harness("marks_checkpoint").await;
+        let id = sender(0x33);
+        push_marked(
+            &h,
+            make_otlp_req(&[("api", vec![("line", 1)])]),
+            CollectMark {
+                sender: id,
+                sequence: 9,
+            },
+        )
+        .await;
+        let checkpoint = h.journal.checkpoint().await.unwrap();
+        assert!(checkpoint.offset > 0);
+
+        let carried = CollectMarks::load(&h.dir);
+        assert_eq!(carried.sequence(&id), 9);
+    }
+
+    /// Never backwards. A batch that reaches the writer out of order, or a
+    /// resend of one already covered, must not walk the mark back over records
+    /// whose twins would then be stored again.
+    #[tokio::test]
+    async fn a_mark_only_moves_forward() {
+        let marks = CollectMarks::default();
+        let id = sender(0x44);
+        marks.advance(CollectMark {
+            sender: id,
+            sequence: 7,
+        });
+        marks.advance(CollectMark {
+            sender: id,
+            sequence: 4,
+        });
+        assert_eq!(marks.sequence(&id), 7);
     }

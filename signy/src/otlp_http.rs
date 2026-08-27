@@ -244,6 +244,15 @@ pub const MAX_COLLECT_RECORD_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
 /// exports.
 const MAX_INFLIGHT_RECORDS: usize = 32;
 
+/// Which collecty sent the batch, and the number of the first record in it.
+///
+/// The body carries no numbers of its own. Records are counted as they are
+/// read, so record `i` of the body is `start + i`, and that is enough to skip
+/// the ones this instance already stored without a per-record cost on the
+/// wire.
+pub const COLLECT_SENDER_HEADER: &str = "x-collecty-sender";
+pub const COLLECT_START_SEQUENCE_HEADER: &str = "x-collecty-start-sequence";
+
 /// Compressed bytes fed to the decoder before its output is drained.
 ///
 /// Small on purpose: a decoder handed a whole chunk at once can produce every
@@ -331,17 +340,52 @@ async fn collect_inner(
     let tenant = crate::tenant::from_headers(headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http);
 
+    let sender = collect_sender(headers)?;
+    let marks = state.journal.collect_marks();
+    // Everything at or below this was stored on some earlier attempt. A
+    // collecty resends from its own cursor, which is behind whatever it was
+    // last told, so the overlap is expected on every restart.
+    let stored = sender.map(|(id, _)| marks.sequence(&id)).unwrap_or(0);
+    if let Some((id, start)) = sender
+        && start > stored + 1
+    {
+        tracing::warn!(
+            sender = %id,
+            start,
+            stored,
+            "a collecty starts past what this instance has; records between the two are gone"
+        );
+    }
+
     let mut records = CollectedRecords::new(body)?;
     let mut inflight: VecDeque<(InflightBody, PendingAppend)> = VecDeque::new();
+    let mut number = sender.map(|(_, start)| start).unwrap_or(0);
+    let mut last_marked = 0u64;
 
     while let Some((signal, payload)) = records.next().await? {
+        let mark = sender.map(|(id, _)| crate::journal::CollectMark {
+            sender: id,
+            sequence: number,
+        });
+        let at = number;
+        number += 1;
+        if at <= stored && sender.is_some() {
+            state
+                .metrics
+                .collect_skipped_records
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         while inflight.len() >= MAX_INFLIGHT_RECORDS {
             settle_oldest(&mut inflight).await?;
         }
         let bytes = payload.len();
         let permit = admit_record(state, &mut inflight, bytes as u64).await?;
-        match enqueue_record(state, &tenant, signal, payload).await {
-            Ok(pending) => inflight.push_back((permit, pending)),
+        match enqueue_record(state, &tenant, signal, payload, mark).await {
+            Ok(pending) => {
+                last_marked = at;
+                inflight.push_back((permit, pending));
+            }
             // Permanent: a decode failure, a body past a limit, a tenant over
             // what it stores. Sending these back would only have collecty
             // halve the batch to find them and drop them anyway, one wasted
@@ -375,7 +419,67 @@ async fn collect_inner(
         settle_oldest(&mut inflight).await?;
     }
 
-    Ok(StatusCode::OK.into_response())
+    // A record this instance will never accept leaves no record behind, and so
+    // no mark either. Without this the collecty that sent it would resend it
+    // forever, because nothing in the WAL says it got past it. Only written
+    // when the last records of a batch were dropped — otherwise the mark of a
+    // record that *was* stored already covers them.
+    if let Some((id, _)) = sender {
+        let last = number.saturating_sub(1);
+        if last > last_marked.max(stored) {
+            state
+                .journal
+                .enqueue_mark(crate::journal::CollectMark {
+                    sender: id,
+                    sequence: last,
+                })
+                .await
+                .map_err(crate::log_ingest::journal_write_failed)?
+                .settle()
+                .await
+                .map_err(crate::log_ingest::journal_write_failed)?;
+        }
+    }
+
+    let stored_now = sender.map(|(id, _)| marks.sequence(&id)).unwrap_or(0);
+    Ok((
+        [(header::CONTENT_TYPE, "application/json")],
+        format!("{{\"stored\":{stored_now}}}"),
+    )
+        .into_response())
+}
+
+/// Who sent the batch and where its numbering starts, when the batch says.
+///
+/// Absent means a caller that is not a collecty — a test, or a hand-made
+/// request. Nothing is skipped and no mark is written for one: the numbering
+/// belongs to a queue, and a caller without a queue has none.
+fn collect_sender(headers: &HeaderMap) -> Result<Option<(crate::journal::SenderId, u64)>, IngestError> {
+    let Some(raw) = headers.get(COLLECT_SENDER_HEADER) else {
+        return Ok(None);
+    };
+    let sender = raw
+        .to_str()
+        .ok()
+        .and_then(crate::journal::SenderId::parse)
+        .ok_or_else(|| {
+            IngestError::from((
+                StatusCode::BAD_REQUEST,
+                format!("{COLLECT_SENDER_HEADER} is not a sender id"),
+            ))
+        })?;
+    let start = headers
+        .get(COLLECT_START_SEQUENCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|start| *start > 0)
+        .ok_or_else(|| {
+            IngestError::from((
+                StatusCode::BAD_REQUEST,
+                format!("{COLLECT_START_SEQUENCE_HEADER} must be a record number above zero"),
+            ))
+        })?;
+    Ok(Some((sender, start)))
 }
 
 /// Charge one record against the in-flight ceiling, waiting on this batch's
@@ -423,15 +527,16 @@ async fn enqueue_record(
     tenant: &Result<crate::tenant::TenantId, (StatusCode, String)>,
     signal: CollectSignal,
     payload: Vec<u8>,
+    mark: Option<crate::journal::CollectMark>,
 ) -> Result<PendingAppend, IngestError> {
     let tenant = match tenant {
         Ok(tenant) => tenant.clone(),
         Err((status, message)) => return Err((*status, message.clone()).into()),
     };
     match signal {
-        CollectSignal::Logs => collect_logs(state, tenant, payload).await,
-        CollectSignal::Traces => collect_traces(state, tenant, payload).await,
-        CollectSignal::Metrics => collect_metrics(state, tenant, payload).await,
+        CollectSignal::Logs => collect_logs(state, tenant, payload, mark).await,
+        CollectSignal::Traces => collect_traces(state, tenant, payload, mark).await,
+        CollectSignal::Metrics => collect_metrics(state, tenant, payload, mark).await,
     }
 }
 
@@ -606,6 +711,7 @@ async fn collect_logs(
     state: &Arc<AppState>,
     tenant: crate::tenant::TenantId,
     payload: Vec<u8>,
+    mark: Option<crate::journal::CollectMark>,
 ) -> Result<PendingAppend, IngestError> {
     let ingest = log_ingest(state);
     ingest.admit_tenant(&tenant, payload.len())?;
@@ -615,13 +721,14 @@ async fn collect_logs(
             format!("OTLP protobuf decode failed: {error}"),
         ))
     })?;
-    ingest.enqueue(tenant, request, Some(payload)).await
+    ingest.enqueue(tenant, request, Some(payload), mark).await
 }
 
 async fn collect_traces(
     state: &Arc<AppState>,
     tenant: crate::tenant::TenantId,
     payload: Vec<u8>,
+    mark: Option<crate::journal::CollectMark>,
 ) -> Result<PendingAppend, IngestError> {
     let ingest = OtlpTraceIngest {
         journal: &state.journal,
@@ -636,13 +743,14 @@ async fn collect_traces(
             format!("OTLP protobuf decode failed: {error}"),
         ))
     })?;
-    ingest.enqueue(tenant, request).await
+    ingest.enqueue(tenant, request, mark).await
 }
 
 async fn collect_metrics(
     state: &Arc<AppState>,
     tenant: crate::tenant::TenantId,
     payload: Vec<u8>,
+    mark: Option<crate::journal::CollectMark>,
 ) -> Result<PendingAppend, IngestError> {
     let ingest = OtlpMetricIngest {
         journal: &state.journal,
@@ -659,7 +767,7 @@ async fn collect_metrics(
             format!("OTLP protobuf decode failed: {error}"),
         ))
     })?;
-    let (pending, outcome) = ingest.enqueue(tenant, request).await?;
+    let (pending, outcome) = ingest.enqueue(tenant, request, mark).await?;
     // The collect route answers a bare 200 — collecty reads the status and
     // nothing else — so a partial refusal has only the log to land in.
     if let Some(partial) = outcome.partial_success() {

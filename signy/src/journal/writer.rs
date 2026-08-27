@@ -22,6 +22,21 @@ impl Journal {
         trace_memtable: Arc<TraceMemTable>,
         series_memtable: Arc<SeriesMemTable>,
     ) -> Result<Self, IoError> {
+        let marks = Arc::new(CollectMarks::load(&config.data_dir));
+        Self::spawn_with_marks(config, memtable, trace_memtable, series_memtable, marks)
+    }
+
+    /// The same, for a startup that has already replayed the WAL into the
+    /// marks it is handing over. Replay runs before the writer exists, so the
+    /// marks it recovered cannot be read out of a journal that is not there
+    /// yet.
+    pub fn spawn_with_marks(
+        config: &Config,
+        memtable: Arc<MemTable>,
+        trace_memtable: Arc<TraceMemTable>,
+        series_memtable: Arc<SeriesMemTable>,
+        collect_marks: Arc<CollectMarks>,
+    ) -> Result<Self, IoError> {
         let dir = &config.data_dir;
         std::fs::create_dir_all(dir)?;
         let wal_path = dir.join(WAL_FILE);
@@ -57,11 +72,14 @@ impl Journal {
         let writer_backlog = backlog.clone();
         let writer_memtable = memtable.clone();
         let writer_metrics = metrics.clone();
+        let writer_marks = collect_marks.clone();
+        let writer_dir = dir.clone();
         tokio::spawn(async move {
             let result = writer_loop(
                 rx,
                 &wal_path_clone,
                 &ckpt_path_clone,
+                &writer_dir,
                 writer_memtable,
                 trace_memtable_clone,
                 series_memtable_clone,
@@ -69,6 +87,7 @@ impl Journal {
                 max_batch_ms,
                 &writer_backlog,
                 &writer_metrics,
+                &writer_marks,
             )
             .await;
             writer_health.store(false, Ordering::Release);
@@ -79,6 +98,7 @@ impl Journal {
 
         Ok(Self {
             tx,
+            collect_marks,
             wal_path,
             ckpt_path,
             healthy,
@@ -121,7 +141,7 @@ impl Journal {
         data: Vec<u8>,
         entries: Vec<LogEntry>,
     ) -> Result<(), IoError> {
-        self.enqueue_otlp_logs(tenant, data, entries)
+        self.enqueue_otlp_logs(tenant, data, entries, None)
             .await?
             .settle()
             .await
@@ -132,15 +152,17 @@ impl Journal {
         tenant: TenantId,
         data: Vec<u8>,
         entries: Vec<LogEntry>,
+        mark: Option<CollectMark>,
     ) -> Result<PendingAppend, IoError> {
         let payload = compress_payload(&data)?;
         self.enqueue_append(
             TENANT_RECORD_KIND_OTLP_LOGS,
             payload,
-            tenant,
+            Some(tenant),
             entries,
             Vec::new(),
             Vec::new(),
+            mark,
         )
         .await
     }
@@ -151,7 +173,10 @@ impl Journal {
         data: Vec<u8>,
         spans: Vec<TraceSpan>,
     ) -> Result<(), IoError> {
-        self.enqueue_trace(tenant, data, spans).await?.settle().await
+        self.enqueue_trace(tenant, data, spans, None)
+            .await?
+            .settle()
+            .await
     }
 
     pub async fn enqueue_trace(
@@ -159,15 +184,17 @@ impl Journal {
         tenant: TenantId,
         data: Vec<u8>,
         spans: Vec<TraceSpan>,
+        mark: Option<CollectMark>,
     ) -> Result<PendingAppend, IoError> {
         let payload = compress_payload(&data)?;
         self.enqueue_append(
             TENANT_RECORD_KIND_TRACES,
             payload,
-            tenant,
+            Some(tenant),
             Vec::new(),
             spans,
             Vec::new(),
+            mark,
         )
         .await
     }
@@ -183,7 +210,7 @@ impl Journal {
         data: Vec<u8>,
         samples: Vec<MetricSample>,
     ) -> Result<(), IoError> {
-        self.enqueue_metrics(tenant, data, samples)
+        self.enqueue_metrics(tenant, data, samples, None)
             .await?
             .settle()
             .await
@@ -194,30 +221,58 @@ impl Journal {
         tenant: TenantId,
         data: Vec<u8>,
         samples: Vec<MetricSample>,
+        mark: Option<CollectMark>,
     ) -> Result<PendingAppend, IoError> {
         let payload = compress_payload(&data)?;
         self.enqueue_append(
             TENANT_RECORD_KIND_OTLP_METRICS,
             payload,
-            tenant,
+            Some(tenant),
             Vec::new(),
             Vec::new(),
             samples,
+            mark,
         )
         .await
     }
 
+    /// A number to remember with nothing to store under it.
+    ///
+    /// A record signy will never accept still has to move the mark past it,
+    /// or the collecty that sent it resends it forever. Nothing else in a
+    /// batch may need writing, so this is an append whose payload is empty.
+    pub async fn enqueue_mark(&self, mark: CollectMark) -> Result<PendingAppend, IoError> {
+        self.enqueue_append(
+            TENANT_RECORD_KIND_OTLP_LOGS,
+            Vec::new(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(mark),
+        )
+        .await
+    }
+
+    pub fn collect_marks(&self) -> &Arc<CollectMarks> {
+        &self.collect_marks
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn enqueue_append(
         &self,
         kind: u8,
         payload: Vec<u8>,
-        tenant: TenantId,
+        tenant: Option<TenantId>,
         entries: Vec<LogEntry>,
         traces: Vec<TraceSpan>,
         metric_samples: Vec<MetricSample>,
+        mark: Option<CollectMark>,
     ) -> Result<PendingAppend, IoError> {
-        let framed_len =
-            TENANT_RECORD_PREFIX_SIZE + tenant.as_str().len() + payload.len();
+        let framed_len = tenant
+            .as_ref()
+            .map(|tenant| TENANT_RECORD_PREFIX_SIZE + tenant.as_str().len() + payload.len())
+            .unwrap_or(0);
         if framed_len > MAX_RECORD_BYTES {
             return Err(IoError::new(
                 std::io::ErrorKind::InvalidInput,
@@ -232,16 +287,17 @@ impl Journal {
         // would report zero for exactly the case it exists to catch.
         let queued_at = Instant::now();
         self.tx
-            .send(JournalCmd::Append {
+            .send(JournalCmd::Append(AppendItem {
                 kind,
                 payload,
                 tenant,
                 entries,
                 traces,
                 metric_samples,
+                mark,
                 queued_at,
                 done: done_tx,
-            })
+            }))
             .await
             .map_err(|_| IoError::new(std::io::ErrorKind::BrokenPipe, "journal writer closed"))?;
         Ok(PendingAppend(done_rx))
@@ -315,6 +371,7 @@ async fn writer_loop(
     mut rx: mpsc::Receiver<JournalCmd>,
     path: &Path,
     ckpt_path: &Path,
+    dir: &Path,
     memtable: Arc<MemTable>,
     trace_memtable: Arc<TraceMemTable>,
     series_memtable: Arc<SeriesMemTable>,
@@ -322,6 +379,7 @@ async fn writer_loop(
     max_batch_ms: u64,
     backlog: &WalBacklog,
     metrics: &JournalMetrics,
+    collect_marks: &CollectMarks,
 ) -> Result<(), IoError> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -342,32 +400,14 @@ async fn writer_loop(
             None;
         let mut pending_compact: Option<(u64, oneshot::Sender<Result<(), IoError>>)> = None;
 
-        let mut batch: Vec<AppendBatchItem> = Vec::new();
+        let mut batch: Vec<AppendItem> = Vec::new();
         let mut batch_bytes = 0usize;
         let mut closed = false;
 
         match first {
-            JournalCmd::Append {
-                kind,
-                payload,
-                tenant,
-                entries,
-                traces,
-                metric_samples,
-                queued_at,
-                done,
-            } => {
-                batch_bytes += framed_record_len(&tenant, &payload);
-                batch.push((
-                    kind,
-                    payload,
-                    tenant,
-                    entries,
-                    traces,
-                    metric_samples,
-                    queued_at,
-                    done,
-                ));
+            JournalCmd::Append(item) => {
+                batch_bytes += item_len(&item);
+                batch.push(item);
                 // Take what has already arrived and write it. Waiting for more
                 // charged every push the full linger even when the channel was
                 // empty, which fixed single-connection throughput at
@@ -394,27 +434,9 @@ async fn writer_loop(
                             .map_err(|_| ())
                     };
                     match next {
-                        Ok(Some(JournalCmd::Append {
-                            kind,
-                            payload,
-                            tenant,
-                            entries,
-                            traces,
-                            metric_samples,
-                            queued_at,
-                            done,
-                        })) => {
-                            batch_bytes += framed_record_len(&tenant, &payload);
-                            batch.push((
-                                kind,
-                                payload,
-                                tenant,
-                                entries,
-                                traces,
-                                metric_samples,
-                                queued_at,
-                                done,
-                            ));
+                        Ok(Some(JournalCmd::Append(item))) => {
+                            batch_bytes += item_len(&item);
+                            batch.push(item);
                         }
                         Ok(Some(JournalCmd::Checkpoint { done })) => {
                             pending_checkpoint = Some(done);
@@ -446,11 +468,11 @@ async fn writer_loop(
             // against the same instant.
             let batch_started = Instant::now();
             let mut oldest_queued = batch_started;
-            for (_, _, _, _, _, _, queued_at, _) in &batch {
+            for item in &batch {
                 metrics
                     .append_queue_wait
-                    .observe(batch_started.saturating_duration_since(*queued_at));
-                oldest_queued = oldest_queued.min(*queued_at);
+                    .observe(batch_started.saturating_duration_since(item.queued_at));
+                oldest_queued = oldest_queued.min(item.queued_at);
             }
             metrics.batches.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -458,7 +480,27 @@ async fn writer_loop(
                 .fetch_add(batch.len() as u64, Ordering::Relaxed);
             let wal_arena = crate::memprof::enter(crate::memprof::Arena::Wal);
             let mut buf = Vec::with_capacity(batch_bytes + batch.len() * RECORD_HEADER_SIZE);
-            for (kind, payload, tenant, _, _, _, _, _) in &batch {
+            // The highest number each collecty reached in this batch. Written
+            // after the records, in the same buffer and so under the same
+            // `sync_all`: a mark that survived a crash is a promise that
+            // everything it covers survived with it.
+            let mut batch_marks: Vec<CollectMark> = Vec::new();
+            for item in &batch {
+                if let Some(mark) = item.mark {
+                    match batch_marks
+                        .iter_mut()
+                        .find(|seen| seen.sender == mark.sender)
+                    {
+                        Some(seen) => seen.sequence = seen.sequence.max(mark.sequence),
+                        None => batch_marks.push(mark),
+                    }
+                }
+            }
+            for item in &batch {
+                let (kind, payload) = (&item.kind, &item.payload);
+                let Some(tenant) = item.tenant.as_ref() else {
+                    continue;
+                };
                 // Framed here, straight into the batch buffer. The frame used
                 // to be its own prefix+tenant+payload Vec built on the ingest
                 // task, which copied every export once more than the write
@@ -485,6 +527,14 @@ async fn writer_loop(
                 buf.push(tenant_bytes.len() as u8);
                 buf.extend_from_slice(tenant_bytes);
                 buf.extend_from_slice(payload);
+            }
+
+            for mark in &batch_marks {
+                let mut framed = Vec::with_capacity(MARK_RECORD_BYTES);
+                frame_mark(mark, &mut framed);
+                buf.extend_from_slice(&(framed.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&crc32fast::hash(&framed).to_le_bytes());
+                buf.extend_from_slice(&framed);
             }
 
             drop(wal_arena);
@@ -516,13 +566,20 @@ async fn writer_loop(
                     // are moved, not copied, so the memtable's own nodes are
                     // charged to the same arena its contents already are.
                     let _arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
+                    // After the fsync, never before: the mark is what lets a
+                    // resend be skipped, and skipping a record this instance
+                    // has not actually stored is the one way to lose one.
+                    for mark in &batch_marks {
+                        collect_marks.advance(*mark);
+                    }
                     let records = batch.len();
-                    for (_, _, tenant, entries, traces, metric_samples, _, done) in batch.drain(..)
-                    {
-                        memtable.insert(tenant.clone(), entries);
-                        trace_memtable.insert(traces);
-                        series_memtable.insert(metric_samples);
-                        let _ = done.send(Ok(()));
+                    for item in batch.drain(..) {
+                        if let Some(tenant) = item.tenant {
+                            memtable.insert(tenant, item.entries);
+                        }
+                        trace_memtable.insert(item.traces);
+                        series_memtable.insert(item.metric_samples);
+                        let _ = item.done.send(Ok(()));
                     }
                     let inserted = Instant::now();
                     let insert = inserted.saturating_duration_since(fsynced);
@@ -551,8 +608,8 @@ async fn writer_loop(
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "journal write failed, truncating partial record");
-                    for (_, _, _, _, _, _, _, done) in batch.drain(..) {
-                        let _ = done.send(Err(IoError::new(e.kind(), e.to_string())));
+                    for item in batch.drain(..) {
+                        let _ = item.done.send(Err(IoError::new(e.kind(), e.to_string())));
                     }
                     let recovered = async {
                         file.set_len(good_len).await?;
@@ -575,6 +632,13 @@ async fn writer_loop(
                 return Err(e);
             }
             let offset = good_len;
+            // Ahead of the offset the flush loop will store when it is done,
+            // which is the order these two files have to be written in: marks
+            // ahead of the checkpoint name records the WAL still holds, and
+            // marks behind it would have those records sent a second time.
+            if let Err(error) = collect_marks.store(dir) {
+                tracing::warn!(%error, "the collect marks could not be written");
+            }
             let snapshot = memtable.begin_flush();
             let trace_snapshot = trace_memtable.begin_flush();
             let series_snapshot = series_memtable.begin_flush();
@@ -643,3 +707,16 @@ async fn writer_loop(
 }
 
 
+
+/// What one append costs the batch buffer. A mark with nothing under it costs
+/// its own record and no tenant frame.
+fn item_len(item: &AppendItem) -> usize {
+    item.tenant
+        .as_ref()
+        .map(|tenant| framed_record_len(tenant, &item.payload))
+        .unwrap_or(0)
+        + item
+            .mark
+            .map(|_| RECORD_HEADER_SIZE + MARK_RECORD_BYTES)
+            .unwrap_or(0)
+}

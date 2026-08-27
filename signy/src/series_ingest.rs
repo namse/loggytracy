@@ -620,7 +620,7 @@ impl OtlpMetricIngest<'_> {
         tenant: crate::tenant::TenantId,
         request: ExportMetricsServiceRequest,
     ) -> Result<MetricAcceptOutcome, IngestError> {
-        let (pending, outcome) = self.enqueue(tenant, request).await?;
+        let (pending, outcome) = self.enqueue(tenant, request, None).await?;
         pending
             .settle()
             .await
@@ -632,6 +632,7 @@ impl OtlpMetricIngest<'_> {
         &self,
         tenant: crate::tenant::TenantId,
         request: ExportMetricsServiceRequest,
+        mark: Option<crate::journal::CollectMark>,
     ) -> Result<(crate::journal::PendingAppend, MetricAcceptOutcome), IngestError> {
         // The cheap pre-check: every datapoint decomposes into at least one
         // sample, so a request past the cap on datapoints alone is refused
@@ -707,7 +708,7 @@ impl OtlpMetricIngest<'_> {
         })?;
         let pending = self
             .journal
-            .enqueue_metrics(tenant, encoded, samples)
+            .enqueue_metrics(tenant, encoded, samples, mark)
             .await
             .map_err(crate::log_ingest::journal_write_failed)?;
         Ok((

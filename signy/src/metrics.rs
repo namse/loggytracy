@@ -23,6 +23,11 @@ pub struct RuntimeMetrics {
     /// itself; these two counters are the only place that loss is visible.
     pub collect_dropped_records: AtomicU64,
     pub collect_dropped_bytes: AtomicU64,
+    /// Records a collecty sent again that this instance already had. Not a
+    /// loss and not an error: it is what a resend after a crash looks like,
+    /// and a number that stays flat while a collector restarts is the sign
+    /// that the numbering is not doing its job.
+    pub collect_skipped_records: AtomicU64,
     /// Writes refused because the tenant is already storing everything its plan
     /// sells. It clears only when retention retires parts, which is why the
     /// refusal carries a long Retry-After.
@@ -146,6 +151,7 @@ impl RuntimeMetrics {
             ingest_throttled: AtomicU64::new(0),
             collect_dropped_records: AtomicU64::new(0),
             collect_dropped_bytes: AtomicU64::new(0),
+            collect_skipped_records: AtomicU64::new(0),
             query_quota_rejected: AtomicU64::new(0),
             storage_limit_rejected: AtomicU64::new(0),
             wal_replayed_records: AtomicU64::new(0),

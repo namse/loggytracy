@@ -15,8 +15,15 @@ pub fn replay_with_signals(
     trace_memtable: &TraceMemTable,
     series_memtable: &SeriesMemTable,
 ) -> Result<(u64, u64), String> {
-    replay_reporting(wal_path, ckpt_path, memtable, trace_memtable, series_memtable)
-        .map(|report| (report.checkpoint, report.end_offset))
+    replay_reporting(
+        wal_path,
+        ckpt_path,
+        memtable,
+        trace_memtable,
+        series_memtable,
+        &CollectMarks::default(),
+    )
+    .map(|report| (report.checkpoint, report.end_offset))
 }
 
 /// What a replay put back, so a restart can be told from a clean start.
@@ -52,6 +59,7 @@ pub fn replay_reporting(
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
     series_memtable: &SeriesMemTable,
+    collect_marks: &CollectMarks,
 ) -> Result<ReplayReport, String> {
     recover_unfinished_compaction(wal_path, ckpt_path).map_err(|e| e.to_string())?;
     let checkpoint = read_checkpoint(ckpt_path).map_err(|e| e.to_string())?;
@@ -65,6 +73,7 @@ pub fn replay_reporting(
         memtable,
         trace_memtable,
         series_memtable,
+        collect_marks,
         &mut report,
     )?;
     report.end_offset = end;
@@ -96,12 +105,14 @@ fn recover_unfinished_compaction(wal_path: &Path, ckpt_path: &Path) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay_from(
     wal_path: &Path,
     checkpoint: u64,
     memtable: &MemTable,
     trace_memtable: &TraceMemTable,
     series_memtable: &SeriesMemTable,
+    collect_marks: &CollectMarks,
     report: &mut ReplayReport,
 ) -> Result<u64, String> {
     if !wal_path.exists() {
@@ -171,7 +182,13 @@ fn replay_from(
             }
             return Err(format!("journal record crc mismatch at offset {offset}"));
         }
-        if let Some((tenant, kind, payload)) = decode_tenant_record(&data)
+        // Ahead of the tenant frame: a mark belongs to no tenant, and the
+        // records it covers are the ones being replayed around it. Recovering
+        // it here is what stops a restart from taking a collecty's whole
+        // resend as new.
+        if let Some(mark) = decode_mark(&data) {
+            collect_marks.advance(mark);
+        } else if let Some((tenant, kind, payload)) = decode_tenant_record(&data)
             .map_err(|error| format!("journal record invalid at offset {offset}: {error}"))?
         {
             match kind {

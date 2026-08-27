@@ -12,6 +12,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
+mod marks;
+pub use marks::{CollectMark, CollectMarks, SenderId};
+use marks::{MARK_RECORD_BYTES, decode_mark, frame_mark};
+
 use crate::config::Config;
 use crate::memtable::{LogEntry, MemTable, MemTableSnapshot};
 use crate::metrics::LatencyHistogram;
@@ -185,25 +189,7 @@ fn decode_tenant_record(data: &[u8]) -> Result<Option<TenantRecord<'_>>, String>
 }
 
 enum JournalCmd {
-    Append {
-        /// Record kind byte, framed by the writer loop. The payload travels
-        /// unframed: framing it here built a prefix+tenant+payload copy of
-        /// every export just to copy it again into the batch buffer —
-        /// invariant II's "WAL write buffer" copy paid twice.
-        kind: u8,
-        payload: Vec<u8>,
-        tenant: TenantId,
-        entries: Vec<LogEntry>,
-        traces: Vec<TraceSpan>,
-        metric_samples: Vec<MetricSample>,
-        /// When the pushing task handed this to the channel. Every push in the
-        /// process funnels through one writer task, so the interval between
-        /// this and the batch that carries it is the queue in front of that
-        /// task — the term nothing measured while the push tail was being
-        /// argued about from the client's side (`todo.md`, 2026-08-12).
-        queued_at: Instant,
-        done: oneshot::Sender<Result<(), IoError>>,
-    },
+    Append(AppendItem),
     Checkpoint {
         done: oneshot::Sender<Result<CheckpointSnapshot, IoError>>,
     },
@@ -213,16 +199,33 @@ enum JournalCmd {
     },
 }
 
-type AppendBatchItem = (
-    u8,
-    Vec<u8>,
-    TenantId,
-    Vec<LogEntry>,
-    Vec<TraceSpan>,
-    Vec<MetricSample>,
-    Instant,
-    oneshot::Sender<Result<(), IoError>>,
-);
+struct AppendItem {
+    /// Record kind byte, framed by the writer loop. The payload travels
+    /// unframed: framing it here built a prefix+tenant+payload copy of every
+    /// export just to copy it again into the batch buffer — invariant II's
+    /// "WAL write buffer" copy paid twice.
+    kind: u8,
+    payload: Vec<u8>,
+    /// Absent when the append carries nothing but a mark: a record signy will
+    /// never accept still has to move the sender's number past it, and there
+    /// is no tenant frame to write for one.
+    tenant: Option<TenantId>,
+    entries: Vec<LogEntry>,
+    traces: Vec<TraceSpan>,
+    metric_samples: Vec<MetricSample>,
+    /// Where this record sat in the queue of the collecty that sent it, when
+    /// one did. The writer takes the highest per sender in a batch and writes
+    /// it as a record of its own, so the mark and the records it covers share
+    /// an fsync.
+    mark: Option<CollectMark>,
+    /// When the pushing task handed this to the channel. Every push in the
+    /// process funnels through one writer task, so the interval between this
+    /// and the batch that carries it is the queue in front of that task — the
+    /// term nothing measured while the push tail was being argued about from
+    /// the client's side (`todo.md`, 2026-08-12).
+    queued_at: Instant,
+    done: oneshot::Sender<Result<(), IoError>>,
+}
 
 /// Where a push's time goes between the handler and its acknowledgement.
 ///
@@ -271,6 +274,7 @@ const SLOW_BATCH: Duration = Duration::from_millis(250);
 
 pub struct Journal {
     tx: mpsc::Sender<JournalCmd>,
+    collect_marks: Arc<CollectMarks>,
     wal_path: PathBuf,
     ckpt_path: PathBuf,
     healthy: Arc<AtomicBool>,

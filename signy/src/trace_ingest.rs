@@ -103,7 +103,7 @@ impl OtlpTraceIngest<'_> {
         tenant: crate::tenant::TenantId,
         request: ExportTraceServiceRequest,
     ) -> Result<(), IngestError> {
-        self.enqueue(tenant, request)
+        self.enqueue(tenant, request, None)
             .await?
             .settle()
             .await
@@ -114,6 +114,7 @@ impl OtlpTraceIngest<'_> {
         &self,
         tenant: crate::tenant::TenantId,
         request: ExportTraceServiceRequest,
+        mark: Option<crate::journal::CollectMark>,
     ) -> Result<crate::journal::PendingAppend, IngestError> {
         let span_count = request
             .resource_spans
@@ -144,7 +145,7 @@ impl OtlpTraceIngest<'_> {
             )
         })?;
         self.journal
-            .enqueue_trace(tenant, encoded, spans)
+            .enqueue_trace(tenant, encoded, spans, mark)
             .await
             .map_err(crate::log_ingest::journal_write_failed)
     }

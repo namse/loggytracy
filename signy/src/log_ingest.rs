@@ -134,7 +134,7 @@ impl OtlpLogIngest<'_> {
         request: ExportLogsServiceRequest,
         wire: Option<Vec<u8>>,
     ) -> Result<(), IngestError> {
-        self.enqueue(tenant, request, wire)
+        self.enqueue(tenant, request, wire, None)
             .await?
             .settle()
             .await
@@ -150,6 +150,7 @@ impl OtlpLogIngest<'_> {
         tenant: crate::tenant::TenantId,
         request: ExportLogsServiceRequest,
         wire: Option<Vec<u8>>,
+        mark: Option<crate::journal::CollectMark>,
     ) -> Result<crate::journal::PendingAppend, IngestError> {
         let record_count = request
             .resource_logs
@@ -208,7 +209,7 @@ impl OtlpLogIngest<'_> {
         // invariant II's copy count. Replay decodes by the record's kind
         // instead, the way traces always have.
         self.journal
-            .enqueue_otlp_logs(tenant, encoded, entries)
+            .enqueue_otlp_logs(tenant, encoded, entries, mark)
             .await
             .map_err(journal_write_failed)
     }
