@@ -58,16 +58,12 @@ impl Config {
                     "COLLECTY_QUEUE_SEGMENT_BYTES",
                     defaults.queue.max_segment_bytes,
                 )?,
+                max_segment_age: duration(
+                    "COLLECTY_SEGMENT_MAX_AGE",
+                    defaults.queue.max_segment_age,
+                )?,
             },
             sender: SenderConfig {
-                max_batch_plain_bytes: bytes(
-                    "COLLECTY_BATCH_MAX_BYTES",
-                    defaults.sender.max_batch_plain_bytes,
-                )?,
-                max_batch_records: count(
-                    "COLLECTY_BATCH_MAX_RECORDS",
-                    defaults.sender.max_batch_records,
-                )?,
                 retry_initial: duration("COLLECTY_RETRY_INITIAL", defaults.sender.retry_initial)?,
                 retry_max: duration("COLLECTY_RETRY_MAX", defaults.sender.retry_max)?,
             },
@@ -112,6 +108,9 @@ COLLECTY_MAX_REQUEST_BYTES ({}) export",
                 self.queue.max_bytes, self.max_request_bytes
             ));
         }
+        if self.queue.max_segment_age.is_zero() {
+            return Err("COLLECTY_SEGMENT_MAX_AGE must be positive".to_string());
+        }
         if !(1..=22).contains(&self.zstd_level) {
             return Err(format!(
                 "COLLECTY_ZSTD_LEVEL is {} and must be between 1 and 22",
@@ -139,21 +138,6 @@ fn octal(name: &str, fallback: u32) -> Result<u32, String> {
         Err(_) => Ok(fallback),
         Ok(value) => u32::from_str_radix(value.trim_start_matches("0o"), 8)
             .map_err(|error| format!("invalid {name} {value:?}: {error}")),
-    }
-}
-
-fn count(name: &str, fallback: usize) -> Result<usize, String> {
-    match std::env::var(name) {
-        Err(_) => Ok(fallback),
-        Ok(value) => {
-            let parsed = value
-                .parse::<usize>()
-                .map_err(|error| format!("invalid {name} {value:?}: {error}"))?;
-            if parsed == 0 {
-                return Err(format!("{name} must be positive"));
-            }
-            Ok(parsed)
-        }
     }
 }
 
@@ -264,6 +248,7 @@ mod tests {
             queue: QueueLimits {
                 max_bytes: 4096,
                 max_segment_bytes: 4096,
+                ..QueueLimits::default()
             },
             max_request_bytes: 8192,
             max_inflight_bytes: 8192,

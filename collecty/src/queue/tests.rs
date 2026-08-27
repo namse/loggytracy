@@ -14,136 +14,160 @@ fn open(scratch: &Scratch, limits: QueueLimits) -> Queue {
     Queue::open(scratch.path(), limits).expect("a queue")
 }
 
-fn drain(queue: &Queue) -> Vec<Vec<u8>> {
-    let mut records = Vec::new();
-    while let Some(batch) = queue.read_batch(usize::MAX, usize::MAX).expect("a batch") {
-        for record in &batch.records {
-            records.push(batch.frames[record.span.clone()].to_vec());
-        }
-        let count = batch.len() as u64;
-        queue.commit(batch.end, count).expect("a commit");
+/// Segments close on age as well as size, and the sender is what asks. Tests
+/// that want a closed segment ask the same way, with an age of nothing.
+fn eager() -> QueueLimits {
+    QueueLimits {
+        max_segment_age: Duration::from_nanos(1),
+        ..QueueLimits::default()
     }
-    records
+}
+
+fn path_of(scratch: &Scratch, seq: u64) -> std::path::PathBuf {
+    scratch.path().join(format!("{seq:020}.seg"))
+}
+
+/// Every record collecty still holds, taken segment by segment the way the
+/// sender takes them.
+fn drain(queue: &Queue) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    queue.seal_if_due().expect("a seal");
+    while let Some(seq) = queue.oldest_sealed() {
+        let sealed = queue.read_segment(seq).expect("a segment");
+        let mut at = 0;
+        // The wire carries frames back to back with nothing between them, so a
+        // test that knows their lengths is what tells them apart again.
+        while at < sealed.frames.len() {
+            frames.push(sealed.frames[at..].to_vec());
+            at = sealed.frames.len();
+        }
+        queue.commit(seq, sealed.records).expect("a commit");
+        queue.seal_if_due().expect("a seal");
+    }
+    frames
 }
 
 #[test]
-fn a_batch_returns_the_appended_frames_in_order() {
-    let scratch = Scratch::new("order");
-    let queue = open(&scratch, QueueLimits::default());
-
+fn a_closed_segment_carries_its_records_frames_concatenated() {
+    let scratch = Scratch::new("frames");
+    let queue = open(&scratch, eager());
     for index in 0..5u8 {
         queue.append(&record(&[index; 40])).expect("an append");
     }
 
-    let batch = queue
-        .read_batch(usize::MAX, usize::MAX)
-        .expect("a batch")
-        .expect("records");
-    assert_eq!(batch.len(), 5);
-    for (index, record) in batch.records.iter().enumerate() {
-        assert_eq!(batch.frames[record.span.clone()], [index as u8; 40]);
+    queue.seal_if_due().expect("a seal");
+    let seq = queue.oldest_sealed().expect("a closed segment");
+    let sealed = queue.read_segment(seq).expect("a segment");
+
+    assert_eq!(sealed.records, 5);
+    assert_eq!(sealed.frames.len(), 5 * 40);
+    for index in 0..5usize {
+        assert_eq!(&sealed.frames[index * 40..(index + 1) * 40], &[index as u8; 40]);
     }
 }
 
+/// The open segment is being appended to, so it is never offered. This is what
+/// removes the one place a reader and a writer shared a file.
 #[test]
-fn a_committed_batch_is_not_returned_again() {
-    let scratch = Scratch::new("commit");
+fn the_open_segment_is_not_offered() {
+    let scratch = Scratch::new("open");
     let queue = open(&scratch, QueueLimits::default());
-    queue.append(&record(b"only")).expect("an append");
+    queue.append(&record(b"still being written")).expect("an append");
 
-    assert_eq!(drain(&queue), vec![b"only".to_vec()]);
-    assert!(
-        queue
-            .read_batch(usize::MAX, usize::MAX)
-            .expect("a batch")
-            .is_none()
-    );
-    assert!(!queue.has_records());
+    assert!(queue.oldest_sealed().is_none());
+    assert!(!queue.has_sealed());
 }
 
 #[test]
-fn a_batch_stops_at_the_uncompressed_ceiling_but_never_returns_nothing() {
-    let scratch = Scratch::new("ceiling");
-    let queue = open(&scratch, QueueLimits::default());
-    for _ in 0..4 {
-        queue
-            .append(&Record {
-                frame: vec![7u8; 10],
-                plain_len: 100,
-            })
-            .expect("an append");
-    }
-
-    let batch = queue
-        .read_batch(250, usize::MAX)
-        .expect("a batch")
-        .expect("records");
-    assert_eq!(batch.len(), 2);
-    assert_eq!(batch.plain_bytes, 200);
-    queue.commit(batch.end, 2).expect("a commit");
-
-    let batch = queue
-        .read_batch(1, usize::MAX)
-        .expect("a batch")
-        .expect("records");
-    assert_eq!(batch.len(), 1);
-    assert_eq!(batch.plain_bytes, 100);
-}
-
-#[test]
-fn a_batch_stops_at_the_record_ceiling() {
-    let scratch = Scratch::new("records");
-    let queue = open(&scratch, QueueLimits::default());
-    for _ in 0..10 {
-        queue.append(&record(b"line")).expect("an append");
-    }
-
-    let batch = queue
-        .read_batch(usize::MAX, 3)
-        .expect("a batch")
-        .expect("records");
-    assert_eq!(batch.len(), 3);
-}
-
-#[test]
-fn a_batch_crosses_a_segment_boundary() {
-    let scratch = Scratch::new("boundary");
+fn an_open_segment_closes_once_it_is_old_enough() {
+    let scratch = Scratch::new("age");
     let queue = open(
         &scratch,
         QueueLimits {
-            max_bytes: 1 << 20,
-            max_segment_bytes: 64,
+            max_segment_age: Duration::from_millis(30),
+            ..QueueLimits::default()
         },
     );
-    for index in 0..6u8 {
-        queue.append(&record(&[index; 30])).expect("an append");
+    queue.append(&record(b"waiting")).expect("an append");
+
+    queue.seal_if_due().expect("a seal");
+    assert!(queue.oldest_sealed().is_none(), "not old enough yet");
+
+    std::thread::sleep(Duration::from_millis(40));
+    queue.seal_if_due().expect("a seal");
+    assert_eq!(queue.oldest_sealed(), Some(1));
+}
+
+/// An empty queue must not roll segments forever while nothing arrives.
+#[test]
+fn an_empty_segment_is_never_closed() {
+    let scratch = Scratch::new("idle");
+    let queue = open(&scratch, eager());
+
+    for _ in 0..5 {
+        queue.seal_if_due().expect("a seal");
     }
 
-    assert!(queue.stats().segments > 1);
-    let frames = drain(&queue);
-    assert_eq!(frames.len(), 6);
-    for (index, frame) in frames.iter().enumerate() {
-        assert_eq!(frame.as_slice(), [index as u8; 30]);
-    }
+    assert_eq!(queue.stats().segments, 1);
+    assert!(queue.oldest_sealed().is_none());
 }
 
 #[test]
-fn a_reopened_queue_keeps_its_records_and_its_cursor() {
-    let scratch = Scratch::new("reopen");
-    {
-        let queue = open(&scratch, QueueLimits::default());
-        queue.append(&record(b"first")).expect("an append");
-        queue.append(&record(b"second")).expect("an append");
-        let batch = queue
-            .read_batch(usize::MAX, 1)
-            .expect("a batch")
-            .expect("records");
-        queue.commit(batch.end, 1).expect("a commit");
-        queue.sync().expect("a sync");
-    }
+fn an_answered_segment_is_removed_and_not_offered_again() {
+    let scratch = Scratch::new("commit");
+    let queue = open(&scratch, eager());
+    queue.append(&record(b"first")).expect("an append");
+    queue.seal_if_due().expect("a seal");
+    queue.append(&record(b"second")).expect("an append");
+    queue.seal_if_due().expect("a seal");
 
-    let queue = open(&scratch, QueueLimits::default());
-    assert_eq!(drain(&queue), vec![b"second".to_vec()]);
+    let seq = queue.oldest_sealed().expect("a closed segment");
+    assert_eq!(seq, 1);
+    queue.commit(seq, 1).expect("a commit");
+
+    assert!(!path_of(&scratch, 1).exists(), "the file is unlinked");
+    assert_eq!(queue.oldest_sealed(), Some(2));
+}
+
+#[test]
+fn a_reopened_queue_keeps_what_signy_has_not_answered_for() {
+    let scratch = Scratch::new("reopen");
+    let sender = {
+        let queue = open(&scratch, eager());
+        queue.append(&record(b"answered")).expect("an append");
+        queue.seal_if_due().expect("a seal");
+        queue.append(&record(b"still owed")).expect("an append");
+        queue.seal_if_due().expect("a seal");
+        queue.commit(1, 1).expect("a commit");
+        queue.sync().expect("a sync");
+        queue.sender_id()
+    };
+
+    let queue = open(&scratch, eager());
+    assert_eq!(queue.sender_id(), sender, "the id outlives the process");
+    assert_eq!(queue.acked(), 1);
+    assert_eq!(drain(&queue), vec![b"still owed".to_vec()]);
+}
+
+/// A crash between signy's answer and the unlink leaves an answered segment on
+/// disk. It is dead weight, and reopening is where it goes.
+#[test]
+fn a_segment_signy_already_answered_for_is_removed_on_open() {
+    let scratch = Scratch::new("stale");
+    {
+        let queue = open(&scratch, eager());
+        queue.append(&record(b"answered")).expect("an append");
+        queue.seal_if_due().expect("a seal");
+        queue.append(&record(b"owed")).expect("an append");
+        queue.sync().expect("a sync");
+        // The cursor moves without the unlink that normally follows it.
+        cursor::store(scratch.path(), queue.sender_id(), 1).expect("a stored cursor");
+    }
+    assert!(path_of(&scratch, 1).exists());
+
+    let queue = open(&scratch, eager());
+    assert!(!path_of(&scratch, 1).exists());
+    assert_eq!(queue.stats().segments, 1);
 }
 
 #[test]
@@ -155,7 +179,7 @@ fn a_torn_tail_is_truncated_when_the_queue_reopens() {
         queue.sync().expect("a sync");
     }
 
-    let segment = scratch.path().join(format!("{:020}.seg", 0));
+    let segment = path_of(&scratch, 1);
     let before = std::fs::metadata(&segment).expect("a segment").len();
     let mut file = std::fs::OpenOptions::new()
         .append(true)
@@ -164,16 +188,17 @@ fn a_torn_tail_is_truncated_when_the_queue_reopens() {
     file.write_all(&[9u8; 7]).expect("a torn write");
     drop(file);
 
-    let queue = open(&scratch, QueueLimits::default());
-    assert_eq!(drain(&queue), vec![b"whole record".to_vec()]);
+    let queue = open(&scratch, eager());
     assert_eq!(
         std::fs::metadata(&segment).expect("a segment").len(),
-        before
+        before,
+        "the torn bytes are gone before anything reads the file"
     );
+    assert_eq!(drain(&queue), vec![b"whole record".to_vec()]);
 }
 
 #[test]
-fn a_corrupt_record_ends_the_segment_rather_than_being_returned() {
+fn a_corrupt_record_ends_the_segment_rather_than_being_sent() {
     let scratch = Scratch::new("corrupt");
     {
         let queue = open(&scratch, QueueLimits::default());
@@ -183,7 +208,7 @@ fn a_corrupt_record_ends_the_segment_rather_than_being_returned() {
         queue.sync().expect("a sync");
     }
 
-    let segment = scratch.path().join(format!("{:020}.seg", 0));
+    let segment = path_of(&scratch, 1);
     let second_frame_at = (RECORD_HEADER_BYTES + 8 + RECORD_HEADER_BYTES) as u64;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -193,8 +218,12 @@ fn a_corrupt_record_ends_the_segment_rather_than_being_returned() {
     file.write_all(b"X").expect("a flipped byte");
     drop(file);
 
-    let queue = open(&scratch, QueueLimits::default());
-    assert_eq!(drain(&queue), vec![b"good one".to_vec()]);
+    let queue = open(&scratch, eager());
+    queue.seal_if_due().expect("a seal");
+    let seq = queue.oldest_sealed().expect("a closed segment");
+    let sealed = queue.read_segment(seq).expect("a segment");
+    assert_eq!(sealed.records, 1);
+    assert_eq!(sealed.frames, b"good one".to_vec());
 }
 
 #[test]
@@ -205,6 +234,7 @@ fn the_oldest_segment_is_dropped_when_the_queue_is_full() {
         QueueLimits {
             max_bytes: 200,
             max_segment_bytes: 60,
+            ..eager()
         },
     );
     for index in 0..12u8 {
@@ -229,167 +259,67 @@ fn a_record_larger_than_the_whole_queue_is_refused() {
         QueueLimits {
             max_bytes: 64,
             max_segment_bytes: 64,
+            ..QueueLimits::default()
         },
     );
     let error = queue.append(&record(&[0u8; 100])).expect_err("a refusal");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
+/// Both the numbering and the name it is kept under restart together. Keeping
+/// the name while the segments went back to one would have signy skip every
+/// segment under the mark it still held.
 #[test]
-fn a_corrupt_cursor_replays_from_the_oldest_record() {
-    let scratch = Scratch::new("cursor");
-    {
-        let queue = open(&scratch, QueueLimits::default());
+fn a_corrupt_cursor_takes_the_sender_id_with_it() {
+    let scratch = Scratch::new("cursor-identity");
+    let before = {
+        let queue = open(&scratch, eager());
         queue.append(&record(b"first")).expect("an append");
-        queue.append(&record(b"second")).expect("an append");
-        let batch = queue
-            .read_batch(usize::MAX, usize::MAX)
-            .expect("a batch")
-            .expect("records");
-        queue.commit(batch.end, 2).expect("a commit");
+        queue.seal_if_due().expect("a seal");
+        queue.commit(1, 1).expect("a commit");
         queue.sync().expect("a sync");
-    }
+        queue.sender_id()
+    };
 
     std::fs::write(scratch.path().join("cursor"), b"junk").expect("a corrupt cursor");
 
-    let queue = open(&scratch, QueueLimits::default());
-    assert_eq!(drain(&queue), vec![b"first".to_vec(), b"second".to_vec()]);
+    let queue = open(&scratch, eager());
+    assert_ne!(queue.sender_id(), before);
+    assert_eq!(queue.acked(), 0);
 }
 
 #[tokio::test]
-async fn a_waiter_wakes_on_the_next_append() {
+async fn a_waiter_wakes_when_a_segment_closes() {
     let scratch = Scratch::new("wait");
-    let queue = std::sync::Arc::new(open(&scratch, QueueLimits::default()));
-    let waiter = queue.clone();
-    let handle = tokio::spawn(async move { waiter.wait_for_records().await });
+    let queue = Arc::new(open(&scratch, eager()));
+    let waiting = queue.clone();
+    let waiter = tokio::spawn(async move { waiting.wait_for_sealed().await });
 
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    queue.append(&record(b"late")).expect("an append");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    queue.append(&record(b"arrived")).expect("an append");
+    queue.seal_if_due().expect("a seal");
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+    tokio::time::timeout(Duration::from_secs(1), waiter)
         .await
         .expect("the waiter woke")
         .expect("the task finished");
 }
 
 #[test]
-fn the_backlog_counts_what_is_unsent_rather_than_what_is_on_disk() {
+fn the_backlog_counts_what_signy_has_not_answered_for() {
     let scratch = Scratch::new("backlog");
-    let queue = open(&scratch, QueueLimits::default());
-    for index in 0..4u8 {
-        queue.append(&record(&[index; 40])).expect("an append");
-    }
+    let queue = open(&scratch, eager());
+    queue.append(&record(&[1u8; 100])).expect("an append");
+    queue.seal_if_due().expect("a seal");
+    queue.append(&record(&[2u8; 100])).expect("an append");
+    queue.seal_if_due().expect("a seal");
 
-    let full = queue.stats();
-    assert_eq!(full.backlog_bytes, full.queued_bytes);
+    let before = queue.stats();
+    assert_eq!(before.backlog_bytes, before.queued_bytes);
 
-    let batch = queue
-        .read_batch(usize::MAX, 2)
-        .expect("a batch")
-        .expect("records");
-    queue.commit(batch.end, 2).expect("a commit");
-
-    let half = queue.stats();
-    assert_eq!(half.queued_bytes, full.queued_bytes);
-    assert_eq!(half.backlog_bytes, full.backlog_bytes / 2);
-
-    drain(&queue);
-    let empty = queue.stats();
-    assert_eq!(empty.backlog_bytes, 0);
-    assert_eq!(empty.queued_bytes, full.queued_bytes);
+    queue.commit(1, 1).expect("a commit");
+    let after = queue.stats();
+    assert!(after.backlog_bytes < before.backlog_bytes);
 }
 
-#[test]
-fn records_are_numbered_from_one_and_the_numbering_survives_a_reopen() {
-    let scratch = Scratch::new("sequence");
-    let sender = {
-        let queue = open(&scratch, QueueLimits::default());
-        for index in 0..3u8 {
-            queue.append(&record(&[index; 16])).expect("an append");
-        }
-        let batch = queue
-            .read_batch(usize::MAX, usize::MAX)
-            .expect("a batch")
-            .expect("records");
-        let numbers: Vec<u64> = batch
-            .records
-            .iter()
-            .map(|record| record.end.sequence)
-            .collect();
-        assert_eq!(numbers, vec![1, 2, 3]);
-        queue.commit(batch.end, 3).expect("a commit");
-        queue.sync().expect("a sync");
-        queue.sender_id()
-    };
-
-    let queue = open(&scratch, QueueLimits::default());
-    assert_eq!(queue.sender_id(), sender, "the id outlives the process");
-    queue.append(&record(b"fourth")).expect("an append");
-    let batch = queue
-        .read_batch(usize::MAX, usize::MAX)
-        .expect("a batch")
-        .expect("records");
-    assert_eq!(batch.records[0].end.sequence, 4);
-}
-
-#[test]
-fn a_corrupt_cursor_takes_the_sender_id_with_it() {
-    let scratch = Scratch::new("cursor-identity");
-    let before = {
-        let queue = open(&scratch, QueueLimits::default());
-        queue.append(&record(b"first")).expect("an append");
-        let batch = queue
-            .read_batch(usize::MAX, usize::MAX)
-            .expect("a batch")
-            .expect("records");
-        queue.commit(batch.end, 1).expect("a commit");
-        queue.sync().expect("a sync");
-        queue.sender_id()
-    };
-
-    std::fs::write(scratch.path().join("cursor"), b"junk").expect("a corrupt cursor");
-
-    // Both the numbering and the name it is kept under restart together.
-    // Keeping the name while the numbering went back to one would have signy
-    // skip every record under the mark it still held.
-    let queue = open(&scratch, QueueLimits::default());
-    assert_ne!(queue.sender_id(), before);
-    let batch = queue
-        .read_batch(usize::MAX, usize::MAX)
-        .expect("a batch")
-        .expect("records");
-    assert_eq!(batch.records[0].end.sequence, 1);
-}
-
-#[test]
-fn a_dropped_segment_does_not_rewind_the_numbering() {
-    let scratch = Scratch::new("drop-sequence");
-    let queue = open(
-        &scratch,
-        QueueLimits {
-            max_bytes: 200,
-            max_segment_bytes: 60,
-        },
-    );
-    queue.append(&record(&[0u8; 30])).expect("an append");
-    let batch = queue
-        .read_batch(usize::MAX, usize::MAX)
-        .expect("a batch")
-        .expect("records");
-    assert_eq!(batch.records[0].end.sequence, 1);
-    queue.commit(batch.end, 1).expect("a commit");
-
-    for index in 1..12u8 {
-        queue.append(&record(&[index; 30])).expect("an append");
-    }
-    assert!(queue.stats().dropped_segments > 0);
-
-    // Numbers are handed out when a record is read for sending, so records
-    // dropped under a full queue never took one. What matters is that the
-    // count only ever goes up.
-    let batch = queue
-        .read_batch(usize::MAX, usize::MAX)
-        .expect("a batch")
-        .expect("records");
-    assert_eq!(batch.records[0].end.sequence, 2);
-}
+use std::sync::Arc;

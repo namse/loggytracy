@@ -25,6 +25,7 @@ fn appending(criterion: &mut Criterion) {
         QueueLimits {
             max_bytes: 8 * 1024 * 1024 * 1024,
             max_segment_bytes: 64 * 1024 * 1024,
+            ..QueueLimits::default()
         },
     )
     .expect("a queue");
@@ -45,21 +46,23 @@ fn appending(criterion: &mut Criterion) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn batching(criterion: &mut Criterion) {
+/// Reading a closed segment into the bytes that go on the wire.
+fn sealing(criterion: &mut Criterion) {
     let export = corpus::export_bytes(64);
     let frame = wire::compress_record(Signal::Logs, &export, wire::ZSTD_LEVEL).expect("a frame");
-    let dir = scratch("batch");
+    let dir = scratch("segment");
     let queue = Arc::new(
         Queue::open(
             &dir,
             QueueLimits {
                 max_bytes: 8 * 1024 * 1024 * 1024,
                 max_segment_bytes: 256 * 1024 * 1024,
+                max_segment_age: std::time::Duration::from_nanos(1),
             },
         )
         .expect("a queue"),
     );
-    for _ in 0..4096 {
+    for _ in 0..256 {
         queue
             .append(&Record {
                 frame: frame.clone(),
@@ -67,21 +70,20 @@ fn batching(criterion: &mut Criterion) {
             })
             .expect("an append");
     }
+    queue.seal_if_due().expect("a seal");
+    let seq = queue.oldest_sealed().expect("a closed segment");
 
-    let mut group = criterion.benchmark_group("queue/read-batch");
+    let mut group = criterion.benchmark_group("queue/read-segment");
     group.throughput(Throughput::Bytes((frame.len() * 256) as u64));
     group.bench_function("256-records", |bencher| {
         bencher.iter(|| {
-            let batch = queue
-                .read_batch(usize::MAX, 256)
-                .expect("a batch")
-                .expect("records");
-            std::hint::black_box(batch.frames.len())
+            let sealed = queue.read_segment(seq).expect("a segment");
+            std::hint::black_box(sealed.frames.len())
         })
     });
     group.finish();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-criterion_group!(benches, appending, batching);
+criterion_group!(benches, appending, sealing);
 criterion_main!(benches);

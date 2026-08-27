@@ -17,6 +17,15 @@ use tower::service_fn;
 
 use super::*;
 use crate::queue::QueueLimits;
+
+/// The tests take what the sender would take, so the open segment has to close
+/// the moment they ask.
+fn eager_limits() -> QueueLimits {
+    QueueLimits {
+        max_segment_age: std::time::Duration::from_nanos(1),
+        ..QueueLimits::default()
+    }
+}
 use crate::test_support::Scratch;
 
 struct Harness {
@@ -31,7 +40,7 @@ impl Harness {
     async fn start(label: &str, max_request_bytes: usize) -> Harness {
         let scratch = Scratch::new(label);
         let queue = Arc::new(
-            Queue::open(&scratch.path().join("queue"), QueueLimits::default()).expect("a queue"),
+            Queue::open(&scratch.path().join("queue"), eager_limits()).expect("a queue"),
         );
         let socket = scratch.path().join("otlp.sock");
         let listener = bind(&socket, DEFAULT_SOCKET_MODE).expect("a bound socket");
@@ -72,25 +81,30 @@ impl Harness {
     }
 
     fn records(&self) -> Vec<(Signal, Vec<u8>)> {
-        let Some(batch) = self
-            .queue
-            .read_batch(usize::MAX, usize::MAX)
-            .expect("a batch")
-        else {
+        let frames = self.sealed_frames();
+        if frames.is_empty() {
             return Vec::new();
-        };
-        batch
-            .records
-            .iter()
-            .map(|record| {
-                let frame = &batch.frames[record.span.clone()];
-                let plain = crate::wire::decompress_concatenated(frame, record.plain_len as usize)
-                    .expect("a decompressed record");
-                let split = crate::wire::split_records(&plain).expect("a framed record");
-                assert_eq!(split.len(), 1, "one frame carries one record");
-                (split[0].0, split[0].1.to_vec())
-            })
+        }
+        let plain = crate::wire::decompress_concatenated(&frames, frames.len() * 8)
+            .expect("decompressed frames");
+        crate::wire::split_records(&plain)
+            .expect("framed records")
+            .into_iter()
+            .map(|(signal, payload)| (signal, payload.to_vec()))
             .collect()
+    }
+
+    /// What the sender would ship: the open segment closed, then read whole.
+    fn sealed_frames(&self) -> Vec<u8> {
+        self.queue.seal_if_due().expect("a seal");
+        let mut frames = Vec::new();
+        while let Some(seq) = self.queue.oldest_sealed() {
+            let sealed = self.queue.read_segment(seq).expect("a segment");
+            frames.extend_from_slice(&sealed.frames);
+            self.queue.commit(seq, sealed.records).expect("a commit");
+            self.queue.seal_if_due().expect("a seal");
+        }
+        frames
     }
 
     async fn stop(mut self) {
@@ -182,7 +196,7 @@ async fn an_export_over_the_ceiling_is_refused_and_stores_nothing() {
 async fn a_payload_over_the_ceiling_is_refused_off_the_grpc_path_too() {
     let scratch = Scratch::new("intake-ceiling");
     let queue = Arc::new(
-        Queue::open(&scratch.path().join("queue"), QueueLimits::default()).expect("a queue"),
+        Queue::open(&scratch.path().join("queue"), eager_limits()).expect("a queue"),
     );
     let intake = Intake::new(
         queue.clone(),
@@ -228,13 +242,9 @@ async fn separate_exports_reassemble_into_one_merged_request() {
             .expect("an accepted export");
     }
 
-    let batch = harness
-        .queue
-        .read_batch(usize::MAX, usize::MAX)
-        .expect("a batch")
-        .expect("records");
+    let frames = harness.sealed_frames();
     let plain =
-        crate::wire::decompress_concatenated(&batch.frames, batch.plain_bytes).expect("plain");
+        crate::wire::decompress_concatenated(&frames, frames.len() * 8).expect("plain");
     let mut payloads = Vec::new();
     for (signal, payload) in crate::wire::split_records(&plain).expect("framed records") {
         assert_eq!(signal, Signal::Logs);

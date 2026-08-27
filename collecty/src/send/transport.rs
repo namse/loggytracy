@@ -10,12 +10,11 @@ use hyper_util::rt::TokioExecutor;
 
 use super::{DeliverFuture, Outcome, Shipment, Transport};
 
-/// Which collecty the batch came from, and where the batch starts in that
-/// collecty's numbering. Together they are what signy needs to skip a record
-/// it has already stored, so a resend after a crash costs bandwidth and
-/// nothing else.
+/// Which collecty the segment came from, and which segment it is. Together
+/// they are what signy needs to skip what it already stored, so a resend after
+/// a crash costs bandwidth and nothing else.
 pub const SENDER_HEADER: &str = "x-collecty-sender";
-pub const START_SEQUENCE_HEADER: &str = "x-collecty-start-sequence";
+pub const SEGMENT_HEADER: &str = "x-collecty-segment";
 const REASON_LIMIT: usize = 512;
 
 pub struct HttpTransport {
@@ -50,7 +49,7 @@ impl Transport for HttpTransport {
                 .header(CONTENT_TYPE, "application/x-protobuf")
                 .header(CONTENT_ENCODING, "zstd")
                 .header(SENDER_HEADER, shipment.sender.to_string())
-                .header(START_SEQUENCE_HEADER, shipment.start_sequence.to_string())
+                .header(SEGMENT_HEADER, shipment.segment.to_string())
                 .body(Full::new(shipment.frames))
             {
                 Ok(request) => request,
@@ -99,10 +98,10 @@ impl Transport for HttpTransport {
     }
 }
 
-/// The number signy says it now holds, out of `{"stored":n}`.
+/// The segment signy says it now holds whole, out of `{"stored":n}`.
 ///
-/// Zero for an answer that does not say — the attempt is then committed whole,
-/// which is what happened before there was a number at all.
+/// Zero for an answer that does not say, which leaves the sender committing
+/// only the segment it just sent.
 fn stored_number(body: &str) -> u64 {
     let Some(at) = body.find("\"stored\"") else {
         return 0;

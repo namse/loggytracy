@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::sync::watch;
 
-use crate::queue::{Batch, BatchRecord, Queue, SenderId};
+use crate::queue::{Queue, SealedSegment, SenderId};
 
 pub use transport::HttpTransport;
 
@@ -19,28 +19,26 @@ pub type DeliverFuture<'a> = Pin<Box<dyn Future<Output = Outcome> + Send + 'a>>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// Taken, and the number signy says it now holds for this sender.
+    /// Taken, and the highest segment signy says it now holds whole.
     ///
-    /// Normally the last record's number, and then the whole attempt is
-    /// committed. It can be higher — signy remembers more than this batch
-    /// carried, because an earlier attempt got further than collecty heard —
-    /// and the next batch simply starts under it and is skipped. Zero means
-    /// the answer said nothing, and the attempt is committed whole.
+    /// Normally the segment that was sent. It can be higher — signy answered
+    /// an earlier attempt collecty never heard — and then everything up to it
+    /// can go at once.
     Accepted(u64),
     Retry(String),
     Refused(String),
 }
 
-/// One attempt's worth of a batch, and who it belongs to.
+/// One segment on its way to signy.
 ///
-/// The frames are unchanged from what the queue holds. The sender and the
-/// number of the first record are what let signy place every record without
-/// the wire carrying a number per record: it counts as it reads, so record
-/// `i` of the body is `start_sequence + i`.
+/// The frames are the segment's records, unchanged from what the queue holds.
+/// The sender and the segment number are what let signy skip what it already
+/// stored: a segment is sent from its first record every time, so signy counts
+/// as it reads and knows exactly which records it has seen before.
 pub struct Shipment {
     pub frames: Bytes,
     pub sender: SenderId,
-    pub start_sequence: u64,
+    pub segment: u64,
 }
 
 pub trait Transport: Send + Sync + 'static {
@@ -49,8 +47,6 @@ pub trait Transport: Send + Sync + 'static {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SenderConfig {
-    pub max_batch_plain_bytes: usize,
-    pub max_batch_records: usize,
     pub retry_initial: Duration,
     pub retry_max: Duration,
 }
@@ -58,15 +54,6 @@ pub struct SenderConfig {
 impl Default for SenderConfig {
     fn default() -> Self {
         Self {
-            // What one batch costs *this* process, not what signy will hold.
-            // signy reads a batch as it arrives and never has more than a
-            // record of it in hand, so the number that used to sit under its
-            // admission ceiling now sits under nothing but the frames kept
-            // here while an attempt is out. Raised because the only time a
-            // large batch happens is when the backlog is large, which is
-            // exactly when the round trips are worth saving.
-            max_batch_plain_bytes: 64 * 1024 * 1024,
-            max_batch_records: 8192,
             retry_initial: Duration::from_millis(100),
             retry_max: Duration::from_secs(30),
         }
@@ -75,7 +62,7 @@ impl Default for SenderConfig {
 
 #[derive(Default, Debug)]
 pub struct SenderStats {
-    pub sent_batches: AtomicU64,
+    pub sent_segments: AtomicU64,
     pub sent_records: AtomicU64,
     pub sent_bytes: AtomicU64,
     pub refused_records: AtomicU64,
@@ -87,12 +74,6 @@ pub struct Sender<T> {
     transport: Arc<T>,
     config: SenderConfig,
     stats: Arc<SenderStats>,
-}
-
-enum Attempt {
-    Accepted(u64),
-    Refused(String),
-    Aborted,
 }
 
 impl<T: Transport> Sender<T> {
@@ -111,128 +92,96 @@ impl<T: Transport> Sender<T> {
 
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) {
         while !*shutdown.borrow() {
-            if !self.queue.has_records() {
+            // Before looking for work: a quiet host would otherwise hold its
+            // records until the open segment filled.
+            if let Err(error) = self.queue.seal_if_due() {
+                tracing::error!(%error, "the open segment could not be closed");
+            }
+
+            let Some(seq) = self.queue.oldest_sealed() else {
                 tokio::select! {
-                    _ = self.queue.wait_for_records() => {}
+                    _ = self.queue.wait_for_sealed() => {}
+                    _ = tokio::time::sleep(self.config.retry_initial) => {}
                     _ = shutdown.changed() => {}
                 }
                 continue;
-            }
+            };
 
             let queue = self.queue.clone();
-            let plain_ceiling = self.config.max_batch_plain_bytes;
-            let record_ceiling = self.config.max_batch_records;
-            let batch = tokio::task::spawn_blocking(move || {
-                queue.read_batch(plain_ceiling, record_ceiling)
-            })
-            .await;
-
-            let batch = match batch {
-                Ok(Ok(Some(batch))) => batch,
-                Ok(Ok(None)) => continue,
+            let segment = tokio::task::spawn_blocking(move || queue.read_segment(seq)).await;
+            let segment = match segment {
+                Ok(Ok(segment)) => segment,
                 Ok(Err(error)) => {
-                    tracing::error!(%error, "the queue could not be read");
+                    tracing::error!(%error, segment = seq, "the segment could not be read");
                     tokio::time::sleep(self.config.retry_initial).await;
                     continue;
                 }
                 Err(error) => {
-                    tracing::error!(%error, "the queue reader did not finish");
+                    tracing::error!(%error, "the segment reader did not finish");
                     continue;
                 }
             };
 
-            self.deliver(batch, &mut shutdown).await;
+            self.deliver(segment, &mut shutdown).await;
         }
     }
 
-    pub(crate) async fn deliver(&self, batch: Batch, shutdown: &mut watch::Receiver<bool>) {
-        let Batch {
-            frames, records, ..
-        } = batch;
+    pub(crate) async fn deliver(
+        &self,
+        segment: SealedSegment,
+        shutdown: &mut watch::Receiver<bool>,
+    ) {
+        let SealedSegment {
+            seq,
+            frames,
+            records,
+        } = segment;
+        let bytes = frames.len() as u64;
         let frames = Bytes::from(frames);
-        let mut from = 0;
 
-        while from < records.len() {
-            let mut to = records.len();
-            loop {
-                let span = records[from].span.start..records[to - 1].span.end;
-                let plain_bytes: usize = records[from..to]
-                    .iter()
-                    .map(|record| record.plain_len as usize)
-                    .sum();
-
-                let shipment = Shipment {
-                    frames: frames.slice(span.clone()),
-                    sender: self.queue.sender_id(),
-                    start_sequence: records[from].end.sequence,
-                };
-
-                match self.attempt(shipment, shutdown).await {
-                    Attempt::Accepted(stored) => {
-                        let Some(taken) = taken_upto(&records[from..to], stored) else {
-                            tracing::warn!(
-                                stored,
-                                first = records[from].end.sequence,
-                                "signy took none of the attempt it answered; holding it"
-                            );
-                            return;
-                        };
-                        let to = from + taken;
-                        self.stats.sent_batches.fetch_add(1, Ordering::Relaxed);
-                        self.stats
-                            .sent_records
-                            .fetch_add(taken as u64, Ordering::Relaxed);
-                        self.stats
-                            .sent_bytes
-                            .fetch_add(span.len() as u64, Ordering::Relaxed);
-                        self.commit(&records, to, taken as u64);
-                        from = to;
-                        break;
-                    }
-                    Attempt::Refused(reason) if to - from == 1 => {
-                        tracing::error!(
-                            reason,
-                            plain_bytes,
-                            "dropping one record signy refuses to accept"
-                        );
-                        self.stats.refused_records.fetch_add(1, Ordering::Relaxed);
-                        self.commit(&records, to, 0);
-                        from = to;
-                        break;
-                    }
-                    Attempt::Refused(reason) => {
-                        tracing::warn!(
-                            reason,
-                            records = to - from,
-                            "halving a refused batch to find the record signy will not take"
-                        );
-                        to = from + (to - from) / 2;
-                    }
-                    Attempt::Aborted => return,
-                }
-            }
-        }
-    }
-
-    async fn attempt(&self, shipment: Shipment, shutdown: &mut watch::Receiver<bool>) -> Attempt {
         let mut backoff = self.config.retry_initial;
         loop {
             if *shutdown.borrow() {
-                return Attempt::Aborted;
+                return;
             }
-            let attempt = Shipment {
-                frames: shipment.frames.clone(),
-                ..shipment
+            let shipment = Shipment {
+                frames: frames.clone(),
+                sender: self.queue.sender_id(),
+                segment: seq,
             };
-            match self.transport.deliver(attempt).await {
-                Outcome::Accepted(stored) => return Attempt::Accepted(stored),
-                Outcome::Refused(reason) => return Attempt::Refused(reason),
+            match self.transport.deliver(shipment).await {
+                Outcome::Accepted(stored) => {
+                    self.stats.sent_segments.fetch_add(1, Ordering::Relaxed);
+                    self.stats.sent_records.fetch_add(records, Ordering::Relaxed);
+                    self.stats.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    self.commit(stored.max(seq), records);
+                    return;
+                }
+                // Permanent for this segment's shape rather than its content:
+                // signy drops a record it cannot decode on its own side and
+                // answers 200, so what reaches here is framing that will fail
+                // the same way however many times it is sent.
+                Outcome::Refused(reason) => {
+                    tracing::error!(
+                        reason,
+                        segment = seq,
+                        records,
+                        bytes,
+                        "dropping a segment signy refuses to accept"
+                    );
+                    self.stats
+                        .refused_records
+                        .fetch_add(records, Ordering::Relaxed);
+                    self.commit(seq, 0);
+                    return;
+                }
                 Outcome::Retry(reason) => {
                     self.stats.retries.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         reason,
+                        segment = seq,
                         backoff_ms = backoff.as_millis() as u64,
-                        "signy did not take the batch"
+                        "signy did not take the segment"
                     );
                     tokio::select! {
                         _ = tokio::time::sleep(jittered(backoff)) => {}
@@ -244,29 +193,11 @@ impl<T: Transport> Sender<T> {
         }
     }
 
-    fn commit(&self, records: &[BatchRecord], to: usize, sent: u64) {
-        if let Err(error) = self.queue.commit(records[to - 1].end, sent) {
+    fn commit(&self, acked: u64, records: u64) {
+        if let Err(error) = self.queue.commit(acked, records) {
             tracing::error!(%error, "the cursor could not be advanced");
         }
     }
-}
-
-/// How many of an attempt's records the answer covers.
-///
-/// Normally all of them: signy answers with the last record's number, or with
-/// a higher one of its own. A lower answer means it stopped short of what was
-/// sent, and the rest stay in the queue rather than being taken on trust —
-/// they are offered again on the next batch and skipped there if it turns out
-/// signy had them after all.
-fn taken_upto(records: &[BatchRecord], stored: u64) -> Option<usize> {
-    if stored == 0 {
-        return Some(records.len());
-    }
-    let taken = records
-        .iter()
-        .take_while(|record| record.end.sequence <= stored)
-        .count();
-    (taken > 0).then_some(taken)
 }
 
 fn jittered(backoff: Duration) -> Duration {
