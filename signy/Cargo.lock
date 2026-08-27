@@ -1262,41 +1262,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "signy"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "crc32fast",
- "criterion",
- "futures-util",
- "libc",
- "object_store",
- "opentelemetry-proto",
- "parking_lot",
- "parquet",
- "prost",
- "regex",
- "regex-syntax",
- "roaring",
- "serde",
- "serde_json",
- "tikv-jemallocator",
- "tokio",
- "tonic",
- "tonic-types",
- "tower",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "zstd",
-]
-
-[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2169,6 +2134,41 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "signy"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "crc32fast",
+ "criterion",
+ "futures-util",
+ "libc",
+ "object_store",
+ "opentelemetry-proto",
+ "parking_lot",
+ "parquet",
+ "prost",
+ "regex",
+ "regex-syntax",
+ "roaring",
+ "serde",
+ "serde_json",
+ "tikv-jemallocator",
+ "tokio",
+ "tonic",
+ "tonic-types",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "zstd",
 ]
 
 [[package]]

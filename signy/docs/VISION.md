@@ -8,7 +8,7 @@ records what it is *for*, which of its properties are load-bearing, and what
 would prove the claim wrong. Where the two disagree, this one is the intent and
 the other is the implementation.
 
-The feature surface is done. Logs and traces ingest over OTLP, the first-party
+The feature surface is done. Logs, traces and metrics ingest over OTLP, the first-party
 query API answers the fn0 console and any agent driving `curl`
 ([`QUERY_API.md`](QUERY_API.md)), tenants are isolated and their retention is
 enforced, and the durability protocol survives crashes, restarts and a split

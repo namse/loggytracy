@@ -1,6 +1,6 @@
 # signy architecture
 
-A single-machine log and trace engine written in Rust. It combines VictoriaLogs' logical design with
+A single-machine log, trace and metric engine written in Rust. It combines VictoriaLogs' logical design with
 the Parquet physical format and S3 tiering.
 
 This document records what the engine *is*. [`VISION.md`](VISION.md) records what it is *for* — the three
@@ -48,8 +48,8 @@ elsewhere in these docs.
 | Physical format | Parquet (dictionary + zstd) + sidecar index files |
 | Indexes | Stream index + per-block trigram bloom filter (no inverted index) |
 | Query language | None — a query is a flat AND of URL filters; refusals teach the accepted set |
-| API | First-party flat-filter query API for logs and traces ([`QUERY_API.md`](QUERY_API.md)); the Loki and Tempo compatibility surfaces were removed with the read-path decision (issue #3, M12), and the first-party trace endpoints (M13, issue #7) are their replacement |
-| Ingest protocols | **OTLP only**, over gRPC (`:4317`) or HTTP (`POST /v1/logs`, `/v1/traces`), traces and logs. Loki push is removed — see [`VISION.md`](VISION.md), "Ingest is OTLP" |
+| API | First-party flat-filter query API for logs, traces and metrics ([`QUERY_API.md`](QUERY_API.md)); the Loki and Tempo compatibility surfaces were removed with the read-path decision (issue #3, M12), and the first-party trace endpoints (M13, issue #7) are their replacement. The metric surface arrived with M14 as seven routes under `/signy/api/v1/metrics/` |
+| Ingest protocols | **OTLP only**, over gRPC (`:4317`) or HTTP (`POST /v1/logs`, `/v1/traces`, `/v1/metrics`) — all three signals on both transports. Loki push is removed — see [`VISION.md`](VISION.md), "Ingest is OTLP" |
 | Query protocol | **First-party HTTP API** (GET + URL filters, NDJSON out). The viewer is the fn0 control plane behind the gateway; agents drive the same endpoints with `curl` |
 | Transport security | **TLS is unsupported.** Only plain HTTP/gRPC is provided; a reverse proxy or service mesh handles end-to-end encryption |
 | Multi-tenancy | Multi-tenant. `X-Scope-OrgID` identifies tenants, and tenants are the unit of quota and retention |
@@ -145,7 +145,7 @@ storage, and query paths.
 - **Observability**: rejection counters are on `/metrics` without tenant labels (a label per tenant
   multiplies every series by the tenant count); per-tenant numbers are the admin usage endpoint's.
 - **Storage limit**: `max_stored_bytes` is pushed alongside retention and bounds the bytes a tenant may
-  keep. Charged on the tenant's own extents in the shared objects — logs and traces — read from `meta.json`
+  keep. Charged on the tenant's own extents in the shared objects — logs and traces, not metric parts — read from `meta.json`
   rather than from the local files, so it does not move as the cache evicts and restores bodies. Over the
   limit, writes are refused; nothing is deleted to make room, because the space comes back when retention
   retires the oldest parts and choosing which of a customer's logs to destroy is not this engine's call.
