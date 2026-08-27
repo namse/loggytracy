@@ -162,13 +162,12 @@ pub async fn get_usage(
     let on_disk = state.parts.stats(&tenant, window);
     let buffered = state.memtable.stats(&tenant, window);
     // What a storage plan charges for: the tenant's own extents in the shared
-    // objects, logs and traces together. Read from the registries' running
-    // census rather than recomputed, so this endpoint costs the same whether
-    // the tenant has one part or ten thousand.
-    let stored_bytes = state
-        .parts
-        .tenant_stored_bytes(&tenant)
-        .saturating_add(state.trace_parts.tenant_stored_bytes(&tenant));
+    // objects, every signal together. Asked of the quota rather than summed
+    // here, so the number a customer is shown is the number they are refused
+    // on. Read from the registries' running census rather than recomputed, so
+    // this endpoint costs the same whether the tenant has one part or ten
+    // thousand.
+    let stored_bytes = state.tenant_quota.tenant_stored_bytes(&tenant);
     Ok(Json(serde_json::json!({
         "tenant": tenant.as_str(),
         "parts": state.parts.tenant_part_count(&tenant),

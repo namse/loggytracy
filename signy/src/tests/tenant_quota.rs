@@ -19,14 +19,74 @@
         policy: Arc<TenantPolicy>,
         parts: Arc<crate::part_registry::PartRegistry>,
     ) -> TenantQuota {
+        quota_over_all(
+            config,
+            policy,
+            parts,
+            Arc::new(crate::series_registry::SeriesRegistry::standalone()),
+        )
+    }
+
+    fn quota_over_all(
+        config: Config,
+        policy: Arc<TenantPolicy>,
+        parts: Arc<crate::part_registry::PartRegistry>,
+        series_parts: Arc<crate::series_registry::SeriesRegistry>,
+    ) -> TenantQuota {
         TenantQuota::new(
             Arc::new(config),
             Arc::new(RuntimeMetrics::new()),
             policy,
             parts,
             Arc::new(crate::trace_registry::TraceRegistry::standalone()),
-            Arc::new(crate::series_registry::SeriesRegistry::standalone()),
+            series_parts,
         )
+    }
+
+    /// A metric registry holding one flushed part for the named tenant, the
+    /// series counterpart of `registry_holding`.
+    fn series_registry_holding(name: &str) -> Arc<crate::series_registry::SeriesRegistry> {
+        use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
+
+        let root = std::env::temp_dir().join(format!(
+            "signy-storage-quota-series-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let labels = SeriesLabels::from_pairs(vec![
+            (METRIC_NAME_LABEL.to_string(), "queue_depth".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ]);
+        let memtable = crate::series::SeriesMemTable::new();
+        memtable.insert(
+            (0..64)
+                .map(|index| MetricSample {
+                    tenant: TenantId::parse(name).unwrap(),
+                    labels: labels.clone(),
+                    ts_ns: 1_772_000_000_000_000_000 + index * 1_000_000_000,
+                    value: index as f64,
+                    kind: SampleKind::Gauge,
+                    datapoint_index: 0,
+                })
+                .collect(),
+        );
+        let snapshot = memtable.begin_flush();
+        crate::series_part::flush_series_snapshot(&snapshot, &root).unwrap();
+        memtable.commit_flush();
+
+        let registry = Arc::new(
+            crate::series_registry::SeriesRegistry::load_from_disk(
+                &root,
+                Arc::new(tokio::sync::RwLock::new(())),
+            )
+            .unwrap(),
+        );
+        assert!(registry.tenant_stored_bytes(&TenantId::parse(name).unwrap()) > 0);
+        registry
     }
 
     /// A registry holding one part with rows for each named tenant, so a
@@ -97,6 +157,42 @@
             "a storage refusal clears when retention runs, not in a second"
         );
         assert!(error.message.contains("at its limit"), "{}", error.message);
+    }
+
+    /// Metrics are the third signal and they occupy the same disk, so they are
+    /// charged like the other two. M14 added metric parts without teaching the
+    /// usage endpoint about them, which left a tenant refused on a total larger
+    /// than the one it was shown; both readers ask `tenant_stored_bytes` now.
+    #[test]
+    fn a_tenant_holding_only_metrics_is_charged_for_them() {
+        let series_parts = series_registry_holding("acme");
+        let stored = series_parts.tenant_stored_bytes(&tenant("acme"));
+        let empty_logs = Arc::new(crate::part_registry::PartRegistry::new());
+
+        let quota = quota_over_all(
+            Config::default(),
+            Arc::new(TenantPolicy::disabled()),
+            empty_logs.clone(),
+            series_parts.clone(),
+        );
+        assert_eq!(
+            quota.tenant_stored_bytes(&tenant("acme")),
+            stored,
+            "a tenant with no logs and no traces still stores its metric parts"
+        );
+
+        let at = Config {
+            default_tenant_max_stored_bytes: Some(stored),
+            ..Config::default()
+        };
+        quota_over_all(
+            at,
+            Arc::new(TenantPolicy::disabled()),
+            empty_logs,
+            series_parts,
+        )
+        .admit_storage(&tenant("acme"))
+        .expect_err("metric bytes alone reach the limit");
     }
 
     /// One tenant's storage says nothing about its neighbour's, even though

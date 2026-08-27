@@ -145,7 +145,7 @@ storage, and query paths.
 - **Observability**: rejection counters are on `/metrics` without tenant labels (a label per tenant
   multiplies every series by the tenant count); per-tenant numbers are the admin usage endpoint's.
 - **Storage limit**: `max_stored_bytes` is pushed alongside retention and bounds the bytes a tenant may
-  keep. Charged on the tenant's own extents in the shared objects — logs and traces, not metric parts — read from `meta.json`
+  keep. Charged on the tenant's own extents in the shared objects — logs, traces and metric parts — read from `meta.json`
   rather than from the local files, so it does not move as the cache evicts and restores bodies. Over the
   limit, writes are refused; nothing is deleted to make room, because the space comes back when retention
   retires the oldest parts and choosing which of a customer's logs to destroy is not this engine's call.

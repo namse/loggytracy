@@ -73,8 +73,8 @@ choosing which of a customer's logs to destroy, which is not a decision it has
 the standing to make.
 
 The comparison is against the tenant's own byte extents in the shared objects —
-logs and traces both, and not metric parts — read from `meta.json` rather than
-from the local files,
+logs, traces and metric parts — read from `meta.json` rather than from the local
+files,
 so it does not change as the cache evicts and restores bodies. The Parquet
 footer and the sidecars belong to no single tenant and are not charged to one.
 `GET …/tenants/{tenant}/usage` reports the same number as `stored_bytes`

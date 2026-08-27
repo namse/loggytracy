@@ -138,6 +138,20 @@ impl TenantQuota {
         }
     }
 
+    /// The bytes a tenant has stored, every signal included.
+    ///
+    /// One function because two callers read it: `admit_storage` refuses on
+    /// this number and the admin usage endpoint reports it. They were separate
+    /// sums until 2026-08-27, and the reporting one was never taught about
+    /// metric parts when M14 added them -- so a tenant was refused on a total
+    /// larger than the one its control plane was showing it.
+    pub fn tenant_stored_bytes(&self, tenant: &TenantId) -> u64 {
+        self.parts
+            .tenant_stored_bytes(tenant)
+            .saturating_add(self.trace_parts.tenant_stored_bytes(tenant))
+            .saturating_add(self.series_parts.tenant_stored_bytes(tenant))
+    }
+
     fn resolve_storage_limit(&self, tenant: &TenantId) -> TenantStorageLimit {
         self.policy
             .max_stored_bytes(tenant)
@@ -165,11 +179,7 @@ impl TenantQuota {
         let TenantStorageLimit::Bytes(limit) = self.resolve_storage_limit(tenant) else {
             return Ok(());
         };
-        let stored = self
-            .parts
-            .tenant_stored_bytes(tenant)
-            .saturating_add(self.trace_parts.tenant_stored_bytes(tenant))
-            .saturating_add(self.series_parts.tenant_stored_bytes(tenant));
+        let stored = self.tenant_stored_bytes(tenant);
         if stored < limit {
             return Ok(());
         }
