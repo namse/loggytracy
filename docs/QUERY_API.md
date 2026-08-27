@@ -301,10 +301,18 @@ At each `t = start + k*step`:
 - `func=increase` answers the sum of the **positive deltas** over
   `(t − range, t]`, walking from the last sample at or before the window's
   start; a counter reset contributes the post-reset value. `func=rate` is
-  that divided by the window in seconds. This is the VictoriaMetrics
-  definition, adopted deliberately — **not** Prometheus's, which extrapolates
-  to the window boundaries; the numbers differ by a few percent on sparse
-  windows, and `increase` here counts what actually arrived.
+  that divided by the window in seconds. **Nothing is scaled or
+  extrapolated**: a window the samples only half cover answers half the
+  increase, because that is what arrived.
+
+  This differs from both neighbours, and the difference was measured rather
+  than assumed (2026-08-27, `COMPARISON_METRICS.md`). Prometheus extrapolates
+  to the window boundaries. VictoriaMetrics does not extrapolate *past* the
+  data, but it does scale a partially-covered window up to the full range —
+  at a dataset's trailing edge, where a 60 s window held 50 s of samples, it
+  answered `60/50` of what this engine answered. The three agree wherever a
+  window is fully covered, which is every window a live dashboard asks
+  about; they diverge at the edges of a finite dataset.
 - `agg` then folds the per-series values at each step across the series,
   grouped by the `by` projection of their labels (no `by`: one group, empty
   labels; a key a series lacks is omitted from its group's labels rather

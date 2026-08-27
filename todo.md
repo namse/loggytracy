@@ -234,16 +234,41 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
       rather than dies" is not a differentiator against an engine that neither refused nor died. The
       wording is the thing to revisit, after the gate says what a series actually costs.
 
-- [ ] **The two exact-class shapes return two fewer points than VictoriaMetrics, and the digest has not
-      adjudicated it yet.** Measured 2026-08-27 on the Phase 7 smoke, same anchor and knobs on both
-      sides: `raw_range` and `agg_sum_by` answered 44 points where VictoriaMetrics answered 46
-      (`churned_selector`, `instant_alert`, `quantile_p99` and `rate_range` matched exactly at
-      88/6/84/84). Six queries per shape over three windows, so two of them carry one point fewer —
-      the suspects are how each side treats a window whose span is not a whole multiple of `step` and
-      whether VictoriaMetrics aligns `start` down to a step boundary. It is a count difference, not yet
-      a value difference: the per-answer records both sides already emit are what settles it, so Phase 8
-      wires the comparison and Phase 9 publishes whichever way it falls. Not fixed blind before then —
-      guessing at the boundary rule is how a bed starts measuring its author.
+- [x] **The value disagreement is diagnosed, and it is two unrelated things.** The published run's
+      per-answer records settled it (`docs/artifacts/m14/metric-matrix_*.json`, 2026-08-27); every
+      disagreement falls in one of two buckets and neither is a wrong answer.
+
+      *One ULP, on the shapes held to the `exact` rule.* `raw_range` (19/24 answers) and `agg_sum_by`
+      (3/3) differ by at most `2.99e-16` — one or two representable doubles, on a shape that performs no
+      arithmetic at all. Measured directly against a VictoriaMetrics container: pushed
+      `250.07999999999998` (`c2f5285c8f426f40`), read back `250.08` (`c3f5285c8f426f40`), one ULP apart.
+      VictoriaMetrics does not promise to return the bits it was given — it stores a decimal
+      approximation — while this engine's Gorilla XOR is bit-exact by construction
+      (`value_bit_patterns_round_trip_exactly`). So the **`exact` digest class is unsatisfiable for any
+      pair containing VictoriaMetrics**, which is precisely the lesson the log bed already learned about
+      VictoriaLogs and the strict digest: the basis has to be something both systems can produce. The
+      fix belongs to the bed, not the engine — move `raw_range` and `agg_sum_by` to `tolerance`, and say
+      in the document why the strongest available rule is not bit-equality.
+
+      *One sixth, at exactly one instant.* `rate_range`, `instant_alert` and `churned_selector` differ
+      only in the **last window's last step** — 8 of 24 answers, every one of them `w2`, one timestamp
+      each, `L/V = 0.8333` flat. The dataset's last sample sits at `anchor + 3590 s` while the window's
+      end is `anchor + 3600 s`, so a 60 s range holds 50 s of samples: this engine answers the five
+      deltas that arrived, VictoriaMetrics scales them to the full window and answers `60/50` as much.
+      `churned_selector`'s `2/3` is the same mechanism over a sparser series. **The M14 decision record
+      and `QUERY_API.md` were wrong to say VictoriaMetrics "does not extrapolate"** — it does not
+      extrapolate past the data, but it does scale a partially-covered window, and the document has been
+      corrected to what was measured.
+
+- [ ] **Decide whether a partially-covered window scales, and make the bed's rule match.** Two changes
+      fall out of the diagnosis above and neither should be made blind. The digest class for
+      `raw_range`/`agg_sum_by` has to move to `tolerance` or the bed will withhold those ratios forever
+      over a difference no engine can avoid. And the rate semantics is a product decision the way the
+      original VM-versus-Prometheus choice was: answering what arrived is honest and answers a partial
+      window low, while scaling matches what a VictoriaMetrics user's dashboard shows at the trailing
+      edge. Whichever is chosen, `QUERY_API.md`, the decision record and the bed's tolerance all move
+      together — and the shapes agree everywhere a window is fully covered, so no live dashboard is
+      affected either way.
 
 Found while building the metrics bed, and not a metrics defect: **the log bed's next rerun will 403 at
 the seed phase.** The env tenant allowlist was removed after the last published run — the pushed policy
