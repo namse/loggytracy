@@ -1,0 +1,250 @@
+# collecty architecture
+
+A per-machine OTLP collector written in Rust. It takes exports over a Unix
+domain socket, writes them zstd-compressed to an append-only disk queue, and
+ships them to signy in batches.
+
+This document records what the collector *is* and why each decision was made.
+There are no comments in the source, so every "why" that would have been one
+lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference.
+
+## Decided choices
+
+| Item | Decision |
+|---|---|
+| Deployment | One process per machine or one sidecar per pod; both are supported and neither is assumed |
+| Ingest protocol | **OTLP over gRPC on a Unix domain socket**, all three signals |
+| Payload handling | **Never decoded.** The bytes that arrive are the bytes that are stored and the bytes that are sent |
+| Acknowledgement | After `write(2)`, before `fsync`. See "What an acknowledgement means" |
+| Durability | Append-only segments, crc32 per record, periodic `fsync`, cursor on disk |
+| When the queue is full | **Drop the oldest segment.** The application is never refused for lack of disk |
+| Delivery | At-least-once, one batch in flight at a time, in queue order |
+| Transport to signy | `POST /signy/api/v1/collect/{signal}` with `Content-Encoding: zstd` |
+| Tenancy | **None.** The tenant travels inside the payload as a resource attribute (obsy issue #9), so a collector that does not decode has nothing to do |
+| Self-observation | `collecty_*` metrics encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr |
+| Format versioning | **None.** Nothing on disk is versioned. A queue written by another build is deleted, not migrated |
+| Transport security | **None, by design.** A Unix socket has no network to secure, and the hop to signy is expected to stay inside a trust boundary |
+
+## The property the whole design rests on
+
+Two independent formats both survive plain concatenation, and collecty is built
+out of that coincidence.
+
+**OTLP export requests concatenate.** `ExportLogsServiceRequest` carries exactly
+one field, `repeated ResourceLogs resource_logs = 1`; the trace and metric
+requests have the same shape. Protobuf's merge rule says parsing two serialized
+messages back to back yields one message whose repeated fields are the
+concatenation. So joining the serialized bytes of N exports **is** the merged
+export — no decode, no re-encode, no field walking.
+
+**zstd frames concatenate.** A zstd stream may hold any number of frames, and
+decompressing the stream yields the concatenation of what each frame held. So
+joining N independently compressed frames **is** one stream that decompresses to
+the joined plaintext.
+
+Stack them and a batch is a `memcpy`:
+
+```
+export₁ ──encode──▶ bytes₁ ──zstd──▶ frame₁ ─┐
+export₂ ──encode──▶ bytes₂ ──zstd──▶ frame₂ ─┼─▶ frame₁‖frame₂‖frame₃  (the body sent)
+export₃ ──encode──▶ bytes₃ ──zstd──▶ frame₃ ─┘
+                                              │
+                       signy: one decompress ─┴─▶ bytes₁‖bytes₂‖bytes₃
+                              one decode ───────▶ one export with every ResourceLogs
+```
+
+collecty compresses each export once, on arrival, and never touches it again.
+It does not decode on the way in, does not merge structurally, and does not
+recompress on the way out.
+
+Both halves are pinned by tests in `src/wire.rs`
+(`concatenated_zstd_frames_decompress_to_the_concatenated_plaintext`,
+`concatenated_export_requests_decode_as_one_merged_request`,
+`a_batch_survives_both_layers_at_once`), and the whole path is pinned end to end
+by signy's `a_collected_batch_of_separate_exports_lands_as_every_line_it_carried`.
+
+## Receiving
+
+A gRPC server bound to a Unix socket, serving the three OTLP `Export` methods.
+It uses a **passthrough codec** (`src/receive/codec.rs`) rather than the
+generated prost services: the decoder hands back the message bytes as `Bytes`
+and the encoder writes nothing. An empty body is a valid
+`ExportLogsServiceResponse` with no `partial_success`, which is what a successful
+export answers, so a response costs zero bytes and zero encoding work.
+
+Because of this, `prost` and `opentelemetry-proto` are **not** on the receive
+path at all. They appear at runtime only to *encode* collecty's own metrics
+(see "Self-observation"), and in tests to prove the concatenation property.
+
+Two ceilings guard memory:
+
+- **Per request.** tonic's `max_decoding_message_size` refuses an oversized
+  export with `OUT_OF_RANGE` *before* buffering the body. `Intake::accept` keeps
+  the same check for callers that do not arrive over gRPC.
+- **In flight.** A `Semaphore` whose permits are bytes. Each request acquires its
+  own length and holds it until the record is on disk, so the memory a burst can
+  reach is a declared number rather than a product of concurrency and size.
+
+Compression and the queue append both run on a blocking thread. Compression is
+the only meaningful CPU this process spends.
+
+## What an acknowledgement means
+
+**A `200` means the bytes reached the kernel, not the device.** `Queue::append`
+does `write(2)` and returns; `fsync` happens on a timer (`COLLECTY_FSYNC_INTERVAL`,
+1 s) and when a segment rolls.
+
+This was chosen over acknowledging after `fsync`, and the reason is that it is
+the option that leaves the **least** memory held anywhere:
+
+- Acknowledging after `fsync` delays every response by a device sync. The
+  application's exporter queue grows by exactly that delay, and collecty holds
+  the in-flight request for the same span. Both sides pay.
+- Acknowledging from an in-memory channel is no faster in practice and moves the
+  bytes from the application's heap to collecty's — the same bytes, a different
+  owner, and a channel-sized ceiling on top.
+- Acknowledging after `write` is the only one where the bytes leave user memory
+  entirely. Page cache is reclaimable, is not charged to either process's RSS,
+  and a cgroup counts it as reclaimable rather than as pressure.
+
+What that costs: a machine that loses power loses at most one `fsync` interval.
+A collecty that crashes or is redeployed loses nothing, because the kernel still
+holds what was written. The lost window belongs to a failure that takes the
+application on that machine with it, and signy already accepts a loss window of
+its own flush interval for the same class of event.
+
+## The disk queue
+
+One queue per signal, under `{data_dir}/{logs,traces,metrics}/`.
+
+```
+00000000000000000000.seg   append-only segment, rolls at COLLECTY_QUEUE_SEGMENT_BYTES
+00000000000000000001.seg
+cursor                     20 bytes: segment u64, offset u64, crc32
+```
+
+A record is a 12-byte header and a zstd frame:
+
+| bytes | field | why |
+|---|---|---|
+| 0..4 | compressed length | frames the record |
+| 4..8 | uncompressed length | a batch's ceiling is *uncompressed* bytes, because that is what signy admits against; knowing it without decompressing is what makes batch assembly free |
+| 8..12 | crc32 of the frame | tells a torn tail from bit rot |
+
+**One frame per record rather than one stream per segment.** A streaming
+compressor over a whole segment would compress better, but its output cannot be
+cut at record boundaries, and cutting at record boundaries is exactly what
+lets a batch be a slice and a poisoned record be isolated. The ratio is paid to
+keep the byte range addressable.
+
+**Recovery.** On open, the last segment is walked from its start and truncated at
+the first record whose header does not fit, whose length runs past the file, or
+whose crc does not match. Earlier segments are not walked: a corrupt record found
+later, while reading, ends that segment and the reader moves to the next one.
+Trusting a bad length field to find the next boundary would be worse than losing
+the tail of one segment.
+
+**The cursor is advisory.** It is overwritten in place with no rename, because
+losing it costs duplicates and duplicates are allowed. A torn write fails its
+crc, and a queue whose cursor will not load replays from the oldest record it
+still holds.
+
+**Drop-oldest works in whole segments.** Rewriting a file to remove its head is
+expensive; unlinking is one syscall. If the cursor was inside the segment being
+dropped it jumps to the start of the next one.
+
+**Dropped records are counted in bytes, not in records.** Counting records would
+mean walking every segment at startup to know how many each holds, which is a
+full read of the backlog on every restart. Bytes are free and answer the question
+an operator actually asks.
+
+**Backlog and disk usage are separate numbers.** `collecty_queue_bytes` is what
+the segments occupy; `collecty_queue_backlog_bytes` is what has not reached signy
+yet. They differ because a delivered segment is not unlinked until a later one
+exists, and only the second one means "signy is behind".
+
+## Sending
+
+One sender task per signal, one batch in flight, in queue order. There is no
+linger: if the queue has anything, it goes now. Batching is therefore automatic —
+when signy is slow or down the backlog grows and the next batch is larger, which
+is the only time a large batch is useful.
+
+A batch is capped at `COLLECTY_BATCH_MAX_BYTES` **uncompressed** (8 MiB by
+default, half of what signy admits) and `COLLECTY_BATCH_MAX_RECORDS` records. A
+single record that alone exceeds the ceiling is still sent rather than blocking
+the queue behind it.
+
+The request carries `Content-Encoding: zstd` and
+`x-collecty-uncompressed-bytes`, which lets signy refuse an oversized batch and
+charge its admission gate **before** decompressing anything. signy also refuses a
+batch that decompresses past what it declared, so the header cannot be used to
+understate a decompression bomb.
+
+### How an answer is read
+
+| Answer | Meaning | Action |
+|---|---|---|
+| 2xx | accepted and durable in signy | advance the cursor |
+| 400, 413, 415, 422 | this payload is not acceptable | isolate and drop |
+| everything else, including 401/403/429/5xx and any connection failure | signy cannot take it *right now* | retry with backoff |
+
+The default is **retry, not drop**. A `403` from a misconfigured tenant policy
+must not destroy data, so only the four statuses that say "this body is wrong"
+are treated as permanent. Backoff is 100 ms doubling to 30 s with jitter.
+
+### Poison isolation
+
+Not decoding has one cost: a corrupt payload is only discovered when signy
+refuses the batch that contains it, and a batch that always fails would block
+the queue head forever.
+
+So a permanent refusal halves the batch and retries the left half, narrowing
+until one record is left; that record is dropped, counted in
+`collecty_records_refused_total`, logged at error, and the cursor moves past it.
+For eight records with the sixth poisoned, the attempts are 8, 4, 4, 2, 1, 3, 1,
+2 — seven records delivered, one dropped, and this exact sequence is asserted in
+`send::tests::a_refused_batch_is_halved_until_the_one_bad_record_is_dropped`.
+
+**This mechanism is currently load-bearing in a way it should not be.** signy
+refuses on record *counts* as well as bytes (`MAX_OTLP_LOG_RECORDS` and its two
+siblings, 100,000 each), and collecty cannot count records without decoding. A
+batch refused for being too numerous therefore enters the same halving path and
+can end in a drop. That is obsy issue #10, which owns the decision; until it is
+settled the 8 MiB batch ceiling is deliberately conservative.
+
+## Self-observation
+
+collecty encodes its own counters as an OTLP metrics export and pushes them
+through its own queue, so they take the same path as everything else and need no
+listening port. `opentelemetry-proto` is used rather than hand-written prost
+structs on purpose: a hand-transcribed field number fails silently, because the
+test that round-trips it decodes with the same wrong definition.
+
+The cost is that while signy is unreachable, the metrics describing that outage
+are stuck in the queue behind it. The periodic summary written to stderr exists
+for exactly that window — it is the only channel that still works when nothing
+else does.
+
+## What is deliberately not built
+
+- **A metrics endpoint.** Adding a port would mean a second surface to secure and
+  operate, for numbers that already have a path.
+- **Multiple in-flight batches.** Ordered delivery with one cursor is a single
+  number to reason about and to recover. Throughput here is bounded by signy, not
+  by the link.
+- **A read or query API.** The queue is a pipe, not a store.
+- **Payload transformation.** No attribute injection, no filtering, no sampling.
+  All of it requires decoding, and not decoding is the point.
+- **Tenancy.** See the decisions table.
+- **TLS.** See the decisions table.
+
+## Where this depends on signy
+
+- `/signy/api/v1/collect/{logs,traces,metrics}` must exist and accept
+  `Content-Encoding: zstd`.
+- signy's admission ceilings and collecty's batch ceiling are coupled by nothing
+  but these documents. That coupling, and whether the ceilings should exist in
+  their current form at all, is obsy issue #10.
+- signy must tolerate duplicates. It already does; its own recovery is
+  at-least-once across a flush boundary.

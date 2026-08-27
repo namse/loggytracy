@@ -1,0 +1,180 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use collecty::config::Config;
+use collecty::observe::Reporter;
+use collecty::queue::Queue;
+use collecty::receive::{self, Intake};
+use collecty::send::{HttpTransport, Sender};
+use collecty::signal::Signal;
+use tokio::sync::watch;
+
+#[tokio::main]
+async fn main() {
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("collecty: {error}");
+            std::process::exit(2);
+        }
+    };
+    init_tracing(config.log_json);
+
+    if let Err(error) = run(config).await {
+        tracing::error!(%error, "collecty stopped");
+        std::process::exit(1);
+    }
+}
+
+fn init_tracing(json: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("COLLECTY_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if json {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
+}
+
+async fn run(config: Config) -> Result<(), String> {
+    let mut queues = HashMap::new();
+    for signal in Signal::ALL {
+        let dir = config.queue_dir(signal);
+        let queue = Queue::open(&dir, config.queue)
+            .map_err(|error| format!("cannot open the {signal} queue at {dir:?}: {error}"))?;
+        queues.insert(signal, Arc::new(queue));
+    }
+
+    let listener = receive::bind(&config.socket_path, config.socket_mode)
+        .map_err(|error| format!("cannot serve OTLP: {error}"))?;
+    let intake = Intake::new(
+        queues.clone(),
+        config.max_request_bytes,
+        config.max_inflight_bytes,
+        config.zstd_level,
+    );
+
+    let (shutdown, watcher) = watch::channel(false);
+    let transport = Arc::new(HttpTransport::new(
+        config.signy_url.clone(),
+        config.send_timeout,
+    ));
+
+    let mut senders = Vec::new();
+    let mut watched = Vec::new();
+    for signal in Signal::ALL {
+        let queue = queues.get(&signal).expect("a queue").clone();
+        let sender = Sender::new(signal, queue.clone(), transport.clone(), config.sender);
+        watched.push((signal, queue, sender.stats()));
+        let watcher = watcher.clone();
+        senders.push(tokio::spawn(async move { sender.run(watcher).await }));
+    }
+
+    let syncing = tokio::spawn(sync_loop(
+        queues.values().cloned().collect(),
+        config.fsync_interval,
+        watcher.clone(),
+    ));
+    let reporting = tokio::spawn(report_loop(
+        Reporter::new(watched),
+        intake.clone(),
+        config.report_interval,
+        watcher.clone(),
+    ));
+
+    tracing::info!(
+        socket = %config.socket_path.display(),
+        data_dir = %config.data_dir.display(),
+        signy = %config.signy_url,
+        queue_max_bytes = config.queue.max_bytes,
+        "collecty is accepting OTLP"
+    );
+
+    let stopping = shutdown.clone();
+    let served = receive::serve(intake, listener, async move {
+        wait_for_a_stop_signal().await;
+        tracing::info!("collecty is shutting down");
+        let _ = stopping.send(true);
+    })
+    .await;
+
+    let _ = shutdown.send(true);
+    for sender in senders {
+        let _ = sender.await;
+    }
+    let _ = syncing.await;
+    let _ = reporting.await;
+
+    for (signal, queue) in queues {
+        if let Err(error) = queue.sync() {
+            tracing::error!(%signal, %error, "the queue could not be synced on the way out");
+        }
+    }
+    let _ = std::fs::remove_file(&config.socket_path);
+
+    served.map_err(|error| format!("the OTLP listener stopped: {error}"))
+}
+
+async fn wait_for_a_stop_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::error!(%error, "cannot listen for SIGTERM");
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+async fn sync_loop(
+    queues: Vec<Arc<Queue>>,
+    interval: std::time::Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.changed() => return,
+        }
+        for queue in &queues {
+            let queue = queue.clone();
+            let synced = tokio::task::spawn_blocking(move || queue.sync()).await;
+            if let Ok(Err(error)) = synced {
+                tracing::error!(%error, "a queue could not be synced");
+            }
+        }
+    }
+}
+
+async fn report_loop(
+    reporter: Reporter,
+    intake: Arc<Intake>,
+    interval: std::time::Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.changed() => return,
+        }
+        let observed = reporter.observe();
+        reporter.log(&observed);
+        let export = reporter.export(&observed);
+        if let Err(status) = intake
+            .accept(Signal::Metrics, bytes::Bytes::from(export))
+            .await
+        {
+            tracing::warn!(%status, "collecty could not queue its own metrics");
+        }
+    }
+}
