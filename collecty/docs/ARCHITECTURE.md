@@ -2,7 +2,7 @@
 
 A per-machine OTLP collector written in Rust. It takes exports over a Unix
 domain socket, writes them zstd-compressed to an append-only disk queue, and
-ships them to signy in batches.
+ships them to signy a segment at a time.
 
 This document records what the collector *is* and why each decision was made.
 There are no comments in the source, so every "why" that would have been one
@@ -18,9 +18,10 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Acknowledgement | After `write(2)`, before `fsync`. See "What an acknowledgement means" |
 | Durability | Append-only segments, crc32 per record, periodic `fsync`, cursor on disk |
 | When the queue is full | **Drop the oldest segment.** The application is never refused for lack of disk |
-| Delivery | One batch in flight at a time, in queue order. A resend after a crash is **suppressed by signy**, not duplicated — see "Sending twice" |
+| Delivery | One closed segment in flight at a time, in queue order. A resend after a crash is **suppressed by signy**, not duplicated — see "Sending twice" |
 | Transport to signy | `POST /signy/api/v1/collect` with `Content-Encoding: zstd`, one route for all three signals |
 | Sender identity | Random 16 bytes made with the queue directory, kept in the cursor file. Not configurable, and not the hostname — it names the queue, not the machine |
+| What a request carries | **One closed segment, from its first record.** Never part of one, and never the segment still being written |
 | Tenancy | **None.** The tenant travels inside the payload as a resource attribute (obsy issue #9), so a collector that does not decode has nothing to do |
 | Self-observation | `collecty_*` metrics encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr |
 | Format versioning | **None.** Nothing on disk is versioned. A queue written by another build is deleted, not migrated |
@@ -128,30 +129,40 @@ One queue for every signal, under `{data_dir}/queue/`.
 ```
 00000000000000000000.seg   append-only segment, rolls at COLLECTY_QUEUE_SEGMENT_BYTES
 00000000000000000001.seg
-cursor                     44 bytes: segment u64, offset u64, sequence u64, sender id, crc32
+cursor                     28 bytes: acknowledged segment u64, sender id, crc32
 ```
+
+Segments are numbered from one, so zero in the cursor means signy has none of
+them.
 
 A record is a 12-byte header and a zstd frame:
 
 | bytes | field | why |
 |---|---|---|
 | 0..4 | compressed length | frames the record |
-| 4..8 | uncompressed length | a batch's ceiling is *uncompressed* bytes, because that is what signy admits against; knowing it without decompressing is what makes batch assembly free |
+| 4..8 | uncompressed length | what the frame decompresses to, so a segment can be sized without decompressing it |
 | 8..12 | crc32 of the frame | tells a torn tail from bit rot |
 
 **The signal is inside the frame, not in this header.** Compressed, the frame
 holds five more bytes in front of the payload — one signal tag and the payload's
-length — and those are the bytes signy reads to split a batch apart. Putting the
+length — and those are the bytes signy reads to split a segment apart. Putting the
 tag here instead would have been cheaper to read locally and useless remotely:
 the queue header never leaves this machine, and the sender would then have to
 rebuild an index for signy out of bytes it is otherwise free to `memcpy`. So the
 queue stays signal-agnostic and only the two ends of the wire know the tag.
 
 **One frame per record rather than one stream per segment.** A streaming
-compressor over a whole segment would compress better, but its output cannot be
-cut at record boundaries, and cutting at record boundaries is exactly what
-lets a batch be a slice and a poisoned record be isolated. The ratio is paid to
-keep the byte range addressable.
+compressor over a whole segment would compress better — measured at 28% fewer
+bytes for a normal export size and far more for small ones — and now that a
+segment is what a request carries, most of what stood in the way is gone: the
+file would be sent verbatim, and it is never read while it is open.
+
+What is left is the acknowledgement. A record is acknowledged to the exporting
+application after `write(2)`, and a streaming compressor holds bytes in the
+encoder until it flushes, so the record would not be in the file yet. Closing
+that gap means either delaying the answer to the next flush or answering for
+something not yet written. That is the decision this has not made, and until it
+does the ratio is what it costs.
 
 **Recovery.** On open, the last segment is walked from its start and truncated at
 the first record whose header does not fit, whose length runs past the file, or
@@ -162,21 +173,18 @@ the tail of one segment.
 
 **The cursor is advisory.** It is overwritten in place with no rename, because
 losing it costs a resend and a resend is cheap. A torn write fails its crc, and
-a queue whose cursor will not load replays from the oldest record it still
-holds.
+a queue whose cursor will not load offers every segment it still holds.
 
-**The sequence and the sender id share the cursor's fate.** The sequence counts
-records handed out for sending, and signy remembers the highest it has stored
-under the sender id. If the id survived a cursor that did not, the numbering
-would restart under a name signy still held a high-water mark for, and every
-record under that mark would be skipped as one it had already seen. So a cursor
-that will not load takes the id with it: the queue comes back as a sender signy
-has never heard of, and nothing is skipped.
+**The segment number and the sender id share the cursor's fate.** signy
+remembers the last segment it has whole under the sender id. If the id survived
+a cursor that did not, the numbering would restart under a name signy still held
+a high-water mark for, and every segment under that mark would be skipped as one
+it had already stored. So a cursor that will not load takes the id with it: the
+queue comes back as a sender signy has never heard of, and nothing is skipped.
 
-**Numbers are handed out at read time, not at append time.** A segment dropped
-under a full queue takes its records with it before they were ever numbered, so
-there is no gap to explain. All the number has to be is monotonic, and reading
-only ever moves forward.
+**A segment answered for is unlinked, and one still owed is not.** Reopening
+removes anything at or below the acknowledged number, which is what a crash
+between signy's answer and the unlink leaves behind.
 
 **Drop-oldest works in whole segments.** Rewriting a file to remove its head is
 expensive; unlinking is one syscall. If the cursor was inside the segment being
@@ -194,70 +202,62 @@ exists, and only the second one means "signy is behind".
 
 ## Sending
 
-One sender task, one batch in flight, in queue order. There is no
-linger: if the queue has anything, it goes now. Batching is therefore automatic —
-when signy is slow or down the backlog grows and the next batch is larger, which
-is the only time a large batch is useful.
+One sender task, one closed segment in flight at a time, in queue order. The
+open segment is never read: it is the one thing the intake is appending to, and
+keeping a reader out of it is most of what makes the rest of this simple.
 
-A batch is capped at `COLLECTY_BATCH_MAX_BYTES` **uncompressed** (64 MiB by
-default) and `COLLECTY_BATCH_MAX_RECORDS` records. A single record that alone
-exceeds the ceiling is still sent rather than blocking the queue behind it.
-
-**The ceiling is this process's memory and nothing else.** It used to be half of
-what signy would admit, because signy collected the whole body before it looked
-at it. signy now decompresses and ingests a record at a time and never holds
-more than one, so the only thing the number bounds is the frames kept here while
-an attempt is out. A large batch only happens when the backlog is large, which is
-exactly when saving round trips is worth the memory.
+**A segment closes on size or on age.** `COLLECTY_QUEUE_SEGMENT_BYTES` (8 MiB by
+default) closes it on a busy host; `COLLECTY_SEGMENT_MAX_AGE` (1 s) closes it on
+a quiet one, and that is the floor on how long a record waits before it leaves
+the machine. Both numbers also decide how much is re-sent when a delivery is
+cut, because what is re-sent is the segment.
 
 The request carries `Content-Encoding: zstd`, `x-collecty-sender` and
-`x-collecty-start-sequence`. There is no declared-size header any more: signy
-has nothing to admit a whole batch against.
+`x-collecty-segment`, and the body is the segment's frames, concatenated. The
+twelve-byte on-disk header of each is stripped: it exists to find a torn tail
+and to size a segment, and signy has no use for it.
 
 ### Sending twice
 
-The batch body carries no numbers. It does not have to: the header names the
-first record's number and signy counts as it reads, so record *i* of the body is
-`start + i`.
+The body carries no numbers and does not need to. **A segment is sent from its
+first record every time**, so signy counts as it reads and record *i* of the
+body is record *i* of that segment, on every attempt.
 
-signy remembers the highest number it has stored per sender, and skips anything
-at or below it. The answer says how far it has got, and the cursor moves to
-that.
+signy remembers, per sender, which segment it is reading and how many of its
+records it has stored. A segment it already has whole is answered from the
+headers with the body unread. One it has part of is counted off to where it
+stopped, and only the rest is stored.
 
 That closes the window this design used to leave open. The cursor was written
 after the answer arrived, so a collecty that died in between — or an answer lost
-on the way back — resent a batch signy already had, and every record in it was
+on the way back — resent what signy already had, and every record in it was
 stored a second time. Logs collapsed on merge; spans and metric samples did not.
-Now the resend arrives, is counted in `signy_collect_skipped_records_total`, and
-stores nothing.
 
-The same holds for a batch cut off halfway. Whatever reached signy is durable
-with its number beside it, and the resend picks up from there rather than
-starting again.
+The same holds for a delivery cut halfway. Whatever reached signy is durable
+with its position beside it, and the resend is counted off to there rather than
+stored again — `signy_collect_skipped_records_total` is where that shows.
 
 ### How an answer is read
 
 | Answer | Meaning | Action |
 |---|---|---|
-| 2xx | accepted and durable in signy; the body is `{"stored":n}` | advance the cursor to `n` |
-| 400, 413, 415, 422 | this *batch* is not acceptable | isolate and drop |
+| 2xx | the segment is durable in signy; the body is `{"stored":n}` | advance the cursor to `n` and unlink everything at or below it |
+| 400, 413, 415, 422 | this *segment* is not acceptable | drop it and move on |
 | everything else, including 401/403/429/5xx and any connection failure | signy cannot take it *right now* | retry with backoff |
 
 The default is **retry, not drop**. A `403` from a misconfigured tenant policy
 must not destroy data, so only the four statuses that say "this body is wrong"
 are treated as permanent. Backoff is 100 ms doubling to 30 s with jitter.
 
-`n` is normally the last record's number and the whole attempt is committed. It
-can be *higher* — signy got further on an earlier attempt than collecty heard
-about — and then the next batch starts under it and is skipped there. If it is
-lower, the records past it stay in the queue rather than being taken on trust.
+`n` is normally the segment that was just sent. It can be *higher* — signy
+answered an earlier attempt collecty never heard — and then everything up to it
+is unlinked at once.
 
-A single bad *record* no longer reaches this table. signy splits a batch by
-signal itself, and a signal it will never accept — an undecodable body, a tenant
-at its storage limit — is dropped there, logged, counted in
-`signy_collect_dropped_records_total`, and answered `200`. Sending it back would
-only have collecty halve the batch to rediscover what signy already knew, one
-round trip at a time, and drop it anyway.
+A single bad *record* does not reach this table. A record signy will never
+accept — an undecodable body, a tenant at its storage limit — is dropped there,
+logged, counted in `signy_collect_dropped_records_total`, and the segment still
+finishes with a `200`. Sending it back would only have collecty guess which
+record it meant, and drop it anyway.
 
 **signy drops on every client error, including `403`.** That is wider than this
 table, and the queue being shared is the reason. One application exporting under
@@ -268,36 +268,27 @@ whose `429` clears only when retention retires parts. Both are real data loss an
 both are visible: a warning per drop and
 `signy_collect_dropped_records_total`, which the runbook alerts on.
 
-What still reaches the table as a refusal is a batch that is wrong as a *whole*:
-not zstd, framing that does not add up, or more uncompressed bytes than signy
-will hold — and that last one halving genuinely fixes. The statuses this table
-calls retryable stay retryable, because they are answered before a batch is ever
-split: a fenced or draining instance, and a gate that is behind.
+What still reaches the table as a refusal is a segment that is wrong as a
+*whole*: not zstd, or framing that does not add up. The statuses this table
+calls retryable stay retryable, because they are answered before any of the body
+is read: a fenced or draining instance, and a gate that is behind.
 
 ### Poison isolation
 
-Not decoding has one cost: a corrupt payload is only discovered when signy
-refuses the batch that contains it, and a batch that always fails would block
-the queue head forever.
+Not decoding has one cost: a corrupt payload is only discovered on the far side,
+and a segment that always fails would block the queue head forever.
 
-So a permanent refusal halves the batch and retries the left half, narrowing
-until one record is left; that record is dropped, counted in
-`collecty_records_refused_total`, logged at error, and the cursor moves past it.
-With signy dropping what it cannot decode, this path is now reached only by a
-batch refused for its shape rather than its content, but it stays: it is the only
-thing standing between a queue head that always fails and a queue that never
-drains.
-For eight records with the sixth poisoned, the attempts are 8, 4, 4, 2, 1, 3, 1,
-2 — seven records delivered, one dropped, and this exact sequence is asserted in
-`send::tests::a_refused_batch_is_halved_until_the_one_bad_record_is_dropped`.
+**Halving is gone.** It used to narrow a refused batch by halves until one
+record was left and drop that one. signy now reads a segment a record at a time
+and drops what it will never take on its own side, so nothing that reaches the
+sender as a refusal is about a record — it is the segment's framing, and no
+amount of splitting finds anything. A refused segment is dropped whole, counted
+in `collecty_records_refused_total` by the records it held, and logged at error.
 
-**Almost nothing reaches this path any more.** signy reads a batch a record at
-a time, so a record over any of its ceilings — bytes or `MAX_OTLP_LOG_RECORDS`
-and its two siblings — is dropped there and answered `200` like any other
-undecodable one. What is left for halving is a batch wrong in its framing, which
-halving cannot fix either. It stays because it costs nothing and it is the only
-thing standing between a queue head that always fails and a queue that never
-drains.
+That is a blunter loss than the old search, and it is bounded by
+`COLLECTY_QUEUE_SEGMENT_BYTES` rather than by one record. A segment whose
+framing does not add up is a bug in this process or a disk that is lying,
+neither of which the old search was really for.
 
 ## Self-observation
 
@@ -334,9 +325,10 @@ else does.
   so a refusal it cannot act on becomes a halving search it should not have to
   run — and with one queue for the machine, a batch that can never be accepted
   blocks every application on it.
-- signy must remember the number in `x-collecty-start-sequence` per sender and
-  answer with how far it has got. Without that a resend is stored twice, which
-  logs collapse on merge and spans and metric samples do not.
+- signy must remember, per sender, the segment in `x-collecty-segment` and how
+  far into it it has got, and answer with the last segment it holds whole.
+  Without that a resend is stored twice, which logs collapse on merge and spans
+  and metric samples do not.
 - signy must tolerate duplicates it does not catch. Its own recovery is still
   at-least-once across a flush boundary, so a restart there can replay records
   already in parts.

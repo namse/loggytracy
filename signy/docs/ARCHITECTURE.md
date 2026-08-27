@@ -285,16 +285,16 @@ All limits apply **before** journal append, so rejected requests leave no trace 
 Protecting the engine takes priority over preserving every log line — Alloy retries or drops rejected batches from its own WAL.
 
 - The OTLP body limit is a 16 MiB constant, matched across both transports.
-- The collect route has no batch limit. It decompresses and ingests a record at
-  a time and never holds more than one, so the 16 MiB constant applies to a
-  record's payload and nothing bounds the batch around it. How large a batch
-  collecty sends is collecty's own memory question.
+- The collect route has no limit on the segment it is sent. It decompresses and
+  ingests a record at a time and never holds more than one, so the 16 MiB
+  constant applies to a record's payload and nothing bounds the segment around
+  it. How large a segment is, is collecty's own question.
 
 **What reading a record at a time cost.** The route used to merge every record
-of a signal in a batch into one export and write one WAL record for it. One WAL
-record per collected record instead means one zstd frame each, and exports from
-one service repeat their resource attributes, their service name and their line
-shapes — which a merged payload compresses across and separate ones do not.
+of a signal in a request into one export and write one WAL record for it. One
+WAL record per collected record instead means one zstd frame each, and exports
+from one service repeat their resource attributes, their service name and their
+line shapes — which a merged payload compresses across and separate ones do not.
 Measured on synthetic checkout-service exports at zstd level 1, WAL bytes for the
 same data:
 

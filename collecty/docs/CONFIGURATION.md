@@ -37,7 +37,7 @@ disk.
 | Variable | Default | What it does |
 |---|---|---|
 | `COLLECTY_QUEUE_MAX_BYTES` | `1GiB` | One queue holds every signal, so this is the whole budget. **This number is how long signy may be down before data is lost.** At 1 MB/s of compressed logs it is about 17 minutes |
-| `COLLECTY_QUEUE_SEGMENT_BYTES` | `64MiB` | Segment roll size. Also the granularity of dropping: when the queue is full an entire segment goes at once. Smaller segments lose less per drop and cost more file handles and metadata |
+| `COLLECTY_QUEUE_SEGMENT_BYTES` | `8MiB` | Segment roll size, and therefore the unit of everything else: one request carries one segment, dropping under a full queue takes one at a time, and a cut delivery re-sends one. Smaller segments lose less per drop and cost more requests |
 | `COLLECTY_FSYNC_INTERVAL` | `1s` | How often written records are forced to the device. **This is the loss window for a power cut**, and nothing else |
 
 When `COLLECTY_QUEUE_MAX_BYTES` is reached the oldest segment is unlinked and the
@@ -48,8 +48,7 @@ movement means data was thrown away.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLECTY_BATCH_MAX_BYTES` | `64MiB` | Batch ceiling in **uncompressed** bytes. This bounds what collecty holds while an attempt is out, nothing on signy's side: signy reads a batch a record at a time |
-| `COLLECTY_BATCH_MAX_RECORDS` | `8192` | Exports per batch |
+| `COLLECTY_SEGMENT_MAX_AGE` | `1s` | How long an open segment may keep collecting before it closes and becomes sendable. Nothing leaves the machine until a segment closes, so on a quiet host this is the delivery latency |
 | `COLLECTY_RETRY_INITIAL` | `100ms` | First backoff after signy declines |
 | `COLLECTY_RETRY_MAX` | `30s` | Backoff ceiling. Doubling, with up to 25% jitter |
 | `COLLECTY_SEND_TIMEOUT` | `30s` | How long one batch may wait for an answer before it counts as a retryable failure |
