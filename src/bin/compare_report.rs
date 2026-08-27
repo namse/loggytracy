@@ -2249,6 +2249,37 @@ fn metrics_verdict(
         ));
     }
 
+    // Whatever else the run decided, the shapes that *did* agree are the only
+    // like-for-like numbers in it, and a verdict that skipped them because
+    // they are not the claim's own two would be choosing what to report.
+    let mut agreed: Vec<(&str, String)> = Vec::new();
+    for shape in METRIC_SHAPES {
+        if !agreements[shape].agrees() {
+            continue;
+        }
+        let ours = &matrix["loggytracy"]["matrix"]["shapes"][shape]["cold_ms"]["p50_ms"];
+        let theirs = &matrix["victoriametrics"]["matrix"]["shapes"][shape]["cold_ms"]["p50_ms"];
+        if let (Some(ours), Some(theirs)) = (f64_of(ours), f64_of(theirs))
+            && theirs > 0.0
+        {
+            agreed.push((shape, format!("{:.2}x", ours / theirs)));
+        }
+    }
+    if agreed.is_empty() {
+        page.push_str(
+            "**No shape agreed**, so this run compared no latency at all. Every ratio\nabove is withheld and the tables are two engines' own numbers side by side,\nnot a race.\n\n",
+        );
+    } else {
+        let rendered: Vec<String> = agreed
+            .iter()
+            .map(|(shape, ratio)| format!("`{shape}` at {ratio}"))
+            .collect();
+        page.push_str(&format!(
+            "**The shapes that agreed, whatever the claim rests on:** {}. These are the\nonly like-for-like ratios in the run, and they are reported whether or not\nthey flatter.\n\n",
+            rendered.join(", "),
+        ));
+    }
+
     page.push_str(
         "The claim is abandoned if VictoriaMetrics inside the same limit both\nsurvives the same churn with at least the same sample acceptance *and* beats\nloggytracy materially on the steady shapes. Publishing this comparison means\npublishing it when it loses.\n\n",
     );

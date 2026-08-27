@@ -245,8 +245,12 @@ tracks execution state per phase.
   phases, both digest classes compared, `COMPARISON_METRICS.md` generated
   from the result JSON under the same sentinel test as the log document, and
   the memory gate's `--scenario metrics`.
-- [ ] Phase 9 — run, regenerate, publish `COMPARISON_METRICS.md` win or
-  lose.
+- [x] Phase 9 — run, regenerate, publish `COMPARISON_METRICS.md`: it lost,
+  and it is published. The churn axis was reached but the competitor took
+  more series in less memory without refusing anything; the steady shapes
+  disagree on values with equal record sets; the one shape that agreed reads
+  1.74x against. The open work is in `todo.md`, and the memory-gate
+  calibration of `max_active_series` has not been run.
 
 ## Completion protocol
 

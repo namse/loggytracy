@@ -185,10 +185,14 @@ reason expires now — the bed is built and its baseline is published.
 
 ## M14 — the metrics engine (issue #8)
 
-**In progress.** The plan is [`docs/M14_IMPLEMENTATION_PLAN.md`](docs/M14_IMPLEMENTATION_PLAN.md); execution
-state is the phase list in [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md). The claim is in
-[`docs/VISION.md`](docs/VISION.md) and nothing under it is measured yet — the ruler (workload, shapes,
-VictoriaMetrics bed) is built before the engine, the order M8/M9 imposed on logs.
+**Built, measured, and the first comparison lost.** The plan is
+[`docs/M14_IMPLEMENTATION_PLAN.md`](docs/M14_IMPLEMENTATION_PLAN.md); execution state is the phase list
+in [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md); the numbers are
+[`docs/COMPARISON_METRICS.md`](docs/COMPARISON_METRICS.md) and the claim they answer is in
+[`docs/VISION.md`](docs/VISION.md). The engine ingests all five OTLP metric types, stores them as
+Gorilla-encoded float series behind the shared journal/part/offload lifecycle, contains a cardinality
+burst by refusing new series with a named `partial_success`, and answers seven first-party routes. What
+it has not done is win: see the two open items below.
 
 Deferred items this plan minted, so they are not re-litigated mid-build:
 
@@ -205,6 +209,30 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
 - [ ] **`rate`/`increase` are the VictoriaMetrics definition** (positive-delta sum, no extrapolation —
       decided with the user, 2026-08-26). Revisiting this means revisiting the bed's exact-agreement
       digests, so it does not happen casually.
+
+- [x] **The metrics memtable could count its way to an outage, and the first published bed run is how it
+      was found.** During the churn phase a series whose samples were mid-flush was evicted by the idle
+      sweep; the flush's abort then re-created the entry *without* its state bytes, so the next eviction
+      released what had never been reserved and the `u64` wrapped. The ingest gate read
+      `memtable holds 18446744073708471276 bytes, over the limit of 128849018` and refused every push
+      from then on — which is how the run's seed phase landed 44 992 of 106 560 datapoints and made that
+      run's query columns a comparison of nothing. Fixed twice over: the abort brings the state bytes
+      back with the entry, and every release clamps at zero, because a gauge that is a little wrong is a
+      bug to find while a gauge at `u64::MAX` is an outage. Pinned by
+      `an_abort_that_recreates_an_evicted_series_keeps_the_accounting_sound` and
+      `releasing_more_bytes_than_were_taken_clamps_at_zero`.
+
+- [ ] **The churn axis was reached but not won, and the limit that bound was policy rather than memory.**
+      Measured 2026-08-27, both engines at a 2 GiB container, 520 288 series offered: loggytracy refused
+      24 288 datapoints (five whole-request 429s) at its `max_active_series` default of 500 000 while
+      peaking at 1 037.8 MiB, and VictoriaMetrics accepted every one of them at 627.3 MiB. So the engine
+      contained the burst exactly as designed — and the competitor held *more* series in *less* memory
+      without needing to refuse anything. Two things follow and neither is a tuning task. The default
+      limit binds far below what the budget it is supposed to protect can actually hold, which is the
+      calibration the plan deferred to the memory gate and which has still not been done. And the claim's
+      churn half, as worded, is satisfied by behaviour that the comparison does not reward: "refuses
+      rather than dies" is not a differentiator against an engine that neither refused nor died. The
+      wording is the thing to revisit, after the gate says what a series actually costs.
 
 - [ ] **The two exact-class shapes return two fewer points than VictoriaMetrics, and the digest has not
       adjudicated it yet.** Measured 2026-08-27 on the Phase 7 smoke, same anchor and knobs on both

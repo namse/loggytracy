@@ -620,13 +620,38 @@ materially on the steady shapes — then the budget axis bought nothing, the
 metrics engine remains a convenience of the one-binary packaging rather than
 a differentiator, and the document publishes the loss.
 
-**Nothing below this claim is measured yet.** It is stated before the engine
-exists because the ruler comes before the work: the workload, the query
-shapes, and the comparison bed against VictoriaMetrics
-(`compare/run_metrics.sh` regenerating `COMPARISON_METRICS.md` from result
-JSON, published win or lose) are built first, the same order M8/M9 imposed on
-logs. The design that must survive that bed is recorded in
-[`M14_IMPLEMENTATION_PLAN.md`](M14_IMPLEMENTATION_PLAN.md).
+**The first run is in, and it decides neither half in this engine's favour**
+([`COMPARISON_METRICS.md`](COMPARISON_METRICS.md), 2026-08-27, both engines
+at 2 GiB).
+
+*The churn half happened, and it is not yet a differentiator.* Offered
+520 288 series, loggytracy refused 24 288 datapoints by name at its
+`max_active_series` default of 500 000, kept every steady and churn-phase
+datapoint, and survived — the behaviour the claim describes. VictoriaMetrics
+accepted all 520 288 without refusing anything, peaking at **627 MiB against
+loggytracy's 1 038**. So the competitor held more series in less memory and
+never had to degrade at all: "refuses rather than dies" is not a
+differentiator against an engine that neither refused nor died. And the limit
+that bound was a *policy* number, not the budget — 500 000 is a default the
+plan admitted was a guess, and the memory gate that was supposed to calibrate
+it against the real per-series cost has still not been run.
+
+*The steady half could not be decided,* because its two shapes disagreed:
+`rate_range` at 16/24 and `agg_sum_by` at 0/3, with **equal record counts on
+both sides**, so the two engines are returning the same series and different
+values. `quantile_p99` is the one shape that agreed on all 24, and it
+publishes a loss — **1.74x cold, 7.00x warm**.
+
+The claim is not abandoned yet: abandonment needs VictoriaMetrics to beat it
+materially on the steady shapes, and those are undecided rather than lost.
+What the run establishes is that the value disagreement has to be settled
+before any of this means anything, and that the ladder's default limit needs
+the calibration it never got. Both are open in [`todo.md`](../todo.md).
+
+The design behind it is recorded in
+[`M14_IMPLEMENTATION_PLAN.md`](M14_IMPLEMENTATION_PLAN.md); the bed that
+produced the numbers is `compare/run_metrics.sh`, which regenerates the
+document from result JSON and publishes it win or lose — as it has here.
 
 ---
 
