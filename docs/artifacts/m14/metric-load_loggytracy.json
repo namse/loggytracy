@@ -1,6 +1,6 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-9d79737438d1dbf397fc055622d7470187017fe35c1abbf7f8da0bcd851011be.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-fa79d374e53fa96e264a0de5fbd27c19ded8aef71e8377e0020dca47a3803919.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
@@ -16,7 +16,7 @@
     "logfmt_weight": 2,
     "metadata_pairs": 2,
     "metric_verify": {
-      "anchor_ns": 1787788770000000000,
+      "anchor_ns": 1787792430000000000,
       "churn_generations": 4,
       "churn_instances": 4,
       "churn_replace_per_scrape": 2000,
@@ -93,7 +93,7 @@
     "warmup_seconds": 10
   },
   "load": {
-    "elapsed_seconds": 483.301472521,
+    "elapsed_seconds": 483.556753521,
     "phases": {
       "churn": {
         "acceptance": 1.0,
@@ -104,11 +104,11 @@
         "first_error": null,
         "latency_ms": {
           "count": 30,
-          "max_ms": 35.388076999999996,
-          "mean_ms": 17.8289674,
-          "min_ms": 11.563742,
-          "p50_ms": 17.291262000000003,
-          "p95_ms": 24.458085,
+          "max_ms": 37.533371,
+          "mean_ms": 17.615422866666666,
+          "min_ms": 13.580658000000001,
+          "p50_ms": 16.49881,
+          "p95_ms": 25.662999,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 30"
@@ -121,29 +121,29 @@
         }
       },
       "explosion": {
-        "acceptance": 0.9462007371703998,
-        "datapoints_accepted": 427168,
+        "acceptance": 0.9572760136092997,
+        "datapoints_accepted": 432168,
         "datapoints_offered": 451456,
         "datapoints_rejected": 0,
         "errors": 0,
         "first_error": null,
         "latency_ms": {
           "count": 92,
-          "max_ms": 344.407077,
-          "mean_ms": 22.970422543478268,
-          "min_ms": 0.215174,
-          "p50_ms": 14.73469,
-          "p95_ms": 54.502444,
+          "max_ms": 212.39635,
+          "mean_ms": 25.844110641304354,
+          "min_ms": 0.187853,
+          "p50_ms": 15.970367,
+          "p95_ms": 120.05010200000001,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 92"
           ]
         },
-        "requests_refused": 5,
+        "requests_refused": 4,
         "scrapes": 92,
         "statuses": {
-          "200": 87,
-          "429": 5
+          "200": 88,
+          "429": 4
         }
       },
       "steady": {
@@ -155,10 +155,10 @@
         "first_error": null,
         "latency_ms": {
           "count": 6,
-          "max_ms": 10.947486,
-          "mean_ms": 8.5132555,
-          "min_ms": 7.110758,
-          "p50_ms": 8.531657,
+          "max_ms": 10.922563,
+          "mean_ms": 7.945547666666667,
+          "min_ms": 6.7639689999999995,
+          "p50_ms": 7.395866,
           "p95_ms": null,
           "p99_ms": null,
           "unsupported": [
@@ -176,16 +176,16 @@
     "series_offered": 520288
   },
   "memory": {
-    "anon_bytes_end": 496259072,
-    "anon_peak_bytes": 811065344,
-    "current_bytes": 755130368,
+    "anon_bytes_end": 624300032,
+    "anon_peak_bytes": 862941184,
+    "current_bytes": 863326208,
     "error": null,
-    "file_bytes_end": 86061056,
-    "peak_bytes": 1059401728,
-    "source": "/sys/fs/cgroup/system.slice/docker-9d79737438d1dbf397fc055622d7470187017fe35c1abbf7f8da0bcd851011be.scope/memory.peak"
+    "file_bytes_end": 86810624,
+    "peak_bytes": 1117155328,
+    "source": "/sys/fs/cgroup/system.slice/docker-fa79d374e53fa96e264a0de5fbd27c19ded8aef71e8377e0020dca47a3803919.scope/memory.peak"
   },
   "metric_verify": {
-    "anchor_ns": 1787788770000000000,
+    "anchor_ns": 1787792430000000000,
     "datapoints": 106560,
     "decomposed_samples": 221760,
     "decomposed_series": 640,
@@ -196,7 +196,7 @@
   },
   "phase": "metric-load",
   "run": {
-    "build_revision": "7e5b655",
+    "build_revision": "67fab2a",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "seed": 1592598566
   },

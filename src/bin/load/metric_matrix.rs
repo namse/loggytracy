@@ -119,6 +119,19 @@ impl MetricShape {
 pub struct MetricQuery {
     pub id: String,
     pub shape: MetricShape,
+    /// Evaluation instants this query's answers must not be compared at, as
+    /// the canonical seconds the records carry.
+    ///
+    /// Only the churn shape has any. Its window deliberately straddles the
+    /// points where a generation of series stops reporting, and that is
+    /// exactly where the two engines' conventions differ by construction:
+    /// this one answers the increase that arrived, VictoriaMetrics scales a
+    /// partially-covered window to the full range (`QUERY_API.md`). Measured
+    /// 2026-08-27: 6 of 118 steps, every one within `range` of a generation
+    /// end, and the series set — what this shape exists to check — agreed on
+    /// all 16. Exempting them by name keeps that check in force instead of
+    /// widening a tolerance until a 3x difference passes.
+    pub exempt_steps: Vec<String>,
     /// The human-readable form of the question — the MetricsQL text for the
     /// VictoriaMetrics side, the flat parameters for the first-party side —
     /// recorded so the report can print what was asked.
@@ -183,6 +196,18 @@ pub fn build_metric_queries(cfg: &Config) -> Vec<MetricQuery> {
         (start, end.min(align_to_step(last_sample_ns, step_ns)))
     };
 
+    // Where a churn generation stops reporting. Every step within `range`
+    // after one of these is a window the two engines answer differently by
+    // construction; the comparison exempts them by name.
+    let generation_ends: Vec<i64> = (1..=verify.churn_generations.max(1) as i64)
+        .map(|generation| {
+            verify.anchor_ns
+                + (verify.scrapes as i64 * generation / verify.churn_generations.max(1) as i64)
+                    * verify.scrape_interval_seconds
+                    * 1_000_000_000
+        })
+        .collect();
+
     let mut queries = Vec::new();
     let mut push = |shape: MetricShape,
                     id: String,
@@ -191,6 +216,22 @@ pub fn build_metric_queries(cfg: &Config) -> Vec<MetricQuery> {
                     instant: bool,
                     description: String,
                     path: String| {
+        let exempt_steps = if shape == MetricShape::ChurnedSelector {
+            let mut steps = Vec::new();
+            let mut at = start_ns;
+            while at <= end_ns {
+                if generation_ends
+                    .iter()
+                    .any(|end| at >= *end && at - *end <= range_ns)
+                {
+                    steps.push(canonical_seconds_ns(at));
+                }
+                at += step_ns;
+            }
+            steps
+        } else {
+            Vec::new()
+        };
         queries.push(MetricQuery {
             id,
             shape,
@@ -200,6 +241,7 @@ pub fn build_metric_queries(cfg: &Config) -> Vec<MetricQuery> {
             instant,
             path,
             step_ns,
+            exempt_steps,
         });
     };
 
@@ -933,6 +975,7 @@ pub async fn run_metric_matrix(cfg: &Config) -> Value {
                 "start_ns": query.start_ns,
                 "end_ns": query.end_ns,
                 "step_ns": query.step_ns,
+                "exempt_steps": query.exempt_steps,
                 "instant": query.instant,
                 "status": timing.status,
                 "error": timing.error,
@@ -1141,6 +1184,49 @@ mod tests {
                 query.id
             );
         }
+    }
+
+    /// The exemption is derived from the workload's generation boundaries, not
+    /// from the answers — a comparison that decided what to skip by looking at
+    /// what disagreed would license every difference it found.
+    #[test]
+    fn only_the_churn_shape_exempts_instants_and_only_at_generation_ends() {
+        let cfg = config_for(Target::Loggytracy);
+        let verify = &cfg.metric_verify;
+        let range_ns = verify.range_seconds * 1_000_000_000;
+        let ends: Vec<i64> = (1..=verify.churn_generations as i64)
+            .map(|generation| {
+                verify.anchor_ns
+                    + (verify.scrapes as i64 * generation / verify.churn_generations as i64)
+                        * verify.scrape_interval_seconds
+                        * 1_000_000_000
+            })
+            .collect();
+        let queries = build_metric_queries(&cfg);
+        let mut churn_exemptions = 0;
+        for query in &queries {
+            if query.shape != MetricShape::ChurnedSelector {
+                assert!(
+                    query.exempt_steps.is_empty(),
+                    "{} exempts instants but is not the churn shape",
+                    query.id
+                );
+                continue;
+            }
+            churn_exemptions += query.exempt_steps.len();
+            for step in &query.exempt_steps {
+                let seconds: i64 = step.parse().expect("an exempt step is whole seconds");
+                let at = seconds * 1_000_000_000;
+                assert!(
+                    ends.iter().any(|end| at >= *end && at - *end <= range_ns),
+                    "{step} is exempted but is not within one range of a generation end"
+                );
+            }
+        }
+        assert!(
+            churn_exemptions > 0,
+            "the churn shape crosses generation ends, so it must exempt some instants"
+        );
     }
 
     #[test]

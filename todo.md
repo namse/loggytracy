@@ -274,6 +274,17 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
       the log `rate` shape: a difference in edge conventions is not a difference in engines, and it
       belongs in `QUERY_API.md` rather than in a table.
 
+- [x] **`churned_selector`'s remaining disagreement is the semantic difference itself, and it is now a
+      declared exemption.** After the matrix stopped asking past the last sample, five of six shapes
+      agreed and this one did not: 36 records, at 6 of its 118 steps, every one within `range` of a
+      churn generation's end — the instants where a series stops reporting, which is precisely what the
+      shape exists to cross. The series set it was built to check agreed on all 16. So the boundary
+      instants' *values* go uncompared by name, derived from the workload's generation boundaries rather
+      than from which records happened to differ, with the count printed beside the result — the same
+      treatment `DERIVED_LABELS` gets on the log side. Pinned by
+      `only_the_churn_shape_exempts_instants_and_only_at_generation_ends`; a comparison that decided what
+      to skip by looking at what disagreed would license every difference it found.
+
   *Superseded, kept for the reasoning it was decided against:* Two changes
       fall out of the diagnosis above and neither should be made blind. The digest class for
       `raw_range`/`agg_sum_by` has to move to `tolerance` or the bed will withhold those ratios forever

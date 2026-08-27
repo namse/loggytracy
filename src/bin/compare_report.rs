@@ -1746,6 +1746,10 @@ struct MetricAgreement {
     class: String,
     same: usize,
     total: usize,
+    /// Evaluation instants whose values went uncompared by name — see
+    /// `MetricQuery::exempt_steps`. Reported beside the result rather than
+    /// quietly narrowing it.
+    exempted: usize,
     /// The first disagreement, quoted so the reader can chase it rather than
     /// being handed a count.
     example: Option<String>,
@@ -1801,12 +1805,19 @@ fn within_tolerance(left: f64, right: f64, relative: f64) -> bool {
 /// pointwise within what the shape's class licenses. The identities must line
 /// up whichever class applies — a shape that returned a different *series
 /// set* disagrees however close its numbers are.
-fn answers_agree(left: &Value, right: &Value, relative: f64) -> bool {
+fn answers_agree(left: &Value, right: &Value, relative: f64, exempt: &[String]) -> bool {
     let (left, right) = (metric_records(left), metric_records(right));
     if left.len() != right.len() {
         return false;
     }
     left.iter().zip(&right).all(|(left, right)| {
+        // A record at an exempted instant still has to *exist* on both sides
+        // with the same identity — only its value goes uncompared. The
+        // exemption narrows what is checked, by name; it does not remove the
+        // record from the answer.
+        if is_exempt(left, exempt) || is_exempt(right, exempt) {
+            return split_record(left).0 == split_record(right).0;
+        }
         let (left_key, left_value) = split_record(left);
         let (right_key, right_value) = split_record(right);
         if left_key != right_key {
@@ -1820,11 +1831,23 @@ fn answers_agree(left: &Value, right: &Value, relative: f64) -> bool {
     })
 }
 
+/// Whether a record sits at one of the query's exempted instants. The
+/// timestamp is the second-to-last field, in the same canonical seconds the
+/// matrix recorded.
+fn is_exempt(record: &str, exempt: &[String]) -> bool {
+    if exempt.is_empty() {
+        return false;
+    }
+    let fields: Vec<&str> = record.split('\u{1}').collect();
+    fields.len() >= 3 && exempt.iter().any(|step| step == fields[fields.len() - 2])
+}
+
 fn compute_metric_agreements(matrix: &BTreeMap<&str, Value>) -> BTreeMap<String, MetricAgreement> {
     let mut agreements = BTreeMap::new();
     for shape in METRIC_SHAPES {
         let mut same = 0usize;
         let mut total = 0usize;
+        let mut exempted = 0usize;
         let mut example: Option<String> = None;
         let mut class = "computed".to_string();
         let empty = Vec::new();
@@ -1850,7 +1873,17 @@ fn compute_metric_agreements(matrix: &BTreeMap<&str, Value>) -> BTreeMap<String,
                 continue;
             };
             total += 1;
-            if answers_agree(left, right, class_tolerance(&class)) {
+            let exempt: Vec<String> = left["exempt_steps"]
+                .as_array()
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .filter_map(|step| step.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            exempted += exempt.len();
+            if answers_agree(left, right, class_tolerance(&class), &exempt) {
                 same += 1;
             } else if example.is_none() {
                 example = Some(format!(
@@ -1867,6 +1900,7 @@ fn compute_metric_agreements(matrix: &BTreeMap<&str, Value>) -> BTreeMap<String,
                 class,
                 same,
                 total,
+                exempted,
                 example,
             },
         );
@@ -2069,10 +2103,19 @@ licenses:
   fold a window. The rate definitions agree by decision; each engine's
   floating-point path does not have to.
 
+One exemption, declared by name rather than absorbed into a tolerance: the
+`churned_selector` shape's window deliberately straddles the instants where a
+generation of series stops reporting, and that is exactly where the two
+conventions differ by construction — this engine answers the increase that
+arrived, VictoriaMetrics scales a partially-covered window to the full range
+(`QUERY_API.md`). Those instants' **values** go uncompared; their records
+must still exist on both sides under the same identity, and every other
+instant in the same answer is compared normally. The count is in the table.
+
 A shape that disagrees has its ratios **withheld** below.
 
-| shape | class | agreed | first disagreement |
-|---|---|---|---|
+| shape | class | agreed | exempted instants | first disagreement |
+|---|---|---|---|---|
 "#,
         stored = METRIC_STORED_RELATIVE,
         computed = METRIC_COMPUTED_RELATIVE,
@@ -2081,9 +2124,14 @@ A shape that disagrees has its ratios **withheld** below.
     for shape in METRIC_SHAPES {
         let agreement = &agreements[shape];
         page.push_str(&format!(
-            "| `{shape}` | {class} | {cell} | {example} |\n",
+            "| `{shape}` | {class} | {cell} | {exempted} | {example} |\n",
             class = agreement.class,
             cell = agreement.cell(),
+            exempted = if agreement.exempted == 0 {
+                "—".to_string()
+            } else {
+                agreement.exempted.to_string()
+            },
             example = agreement.example.as_deref().unwrap_or("—"),
         ));
     }
