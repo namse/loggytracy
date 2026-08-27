@@ -285,6 +285,10 @@ All limits apply **before** journal append, so rejected requests leave no trace 
 Protecting the engine takes priority over preserving every log line — Alloy retries or drops rejected batches from its own WAL.
 
 - The OTLP body limit is a 16 MiB constant, matched across both transports.
+- The collect route has no batch limit. It decompresses and ingests a record at
+  a time and never holds more than one, so the 16 MiB constant applies to a
+  record's payload and nothing bounds the batch around it. How large a batch
+  collecty sends is collecty's own memory question.
 - `SIGNY_MAX_LINE_BYTES` (256 KiB by default)
 - `SIGNY_MAX_TIMESTAMP_AGE` (7d by default) and `SIGNY_MAX_TIMESTAMP_SKEW` (1h by default): Acceptance window relative to the server clock. Disable with `off` when bulk-loading historical data. Because partitions are UTC-day based, clock errors or unit mistakes (sending seconds/milliseconds as nanoseconds) multiply partitions; in particular, **a future-date part never reaches the retention cutoff.**
 

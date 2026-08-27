@@ -48,8 +48,8 @@ movement means data was thrown away.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLECTY_BATCH_MAX_BYTES` | `8MiB` | Batch ceiling in **uncompressed** bytes, because that is what signy admits against. Half of signy's 16 MiB on purpose — see obsy issue #10 |
-| `COLLECTY_BATCH_MAX_RECORDS` | `1024` | Exports per batch |
+| `COLLECTY_BATCH_MAX_BYTES` | `64MiB` | Batch ceiling in **uncompressed** bytes. This bounds what collecty holds while an attempt is out, nothing on signy's side: signy reads a batch a record at a time |
+| `COLLECTY_BATCH_MAX_RECORDS` | `8192` | Exports per batch |
 | `COLLECTY_RETRY_INITIAL` | `100ms` | First backoff after signy declines |
 | `COLLECTY_RETRY_MAX` | `30s` | Backoff ceiling. Doubling, with up to 25% jitter |
 | `COLLECTY_SEND_TIMEOUT` | `30s` | How long one batch may wait for an answer before it counts as a retryable failure |

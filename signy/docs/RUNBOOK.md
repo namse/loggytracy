@@ -61,6 +61,7 @@ without the other.
 |---|---|---|
 | `signy_ingest_throttled_total` | Increasing | Returning 429; flush cannot keep up with ingest |
 | `signy_collect_dropped_records_total` | Increasing | **Data loss.** A collected batch carried records this instance will never accept — a body it cannot decode, a tenant it does not serve, a tenant at its storage limit — and the collect route dropped them. Deliberate: the collector has one queue per machine, so holding them would stop every other application on that host. **Check the warning beside this counter for the reason: an unserved tenant is usually a policy that was never pushed, and the fix is to push it.** `signy_collect_dropped_bytes_total` is how much |
+| `signy_collect_skipped_records_total` | Increasing | **Not a problem.** A collecty resent records this instance already had, and they were skipped instead of stored twice. Expect a step after a collector restarts or a connection is cut mid-batch. Flat while `collecty` is restarting is the thing to look at: it means the numbering is not reaching here, and the duplicates are landing |
 | `signy_wal_backlog_bytes` | Upward trend | Same cause, earlier signal |
 | `signy_data_dir_free_bytes` | Below `SIGNY_MIN_FREE_DISK_BYTES` × 2 | **Alert here, not at the floor.** At the floor ingest is already being refused; this is the warning before it. Divide by `signy_data_dir_total_bytes` for a percentage |
 | `signy_flush_errors_total` | Increasing while `flush_success_total` is flat | **Flush stopped.** Most dangerous state |
