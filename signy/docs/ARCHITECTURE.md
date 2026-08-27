@@ -289,6 +289,33 @@ Protecting the engine takes priority over preserving every log line — Alloy re
   a time and never holds more than one, so the 16 MiB constant applies to a
   record's payload and nothing bounds the batch around it. How large a batch
   collecty sends is collecty's own memory question.
+
+**What reading a record at a time cost.** The route used to merge every record
+of a signal in a batch into one export and write one WAL record for it. One WAL
+record per collected record instead means one zstd frame each, and exports from
+one service repeat their resource attributes, their service name and their line
+shapes — which a merged payload compresses across and separate ones do not.
+Measured on synthetic checkout-service exports at zstd level 1, WAL bytes for the
+same data:
+
+| records per export | exports per batch | merged | per record |
+|---|---|---|---|
+| 512 | 1024 | 2.77 MB | 3.82 MB (1.38×) |
+| 100 | 1024 | 0.58 MB | 1.09 MB (1.87×) |
+| 10 | 1024 | 57 KB | 479 KB (8.4×) |
+| 1 | 1024 | 7.4 KB | 243 KB (33×) |
+
+A collector SDK batches, so the realistic rows are the top two: about 1.4× the
+WAL write amplification for a normal export size, and a cliff only for a client
+that exports one record at a time. It is amplification on a buffer the flush
+loop retires about once a second, not on stored bytes — parts are written from
+the memtable and are unchanged.
+
+Merging could come back in the journal writer, which already groups a batch into
+one write, by concatenating same-tenant same-kind payloads before compressing.
+That would mean moving compression from the ingest tasks into the single writer
+task, where it would serialize instead of scaling with connections — a trade
+worth making only if this amplification shows up as a real cost.
 - `SIGNY_MAX_LINE_BYTES` (256 KiB by default)
 - `SIGNY_MAX_TIMESTAMP_AGE` (7d by default) and `SIGNY_MAX_TIMESTAMP_SKEW` (1h by default): Acceptance window relative to the server clock. Disable with `off` when bulk-loading historical data. Because partitions are UTC-day based, clock errors or unit mistakes (sending seconds/milliseconds as nanoseconds) multiply partitions; in particular, **a future-date part never reaches the retention cutoff.**
 
