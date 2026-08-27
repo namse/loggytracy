@@ -127,6 +127,12 @@ signy_ingest_requests_total {}\n\
 signy_ingest_errors_total {}\n\
 # TYPE signy_ingest_throttled_total counter\n\
 signy_ingest_throttled_total {}\n\
+# HELP signy_collect_dropped_records_total Records a collected batch carried that will never be accepted, dropped rather than sent back for the collector to rediscover.\n\
+# TYPE signy_collect_dropped_records_total counter\n\
+signy_collect_dropped_records_total {}\n\
+# HELP signy_collect_dropped_bytes_total Payload bytes behind signy_collect_dropped_records_total.\n\
+# TYPE signy_collect_dropped_bytes_total counter\n\
+signy_collect_dropped_bytes_total {}\n\
 # HELP signy_query_quota_rejected_total Queries refused by the tenant's own concurrency limit, as opposed to queries this instance failed to answer.\n\
 # TYPE signy_query_quota_rejected_total counter\n\
 signy_query_quota_rejected_total {}\n\
@@ -246,6 +252,8 @@ signy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         m.ingest_requests.load(Ordering::Relaxed),
         m.ingest_errors.load(Ordering::Relaxed),
         m.ingest_throttled.load(Ordering::Relaxed),
+        m.collect_dropped_records.load(Ordering::Relaxed),
+        m.collect_dropped_bytes.load(Ordering::Relaxed),
         m.query_quota_rejected.load(Ordering::Relaxed),
         m.storage_limit_rejected.load(Ordering::Relaxed),
         m.wal_replayed_records.load(Ordering::Relaxed),

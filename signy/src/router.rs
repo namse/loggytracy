@@ -93,10 +93,8 @@ fn ingest_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 
 fn collect_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
-        .route("/signy/api/v1/collect/logs", post(otlp_http::logs))
-        .route("/signy/api/v1/collect/traces", post(otlp_http::traces))
-        .route("/signy/api/v1/collect/metrics", post(otlp_http::metrics))
-        .layer(DefaultBodyLimit::max(otlp_http::MAX_OTLP_HTTP_BODY_BYTES))
+        .route("/signy/api/v1/collect", post(otlp_http::collect))
+        .layer(DefaultBodyLimit::max(otlp_http::MAX_COLLECT_PLAIN_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             state,
             otlp_http::decompress_collected_body,

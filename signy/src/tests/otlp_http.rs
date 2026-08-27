@@ -327,26 +327,63 @@
         );
     }
 
-    fn zstd_frames(bodies: &[Vec<u8>]) -> (Vec<u8>, usize) {
+    fn span_request(mark: u8) -> ExportTraceServiceRequest {
+        ExportTraceServiceRequest {
+            resource_spans: vec![opentelemetry_proto::tonic::trace::v1::ResourceSpans {
+                resource: None,
+                scope_spans: vec![opentelemetry_proto::tonic::trace::v1::ScopeSpans {
+                    scope: None,
+                    spans: vec![opentelemetry_proto::tonic::trace::v1::Span {
+                        trace_id: vec![mark; 16],
+                        span_id: vec![mark; 8],
+                        start_time_unix_nano: 10,
+                        end_time_unix_nano: 20,
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn spans(state: &Arc<AppState>) -> usize {
+        state
+            .journal
+            .trace_memtable()
+            .snapshot_limited(&test_tenant(), 10)
+            .unwrap()
+            .len()
+    }
+
+    const LOGS_TAG: u8 = 1;
+    const TRACES_TAG: u8 = 2;
+
+    /// The batch collecty ships: each payload behind its own record header,
+    /// each record its own zstd frame, all of it concatenated.
+    fn zstd_frames(records: &[(u8, Vec<u8>)]) -> (Vec<u8>, usize) {
         let mut frames = Vec::new();
         let mut plain_bytes = 0;
-        for body in bodies {
-            plain_bytes += body.len();
-            frames.extend_from_slice(&zstd::bulk::compress(body, 3).unwrap());
+        for (tag, payload) in records {
+            let mut plain = Vec::with_capacity(5 + payload.len());
+            plain.push(*tag);
+            plain.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            plain.extend_from_slice(payload);
+            plain_bytes += plain.len();
+            frames.extend_from_slice(&zstd::bulk::compress(&plain, 3).unwrap());
         }
         (frames, plain_bytes)
     }
 
     async fn post_collected(
         state: &Arc<AppState>,
-        uri: &str,
         encoding: &str,
         declared: usize,
         frames: Vec<u8>,
     ) -> (StatusCode, String) {
         let request = axum::http::Request::builder()
             .method("POST")
-            .uri(uri)
+            .uri("/signy/api/v1/collect")
             .header(header::CONTENT_TYPE, "application/x-protobuf")
             .header(header::CONTENT_ENCODING, encoding)
             .header(
@@ -370,20 +407,13 @@
     #[tokio::test]
     async fn a_collected_batch_of_separate_exports_lands_as_every_line_it_carried() {
         let (memtable, state) = fixture();
-        let bodies: Vec<Vec<u8>> = ["first", "second", "third"]
+        let records: Vec<(u8, Vec<u8>)> = ["first", "second", "third"]
             .iter()
-            .map(|line| log_request(line).encode_to_vec())
+            .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
             .collect();
-        let (frames, declared) = zstd_frames(&bodies);
+        let (frames, declared) = zstd_frames(&records);
 
-        let (status, body) = post_collected(
-            &state,
-            "/signy/api/v1/collect/logs",
-            "zstd",
-            declared,
-            frames,
-        )
-        .await;
+        let (status, body) = post_collected(&state, "zstd", declared, frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         let mut lines = lines(&memtable);
@@ -394,34 +424,13 @@
     #[tokio::test]
     async fn a_collected_batch_of_spans_reaches_the_trace_memtable() {
         let (_memtable, state) = fixture();
-        let span = |trace: u8| ExportTraceServiceRequest {
-            resource_spans: vec![opentelemetry_proto::tonic::trace::v1::ResourceSpans {
-                resource: None,
-                scope_spans: vec![opentelemetry_proto::tonic::trace::v1::ScopeSpans {
-                    scope: None,
-                    spans: vec![opentelemetry_proto::tonic::trace::v1::Span {
-                        trace_id: vec![trace; 16],
-                        span_id: vec![trace; 8],
-                        start_time_unix_nano: 10,
-                        end_time_unix_nano: 20,
-                        ..Default::default()
-                    }],
-                    schema_url: String::new(),
-                }],
-                schema_url: String::new(),
-            }],
-        };
-        let bodies = vec![span(1).encode_to_vec(), span(2).encode_to_vec()];
-        let (frames, declared) = zstd_frames(&bodies);
+        let records = vec![
+            (TRACES_TAG, span_request(1).encode_to_vec()),
+            (TRACES_TAG, span_request(2).encode_to_vec()),
+        ];
+        let (frames, declared) = zstd_frames(&records);
 
-        let (status, body) = post_collected(
-            &state,
-            "/signy/api/v1/collect/traces",
-            "zstd",
-            declared,
-            frames,
-        )
-        .await;
+        let (status, body) = post_collected(&state, "zstd", declared, frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
@@ -441,14 +450,7 @@
         let body = log_request("never stored").encode_to_vec();
         let declared = body.len();
 
-        let (status, _) = post_collected(
-            &state,
-            "/signy/api/v1/collect/logs",
-            "gzip",
-            declared,
-            body,
-        )
-        .await;
+        let (status, _) = post_collected(&state, "gzip", declared, body).await;
 
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert!(lines(&memtable).is_empty());
@@ -457,14 +459,13 @@
     #[tokio::test]
     async fn a_batch_declaring_more_than_the_maximum_is_refused_before_it_is_read() {
         let (memtable, state) = fixture();
-        let bodies = vec![log_request("never stored").encode_to_vec()];
-        let (frames, _) = zstd_frames(&bodies);
+        let records = vec![(LOGS_TAG, log_request("never stored").encode_to_vec())];
+        let (frames, _) = zstd_frames(&records);
 
         let (status, _) = post_collected(
             &state,
-            "/signy/api/v1/collect/logs",
             "zstd",
-            crate::trace_ingest::MAX_OTLP_REQUEST_BYTES + 1,
+            crate::otlp_http::MAX_COLLECT_PLAIN_BYTES + 1,
             frames,
         )
         .await;
@@ -476,19 +477,90 @@
     #[tokio::test]
     async fn a_batch_that_decompresses_past_what_it_declared_is_refused() {
         let (memtable, state) = fixture();
-        let bodies = vec![log_request("never stored").encode_to_vec()];
-        let (frames, declared) = zstd_frames(&bodies);
+        let records = vec![(LOGS_TAG, log_request("never stored").encode_to_vec())];
+        let (frames, declared) = zstd_frames(&records);
 
-        let (status, body) = post_collected(
-            &state,
-            "/signy/api/v1/collect/logs",
-            "zstd",
-            declared / 2,
-            frames,
-        )
-        .await;
+        let (status, body) = post_collected(&state, "zstd", declared / 2, frames).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("declared"), "{body}");
         assert!(lines(&memtable).is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_batch_of_mixed_signals_lands_in_every_store_it_names() {
+        let (memtable, state) = fixture();
+        let records = vec![
+            (LOGS_TAG, log_request("first").encode_to_vec()),
+            (TRACES_TAG, span_request(7).encode_to_vec()),
+            (LOGS_TAG, log_request("second").encode_to_vec()),
+        ];
+        let (frames, declared) = zstd_frames(&records);
+
+        let (status, body) = post_collected(&state, "zstd", declared, frames).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut lines = lines(&memtable);
+        lines.sort();
+        assert_eq!(lines, vec!["first", "second"]);
+        assert_eq!(spans(&state), 1);
+    }
+
+    #[tokio::test]
+    async fn a_signal_that_will_never_decode_is_dropped_and_the_rest_of_the_batch_lands() {
+        let (memtable, state) = fixture();
+        let poison = vec![0xFFu8; 16];
+        let records = vec![
+            (LOGS_TAG, poison.clone()),
+            (TRACES_TAG, span_request(9).encode_to_vec()),
+        ];
+        let (frames, declared) = zstd_frames(&records);
+
+        let (status, body) = post_collected(&state, "zstd", declared, frames).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(lines(&memtable).is_empty());
+        assert_eq!(spans(&state), 1);
+        assert_eq!(
+            state
+                .metrics
+                .collect_dropped_records
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            state
+                .metrics
+                .collect_dropped_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            poison.len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_whose_framing_does_not_add_up_is_refused() {
+        let (memtable, state) = fixture();
+        let mut plain = vec![LOGS_TAG];
+        plain.extend_from_slice(&64u32.to_le_bytes());
+        plain.extend_from_slice(b"eight...");
+        let frames = zstd::bulk::compress(&plain, 3).unwrap();
+
+        let (status, body) = post_collected(&state, "zstd", plain.len(), frames).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("claims 64 bytes"), "{body}");
+        assert!(lines(&memtable).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_record_under_a_tag_signy_does_not_know_is_refused() {
+        let (_memtable, state) = fixture();
+        let mut plain = vec![9u8];
+        plain.extend_from_slice(&0u32.to_le_bytes());
+        let frames = zstd::bulk::compress(&plain, 3).unwrap();
+
+        let (status, body) = post_collected(&state, "zstd", plain.len(), frames).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("not a signal tag"), "{body}");
     }

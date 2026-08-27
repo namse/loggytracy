@@ -216,6 +216,275 @@ pub const COLLECT_UNCOMPRESSED_BYTES_HEADER: &str = "x-collecty-uncompressed-byt
 
 pub const MAX_COLLECT_COMPRESSED_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
 
+/// The header collecty writes in front of each record's payload: one signal
+/// tag and the payload's length, little-endian.
+const COLLECT_RECORD_HEADER_BYTES: usize = 5;
+
+/// Ceiling on a collected batch's *decompressed* size.
+///
+/// A batch of n records decompresses to `5n + Σ payload`, so allowing the
+/// framing of a single record on top of the request maximum is what keeps a
+/// maximal export shippable — and it is also all that can be allowed: any
+/// batch under this ceiling has every signal's merged payload at or under
+/// `MAX_OTLP_REQUEST_BYTES`, so no group can be built that the ingest path
+/// would then refuse as too large.
+pub const MAX_COLLECT_PLAIN_BYTES: usize = MAX_OTLP_REQUEST_BYTES + COLLECT_RECORD_HEADER_BYTES;
+
+/// The signals a collected batch may carry, in the order they are ingested.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CollectSignal {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl CollectSignal {
+    const ALL: [CollectSignal; 3] = [
+        CollectSignal::Logs,
+        CollectSignal::Traces,
+        CollectSignal::Metrics,
+    ];
+
+    fn from_tag(tag: u8) -> Option<CollectSignal> {
+        match tag {
+            1 => Some(CollectSignal::Logs),
+            2 => Some(CollectSignal::Traces),
+            3 => Some(CollectSignal::Metrics),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            CollectSignal::Logs => "logs",
+            CollectSignal::Traces => "traces",
+            CollectSignal::Metrics => "metrics",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            CollectSignal::Logs => 0,
+            CollectSignal::Traces => 1,
+            CollectSignal::Metrics => 2,
+        }
+    }
+}
+
+/// One collected batch, every signal.
+///
+/// collecty keeps a single queue, so what arrives here is a mix: records in
+/// arrival order, each naming its signal. Records of one signal concatenate
+/// into that signal's merged export, exactly as they did when each signal had
+/// a route of its own, so this walks the batch once and hands each signal's
+/// bytes to the ingest path it already had.
+pub async fn collect(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, IngestError> {
+    // Ahead of the request counter, and once for the whole batch: the checks
+    // behind it are the instance's, not a signal's, so a fenced or overloaded
+    // server refuses the batch rather than dropping part of it.
+    log_ingest(&state).admit_transport()?;
+    state
+        .metrics
+        .ingest_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let result = collect_inner(&state, &headers, &body).await;
+    if result.is_err() {
+        state
+            .metrics
+            .ingest_errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+async fn collect_inner(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<Response, IngestError> {
+    let mut payloads: [Vec<u8>; 3] = Default::default();
+    let mut records = [0u64; 3];
+    for (signal, payload) in split_collected_records(body)? {
+        payloads[signal.index()].extend_from_slice(payload);
+        records[signal.index()] += 1;
+    }
+
+    for signal in CollectSignal::ALL {
+        let payload = std::mem::take(&mut payloads[signal.index()]);
+        if payload.is_empty() {
+            continue;
+        }
+        let bytes = payload.len();
+        let outcome = match signal {
+            CollectSignal::Logs => collect_logs(state, headers, payload).await,
+            CollectSignal::Traces => collect_traces(state, headers, payload).await,
+            CollectSignal::Metrics => collect_metrics(state, headers, payload).await,
+        };
+        match outcome {
+            Ok(()) => {}
+            // Retryable: the batch is fine and this instance is not. Answering
+            // with it stops the batch here, because everything after would be
+            // refused too and everything before is already written — collecty
+            // resends the whole batch either way.
+            Err(error) if error.status.is_server_error() => return Err(error),
+            // Permanent: a decode failure, a tenant over its stored quota, a
+            // body past a limit. Sending these back would only have collecty
+            // halve the batch to find them and drop them anyway, one wasted
+            // round trip at a time, so they are dropped here and counted.
+            Err(error) => {
+                tracing::warn!(
+                    signal = signal.as_str(),
+                    status = error.status.as_u16(),
+                    records = records[signal.index()],
+                    bytes,
+                    reason = error.message,
+                    "dropping collected records signy will not take"
+                );
+                state.metrics.collect_dropped_records.fetch_add(
+                    records[signal.index()],
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                state
+                    .metrics
+                    .collect_dropped_bytes
+                    .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    Ok(StatusCode::OK.into_response())
+}
+
+fn split_collected_records(body: &[u8]) -> Result<Vec<(CollectSignal, &[u8])>, IngestError> {
+    let mut records = Vec::new();
+    let mut at = 0;
+    while at < body.len() {
+        let Some(header) = body.get(at..at + COLLECT_RECORD_HEADER_BYTES) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "a record header needs {COLLECT_RECORD_HEADER_BYTES} bytes and {} are left",
+                    body.len() - at
+                ),
+            )
+                .into());
+        };
+        let Some(signal) = CollectSignal::from_tag(header[0]) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{} is not a signal tag", header[0]),
+            )
+                .into());
+        };
+        let len = u32::from_le_bytes(header[1..5].try_into().expect("four bytes")) as usize;
+        at += COLLECT_RECORD_HEADER_BYTES;
+        let Some(payload) = body.get(at..at + len) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "a record claims {len} bytes and {} are left",
+                    body.len() - at
+                ),
+            )
+                .into());
+        };
+        at += len;
+        records.push((signal, payload));
+    }
+    Ok(records)
+}
+
+fn log_ingest(state: &Arc<AppState>) -> OtlpLogIngest<'_> {
+    OtlpLogIngest {
+        journal: &state.journal,
+        shutdown: &state.shutdown,
+        config: &state.config,
+        ingest_gate: &state.ingest_gate,
+        tenant_quota: &state.tenant_quota,
+        clock: &state.clock,
+    }
+}
+
+async fn collect_logs(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    payload: Vec<u8>,
+) -> Result<(), IngestError> {
+    let ingest = log_ingest(state);
+    let tenant = crate::tenant::from_headers(headers, &state.config, &state.tenant_policy)
+        .map_err(crate::tenant::TenantError::into_http)?;
+    ingest.admit_tenant(&tenant, payload.len())?;
+    let request = ExportLogsServiceRequest::decode(payload.as_slice()).map_err(|error| {
+        IngestError::from((
+            StatusCode::BAD_REQUEST,
+            format!("OTLP protobuf decode failed: {error}"),
+        ))
+    })?;
+    ingest.accept(tenant, request, Some(payload)).await
+}
+
+async fn collect_traces(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    payload: Vec<u8>,
+) -> Result<(), IngestError> {
+    let ingest = OtlpTraceIngest {
+        journal: &state.journal,
+        shutdown: &state.shutdown,
+        ingest_gate: &state.ingest_gate,
+        tenant_quota: &state.tenant_quota,
+    };
+    let tenant = crate::tenant::from_headers(headers, &state.config, &state.tenant_policy)
+        .map_err(crate::tenant::TenantError::into_http)?;
+    ingest.admit_tenant(&tenant, payload.len())?;
+    let request = ExportTraceServiceRequest::decode(payload.as_slice()).map_err(|error| {
+        IngestError::from((
+            StatusCode::BAD_REQUEST,
+            format!("OTLP protobuf decode failed: {error}"),
+        ))
+    })?;
+    ingest.accept(tenant, request).await
+}
+
+async fn collect_metrics(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    payload: Vec<u8>,
+) -> Result<(), IngestError> {
+    let ingest = OtlpMetricIngest {
+        journal: &state.journal,
+        shutdown: &state.shutdown,
+        config: &state.config,
+        ingest_gate: &state.ingest_gate,
+        tenant_quota: &state.tenant_quota,
+        clock: &state.clock,
+    };
+    let tenant = crate::tenant::from_headers(headers, &state.config, &state.tenant_policy)
+        .map_err(crate::tenant::TenantError::into_http)?;
+    ingest.admit_tenant(&tenant, payload.len())?;
+    let request = ExportMetricsServiceRequest::decode(payload.as_slice()).map_err(|error| {
+        IngestError::from((
+            StatusCode::BAD_REQUEST,
+            format!("OTLP protobuf decode failed: {error}"),
+        ))
+    })?;
+    let outcome = ingest.accept(tenant, request).await?;
+    // The collect route answers a bare 200 — collecty reads the status and
+    // nothing else — so a partial refusal has only the log to land in.
+    if let Some(partial) = outcome.partial_success() {
+        tracing::warn!(
+            rejected_points = partial.rejected_data_points,
+            reason = partial.error_message,
+            "collected metrics were partially refused"
+        );
+    }
+    Ok(())
+}
+
 pub async fn decompress_collected_body(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -242,13 +511,13 @@ pub async fn decompress_collected_body(
         .get(COLLECT_UNCOMPRESSED_BYTES_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(MAX_OTLP_REQUEST_BYTES);
-    if declared > MAX_OTLP_REQUEST_BYTES {
+        .unwrap_or(MAX_COLLECT_PLAIN_BYTES);
+    if declared > MAX_COLLECT_PLAIN_BYTES {
         return IngestError::from((
             StatusCode::PAYLOAD_TOO_LARGE,
             format!(
                 "the batch declares {declared} uncompressed bytes, \
-over the maximum of {MAX_OTLP_REQUEST_BYTES}"
+over the maximum of {MAX_COLLECT_PLAIN_BYTES}"
             ),
         ))
         .into_response();
@@ -291,7 +560,7 @@ over the maximum of {MAX_OTLP_REQUEST_BYTES}"
 fn decompress_batch(compressed: &[u8], declared: usize) -> Result<Vec<u8>, IngestError> {
     use std::io::Read;
 
-    let mut plain = Vec::with_capacity(declared.min(MAX_OTLP_REQUEST_BYTES));
+    let mut plain = Vec::with_capacity(declared.min(MAX_COLLECT_PLAIN_BYTES));
     let decoder = zstd::stream::read::Decoder::new(compressed).map_err(|error| {
         IngestError::from((
             StatusCode::BAD_REQUEST,
@@ -299,7 +568,7 @@ fn decompress_batch(compressed: &[u8], declared: usize) -> Result<Vec<u8>, Inges
         ))
     })?;
     decoder
-        .take(MAX_OTLP_REQUEST_BYTES as u64 + 1)
+        .take(MAX_COLLECT_PLAIN_BYTES as u64 + 1)
         .read_to_end(&mut plain)
         .map_err(|error| {
             IngestError::from((
@@ -308,10 +577,10 @@ fn decompress_batch(compressed: &[u8], declared: usize) -> Result<Vec<u8>, Inges
             ))
         })?;
 
-    if plain.len() > MAX_OTLP_REQUEST_BYTES {
+    if plain.len() > MAX_COLLECT_PLAIN_BYTES {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("the batch decompresses past the maximum of {MAX_OTLP_REQUEST_BYTES} bytes"),
+            format!("the batch decompresses past the maximum of {MAX_COLLECT_PLAIN_BYTES} bytes"),
         )
             .into());
     }
