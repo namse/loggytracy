@@ -239,6 +239,19 @@ impl SeriesBuffer {
     }
 }
 
+/// Subtract without wrapping.
+///
+/// An accounting slip that went *negative* on a `u64` did not read as a small
+/// error: it read as eighteen quintillion buffered bytes, and the ingest gate
+/// refused every push against it until the process restarted. A gauge that is
+/// a little wrong is a bug to find; a gauge that is `u64::MAX` is an outage,
+/// and the two must not be the same failure.
+fn saturating_release(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
+    });
+}
+
 /// Whether two inclusive timestamp ranges touch.
 fn ranges_overlap(bounds: Option<(i64, i64)>, start_ns: i64, end_ns: i64) -> bool {
     // An absent bound cannot prune: metadata that cannot answer must not be
@@ -354,7 +367,7 @@ impl SeriesMemTable {
                     evicted_for_pressure = true;
                     let evicted =
                         Self::evict_idle_locked(tenant_series, idle_cutoff_ns, &self.counters);
-                    self.inner_bytes.fetch_sub(evicted, Ordering::Relaxed);
+                    saturating_release(&self.inner_bytes, evicted);
                 }
                 if tenant_series.len() + new_labels.len() > max_active {
                     outcome.rejected_datapoints += 1;
@@ -404,7 +417,7 @@ impl SeriesMemTable {
             freed += Self::evict_idle_locked(tenant_series, idle_cutoff_ns, &self.counters);
             evicted += before - tenant_series.len() as u64;
         }
-        self.inner_bytes.fetch_sub(freed, Ordering::Relaxed);
+        saturating_release(&self.inner_bytes, freed);
         evicted
     }
 
@@ -526,7 +539,7 @@ impl SeriesMemTable {
                 *entry = list;
             }
         }
-        self.inner_bytes.fetch_sub(moved, Ordering::Relaxed);
+        saturating_release(&self.inner_bytes, moved);
         self.flushing_bytes.fetch_add(moved, Ordering::Relaxed);
         let snapshot = Arc::new(SeriesSnapshot { tenants });
         *flushing = Some(snapshot.clone());
@@ -544,9 +557,18 @@ impl SeriesMemTable {
         *self.flushing.write() = None;
         let snapshot = unwrap_snapshot(snapshot);
         let mut inner = self.inner.write();
+        // Bytes for entries this abort has to re-create. A series whose
+        // samples were mid-flush can have been evicted in between — its
+        // state left the accounting when it did, and putting the entry back
+        // without putting the bytes back is what made a later eviction
+        // subtract what was never added.
+        let mut restored_state = 0u64;
         for (tenant, list) in snapshot.tenants {
             let tenant_series = inner.entry(tenant).or_default();
             for series in list {
+                if !tenant_series.contains_key(&series.labels) {
+                    restored_state += series.labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                }
                 let buffer = tenant_series
                     .entry(series.labels)
                     .or_insert_with(SeriesBuffer::new);
@@ -562,7 +584,8 @@ impl SeriesMemTable {
         }
         drop(inner);
         let returned = self.flushing_bytes.swap(0, Ordering::Relaxed);
-        self.inner_bytes.fetch_add(returned, Ordering::Relaxed);
+        self.inner_bytes
+            .fetch_add(returned.saturating_add(restored_state), Ordering::Relaxed);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1038,6 +1061,51 @@ mod tests {
             "the total restarts at the delta — the counter-reset shape rate's \
 positive-delta sum is defined to absorb"
         );
+    }
+
+    /// The defect the published bed run found: a series evicted while its
+    /// samples were mid-flush is re-created by the abort, and the entry came
+    /// back without its state bytes — so the *next* eviction subtracted what
+    /// was never added, wrapped the `u64`, and the ingest gate refused every
+    /// push against an eighteen-quintillion-byte memtable.
+    #[test]
+    fn an_abort_that_recreates_an_evicted_series_keeps_the_accounting_sound() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "a");
+        memtable.insert(vec![sample(&series, 1_000, 1.0, SampleKind::Gauge)]);
+        let snapshot = memtable.begin_flush();
+        // The samples are in the snapshot, so the entry looks idle and the
+        // sweep takes it.
+        assert_eq!(memtable.evict_idle(i64::MAX), 1);
+        assert_eq!(memtable.active_series(&test_tenant()), 0);
+        // The flush then fails and puts the samples back.
+        memtable.abort_flush(snapshot);
+        assert_eq!(memtable.active_series(&test_tenant()), 1);
+        let after_abort = memtable.approximate_size();
+        assert!(after_abort > 0);
+
+        // Flushing and evicting for real must not take the accounting below
+        // zero.
+        memtable.begin_flush();
+        memtable.commit_flush();
+        assert_eq!(memtable.evict_idle(i64::MAX), 1);
+        assert_eq!(
+            memtable.approximate_size(),
+            0,
+            "every byte added has been released exactly once"
+        );
+    }
+
+    /// Belt as well as braces: even if some future accounting slips, a
+    /// release past zero must clamp rather than wrap — the gauge is allowed
+    /// to be wrong, the ingest gate is not allowed to read `u64::MAX`.
+    #[test]
+    fn releasing_more_bytes_than_were_taken_clamps_at_zero() {
+        let counter = AtomicU64::new(100);
+        saturating_release(&counter, 40);
+        assert_eq!(counter.load(Ordering::Relaxed), 60);
+        saturating_release(&counter, 1_000);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
     #[test]

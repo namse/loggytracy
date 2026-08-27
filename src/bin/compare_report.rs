@@ -1976,10 +1976,12 @@ population, then rolling instance replacement (the pod-restart shape), then a
 one-scrape cardinality burst. Acceptance is the fraction of offered datapoints
 the engine took; a refusal it *named* — OTLP `partial_success`, or a 429 when
 every datapoint in a request was new — is the designed behaviour and is
-counted here rather than hidden in the acceptance number.
+counted here rather than hidden in the acceptance number. **Turned away** is
+the two together: the partial refusals plus the datapoints inside a request
+refused whole, which is what a burst of nothing but new series produces.
 
-| target | phase | offered | accepted | rejected | refused whole | acceptance |
-|---|---|---|---|---|---|---|
+| target | phase | offered | accepted | turned away | partial | 429s | acceptance |
+|---|---|---|---|---|---|---|---|
 "#,
     );
     for target in targets {
@@ -1989,10 +1991,13 @@ counted here rather than hidden in the acceptance number.
             if tally.is_null() {
                 continue;
             }
+            let offered_count = f64_of(&tally["datapoints_offered"]).unwrap_or(0.0);
+            let accepted_count = f64_of(&tally["datapoints_accepted"]).unwrap_or(0.0);
             page.push_str(&format!(
-                "| {target} | {phase} | {offered} | {accepted} | {rejected} | {refused} | {acceptance} |\n",
+                "| {target} | {phase} | {offered} | {accepted} | {turned_away:.0} | {rejected} | {refused} | {acceptance} |\n",
                 offered = num(&tally["datapoints_offered"]),
                 accepted = num(&tally["datapoints_accepted"]),
+                turned_away = (offered_count - accepted_count).max(0.0),
                 rejected = num(&tally["datapoints_rejected"]),
                 refused = num(&tally["requests_refused"]),
                 acceptance = match f64_of(&tally["acceptance"]) {
@@ -2212,11 +2217,13 @@ fn metrics_verdict(
     let ours_survived = bed["churn_survival"]["loggytracy"]["survived"] == Value::Bool(true);
     let steady_acceptance =
         f64_of(&load["loggytracy"]["load"]["phases"]["steady"]["acceptance"]).unwrap_or(0.0);
-    let refused = f64_of(&load["loggytracy"]["load"]["phases"]["explosion"]["datapoints_rejected"])
-        .unwrap_or(0.0);
-    let theirs_refused =
-        f64_of(&load["victoriametrics"]["load"]["phases"]["explosion"]["datapoints_rejected"])
-            .unwrap_or(0.0);
+    // Both shapes of named refusal count. A chunk whose datapoints are *all*
+    // new series is refused whole with a 429 rather than partially, and the
+    // burst phase is made of exactly such chunks — reading only
+    // `datapoints_rejected` would score a boundary the engine plainly reached
+    // as one it never met.
+    let refused = named_refusals(&load["loggytracy"]);
+    let theirs_refused = named_refusals(&load["victoriametrics"]);
     // A run where neither engine refused anything did not reach the boundary
     // this half is about, and saying so is not the same as saying the claim
     // failed. `NOT_MEASURED` is a failure rather than a skip in the memory
@@ -2234,7 +2241,7 @@ fn metrics_verdict(
     } else {
         let churn_holds = ours_survived && steady_acceptance >= 0.9 && refused > 0.0;
         page.push_str(&format!(
-            "**The churn half {}.** loggytracy {} the churn and burst, took {:.1}% of the\nsteady phase's offered datapoints, and named {} refused datapoints in the\nexplosion rather than swallowing or dying of them.\n\n",
+            "**The churn half {}.** loggytracy {} the churn and burst, took {:.1}% of the\nsteady phase's offered datapoints, and turned away {} datapoints by name across\nthe churn and explosion rather than swallowing or dying of them.\n\n",
             if churn_holds { "**holds**" } else { "**does not hold**" },
             if ours_survived { "survived" } else { "did not survive" },
             steady_acceptance * 100.0,
@@ -2245,6 +2252,23 @@ fn metrics_verdict(
     page.push_str(
         "The claim is abandoned if VictoriaMetrics inside the same limit both\nsurvives the same churn with at least the same sample acceptance *and* beats\nloggytracy materially on the steady shapes. Publishing this comparison means\npublishing it when it loses.\n\n",
     );
+}
+
+/// What an engine said no to across the churn and explosion phases, counting
+/// a whole-request refusal as the datapoints it turned away.
+fn named_refusals(load: &Value) -> f64 {
+    ["churn", "explosion"]
+        .iter()
+        .map(|phase| {
+            let phase = &load["load"]["phases"][phase];
+            let partial = f64_of(&phase["datapoints_rejected"]).unwrap_or(0.0);
+            let offered = f64_of(&phase["datapoints_offered"]).unwrap_or(0.0);
+            let accepted = f64_of(&phase["datapoints_accepted"]).unwrap_or(0.0);
+            // Offered minus accepted covers both: the partial refusals and
+            // the datapoints inside a request refused whole.
+            partial.max(offered - accepted)
+        })
+        .sum()
 }
 
 fn metrics_distrust(page: &mut String, bed: &Value, targets: &[&str]) {
@@ -2413,15 +2437,28 @@ mod tests {
 
         for (name, citation) in &documents {
             let directory = docs_dir().join(&citation.artifacts);
-            let bed_path = directory.join("bed.json");
+            // Each bed names its run in its own file. Which one this document
+            // is tied to is the document's business, not this check's, so it
+            // takes whichever the cited directory holds.
+            let bed_path = ["bed.json", "bed_metrics.json"]
+                .iter()
+                .map(|name| directory.join(name))
+                .find(|path| path.exists())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} cites {}, which holds neither bed.json nor bed_metrics.json",
+                        citation.artifacts
+                    )
+                });
             let bed_text = std::fs::read_to_string(&bed_path).unwrap_or_else(|error| {
                 panic!(
-                    "{name} cites {}, whose bed.json cannot be read: {error}",
-                    citation.artifacts
+                    "{name} cites {}, whose {} cannot be read: {error}",
+                    citation.artifacts,
+                    bed_path.display()
                 )
             });
             let bed: serde_json::Value = serde_json::from_str(&bed_text).unwrap_or_else(|error| {
-                panic!("{name} cites a bed.json that is not JSON: {error}")
+                panic!("{name} cites a bed file that is not JSON: {error}")
             });
 
             for (field, cited) in [

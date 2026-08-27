@@ -320,9 +320,13 @@ out, under `/loggytracy/api/v1/`. Endpoints: `/logs` (search),
 `/logs/histogram` (bucketed counts over the counting sink),
 `/logs/attributes[/{key}/values]` (bounded autocomplete), `/logs/tail`
 (chunked NDJSON streaming), `/logs/delete` (deletion requests, persisting the
-same flat form). LogQL and the Loki/Tempo compatibility surfaces were removed
-with the read-path decision (issue #3); an unknown parameter or route is
-refused with a message that teaches the accepted set.
+same flat form). The trace routes are `/traces` (search), `/traces/{trace_id}`
+and its autocomplete pair; the metric routes (M14) are `/metrics/query`,
+`/metrics/instant`, `/metrics/quantile` and four discovery routes, with one
+function and one aggregation per request and no PromQL. LogQL and the
+Loki/Tempo compatibility surfaces were removed with the read-path decision
+(issue #3); an unknown parameter or route is refused with a message that
+teaches the accepted set.
 
 ## Milestones
 
