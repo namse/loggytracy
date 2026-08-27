@@ -65,7 +65,6 @@ fn queue_with(scratch: &Scratch, bodies: &[Vec<u8>]) -> Arc<Queue> {
         queue
             .append(&Record {
                 frame: body.clone(),
-                plain_len: body.len() as u32,
             })
             .expect("an append");
         queue.seal_if_due().expect("a seal");
@@ -181,7 +180,6 @@ async fn the_run_loop_closes_the_open_segment_and_ships_it() {
     for body in frames(3) {
         queue
             .append(&Record {
-                plain_len: body.len() as u32,
                 frame: body,
             })
             .expect("an append");

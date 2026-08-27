@@ -88,7 +88,7 @@ pub fn truncate_torn_tail(dir: &Path, seq: u64) -> io::Result<u64> {
         file.seek(SeekFrom::Start(valid))?;
         file.read_exact(&mut header)?;
         let frame_len = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
-        let crc = u32::from_le_bytes(header[8..12].try_into().expect("four bytes"));
+        let crc = u32::from_le_bytes(header[4..8].try_into().expect("four bytes"));
         if (RECORD_HEADER_BYTES + frame_len) as u64 > remaining {
             break;
         }

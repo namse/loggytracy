@@ -14,7 +14,12 @@ use tokio::sync::Notify;
 pub use identity::SenderId;
 use segment::{SegmentFile, SegmentMeta};
 
-pub const RECORD_HEADER_BYTES: usize = 12;
+/// A record's on-disk header: the frame's length and its crc32.
+///
+/// Nothing else. It used to carry the decompressed length as well, so a batch
+/// could be sized against what signy would admit without decompressing it;
+/// both the batch and that ceiling are gone.
+pub const RECORD_HEADER_BYTES: usize = 8;
 
 /// Segments are numbered from one so that zero can mean "signy has none of
 /// them" in the cursor and in signy's own memory.
@@ -76,7 +81,6 @@ struct Inner {
 
 pub struct Record {
     pub frame: Vec<u8>,
-    pub plain_len: u32,
 }
 
 /// A closed segment, ready to be shipped whole.
@@ -169,8 +173,7 @@ impl Queue {
 
         let mut header = [0u8; RECORD_HEADER_BYTES];
         header[0..4].copy_from_slice(&(record.frame.len() as u32).to_le_bytes());
-        header[4..8].copy_from_slice(&record.plain_len.to_le_bytes());
-        header[8..12].copy_from_slice(&crc32fast::hash(&record.frame).to_le_bytes());
+        header[4..8].copy_from_slice(&crc32fast::hash(&record.frame).to_le_bytes());
 
         let mut inner = self.inner.lock();
 
@@ -393,7 +396,7 @@ fn read_record(file: &mut std::fs::File, remaining: u64) -> io::Result<Option<Ve
     let mut header = [0u8; RECORD_HEADER_BYTES];
     file.read_exact(&mut header)?;
     let frame_len = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
-    let crc = u32::from_le_bytes(header[8..12].try_into().expect("four bytes"));
+    let crc = u32::from_le_bytes(header[4..8].try_into().expect("four bytes"));
     if (RECORD_HEADER_BYTES + frame_len) as u64 > remaining {
         return Ok(None);
     }

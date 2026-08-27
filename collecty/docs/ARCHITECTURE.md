@@ -136,13 +136,29 @@ That file is the whole of what the queue writes about itself. There is no
 cursor: a segment signy has answered for is unlinked on the spot, so the oldest
 file that is not still being written is the next one to send.
 
-A record is a 12-byte header and a zstd frame:
+A record is an 8-byte header and a zstd frame:
 
 | bytes | field | why |
 |---|---|---|
 | 0..4 | compressed length | frames the record |
-| 4..8 | uncompressed length | what the frame decompresses to, so a segment can be sized without decompressing it |
-| 8..12 | crc32 of the frame | tells a torn tail from bit rot |
+| 4..8 | crc32 of the frame | says where a torn tail ends |
+
+It used to carry the decompressed length as well, so a batch could be sized
+against what signy would admit without decompressing it. Both the batch and
+that ceiling are gone.
+
+**Why the crc and not a recorded byte offset.** The length alone catches the
+tail a *process* crash leaves — the header and the frame are two `write(2)`
+calls, and dying between them leaves a header whose length runs past the file.
+A *machine* crash is what the crc is for: the page cache goes with it, and a
+header half old and half new can carry a length that fits. Reading that as a
+record sends a frame signy cannot decompress, and the whole segment is refused
+and dropped — a torn tail traded for a whole segment.
+
+Writing down a known-good offset at each `fsync` would find the end too, and it
+would throw away everything since that `fsync` on every restart. The common
+crash is the process alone, where the page cache still holds all of it and
+walking recovers all of it. Four bytes a record is the cheaper side.
 
 **The signal is inside the frame, not in this header.** Compressed, the frame
 holds five more bytes in front of the payload — one signal tag and the payload's

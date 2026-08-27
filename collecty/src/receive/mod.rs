@@ -82,10 +82,7 @@ impl Intake {
         let level = self.zstd_level;
         tokio::task::spawn_blocking(move || {
             let frame = wire::compress_record(signal, &payload, level)?;
-            queue.append(&Record {
-                frame,
-                plain_len: (wire::RECORD_HEADER_BYTES + plain_len) as u32,
-            })
+            queue.append(&Record { frame })
         })
         .await
         .map_err(|error| Status::internal(format!("the spool task did not finish: {error}")))?

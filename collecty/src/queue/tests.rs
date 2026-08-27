@@ -6,7 +6,6 @@ use crate::test_support::Scratch;
 fn record(body: &[u8]) -> Record {
     Record {
         frame: body.to_vec(),
-        plain_len: body.len() as u32,
     }
 }
 

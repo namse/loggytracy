@@ -37,7 +37,6 @@ fn appending(criterion: &mut Criterion) {
             queue
                 .append(&Record {
                     frame: frame.clone(),
-                    plain_len: (wire::RECORD_HEADER_BYTES + export.len()) as u32,
                 })
                 .expect("an append")
         })
@@ -66,7 +65,6 @@ fn sealing(criterion: &mut Criterion) {
         queue
             .append(&Record {
                 frame: frame.clone(),
-                plain_len: export.len() as u32,
             })
             .expect("an append");
     }
