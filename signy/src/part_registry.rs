@@ -805,17 +805,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn temp_dir() -> std::path::PathBuf {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "signy-registry-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_support::temp_dir("registry")
     }
 
     fn row(line: &str, timestamp_ns: i64) -> Row {

@@ -48,15 +48,7 @@
     fn series_registry_holding(name: &str) -> Arc<crate::series_registry::SeriesRegistry> {
         use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
 
-        let root = std::env::temp_dir().join(format!(
-            "signy-storage-quota-series-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::temp_dir("storage-quota-series");
         let labels = SeriesLabels::from_pairs(vec![
             (METRIC_NAME_LABEL.to_string(), "queue_depth".to_string()),
             ("instance".to_string(), "a".to_string()),
@@ -96,15 +88,7 @@
         use crate::part::Row;
         use std::collections::BTreeMap;
 
-        let root = std::env::temp_dir().join(format!(
-            "signy-storage-quota-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::temp_dir("storage-quota");
         let mut labels: Labels = BTreeMap::new();
         labels.insert("app".to_string(), "test".to_string());
         let rows: Vec<Row> = tenants

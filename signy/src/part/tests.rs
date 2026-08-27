@@ -1125,20 +1125,7 @@
     }
 
     fn tempfile_dir() -> PathBuf {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "signy-test-{}-{}-{}",
-            std::process::id(),
-            c,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&p).unwrap();
-        p
+        crate::test_support::temp_dir("part")
     }
 
     #[cfg(unix)]

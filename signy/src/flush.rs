@@ -762,17 +762,7 @@ mod tests {
     use crate::tenant::test_tenant;
 
     fn temp_dir() -> std::path::PathBuf {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "signy-flush-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_support::temp_dir("flush")
     }
 
     /// Every phase a flush passes through is measured, and by the flush loop

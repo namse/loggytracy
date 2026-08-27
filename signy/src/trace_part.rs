@@ -916,15 +916,7 @@ mod tests {
     /// tenant-attributable size of the part.
     #[test]
     fn tenant_segments_record_disjoint_byte_extents() {
-        let root = std::env::temp_dir().join(format!(
-            "signy-trace-bytes-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::temp_dir("trace-bytes");
         let mut all = Vec::new();
         for tenant in ["acme", "globex"] {
             for span in spans() {

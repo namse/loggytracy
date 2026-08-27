@@ -7,18 +7,7 @@
     use crate::part_registry::PartRegistry;
 
     fn tmp_dir(label: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "signy-merge-{}-{}-{}",
-            label,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::test_support::temp_dir(&format!("merge-{label}"))
     }
 
     fn make_rows(n: usize, start_ts: i64, suffix: &str) -> Vec<part::Row> {

@@ -14,18 +14,7 @@
     const CRASH_DIR_ENV: &str = "SIGNY_CRASH_TEST_DIR";
 
     fn tmp_data_dir(label: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "signy-e2e-{}-{}-{}",
-            label,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::test_support::temp_dir(&format!("e2e-{label}"))
     }
 
     fn string_attribute(key: &str, value: &str) -> KeyValue {

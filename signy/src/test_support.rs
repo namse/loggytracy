@@ -110,3 +110,50 @@ fn state_inner(
         },
     ))
 }
+
+pub fn temp_dir(label: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "signy-{label}-{}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn concurrent_callers_with_one_label_never_agree_on_a_path() {
+        let thread_count = 16;
+        let per_thread = 64;
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    (0..per_thread)
+                        .map(|_| super::temp_dir("collision-probe"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let mut seen = std::collections::HashSet::new();
+        let mut made = Vec::new();
+        for handle in handles {
+            for dir in handle.join().unwrap() {
+                assert!(seen.insert(dir.clone()), "two callers agreed on {dir:?}");
+                made.push(dir);
+            }
+        }
+        assert_eq!(seen.len(), thread_count * per_thread);
+
+        for dir in made {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+}

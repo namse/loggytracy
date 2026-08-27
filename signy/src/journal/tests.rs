@@ -7,18 +7,7 @@
     use std::sync::Arc;
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "signy-journal-{}-{}-{}",
-            name,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::test_support::temp_dir(&format!("journal-{name}"))
     }
 
     /// An encoded `ExportLogsServiceRequest`: one `ResourceLogs` per `(app,
