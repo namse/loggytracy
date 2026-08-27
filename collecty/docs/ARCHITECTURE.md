@@ -19,7 +19,7 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Durability | Append-only segments, crc32 per record, periodic `fsync`, cursor on disk |
 | When the queue is full | **Drop the oldest segment.** The application is never refused for lack of disk |
 | Delivery | At-least-once, one batch in flight at a time, in queue order |
-| Transport to signy | `POST /signy/api/v1/collect/{signal}` with `Content-Encoding: zstd` |
+| Transport to signy | `POST /signy/api/v1/collect` with `Content-Encoding: zstd`, one route for all three signals |
 | Tenancy | **None.** The tenant travels inside the payload as a resource attribute (obsy issue #9), so a collector that does not decode has nothing to do |
 | Self-observation | `collecty_*` metrics encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr |
 | Format versioning | **None.** Nothing on disk is versioned. A queue written by another build is deleted, not migrated |
@@ -42,26 +42,33 @@ decompressing the stream yields the concatenation of what each frame held. So
 joining N independently compressed frames **is** one stream that decompresses to
 the joined plaintext.
 
-Stack them and a batch is a `memcpy`:
+Only the first half is signal-specific: logs merge with logs, not with spans.
+One queue holds all three, so each export is compressed **behind a five byte
+header** naming its signal and its length, and the batch signy receives is a
+sequence of those records rather than one anonymous run of bytes. Splitting them
+apart again is a walk over the plaintext with no decoding in it; joining each
+signal's payloads is then the same free merge as before.
 
 ```
-export₁ ──encode──▶ bytes₁ ──zstd──▶ frame₁ ─┐
-export₂ ──encode──▶ bytes₂ ──zstd──▶ frame₂ ─┼─▶ frame₁‖frame₂‖frame₃  (the body sent)
-export₃ ──encode──▶ bytes₃ ──zstd──▶ frame₃ ─┘
-                                              │
-                       signy: one decompress ─┴─▶ bytes₁‖bytes₂‖bytes₃
-                              one decode ───────▶ one export with every ResourceLogs
+export₁ (logs)   ──encode──▶ [L]bytes₁ ──zstd──▶ frame₁ ─┐
+export₂ (traces) ──encode──▶ [T]bytes₂ ──zstd──▶ frame₂ ─┼─▶ frame₁‖frame₂‖frame₃
+export₃ (logs)   ──encode──▶ [L]bytes₃ ──zstd──▶ frame₃ ─┘      (the body sent)
+                                                          │
+              signy: one decompress ──────────────────────┴─▶ [L]bytes₁[T]bytes₂[L]bytes₃
+                     one walk, one decode per signal ───────▶ logs:   bytes₁‖bytes₃
+                                                              traces: bytes₂
 ```
 
 collecty compresses each export once, on arrival, and never touches it again.
 It does not decode on the way in, does not merge structurally, and does not
-recompress on the way out.
+recompress on the way out. The header is written before compression, so even it
+costs nothing on the send path.
 
 Both halves are pinned by tests in `src/wire.rs`
-(`concatenated_zstd_frames_decompress_to_the_concatenated_plaintext`,
+(`concatenated_frames_decompress_to_the_concatenated_records`,
 `concatenated_export_requests_decode_as_one_merged_request`,
 `a_batch_survives_both_layers_at_once`), and the whole path is pinned end to end
-by signy's `a_collected_batch_of_separate_exports_lands_as_every_line_it_carried`.
+by signy's `one_batch_of_mixed_signals_lands_in_every_store_it_names`.
 
 ## Receiving
 
@@ -115,7 +122,7 @@ its own flush interval for the same class of event.
 
 ## The disk queue
 
-One queue per signal, under `{data_dir}/{logs,traces,metrics}/`.
+One queue for every signal, under `{data_dir}/queue/`.
 
 ```
 00000000000000000000.seg   append-only segment, rolls at COLLECTY_QUEUE_SEGMENT_BYTES
@@ -130,6 +137,14 @@ A record is a 12-byte header and a zstd frame:
 | 0..4 | compressed length | frames the record |
 | 4..8 | uncompressed length | a batch's ceiling is *uncompressed* bytes, because that is what signy admits against; knowing it without decompressing is what makes batch assembly free |
 | 8..12 | crc32 of the frame | tells a torn tail from bit rot |
+
+**The signal is inside the frame, not in this header.** Compressed, the frame
+holds five more bytes in front of the payload — one signal tag and the payload's
+length — and those are the bytes signy reads to split a batch apart. Putting the
+tag here instead would have been cheaper to read locally and useless remotely:
+the queue header never leaves this machine, and the sender would then have to
+rebuild an index for signy out of bytes it is otherwise free to `memcpy`. So the
+queue stays signal-agnostic and only the two ends of the wire know the tag.
 
 **One frame per record rather than one stream per segment.** A streaming
 compressor over a whole segment would compress better, but its output cannot be
@@ -165,7 +180,7 @@ exists, and only the second one means "signy is behind".
 
 ## Sending
 
-One sender task per signal, one batch in flight, in queue order. There is no
+One sender task, one batch in flight, in queue order. There is no
 linger: if the queue has anything, it goes now. Batching is therefore automatic —
 when signy is slow or down the backlog grows and the next batch is larger, which
 is the only time a large batch is useful.
@@ -186,12 +201,22 @@ understate a decompression bomb.
 | Answer | Meaning | Action |
 |---|---|---|
 | 2xx | accepted and durable in signy | advance the cursor |
-| 400, 413, 415, 422 | this payload is not acceptable | isolate and drop |
+| 400, 413, 415, 422 | this *batch* is not acceptable | isolate and drop |
 | everything else, including 401/403/429/5xx and any connection failure | signy cannot take it *right now* | retry with backoff |
 
 The default is **retry, not drop**. A `403` from a misconfigured tenant policy
 must not destroy data, so only the four statuses that say "this body is wrong"
 are treated as permanent. Backoff is 100 ms doubling to 30 s with jitter.
+
+A single bad *record* no longer reaches this table. signy splits a batch by
+signal itself, and a signal it will never accept — an undecodable body, a tenant
+at its storage limit — is dropped there, logged, counted in
+`signy_collect_dropped_records_total`, and answered `200`. Sending it back would
+only have collecty halve the batch to rediscover what signy already knew, one
+round trip at a time, and drop it anyway. What still reaches the table is a batch
+that is wrong as a *whole*: not zstd, framing that does not add up, or more
+uncompressed bytes than signy will hold — and that last one halving genuinely
+fixes.
 
 ### Poison isolation
 
@@ -202,6 +227,10 @@ the queue head forever.
 So a permanent refusal halves the batch and retries the left half, narrowing
 until one record is left; that record is dropped, counted in
 `collecty_records_refused_total`, logged at error, and the cursor moves past it.
+With signy dropping what it cannot decode, this path is now reached only by a
+batch refused for its shape rather than its content, but it stays: it is the only
+thing standing between a queue head that always fails and a queue that never
+drains.
 For eight records with the sixth poisoned, the attempts are 8, 4, 4, 2, 1, 3, 1,
 2 — seven records delivered, one dropped, and this exact sequence is asserted in
 `send::tests::a_refused_batch_is_halved_until_the_one_bad_record_is_dropped`.
@@ -241,8 +270,12 @@ else does.
 
 ## Where this depends on signy
 
-- `/signy/api/v1/collect/{logs,traces,metrics}` must exist and accept
-  `Content-Encoding: zstd`.
+- `/signy/api/v1/collect` must exist, accept `Content-Encoding: zstd`, and read
+  the five byte record header this document describes.
+- signy must drop a record it will never accept rather than refusing the batch
+  that carries it. collecty cannot tell one record from another without decoding,
+  so a refusal it cannot act on becomes a halving search it should not have to
+  run.
 - signy's admission ceilings and collecty's batch ceiling are coupled by nothing
   but these documents. That coupling, and whether the ceilings should exist in
   their current form at all, is obsy issue #10.

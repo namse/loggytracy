@@ -35,6 +35,22 @@ groups:
             failing -- but the sender is losing headroom.
           runbook: docs/RUNBOOK.md#what-to-alert-on
 
+      - alert: SignyCollectRecordsDropped
+        expr: increase(signy_collect_dropped_records_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The collect route is dropping records it will never accept"
+          description: >-
+            A batch from the collector carried records this instance cannot
+            take -- an undecodable body, a tenant at its storage limit -- and
+            they were dropped here. Deliberate: sending them back only makes
+            the collector halve the batch to find them and drop them itself.
+            But it is still data loss, and this counter and
+            signy_collect_dropped_bytes_total are the only places it shows.
+          runbook: docs/RUNBOOK.md#what-to-alert-on
+
       - alert: SignyWalBacklogGrowing
         expr: deriv(signy_wal_backlog_bytes[15m]) > 0
         for: 15m

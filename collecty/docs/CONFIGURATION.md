@@ -14,7 +14,7 @@ rejected, because a number with no unit is a guess about which unit was meant.
 |---|---|---|
 | `COLLECTY_SOCKET_PATH` | `/run/collecty/otlp.sock` | The Unix socket applications export to. Parent directories are created. A stale socket file left by a killed process is replaced; a socket something is still listening on refuses the start |
 | `COLLECTY_SOCKET_MODE` | `0666` | Socket permissions, octal. The default lets an application running as another user write, which is the ordinary case for a host daemon. Tighten it and control access with the directory's permissions instead |
-| `COLLECTY_DATA_DIR` | `/var/lib/collecty` | Holds one queue directory per signal. **This directory is the only copy of an acknowledged export until signy takes it** — it must outlive the container |
+| `COLLECTY_DATA_DIR` | `/var/lib/collecty` | Holds the queue, under `queue/`. **This directory is the only copy of an acknowledged export until signy takes it** — it must outlive the container |
 | `COLLECTY_SIGNY_URL` | `http://127.0.0.1:3100` | Where batches go. Plain HTTP only |
 
 The socket path has a hard limit the operating system sets, not collecty:
@@ -28,7 +28,7 @@ The socket path has a hard limit the operating system sets, not collecty:
 | `COLLECTY_MAX_REQUEST_BYTES` | `16MiB` | Largest single export accepted. Matches signy's own ceiling so an export that collecty takes is one signy can take. Refused with `OUT_OF_RANGE` before the body is buffered |
 | `COLLECTY_MAX_INFLIGHT_BYTES` | `64MiB` | Total bytes of exports being compressed and written at once. A request waits for room rather than being refused. Must be at least `COLLECTY_MAX_REQUEST_BYTES`, or a large export could never be admitted |
 
-Resident memory is roughly this ceiling plus one batch buffer per signal plus the
+Resident memory is roughly this ceiling plus one batch buffer plus the
 runtime. It is not affected by how far behind signy is — that backlog lives on
 disk.
 
@@ -36,7 +36,7 @@ disk.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLECTY_QUEUE_MAX_BYTES` | `1GiB` | Per signal, so three signals can reach three times this. **This number is how long signy may be down before data is lost.** At 1 MB/s of compressed logs it is about 17 minutes |
+| `COLLECTY_QUEUE_MAX_BYTES` | `1GiB` | One queue holds every signal, so this is the whole budget. **This number is how long signy may be down before data is lost.** At 1 MB/s of compressed logs it is about 17 minutes |
 | `COLLECTY_QUEUE_SEGMENT_BYTES` | `64MiB` | Segment roll size. Also the granularity of dropping: when the queue is full an entire segment goes at once. Smaller segments lose less per drop and cost more file handles and metadata |
 | `COLLECTY_FSYNC_INTERVAL` | `1s` | How often written records are forced to the device. **This is the loss window for a power cut**, and nothing else |
 
@@ -73,7 +73,8 @@ queued behind it, which is why the stderr summary exists.
 
 ### The metrics
 
-Every family carries a `signal` attribute of `logs`, `traces` or `metrics`.
+One queue and one sender, so every family is a single series with no
+attributes.
 
 | Family | Kind | What it answers |
 |---|---|---|
@@ -85,7 +86,7 @@ Every family carries a `signal` attribute of `logs`, `traces` or `metrics`.
 | `collecty_records_sent_total` | counter | Exports signy accepted |
 | `collecty_batches_sent_total` | counter | Batches signy accepted |
 | `collecty_bytes_sent_total` | counter | Compressed bytes shipped |
-| `collecty_records_refused_total` | counter | Exports **dropped** because signy would not take them. Any movement is data loss |
+| `collecty_records_refused_total` | counter | Exports **dropped** because signy would not take the batch even alone. Any movement is data loss. Records signy itself drops are counted on its side, in `signy_collect_dropped_records_total` |
 | `collecty_send_retries_total` | counter | Batches signy declined and that were retried |
 | `collecty_queue_dropped_bytes_total` | counter | Bytes **dropped** because the queue was full. Any movement is data loss |
 | `collecty_queue_dropped_segments_total` | counter | Segments unlinked while full |

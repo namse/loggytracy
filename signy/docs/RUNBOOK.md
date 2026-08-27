@@ -60,6 +60,7 @@ without the other.
 | Signal | Condition | Meaning |
 |---|---|---|
 | `signy_ingest_throttled_total` | Increasing | Returning 429; flush cannot keep up with ingest |
+| `signy_collect_dropped_records_total` | Increasing | **Data loss.** A collected batch carried records this instance will never accept — a body it cannot decode, a tenant at its storage limit — and the collect route dropped them rather than sending them back for the collector to rediscover and drop itself. `signy_collect_dropped_bytes_total` is how much |
 | `signy_wal_backlog_bytes` | Upward trend | Same cause, earlier signal |
 | `signy_data_dir_free_bytes` | Below `SIGNY_MIN_FREE_DISK_BYTES` × 2 | **Alert here, not at the floor.** At the floor ingest is already being refused; this is the warning before it. Divide by `signy_data_dir_total_bytes` for a percentage |
 | `signy_flush_errors_total` | Increasing while `flush_success_total` is flat | **Flush stopped.** Most dangerous state |
