@@ -2283,7 +2283,7 @@ fn metrics_verdict(
     }
     let steady_holds = decided && worst < NOT_MATERIALLY_WORSE;
     page.push_str(&format!(
-        "**The steady half {}.** The claim's shapes — `rate_range` and\n`agg_sum_by` — read at worst {} against VictoriaMetrics, and \"not\nmaterially worse\" is `< {NOT_MATERIALLY_WORSE:.1}x` by the same threshold the\nlog document uses.\n\n",
+        "**The steady half {}.** The claim's shapes — `rate_range` and\n`agg_sum_by` — read at worst {} against VictoriaMetrics, and \"not\nmaterially worse\" is `< {NOT_MATERIALLY_WORSE:.1}x` by the same threshold the\nlog document uses. **One run does not settle this**: two consecutive runs of\nidentical query code landed either side of that threshold, for the reason the\nlast section gives.\n\n",
         if !decided {
             "could not be decided"
         } else if steady_holds {
@@ -2400,9 +2400,17 @@ fn metrics_distrust(page: &mut String, bed: &Value, targets: &[&str]) {
   under series pressure, not throughput under concurrency — the rate axis
   belongs to the log bed's load phase, and no ingest-throughput claim should
   be read out of these tables.
-- **Query latency is a median over a small matrix.** {issued} queries per
-  engine including warm repeats; a p50 over that is a shape, not a
-  distribution.
+- **The latency verdict is not stable across runs, and that is measured, not
+  suspected.** Two consecutive runs of identical query code read `rate_range`
+  at 1.03x and then 1.62x — either side of the 1.1x threshold the verdict
+  turns on. The per-query spread says why: at these magnitudes a single
+  query's ratio ranges from roughly a quarter to twice the median, because
+  every number here is a sub-millisecond HTTP exchange and the request floor
+  is a large share of it. Read the table as an order of magnitude, not as a
+  decision; the verdict prints because the threshold is defined, not because
+  one run can settle it. A latency claim needs a bigger matrix, a warmed
+  connection, or a corpus large enough that the work dominates the round
+  trip — none of which this bed has yet.
 - **Disk is measured once, after a settle.** Compaction is time-dependent on
   both sides, and neither engine was given long enough for its steady state.
 
@@ -2413,10 +2421,6 @@ one side only would compare a deployment rather than an engine. And the
 one engine survives and the other does not is the more interesting result and
 it needs its own runs.
 "#,
-        issued = bed["metric_scrapes"]
-            .as_i64()
-            .map(|_| "the matrix's")
-            .unwrap_or("the matrix's"),
         memory_limit = bed["memory_limit"].as_str().unwrap_or("?"),
     ));
     let _ = targets;

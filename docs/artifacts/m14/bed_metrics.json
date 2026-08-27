@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-08-27T02:23:58Z",
-  "revision": "67fab2a",
+  "generated_at": "2026-08-27T02:45:10Z",
+  "revision": "91a1495",
   "branch": "master",
   "machine": "Linux 6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
   "docker": "29.1.3",
@@ -9,20 +9,20 @@
   "targets": ["loggytracy","victoriametrics"],
   "memory_limit": "2g",
   "settle_seconds": 60,
-  "metric_anchor_ns": 1787792430000000000,
+  "metric_anchor_ns": 1787793720000000000,
   "metric_scrapes": 360,
   "metric_scrape_seconds": 10,
   "object_store": "none: every system is on its local filesystem",
   "peak_bytes": {
-    "loggytracy": { "ingest": 1117155328, "query": 196517888, "churn": 1117155328, "oom_killed": false },
-    "victoriametrics": { "ingest": 695619584, "query": 144519168, "churn": 695619584, "oom_killed": false }
+    "loggytracy": { "ingest": 1081638912, "query": 192430080, "churn": 1081638912, "oom_killed": false },
+    "victoriametrics": { "ingest": 687702016, "query": 144551936, "churn": 687702016, "oom_killed": false }
   },
   "churn_survival": {
     "loggytracy": { "survived": true, "oom_killed": false },
     "victoriametrics": { "survived": true, "oom_killed": false }
   },
   "disk_bytes": {
-    "loggytracy": { "settled": 89058789, "after_queries": 89054693 },
-    "victoriametrics": { "settled": 24755460, "after_queries": 43173297 }
+    "loggytracy": { "settled": 87545770, "after_queries": 87541674 },
+    "victoriametrics": { "settled": 24637710, "after_queries": 43056108 }
   }
 }

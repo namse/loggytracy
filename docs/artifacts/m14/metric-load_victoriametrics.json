@@ -1,6 +1,6 @@
 {
   "config": {
-    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-e67049e9fa1ab17f89a16acd789980e7c1be5a3209f934641320ed288dabfa1e.scope",
+    "cgroup_path": "/sys/fs/cgroup/system.slice/docker-10a0818995520d7e59698052a2a2391424ae9b0bdb4016d925ae036d2a533bff.scope",
     "corpus_rows": 50000,
     "duration_seconds": 60,
     "entries_per_push": 100,
@@ -16,7 +16,7 @@
     "logfmt_weight": 2,
     "metadata_pairs": 2,
     "metric_verify": {
-      "anchor_ns": 1787792430000000000,
+      "anchor_ns": 1787793720000000000,
       "churn_generations": 4,
       "churn_instances": 4,
       "churn_replace_per_scrape": 2000,
@@ -93,7 +93,7 @@
     "warmup_seconds": 10
   },
   "load": {
-    "elapsed_seconds": 482.233788347,
+    "elapsed_seconds": 482.192434928,
     "phases": {
       "churn": {
         "acceptance": 1.0,
@@ -104,11 +104,11 @@
         "first_error": null,
         "latency_ms": {
           "count": 30,
-          "max_ms": 19.007602,
-          "mean_ms": 13.767030033333334,
-          "min_ms": 11.492763,
-          "p50_ms": 13.537525,
-          "p95_ms": 17.124004000000003,
+          "max_ms": 16.225056000000002,
+          "mean_ms": 13.726271733333332,
+          "min_ms": 11.174276,
+          "p50_ms": 13.652422000000001,
+          "p95_ms": 16.109629,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 30"
@@ -129,11 +129,11 @@
         "first_error": null,
         "latency_ms": {
           "count": 92,
-          "max_ms": 16.236235,
-          "mean_ms": 13.0371354673913,
-          "min_ms": 2.890943,
-          "p50_ms": 14.179120999999999,
-          "p95_ms": 15.869115999999998,
+          "max_ms": 21.228317,
+          "mean_ms": 12.78194722826087,
+          "min_ms": 2.942559,
+          "p50_ms": 13.737311,
+          "p95_ms": 15.874096000000002,
           "p99_ms": null,
           "unsupported": [
             "p99 needs 101 samples, has 92"
@@ -154,10 +154,10 @@
         "first_error": null,
         "latency_ms": {
           "count": 6,
-          "max_ms": 6.652649,
-          "mean_ms": 2.2693873333333334,
-          "min_ms": 1.073267,
-          "p50_ms": 1.51129,
+          "max_ms": 5.779309,
+          "mean_ms": 2.143898333333333,
+          "min_ms": 1.0826239999999998,
+          "p50_ms": 1.477025,
           "p95_ms": null,
           "p99_ms": null,
           "unsupported": [
@@ -175,16 +175,16 @@
     "series_offered": 520288
   },
   "memory": {
-    "anon_bytes_end": 244191232,
-    "anon_peak_bytes": 639750144,
-    "current_bytes": 410370048,
+    "anon_bytes_end": 226394112,
+    "anon_peak_bytes": 657403904,
+    "current_bytes": 360960000,
     "error": null,
-    "file_bytes_end": 24432640,
-    "peak_bytes": 695619584,
-    "source": "/sys/fs/cgroup/system.slice/docker-e67049e9fa1ab17f89a16acd789980e7c1be5a3209f934641320ed288dabfa1e.scope/memory.peak"
+    "file_bytes_end": 24309760,
+    "peak_bytes": 687702016,
+    "source": "/sys/fs/cgroup/system.slice/docker-10a0818995520d7e59698052a2a2391424ae9b0bdb4016d925ae036d2a533bff.scope/memory.peak"
   },
   "metric_verify": {
-    "anchor_ns": 1787792430000000000,
+    "anchor_ns": 1787793720000000000,
     "datapoints": 106560,
     "decomposed_samples": 221760,
     "decomposed_series": 640,
@@ -195,7 +195,7 @@
   },
   "phase": "metric-load",
   "run": {
-    "build_revision": "67fab2a",
+    "build_revision": "91a1495",
     "machine_profile": "6.12.57+deb13-amd64; 12 logical CPUs; 31.3 GiB RAM",
     "seed": 1592598566
   },

@@ -285,6 +285,19 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
       `only_the_churn_shape_exempts_instants_and_only_at_generation_ends`; a comparison that decided what
       to skip by looking at what disagreed would license every difference it found.
 
+- [ ] **The latency verdict is decided by noise, and the bed cannot settle it as built.** With the value
+      disagreements resolved the ratios finally print — and two consecutive runs of *identical* query
+      code read `rate_range` at 1.03x and then 1.62x, either side of the 1.1x threshold the verdict
+      turns on. The per-query spread says why: loggytracy's cold `rate_range` ranges 0.31–0.55 ms
+      against VictoriaMetrics' 0.25–1.20 ms, so a single query's ratio spans 0.26x–2.15x. Every number
+      is a sub-millisecond HTTP exchange where the request floor is a large share of the measurement.
+      The document now says so in both the verdict and the distrust section rather than presenting a
+      coin flip as a result. Settling it needs one of: a matrix large enough to average the floor out, a
+      corpus where the work dominates the round trip, or a measurement taken inside the engine rather
+      than across a socket — and until then no latency conclusion should be drawn in either direction.
+      What the run *does* establish is that all six shapes now agree, which is what makes any of this
+      measurable at all.
+
   *Superseded, kept for the reasoning it was decided against:* Two changes
       fall out of the diagnosis above and neither should be made blind. The digest class for
       `raw_range`/`agg_sum_by` has to move to `tolerance` or the bed will withhold those ratios forever
