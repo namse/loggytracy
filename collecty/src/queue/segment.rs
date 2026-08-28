@@ -1,10 +1,9 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::RECORD_HEADER_BYTES;
-
 const SEGMENT_SUFFIX: &str = ".seg";
+const TEMPORARY_SUFFIX: &str = ".tmp";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
@@ -12,33 +11,69 @@ pub struct SegmentMeta {
     pub bytes: u64,
 }
 
-pub struct SegmentFile {
-    file: File,
+/// The open segment: one zstd stream, written until the segment closes.
+///
+/// Records go in as plain bytes and the encoder decides when to emit a block,
+/// so what the file holds trails what has been accepted. Nothing forces that
+/// gap shut before the segment closes — `finish` is the only durability point
+/// the queue has, and it is the same moment the segment becomes sendable.
+pub struct SegmentWriter {
+    encoder: Option<zstd::stream::write::Encoder<'static, Counted>>,
 }
 
-impl SegmentFile {
-    pub fn create(dir: &Path, seq: u64) -> io::Result<SegmentFile> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path(dir, seq))?;
-        file.sync_all()?;
-        File::open(dir)?.sync_all()?;
-        Ok(SegmentFile { file })
+/// The segment file, counting what the encoder has actually handed it.
+///
+/// This is the segment's size for every purpose the queue has: what the disk
+/// holds and what the wire will carry are the same bytes.
+struct Counted {
+    file: File,
+    written: u64,
+}
+
+impl Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let wrote = self.file.write(buf)?;
+        self.written += wrote as u64;
+        Ok(wrote)
     }
 
-    pub fn open_for_append(dir: &Path, seq: u64) -> io::Result<SegmentFile> {
-        Ok(SegmentFile {
-            file: OpenOptions::new().append(true).open(path(dir, seq))?,
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl SegmentWriter {
+    pub fn create(dir: &Path, seq: u64, level: i32) -> io::Result<SegmentWriter> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path(dir, seq))?;
+        file.sync_all()?;
+        sync_dir(dir)?;
+        Ok(SegmentWriter {
+            encoder: Some(encoder(file, level)?),
         })
     }
 
-    pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes)
+    pub fn write_all(&mut self, plain: &[u8]) -> io::Result<()> {
+        self.encoder.as_mut().ok_or_else(closed)?.write_all(plain)
     }
 
-    pub fn sync(&mut self) -> io::Result<()> {
-        self.file.sync_data()
+    /// What the file holds. Behind what has been accepted by whatever the
+    /// encoder is still holding, and caught up by `finish`.
+    pub fn written(&self) -> u64 {
+        self.encoder
+            .as_ref()
+            .map(|encoder| encoder.get_ref().written)
+            .unwrap_or(0)
+    }
+
+    /// Close the stream and force it to the device.
+    pub fn finish(&mut self) -> io::Result<u64> {
+        let counted = self.encoder.take().ok_or_else(closed)?.finish()?;
+        counted.file.sync_all()?;
+        Ok(counted.written)
     }
 }
 
@@ -71,40 +106,89 @@ pub fn list(dir: &Path) -> io::Result<Vec<SegmentMeta>> {
     Ok(metas)
 }
 
-pub fn truncate_torn_tail(dir: &Path, seq: u64) -> io::Result<u64> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path(dir, seq))?;
-    let len = file.metadata()?.len();
-    let mut valid = 0u64;
+/// A rewrite that a crash interrupted. The segment it was repairing is still
+/// there under its own name, so this is only a file to unlink.
+pub fn sweep_temporaries(dir: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.ends_with(TEMPORARY_SUFFIX))
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
 
-    loop {
-        let remaining = len - valid;
-        if remaining < RECORD_HEADER_BYTES as u64 {
-            break;
-        }
-        let mut header = [0u8; RECORD_HEADER_BYTES];
-        file.seek(SeekFrom::Start(valid))?;
-        file.read_exact(&mut header)?;
-        let frame_len = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
-        let crc = u32::from_le_bytes(header[4..8].try_into().expect("four bytes"));
-        if (RECORD_HEADER_BYTES + frame_len) as u64 > remaining {
-            break;
-        }
-        let mut frame = vec![0u8; frame_len];
-        file.read_exact(&mut frame)?;
-        if crc32fast::hash(&frame) != crc {
-            break;
-        }
-        valid += (RECORD_HEADER_BYTES + frame_len) as u64;
+/// Close a segment that a previous process left open.
+///
+/// The encoder's state died with that process, so there is no appending to an
+/// unfinished stream — the segment is closed where it stopped instead. What
+/// decompresses is kept, cut back to the last record that arrived whole, and
+/// written out again as a stream that ends properly. A segment ending mid
+/// record is one signy refuses whole, which is why the cut is not left to it.
+///
+/// Returns the segment's size, or `None` if nothing in it survived and the
+/// file is gone.
+pub fn reseal(dir: &Path, seq: u64, level: i32) -> io::Result<Option<u64>> {
+    let bytes = std::fs::metadata(path(dir, seq))?.len();
+    if bytes == 0 {
+        remove(dir, seq)?;
+        sync_dir(dir)?;
+        return Ok(None);
     }
 
-    if valid < len {
-        file.set_len(valid)?;
-        file.sync_all()?;
+    // An error here is the ordinary case, not a surprise: an unfinished stream
+    // reads as far as its last complete block and then says so. What it read
+    // before that is what a crash left behind.
+    let mut plain = Vec::new();
+    let whole = zstd::stream::read::Decoder::new(open_for_read(dir, seq)?)
+        .and_then(|mut decoder| decoder.read_to_end(&mut plain))
+        .is_ok();
+    let kept = crate::wire::whole_records_len(&plain);
+
+    if whole && kept == plain.len() {
+        return Ok(Some(bytes));
     }
-    Ok(valid)
+    tracing::warn!(
+        segment = seq,
+        bytes,
+        recovered = kept,
+        dropped = plain.len() - kept,
+        "closing a segment a crash left open"
+    );
+    plain.truncate(kept);
+    if plain.is_empty() {
+        remove(dir, seq)?;
+        sync_dir(dir)?;
+        return Ok(None);
+    }
+    rewrite(dir, seq, &plain, level).map(Some)
+}
+
+fn rewrite(dir: &Path, seq: u64, plain: &[u8], level: i32) -> io::Result<u64> {
+    let temporary = path(dir, seq).with_extension("tmp");
+    let mut encoder = encoder(File::create(&temporary)?, level)?;
+    encoder.write_all(plain)?;
+    let counted = encoder.finish()?;
+    counted.file.sync_all()?;
+    std::fs::rename(&temporary, path(dir, seq))?;
+    sync_dir(dir)?;
+    Ok(counted.written)
+}
+
+fn encoder(file: File, level: i32) -> io::Result<zstd::stream::write::Encoder<'static, Counted>> {
+    zstd::stream::write::Encoder::new(Counted { file, written: 0 }, level)
+}
+
+fn closed() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "the segment is already closed")
+}
+
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 fn path(dir: &Path, seq: u64) -> PathBuf {

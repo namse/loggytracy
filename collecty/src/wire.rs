@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Read;
 
 use crate::signal::Signal;
 
@@ -6,18 +6,15 @@ pub const ZSTD_LEVEL: i32 = 3;
 
 pub const RECORD_HEADER_BYTES: usize = 5;
 
-pub fn compress_record(signal: Signal, payload: &[u8], level: i32) -> std::io::Result<Vec<u8>> {
-    let mut header = [0u8; RECORD_HEADER_BYTES];
-    header[0] = signal.tag();
-    header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-
-    let mut encoder = zstd::stream::write::Encoder::new(
-        Vec::with_capacity(RECORD_HEADER_BYTES + payload.len() / 2),
-        level,
-    )?;
-    encoder.write_all(&header)?;
-    encoder.write_all(payload)?;
-    encoder.finish()
+/// A record as it goes into a segment: a signal tag, the payload's length, and
+/// the payload. Uncompressed — the segment compresses the whole of itself as
+/// one zstd stream, so nothing here knows about compression.
+pub fn frame_record(signal: Signal, payload: &[u8]) -> Vec<u8> {
+    let mut plain = Vec::with_capacity(RECORD_HEADER_BYTES + payload.len());
+    plain.push(signal.tag());
+    plain.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    plain.extend_from_slice(payload);
+    plain
 }
 
 pub fn split_records(plain: &[u8]) -> Result<Vec<(Signal, &[u8])>, String> {
@@ -47,12 +44,33 @@ pub fn split_records(plain: &[u8]) -> Result<Vec<(Signal, &[u8])>, String> {
     Ok(records)
 }
 
-pub fn decompress_concatenated(
-    frames: &[u8],
-    expected_plain_len: usize,
-) -> std::io::Result<Vec<u8>> {
+/// How much of `plain` is whole, well-formed records.
+///
+/// What a crash leaves in a segment ends wherever the encoder happened to be,
+/// which is not a record boundary. signy refuses a batch whose last record is
+/// cut short, and refusing means the whole segment is dropped, so this is
+/// where recovery cuts instead.
+pub fn whole_records_len(plain: &[u8]) -> usize {
+    let mut at = 0;
+    loop {
+        let Some(header) = plain.get(at..at + RECORD_HEADER_BYTES) else {
+            return at;
+        };
+        if Signal::from_tag(header[0]).is_none() {
+            return at;
+        }
+        let len = u32::from_le_bytes(header[1..5].try_into().expect("four bytes")) as usize;
+        let end = at + RECORD_HEADER_BYTES + len;
+        if end > plain.len() {
+            return at;
+        }
+        at = end;
+    }
+}
+
+pub fn decompress(body: &[u8], expected_plain_len: usize) -> std::io::Result<Vec<u8>> {
     let mut plain = Vec::with_capacity(expected_plain_len);
-    zstd::stream::read::Decoder::new(frames)?.read_to_end(&mut plain)?;
+    zstd::stream::read::Decoder::new(body)?.read_to_end(&mut plain)?;
     Ok(plain)
 }
 
@@ -102,16 +120,19 @@ mod tests {
         }
     }
 
+    /// A segment is one zstd stream over every record it took, and the file is
+    /// what goes on the wire unchanged.
     #[test]
-    fn concatenated_frames_decompress_to_the_concatenated_records() {
-        let first = b"the first request's bytes, long enough that zstd emits a real frame";
-        let second = b"the second request's bytes, also long enough to be worth compressing";
+    fn one_stream_over_many_records_decompresses_to_all_of_them() {
+        let first = b"the first request's bytes, long enough to be worth compressing";
+        let second = b"the second request's bytes, also long enough to be worth it";
 
-        let mut frames = compress_record(Signal::Logs, first, ZSTD_LEVEL).unwrap();
-        frames.extend_from_slice(&compress_record(Signal::Traces, second, ZSTD_LEVEL).unwrap());
+        let mut plain = frame_record(Signal::Logs, first);
+        plain.extend_from_slice(&frame_record(Signal::Traces, second));
+        let body = zstd::encode_all(plain.as_slice(), ZSTD_LEVEL).unwrap();
 
-        let plain = decompress_concatenated(&frames, frames.len() * 4).unwrap();
-        let records = split_records(&plain).unwrap();
+        let decompressed = decompress(&body, plain.len()).unwrap();
+        let records = split_records(&decompressed).unwrap();
 
         assert_eq!(
             records,
@@ -143,16 +164,14 @@ mod tests {
             .map(|index| request_with(&format!("service-{index}"), &format!("line {index}")))
             .collect();
 
-        let mut frames = Vec::new();
-        let mut plain_len = 0;
+        let mut written = Vec::new();
         for request in &requests {
-            let encoded = request.encode_to_vec();
-            plain_len += RECORD_HEADER_BYTES + encoded.len();
-            frames.extend_from_slice(&compress_record(Signal::Logs, &encoded, ZSTD_LEVEL).unwrap());
+            written.extend_from_slice(&frame_record(Signal::Logs, &request.encode_to_vec()));
         }
+        let body = zstd::encode_all(written.as_slice(), ZSTD_LEVEL).unwrap();
 
-        let plain = decompress_concatenated(&frames, plain_len).unwrap();
-        assert_eq!(plain.len(), plain_len);
+        let plain = decompress(&body, written.len()).unwrap();
+        assert_eq!(plain, written);
         let mut merged_bytes = Vec::new();
         for (signal, payload) in split_records(&plain).unwrap() {
             assert_eq!(signal, Signal::Logs);
@@ -164,6 +183,30 @@ mod tests {
         for (index, request) in requests.iter().enumerate() {
             assert_eq!(merged.resource_logs[index], request.resource_logs[0]);
         }
+    }
+
+    /// A crash cuts the stream wherever the encoder happened to be. What is
+    /// kept is the last record that arrived whole.
+    #[test]
+    fn a_recovered_stream_is_cut_at_the_last_whole_record() {
+        let mut plain = frame_record(Signal::Logs, b"first");
+        plain.extend_from_slice(&frame_record(Signal::Traces, b"second"));
+        let whole = plain.len();
+        plain.extend_from_slice(&frame_record(Signal::Logs, b"cut short"));
+        plain.truncate(whole + RECORD_HEADER_BYTES + 3);
+
+        assert_eq!(whole_records_len(&plain), whole);
+        assert_eq!(whole_records_len(&plain[..whole + 2]), whole);
+        assert_eq!(whole_records_len(&[]), 0);
+
+        plain.truncate(whole);
+        assert_eq!(
+            split_records(&plain).unwrap(),
+            vec![
+                (Signal::Logs, b"first".as_slice()),
+                (Signal::Traces, b"second".as_slice())
+            ]
+        );
     }
 
     #[test]

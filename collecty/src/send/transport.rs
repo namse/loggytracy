@@ -50,7 +50,7 @@ impl Transport for HttpTransport {
                 .header(CONTENT_ENCODING, "zstd")
                 .header(SENDER_HEADER, shipment.sender.to_string())
                 .header(SEGMENT_HEADER, shipment.segment.to_string())
-                .body(Full::new(shipment.frames))
+                .body(Full::new(shipment.body))
             {
                 Ok(request) => request,
                 Err(error) => {

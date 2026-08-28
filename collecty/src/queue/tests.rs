@@ -1,16 +1,19 @@
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
+use std::sync::Arc;
 
 use super::*;
+use crate::signal::Signal;
 use crate::test_support::Scratch;
+use crate::wire::{self, ZSTD_LEVEL};
 
 fn record(body: &[u8]) -> Record {
     Record {
-        frame: body.to_vec(),
+        plain: wire::frame_record(Signal::Logs, body),
     }
 }
 
 fn open(scratch: &Scratch, limits: QueueLimits) -> Queue {
-    Queue::open(scratch.path(), limits).expect("a queue")
+    Queue::open(scratch.path(), limits, ZSTD_LEVEL).expect("a queue")
 }
 
 /// Segments close on age as well as size, and the sender is what asks. Tests
@@ -26,43 +29,100 @@ fn path_of(scratch: &Scratch, seq: u64) -> std::path::PathBuf {
     scratch.path().join(format!("{seq:020}.seg"))
 }
 
+/// A closed segment's records, as signy would read them: one zstd stream, and
+/// behind it the records back to back.
+fn records_of(sealed: &SealedSegment) -> Vec<Vec<u8>> {
+    let plain = wire::decompress(&sealed.body, sealed.body.len() * 8).expect("a stream");
+    wire::split_records(&plain)
+        .expect("framed records")
+        .into_iter()
+        .map(|(_, payload)| payload.to_vec())
+        .collect()
+}
+
 /// Every record collecty still holds, taken segment by segment the way the
 /// sender takes them.
 fn drain(queue: &Queue) -> Vec<Vec<u8>> {
-    let mut frames = Vec::new();
+    let mut records = Vec::new();
     queue.seal_if_due().expect("a seal");
     while let Some(seq) = queue.oldest_sealed() {
         let sealed = queue.read_segment(seq).expect("a segment");
-        let mut at = 0;
-        // The wire carries frames back to back with nothing between them, so a
-        // test that knows their lengths is what tells them apart again.
-        while at < sealed.frames.len() {
-            frames.push(sealed.frames[at..].to_vec());
-            at = sealed.frames.len();
-        }
-        queue.commit(seq, sealed.records).expect("a commit");
+        records.extend(records_of(&sealed));
+        queue.commit(seq).expect("a commit");
         queue.seal_if_due().expect("a seal");
     }
-    frames
+    records
+}
+
+/// Bytes with nothing in them to compress, for tests about what a segment
+/// occupies rather than about what it saves.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+fn lines(count: usize) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|index| format!("GET /v1/checkout 200 in 31ms request_id=req-{index:08}").into_bytes())
+        .collect()
 }
 
 #[test]
-fn a_closed_segment_carries_its_records_frames_concatenated() {
-    let scratch = Scratch::new("frames");
+fn a_closed_segment_is_one_stream_over_every_record_it_took() {
+    let scratch = Scratch::new("stream");
     let queue = open(&scratch, eager());
-    for index in 0..5u8 {
-        queue.append(&record(&[index; 40])).expect("an append");
+    let bodies = lines(5);
+    for body in &bodies {
+        queue.append(&record(body)).expect("an append");
     }
 
     queue.seal_if_due().expect("a seal");
     let seq = queue.oldest_sealed().expect("a closed segment");
     let sealed = queue.read_segment(seq).expect("a segment");
 
-    assert_eq!(sealed.records, 5);
-    assert_eq!(sealed.frames.len(), 5 * 40);
-    for index in 0..5usize {
-        assert_eq!(&sealed.frames[index * 40..(index + 1) * 40], &[index as u8; 40]);
+    assert_eq!(records_of(&sealed), bodies);
+    assert_eq!(
+        sealed.body,
+        std::fs::read(path_of(&scratch, seq)).expect("the file"),
+        "the file is the body, byte for byte"
+    );
+}
+
+/// The whole point of one stream a segment: the second record costs almost
+/// nothing once the first has taught the compressor what the data looks like.
+#[test]
+fn a_segment_compresses_across_its_records() {
+    let scratch = Scratch::new("ratio");
+    let queue = open(&scratch, eager());
+    let bodies = lines(200);
+    for body in &bodies {
+        queue.append(&record(body)).expect("an append");
     }
+
+    queue.seal_if_due().expect("a seal");
+    let seq = queue.oldest_sealed().expect("a closed segment");
+    let together = queue.read_segment(seq).expect("a segment").body.len();
+
+    let apart: usize = bodies
+        .iter()
+        .map(|body| {
+            zstd::bulk::compress(&wire::frame_record(Signal::Logs, body), ZSTD_LEVEL)
+                .expect("a frame")
+                .len()
+        })
+        .sum();
+
+    assert!(
+        together * 4 < apart,
+        "one stream is {together} bytes against {apart} for a frame a record"
+    );
 }
 
 /// The open segment is being appended to, so it is never offered. This is what
@@ -71,7 +131,9 @@ fn a_closed_segment_carries_its_records_frames_concatenated() {
 fn the_open_segment_is_not_offered() {
     let scratch = Scratch::new("open");
     let queue = open(&scratch, QueueLimits::default());
-    queue.append(&record(b"still being written")).expect("an append");
+    queue
+        .append(&record(b"still being written"))
+        .expect("an append");
 
     assert!(queue.oldest_sealed().is_none());
     assert!(!queue.has_sealed());
@@ -97,7 +159,9 @@ fn an_open_segment_closes_once_it_is_old_enough() {
     assert_eq!(queue.oldest_sealed(), Some(1));
 }
 
-/// An empty queue must not roll segments forever while nothing arrives.
+/// An empty queue must not roll segments forever while nothing arrives. The
+/// file being empty is not the test: a segment that has taken records can
+/// still be an empty file while the encoder holds them.
 #[test]
 fn an_empty_segment_is_never_closed() {
     let scratch = Scratch::new("idle");
@@ -109,6 +173,10 @@ fn an_empty_segment_is_never_closed() {
 
     assert_eq!(queue.stats().segments, 1);
     assert!(queue.oldest_sealed().is_none());
+
+    queue.append(&record(b"arrived")).expect("an append");
+    queue.seal_if_due().expect("a seal");
+    assert_eq!(queue.oldest_sealed(), Some(1));
 }
 
 #[test]
@@ -122,7 +190,7 @@ fn an_answered_segment_is_removed_and_not_offered_again() {
 
     let seq = queue.oldest_sealed().expect("a closed segment");
     assert_eq!(seq, 1);
-    queue.commit(seq, 1).expect("a commit");
+    queue.commit(seq).expect("a commit");
 
     assert!(!path_of(&scratch, 1).exists(), "the file is unlinked");
     assert_eq!(queue.oldest_sealed(), Some(2));
@@ -137,14 +205,38 @@ fn a_reopened_queue_keeps_what_signy_has_not_answered_for() {
         queue.seal_if_due().expect("a seal");
         queue.append(&record(b"still owed")).expect("an append");
         queue.seal_if_due().expect("a seal");
-        queue.commit(1, 1).expect("a commit");
-        queue.sync().expect("a sync");
+        queue.commit(1).expect("a commit");
         queue.sender_id()
     };
 
     let queue = open(&scratch, eager());
     assert_eq!(queue.sender_id(), sender, "the id outlives the process");
     assert_eq!(drain(&queue), vec![b"still owed".to_vec()]);
+}
+
+/// A stream cannot be resumed, so what a previous process left open is closed
+/// as it is and this one starts a segment of its own.
+#[test]
+fn a_reopened_queue_closes_the_old_segment_and_opens_a_new_one() {
+    let scratch = Scratch::new("resume");
+    {
+        let queue = open(&scratch, QueueLimits::default());
+        queue
+            .append(&record(b"before the restart"))
+            .expect("an append");
+        queue.seal().expect("a seal on the way out");
+    }
+
+    let queue = open(&scratch, eager());
+    assert_eq!(queue.oldest_sealed(), Some(1), "the old one is sendable");
+    queue.append(&record(b"after it")).expect("an append");
+    assert_eq!(queue.oldest_sealed(), Some(1), "and not appended to");
+    assert_eq!(queue.stats().segments, 2);
+
+    assert_eq!(
+        drain(&queue),
+        vec![b"before the restart".to_vec(), b"after it".to_vec()]
+    );
 }
 
 /// Nothing is written down about how far signy has got: an answered segment is
@@ -158,70 +250,111 @@ fn a_segment_left_behind_by_a_crash_is_offered_again() {
         let queue = open(&scratch, eager());
         queue.append(&record(b"answered")).expect("an append");
         queue.seal_if_due().expect("a seal");
-        queue.append(&record(b"owed")).expect("an append");
-        queue.sync().expect("a sync");
     }
     assert!(path_of(&scratch, 1).exists());
 
     let queue = open(&scratch, eager());
     assert_eq!(queue.oldest_sealed(), Some(1));
-    assert_eq!(drain(&queue), vec![b"answered".to_vec(), b"owed".to_vec()]);
+    assert_eq!(drain(&queue), vec![b"answered".to_vec()]);
 }
 
+/// A segment closes and syncs in one step, so a process that dies without
+/// closing loses whatever the encoder was still holding — and keeps every
+/// record that had already reached the file.
 #[test]
-fn a_torn_tail_is_truncated_when_the_queue_reopens() {
-    let scratch = Scratch::new("torn");
+fn a_crash_keeps_the_records_that_reached_the_file() {
+    let scratch = Scratch::new("crash");
+    // Past the encoder's block size, so some of it is written and some is not.
+    let bodies = lines(4000);
     {
         let queue = open(&scratch, QueueLimits::default());
-        queue.append(&record(b"whole record")).expect("an append");
-        queue.sync().expect("a sync");
+        for body in &bodies {
+            queue.append(&record(body)).expect("an append");
+        }
     }
 
-    let segment = path_of(&scratch, 1);
-    let before = std::fs::metadata(&segment).expect("a segment").len();
+    let queue = open(&scratch, eager());
+    let recovered = drain(&queue);
+
+    assert!(!recovered.is_empty(), "what reached the file is kept");
+    assert!(
+        recovered.len() < bodies.len(),
+        "and what the encoder still held is not"
+    );
+    assert_eq!(recovered, bodies[..recovered.len()]);
+}
+
+/// The stream ends wherever the crash left it, which is not a record boundary.
+/// Recovery cuts back to one, because a segment ending mid-record is one signy
+/// refuses whole.
+#[test]
+fn a_torn_tail_is_cut_back_to_the_last_whole_record() {
+    let scratch = Scratch::new("torn");
+    let bodies = lines(4000);
+    {
+        let queue = open(&scratch, QueueLimits::default());
+        for body in &bodies {
+            queue.append(&record(body)).expect("an append");
+        }
+    }
+
     let mut file = std::fs::OpenOptions::new()
         .append(true)
-        .open(&segment)
+        .open(path_of(&scratch, 1))
         .expect("the segment");
     file.write_all(&[9u8; 7]).expect("a torn write");
     drop(file);
 
     let queue = open(&scratch, eager());
-    assert_eq!(
-        std::fs::metadata(&segment).expect("a segment").len(),
-        before,
-        "the torn bytes are gone before anything reads the file"
-    );
-    assert_eq!(drain(&queue), vec![b"whole record".to_vec()]);
+    let recovered = drain(&queue);
+
+    assert!(!recovered.is_empty());
+    assert_eq!(recovered, bodies[..recovered.len()]);
 }
 
+/// Closing a recovered segment rewrites it, so what the sender picks up is a
+/// stream that ends properly rather than one signy would refuse.
 #[test]
-fn a_corrupt_record_ends_the_segment_rather_than_being_sent() {
-    let scratch = Scratch::new("corrupt");
+fn a_recovered_segment_is_closed_before_it_is_offered() {
+    let scratch = Scratch::new("recovered");
     {
         let queue = open(&scratch, QueueLimits::default());
-        queue.append(&record(b"good one")).expect("an append");
-        queue.append(&record(b"bad one!")).expect("an append");
-        queue.append(&record(b"after it")).expect("an append");
-        queue.sync().expect("a sync");
+        for body in lines(4000) {
+            queue.append(&record(&body)).expect("an append");
+        }
     }
 
-    let segment = path_of(&scratch, 1);
-    let second_frame_at = (RECORD_HEADER_BYTES + 8 + RECORD_HEADER_BYTES) as u64;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&segment)
-        .expect("the segment");
-    file.seek(SeekFrom::Start(second_frame_at)).expect("a seek");
-    file.write_all(b"X").expect("a flipped byte");
-    drop(file);
-
     let queue = open(&scratch, eager());
+    let sealed = queue.read_segment(1).expect("a segment");
+    wire::decompress(&sealed.body, sealed.body.len() * 8).expect("a stream that ends properly");
+}
+
+/// A segment that holds nothing readable leaves nothing behind.
+#[test]
+fn a_segment_that_decompresses_to_nothing_is_dropped() {
+    let scratch = Scratch::new("garbage");
+    {
+        let queue = open(&scratch, QueueLimits::default());
+        queue
+            .append(&record(b"never reached the file"))
+            .expect("an append");
+    }
+    assert_eq!(
+        std::fs::metadata(path_of(&scratch, 1))
+            .expect("a segment")
+            .len(),
+        0,
+        "the encoder held all of it"
+    );
+
+    // The number is not reused. signy holds a high-water mark under this
+    // sender's name, and numbering that went backwards would have it skip
+    // every segment under that mark as one it already stored.
+    let queue = open(&scratch, eager());
+    assert!(drain(&queue).is_empty());
+    queue.append(&record(b"after it")).expect("an append");
     queue.seal_if_due().expect("a seal");
-    let seq = queue.oldest_sealed().expect("a closed segment");
-    let sealed = queue.read_segment(seq).expect("a segment");
-    assert_eq!(sealed.records, 1);
-    assert_eq!(sealed.frames, b"good one".to_vec());
+    assert_eq!(queue.oldest_sealed(), Some(2));
 }
 
 #[test]
@@ -230,25 +363,32 @@ fn the_oldest_segment_is_dropped_when_the_queue_is_full() {
     let queue = open(
         &scratch,
         QueueLimits {
-            max_bytes: 200,
-            max_segment_bytes: 60,
+            max_bytes: 4096,
+            max_segment_bytes: 1024,
             ..eager()
         },
     );
-    for index in 0..12u8 {
-        queue.append(&record(&[index; 30])).expect("an append");
+    // A segment a record, so the cap has whole segments to unlink: what the
+    // encoder still holds is not on disk and cannot be counted or dropped.
+    // Bodies zstd cannot shrink, so the segments are the size they look.
+    let bodies: Vec<Vec<u8>> = (0..40).map(|index| noise(index, 400)).collect();
+    for body in &bodies {
+        queue.append(&record(body)).expect("an append");
+        queue.seal_if_due().expect("a seal");
     }
 
     let stats = queue.stats();
     assert!(stats.dropped_segments > 0);
     assert!(stats.dropped_bytes > 0);
-    assert!(stats.queued_bytes <= 200);
+    assert!(stats.queued_bytes <= 4096);
 
-    let frames = drain(&queue);
-    assert!(!frames.is_empty());
-    assert_eq!(frames.last().expect("a frame").as_slice(), [11u8; 30]);
+    let kept = drain(&queue);
+    assert!(!kept.is_empty());
+    assert_eq!(kept.last().expect("a record"), bodies.last().expect("one"));
 }
 
+/// Against the plain length, which is all that is known before the record has
+/// been compressed.
 #[test]
 fn a_record_larger_than_the_whole_queue_is_refused() {
     let scratch = Scratch::new("oversized");
@@ -274,8 +414,7 @@ fn an_unreadable_identity_is_replaced() {
         let queue = open(&scratch, eager());
         queue.append(&record(b"first")).expect("an append");
         queue.seal_if_due().expect("a seal");
-        queue.commit(1, 1).expect("a commit");
-        queue.sync().expect("a sync");
+        queue.commit(1).expect("a commit");
         queue.sender_id()
     };
 
@@ -314,9 +453,29 @@ fn an_answered_segment_leaves_the_queue_smaller() {
     queue.seal_if_due().expect("a seal");
 
     let before = queue.stats().queued_bytes;
-    queue.commit(1, 1).expect("a commit");
+    queue.commit(1).expect("a commit");
 
     assert!(queue.stats().queued_bytes < before);
 }
 
-use std::sync::Arc;
+/// Plain bytes in, compressed bytes on disk. The two together are the ratio a
+/// host is achieving, which is the reason they are counted differently.
+#[test]
+fn appended_bytes_are_what_arrived_and_queued_bytes_are_what_is_kept() {
+    let scratch = Scratch::new("counts");
+    let queue = open(&scratch, eager());
+    let bodies = lines(200);
+    for body in &bodies {
+        queue.append(&record(body)).expect("an append");
+    }
+    queue.seal_if_due().expect("a seal");
+
+    let stats = queue.stats();
+    let plain: u64 = bodies
+        .iter()
+        .map(|body| (wire::RECORD_HEADER_BYTES + body.len()) as u64)
+        .sum();
+    assert_eq!(stats.appended_records, bodies.len() as u64);
+    assert_eq!(stats.appended_bytes, plain);
+    assert!(stats.queued_bytes < plain);
+}

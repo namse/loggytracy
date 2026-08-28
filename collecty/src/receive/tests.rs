@@ -40,16 +40,16 @@ impl Harness {
     async fn start(label: &str, max_request_bytes: usize) -> Harness {
         let scratch = Scratch::new(label);
         let queue = Arc::new(
-            Queue::open(&scratch.path().join("queue"), eager_limits()).expect("a queue"),
+            Queue::open(
+                &scratch.path().join("queue"),
+                eager_limits(),
+                crate::wire::ZSTD_LEVEL,
+            )
+            .expect("a queue"),
         );
         let socket = scratch.path().join("otlp.sock");
         let listener = bind(&socket, DEFAULT_SOCKET_MODE).expect("a bound socket");
-        let intake = Intake::new(
-            queue.clone(),
-            max_request_bytes,
-            DEFAULT_MAX_INFLIGHT_BYTES,
-            crate::wire::ZSTD_LEVEL,
-        );
+        let intake = Intake::new(queue.clone(), max_request_bytes, DEFAULT_MAX_INFLIGHT_BYTES);
         let (tx, rx) = oneshot::channel();
         let server = tokio::spawn(serve(intake, listener, async move {
             let _ = rx.await;
@@ -81,12 +81,11 @@ impl Harness {
     }
 
     fn records(&self) -> Vec<(Signal, Vec<u8>)> {
-        let frames = self.sealed_frames();
-        if frames.is_empty() {
+        let body = self.sealed_body();
+        if body.is_empty() {
             return Vec::new();
         }
-        let plain = crate::wire::decompress_concatenated(&frames, frames.len() * 8)
-            .expect("decompressed frames");
+        let plain = crate::wire::decompress(&body, body.len() * 8).expect("a stream");
         crate::wire::split_records(&plain)
             .expect("framed records")
             .into_iter()
@@ -95,16 +94,18 @@ impl Harness {
     }
 
     /// What the sender would ship: the open segment closed, then read whole.
-    fn sealed_frames(&self) -> Vec<u8> {
+    /// Several segments' bodies run together here, which decompresses the same
+    /// way — zstd streams concatenate.
+    fn sealed_body(&self) -> Vec<u8> {
         self.queue.seal_if_due().expect("a seal");
-        let mut frames = Vec::new();
+        let mut body = Vec::new();
         while let Some(seq) = self.queue.oldest_sealed() {
             let sealed = self.queue.read_segment(seq).expect("a segment");
-            frames.extend_from_slice(&sealed.frames);
-            self.queue.commit(seq, sealed.records).expect("a commit");
+            body.extend_from_slice(&sealed.body);
+            self.queue.commit(seq).expect("a commit");
             self.queue.seal_if_due().expect("a seal");
         }
-        frames
+        body
     }
 
     async fn stop(mut self) {
@@ -196,14 +197,14 @@ async fn an_export_over_the_ceiling_is_refused_and_stores_nothing() {
 async fn a_payload_over_the_ceiling_is_refused_off_the_grpc_path_too() {
     let scratch = Scratch::new("intake-ceiling");
     let queue = Arc::new(
-        Queue::open(&scratch.path().join("queue"), eager_limits()).expect("a queue"),
+        Queue::open(
+            &scratch.path().join("queue"),
+            eager_limits(),
+            crate::wire::ZSTD_LEVEL,
+        )
+        .expect("a queue"),
     );
-    let intake = Intake::new(
-        queue.clone(),
-        64,
-        DEFAULT_MAX_INFLIGHT_BYTES,
-        crate::wire::ZSTD_LEVEL,
-    );
+    let intake = Intake::new(queue.clone(), 64, DEFAULT_MAX_INFLIGHT_BYTES);
 
     let status = intake
         .accept(Signal::Logs, bytes::Bytes::from(vec![0u8; 128]))
@@ -242,9 +243,8 @@ async fn separate_exports_reassemble_into_one_merged_request() {
             .expect("an accepted export");
     }
 
-    let frames = harness.sealed_frames();
-    let plain =
-        crate::wire::decompress_concatenated(&frames, frames.len() * 8).expect("plain");
+    let body = harness.sealed_body();
+    let plain = crate::wire::decompress(&body, body.len() * 8).expect("plain");
     let mut payloads = Vec::new();
     for (signal, payload) in crate::wire::split_records(&plain).expect("framed records") {
         assert_eq!(signal, Signal::Logs);

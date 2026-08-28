@@ -39,7 +39,7 @@ fn init_tracing(json: bool) {
 async fn run(config: Config) -> Result<(), String> {
     let dir = config.queue_dir();
     let queue = Arc::new(
-        Queue::open(&dir, config.queue)
+        Queue::open(&dir, config.queue, config.zstd_level)
             .map_err(|error| format!("cannot open the queue at {dir:?}: {error}"))?,
     );
 
@@ -49,7 +49,6 @@ async fn run(config: Config) -> Result<(), String> {
         queue.clone(),
         config.max_request_bytes,
         config.max_inflight_bytes,
-        config.zstd_level,
     );
 
     let (shutdown, watcher) = watch::channel(false);
@@ -65,11 +64,6 @@ async fn run(config: Config) -> Result<(), String> {
         tokio::spawn(async move { sender.run(watcher).await })
     };
 
-    let syncing = tokio::spawn(sync_loop(
-        queue.clone(),
-        config.fsync_interval,
-        watcher.clone(),
-    ));
     let reporting = tokio::spawn(report_loop(
         reporter,
         intake.clone(),
@@ -95,11 +89,13 @@ async fn run(config: Config) -> Result<(), String> {
 
     let _ = shutdown.send(true);
     let _ = sending.await;
-    let _ = syncing.await;
     let _ = reporting.await;
 
-    if let Err(error) = queue.sync() {
-        tracing::error!(%error, "the queue could not be synced on the way out");
+    // The only `fsync` the queue has is the one that closes a segment, so
+    // leaving without closing the open one would leave its records to be
+    // recovered rather than simply read.
+    if let Err(error) = queue.seal() {
+        tracing::error!(%error, "the open segment could not be closed on the way out");
     }
     let _ = std::fs::remove_file(&config.socket_path);
 
@@ -119,26 +115,6 @@ async fn wait_for_a_stop_signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
-    }
-}
-
-async fn sync_loop(
-    queue: Arc<Queue>,
-    interval: std::time::Duration,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {}
-            _ = shutdown.changed() => return,
-        }
-        let queue = queue.clone();
-        let synced = tokio::task::spawn_blocking(move || queue.sync()).await;
-        if let Ok(Err(error)) = synced {
-            tracing::error!(%error, "the queue could not be synced");
-        }
     }
 }
 

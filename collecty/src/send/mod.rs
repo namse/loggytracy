@@ -31,12 +31,13 @@ pub enum Outcome {
 
 /// One segment on its way to signy.
 ///
-/// The frames are the segment's records, unchanged from what the queue holds.
-/// The sender and the segment number are what let signy skip what it already
-/// stored: a segment is sent from its first record every time, so signy counts
-/// as it reads and knows exactly which records it has seen before.
+/// The body is the segment file, byte for byte: one zstd stream over every
+/// record the segment took. The sender and the segment number are what let
+/// signy skip what it already stored: a segment is sent from its first record
+/// every time, so signy counts as it reads and knows exactly which records it
+/// has seen before.
 pub struct Shipment {
-    pub frames: Bytes,
+    pub body: Bytes,
     pub sender: SenderId,
     pub segment: u64,
 }
@@ -60,12 +61,18 @@ impl Default for SenderConfig {
     }
 }
 
+/// Segments and bytes, never records.
+///
+/// What a segment holds is inside its compression, and reading it back would
+/// mean decompressing every segment on the way out to learn a number nobody
+/// acts on. `collecty_records_appended_total` is where the record count lives,
+/// counted where it is free.
 #[derive(Default, Debug)]
 pub struct SenderStats {
     pub sent_segments: AtomicU64,
-    pub sent_records: AtomicU64,
     pub sent_bytes: AtomicU64,
-    pub refused_records: AtomicU64,
+    pub refused_segments: AtomicU64,
+    pub refused_bytes: AtomicU64,
     pub retries: AtomicU64,
 }
 
@@ -131,13 +138,9 @@ impl<T: Transport> Sender<T> {
         segment: SealedSegment,
         shutdown: &mut watch::Receiver<bool>,
     ) {
-        let SealedSegment {
-            seq,
-            frames,
-            records,
-        } = segment;
-        let bytes = frames.len() as u64;
-        let frames = Bytes::from(frames);
+        let SealedSegment { seq, body } = segment;
+        let bytes = body.len() as u64;
+        let body = Bytes::from(body);
 
         let mut backoff = self.config.retry_initial;
         loop {
@@ -145,34 +148,31 @@ impl<T: Transport> Sender<T> {
                 return;
             }
             let shipment = Shipment {
-                frames: frames.clone(),
+                body: body.clone(),
                 sender: self.queue.sender_id(),
                 segment: seq,
             };
             match self.transport.deliver(shipment).await {
                 Outcome::Accepted(stored) => {
                     self.stats.sent_segments.fetch_add(1, Ordering::Relaxed);
-                    self.stats.sent_records.fetch_add(records, Ordering::Relaxed);
                     self.stats.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
-                    self.commit(stored.max(seq), records);
+                    self.commit(stored.max(seq));
                     return;
                 }
                 // Permanent for this segment's shape rather than its content:
                 // signy drops a record it cannot decode on its own side and
-                // answers 200, so what reaches here is framing that will fail
-                // the same way however many times it is sent.
+                // answers 200, so what reaches here is a stream or a framing
+                // that will fail the same way however many times it is sent.
                 Outcome::Refused(reason) => {
                     tracing::error!(
                         reason,
                         segment = seq,
-                        records,
                         bytes,
                         "dropping a segment signy refuses to accept"
                     );
-                    self.stats
-                        .refused_records
-                        .fetch_add(records, Ordering::Relaxed);
-                    self.commit(seq, 0);
+                    self.stats.refused_segments.fetch_add(1, Ordering::Relaxed);
+                    self.stats.refused_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    self.commit(seq);
                     return;
                 }
                 Outcome::Retry(reason) => {
@@ -193,8 +193,8 @@ impl<T: Transport> Sender<T> {
         }
     }
 
-    fn commit(&self, acked: u64, records: u64) {
-        if let Err(error) = self.queue.commit(acked, records) {
+    fn commit(&self, acked: u64) {
+        if let Err(error) = self.queue.commit(acked) {
             tracing::error!(%error, "the cursor could not be advanced");
         }
     }

@@ -30,7 +30,6 @@ pub struct Intake {
     queue: Arc<Queue>,
     inflight: Semaphore,
     max_request_bytes: usize,
-    zstd_level: i32,
 }
 
 impl Intake {
@@ -38,7 +37,6 @@ impl Intake {
         queue: Arc<Queue>,
         max_request_bytes: usize,
         max_inflight_bytes: usize,
-        zstd_level: i32,
     ) -> Arc<Intake> {
         assert!(
             max_request_bytes <= u32::MAX as usize - wire::RECORD_HEADER_BYTES,
@@ -52,7 +50,6 @@ impl Intake {
             queue,
             inflight: Semaphore::new(max_inflight_bytes),
             max_request_bytes,
-            zstd_level,
         })
     }
 
@@ -78,11 +75,13 @@ impl Intake {
             .await
             .map_err(|_| Status::unavailable("collecty is shutting down"))?;
 
+        // Framing is nothing, but the queue compresses inside its lock, so the
+        // append is still the blocking pool's work.
         let queue = self.queue.clone();
-        let level = self.zstd_level;
         tokio::task::spawn_blocking(move || {
-            let frame = wire::compress_record(signal, &payload, level)?;
-            queue.append(&Record { frame })
+            queue.append(&Record {
+                plain: wire::frame_record(signal, &payload),
+            })
         })
         .await
         .map_err(|error| Status::internal(format!("the spool task did not finish: {error}")))?

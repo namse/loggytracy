@@ -16,7 +16,6 @@ pub struct Config {
     pub queue: QueueLimits,
     pub sender: SenderConfig,
     pub send_timeout: Duration,
-    pub fsync_interval: Duration,
     pub report_interval: Duration,
     pub zstd_level: i32,
     pub log_json: bool,
@@ -34,7 +33,6 @@ impl Default for Config {
             queue: QueueLimits::default(),
             sender: SenderConfig::default(),
             send_timeout: Duration::from_secs(30),
-            fsync_interval: Duration::from_secs(1),
             report_interval: Duration::from_secs(60),
             zstd_level: crate::wire::ZSTD_LEVEL,
             log_json: false,
@@ -68,7 +66,6 @@ impl Config {
                 retry_max: duration("COLLECTY_RETRY_MAX", defaults.sender.retry_max)?,
             },
             send_timeout: duration("COLLECTY_SEND_TIMEOUT", defaults.send_timeout)?,
-            fsync_interval: duration("COLLECTY_FSYNC_INTERVAL", defaults.fsync_interval)?,
             report_interval: duration("COLLECTY_REPORT_INTERVAL", defaults.report_interval)?,
             zstd_level: level("COLLECTY_ZSTD_LEVEL", defaults.zstd_level)?,
             log_json: matches!(

@@ -22,10 +22,10 @@ pub struct Observation {
     pub appended_bytes: u64,
     pub dropped_bytes: u64,
     pub dropped_segments: u64,
-    pub sent_records: u64,
     pub sent_segments: u64,
     pub sent_bytes: u64,
-    pub refused_records: u64,
+    pub refused_segments: u64,
+    pub refused_bytes: u64,
     pub retries: u64,
 }
 
@@ -63,6 +63,8 @@ const FAMILIES: &[Family] = &[
         kind: Kind::Counter,
         read: |observation| observation.appended_records,
     },
+    // Plain bytes, before the segment compresses them. Against
+    // `collecty_bytes_sent_total` this is the ratio a host is achieving.
     Family {
         name: "collecty_bytes_appended_total",
         unit: "By",
@@ -82,12 +84,6 @@ const FAMILIES: &[Family] = &[
         read: |observation| observation.dropped_segments,
     },
     Family {
-        name: "collecty_records_sent_total",
-        unit: "{record}",
-        kind: Kind::Counter,
-        read: |observation| observation.sent_records,
-    },
-    Family {
         name: "collecty_segments_sent_total",
         unit: "{segment}",
         kind: Kind::Counter,
@@ -100,10 +96,16 @@ const FAMILIES: &[Family] = &[
         read: |observation| observation.sent_bytes,
     },
     Family {
-        name: "collecty_records_refused_total",
-        unit: "{record}",
+        name: "collecty_segments_refused_total",
+        unit: "{segment}",
         kind: Kind::Counter,
-        read: |observation| observation.refused_records,
+        read: |observation| observation.refused_segments,
+    },
+    Family {
+        name: "collecty_bytes_refused_total",
+        unit: "By",
+        kind: Kind::Counter,
+        read: |observation| observation.refused_bytes,
     },
     Family {
         name: "collecty_send_retries_total",
@@ -137,10 +139,10 @@ impl Reporter {
             appended_bytes: queued.appended_bytes,
             dropped_bytes: queued.dropped_bytes,
             dropped_segments: queued.dropped_segments,
-            sent_records: self.stats.sent_records.load(Ordering::Relaxed),
             sent_segments: self.stats.sent_segments.load(Ordering::Relaxed),
             sent_bytes: self.stats.sent_bytes.load(Ordering::Relaxed),
-            refused_records: self.stats.refused_records.load(Ordering::Relaxed),
+            refused_segments: self.stats.refused_segments.load(Ordering::Relaxed),
+            refused_bytes: self.stats.refused_bytes.load(Ordering::Relaxed),
             retries: self.stats.retries.load(Ordering::Relaxed),
         }
     }
@@ -154,11 +156,12 @@ impl Reporter {
             queued_bytes = observed.queued_bytes,
             segments = observed.segments,
             appended_records = observed.appended_records,
+            appended_bytes = observed.appended_bytes,
             dropped_bytes = observed.dropped_bytes,
             dropped_segments = observed.dropped_segments,
-            sent_records = observed.sent_records,
             sent_segments = observed.sent_segments,
-            refused_records = observed.refused_records,
+            sent_bytes = observed.sent_bytes,
+            refused_segments = observed.refused_segments,
             retries = observed.retries,
             "queue report"
         );
@@ -236,7 +239,7 @@ mod tests {
     fn every_family_is_exported_once_with_one_point() {
         let observed = Observation {
             queued_bytes: 11,
-            sent_records: 22,
+            sent_segments: 22,
             ..Observation::default()
         };
 
@@ -260,7 +263,7 @@ mod tests {
     fn a_gauge_carries_the_value_it_was_given_and_a_counter_is_monotonic() {
         let observed = Observation {
             queued_bytes: 4096,
-            sent_records: 7,
+            sent_segments: 7,
             ..Observation::default()
         };
         let export = ExportMetricsServiceRequest::decode(encode(&observed, 5, 9).as_slice())
@@ -283,10 +286,10 @@ mod tests {
         let sent = scope
             .metrics
             .iter()
-            .find(|metric| metric.name == "collecty_records_sent_total")
+            .find(|metric| metric.name == "collecty_segments_sent_total")
             .expect("the sent counter");
         let metric::Data::Sum(sum) = sent.data.as_ref().expect("data") else {
-            panic!("collecty_records_sent_total must be a sum");
+            panic!("collecty_segments_sent_total must be a sum");
         };
         assert!(sum.is_monotonic);
         assert_eq!(

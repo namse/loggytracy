@@ -35,15 +35,15 @@ impl Transport for Scripted {
     fn deliver<'a>(&'a self, shipment: Shipment) -> DeliverFuture<'a> {
         Box::pin(async move {
             self.segments.lock().push(shipment.segment);
-            self.bytes.lock().push(shipment.frames.len());
-            (self.respond)(&shipment.frames)
+            self.bytes.lock().push(shipment.body.len());
+            (self.respond)(&shipment.body)
         })
     }
 }
 
-fn shipment(frames: &'static [u8]) -> Shipment {
+fn shipment(body: &'static [u8]) -> Shipment {
     Shipment {
-        frames: Bytes::from_static(frames),
+        body: Bytes::from_static(body),
         sender: crate::queue::SenderId::generate().expect("an id"),
         segment: 1,
     }
@@ -60,11 +60,12 @@ fn eager() -> QueueLimits {
 
 /// One segment per record, so a test can count segments and records together.
 fn queue_with(scratch: &Scratch, bodies: &[Vec<u8>]) -> Arc<Queue> {
-    let queue = Arc::new(Queue::open(scratch.path(), eager()).expect("a queue"));
+    let queue =
+        Arc::new(Queue::open(scratch.path(), eager(), crate::wire::ZSTD_LEVEL).expect("a queue"));
     for body in bodies {
         queue
             .append(&Record {
-                frame: body.clone(),
+                plain: body.clone(),
             })
             .expect("an append");
         queue.seal_if_due().expect("a seal");
@@ -72,8 +73,10 @@ fn queue_with(scratch: &Scratch, bodies: &[Vec<u8>]) -> Arc<Queue> {
     queue
 }
 
-fn frames(count: usize) -> Vec<Vec<u8>> {
-    (0..count).map(|index| vec![index as u8; 32]).collect()
+fn records(count: usize) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|index| crate::wire::frame_record(crate::signal::Signal::Logs, &[index as u8; 32]))
+        .collect()
 }
 
 async fn deliver_all<T: Transport>(sender: &Sender<T>, queue: &Queue) {
@@ -89,14 +92,14 @@ async fn deliver_all<T: Transport>(sender: &Sender<T>, queue: &Queue) {
 #[tokio::test]
 async fn a_delivered_segment_advances_the_cursor_and_unlinks_the_file() {
     let scratch = Scratch::new("send-ok");
-    let queue = queue_with(&scratch, &frames(3));
+    let queue = queue_with(&scratch, &records(3));
     let transport = Scripted::new(|_| Outcome::Accepted(0));
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
 
     deliver_all(&sender, &queue).await;
 
     assert_eq!(transport.segments(), vec![1, 2, 3]);
-    assert_eq!(sender.stats().sent_records.load(Ordering::Relaxed), 3);
+    assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 3);
     assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 3);
     assert!(!queue.has_sealed());
 }
@@ -106,7 +109,7 @@ async fn a_delivered_segment_advances_the_cursor_and_unlinks_the_file() {
 #[tokio::test]
 async fn a_retried_segment_is_sent_whole_again() {
     let scratch = Scratch::new("send-retry");
-    let queue = queue_with(&scratch, &frames(1));
+    let queue = queue_with(&scratch, &records(1));
     let attempts = Arc::new(Mutex::new(0usize));
     let counter = attempts.clone();
     let transport = Scripted::new(move |_| {
@@ -124,7 +127,12 @@ async fn a_retried_segment_is_sent_whole_again() {
     deliver_all(&sender, &queue).await;
 
     assert_eq!(transport.segments(), vec![1, 1, 1]);
-    assert_eq!(transport.bytes(), vec![32, 32, 32], "the same bytes each time");
+    let sizes = transport.bytes();
+    assert!(sizes[0] > 0);
+    assert!(
+        sizes.iter().all(|size| *size == sizes[0]),
+        "the same bytes each time, not {sizes:?}"
+    );
     assert_eq!(sender.stats().retries.load(Ordering::Relaxed), 2);
     assert!(!queue.has_sealed());
 }
@@ -135,9 +143,13 @@ async fn a_retried_segment_is_sent_whole_again() {
 #[tokio::test]
 async fn a_refused_segment_is_dropped_whole_and_counted() {
     let scratch = Scratch::new("send-refused");
-    let queue = queue_with(&scratch, &frames(2));
-    let transport = Scripted::new(|frames: &Bytes| {
-        if frames[0] == 0 {
+    let queue = queue_with(&scratch, &records(2));
+    // On what the segment holds rather than on its first byte: the body is a
+    // compressed stream now and every one of them starts the same way.
+    let transport = Scripted::new(|body: &Bytes| {
+        let plain = crate::wire::decompress(body, body.len() * 8).expect("a stream");
+        let records = crate::wire::split_records(&plain).expect("framed records");
+        if records[0].1[0] == 0 {
             Outcome::Refused("signy cannot read this".to_string())
         } else {
             Outcome::Accepted(0)
@@ -148,15 +160,15 @@ async fn a_refused_segment_is_dropped_whole_and_counted() {
     deliver_all(&sender, &queue).await;
 
     assert_eq!(transport.segments(), vec![1, 2]);
-    assert_eq!(sender.stats().refused_records.load(Ordering::Relaxed), 1);
-    assert_eq!(sender.stats().sent_records.load(Ordering::Relaxed), 1);
+    assert_eq!(sender.stats().refused_segments.load(Ordering::Relaxed), 1);
+    assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 1);
     assert!(!queue.has_sealed());
 }
 
 #[tokio::test(start_paused = true)]
 async fn shutdown_stops_a_retry_loop_without_advancing_the_cursor() {
     let scratch = Scratch::new("send-stop");
-    let queue = queue_with(&scratch, &frames(1));
+    let queue = queue_with(&scratch, &records(1));
     let transport = Scripted::new(|_| Outcome::Retry("signy is down".to_string()));
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
 
@@ -170,19 +182,16 @@ async fn shutdown_stops_a_retry_loop_without_advancing_the_cursor() {
     sender.deliver(segment, &mut rx).await;
 
     assert_eq!(queue.oldest_sealed(), Some(1), "the segment is still owed");
-    assert_eq!(sender.stats().sent_records.load(Ordering::Relaxed), 0);
+    assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(start_paused = true)]
 async fn the_run_loop_closes_the_open_segment_and_ships_it() {
     let scratch = Scratch::new("send-run");
-    let queue = Arc::new(Queue::open(scratch.path(), eager()).expect("a queue"));
-    for body in frames(3) {
-        queue
-            .append(&Record {
-                frame: body,
-            })
-            .expect("an append");
+    let queue =
+        Arc::new(Queue::open(scratch.path(), eager(), crate::wire::ZSTD_LEVEL).expect("a queue"));
+    for body in records(3) {
+        queue.append(&Record { plain: body }).expect("an append");
     }
     let transport = Scripted::new(|_| Outcome::Accepted(0));
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
@@ -194,7 +203,11 @@ async fn the_run_loop_closes_the_open_segment_and_ships_it() {
     };
     tokio::join!(sender.run(rx), stop);
 
-    assert_eq!(sender.stats().sent_records.load(Ordering::Relaxed), 3);
+    // One segment, because nothing closed it between the appends, and it went
+    // whole.
+    assert_eq!(transport.segments(), vec![1]);
+    assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 1);
+    assert_eq!(queue.stats().appended_records, 3);
     assert!(!queue.has_sealed());
 }
 
@@ -203,14 +216,21 @@ async fn the_run_loop_closes_the_open_segment_and_ships_it() {
 #[tokio::test]
 async fn an_answer_beyond_the_segment_clears_everything_under_it() {
     let scratch = Scratch::new("send-ahead");
-    let queue = queue_with(&scratch, &frames(3));
+    let queue = queue_with(&scratch, &records(3));
     let transport = Scripted::new(|_| Outcome::Accepted(3));
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
 
     deliver_all(&sender, &queue).await;
 
-    assert_eq!(transport.segments(), vec![1], "the rest were already stored");
-    assert!(!queue.has_sealed(), "segments two and three went with the answer");
+    assert_eq!(
+        transport.segments(),
+        vec![1],
+        "the rest were already stored"
+    );
+    assert!(
+        !queue.has_sealed(),
+        "segments two and three went with the answer"
+    );
 }
 
 type SeenRequest = (String, String, String, String);
@@ -246,11 +266,9 @@ async fn fake_signy(status: http::StatusCode, seen: Arc<Mutex<Vec<SeenRequest>>>
                                 header(super::transport::SENDER_HEADER),
                                 header(super::transport::SEGMENT_HEADER),
                             ));
-                            http::Response::builder()
-                                .status(status)
-                                .body(http_body_util::Full::new(Bytes::from_static(
-                                    br#"{"stored":42}"#,
-                                )))
+                            http::Response::builder().status(status).body(
+                                http_body_util::Full::new(Bytes::from_static(br#"{"stored":42}"#)),
+                            )
                         }
                     },
                 );
