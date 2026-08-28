@@ -205,7 +205,7 @@ pub async fn run(config: Arc<Config>) {
         &series_memtable,
         &collect_marks,
     )
-        .unwrap_or_else(|e| panic!("recovery failed: {e}"));
+    .unwrap_or_else(|e| panic!("recovery failed: {e}"));
 
     let object_storage = config
         .object_store_url

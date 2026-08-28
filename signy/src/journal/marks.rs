@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MARKS_FILE: &str = "journal.marks";
 const SENDER_ID_BYTES: usize = 16;
-const MARK_ENTRY_BYTES: usize = SENDER_ID_BYTES + 8 + 8 + 8;
+const MARK_ENTRY_BYTES: usize = SENDER_ID_BYTES + 1 + 8 + 8 + 8;
 
 /// How long a collecty may stay silent before its number is forgotten.
 ///
@@ -51,8 +51,61 @@ impl std::fmt::Debug for SenderId {
     }
 }
 
-/// Where a sender's stream is up to: everything strictly before this point is
-/// durable.
+/// Which of a collecty's three streams a segment belongs to.
+///
+/// A collecty keeps a queue per signal and numbers each of them from one, so a
+/// sender id on its own does not place a segment. The pair does, and every
+/// position here is held under the pair.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum CollectSignal {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl CollectSignal {
+    pub const ALL: [CollectSignal; 3] = [
+        CollectSignal::Logs,
+        CollectSignal::Traces,
+        CollectSignal::Metrics,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollectSignal::Logs => "logs",
+            CollectSignal::Traces => "traces",
+            CollectSignal::Metrics => "metrics",
+        }
+    }
+
+    /// What the request names it. The wire spells the signal out rather than
+    /// numbering it, so a request is readable in a log or a proxy.
+    pub fn parse(name: &str) -> Option<CollectSignal> {
+        CollectSignal::ALL
+            .into_iter()
+            .find(|signal| signal.as_str() == name)
+    }
+
+    /// What this instance's own records spell it as. A byte rather than a
+    /// name, because it sits in every mark in the WAL and in every entry of
+    /// the marks file.
+    fn tag(self) -> u8 {
+        match self {
+            CollectSignal::Logs => 1,
+            CollectSignal::Traces => 2,
+            CollectSignal::Metrics => 3,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<CollectSignal> {
+        CollectSignal::ALL
+            .into_iter()
+            .find(|signal| signal.tag() == tag)
+    }
+}
+
+/// Where one of a sender's streams is up to: everything strictly before this
+/// point is durable.
 ///
 /// `segment` is the one being read and `records` how many of its records are
 /// stored, counted from its first. A segment that arrived whole leaves
@@ -77,20 +130,26 @@ impl Position {
     }
 }
 
-/// One claim about a sender's stream, written into the WAL beside the records
-/// it accounts for.
+/// One claim about one of a sender's streams, written into the WAL beside the
+/// records it accounts for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CollectMark {
     pub sender: SenderId,
+    pub signal: CollectSignal,
     pub at: Position,
 }
 
-/// How far each collecty has got, as far as this instance is concerned.
+/// How far each of a collecty's three streams has got, as far as this instance
+/// is concerned.
 ///
 /// A collecty sends a segment from its first record every time, so a resend
 /// after a crash or a cut connection repeats whatever the earlier attempt got
 /// through. The position here is where that attempt stopped; the records
 /// before it are counted off and dropped rather than stored twice.
+///
+/// A signal is a stream of its own: its segments are numbered from one
+/// independently of the other two, and they arrive interleaved with them, so
+/// one position per sender would have each signal walking the others' back.
 ///
 /// The position is written by the journal writer **in the same batch as the
 /// records it covers**, so one `sync_all` makes both durable together. There
@@ -98,7 +157,7 @@ pub struct CollectMark {
 /// twin is not.
 #[derive(Default)]
 pub struct CollectMarks {
-    inner: std::sync::RwLock<HashMap<SenderId, Seen>>,
+    inner: std::sync::RwLock<HashMap<(SenderId, CollectSignal), Seen>>,
 }
 
 #[derive(Clone, Copy)]
@@ -108,14 +167,14 @@ struct Seen {
 }
 
 impl CollectMarks {
-    /// Where this sender's stream is up to. The start of segment one for a
-    /// sender never heard from, which is below everything it can send, so
-    /// nothing is skipped.
-    pub fn position(&self, sender: &SenderId) -> Position {
+    /// Where this sender's stream for this signal is up to. The start of
+    /// segment one for one never heard from, which is below everything it can
+    /// send, so nothing is skipped.
+    pub fn position(&self, sender: &SenderId, signal: CollectSignal) -> Position {
         self.inner
             .read()
             .expect("collect marks lock")
-            .get(sender)
+            .get(&(*sender, signal))
             .map(|seen| seen.at)
             .unwrap_or(Position::START)
     }
@@ -125,7 +184,7 @@ impl CollectMarks {
     /// would then be stored a second time.
     pub fn advance(&self, mark: CollectMark) {
         let mut inner = self.inner.write().expect("collect marks lock");
-        let seen = inner.entry(mark.sender).or_insert(Seen {
+        let seen = inner.entry((mark.sender, mark.signal)).or_insert(Seen {
             at: Position::START,
             when: UNIX_EPOCH,
         });
@@ -133,7 +192,8 @@ impl CollectMarks {
         seen.when = SystemTime::now();
     }
 
-    pub fn senders(&self) -> usize {
+    /// How many streams are remembered — up to three per collecty.
+    pub fn streams(&self) -> usize {
         self.inner.read().expect("collect marks lock").len()
     }
 
@@ -165,14 +225,17 @@ impl CollectMarks {
             let at = 4 + index * MARK_ENTRY_BYTES;
             let mut id = [0u8; SENDER_ID_BYTES];
             id.copy_from_slice(&bytes[at..at + SENDER_ID_BYTES]);
+            let Some(signal) = CollectSignal::from_tag(bytes[at + SENDER_ID_BYTES]) else {
+                continue;
+            };
             let number = |from: usize| {
                 u64::from_le_bytes(bytes[from..from + 8].try_into().expect("eight bytes"))
             };
-            let segment = number(at + SENDER_ID_BYTES);
-            let records = number(at + SENDER_ID_BYTES + 8);
-            let seconds = number(at + SENDER_ID_BYTES + 16);
+            let segment = number(at + SENDER_ID_BYTES + 1);
+            let records = number(at + SENDER_ID_BYTES + 9);
+            let seconds = number(at + SENDER_ID_BYTES + 17);
             inner.insert(
-                SenderId(id),
+                (SenderId(id), signal),
                 Seen {
                     at: Position { segment, records },
                     when: UNIX_EPOCH + Duration::from_secs(seconds),
@@ -192,20 +255,21 @@ impl CollectMarks {
     /// while marks behind it would have those records sent again.
     pub fn store(&self, dir: &std::path::Path) -> Result<(), std::io::Error> {
         let now = SystemTime::now();
-        let live: Vec<(SenderId, Seen)> = {
+        let live: Vec<((SenderId, CollectSignal), Seen)> = {
             let mut inner = self.inner.write().expect("collect marks lock");
             inner.retain(|_, seen| {
                 now.duration_since(seen.when)
                     .map(|silent| silent < FORGET_AFTER)
                     .unwrap_or(true)
             });
-            inner.iter().map(|(id, seen)| (*id, *seen)).collect()
+            inner.iter().map(|(key, seen)| (*key, *seen)).collect()
         };
 
         let mut bytes = Vec::with_capacity(8 + live.len() * MARK_ENTRY_BYTES);
         bytes.extend_from_slice(&(live.len() as u32).to_le_bytes());
-        for (id, seen) in &live {
+        for ((id, signal), seen) in &live {
             bytes.extend_from_slice(&id.0);
+            bytes.push(signal.tag());
             bytes.extend_from_slice(&seen.at.segment.to_le_bytes());
             bytes.extend_from_slice(&seen.at.records.to_le_bytes());
             let seconds = seen
@@ -228,8 +292,8 @@ impl CollectMarks {
     }
 }
 
-/// `LGYM | sender | segment | records`, a WAL record of its own rather than a
-/// field on the records it covers.
+/// `LGYM | sender | signal | segment | records`, a WAL record of its own rather
+/// than a field on the records it covers.
 ///
 /// One per sender per batch, not one per record: the writer already groups
 /// what is in its channel into a single write and a single `sync_all`, and the
@@ -237,11 +301,12 @@ impl CollectMarks {
 /// would have paid for it once per export to say something the batch says
 /// once.
 const MARK_RECORD_MAGIC: &[u8; 4] = b"LGYM";
-pub const MARK_RECORD_BYTES: usize = 4 + SENDER_ID_BYTES + 8 + 8;
+pub const MARK_RECORD_BYTES: usize = 4 + SENDER_ID_BYTES + 1 + 8 + 8;
 
 pub fn frame_mark(mark: &CollectMark, into: &mut Vec<u8>) {
     into.extend_from_slice(MARK_RECORD_MAGIC);
     into.extend_from_slice(&mark.sender.0);
+    into.push(mark.signal.tag());
     into.extend_from_slice(&mark.at.segment.to_le_bytes());
     into.extend_from_slice(&mark.at.records.to_le_bytes());
 }
@@ -252,14 +317,15 @@ pub fn decode_mark(data: &[u8]) -> Option<CollectMark> {
     }
     let mut id = [0u8; SENDER_ID_BYTES];
     id.copy_from_slice(&data[4..4 + SENDER_ID_BYTES]);
-    let number = |from: usize| {
-        u64::from_le_bytes(data[from..from + 8].try_into().expect("eight bytes"))
-    };
+    let signal = CollectSignal::from_tag(data[4 + SENDER_ID_BYTES])?;
+    let number =
+        |from: usize| u64::from_le_bytes(data[from..from + 8].try_into().expect("eight bytes"));
     Some(CollectMark {
         sender: SenderId(id),
+        signal,
         at: Position {
-            segment: number(4 + SENDER_ID_BYTES),
-            records: number(4 + SENDER_ID_BYTES + 8),
+            segment: number(4 + SENDER_ID_BYTES + 1),
+            records: number(4 + SENDER_ID_BYTES + 9),
         },
     })
 }

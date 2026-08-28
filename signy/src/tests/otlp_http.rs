@@ -356,19 +356,18 @@
             .len()
     }
 
-    const LOGS_TAG: u8 = 1;
-    const TRACES_TAG: u8 = 2;
+    const LOGS: CollectSignal = CollectSignal::Logs;
+    const TRACES: CollectSignal = CollectSignal::Traces;
 
-    /// The batch collecty ships: each payload behind its own record header,
-    /// each record its own zstd frame, all of it concatenated. A real collecty
+    /// The batch collecty ships: each payload behind its own length, each
+    /// record its own zstd frame, all of it concatenated. A real collecty
     /// sends one stream over the whole segment, which decompresses the same
     /// way — this shape is the harder one for the reader, so it is what the
-    /// tests use.
-    fn zstd_frames(records: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    /// tests use. Nothing here names a signal: the request does, once.
+    fn zstd_frames(records: &[Vec<u8>]) -> Vec<u8> {
         let mut frames = Vec::new();
-        for (tag, payload) in records {
-            let mut plain = Vec::with_capacity(5 + payload.len());
-            plain.push(*tag);
+        for payload in records {
+            let mut plain = Vec::with_capacity(4 + payload.len());
             plain.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             plain.extend_from_slice(payload);
             frames.extend_from_slice(&zstd::bulk::compress(&plain, 3).unwrap());
@@ -378,10 +377,9 @@
 
     /// The shape a real collecty ships: one zstd stream over the whole
     /// segment, the records back to back inside it.
-    fn zstd_stream(records: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    fn zstd_stream(records: &[Vec<u8>]) -> Vec<u8> {
         let mut plain = Vec::new();
-        for (tag, payload) in records {
-            plain.push(*tag);
+        for payload in records {
             plain.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             plain.extend_from_slice(payload);
         }
@@ -390,15 +388,17 @@
 
     async fn post_collected(
         state: &Arc<AppState>,
+        signal: CollectSignal,
         encoding: &str,
         frames: Vec<u8>,
     ) -> (StatusCode, String) {
-        post_collected_as(state, test_tenant().as_str(), encoding, frames).await
+        post_collected_as(state, test_tenant().as_str(), signal, encoding, frames).await
     }
 
     async fn post_collected_as(
         state: &Arc<AppState>,
         tenant: &str,
+        signal: CollectSignal,
         encoding: &str,
         frames: Vec<u8>,
     ) -> (StatusCode, String) {
@@ -409,6 +409,7 @@
                 .header(header::CONTENT_TYPE, "application/x-protobuf")
                 .header(header::CONTENT_ENCODING, encoding)
                 .header(crate::tenant::TENANT_HEADER, tenant)
+                .header(crate::otlp_http::COLLECT_SIGNAL_HEADER, signal.as_str())
                 .body(axum::body::Body::from(frames))
                 .unwrap(),
             state,
@@ -422,6 +423,7 @@
     async fn post_collected_from(
         state: &Arc<AppState>,
         sender: &str,
+        signal: CollectSignal,
         segment: u64,
         frames: Vec<u8>,
     ) -> (StatusCode, String) {
@@ -433,6 +435,7 @@
                 .header(header::CONTENT_ENCODING, "zstd")
                 .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
                 .header(crate::otlp_http::COLLECT_SENDER_HEADER, sender)
+                .header(crate::otlp_http::COLLECT_SIGNAL_HEADER, signal.as_str())
                 .header(
                     crate::otlp_http::COLLECT_SEGMENT_HEADER,
                     segment.to_string(),
@@ -466,10 +469,10 @@
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn logs(lines: &[&str]) -> Vec<(u8, Vec<u8>)> {
+    fn logs(lines: &[&str]) -> Vec<Vec<u8>> {
         lines
             .iter()
-            .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
+            .map(|line| log_request(line).encode_to_vec())
             .collect()
     }
 
@@ -478,16 +481,15 @@
     #[tokio::test]
     async fn a_segment_compressed_as_one_stream_is_read_a_record_at_a_time() {
         let (memtable, state) = fixture();
-        let mut records = logs(&["first", "second", "third"]);
-        records.push((TRACES_TAG, span_request(1).encode_to_vec()));
+        let records = logs(&["first", "second", "third", "fourth"]);
 
-        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_stream(&records)).await;
+        let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_stream(&records)).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body, r#"{"stored":1}"#);
         let mut stored = lines(&memtable);
         stored.sort();
-        assert_eq!(stored, vec!["first", "second", "third"]);
+        assert_eq!(stored, vec!["first", "fourth", "second", "third"]);
     }
 
     /// The whole point of the numbering: a collecty that died before it could
@@ -498,11 +500,11 @@
         let (memtable, state) = fixture();
         let records = logs(&["first", "second", "third"]);
 
-        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+        let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body, r#"{"stored":1}"#);
 
-        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+        let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body, r#"{"stored":1}"#, "the answer does not move");
 
@@ -520,10 +522,10 @@
     #[tokio::test]
     async fn the_next_segment_carries_on_from_the_one_before() {
         let (memtable, state) = fixture();
-        post_collected_from(&state, SENDER, 1, zstd_frames(&logs(&["first"]))).await;
+        post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&logs(&["first"]))).await;
 
         let (status, body) =
-            post_collected_from(&state, SENDER, 2, zstd_frames(&logs(&["second"]))).await;
+            post_collected_from(&state, SENDER, LOGS, 2, zstd_frames(&logs(&["second"]))).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body, r#"{"stored":2}"#);
@@ -545,6 +547,7 @@
             .collect_marks()
             .advance(crate::journal::CollectMark {
                 sender: crate::journal::SenderId::parse(SENDER).unwrap(),
+                signal: LOGS,
                 at: crate::journal::Position {
                     segment: 1,
                     records: 2,
@@ -552,7 +555,7 @@
             });
 
         let records = logs(&["first", "second", "third", "fourth"]);
-        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+        let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&records)).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body, r#"{"stored":1}"#);
@@ -567,11 +570,11 @@
     #[tokio::test]
     async fn one_sender_s_segments_do_not_skip_another_s() {
         let (memtable, state) = fixture();
-        post_collected_from(&state, SENDER, 1, zstd_frames(&logs(&["mine"]))).await;
+        post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&logs(&["mine"]))).await;
 
         let other = "ffffffffffffffffffffffffffffffff";
         let (status, body) =
-            post_collected_from(&state, other, 1, zstd_frames(&logs(&["theirs"]))).await;
+            post_collected_from(&state, other, LOGS, 1, zstd_frames(&logs(&["theirs"]))).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         let mut lines = lines(&memtable);
@@ -586,16 +589,13 @@
     #[tokio::test]
     async fn a_segment_whose_last_record_is_dropped_still_finishes() {
         let (_memtable, state) = fixture();
-        let records = vec![
-            (TRACES_TAG, span_request(4).encode_to_vec()),
-            (LOGS_TAG, vec![0xFFu8; 16]),
-        ];
+        let records = vec![log_request("first").encode_to_vec(), vec![0xFFu8; 16]];
 
-        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+        let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body, r#"{"stored":1}"#);
 
-        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_frames(&records)).await;
+        let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             state
@@ -612,7 +612,7 @@
         let (_memtable, state) = fixture();
 
         let (status, body) =
-            post_collected_from(&state, "not-an-id", 1, zstd_frames(&logs(&["never stored"]))).await;
+            post_collected_from(&state, "not-an-id", LOGS, 1, zstd_frames(&logs(&["never stored"]))).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
@@ -622,7 +622,7 @@
         let (_memtable, state) = fixture();
 
         let (status, body) =
-            post_collected_from(&state, SENDER, 0, zstd_frames(&logs(&["never stored"]))).await;
+            post_collected_from(&state, SENDER, LOGS, 0, zstd_frames(&logs(&["never stored"]))).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
@@ -630,13 +630,10 @@
     #[tokio::test]
     async fn a_collected_batch_of_separate_exports_lands_as_every_line_it_carried() {
         let (memtable, state) = fixture();
-        let records: Vec<(u8, Vec<u8>)> = ["first", "second", "third"]
-            .iter()
-            .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
-            .collect();
+        let records = logs(&["first", "second", "third"]);
         let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected(&state, "zstd", frames).await;
+        let (status, body) = post_collected(&state, LOGS, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         let mut lines = lines(&memtable);
@@ -648,12 +645,12 @@
     async fn a_collected_batch_of_spans_reaches_the_trace_memtable() {
         let (_memtable, state) = fixture();
         let records = vec![
-            (TRACES_TAG, span_request(1).encode_to_vec()),
-            (TRACES_TAG, span_request(2).encode_to_vec()),
+            span_request(1).encode_to_vec(),
+            span_request(2).encode_to_vec(),
         ];
         let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected(&state, "zstd", frames).await;
+        let (status, body) = post_collected(&state, TRACES, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
@@ -672,7 +669,7 @@
         let (memtable, state) = fixture();
         let body = log_request("never stored").encode_to_vec();
 
-        let (status, _) = post_collected(&state, "gzip", body).await;
+        let (status, _) = post_collected(&state, LOGS, "gzip", body).await;
 
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert!(lines(&memtable).is_empty());
@@ -684,14 +681,14 @@
     #[tokio::test]
     async fn a_record_claiming_more_than_one_export_is_refused_before_it_arrives() {
         let (memtable, state) = fixture();
-        let mut plain = vec![LOGS_TAG];
+        let mut plain = Vec::new();
         plain.extend_from_slice(
             &((crate::otlp_http::MAX_COLLECT_RECORD_BYTES + 1) as u32).to_le_bytes(),
         );
         plain.extend_from_slice(b"and nothing like that much behind it");
         let frames = zstd::bulk::compress(&plain, 3).unwrap();
 
-        let (status, body) = post_collected(&state, "zstd", frames).await;
+        let (status, body) = post_collected(&state, LOGS, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
         assert!(lines(&memtable).is_empty());
@@ -703,21 +700,13 @@
     async fn a_batch_past_the_old_ceiling_lands_whole() {
         let (memtable, state) = fixture();
         let filler = "x".repeat(64 * 1024);
-        let records: Vec<(u8, Vec<u8>)> = (0..400)
-            .map(|index| {
-                (
-                    LOGS_TAG,
-                    log_request(&format!("{index} {filler}")).encode_to_vec(),
-                )
-            })
+        let records: Vec<Vec<u8>> = (0..400)
+            .map(|index| log_request(&format!("{index} {filler}")).encode_to_vec())
             .collect();
-        let plain_bytes: usize = records
-            .iter()
-            .map(|(_, payload)| 5 + payload.len())
-            .sum();
+        let plain_bytes: usize = records.iter().map(|payload| 4 + payload.len()).sum();
         assert!(plain_bytes > crate::trace_ingest::MAX_OTLP_REQUEST_BYTES);
 
-        let (status, body) = post_collected(&state, "zstd", zstd_frames(&records)).await;
+        let (status, body) = post_collected(&state, LOGS, "zstd", zstd_frames(&records)).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         let stored: usize = memtable
@@ -734,19 +723,25 @@
         assert_eq!(stored, 400);
     }
 
+    /// A batch is one signal's now, so a collecty that has both to send sends
+    /// them as two, and each lands in the store its request names.
     #[tokio::test]
-    async fn one_batch_of_mixed_signals_lands_in_every_store_it_names() {
+    async fn a_batch_per_signal_lands_in_the_store_its_request_names() {
         let (memtable, state) = fixture();
-        let records = vec![
-            (LOGS_TAG, log_request("first").encode_to_vec()),
-            (TRACES_TAG, span_request(7).encode_to_vec()),
-            (LOGS_TAG, log_request("second").encode_to_vec()),
-        ];
-        let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected(&state, "zstd", frames).await;
-
+        let (status, body) =
+            post_collected(&state, LOGS, "zstd", zstd_frames(&logs(&["first", "second"]))).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = post_collected(
+            &state,
+            TRACES,
+            "zstd",
+            zstd_frames(&[span_request(7).encode_to_vec()]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
         let mut lines = lines(&memtable);
         lines.sort();
         assert_eq!(lines, vec!["first", "second"]);
@@ -754,20 +749,16 @@
     }
 
     #[tokio::test]
-    async fn a_signal_that_will_never_decode_is_dropped_and_the_rest_of_the_batch_lands() {
+    async fn a_record_that_will_never_decode_is_dropped_and_the_rest_of_the_batch_lands() {
         let (memtable, state) = fixture();
         let poison = vec![0xFFu8; 16];
-        let records = vec![
-            (LOGS_TAG, poison.clone()),
-            (TRACES_TAG, span_request(9).encode_to_vec()),
-        ];
+        let records = vec![poison.clone(), log_request("after it").encode_to_vec()];
         let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected(&state, "zstd", frames).await;
+        let (status, body) = post_collected(&state, LOGS, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(lines(&memtable).is_empty());
-        assert_eq!(spans(&state), 1);
+        assert_eq!(lines(&memtable), vec!["after it"]);
         assert_eq!(
             state
                 .metrics
@@ -787,35 +778,50 @@
     #[tokio::test]
     async fn a_batch_whose_framing_does_not_add_up_is_refused() {
         let (memtable, state) = fixture();
-        let mut plain = vec![LOGS_TAG];
+        let mut plain = Vec::new();
         plain.extend_from_slice(&64u32.to_le_bytes());
         plain.extend_from_slice(b"eight...");
         let frames = zstd::bulk::compress(&plain, 3).unwrap();
 
-        let (status, body) = post_collected(&state, "zstd", frames).await;
+        let (status, body) = post_collected(&state, LOGS, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("claims 64 bytes"), "{body}");
         assert!(lines(&memtable).is_empty());
     }
 
+    /// A record no longer names its own signal, so a request that does not
+    /// name one says nothing about what its body holds.
     #[tokio::test]
-    async fn a_record_under_a_tag_signy_does_not_know_is_refused() {
+    async fn a_batch_that_does_not_name_its_signal_is_refused() {
         let (_memtable, state) = fixture();
-        let mut plain = vec![9u8];
-        plain.extend_from_slice(&0u32.to_le_bytes());
-        let frames = zstd::bulk::compress(&plain, 3).unwrap();
+        let frames = zstd_frames(&logs(&["never stored"]));
 
-        let (status, body) = post_collected(&state, "zstd", frames).await;
+        for headers in [Vec::new(), vec![("x-collecty-signal", "profiles")]] {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/signy/api/v1/collect")
+                .header(header::CONTENT_TYPE, "application/x-protobuf")
+                .header(header::CONTENT_ENCODING, "zstd")
+                .header(crate::tenant::TENANT_HEADER, test_tenant().as_str());
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let (status, body) = post_request(
+                request.body(axum::body::Body::from(frames.clone())).unwrap(),
+                &state,
+            )
+            .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("not a signal tag"), "{body}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("must name a signal"), "{body}");
+        }
     }
 
     /// A tenant nothing was pushed for is a policy mistake, and the batch
-    /// carrying it is still dropped: the collector has one queue for the whole
-    /// machine, so holding it would stop every other application on the host
-    /// behind one misconfigured process.
+    /// carrying it is still dropped: the collector has one queue per signal,
+    /// so holding it would stop every other application on the host behind one
+    /// misconfigured process.
     #[tokio::test]
     async fn a_tenant_this_instance_does_not_serve_is_dropped_rather_than_held() {
         let config = Config {
@@ -847,10 +853,10 @@
             tenant_policy,
         );
 
-        let records = vec![(LOGS_TAG, log_request("held, not lost").encode_to_vec())];
+        let records = vec![log_request("held, not lost").encode_to_vec()];
         let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected_as(&state, "stranger", "zstd", frames).await;
+        let (status, body) = post_collected_as(&state, "stranger", LOGS, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(lines(&memtable).is_empty());

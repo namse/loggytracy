@@ -836,6 +836,7 @@ can be written in"
                 make_otlp_req(&[("api", vec![("line", 1)])]),
                 CollectMark {
                     sender: id,
+                    signal: CollectSignal::Logs,
                     at: Position {
                         segment: 4,
                         records,
@@ -848,7 +849,10 @@ can be written in"
             segment: 4,
             records: 3,
         };
-        assert_eq!(h.journal.collect_marks().position(&id), reached);
+        assert_eq!(
+            h.journal.collect_marks().position(&id, CollectSignal::Logs),
+            reached
+        );
 
         let recovered = CollectMarks::default();
         let memtable = MemTable::new();
@@ -862,8 +866,16 @@ can be written in"
         )
         .unwrap();
 
-        assert_eq!(recovered.position(&id), reached);
-        assert_eq!(recovered.position(&sender(0x22)), Position::START);
+        assert_eq!(recovered.position(&id, CollectSignal::Logs), reached);
+        assert_eq!(
+            recovered.position(&id, CollectSignal::Traces),
+            Position::START,
+            "a signal is a stream of its own"
+        );
+        assert_eq!(
+            recovered.position(&sender(0x22), CollectSignal::Logs),
+            Position::START
+        );
     }
 
     /// The WAL suffix is not enough on its own: a checkpoint retires the prefix
@@ -883,6 +895,7 @@ can be written in"
             make_otlp_req(&[("api", vec![("line", 1)])]),
             CollectMark {
                 sender: id,
+                signal: CollectSignal::Logs,
                 at: reached,
             },
         )
@@ -891,8 +904,11 @@ can be written in"
         assert!(checkpoint.offset > 0);
 
         let carried = CollectMarks::load(&h.dir);
-        assert_eq!(carried.position(&id), reached);
-        assert_eq!(carried.position(&id).whole_segments(), 8);
+        assert_eq!(carried.position(&id, CollectSignal::Logs), reached);
+        assert_eq!(
+            carried.position(&id, CollectSignal::Logs).whole_segments(),
+            8
+        );
     }
 
     /// Never backwards, and a whole segment outranks any part of it. A mark
@@ -903,17 +919,50 @@ can be written in"
     async fn a_position_only_moves_forward() {
         let marks = CollectMarks::default();
         let id = sender(0x44);
-        let at = |segment, records| CollectMark {
+        let at = |signal, segment, records| CollectMark {
             sender: id,
+            signal,
             at: Position { segment, records },
         };
+        let logs = CollectSignal::Logs;
 
-        marks.advance(at(3, 40));
-        marks.advance(at(3, 12));
-        assert_eq!(marks.position(&id), Position { segment: 3, records: 40 });
+        marks.advance(at(logs, 3, 40));
+        marks.advance(at(logs, 3, 12));
+        assert_eq!(
+            marks.position(&id, logs),
+            Position {
+                segment: 3,
+                records: 40
+            }
+        );
 
-        marks.advance(at(4, 0));
-        marks.advance(at(3, 90));
-        assert_eq!(marks.position(&id), Position { segment: 4, records: 0 });
-        assert_eq!(marks.position(&id).whole_segments(), 3);
+        marks.advance(at(logs, 4, 0));
+        marks.advance(at(logs, 3, 90));
+        assert_eq!(
+            marks.position(&id, logs),
+            Position {
+                segment: 4,
+                records: 0
+            }
+        );
+        assert_eq!(marks.position(&id, logs).whole_segments(), 3);
+
+        // One signal's position says nothing about another's: they are
+        // numbered apart and arrive interleaved.
+        marks.advance(at(CollectSignal::Traces, 2, 5));
+        assert_eq!(
+            marks.position(&id, CollectSignal::Traces),
+            Position {
+                segment: 2,
+                records: 5
+            }
+        );
+        assert_eq!(
+            marks.position(&id, logs),
+            Position {
+                segment: 4,
+                records: 0
+            },
+            "and one does not move the other"
+        );
     }

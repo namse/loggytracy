@@ -20,8 +20,8 @@ use prost014::Message;
 use futures_util::StreamExt;
 
 use crate::AppState;
-use crate::backpressure::{IngestError, InflightBody};
-use crate::journal::PendingAppend;
+use crate::backpressure::{InflightBody, IngestError};
+use crate::journal::{CollectSignal, PendingAppend};
 use crate::log_ingest::OtlpLogIngest;
 use crate::series_ingest::OtlpMetricIngest;
 use crate::trace_ingest::{MAX_OTLP_REQUEST_BYTES, OtlpTraceIngest};
@@ -217,9 +217,10 @@ pub async fn metrics(
 /// so a collector sees one size whichever transport it picks.
 pub const MAX_OTLP_HTTP_BODY_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
 
-/// The header collecty writes in front of each record's payload: one signal
-/// tag and the payload's length, little-endian.
-const COLLECT_RECORD_HEADER_BYTES: usize = 5;
+/// The header collecty writes in front of each record's payload: the payload's
+/// length, little-endian. The signal is not repeated here — the request names
+/// it once for the whole segment.
+const COLLECT_RECORD_HEADER_BYTES: usize = 4;
 
 /// The one ceiling the collect route still has: a single record's payload,
 /// which is one OTLP export and is bounded exactly as one is on the push
@@ -244,12 +245,16 @@ pub const MAX_COLLECT_RECORD_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
 /// exports.
 const MAX_INFLIGHT_RECORDS: usize = 32;
 
-/// Which collecty sent the segment, and which segment it is.
+/// Which collecty sent the segment, which of its three streams it belongs to,
+/// and which segment of that stream it is.
 ///
 /// The body carries no numbers of its own and does not need to: a segment is
 /// sent from its first record every time, so counting while reading places
-/// every record without a per-record cost on the wire.
+/// every record without a per-record cost on the wire. The signal is here for
+/// the same reason — a segment holds one signal's exports and no others, so
+/// the answer is the same for the whole body.
 pub const COLLECT_SENDER_HEADER: &str = "x-collecty-sender";
+pub const COLLECT_SIGNAL_HEADER: &str = "x-collecty-signal";
 pub const COLLECT_SEGMENT_HEADER: &str = "x-collecty-segment";
 
 /// Compressed bytes fed to the decoder before its output is drained.
@@ -259,40 +264,13 @@ pub const COLLECT_SEGMENT_HEADER: &str = "x-collecty-segment";
 /// that the server never holds the batch.
 const DECODER_FEED_BYTES: usize = 16 * 1024;
 
-/// The signals a collected batch may carry, in the order they are ingested.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CollectSignal {
-    Logs,
-    Traces,
-    Metrics,
-}
-
-impl CollectSignal {
-    fn from_tag(tag: u8) -> Option<CollectSignal> {
-        match tag {
-            1 => Some(CollectSignal::Logs),
-            2 => Some(CollectSignal::Traces),
-            3 => Some(CollectSignal::Metrics),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            CollectSignal::Logs => "logs",
-            CollectSignal::Traces => "traces",
-            CollectSignal::Metrics => "metrics",
-        }
-    }
-}
-
-/// One collected batch, every signal, read as it arrives.
+/// One collected batch, one signal, read as it arrives.
 ///
-/// collecty keeps a single queue, so what arrives here is a mix: records in
-/// arrival order, each naming its signal, all of them inside one zstd stream.
-/// Every record is a complete export on its own, which is what makes reading
-/// the body a record at a time possible at all — nothing has to be held back
-/// waiting for a later part of the batch to make sense of it.
+/// collecty keeps a queue per signal, so a batch is one signal's exports back
+/// to back inside one zstd stream, and the request says which. Every record is
+/// a complete export on its own, which is what makes reading the body a record
+/// at a time possible at all — nothing has to be held back waiting for a later
+/// part of the batch to make sense of it.
 pub async fn collect(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -339,10 +317,11 @@ async fn collect_inner(
     let tenant = crate::tenant::from_headers(headers, &state.config, &state.tenant_policy)
         .map_err(crate::tenant::TenantError::into_http);
 
+    let signal = collect_signal(headers)?;
     let sender = collect_sender(headers)?;
     let marks = state.journal.collect_marks();
     let at = sender
-        .map(|(id, _)| marks.position(&id))
+        .map(|(id, _)| marks.position(&id, signal))
         .unwrap_or(crate::journal::Position::START);
 
     // Already stored whole, on an attempt whose answer this collecty never
@@ -351,7 +330,12 @@ async fn collect_inner(
     if let Some((id, segment)) = sender
         && segment < at.segment
     {
-        tracing::debug!(sender = %id, segment, "a segment this instance already has, answered unread");
+        tracing::debug!(
+            sender = %id,
+            signal = signal.as_str(),
+            segment,
+            "a segment this instance already has, answered unread"
+        );
         return Ok(answer(at));
     }
     if let Some((id, segment)) = sender
@@ -359,6 +343,7 @@ async fn collect_inner(
     {
         tracing::warn!(
             sender = %id,
+            signal = signal.as_str(),
             segment,
             expected = at.segment,
             "a collecty starts past what this instance has; the segments between are gone"
@@ -376,7 +361,7 @@ async fn collect_inner(
     let mut inflight: VecDeque<(InflightBody, PendingAppend)> = VecDeque::new();
     let mut index = 0u64;
 
-    while let Some((signal, payload)) = records.next().await? {
+    while let Some(payload) = records.next().await? {
         let seen = index;
         index += 1;
         if seen < already {
@@ -388,6 +373,7 @@ async fn collect_inner(
         }
         let mark = sender.map(|(id, segment)| crate::journal::CollectMark {
             sender: id,
+            signal,
             at: crate::journal::Position {
                 segment,
                 records: index,
@@ -443,6 +429,7 @@ async fn collect_inner(
             .journal
             .enqueue_mark(crate::journal::CollectMark {
                 sender: id,
+                signal,
                 at: crate::journal::Position {
                     segment: segment + 1,
                     records: 0,
@@ -455,9 +442,11 @@ async fn collect_inner(
             .map_err(crate::log_ingest::journal_write_failed)?;
     }
 
-    Ok(answer(sender.map(|(id, _)| marks.position(&id)).unwrap_or(
-        crate::journal::Position::START,
-    )))
+    Ok(answer(
+        sender
+            .map(|(id, _)| marks.position(&id, signal))
+            .unwrap_or(crate::journal::Position::START),
+    ))
 }
 
 /// The one thing a collecty reads out of a success: the last segment this
@@ -470,12 +459,31 @@ fn answer(at: crate::journal::Position) -> Response {
         .into_response()
 }
 
+/// Which of the three signals the batch carries.
+///
+/// Required of every caller, collecty or not: a record no longer names its own
+/// signal, so without this there is nothing to say what the body holds.
+fn collect_signal(headers: &HeaderMap) -> Result<CollectSignal, IngestError> {
+    headers
+        .get(COLLECT_SIGNAL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(CollectSignal::parse)
+        .ok_or_else(|| {
+            IngestError::from((
+                StatusCode::BAD_REQUEST,
+                format!("{COLLECT_SIGNAL_HEADER} must name a signal: logs, traces or metrics"),
+            ))
+        })
+}
+
 /// Who sent the segment and which segment it is, when the request says.
 ///
 /// Absent means a caller that is not a collecty — a test, or a hand-made
 /// request. Nothing is skipped and no mark is written for one: the numbering
 /// belongs to a queue, and a caller without a queue has none.
-fn collect_sender(headers: &HeaderMap) -> Result<Option<(crate::journal::SenderId, u64)>, IngestError> {
+fn collect_sender(
+    headers: &HeaderMap,
+) -> Result<Option<(crate::journal::SenderId, u64)>, IngestError> {
     let Some(raw) = headers.get(COLLECT_SENDER_HEADER) else {
         return Ok(None);
     };
@@ -568,13 +576,13 @@ async fn enqueue_record(
 /// and `429`.
 ///
 /// **`403`, a tenant this instance does not serve.** Holding it would be the
-/// kinder answer if the collector had a queue per tenant, or even per signal.
-/// It has one queue for the whole machine, so a single application exporting
-/// under an unknown tenant stops every other application's logs, spans and
-/// metrics behind it — a policy mistake with a blast radius of one process
-/// becomes an outage for the host. Dropping keeps the loss where the mistake
-/// is, and `signy_collect_dropped_records_total` with the warning beside it is
-/// how an operator finds out.
+/// kinder answer if the collector had a queue per tenant. It has one per
+/// signal, so a single application exporting under an unknown tenant stops
+/// every other application's logs behind it — a policy mistake with a blast
+/// radius of one process becomes an outage for a signal on the host. Dropping
+/// keeps the loss where the mistake is, and
+/// `signy_collect_dropped_records_total` with the warning beside it is how an
+/// operator finds out.
 ///
 /// **`429`, a tenant storing everything its plan sells.** It clears when
 /// retention retires parts, which is not a timescale a disk queue can wait out.
@@ -589,9 +597,9 @@ fn never_acceptable(status: StatusCode) -> bool {
 ///
 /// Two layers unwrap here, neither of which needs the whole body. The frames
 /// are decompressed into whatever the decoder has been able to produce, and
-/// the plain bytes behind them are `tag | length | payload` repeated, so a
-/// record can be taken as soon as its last byte has arrived. What is buffered
-/// is one record at most.
+/// the plain bytes behind them are `length | payload` repeated, so a record can
+/// be taken as soon as its last byte has arrived. What is buffered is one
+/// record at most.
 struct CollectedRecords {
     body: axum::body::BodyDataStream,
     decoder: zstd::stream::write::Decoder<'static, Vec<u8>>,
@@ -615,7 +623,7 @@ impl CollectedRecords {
         })
     }
 
-    async fn next(&mut self) -> Result<Option<(CollectSignal, Vec<u8>)>, IngestError> {
+    async fn next(&mut self) -> Result<Option<Vec<u8>>, IngestError> {
         loop {
             if let Some(record) = self.take()? {
                 return Ok(Some(record));
@@ -661,19 +669,16 @@ impl CollectedRecords {
     }
 
     /// The record at the front of the decoded bytes, if all of it has arrived.
-    fn take(&mut self) -> Result<Option<(CollectSignal, Vec<u8>)>, IngestError> {
+    fn take(&mut self) -> Result<Option<Vec<u8>>, IngestError> {
         let plain = self.decoder.get_ref();
         if plain.len() < COLLECT_RECORD_HEADER_BYTES {
             return Ok(None);
         }
-        let Some(signal) = CollectSignal::from_tag(plain[0]) else {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("{} is not a signal tag", plain[0]),
-            )
-                .into());
-        };
-        let len = u32::from_le_bytes(plain[1..5].try_into().expect("four bytes")) as usize;
+        let len = u32::from_le_bytes(
+            plain[..COLLECT_RECORD_HEADER_BYTES]
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
         // Checked before the bytes are waited for, not after they arrive: the
         // length is what says how much to buffer, so trusting it first is what
         // an unbounded buffer would look like.
@@ -693,7 +698,7 @@ impl CollectedRecords {
         let plain = self.decoder.get_mut();
         let payload = plain[COLLECT_RECORD_HEADER_BYTES..record_end].to_vec();
         plain.drain(..record_end);
-        Ok(Some((signal, payload)))
+        Ok(Some(payload))
     }
 
     fn truncated(&self, left: usize) -> IngestError {
@@ -701,11 +706,17 @@ impl CollectedRecords {
         if left < COLLECT_RECORD_HEADER_BYTES {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("a record header needs {COLLECT_RECORD_HEADER_BYTES} bytes and {left} are left"),
+                format!(
+                    "a record header needs {COLLECT_RECORD_HEADER_BYTES} bytes and {left} are left"
+                ),
             )
                 .into();
         }
-        let len = u32::from_le_bytes(plain[1..5].try_into().expect("four bytes"));
+        let len = u32::from_le_bytes(
+            plain[..COLLECT_RECORD_HEADER_BYTES]
+                .try_into()
+                .expect("four bytes"),
+        );
         (
             StatusCode::BAD_REQUEST,
             format!(
