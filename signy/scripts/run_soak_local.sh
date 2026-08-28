@@ -50,6 +50,14 @@ EPS="${SOAK_EPS:-20000}"
 CONNS="${SOAK_CONNECTIONS:-8}"
 QUERY_EPS="${SOAK_QUERY_EPS:-5}"
 RETENTION="${SOAK_RETENTION:-30m}"
+# Retention is a tenant policy the harness pushes, not a server-wide setting:
+# SIGNY_RETENTION_PERIOD stopped being read when it moved there, so the leg
+# this knob names had been running against nothing. `off` is this script's
+# documented spelling; the policy's is `infinite`.
+case "$RETENTION" in
+  off) TENANT_RETENTION="infinite" ;;
+  *)   TENANT_RETENTION="$RETENTION" ;;
+esac
 RETENTION_INTERVAL="${SOAK_RETENTION_INTERVAL:-60s}"
 RETENTION_GRACE="${SOAK_RETENTION_GRACE:-5m}"
 # The comparison bed's seed, so this run's corpus is the bed's corpus.
@@ -89,7 +97,6 @@ trap cleanup EXIT
 env SIGNY_LISTEN_ADDR="127.0.0.1:$PORT" \
     SIGNY_OTLP_GRPC_ADDR="127.0.0.1:$((PORT + 1000))" \
     SIGNY_DATA_DIR="$DATA" \
-    SIGNY_RETENTION_PERIOD="$RETENTION" \
     SIGNY_RETENTION_INTERVAL="$RETENTION_INTERVAL" \
     SIGNY_RETENTION_GRACE_PERIOD="$RETENTION_GRACE" \
     ${SOAK_SERVER_ENV:-} \
@@ -221,6 +228,7 @@ SIGNY_LOAD_TARGET_EPS="$EPS" \
 SIGNY_LOAD_CONNECTIONS="$CONNS" \
 SIGNY_LOAD_QUERY_EPS="$QUERY_EPS" \
 SIGNY_LOAD_OTLP_EPS=0 \
+SIGNY_LOAD_TENANT_RETENTION="$TENANT_RETENTION" \
 SIGNY_LOAD_RESULT_PATH="$OUT/load.json" \
   "$ROOT/target/release/load" >"$OUT/harness.log" 2>&1
 HARNESS_STATUS=$?

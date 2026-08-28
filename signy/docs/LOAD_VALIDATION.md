@@ -229,9 +229,9 @@ leaving the probe to query an empty range. Both behaviors are normal on their ow
 Change all three settings together to observe it.
 
 ```
-SIGNY_MERGE_INTERVAL=3600s     # let parts accumulate
-SIGNY_RETENTION_PERIOD=off     # retain old data for the probe
-SIGNY_CACHE_MAX_BYTES=524288   # make the working set exceed the cache
+SIGNY_MERGE_INTERVAL=3600s            # let parts accumulate
+SIGNY_LOAD_TENANT_RETENTION=infinite  # retain old data for the probe
+SIGNY_CACHE_MAX_BYTES=524288          # make the working set exceed the cache
 SIGNY_LOAD_RESTORE_LOOKBACK_SECONDS=40
 ```
 

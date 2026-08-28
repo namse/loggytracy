@@ -55,7 +55,10 @@ export SIGNY_FLUSH_MAX_INTERVAL="${SIGNY_FLUSH_MAX_INTERVAL:-2s}"
 export SIGNY_MERGE_INTERVAL="${SIGNY_MERGE_INTERVAL:-8s}"
 # Retention has to outlast the query range or every wide scan reads an empty
 # window and the run measures the scheduler admitting scans that do nothing.
-export SIGNY_RETENTION_PERIOD="${SIGNY_RETENTION_PERIOD:-600s}"
+# Pushed by the harness when it onboards its tenants: retention lives in the
+# tenant policy now, and the SIGNY_RETENTION_PERIOD this used to set stopped
+# being read when it moved there.
+export SIGNY_LOAD_TENANT_RETENTION="${SIGNY_LOAD_TENANT_RETENTION:-600s}"
 export SIGNY_RETENTION_GRACE_PERIOD="${SIGNY_RETENTION_GRACE_PERIOD:-5s}"
 export SIGNY_RETENTION_INTERVAL="${SIGNY_RETENTION_INTERVAL:-30s}"
 # The term this profile exists to exercise. Named here rather than passed to the
