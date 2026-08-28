@@ -122,20 +122,28 @@ option that leaves the **least** memory held anywhere:
   which is one buffer for the whole segment however many records went through
   it, and what reaches the page cache is reclaimable and charged to nobody's RSS.
 
-What that costs: **a segment that has not closed is not promised to anyone.** A
-machine that loses power loses the open segment, which
-`COLLECTY_SEGMENT_MAX_AGE` (1 s) bounds. A collecty that crashes or is
-redeployed loses only what the encoder had not written yet — the kernel still
-holds the blocks that had reached it, and recovery reads them back.
+What that costs, by how the process ends:
 
-This is a real step back from acknowledging after `write(2)`, which is what the
-per-record framing allowed: there, a process crash lost nothing at all. It is
-the price of one stream a segment, and it is bounded by the same knob that
-already bounds how long a record waits before it leaves the machine.
+- **A clean stop** loses nothing. `SIGTERM` closes the open segment on the way
+  out, which is the same `fsync` a full one gets.
+- **A crash** loses what the encoder had not written yet — a block's worth at
+  most. The kernel still holds the blocks that had reached it, and recovery
+  reads them back.
+- **A power cut** loses the open segment, because nothing in it was `fsync`ed.
+  `COLLECTY_SEGMENT_MAX_AGE` (1 s) is what bounds that.
 
-Flushing the encoder on a timer would buy the old window back, and it was
-measured and rejected: a flush ends a block early, and flushing often enough to
-matter is close to giving up the ratio this is all for.
+The middle one is a real step back from acknowledging after `write(2)`, which is
+what per-record framing allowed: there a process crash lost nothing at all. It
+is the price of one stream a segment.
+
+Flushing the encoder would narrow that window, and where to flush was the
+decision this made rather than avoided. Per record is the only setting that
+closes it completely, and it is the one that gives the ratio away: measured at
+42× down to 4.2× on the same records. Anything coarser — every *n* records, or
+on a timer — costs little ratio but only moves the window rather than closing
+it, in exchange for a second durability knob that would have to be explained
+against the segment. So the segment is the only unit, and it is the one an
+operator already has a reason to think about.
 
 ## The disk queue
 
