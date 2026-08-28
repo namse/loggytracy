@@ -107,7 +107,6 @@ fn count_spans(request: &ExportTraceServiceRequest) -> Result<usize, IngestError
         })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,9 +117,9 @@ mod tests {
     use crate::tenant::test_tenant;
     use crate::trace::TraceMemTable;
     use crate::trace_registry::TraceRegistry;
-    use std::sync::Arc;
     use opentelemetry_proto::tonic::common::v1::AnyValue;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// The collect route's own sequence over one record, so these tests refuse

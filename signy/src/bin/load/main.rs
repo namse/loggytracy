@@ -41,9 +41,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost014::Message;
 
-use opentelemetry_proto::tonic::collector::trace::v1::{
-    ExportTraceServiceRequest,
-};
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};

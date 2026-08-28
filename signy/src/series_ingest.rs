@@ -794,7 +794,6 @@ mod tests {
     use crate::backpressure::IngestGate;
     use crate::series::SeriesMemTable;
     use crate::shutdown::ShutdownState;
-    use std::sync::Arc;
     use crate::tenant::test_tenant;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::metrics::v1::{
@@ -802,6 +801,7 @@ mod tests {
         exponential_histogram_data_point, summary_data_point,
     };
     use opentelemetry_proto::tonic::resource::v1::Resource;
+    use std::sync::Arc;
 
     fn attr(key: &str, value: &str) -> KeyValue {
         KeyValue {
@@ -1223,10 +1223,7 @@ mod tests {
             ..Config::default()
         };
         let (ingest, series_memtable, journal) = ingest_over(config);
-        ingest
-            .accept(small_request())
-            .await
-            .unwrap();
+        ingest.accept(small_request()).await.unwrap();
         let live = series_memtable.sorted_samples(&test_tenant()).unwrap();
         assert_eq!(live.len(), 1);
 
@@ -1571,10 +1568,7 @@ mod tests {
             ..Config::default()
         };
         let (ingest, series_memtable, journal) = ingest_over(config.clone());
-        ingest
-            .accept(small_request())
-            .await
-            .unwrap();
+        ingest.accept(small_request()).await.unwrap();
         let live = series_memtable.sorted_samples(&test_tenant()).unwrap();
 
         let registry = crate::part_registry::PartRegistry::new();
