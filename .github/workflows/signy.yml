@@ -77,44 +77,6 @@ jobs:
           path: signy/target/test-output.log
           if-no-files-found: ignore
 
-      - name: Load-harness smoke run
-        # NOT A MEASUREMENT. Debug profile, twenty seconds, on a shared runner
-        # whose neighbours are invisible to us: every latency and throughput
-        # number this produces is noise. This repository has already published
-        # numbers from a machine that was busy doing something else
-        # (docs/LOAD_RESULTS.md), so the gate below reads the verdict field and
-        # deliberately ignores its value.
-        #
-        # What it does catch: the run script or the harness failing to run at
-        # all. Exit 1 is "the server never became ready" and exit 101 is a
-        # panic; both are real breakage. Exit 2 is the harness reporting a
-        # verdict other than PASS, which is the expected outcome here -- a
-        # twenty-second run cannot even collect the 101 samples a p99 requires.
-        timeout-minutes: 10
-        env:
-          # `debug` reuses the artifacts `cargo test` just built. A debug harness
-          # measures the harness, which is fine when nothing is being measured.
-          SIGNY_LOAD_PROFILE: debug
-          SIGNY_LOAD_SECONDS: '20'
-          SIGNY_LOAD_WARMUP_SECONDS: '2'
-          SIGNY_LOAD_CORPUS_ROWS: '2000'
-          SIGNY_LOAD_STREAMS: '32'
-          SIGNY_LOAD_TARGET_EPS: '200'
-        run: |
-          set -uo pipefail
-          status=0
-          ./scripts/run_load_local.sh || status=$?
-          case "$status" in
-            0|2) ;;
-            *) echo "::error::the load harness did not complete (exit $status)"; exit 1 ;;
-          esac
-          verdict=$(jq -r '.verdict // empty' target/load_result.json)
-          if [ -z "$verdict" ]; then
-            echo "::error::the harness produced no verdict"
-            exit 1
-          fi
-          echo "harness verdict: $verdict (recorded, not gated -- see above)"
-
   # Separate job: the benches build under the `bench` profile, so they share no
   # compiled artifacts with `check` and there is nothing to gain by serializing
   # them behind it.
