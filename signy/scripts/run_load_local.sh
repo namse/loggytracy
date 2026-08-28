@@ -98,7 +98,10 @@ if [ -z "${SIGNY_MACHINE_PROFILE:-}" ]; then
 fi
 
 # The harness exits non-zero when its verdict is not PASS, which is the point of
-# having a verdict. `set -e` must not cut off the server log that explains why.
+# having a verdict, and exits 3 when the bed never got its load into the server
+# -- a separate code because that one, unlike a verdict a short run cannot
+# reach, is never an ordinary outcome. `set -e` must not cut off the server log
+# that explains why.
 STATUS=0
 SIGNY_LOAD_SERVER_PID="$SERVER_PID" \
 SIGNY_LOAD_ADDR="${SIGNY_LOAD_ADDR:-$LISTEN_ADDR}" \
@@ -111,5 +114,5 @@ SIGNY_MACHINE_PROFILE="$SIGNY_MACHINE_PROFILE" \
 
 echo "=== server log tail ==="
 tail -20 "$SERVER_LOG"
-echo "=== harness exit status: $STATUS (0 = PASS) ==="
+echo "=== harness exit status: $STATUS (0 = PASS, 3 = load never landed) ==="
 exit "$STATUS"

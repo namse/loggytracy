@@ -696,6 +696,21 @@ async fn run_load(cfg: Config) {
         eprintln!("warning: failed to write result file {path}: {error}");
     }
     println!("{rendered}");
+    // Two codes, because a caller has to be able to ignore one without ignoring
+    // the other. Exit 2 is "the verdict is not PASS", which a run too short to
+    // fill its percentiles reaches on the numeric gates alone; a caller that
+    // knows its run is short is entitled to wave that through. A run that did
+    // not get its load into the system under test is not a short run, and
+    // nothing entitles a caller to wave it through, so it leaves by a door of
+    // its own.
+    if report["load_delivered"] == json!(false) {
+        eprintln!(
+            "the bed did not deliver its load; nothing under the verdict measures anything. \
+             behavioral.delivered in the result file says which half failed -- nothing was \
+             accepted, or what was accepted was dropped on arrival"
+        );
+        std::process::exit(3);
+    }
     if report["verdict"] != json!("PASS") {
         std::process::exit(2);
     }
@@ -1292,6 +1307,12 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
     let merge_success = delta("signy_merge_success_total");
     let merge_errors = delta("signy_merge_errors_total");
     let ingest_errors = delta("signy_ingest_errors_total");
+    let dropped_resources = probe::sum_delta(
+        &start_metrics,
+        &end_metrics,
+        "signy_ingest_dropped_resources_total",
+    );
+    let signy_delivered = push.events_accepted > 0 && dropped_resources == 0;
     let retention_success = delta("signy_retention_success_total");
     let restore_success = delta("signy_remote_restore_success_total");
     let restore_errors = delta("signy_remote_restore_errors_total");
@@ -1395,9 +1416,35 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
     // old sample or an unordered write would show up. Every deviation this bed
     // makes from Loki's defaults exists to keep that counter at zero, and a
     // run where it is not zero is a misconfiguration on our side, not a result.
-    let (behavioral, behavioral_pass) = match cfg.target {
+    // `delivered` is the arrival gate on its own, split out of the pass so the
+    // exit code can key on it. Every target has one and it means the same thing
+    // in each: the bed put its load into the system under test. A run that did
+    // not is not a slow run or a short one, it is not a run.
+    let (behavioral, behavioral_pass, delivered) = match cfg.target {
+        // The two gates Loki's and VictoriaLogs' arms already lead with, and
+        // signy's did not: something arrived, and nothing was thrown away.
+        //
+        // Neither is spare. `events_accepted` is the harness's own count, taken
+        // where a push was answered 200, and it is what a run refused outright
+        // leaves at zero -- `signy_ingest_errors_total` counts what ingest
+        // failed at rather than what admission turned away, so it stays clean
+        // through a run in which nothing was stored. `dropped_resources` is the
+        // other half, and the one no client can see: an export naming a tenant
+        // this instance does not serve is dropped and still answered 200, so a
+        // bed whose tenants were never onboarded reports every push accepted
+        // and stores none of them. The counter's own help text says why it has
+        // to be read here -- an ingest answers whether the body arrived and
+        // nothing about who sent it.
         Target::Signy => (
             json!({
+                "delivered": signy_delivered,
+                "events_accepted": push.events_accepted,
+                "dropped_resources": dropped_resources,
+                "dropped_by_reason": probe::breakdown(
+                    &end_metrics,
+                    "signy_ingest_dropped_resources_total",
+                    "reason",
+                ),
                 "no_ingest_errors": ingest_errors == 0,
                 "remote_healthy_fraction": remote_healthy_fraction,
                 "cache_healthy_end": cache_healthy_end,
@@ -1416,10 +1463,12 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 "restore_probes_with_rows": query.restore_probes_with_rows,
                 "retention_observed": retention_success > 0,
             }),
-            ingest_errors == 0
+            signy_delivered
+                && ingest_errors == 0
                 && remote_healthy_fraction >= 0.95
                 && cache_healthy_end
                 && flush_progressing,
+            signy_delivered,
         ),
         Target::Loki => {
             let lines_received = probe::sum_delta(
@@ -1431,6 +1480,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 probe::sum_delta(&start_metrics, &end_metrics, "loki_discarded_samples_total");
             (
                 json!({
+                    "delivered": lines_received > 0 && discarded == 0,
                     "lines_received": lines_received,
                     "discarded_samples": discarded,
                     "discarded_by_reason": probe::breakdown(
@@ -1449,6 +1499,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 result; the reason label says which limit did it",
                 }),
                 lines_received > 0 && discarded == 0,
+                lines_received > 0 && discarded == 0,
             )
         }
         // Same rule as Loki's: a rejection here is this bed misconfiguring the
@@ -1459,6 +1510,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
             let dropped = probe::sum_delta(&start_metrics, &end_metrics, "vl_rows_dropped_total");
             (
                 json!({
+                    "delivered": rows > 0 && dropped == 0,
                     "rows_ingested": rows,
                     "rows_dropped": dropped,
                     "dropped_by_reason": probe::breakdown(
@@ -1471,6 +1523,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                     "note": "a non-zero drop count is this bed misconfiguring VictoriaLogs, not a \
                 VictoriaLogs result",
                 }),
+                rows > 0 && dropped == 0,
                 rows > 0 && dropped == 0,
             )
         }
@@ -1502,6 +1555,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         },
         "numeric_pass": numeric_pass,
         "behavioral_pass": behavioral_pass,
+        "load_delivered": delivered,
         "targets": targets,
         "behavioral": behavioral,
         "run": {
