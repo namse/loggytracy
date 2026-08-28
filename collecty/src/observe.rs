@@ -119,14 +119,16 @@ pub struct Reporter {
     queue: Arc<Queue>,
     stats: Arc<SenderStats>,
     started_unix_nanos: u64,
+    tenant: Option<String>,
 }
 
 impl Reporter {
-    pub fn new(queue: Arc<Queue>, stats: Arc<SenderStats>) -> Reporter {
+    pub fn new(queue: Arc<Queue>, stats: Arc<SenderStats>, tenant: Option<String>) -> Reporter {
         Reporter {
             queue,
             stats,
             started_unix_nanos: unix_nanos(),
+            tenant,
         }
     }
 
@@ -147,8 +149,20 @@ impl Reporter {
         }
     }
 
-    pub fn export(&self, observed: &Observation) -> Vec<u8> {
-        encode(observed, self.started_unix_nanos, unix_nanos())
+    /// The export to push, or `None` when no tenant was configured.
+    ///
+    /// signy drops an export naming no tenant and says nothing about it, so a
+    /// collecty with none produces bytes that are queued, shipped and thrown
+    /// away. The stderr summary below runs either way, so the numbers are
+    /// still available — only the push of them is not.
+    pub fn export(&self, observed: &Observation) -> Option<Vec<u8>> {
+        let tenant = self.tenant.as_deref()?;
+        Some(encode(
+            observed,
+            self.started_unix_nanos,
+            unix_nanos(),
+            tenant,
+        ))
     }
 
     pub fn log(&self, observed: &Observation) {
@@ -168,7 +182,11 @@ impl Reporter {
     }
 }
 
-pub fn encode(observed: &Observation, started: u64, now: u64) -> Vec<u8> {
+/// `tenant` is stamped onto the resource because that is where signy reads it
+/// from. collecty never writes it onto anything it forwards — those carry
+/// their own, and collecty does not decode them — so this export is the one
+/// place it names a tenant at all.
+pub fn encode(observed: &Observation, started: u64, now: u64, tenant: &str) -> Vec<u8> {
     let metrics = FAMILIES
         .iter()
         .map(|family| {
@@ -201,7 +219,10 @@ pub fn encode(observed: &Observation, started: u64, now: u64) -> Vec<u8> {
     ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
             resource: Some(Resource {
-                attributes: vec![attribute("service.name", "collecty")],
+                attributes: vec![
+                    attribute(crate::TENANT_ATTRIBUTE, tenant),
+                    attribute("service.name", "collecty"),
+                ],
                 ..Default::default()
             }),
             scope_metrics: vec![ScopeMetrics {
@@ -243,8 +264,10 @@ mod tests {
             ..Observation::default()
         };
 
-        let export = ExportMetricsServiceRequest::decode(encode(&observed, 5, 9).as_slice())
-            .expect("a decodable export");
+        let export = ExportMetricsServiceRequest::decode(
+            encode(&observed, 5, 9, "collecty-tenant").as_slice(),
+        )
+        .expect("a decodable export");
         let scope = &export.resource_metrics[0].scope_metrics[0];
 
         assert_eq!(scope.metrics.len(), FAMILIES.len());
@@ -259,6 +282,54 @@ mod tests {
         }
     }
 
+    /// The one export collecty builds itself has to say whose it is, or signy
+    /// drops it without telling anyone.
+    #[test]
+    fn the_self_export_names_the_configured_tenant() {
+        let export = ExportMetricsServiceRequest::decode(
+            encode(&Observation::default(), 5, 9, "collecty-tenant").as_slice(),
+        )
+        .expect("a decodable export");
+        let attributes = &export.resource_metrics[0]
+            .resource
+            .as_ref()
+            .expect("a resource")
+            .attributes;
+        let named = attributes
+            .iter()
+            .find(|attribute| attribute.key == crate::TENANT_ATTRIBUTE)
+            .expect("the tenant attribute");
+        assert_eq!(
+            named.value.as_ref().and_then(|value| value.value.as_ref()),
+            Some(&any_value::Value::StringValue(
+                "collecty-tenant".to_string()
+            ))
+        );
+        assert!(
+            attributes
+                .iter()
+                .any(|attribute| attribute.key == "service.name"),
+            "the export still identifies itself as collecty"
+        );
+    }
+
+    /// No tenant, no push. The summary on stderr still runs, so the numbers
+    /// are not lost — only the export of them is.
+    #[test]
+    fn a_reporter_without_a_tenant_produces_no_export() {
+        let scratch = crate::test_support::Scratch::new("observe-no-tenant");
+        let queue = Arc::new(
+            Queue::open(
+                scratch.path(),
+                crate::queue::QueueLimits::default(),
+                crate::wire::ZSTD_LEVEL,
+            )
+            .expect("a queue"),
+        );
+        let reporter = Reporter::new(queue, Arc::new(SenderStats::default()), None);
+        assert!(reporter.export(&reporter.observe()).is_none());
+    }
+
     #[test]
     fn a_gauge_carries_the_value_it_was_given_and_a_counter_is_monotonic() {
         let observed = Observation {
@@ -266,8 +337,10 @@ mod tests {
             sent_segments: 7,
             ..Observation::default()
         };
-        let export = ExportMetricsServiceRequest::decode(encode(&observed, 5, 9).as_slice())
-            .expect("a decodable export");
+        let export = ExportMetricsServiceRequest::decode(
+            encode(&observed, 5, 9, "collecty-tenant").as_slice(),
+        )
+        .expect("a decodable export");
         let scope = &export.resource_metrics[0].scope_metrics[0];
 
         let queued = scope
@@ -304,13 +377,19 @@ mod tests {
 
     #[test]
     fn the_export_names_collecty_as_the_service() {
-        let export =
-            ExportMetricsServiceRequest::decode(encode(&Observation::default(), 0, 0).as_slice())
-                .expect("an export");
+        let export = ExportMetricsServiceRequest::decode(
+            encode(&Observation::default(), 0, 0, "collecty-tenant").as_slice(),
+        )
+        .expect("an export");
         let resource = export.resource_metrics[0]
             .resource
             .as_ref()
             .expect("a resource");
-        assert_eq!(resource.attributes[0].key, "service.name");
+        assert!(
+            resource
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "service.name")
+        );
     }
 }

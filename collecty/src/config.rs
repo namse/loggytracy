@@ -19,6 +19,15 @@ pub struct Config {
     pub report_interval: Duration,
     pub zstd_level: i32,
     pub log_json: bool,
+    /// Which tenant collecty's *own* metrics belong to.
+    ///
+    /// The only tenant collecty has an opinion about. Everything it forwards
+    /// carries its own in the payload, which collecty never decodes; its
+    /// self-export it builds itself, so it is the one place a tenant has to be
+    /// named. Unset means it does not export them — signy would drop an export
+    /// naming no tenant, silently, and a queue kept busy producing dropped
+    /// bytes is worse than not producing them.
+    pub tenant: Option<String>,
 }
 
 impl Default for Config {
@@ -37,6 +46,7 @@ impl Default for Config {
             report_interval: Duration::from_secs(60),
             zstd_level: crate::wire::ZSTD_LEVEL,
             log_json: false,
+            tenant: None,
         }
     }
 }
@@ -72,6 +82,7 @@ impl Config {
                 string("COLLECTY_LOG_FORMAT", "text".to_string()).as_str(),
                 "json"
             ),
+            tenant: tenant("COLLECTY_TENANT")?,
         };
         config.validate()?;
         Ok(config)
@@ -124,6 +135,36 @@ COLLECTY_MAX_REQUEST_BYTES ({}) export",
 
 fn string(name: &str, fallback: String) -> String {
     std::env::var(name).unwrap_or(fallback)
+}
+
+/// The same grammar signy validates a tenant id against, checked here so a
+/// typo fails startup rather than turning every self-export into a drop nobody
+/// asked about.
+fn tenant(name: &str) -> Result<Option<String>, String> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(None);
+    };
+    parse_tenant(&value)
+        .map(Some)
+        .map_err(|reason| format!("invalid {name} {value:?}: {reason}"))
+}
+
+fn parse_tenant(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("a tenant id must not be empty".to_string());
+    }
+    if value.len() > 64 {
+        return Err(format!("{} bytes, over the 64 allowed", value.len()));
+    }
+    if let Some(invalid) = value
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-')
+    {
+        return Err(format!(
+            "contains the unsupported character {invalid:?}; only [a-zA-Z0-9_-] is accepted"
+        ));
+    }
+    Ok(value.to_string())
 }
 
 fn path(name: &str, fallback: PathBuf) -> PathBuf {
@@ -218,6 +259,24 @@ mod tests {
         assert_eq!(parse_bytes("1GiB"), Some(1024 * 1024 * 1024));
         assert_eq!(parse_bytes("1GB"), None);
         assert_eq!(parse_bytes("many"), None);
+    }
+
+    /// The same grammar signy parses one with. Checked here so a typo fails
+    /// startup: signy would answer 200 and drop every self-export, which is
+    /// the one refusal shape that reports nothing back.
+    #[test]
+    fn a_tenant_id_is_validated_the_way_signy_validates_one() {
+        assert_eq!(parse_tenant("fn0-proj_42").as_deref(), Ok("fn0-proj_42"));
+        assert_eq!(
+            parse_tenant(&"a".repeat(64)).as_deref(),
+            Ok("a".repeat(64).as_str())
+        );
+
+        assert!(parse_tenant("").is_err());
+        assert!(parse_tenant(&"a".repeat(65)).is_err());
+        assert!(parse_tenant("a/b").is_err());
+        assert!(parse_tenant("a b").is_err());
+        assert!(parse_tenant("문자").is_err());
     }
 
     #[test]

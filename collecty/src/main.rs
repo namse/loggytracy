@@ -58,7 +58,7 @@ async fn run(config: Config) -> Result<(), String> {
     ));
 
     let sender = Sender::new(queue.clone(), transport, config.sender);
-    let reporter = Reporter::new(queue.clone(), sender.stats());
+    let reporter = Reporter::new(queue.clone(), sender.stats(), config.tenant.clone());
     let sending = {
         let watcher = watcher.clone();
         tokio::spawn(async move { sender.run(watcher).await })
@@ -131,7 +131,9 @@ async fn report_loop(
         }
         let observed = reporter.observe();
         reporter.log(&observed);
-        let export = reporter.export(&observed);
+        let Some(export) = reporter.export(&observed) else {
+            continue;
+        };
         if let Err(refusal) = intake
             .accept(Signal::Metrics, bytes::Bytes::from(export))
             .await
