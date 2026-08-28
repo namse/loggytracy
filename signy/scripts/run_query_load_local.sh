@@ -85,6 +85,10 @@ if [ -z "${SIGNY_MACHINE_PROFILE:-}" ]; then
   SIGNY_MACHINE_PROFILE="$(uname -sm); ${CPUS} logical CPUs; ${RAM_GIB} GiB RAM"
 fi
 
+# Same two exit codes as `run_load_local.sh`: non-zero is a verdict other than
+# PASS, and 3 is the bed never getting its load into the server. `set -e` must
+# not cut off the server log that explains either.
+STATUS=0
 SIGNY_LOAD_SERVER_PID="$SERVER_PID" \
 SIGNY_LOAD_TIER=B \
 SIGNY_LOAD_RESULT_PATH="$RESULT" \
@@ -98,7 +102,9 @@ SIGNY_LOAD_TENANTS="${SIGNY_LOAD_TENANTS:-24}" \
 SIGNY_LOAD_QUERY_CONNECTIONS="${SIGNY_LOAD_QUERY_CONNECTIONS:-24}" \
 SIGNY_LOAD_QUERY_WINDOW_SECONDS="${SIGNY_LOAD_QUERY_WINDOW_SECONDS:-120}" \
 SIGNY_LOAD_QUERY_LIMIT="${SIGNY_LOAD_QUERY_LIMIT:-5000}" \
-  ./target/release/load
+  ./target/release/load || STATUS=$?
 
 echo "=== server log tail ==="
 tail -20 "$SERVER_LOG"
+echo "=== harness exit status: $STATUS (0 = PASS, 3 = load never landed) ==="
+exit "$STATUS"

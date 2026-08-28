@@ -178,6 +178,12 @@ kill -0 "$SERVER_PID" 2>/dev/null && ALIVE=true
 # and reporting it would attribute the whole peak to nothing.
 {
   echo "run=$NAME limit=$LIMIT alive=$ALIVE harness_status=$HARNESS_STATUS"
+  # Exit 3 is the harness reporting that nothing it pushed reached storage. A
+  # peak measured through that is the resident set of an idle server, and it is
+  # low, so it reads as the best result this script can produce.
+  if [ "$HARNESS_STATUS" = 3 ]; then
+    echo "NO LOAD DELIVERED: harness exit 3, so the peak below is an idle server"
+  fi
   echo "data_dir_bytes=$(du -sb "$DATA" 2>/dev/null | cut -f1)"
   awk -F, 'NR>1 && $4+0>best { best=$4+0; for (i=1;i<=NF;i++) r[i]=$i }
            NR>1 && $30+0>0 && $4+0>bestm { bestm=$4+0; for (i=1;i<=NF;i++) s[i]=$i }

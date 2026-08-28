@@ -257,6 +257,12 @@ GUARD=ok
 {
   echo "run=$NAME limit=$LIMIT seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
   echo "alive=$ALIVE harness_status=$HARNESS_STATUS disk_guard=$GUARD"
+  # Exit 3 is the harness reporting that nothing it pushed reached storage. The
+  # verdict below is trends, and a server that was never given anything to hold
+  # is flat in every quarter, which is what a healthy soak looks like.
+  if [ "$HARNESS_STATUS" = 3 ]; then
+    echo "NO LOAD DELIVERED: harness exit 3, so the trends below are of an idle server"
+  fi
   grep -o '"verdict":"[A-Z_]*"' "$OUT/load.json" 2>/dev/null | head -1
   awk -F, '
     NR>1 && ($10+0>0 || $14+0>0) { n++; t[n]=$1+0
