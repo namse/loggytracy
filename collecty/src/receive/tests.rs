@@ -1,22 +1,24 @@
-use std::path::PathBuf;
+use std::net::SocketAddr;
 
+use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
+use http::{Method, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::metrics::v1::ResourceMetrics;
 use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
 use prost::Message;
 use tokio::sync::oneshot;
-use tonic::transport::{Channel, Endpoint, Uri};
-use tower::service_fn;
 
 use super::*;
 use crate::queue::QueueLimits;
+use crate::test_support::Scratch;
 
 /// The tests take what the sender would take, so the open segment has to close
 /// the moment they ask.
@@ -26,14 +28,35 @@ fn eager_limits() -> QueueLimits {
         ..QueueLimits::default()
     }
 }
-use crate::test_support::Scratch;
 
 struct Harness {
     _scratch: Scratch,
     queue: Arc<Queue>,
-    socket: PathBuf,
+    addr: SocketAddr,
+    client: Client<HttpConnector, Full<Bytes>>,
     shutdown: Option<oneshot::Sender<()>>,
-    server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    server: tokio::task::JoinHandle<io::Result<()>>,
+}
+
+/// One export, spelled the way an OTLP/HTTP client spells it.
+struct Export {
+    method: Method,
+    path: &'static str,
+    content_type: Option<&'static str>,
+    content_encoding: Option<&'static str>,
+    body: Vec<u8>,
+}
+
+impl Export {
+    fn to(path: &'static str, body: Vec<u8>) -> Export {
+        Export {
+            method: Method::POST,
+            path,
+            content_type: Some(PROTOBUF),
+            content_encoding: None,
+            body,
+        }
+    }
 }
 
 impl Harness {
@@ -47,8 +70,10 @@ impl Harness {
             )
             .expect("a queue"),
         );
-        let socket = scratch.path().join("otlp.sock");
-        let listener = bind(&socket, DEFAULT_SOCKET_MODE).expect("a bound socket");
+        // Port zero, so a test never collides with another test or with
+        // whatever else is listening on this machine.
+        let listener = bind("127.0.0.1:0".parse().expect("a literal address")).expect("a listener");
+        let addr = listener.local_addr().expect("a bound address");
         let intake = Intake::new(queue.clone(), max_request_bytes, DEFAULT_MAX_INFLIGHT_BYTES);
         let (tx, rx) = oneshot::channel();
         let server = tokio::spawn(serve(intake, listener, async move {
@@ -58,26 +83,42 @@ impl Harness {
         Harness {
             _scratch: scratch,
             queue,
-            socket,
+            addr,
+            client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
             shutdown: Some(tx),
             server,
         }
     }
 
-    async fn channel(&self) -> Channel {
-        let path = self.socket.clone();
-        Endpoint::try_from("http://collecty.invalid")
-            .expect("a placeholder endpoint")
-            .connect_with_connector(service_fn(move |_: Uri| {
-                let path = path.clone();
-                async move {
-                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
-                        tokio::net::UnixStream::connect(path).await?,
-                    ))
-                }
-            }))
+    async fn send(&self, export: Export) -> (StatusCode, String) {
+        let mut request = http::Request::builder()
+            .method(export.method)
+            .uri(format!("http://{}{}", self.addr, export.path));
+        if let Some(content_type) = export.content_type {
+            request = request.header(CONTENT_TYPE, content_type);
+        }
+        if let Some(encoding) = export.content_encoding {
+            request = request.header(CONTENT_ENCODING, encoding);
+        }
+        let response = self
+            .client
+            .request(
+                request
+                    .body(Full::new(Bytes::from(export.body)))
+                    .expect("a well-formed request"),
+            )
             .await
-            .expect("a connected channel")
+            .expect("an answer");
+        let status = response.status();
+        let body = response.into_body().collect().await.expect("a body");
+        (
+            status,
+            String::from_utf8_lossy(&body.to_bytes()).into_owned(),
+        )
+    }
+
+    async fn export(&self, path: &'static str, body: Vec<u8>) -> StatusCode {
+        self.send(Export::to(path, body)).await.0
     }
 
     /// Every record the queue is holding, under the signal of the segment it
@@ -140,11 +181,9 @@ async fn an_export_is_stored_as_a_frame_that_decompresses_to_the_request() {
     let request = logs("a line worth compressing, repeated repeated repeated");
     let expected = request.encode_to_vec();
 
-    LogsServiceClient::new(harness.channel().await)
-        .export(request)
-        .await
-        .expect("an accepted export");
+    let status = harness.export("/v1/logs", expected.clone()).await;
 
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(harness.records(), vec![(Signal::Logs, expected)]);
     harness.stop().await;
 }
@@ -154,24 +193,37 @@ async fn an_export_is_stored_as_a_frame_that_decompresses_to_the_request() {
 #[tokio::test]
 async fn every_signal_lands_in_a_segment_of_its_own() {
     let harness = Harness::start("receive-signals", DEFAULT_MAX_REQUEST_BYTES).await;
-    let channel = harness.channel().await;
 
-    LogsServiceClient::new(channel.clone())
-        .export(logs("one log"))
-        .await
-        .expect("an accepted log export");
-    TraceServiceClient::new(channel.clone())
-        .export(ExportTraceServiceRequest {
-            resource_spans: vec![ResourceSpans::default()],
-        })
-        .await
-        .expect("an accepted trace export");
-    MetricsServiceClient::new(channel)
-        .export(ExportMetricsServiceRequest {
-            resource_metrics: vec![ResourceMetrics::default()],
-        })
-        .await
-        .expect("an accepted metric export");
+    assert_eq!(
+        harness
+            .export("/v1/logs", logs("one log").encode_to_vec())
+            .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        harness
+            .export(
+                "/v1/traces",
+                ExportTraceServiceRequest {
+                    resource_spans: vec![ResourceSpans::default()],
+                }
+                .encode_to_vec(),
+            )
+            .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        harness
+            .export(
+                "/v1/metrics",
+                ExportMetricsServiceRequest {
+                    resource_metrics: vec![ResourceMetrics::default()],
+                }
+                .encode_to_vec(),
+            )
+            .await,
+        StatusCode::OK
+    );
 
     let sealed = harness.sealed();
     let signals: Vec<Signal> = sealed.iter().map(|(signal, _)| *signal).collect();
@@ -179,23 +231,47 @@ async fn every_signal_lands_in_a_segment_of_its_own() {
     harness.stop().await;
 }
 
+/// A successful export answers with an empty body, which is a valid
+/// `ExportLogsServiceResponse` carrying no `partial_success`.
+#[tokio::test]
+async fn a_success_answers_with_an_empty_protobuf_body() {
+    let harness = Harness::start("receive-ack", DEFAULT_MAX_REQUEST_BYTES).await;
+
+    let (status, body) = harness
+        .send(Export::to("/v1/logs", logs("one line").encode_to_vec()))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.is_empty(),
+        "a success should answer no bytes: {body:?}"
+    );
+    assert_eq!(
+        ExportLogsServiceRequest::decode(body.as_bytes()).expect("an empty response decodes"),
+        ExportLogsServiceRequest::default()
+    );
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn an_export_over_the_ceiling_is_refused_and_stores_nothing() {
     let harness = Harness::start("receive-ceiling", 64).await;
 
-    let status = LogsServiceClient::new(harness.channel().await)
-        .export(logs(&"x".repeat(4096)))
-        .await
-        .expect_err("a refusal");
+    let (status, _) = harness
+        .send(Export::to(
+            "/v1/logs",
+            logs(&"x".repeat(4096)).encode_to_vec(),
+        ))
+        .await;
 
-    assert_eq!(status.code(), tonic::Code::OutOfRange);
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(harness.records().is_empty());
     assert_eq!(harness.queue.stats().appended_records, 0);
     harness.stop().await;
 }
 
 #[tokio::test]
-async fn a_payload_over_the_ceiling_is_refused_off_the_grpc_path_too() {
+async fn a_payload_over_the_ceiling_is_refused_off_the_http_path_too() {
     let scratch = Scratch::new("intake-ceiling");
     let queue = Arc::new(
         Queue::open(
@@ -207,12 +283,12 @@ async fn a_payload_over_the_ceiling_is_refused_off_the_grpc_path_too() {
     );
     let intake = Intake::new(queue.clone(), 64, DEFAULT_MAX_INFLIGHT_BYTES);
 
-    let status = intake
+    let refusal = intake
         .accept(Signal::Logs, bytes::Bytes::from(vec![0u8; 128]))
         .await
         .expect_err("a refusal");
 
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(refusal.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(queue.stats().appended_records, 0);
 }
 
@@ -220,13 +296,92 @@ async fn a_payload_over_the_ceiling_is_refused_off_the_grpc_path_too() {
 async fn an_empty_export_succeeds_without_storing_a_record() {
     let harness = Harness::start("receive-empty", DEFAULT_MAX_REQUEST_BYTES).await;
 
-    LogsServiceClient::new(harness.channel().await)
-        .export(ExportLogsServiceRequest {
-            resource_logs: Vec::new(),
-        })
-        .await
-        .expect("an accepted empty export");
+    let status = harness
+        .export(
+            "/v1/logs",
+            ExportLogsServiceRequest {
+                resource_logs: Vec::new(),
+            }
+            .encode_to_vec(),
+        )
+        .await;
 
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(harness.queue.stats().appended_records, 0);
+    harness.stop().await;
+}
+
+/// The JSON encoding and a compressed body are both refused rather than
+/// stored: neither survives the concatenation the queue is built on.
+#[tokio::test]
+async fn only_uncompressed_protobuf_is_taken() {
+    let harness = Harness::start("receive-encoding", DEFAULT_MAX_REQUEST_BYTES).await;
+    let body = logs("one line").encode_to_vec();
+
+    let (json, _) = harness
+        .send(Export {
+            content_type: Some("application/json"),
+            ..Export::to("/v1/logs", body.clone())
+        })
+        .await;
+    let (gzip, reason) = harness
+        .send(Export {
+            content_encoding: Some("gzip"),
+            ..Export::to("/v1/logs", body.clone())
+        })
+        .await;
+    let (missing, _) = harness
+        .send(Export {
+            content_type: None,
+            ..Export::to("/v1/logs", body)
+        })
+        .await;
+
+    assert_eq!(json, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(gzip, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(missing, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(
+        reason.contains("gzip"),
+        "the refusal should name it: {reason}"
+    );
+    assert_eq!(harness.queue.stats().appended_records, 0);
+    harness.stop().await;
+}
+
+/// A content type with parameters is the same content type.
+#[tokio::test]
+async fn a_charset_parameter_does_not_change_the_media_type() {
+    let harness = Harness::start("receive-charset", DEFAULT_MAX_REQUEST_BYTES).await;
+
+    let (status, _) = harness
+        .send(Export {
+            content_type: Some("application/x-protobuf; charset=utf-8"),
+            ..Export::to("/v1/logs", logs("one line").encode_to_vec())
+        })
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(harness.queue.stats().appended_records, 1);
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_path_that_is_not_a_signal_is_not_answered_for() {
+    let harness = Harness::start("receive-path", DEFAULT_MAX_REQUEST_BYTES).await;
+    let body = logs("one line").encode_to_vec();
+
+    let (unknown, _) = harness.send(Export::to("/v1/profiles", body.clone())).await;
+    let (root, _) = harness.send(Export::to("/", body.clone())).await;
+    let (wrong_method, _) = harness
+        .send(Export {
+            method: Method::GET,
+            ..Export::to("/v1/logs", Vec::new())
+        })
+        .await;
+
+    assert_eq!(unknown, StatusCode::NOT_FOUND);
+    assert_eq!(root, StatusCode::NOT_FOUND);
+    assert_eq!(wrong_method, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(harness.queue.stats().appended_records, 0);
     harness.stop().await;
 }
@@ -234,14 +389,13 @@ async fn an_empty_export_succeeds_without_storing_a_record() {
 #[tokio::test]
 async fn separate_exports_reassemble_into_one_merged_request() {
     let harness = Harness::start("receive-merge", DEFAULT_MAX_REQUEST_BYTES).await;
-    let channel = harness.channel().await;
     let requests: Vec<_> = (0..6).map(|index| logs(&format!("line {index}"))).collect();
 
     for request in &requests {
-        LogsServiceClient::new(channel.clone())
-            .export(request.clone())
-            .await
-            .expect("an accepted export");
+        assert_eq!(
+            harness.export("/v1/logs", request.encode_to_vec()).await,
+            StatusCode::OK
+        );
     }
 
     let sealed = harness.sealed();
@@ -262,34 +416,34 @@ async fn separate_exports_reassemble_into_one_merged_request() {
     harness.stop().await;
 }
 
+/// The client here keeps its connection pooled and open. Shutdown has to
+/// close it rather than wait on it: the caller seals the open segment once
+/// this returns, and a process that never returns never seals.
 #[tokio::test]
-async fn binding_over_a_live_socket_is_refused() {
-    let harness = Harness::start("receive-bind", DEFAULT_MAX_REQUEST_BYTES).await;
-    let _ = harness.channel().await;
-
-    let error = bind(&harness.socket, DEFAULT_SOCKET_MODE).expect_err("a refusal");
-    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
-    harness.stop().await;
-}
-
-#[tokio::test]
-async fn a_stale_socket_file_is_replaced() {
-    let scratch = Scratch::new("receive-stale");
-    let socket = scratch.path().join("otlp.sock");
-    std::fs::write(&socket, b"left behind by a killed process").expect("a stale file");
-
-    let listener = bind(&socket, DEFAULT_SOCKET_MODE).expect("a bound socket");
-    drop(listener);
-}
-
-#[tokio::test]
-async fn a_socket_path_that_cannot_be_bound_names_itself() {
-    let scratch = Scratch::new("receive-long");
-    let socket = scratch.path().join("x".repeat(200));
-
-    let error = bind(&socket, DEFAULT_SOCKET_MODE).expect_err("a refusal");
-    assert!(
-        error.to_string().contains(&socket.display().to_string()),
-        "the error does not name the path: {error}"
+async fn an_idle_keep_alive_connection_does_not_hold_shutdown_open() {
+    let harness = Harness::start("receive-drain", DEFAULT_MAX_REQUEST_BYTES).await;
+    assert_eq!(
+        harness
+            .export("/v1/logs", logs("one line").encode_to_vec())
+            .await,
+        StatusCode::OK
     );
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), harness.stop())
+        .await
+        .expect("shutdown should not wait on an idle connection");
+}
+
+#[tokio::test]
+async fn binding_over_a_live_address_is_refused() {
+    let harness = Harness::start("receive-bind", DEFAULT_MAX_REQUEST_BYTES).await;
+
+    let error = bind(harness.addr).expect_err("a refusal");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(
+        error.to_string().contains(&harness.addr.to_string()),
+        "the error does not name the address: {error}"
+    );
+    harness.stop().await;
 }

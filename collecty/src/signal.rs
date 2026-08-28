@@ -18,18 +18,19 @@ impl Signal {
         }
     }
 
-    pub fn grpc_method_path(self) -> &'static str {
+    /// The OTLP/HTTP path this signal is exported to.
+    pub fn otlp_path(self) -> &'static str {
         match self {
-            Signal::Logs => "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
-            Signal::Traces => "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
-            Signal::Metrics => "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+            Signal::Logs => "/v1/logs",
+            Signal::Traces => "/v1/traces",
+            Signal::Metrics => "/v1/metrics",
         }
     }
 
-    pub fn from_grpc_method_path(path: &str) -> Option<Signal> {
+    pub fn from_otlp_path(path: &str) -> Option<Signal> {
         Signal::ALL
             .into_iter()
-            .find(|signal| signal.grpc_method_path() == path)
+            .find(|signal| signal.otlp_path() == path)
     }
 
     /// Which of the three queues this signal owns.
@@ -57,14 +58,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_signal_round_trips_through_its_grpc_method_path() {
+    fn every_signal_round_trips_through_its_otlp_path() {
         for signal in Signal::ALL {
-            assert_eq!(
-                Signal::from_grpc_method_path(signal.grpc_method_path()),
-                Some(signal)
-            );
+            assert_eq!(Signal::from_otlp_path(signal.otlp_path()), Some(signal));
         }
-        assert_eq!(Signal::from_grpc_method_path("/health/Check"), None);
+        assert_eq!(Signal::from_otlp_path("/v1/profiles"), None);
     }
 
     #[test]

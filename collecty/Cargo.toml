@@ -14,12 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
-tokio-stream = { version = "0.1", features = ["net"] }
-tonic = { version = "0.14.6", default-features = false, features = ["router", "server"] }
-tower-service = "0.3"
 http = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "http1"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 bytes = "1"
 prost = "0.14.4"
@@ -31,8 +28,6 @@ crc32fast = "1"
 zstd = "0.13"
 
 [dev-dependencies]
-tonic = { version = "0.14.6", features = ["transport", "codegen"] }
-tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }

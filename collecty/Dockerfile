@@ -16,10 +16,13 @@ RUN groupadd --system --gid 10002 collecty \
 USER collecty
 
 WORKDIR /var/lib/collecty
-VOLUME ["/var/lib/collecty", "/run/collecty"]
+VOLUME ["/var/lib/collecty"]
 ENV COLLECTY_DATA_DIR=/var/lib/collecty
-ENV COLLECTY_SOCKET_PATH=/run/collecty/otlp.sock
+# Every address in the container, not the loopback the binary defaults to:
+# a container that only answers itself has nothing to collect.
+ENV COLLECTY_LISTEN_ADDR=0.0.0.0:4318
 ENV COLLECTY_LOG_FORMAT=json
+EXPOSE 4318
 
 COPY --from=build /src/target/release/collecty /usr/local/bin/collecty
 ENTRYPOINT ["/usr/local/bin/collecty"]

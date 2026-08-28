@@ -1,8 +1,8 @@
 # collecty architecture
 
-A per-machine OTLP collector written in Rust. It takes exports over a Unix
-domain socket, writes them zstd-compressed to an append-only disk queue, and
-ships them to signy a segment at a time.
+A per-machine OTLP collector written in Rust. It takes exports over OTLP/HTTP,
+writes them zstd-compressed to an append-only disk queue, and ships them to
+signy a segment at a time.
 
 This document records what the collector *is* and why each decision was made.
 There are no comments in the source, so every "why" that would have been one
@@ -13,7 +13,7 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Item | Decision |
 |---|---|
 | Deployment | One process per machine or one sidecar per pod; both are supported and neither is assumed |
-| Ingest protocol | **OTLP over gRPC on a Unix domain socket**, all three signals |
+| Ingest protocol | **OTLP/HTTP**, protobuf and uncompressed, all three signals. `POST /v1/logs`, `/v1/traces`, `/v1/metrics` on a TCP port, 4318 by default |
 | Payload handling | **Never decoded.** The bytes that arrive are the bytes that are stored and the bytes that are sent |
 | Acknowledgement | After the record enters the open segment's compressor, before it is on the device. See "What an acknowledgement means" |
 | Queue layout | **One queue per signal**, each numbering its segments from one. A segment holds one signal's exports and no others |
@@ -26,7 +26,7 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Tenancy | **None.** The tenant travels inside the payload as a resource attribute (obsy issue #9), so a collector that does not decode has nothing to do |
 | Self-observation | `collecty_*` metrics encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr |
 | Format versioning | **None.** Nothing on disk is versioned. A queue written by another build is deleted, not migrated |
-| Transport security | **None, by design.** A Unix socket has no network to secure, and the hop to signy is expected to stay inside a trust boundary |
+| Transport security | **None, by design.** No TLS and no authentication on either hop, so **the bind address is the access control**: the default is loopback, and anything wider is expected to stay inside a trust boundary |
 
 ## The property the whole design rests on
 
@@ -75,22 +75,43 @@ by signy's `a_batch_per_signal_lands_in_the_store_its_request_names`.
 
 ## Receiving
 
-A gRPC server bound to a Unix socket, serving the three OTLP `Export` methods.
-It uses a **passthrough codec** (`src/receive/codec.rs`) rather than the
-generated prost services: the decoder hands back the message bytes as `Bytes`
-and the encoder writes nothing. An empty body is a valid
-`ExportLogsServiceResponse` with no `partial_success`, which is what a successful
-export answers, so a response costs zero bytes and zero encoding work.
+An HTTP/1.1 server on a TCP port, serving the three OTLP/HTTP export paths.
+The request body **is** the serialized export request, so there is nothing to
+decode and nothing to unwrap: the bytes hyper hands over are the bytes that go
+into the queue. An empty body is a valid `ExportLogsServiceResponse` with no
+`partial_success`, which is what a successful export answers, so a response
+costs zero bytes and zero encoding work.
 
 Because of this, `prost` and `opentelemetry-proto` are **not** on the receive
 path at all. They appear at runtime only to *encode* collecty's own metrics
 (see "Self-observation"), and in tests to prove the concatenation property.
 
+Two things are refused rather than stored, both because the queue's whole
+design rests on serialized export requests concatenating into one merged
+request:
+
+- **The JSON encoding**, with `415`. Concatenation is a protobuf property.
+  Two JSON documents joined end to end are not a document.
+- **A compressed body**, with `415`. Decompressing would make the bytes that
+  arrive different from the bytes that are stored, which is the property the
+  passthrough is. A client that compresses must be told, not silently
+  half-served.
+
+An unknown path is `404` and a non-`POST` is `405`, rather than either being
+answered for: a collector that accepts an export nobody can name invites a
+client to believe it landed somewhere.
+
+A refusal's body is plain text naming the reason, not the `google.rpc.Status`
+protobuf the OTLP specification suggests. Encoding one would put prost back on
+the receive path to say something no client acts on beyond its status code.
+
 Two ceilings guard memory:
 
-- **Per request.** tonic's `max_decoding_message_size` refuses an oversized
-  export with `OUT_OF_RANGE` *before* buffering the body. `Intake::accept` keeps
-  the same check for callers that do not arrive over gRPC.
+- **Per request.** A declared `Content-Length` over the ceiling is refused with
+  `413` *before* a byte of the body is read; a request that declares nothing is
+  cut off at the ceiling while reading. `Intake::accept` keeps the same check
+  for callers that do not arrive over HTTP — collecty queues its own metrics
+  through it.
 - **In flight.** A `Semaphore` whose permits are bytes. Each request acquires its
   own length and holds it until the record is on disk, so the memory a burst can
   reach is a declared number rather than a product of concurrency and size.

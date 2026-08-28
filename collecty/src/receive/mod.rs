@@ -1,35 +1,82 @@
-mod codec;
 #[cfg(test)]
 mod tests;
 
-use std::convert::Infallible;
+use std::fmt;
 use std::future::Future;
 use std::io;
-use std::path::Path;
-use std::pin::Pin;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use tokio::net::UnixListener;
-use tokio::sync::Semaphore;
-use tokio_stream::wrappers::UnixListenerStream;
-use tonic::Status;
-use tonic::transport::Server;
+use http::header::{ALLOW, CONTENT_ENCODING, CONTENT_TYPE};
+use http::{Method, Request, Response, StatusCode};
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::body::{Body, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpListener;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 
 use crate::queue::{Queue, Record};
 use crate::signal::Signal;
 use crate::wire;
-use codec::PassthroughCodec;
 
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
-pub const DEFAULT_SOCKET_MODE: u32 = 0o666;
+/// Loopback, because a bind address is now the whole of the access control.
+/// A deployment that needs to take exports from other containers says so.
+pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:4318";
+
+/// The only encoding served. OTLP/HTTP also defines a JSON one, which this
+/// collector cannot carry: the queue's whole design rests on serialized
+/// export requests concatenating into one merged request, which is a protobuf
+/// property and not a JSON one.
+const PROTOBUF: &str = "application/x-protobuf";
 
 pub struct Intake {
     queue: Arc<Queue>,
     inflight: Semaphore,
     max_request_bytes: usize,
+}
+
+/// Why an export was not taken, in the vocabulary of the status code it
+/// becomes. `Intake` is reachable off the HTTP path -- collecty queues its own
+/// metrics through it -- so this is a type of its own rather than a response.
+#[derive(Debug)]
+pub enum Refusal {
+    TooLarge { bytes: usize, limit: usize },
+    ShuttingDown,
+    Rejected(String),
+    Failed(String),
+}
+
+impl Refusal {
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Refusal::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Refusal::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+            Refusal::Rejected(_) => StatusCode::BAD_REQUEST,
+            Refusal::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::TooLarge { bytes, limit } => {
+                write!(
+                    f,
+                    "an OTLP export of {bytes} bytes exceeds the {limit} byte maximum"
+                )
+            }
+            Refusal::ShuttingDown => write!(f, "collecty is shutting down"),
+            Refusal::Rejected(reason) => write!(f, "{reason}"),
+            Refusal::Failed(reason) => write!(f, "{reason}"),
+        }
+    }
 }
 
 impl Intake {
@@ -57,13 +104,13 @@ impl Intake {
         self.max_request_bytes
     }
 
-    pub async fn accept(&self, signal: Signal, payload: Bytes) -> Result<(), Status> {
+    pub async fn accept(&self, signal: Signal, payload: Bytes) -> Result<(), Refusal> {
         let plain_len = payload.len();
         if plain_len > self.max_request_bytes {
-            return Err(Status::invalid_argument(format!(
-                "an OTLP export of {plain_len} bytes exceeds the {} byte maximum",
-                self.max_request_bytes
-            )));
+            return Err(Refusal::TooLarge {
+                bytes: plain_len,
+                limit: self.max_request_bytes,
+            });
         }
         if plain_len == 0 {
             return Ok(());
@@ -73,7 +120,7 @@ impl Intake {
             .inflight
             .acquire_many(plain_len as u32)
             .await
-            .map_err(|_| Status::unavailable("collecty is shutting down"))?;
+            .map_err(|_| Refusal::ShuttingDown)?;
 
         // Framing is nothing, but the queue compresses inside its lock, so the
         // append is still the blocking pool's work.
@@ -87,127 +134,206 @@ impl Intake {
             )
         })
         .await
-        .map_err(|error| Status::internal(format!("the spool task did not finish: {error}")))?
+        .map_err(|error| Refusal::Failed(format!("the spool task did not finish: {error}")))?
         .map_err(spool_failure)
     }
 }
 
-fn spool_failure(error: io::Error) -> Status {
+fn spool_failure(error: io::Error) -> Refusal {
     match error.kind() {
-        io::ErrorKind::InvalidInput => Status::invalid_argument(error.to_string()),
-        _ => Status::internal(format!("the queue refused the record: {error}")),
+        io::ErrorKind::InvalidInput => Refusal::Rejected(error.to_string()),
+        _ => Refusal::Failed(format!("the queue refused the record: {error}")),
     }
 }
 
-struct Export {
-    intake: Arc<Intake>,
-    signal: Signal,
+/// A media type without its parameters, lowercased, so `application/x-protobuf`
+/// and `application/x-protobuf; charset=utf-8` are the same answer.
+fn media_type(raw: &str) -> String {
+    raw.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
-impl tonic::server::UnaryService<Bytes> for Export {
-    type Response = ();
-    type Future = Pin<Box<dyn Future<Output = Result<tonic::Response<()>, Status>> + Send>>;
+fn text(status: StatusCode, reason: impl fmt::Display) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(reason.to_string())))
+        .expect("a well-formed refusal")
+}
 
-    fn call(&mut self, request: tonic::Request<Bytes>) -> Self::Future {
-        let intake = self.intake.clone();
-        let signal = self.signal;
-        Box::pin(async move {
-            intake.accept(signal, request.into_inner()).await?;
-            Ok(tonic::Response::new(()))
-        })
+/// An empty body is a valid `ExportLogsServiceResponse` with no
+/// `partial_success`, which is what a wholly successful export answers. So a
+/// success costs zero bytes and no encoding, and prost stays off this path.
+fn accepted() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, PROTOBUF)
+        .body(Full::new(Bytes::new()))
+        .expect("a well-formed acknowledgement")
+}
+
+async fn route(intake: Arc<Intake>, request: Request<Incoming>) -> Response<Full<Bytes>> {
+    // The three paths the spec names and nothing else: answering an unknown
+    // one invites a client to believe an export landed somewhere.
+    let Some(signal) = Signal::from_otlp_path(request.uri().path()) else {
+        return text(
+            StatusCode::NOT_FOUND,
+            "collecty serves /v1/logs, /v1/traces and /v1/metrics",
+        );
+    };
+    if request.method() != Method::POST {
+        return Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(ALLOW, "POST")
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Full::new(Bytes::from_static(b"an OTLP export is a POST")))
+            .expect("a well-formed refusal");
     }
-}
 
-macro_rules! export_service {
-    ($name:ident, $signal:expr, $service:literal) => {
-        #[derive(Clone)]
-        pub struct $name(Arc<Intake>);
-
-        impl tonic::server::NamedService for $name {
-            const NAME: &'static str = $service;
+    let headers = request.headers();
+    match headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) if media_type(value) == PROTOBUF => {}
+        _ => {
+            return text(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format_args!("an OTLP export must be {PROTOBUF}"),
+            );
         }
+    }
+    // Decompressing would make the bytes that arrive different from the bytes
+    // that are stored, which is the one property the queue is built on.
+    match headers
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+    {
+        None => {}
+        Some(value) if value.trim().eq_ignore_ascii_case("identity") => {}
+        Some(value) => {
+            return text(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format_args!("collecty takes uncompressed exports; this one is {value}"),
+            );
+        }
+    }
 
-        impl tower_service::Service<http::Request<tonic::body::Body>> for $name {
-            type Response = http::Response<tonic::body::Body>;
-            type Error = Infallible;
-            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    let limit = intake.max_request_bytes();
+    // A declared length is refused before a byte of it is read. `Limited`
+    // covers what a chunked request that declares nothing can spend.
+    if let Some(declared) = request.body().size_hint().exact()
+        && declared > limit as u64
+    {
+        return text(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Refusal::TooLarge {
+                bytes: declared as usize,
+                limit,
+            },
+        );
+    }
 
-            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-                Poll::Ready(Ok(()))
-            }
-
-            fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
-                let intake = self.0.clone();
-                Box::pin(async move {
-                    let mut grpc = tonic::server::Grpc::new(PassthroughCodec)
-                        .max_decoding_message_size(intake.max_request_bytes());
-                    let export = Export {
-                        intake,
-                        signal: $signal,
-                    };
-                    Ok(grpc.unary(export, request).await)
-                })
-            }
+    let payload = match Limited::new(request.into_body(), limit).collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return text(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format_args!("an OTLP export may not exceed {limit} bytes"),
+            );
         }
     };
-}
 
-export_service!(
-    LogsService,
-    Signal::Logs,
-    "opentelemetry.proto.collector.logs.v1.LogsService"
-);
-export_service!(
-    TraceService,
-    Signal::Traces,
-    "opentelemetry.proto.collector.trace.v1.TraceService"
-);
-export_service!(
-    MetricsService,
-    Signal::Metrics,
-    "opentelemetry.proto.collector.metrics.v1.MetricsService"
-);
-
-pub fn bind(path: &Path, mode: u32) -> io::Result<UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if std::fs::symlink_metadata(path).is_ok() {
-        match std::os::unix::net::UnixStream::connect(path) {
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("{} is already served by a running collecty", path.display()),
-                ));
+    match intake.accept(signal, payload).await {
+        Ok(()) => accepted(),
+        Err(refusal) => {
+            let status = refusal.status();
+            if status.is_server_error() {
+                tracing::warn!(%refusal, "an export was not queued");
             }
-            Err(_) => std::fs::remove_file(path)?,
+            text(status, refusal)
         }
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+}
 
-    let listener = UnixListener::bind(path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("cannot listen on {}: {error}", path.display()),
-        )
+pub fn bind(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(addr).map_err(|error| {
+        io::Error::new(error.kind(), format!("cannot listen on {addr}: {error}"))
     })?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    listener.set_nonblocking(true)?;
     Ok(listener)
 }
 
 pub async fn serve<F>(
     intake: Arc<Intake>,
-    listener: UnixListener,
+    listener: std::net::TcpListener,
     shutdown: F,
-) -> Result<(), tonic::transport::Error>
+) -> io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    Server::builder()
-        .add_service(LogsService(intake.clone()))
-        .add_service(TraceService(intake.clone()))
-        .add_service(MetricsService(intake))
-        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
-        .await
+    let listener = TcpListener::from_std(listener)?;
+    let mut shutdown = std::pin::pin!(shutdown);
+    // Every live connection watches this. A keep-alive connection sitting
+    // idle would otherwise hold the process open until its client hung up.
+    let (closing, watcher) = watch::channel(false);
+    let mut connections = JoinSet::new();
+    let outcome = loop {
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                // One client losing its connection between the queue and the
+                // accept is not the listener failing.
+                Err(error) if is_transient(&error) => continue,
+                Err(error) => break Err(error),
+            },
+            () = &mut shutdown => break Ok(()),
+        };
+        // Reaped here rather than in a task of their own, so a long-lived
+        // process does not accumulate one handle per connection it ever took.
+        while connections.try_join_next().is_some() {}
+        let _ = stream.set_nodelay(true);
+        let intake = intake.clone();
+        let mut watcher = watcher.clone();
+        connections.spawn(async move {
+            let service = service_fn(move |request| {
+                let intake = intake.clone();
+                async move { Ok::<_, std::convert::Infallible>(route(intake, request).await) }
+            });
+            let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+            let mut connection = std::pin::pin!(connection);
+            let result = tokio::select! {
+                result = connection.as_mut() => result,
+                _ = watcher.changed() => {
+                    // Finish the request in flight, then stop reading. An
+                    // export answered for is one the client will not send
+                    // again, so cutting it here would lose it.
+                    connection.as_mut().graceful_shutdown();
+                    connection.await
+                }
+            };
+            if let Err(error) = result {
+                tracing::debug!(%error, "an OTLP connection ended badly");
+            }
+        });
+    };
+
+    // The queue's last `fsync` closes the open segment after this returns, so
+    // an append still on its way in has to land before then.
+    let _ = closing.send(true);
+    drop(watcher);
+    while connections.join_next().await.is_some() {}
+    outcome
+}
+
+fn is_transient(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+    )
 }

@@ -6,7 +6,7 @@
 
 - `signy/` — 저장·질의 엔진. 크레이트 루트가 여기이므로 빌드와 테스트는
   `cd signy && cargo test`로 한다
-- `collecty/` — collector. UDS로 OTLP를 받아 zstd로 압축해 append-only 디스크
+- `collecty/` — collector. OTLP/HTTP로 받아 zstd로 압축해 append-only 디스크
   큐에 쌓고, 모아서 signy로 보낸다. 빌드와 테스트는 `cd collecty && cargo test`
 
 루트에는 Cargo workspace가 없다. 컴포넌트마다 자기 `Cargo.lock`과

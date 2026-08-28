@@ -43,8 +43,8 @@ async fn run(config: Config) -> Result<(), String> {
             .map_err(|error| format!("cannot open the queue at {dir:?}: {error}"))?,
     );
 
-    let listener = receive::bind(&config.socket_path, config.socket_mode)
-        .map_err(|error| format!("cannot serve OTLP: {error}"))?;
+    let listener =
+        receive::bind(config.listen_addr).map_err(|error| format!("cannot serve OTLP: {error}"))?;
     let intake = Intake::new(
         queue.clone(),
         config.max_request_bytes,
@@ -72,7 +72,7 @@ async fn run(config: Config) -> Result<(), String> {
     ));
 
     tracing::info!(
-        socket = %config.socket_path.display(),
+        listen = %config.listen_addr,
         data_dir = %config.data_dir.display(),
         signy = %config.signy_url,
         queue_max_bytes = config.queue.max_bytes,
@@ -97,8 +97,6 @@ async fn run(config: Config) -> Result<(), String> {
     if let Err(error) = queue.seal() {
         tracing::error!(%error, "the open segment could not be closed on the way out");
     }
-    let _ = std::fs::remove_file(&config.socket_path);
-
     served.map_err(|error| format!("the OTLP listener stopped: {error}"))
 }
 
@@ -134,11 +132,11 @@ async fn report_loop(
         let observed = reporter.observe();
         reporter.log(&observed);
         let export = reporter.export(&observed);
-        if let Err(status) = intake
+        if let Err(refusal) = intake
             .accept(Signal::Metrics, bytes::Bytes::from(export))
             .await
         {
-            tracing::warn!(%status, "collecty could not queue its own metrics");
+            tracing::warn!(%refusal, "collecty could not queue its own metrics");
         }
     }
 }

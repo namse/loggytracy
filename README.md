@@ -6,7 +6,7 @@ ship on their own.
 | Component | Directory | What it is |
 |---|---|---|
 | **signy** | [`signy/`](signy/) | The storage and query engine. Ingests logs, traces and metrics over OTLP and answers a first-party HTTP API. Single machine, single writer, S3-compatible object storage as the source of truth, local disk as an evictable cache, and one declared memory budget divided into arenas. |
-| **collecty** | [`collecty/`](collecty/) | The collector. Takes OTLP over a Unix domain socket, writes it zstd-compressed to an append-only disk queue, and ships it to signy in batches. It never decodes a payload: a segment is one zstd stream over the exports as they arrived, and the file is the request body byte for byte. |
+| **collecty** | [`collecty/`](collecty/) | The collector. Takes OTLP/HTTP, writes it zstd-compressed to an append-only disk queue, and ships it to signy in batches. It never decodes a payload: a segment is one zstd stream over the exports as they arrived, and the file is the request body byte for byte. |
 
 `obsy` is the product and the name of this repository. It is deliberately not a
 binary, a crate, an env prefix, a metric family or an image — nothing at build

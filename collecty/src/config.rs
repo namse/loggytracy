@@ -1,14 +1,14 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::queue::QueueLimits;
-use crate::receive::{DEFAULT_MAX_INFLIGHT_BYTES, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_SOCKET_MODE};
+use crate::receive::{DEFAULT_LISTEN_ADDR, DEFAULT_MAX_INFLIGHT_BYTES, DEFAULT_MAX_REQUEST_BYTES};
 use crate::send::SenderConfig;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub socket_path: PathBuf,
-    pub socket_mode: u32,
+    pub listen_addr: SocketAddr,
     pub data_dir: PathBuf,
     pub signy_url: String,
     pub max_request_bytes: usize,
@@ -24,8 +24,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            socket_path: PathBuf::from("/run/collecty/otlp.sock"),
-            socket_mode: DEFAULT_SOCKET_MODE,
+            listen_addr: DEFAULT_LISTEN_ADDR
+                .parse()
+                .expect("the default listen address parses"),
             data_dir: PathBuf::from("/var/lib/collecty"),
             signy_url: "http://127.0.0.1:3100".to_string(),
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
@@ -44,8 +45,7 @@ impl Config {
     pub fn from_env() -> Result<Config, String> {
         let defaults = Config::default();
         let config = Config {
-            socket_path: path("COLLECTY_SOCKET_PATH", defaults.socket_path),
-            socket_mode: octal("COLLECTY_SOCKET_MODE", defaults.socket_mode)?,
+            listen_addr: socket_addr("COLLECTY_LISTEN_ADDR", defaults.listen_addr)?,
             data_dir: path("COLLECTY_DATA_DIR", defaults.data_dir),
             signy_url: string("COLLECTY_SIGNY_URL", defaults.signy_url),
             max_request_bytes: bytes("COLLECTY_MAX_REQUEST_BYTES", defaults.max_request_bytes)?,
@@ -130,10 +130,11 @@ fn path(name: &str, fallback: PathBuf) -> PathBuf {
     std::env::var(name).map(PathBuf::from).unwrap_or(fallback)
 }
 
-fn octal(name: &str, fallback: u32) -> Result<u32, String> {
+fn socket_addr(name: &str, fallback: SocketAddr) -> Result<SocketAddr, String> {
     match std::env::var(name) {
         Err(_) => Ok(fallback),
-        Ok(value) => u32::from_str_radix(value.trim_start_matches("0o"), 8)
+        Ok(value) => value
+            .parse()
             .map_err(|error| format!("invalid {name} {value:?}: {error}")),
     }
 }

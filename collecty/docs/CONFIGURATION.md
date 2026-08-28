@@ -12,20 +12,26 @@ rejected, because a number with no unit is a guess about which unit was meant.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLECTY_SOCKET_PATH` | `/run/collecty/otlp.sock` | The Unix socket applications export to. Parent directories are created. A stale socket file left by a killed process is replaced; a socket something is still listening on refuses the start |
-| `COLLECTY_SOCKET_MODE` | `0666` | Socket permissions, octal. The default lets an application running as another user write, which is the ordinary case for a host daemon. Tighten it and control access with the directory's permissions instead |
+| `COLLECTY_LISTEN_ADDR` | `127.0.0.1:4318` | Where applications export to, over OTLP/HTTP. The default answers only the machine it runs on; a sidecar or host daemon other containers export to needs `0.0.0.0:4318`, which the image sets |
 | `COLLECTY_DATA_DIR` | `/var/lib/collecty` | Holds the queue, under `queue/`. **This directory is the only copy of an acknowledged export until signy takes it** — it must outlive the container |
 | `COLLECTY_SIGNY_URL` | `http://127.0.0.1:3100` | Where batches go. Plain HTTP only |
 
-The socket path has a hard limit the operating system sets, not collecty:
-`sun_path` is 104 bytes on macOS and 108 on Linux, including the trailing
-`NUL`. A path over it fails at bind, and the error names the path.
+There is no authentication and no TLS, so **the bind address is the whole of
+the access control**. Binding a routable address publishes an endpoint that
+takes anything anyone sends it; it belongs behind the same trust boundary as
+the hop to signy.
+
+Three paths are served, and nothing else: `POST /v1/logs`, `POST /v1/traces`
+and `POST /v1/metrics`. The body must be an uncompressed OTLP protobuf export
+request (`Content-Type: application/x-protobuf`). The JSON encoding and a
+`Content-Encoding` are both refused with `415` — see
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for why neither can be stored.
 
 ## What bounds memory
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLECTY_MAX_REQUEST_BYTES` | `16MiB` | Largest single export accepted. Matches signy's own ceiling so an export that collecty takes is one signy can take. Refused with `OUT_OF_RANGE` before the body is buffered |
+| `COLLECTY_MAX_REQUEST_BYTES` | `16MiB` | Largest single export accepted. Matches signy's own ceiling so an export that collecty takes is one signy can take. Refused with `413` before the body is buffered when the request declares its length, and while reading when it does not |
 | `COLLECTY_MAX_INFLIGHT_BYTES` | `64MiB` | Total bytes of exports being compressed and written at once. A request waits for room rather than being refused. Must be at least `COLLECTY_MAX_REQUEST_BYTES`, or a large export could never be admitted |
 
 Resident memory is roughly this ceiling plus one batch buffer plus the
