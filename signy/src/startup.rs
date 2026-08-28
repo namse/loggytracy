@@ -219,10 +219,18 @@ pub async fn run(config: Arc<Config>) {
     // instead of racing this one. The architecture always assumed a single
     // writer; this is what makes the assumption hold when an orchestrator
     // starts the replacement before the original has finished draining.
+    //
+    // Retried like every other startup step that touches the store. A claim
+    // writes three manifests, and a transient failure on the last one leaves
+    // the prefix half-claimed -- exactly the state the paragraph above exists
+    // to avoid. Dying there only hands the same work to the orchestrator's
+    // restart; retrying does it without the bounce. The epoch only ever moves
+    // forward, so a retry costs a number, not a guarantee.
     if let Some(storage) = &object_storage {
-        storage.claim_writer_epoch().await.unwrap_or_else(|error| {
-            panic!("failed to claim the object-store writer epoch: {error}")
-        });
+        with_object_store_retry("writer epoch claim", startup_budget, || {
+            storage.claim_writer_epoch()
+        })
+        .await;
     }
     let remote_manifest = if let Some(storage) = &object_storage {
         let checkpoint = journal::read_checkpoint(&config.data_dir.join("journal.ckpt"))
