@@ -742,10 +742,12 @@ async fn wait_for_ready(cfg: &Config) -> Result<(), String> {
 /// Onboard the tenants this run pushes under.
 ///
 /// signy's tenant registry *is* the set of pushed retention policies: a
-/// tenant nobody has pushed a policy for is not served, and every push under
-/// it comes back 403. So the harness onboards its own tenants first, the way
-/// a control plane would. The comparison targets have no such API and no
-/// such gate, which is why this is signy-only.
+/// tenant nobody has pushed a policy for is not served, and a push naming it
+/// is dropped on arrival and answered 200 anyway -- the tenant rides in a
+/// resource attribute now, so there is no transport left to refuse it. So the
+/// harness onboards its own tenants first, the way a control plane would. The
+/// comparison targets have no such API and no such gate, which is why this is
+/// signy-only.
 ///
 /// A failure here ends the run. A harness offering a rate that nothing
 /// accepts still fills in every field of the result, and an idle server's

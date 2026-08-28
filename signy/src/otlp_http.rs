@@ -571,17 +571,13 @@ async fn enqueue_record(
 /// Whether an answer means "not this body, however long it waits", so that
 /// dropping it loses nothing a retry would have saved.
 ///
-/// Every client error is here, and the two that are judgement calls are `403`
-/// and `429`.
+/// Every client error is here, and the one that is a judgement call is `429`.
 ///
-/// **`403`, a tenant this instance does not serve.** Holding it would be the
-/// kinder answer if the collector had a queue per tenant. It has one per
-/// signal, so a single application exporting under an unknown tenant stops
-/// every other application's logs behind it — a policy mistake with a blast
-/// radius of one process becomes an outage for a signal on the host. Dropping
-/// keeps the loss where the mistake is, and
-/// `signy_collect_dropped_records_total` with the warning beside it is how an
-/// operator finds out.
+/// A tenant this instance does not serve was the other one, answered `403`. It
+/// no longer reaches a status at all: the tenant is a resource attribute, so
+/// the resource is dropped inside a record that is still accepted, and
+/// `signy_ingest_dropped_resources_total` is where that loss shows instead of
+/// here.
 ///
 /// **`429`, a tenant storing everything its plan sells.** It clears when
 /// retention retires parts, which is not a timescale a disk queue can wait out.
