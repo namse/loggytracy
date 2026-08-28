@@ -671,12 +671,18 @@
         assert_eq!(rows, 2);
     }
 
-    fn tenant_push_body(tenant: &str, line: &str) -> Vec<u8> {
+    /// One record inside a batch, framed the way collecty ships one: the
+    /// payload behind its length, zstd over the whole thing.
+    fn collected_body(tenant: &str, line: &str) -> Vec<u8> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        otlp_body_for(tenant, &format!("{tenant}-app"), &[(line, now)])
+        let payload = otlp_body_for(tenant, &format!("{tenant}-app"), &[(line, now)]);
+        let mut plain = Vec::with_capacity(4 + payload.len());
+        plain.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        plain.extend_from_slice(&payload);
+        zstd::bulk::compress(&plain, 3).unwrap()
     }
 
 
@@ -707,21 +713,23 @@
             None,
         );
 
-        let push = |tenant: &'static str, line: &'static str| {
+        let collect = |tenant: &'static str, line: &'static str| {
             let state = state.clone();
             async move {
                 let request = axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v1/logs")
+                    .uri("/signy/api/v1/collect")
                     .header("content-type", "application/x-protobuf")
-                    .body(axum::body::Body::from(tenant_push_body(tenant, line)))
+                    .header("content-encoding", "zstd")
+                    .header("x-collecty-signal", "logs")
+                    .body(axum::body::Body::from(collected_body(tenant, line)))
                     .unwrap();
                 let response = crate::build_router(state).oneshot(request).await.unwrap();
                 assert_eq!(response.status(), axum::http::StatusCode::OK);
             }
         };
-        push("acme", "acme secret").await;
-        push("globex", "globex secret").await;
+        collect("acme", "acme secret").await;
+        collect("globex", "globex secret").await;
 
         let get = |tenant: &'static str, uri: &'static str| {
             let state = state.clone();

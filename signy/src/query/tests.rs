@@ -525,12 +525,10 @@
 
         state.flush_healthy.store(false, Ordering::Release);
         state.merge_healthy.store(false, Ordering::Release);
-        state.otlp_healthy.store(false, Ordering::Release);
         let error = ready(State(state)).await.unwrap_err();
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.contains("flush worker"));
         assert!(error.1.contains("merge worker"));
-        assert!(error.1.contains("OTLP gRPC server"));
     }
 
     /// Readiness follows a sustained object-store outage, not a single failed

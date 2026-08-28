@@ -1,3 +1,20 @@
+//! The one way telemetry enters this engine: a collecty's batch.
+//!
+//! There used to be two more — OTLP over HTTP on `POST /v1/logs`,
+//! `/v1/traces`, `/v1/metrics`, and the same three services over gRPC on
+//! their own listener. Both are gone. An engine that accepts a push straight
+//! from an application has no disk queue in front of it, so a refusal it gives
+//! is telemetry lost unless the application happens to hold it; collecty's
+//! queue is what makes a refusal survivable, and it only helps when nothing
+//! can go around it. So applications export to collecty, collecty ships here,
+//! and this route is the whole ingest surface.
+//!
+//! What arrived over those routes still arrives: the payload of every record
+//! below is an OTLP export request, protobuf-encoded, and the admission and
+//! normalization it goes through is the code the push handlers used to call.
+//! What went with them is the OTLP JSON encoding, which collecty does not take
+//! either — see `docs/ARCHITECTURE.md`, "Ingest is OTLP".
+
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
@@ -6,15 +23,9 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use opentelemetry_proto::tonic::collector::logs::v1::{
-    ExportLogsServiceRequest, ExportLogsServiceResponse,
-};
-use opentelemetry_proto::tonic::collector::metrics::v1::{
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
-};
-use opentelemetry_proto::tonic::collector::trace::v1::{
-    ExportTraceServiceRequest, ExportTraceServiceResponse,
-};
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost014::Message;
 
 use futures_util::StreamExt;
@@ -26,204 +37,13 @@ use crate::log_ingest::OtlpLogIngest;
 use crate::series_ingest::OtlpMetricIngest;
 use crate::trace_ingest::{MAX_OTLP_REQUEST_BYTES, OtlpTraceIngest};
 
-/// OTLP over HTTP.
-///
-/// The same exports the gRPC services take, framed differently. A collector
-/// configured with `otlphttp` is at least as common as one using `otlp`, and
-/// it is the only option where a proxy in front will not carry gRPC. Both
-/// transports share the admission and normalization code, so a limit cannot be
-/// enforced on one and forgotten on the other.
-///
-/// Protobuf and JSON are both accepted, chosen by `Content-Type`, and the
-/// response is encoded the same way the request was — the specification
-/// requires a body of the matching `ExportServiceResponse` type, and a
-/// collector that sent JSON cannot read protobuf back.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OtlpEncoding {
-    Protobuf,
-    Json,
-}
-
-impl OtlpEncoding {
-    fn from_headers(headers: &HeaderMap) -> Result<Self, IngestError> {
-        let content_type = headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/x-protobuf");
-        let content_type = content_type.split(';').next().unwrap_or("").trim();
-        match content_type {
-            "application/x-protobuf" | "application/protobuf" | "" => Ok(Self::Protobuf),
-            "application/json" => Ok(Self::Json),
-            other => Err((
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                format!(
-                    "unsupported OTLP content type {other:?}; \
-use application/x-protobuf or application/json"
-                ),
-            )
-                .into()),
-        }
-    }
-
-    fn content_type(self) -> &'static str {
-        match self {
-            Self::Protobuf => "application/x-protobuf",
-            Self::Json => "application/json",
-        }
-    }
-
-    fn decode<T>(self, body: &[u8]) -> Result<T, IngestError>
-    where
-        T: Message + Default + serde::de::DeserializeOwned,
-    {
-        match self {
-            Self::Protobuf => T::decode(body).map_err(|error| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("OTLP protobuf decode failed: {error}"),
-                )
-                    .into()
-            }),
-            Self::Json => serde_json::from_slice(body).map_err(|error| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("OTLP JSON decode failed: {error}"),
-                )
-                    .into()
-            }),
-        }
-    }
-
-    fn encode<T>(self, message: &T) -> Response
-    where
-        T: Message + serde::Serialize,
-    {
-        let body = match self {
-            Self::Protobuf => message.encode_to_vec(),
-            // An encoding failure here would be a bug in a response type with
-            // no user-supplied content, so an empty body is closer to the
-            // truth than a 500 that blames the client's request.
-            Self::Json => serde_json::to_vec(message).unwrap_or_default(),
-        };
-        ([(header::CONTENT_TYPE, self.content_type())], body).into_response()
-    }
-}
-
-pub async fn logs(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, IngestError> {
-    let ingest = OtlpLogIngest {
-        journal: &state.journal,
-        shutdown: &state.shutdown,
-        config: &state.config,
-        ingest_gate: &state.ingest_gate,
-        tenant_quota: &state.tenant_quota,
-        tenant_policy: &state.tenant_policy,
-        metrics: &state.metrics,
-        clock: &state.clock,
-    };
-    // Ahead of the request counter as well as the body work, the accounting
-    // the push handler this replaces kept: a refusal at the gate is not an
-    // ingest the server attempted, so it is neither a request nor an error.
-    ingest.admit_transport()?;
-    state
-        .metrics
-        .ingest_requests
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let result = logs_inner(&ingest, headers, body).await;
-    if result.is_err() {
-        state
-            .metrics
-            .ingest_errors
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    result
-}
-
-async fn logs_inner(
-    ingest: &OtlpLogIngest<'_>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, IngestError> {
-    let encoding = OtlpEncoding::from_headers(&headers)?;
-    // The size is what this can charge before the decode. The tenant used to
-    // be charged here too, off a header, which spent no CPU on a body that
-    // would be refused; it lives inside the body now, so the storage limit is
-    // reached only after the decode and per tenant named.
-    ingest.admit_size(body.len())?;
-    let request: ExportLogsServiceRequest = encoding.decode(&body)?;
-    // A protobuf body is already the WAL's encoding of choice, so it rides
-    // through untouched; a JSON body has no protobuf bytes to keep.
-    let wire = match encoding {
-        OtlpEncoding::Protobuf => Some(body.to_vec()),
-        OtlpEncoding::Json => None,
-    };
-    ingest.accept(request, wire).await?;
-    Ok(encoding.encode(&ExportLogsServiceResponse::default()))
-}
-
-pub async fn traces(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, IngestError> {
-    let ingest = OtlpTraceIngest {
-        journal: &state.journal,
-        shutdown: &state.shutdown,
-        ingest_gate: &state.ingest_gate,
-        tenant_quota: &state.tenant_quota,
-        tenant_policy: &state.tenant_policy,
-        metrics: &state.metrics,
-    };
-    ingest.admit_transport()?;
-    let encoding = OtlpEncoding::from_headers(&headers)?;
-    ingest.admit_size(body.len())?;
-    let request: ExportTraceServiceRequest = encoding.decode(&body)?;
-    ingest.accept(request).await?;
-    Ok(encoding.encode(&ExportTraceServiceResponse::default()))
-}
-
-pub async fn metrics(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, IngestError> {
-    let ingest = OtlpMetricIngest {
-        journal: &state.journal,
-        shutdown: &state.shutdown,
-        config: &state.config,
-        ingest_gate: &state.ingest_gate,
-        tenant_quota: &state.tenant_quota,
-        tenant_policy: &state.tenant_policy,
-        metrics: &state.metrics,
-        clock: &state.clock,
-    };
-    ingest.admit_transport()?;
-    let encoding = OtlpEncoding::from_headers(&headers)?;
-    ingest.admit_size(body.len())?;
-    let request: ExportMetricsServiceRequest = encoding.decode(&body)?;
-    let outcome = ingest.accept(request).await?;
-    // A partial acceptance answers 200 with the OTLP `partial_success` naming
-    // what was refused and why; only an all-refused export is an error.
-    Ok(encoding.encode(&ExportMetricsServiceResponse {
-        partial_success: outcome.partial_success(),
-    }))
-}
-
-/// Body limit for the OTLP HTTP routes, matching what the gRPC services accept
-/// so a collector sees one size whichever transport it picks.
-pub const MAX_OTLP_HTTP_BODY_BYTES: usize = MAX_OTLP_REQUEST_BYTES;
-
 /// The header collecty writes in front of each record's payload: the payload's
 /// length, little-endian. The signal is not repeated here — the request names
 /// it once for the whole segment.
 const COLLECT_RECORD_HEADER_BYTES: usize = 4;
 
-/// The one ceiling the collect route still has: a single record's payload,
-/// which is one OTLP export and is bounded exactly as one is on the push
-/// routes.
+/// The one ceiling this route has: a single record's payload, which is one
+/// OTLP export and is bounded as `MAX_OTLP_REQUEST_BYTES` bounds one.
 ///
 /// The batch around it has no ceiling any more. The body is decompressed and
 /// ingested as it arrives, so what this server holds at any moment is one
@@ -278,7 +98,7 @@ pub async fn collect(
     // Ahead of the request counter, and once for the whole batch: the checks
     // behind it are the instance's, not a signal's, so a fenced or overloaded
     // server refuses the batch rather than dropping part of it.
-    log_ingest(&state).admit_transport()?;
+    crate::backpressure::admit_batch(&state.shutdown, &state.ingest_gate)?;
     state
         .metrics
         .ingest_requests
@@ -726,9 +546,7 @@ impl CollectedRecords {
 fn log_ingest(state: &Arc<AppState>) -> OtlpLogIngest<'_> {
     OtlpLogIngest {
         journal: &state.journal,
-        shutdown: &state.shutdown,
         config: &state.config,
-        ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
         tenant_policy: &state.tenant_policy,
         metrics: &state.metrics,
@@ -759,8 +577,6 @@ async fn collect_traces(
 ) -> Result<Vec<PendingAppend>, IngestError> {
     let ingest = OtlpTraceIngest {
         journal: &state.journal,
-        shutdown: &state.shutdown,
-        ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
         tenant_policy: &state.tenant_policy,
         metrics: &state.metrics,
@@ -782,9 +598,7 @@ async fn collect_metrics(
 ) -> Result<Vec<PendingAppend>, IngestError> {
     let ingest = OtlpMetricIngest {
         journal: &state.journal,
-        shutdown: &state.shutdown,
         config: &state.config,
-        ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
         tenant_policy: &state.tenant_policy,
         metrics: &state.metrics,
@@ -812,5 +626,5 @@ async fn collect_metrics(
 
 #[cfg(test)]
 mod tests {
-    include!("tests/otlp_http.rs");
+    include!("tests/collect.rs");
 }

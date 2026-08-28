@@ -1,89 +1,25 @@
-use std::sync::Arc;
-
-use opentelemetry_proto::tonic::collector::trace::v1::{
-    ExportTraceServiceRequest, ExportTraceServiceResponse,
-    trace_service_server::{TraceService, TraceServiceServer},
-};
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost014::Message;
-use tonic::{Request, Response, Status};
 
-use crate::backpressure::{IngestError, IngestGate};
+use crate::backpressure::IngestError;
 use crate::journal::Journal;
-use crate::shutdown::ShutdownState;
 use crate::trace::normalize_request;
 use axum::http::StatusCode;
 
 pub const MAX_OTLP_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_OTLP_SPANS: usize = 100_000;
 
-#[derive(Clone)]
-pub struct TraceIngestService {
-    journal: Arc<Journal>,
-    shutdown: Arc<ShutdownState>,
-    ingest_gate: Arc<IngestGate>,
-    tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
-    tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
-    metrics: Arc<crate::metrics::RuntimeMetrics>,
-}
-
-impl TraceIngestService {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        journal: Arc<Journal>,
-        shutdown: Arc<ShutdownState>,
-        ingest_gate: Arc<IngestGate>,
-        tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
-        tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
-        metrics: Arc<crate::metrics::RuntimeMetrics>,
-    ) -> Self {
-        Self {
-            journal,
-            shutdown,
-            ingest_gate,
-            tenant_quota,
-            tenant_policy,
-            metrics,
-        }
-    }
-
-    pub fn into_server(self) -> TraceServiceServer<Self> {
-        TraceServiceServer::new(self)
-            .max_decoding_message_size(MAX_OTLP_REQUEST_BYTES)
-            .max_encoding_message_size(64 * 1024)
-    }
-}
-
 /// Accepting one OTLP trace export, independent of how it arrived. The trace
 /// counterpart to [`crate::log_ingest::OtlpLogIngest`], and split for the same
 /// reason: a limit enforced on gRPC and forgotten on HTTP is not a limit.
 pub struct OtlpTraceIngest<'a> {
     pub journal: &'a Journal,
-    pub shutdown: &'a ShutdownState,
-    pub ingest_gate: &'a IngestGate,
     pub tenant_quota: &'a crate::tenant_quota::TenantQuota,
     pub tenant_policy: &'a crate::tenant_policy::TenantPolicy,
     pub metrics: &'a crate::metrics::RuntimeMetrics,
 }
 
 impl OtlpTraceIngest<'_> {
-    pub fn admit_transport(&self) -> Result<(), IngestError> {
-        if self.shutdown.is_fenced() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "this instance has been fenced by a newer writer and is shutting down".to_string(),
-            )
-                .into());
-        }
-        if self.shutdown.is_draining() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server is draining for shutdown".to_string(),
-            )
-                .into());
-        }
-        self.ingest_gate.check()
-    }
-
     /// See [`crate::log_ingest::OtlpLogIngest::admit_size`]: the tenant is no
     /// longer knowable this early, and the size still is.
     pub fn admit_size(&self, encoded_len: usize) -> Result<(), IngestError> {
@@ -93,16 +29,6 @@ impl OtlpTraceIngest<'_> {
                 format!("OTLP request exceeds the maximum of {MAX_OTLP_REQUEST_BYTES} bytes"),
             )
                 .into());
-        }
-        Ok(())
-    }
-
-    pub async fn accept(&self, request: ExportTraceServiceRequest) -> Result<(), IngestError> {
-        for pending in self.enqueue_request(request, None).await? {
-            pending
-                .settle()
-                .await
-                .map_err(crate::log_ingest::journal_write_failed)?;
         }
         Ok(())
     }
@@ -181,54 +107,86 @@ fn count_spans(request: &ExportTraceServiceRequest) -> Result<usize, IngestError
         })
 }
 
-#[tonic::async_trait]
-impl TraceService for TraceIngestService {
-    async fn export(
-        &self,
-        request: Request<ExportTraceServiceRequest>,
-    ) -> Result<Response<ExportTraceServiceResponse>, Status> {
-        use crate::log_ingest::ingest_error_to_status;
-
-        let ingest = OtlpTraceIngest {
-            journal: &self.journal,
-            shutdown: &self.shutdown,
-            ingest_gate: &self.ingest_gate,
-            tenant_quota: &self.tenant_quota,
-            tenant_policy: &self.tenant_policy,
-            metrics: &self.metrics,
-        };
-        ingest.admit_transport().map_err(ingest_error_to_status)?;
-        let request = request.into_inner();
-        ingest
-            .admit_size(request.encoded_len())
-            .map_err(ingest_error_to_status)?;
-        ingest
-            .accept(request)
-            .await
-            .map_err(ingest_error_to_status)?;
-        Ok(Response::new(ExportTraceServiceResponse::default()))
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backpressure::IngestGate;
     use crate::config::Config;
     use crate::journal;
     use crate::part_registry::PartRegistry;
     use crate::tenant::test_tenant;
     use crate::trace::TraceMemTable;
     use crate::trace_registry::TraceRegistry;
+    use std::sync::Arc;
     use opentelemetry_proto::tonic::common::v1::AnyValue;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use std::time::Duration;
 
-    /// The tenant rides in the payload now, so the wrapper carries nothing:
-    /// what makes a request the test tenant's is the resource `request` builds.
-    fn tenant_request(request: ExportTraceServiceRequest) -> Request<ExportTraceServiceRequest> {
-        Request::new(request)
+    /// The collect route's own sequence over one record, so these tests refuse
+    /// what the route refuses and store what it stores.
+    struct Ingest {
+        journal: Arc<Journal>,
+        shutdown: Arc<crate::shutdown::ShutdownState>,
+        ingest_gate: Arc<IngestGate>,
+        tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
+        tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
+        metrics: Arc<crate::metrics::RuntimeMetrics>,
     }
 
+    impl Ingest {
+        fn over(journal: Arc<Journal>, config: &Config) -> Self {
+            let ingest_gate = IngestGate::for_test(&journal, config);
+            Self {
+                journal,
+                shutdown: Arc::new(crate::shutdown::ShutdownState::new()),
+                ingest_gate,
+                tenant_quota: crate::tenant_quota::TenantQuota::for_test(config),
+                tenant_policy: Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+                metrics: Arc::new(crate::metrics::RuntimeMetrics::new()),
+            }
+        }
+
+        async fn accept(&self, request: ExportTraceServiceRequest) -> Result<(), IngestError> {
+            let ingest = OtlpTraceIngest {
+                journal: &self.journal,
+                tenant_quota: &self.tenant_quota,
+                tenant_policy: &self.tenant_policy,
+                metrics: &self.metrics,
+            };
+            crate::backpressure::admit_batch(&self.shutdown, &self.ingest_gate)?;
+            ingest.admit_size(request.encoded_len())?;
+            for pending in ingest.enqueue_request(request, None).await? {
+                pending
+                    .settle()
+                    .await
+                    .map_err(crate::log_ingest::journal_write_failed)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn journal_over(config: &Config, traces: Arc<TraceMemTable>) -> Arc<Journal> {
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        Arc::new(
+            journal::Journal::spawn_with_traces(
+                config,
+                Arc::new(crate::memtable::MemTable::new()),
+                traces,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn config_at(name: &str) -> Config {
+        Config {
+            data_dir: std::env::temp_dir().join(format!("signy-{name}-{}", uuid::Uuid::new_v4())),
+            ..Config::default()
+        }
+    }
+
+    /// The tenant rides in the payload, so what makes a request the test
+    /// tenant's is the resource `request` builds.
     fn request() -> ExportTraceServiceRequest {
         ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
@@ -250,85 +208,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_rejects_while_draining_for_shutdown() {
-        let config = Config {
-            data_dir: std::env::temp_dir()
-                .join(format!("signy-trace-drain-{}", uuid::Uuid::new_v4())),
-            ..Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
+    async fn an_export_is_rejected_while_draining_for_shutdown() {
+        let config = config_at("trace-drain");
         let trace_memtable = Arc::new(TraceMemTable::new());
-        let journal = Arc::new(
-            journal::Journal::spawn_with_traces(
-                &config,
-                Arc::new(crate::memtable::MemTable::new()),
-                trace_memtable.clone(),
-            )
-            .unwrap(),
-        );
-        let shutdown = Arc::new(crate::shutdown::ShutdownState::new());
-        shutdown.begin_drain();
-        let ingest_gate = IngestGate::for_test(&journal, &config);
-        let service = TraceIngestService::new(
-            journal,
-            shutdown,
-            ingest_gate,
-            crate::tenant_quota::TenantQuota::for_test(&config),
-            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
-            Arc::new(crate::metrics::RuntimeMetrics::new()),
-        );
+        let journal = journal_over(&config, trace_memtable.clone());
+        let ingest = Ingest::over(journal, &config);
+        ingest.shutdown.begin_drain();
 
-        let status = service.export(tenant_request(request())).await.unwrap_err();
+        let error = ingest.accept(request()).await.unwrap_err();
 
-        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             trace_memtable.is_empty(),
             "a drained OTLP request must not be appended"
         );
     }
 
-    /// One process, one memory budget: OTLP has to answer to the same
-    /// thresholds as Loki push, or refusing one protocol just moves the
-    /// overrun into the other.
+    /// One process, one memory budget: every signal answers to the same
+    /// thresholds, or refusing one just moves the overrun into another.
     #[tokio::test]
-    async fn export_is_refused_once_the_buffers_are_over_their_limit() {
+    async fn an_export_is_refused_once_the_buffers_are_over_their_limit() {
         let config = Config {
-            data_dir: std::env::temp_dir()
-                .join(format!("signy-trace-ingest-{}", uuid::Uuid::new_v4())),
             flush_max_bytes: 1,
             max_memtable_bytes: Some(1),
-            ..Config::default()
+            ..config_at("trace-ingest")
         };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
         let trace_memtable = Arc::new(TraceMemTable::new());
-        let journal = Arc::new(
-            journal::Journal::spawn_with_traces(
-                &config,
-                Arc::new(crate::memtable::MemTable::new()),
-                trace_memtable.clone(),
-            )
-            .unwrap(),
-        );
-        let ingest_gate = IngestGate::for_test(&journal, &config);
-        let service = TraceIngestService::new(
-            journal,
-            Arc::new(crate::shutdown::ShutdownState::new()),
-            ingest_gate,
-            crate::tenant_quota::TenantQuota::for_test(&config),
-            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
-            Arc::new(crate::metrics::RuntimeMetrics::new()),
-        );
+        let journal = journal_over(&config, trace_memtable.clone());
+        let ingest = Ingest::over(journal, &config);
 
-        service
-            .export(tenant_request(request()))
+        ingest
+            .accept(request())
             .await
             .expect("the first export is under the limit");
-        let status = service
-            .export(tenant_request(request()))
+        let error = ingest
+            .accept(request())
             .await
             .expect_err("a full buffer must be refused");
 
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             trace_memtable
                 .query_trace_id(&test_tenant(), &"01".repeat(16))
@@ -339,30 +257,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_acknowledges_after_journal_append() {
-        let config = Config {
-            data_dir: std::env::temp_dir()
-                .join(format!("signy-trace-ingest-{}", uuid::Uuid::new_v4())),
-            ..Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let log_memtable = Arc::new(crate::memtable::MemTable::new());
+    async fn an_export_is_acknowledged_after_the_journal_append() {
+        let config = config_at("trace-ingest");
         let trace_memtable = Arc::new(TraceMemTable::new());
-        let journal = Arc::new(
-            journal::Journal::spawn_with_traces(&config, log_memtable, trace_memtable.clone())
-                .unwrap(),
-        );
-        let ingest_gate = IngestGate::for_test(&journal, &config);
-        let service = TraceIngestService::new(
-            journal,
-            Arc::new(crate::shutdown::ShutdownState::new()),
-            ingest_gate,
-            crate::tenant_quota::TenantQuota::for_test(&config),
-            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
-            Arc::new(crate::metrics::RuntimeMetrics::new()),
-        );
-        let response = service.export(tenant_request(request())).await.unwrap();
-        assert!(response.into_inner().partial_success.is_none());
+        let journal = journal_over(&config, trace_memtable.clone());
+        let ingest = Ingest::over(journal, &config);
+
+        ingest.accept(request()).await.unwrap();
+
         assert_eq!(
             trace_memtable
                 .query_trace_id(&test_tenant(), &"01".repeat(16))
@@ -372,8 +274,8 @@ mod tests {
 
         let replayed = TraceMemTable::new();
         journal::replay_with_traces(
-            service.journal.wal_path(),
-            service.journal.ckpt_path(),
+            ingest.journal.wal_path(),
+            ingest.journal.ckpt_path(),
             &crate::memtable::MemTable::new(),
             &replayed,
         )
@@ -387,122 +289,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_rejects_invalid_request_without_inserting() {
-        let config = Config {
-            data_dir: std::env::temp_dir()
-                .join(format!("signy-trace-invalid-{}", uuid::Uuid::new_v4())),
-            ..Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
+    async fn an_invalid_export_is_rejected_without_inserting() {
+        let config = config_at("trace-invalid");
         let trace_memtable = Arc::new(TraceMemTable::new());
-        let journal = Arc::new(
-            journal::Journal::spawn_with_traces(
-                &config,
-                Arc::new(crate::memtable::MemTable::new()),
-                trace_memtable.clone(),
-            )
-            .unwrap(),
-        );
-        let ingest_gate = IngestGate::for_test(&journal, &config);
-        let service = TraceIngestService::new(
-            journal,
-            Arc::new(crate::shutdown::ShutdownState::new()),
-            ingest_gate,
-            crate::tenant_quota::TenantQuota::for_test(&config),
-            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
-            Arc::new(crate::metrics::RuntimeMetrics::new()),
-        );
+        let journal = journal_over(&config, trace_memtable.clone());
+        let ingest = Ingest::over(journal, &config);
         let mut invalid = request();
         invalid.resource_spans[0].scope_spans[0].spans[0].trace_id = vec![0; 16];
-        let status = service.export(tenant_request(invalid)).await.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+        let error = ingest.accept(invalid).await.unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(trace_memtable.is_empty());
     }
 
     #[tokio::test]
-    async fn export_rejects_oversized_request_without_inserting() {
-        let config = Config {
-            data_dir: std::env::temp_dir()
-                .join(format!("signy-trace-oversized-{}", uuid::Uuid::new_v4())),
-            ..Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
+    async fn an_oversized_export_is_rejected_without_inserting() {
+        let config = config_at("trace-oversized");
         let trace_memtable = Arc::new(TraceMemTable::new());
-        let journal = Arc::new(
-            journal::Journal::spawn_with_traces(
-                &config,
-                Arc::new(crate::memtable::MemTable::new()),
-                trace_memtable.clone(),
-            )
-            .unwrap(),
-        );
-        let ingest_gate = IngestGate::for_test(&journal, &config);
-        let service = TraceIngestService::new(
-            journal,
-            Arc::new(crate::shutdown::ShutdownState::new()),
-            ingest_gate,
-            crate::tenant_quota::TenantQuota::for_test(&config),
-            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
-            Arc::new(crate::metrics::RuntimeMetrics::new()),
-        );
+        let journal = journal_over(&config, trace_memtable.clone());
+        let ingest = Ingest::over(journal, &config);
         let mut oversized = request();
         oversized.resource_spans[0].scope_spans[0].spans[0].name =
             "x".repeat(MAX_OTLP_REQUEST_BYTES);
 
-        let status = service.export(tenant_request(oversized)).await.unwrap_err();
+        let error = ingest.accept(oversized).await.unwrap_err();
 
-        // Non-retryable, and that is the point: this batch is over the ceiling
-        // permanently, so the OTLP retry table has to tell the collector to split
-        // or drop it rather than send the identical bytes again.
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        // Permanent for this record, and the collect route reads it that way:
+        // a client error is dropped and counted rather than answered, because
+        // resending the identical bytes produces the identical refusal.
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(trace_memtable.is_empty());
     }
 
     #[tokio::test]
-    async fn export_rejects_too_many_spans_before_normalization() {
-        let config = Config {
-            data_dir: std::env::temp_dir()
-                .join(format!("signy-trace-span-limit-{}", uuid::Uuid::new_v4())),
-            ..Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
+    async fn an_export_with_too_many_spans_is_rejected_before_normalization() {
+        let config = config_at("trace-span-limit");
         let trace_memtable = Arc::new(TraceMemTable::new());
-        let journal = Arc::new(
-            journal::Journal::spawn_with_traces(
-                &config,
-                Arc::new(crate::memtable::MemTable::new()),
-                trace_memtable.clone(),
-            )
-            .unwrap(),
-        );
-        let ingest_gate = IngestGate::for_test(&journal, &config);
-        let service = TraceIngestService::new(
-            journal,
-            Arc::new(crate::shutdown::ShutdownState::new()),
-            ingest_gate,
-            crate::tenant_quota::TenantQuota::for_test(&config),
-            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
-            Arc::new(crate::metrics::RuntimeMetrics::new()),
-        );
+        let journal = journal_over(&config, trace_memtable.clone());
+        let ingest = Ingest::over(journal, &config);
         let mut too_many = request();
         too_many.resource_spans[0].scope_spans[0].spans = vec![Span::default(); MAX_OTLP_SPANS + 1];
 
-        let status = service.export(tenant_request(too_many)).await.unwrap_err();
+        let error = ingest.accept(too_many).await.unwrap_err();
 
         // Same class as the oversized body: a span count over the cap cannot
         // become acceptable by being retried.
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(trace_memtable.is_empty());
     }
 
     #[tokio::test]
-    async fn export_flushes_to_trace_part_and_reloads_after_restart() {
+    async fn an_export_flushes_to_a_trace_part_and_reloads_after_restart() {
         let config = Config {
-            data_dir: std::env::temp_dir()
-                .join(format!("signy-trace-flush-{}", uuid::Uuid::new_v4())),
             flush_max_interval: Duration::from_millis(20),
             flush_check_interval: Duration::from_millis(10),
-            ..Config::default()
+            ..config_at("trace-flush")
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let log_memtable = Arc::new(crate::memtable::MemTable::new());
@@ -532,16 +374,8 @@ mod tests {
             tokio::sync::watch::channel(false).1,
         ));
 
-        let ingest_gate = IngestGate::for_test(&journal, &config);
-        let service = TraceIngestService::new(
-            journal,
-            Arc::new(crate::shutdown::ShutdownState::new()),
-            ingest_gate,
-            crate::tenant_quota::TenantQuota::for_test(&config),
-            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
-            Arc::new(crate::metrics::RuntimeMetrics::new()),
-        );
-        service.export(tenant_request(request())).await.unwrap();
+        let ingest = Ingest::over(journal, &config);
+        ingest.accept(request()).await.unwrap();
         for _ in 0..100 {
             if trace_parts.part_count() == 1 {
                 break;

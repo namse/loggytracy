@@ -45,7 +45,6 @@ pub struct Config {
     /// where the symptom is a connection refused and the startup log says
     /// exactly what was bound.
     pub listen_addr: String,
-    pub otlp_grpc_addr: String,
     pub data_dir: PathBuf,
     /// Tenant a **read** without a tenant header is attributed to, or `None` —
     /// the default — to reject such requests with 400. The opt-in exists for
@@ -273,7 +272,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: "127.0.0.1:3100".to_string(),
-            otlp_grpc_addr: "127.0.0.1:4317".to_string(),
             data_dir: PathBuf::from("./data"),
             missing_tenant: None,
             max_batch_bytes: 1024 * 1024,
@@ -521,7 +519,6 @@ impl Config {
             memory_budget_bytes,
             memory_budget_source,
             listen_addr: env_string("SIGNY_LISTEN_ADDR", defaults.listen_addr),
-            otlp_grpc_addr: env_string("SIGNY_OTLP_GRPC_ADDR", defaults.otlp_grpc_addr),
             data_dir: std::env::var("SIGNY_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| defaults.data_dir.clone()),
@@ -794,8 +791,8 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.listen_addr.trim().is_empty() || self.otlp_grpc_addr.trim().is_empty() {
-            return Err("listen and OTLP addresses must not be empty".to_string());
+        if self.listen_addr.trim().is_empty() {
+            return Err("the listen address must not be empty".to_string());
         }
         positive_usize("max_batch_bytes", self.max_batch_bytes)?;
         // Zero is the default and means "do not linger", so this one is not a

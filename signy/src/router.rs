@@ -4,18 +4,18 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 
-use crate::{AppState, admin, otlp_http, query};
+use crate::{AppState, admin, collect, query};
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    // The ingest routes carry their own body limit, so they are merged as a
-    // separate router rather than layered onto this one. `Router::layer`
-    // applies to every route registered before it, which would leave the
-    // effective limit of a route depending on where in this chain it sits.
+    // The collect route carries its own body limit — none at all — so it is
+    // merged as a separate router rather than layered onto this one.
+    // `Router::layer` applies to every route registered before it, which would
+    // leave the effective limit of a route depending on where in this chain it
+    // sits.
     // The read surface is the first-party API alone: the Loki and Tempo
     // compatibility routes went with the read-path decision (issue #3), and
     // the trace routes below are their first-party replacement.
     let router = Router::new()
-        .merge(ingest_router(state.clone()))
         .merge(collect_router())
         .route("/metrics", get(query::metrics))
         .route("/signy/api/v1/logs", get(query::logs))
@@ -66,69 +66,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     router.merge(admin_router()).with_state(state)
 }
 
-/// The write routes, with the body limit they enforce.
-///
-/// Ingest is OTLP only — the Loki push route was removed with the rest of
-/// that ingest (`todo.md`, "Next — OTLP only"). Without an explicit limit
-/// these routes inherit axum's 2 MiB default, so a collector tuned to larger
-/// batches would get an unexplained 413 with no knob to turn. The limit
-/// matches what the gRPC services accept, so a collector sees one size
-/// whichever transport it picks.
-fn ingest_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/v1/logs", post(otlp_http::logs))
-        .route("/v1/traces", post(otlp_http::traces))
-        .route("/v1/metrics", post(otlp_http::metrics))
-        .layer(DefaultBodyLimit::max(otlp_http::MAX_OTLP_HTTP_BODY_BYTES))
-        // Outside the body limit deliberately, so it runs *before* the body is
-        // collected. A handler takes `body: Bytes`, which means axum has already
-        // put the whole thing in the heap by the time handler code could look at
-        // it — an admission check there would be counting memory it had already
-        // spent. Here the only thing read is the header.
-        .layer(axum::middleware::from_fn_with_state(
-            state,
-            admit_inflight_body,
-        ))
-}
-
-/// The collect route, with no body limit at all.
+/// The whole write surface: one route, with no body limit at all.
 ///
 /// The handler reads the body as it arrives and holds one record, so there is
 /// nothing here for a limit to protect: what a batch may contain is bounded
 /// per record, inside the handler, and how large a batch may be is collecty's
 /// decision. A `DefaultBodyLimit` would put that decision back here, and put
 /// it back as a number nothing on the collector's side can see.
+///
+/// It is also where the in-flight body ceiling is charged. The OTLP push
+/// routes needed middleware for that, because a handler taking `body: Bytes`
+/// has already had the whole thing put in the heap for it by the time its own
+/// code runs. This handler is handed the stream instead, and charges each
+/// record as it decodes it.
 fn collect_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/signy/api/v1/collect", post(otlp_http::collect))
+        .route("/signy/api/v1/collect", post(collect::collect))
         .layer(DefaultBodyLimit::disable())
-}
-
-/// Charge a push against the in-flight body ceiling for as long as it runs.
-///
-/// `Content-Length` is what a collector sends and what axum will buffer, so it
-/// is the charge. A body without one is chunked, and its size is unknowable
-/// until it has been read — exactly the case a bound exists for — so it is
-/// charged the ceiling a single request may reach. The guard lives across
-/// `next.run`, which is the whole request including the response write.
-async fn admit_inflight_body(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    let declared = request
-        .headers()
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(otlp_http::MAX_OTLP_HTTP_BODY_BYTES as u64);
-    let _permit = match state.ingest_gate.admit_body(declared) {
-        Ok(permit) => permit,
-        Err(error) => return error.into_response(),
-    };
-    next.run(request).await
 }
 
 fn admin_router() -> Router<Arc<AppState>> {

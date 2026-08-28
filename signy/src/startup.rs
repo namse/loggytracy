@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use crate::app_state::AppStateDependencies;
 use crate::flush;
-use crate::log_ingest;
 use crate::merge;
 use crate::metrics::RuntimeMetrics;
 use crate::object_storage::{ObjectStorage, RemoteCache};
@@ -18,7 +17,6 @@ use crate::part_registry::PartRegistry;
 use crate::retention;
 use crate::router;
 use crate::tenant_policy::TenantPolicy;
-use crate::trace_ingest;
 use crate::{AppState, trace_registry};
 
 /// Retry a startup step that talks to the object store.
@@ -642,8 +640,6 @@ pub async fn run(config: Arc<Config>) {
         });
     }
 
-    let otlp_journal = journal.clone();
-    let otlp_healthy = Arc::new(AtomicBool::new(true));
     let state = Arc::new(AppState::from_config(
         config.clone(),
         AppStateDependencies {
@@ -655,7 +651,6 @@ pub async fn run(config: Arc<Config>) {
             flush_healthy,
             merge_healthy,
             retention_healthy,
-            otlp_healthy: otlp_healthy.clone(),
             remote_cache,
             tenant_policy,
             metrics: metrics.clone(),
@@ -675,13 +670,10 @@ pub async fn run(config: Arc<Config>) {
         }));
     }
 
-    let ingest_gate = state.ingest_gate.clone();
-    let tenant_quota = state.tenant_quota.clone();
-    let tenant_policy = state.tenant_policy.clone();
     let app = router::build_router(state);
 
     // A SIGTERM/SIGINT starts draining: new ingest is rejected, and every drain
-    // subscriber (the HTTP and gRPC servers plus the background workers) stops.
+    // subscriber (the HTTP server plus the background workers) stops.
     {
         let signal_shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -690,60 +682,6 @@ pub async fn run(config: Arc<Config>) {
             signal_shutdown.begin_drain();
         });
     }
-
-    announce_bind(&config.otlp_grpc_addr, "SIGNY_OTLP_GRPC_ADDR");
-    let otlp_addr = config
-        .otlp_grpc_addr
-        .parse()
-        .unwrap_or_else(|error| panic!("invalid OTLP gRPC address: {error}"));
-    let otlp_service = trace_ingest::TraceIngestService::new(
-        otlp_journal.clone(),
-        shutdown.clone(),
-        ingest_gate.clone(),
-        tenant_quota.clone(),
-        tenant_policy.clone(),
-        metrics.clone(),
-    );
-    // Logs, traces and metrics share the listener, the journal and the drain
-    // signal. `ARCHITECTURE.md` has described OTLP as an ingest protocol from
-    // the start; until each service was registered, a collector exporting that
-    // signal got `UNIMPLEMENTED`.
-    let otlp_log_service = log_ingest::LogIngestService::new(
-        otlp_journal.clone(),
-        shutdown.clone(),
-        config.clone(),
-        ingest_gate.clone(),
-        tenant_quota.clone(),
-        tenant_policy.clone(),
-        metrics.clone(),
-        clock.clone(),
-    );
-    let otlp_metric_service = crate::series_ingest::MetricsIngestService::new(
-        otlp_journal,
-        shutdown.clone(),
-        config.clone(),
-        ingest_gate,
-        tenant_quota,
-        tenant_policy,
-        metrics.clone(),
-        clock.clone(),
-    );
-    let otlp_task_health = otlp_healthy;
-    let mut otlp_drain = shutdown.subscribe();
-    let otlp_handle = tokio::spawn(async move {
-        let result = tonic::transport::Server::builder()
-            .add_service(otlp_service.into_server())
-            .add_service(otlp_log_service.into_server())
-            .add_service(otlp_metric_service.into_server())
-            .serve_with_shutdown(otlp_addr, async move {
-                crate::shutdown::wait_for_drain(&mut otlp_drain).await;
-            })
-            .await;
-        if let Err(error) = result {
-            tracing::error!(%error, "OTLP gRPC server failed");
-        }
-        otlp_task_health.store(false, Ordering::Release);
-    });
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)
         .await
@@ -761,12 +699,9 @@ pub async fn run(config: Arc<Config>) {
     }
 
     // The HTTP server has stopped accepting and finished its in-flight requests.
-    // Ensure draining is set even if it exited for another reason, then wait for
-    // the gRPC server and every background worker to stop.
+    // Ensure draining is set even if it exited for another reason, then wait
+    // for every background worker to stop.
     shutdown.begin_drain();
-    if let Err(error) = otlp_handle.await {
-        tracing::error!(%error, "OTLP gRPC task join failed");
-    }
     for handle in worker_handles {
         if let Err(error) = handle.await {
             tracing::error!(%error, "background worker join failed");
@@ -856,17 +791,12 @@ mod tests {
     /// names its own tenant, so a listener reachable from off the machine is a
     /// decision, not a default.
     #[test]
-    fn the_default_listeners_stay_inside_the_machine() {
+    fn the_default_listener_stays_inside_the_machine() {
         let config = Config::default();
         assert!(
             is_loopback_addr(&config.listen_addr),
             "{}",
             config.listen_addr
-        );
-        assert!(
-            is_loopback_addr(&config.otlp_grpc_addr),
-            "{}",
-            config.otlp_grpc_addr
         );
     }
 

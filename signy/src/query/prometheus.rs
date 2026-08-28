@@ -32,9 +32,6 @@ pub async fn ready(
     if !state.retention_healthy.load(Ordering::Acquire) {
         unavailable.push("retention worker");
     }
-    if !state.otlp_healthy.load(Ordering::Acquire) {
-        unavailable.push("OTLP gRPC server");
-    }
     if let Some(cache) = &state.remote_cache {
         if !cache.is_remote_healthy() {
             unavailable.push("object store");

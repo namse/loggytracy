@@ -43,7 +43,6 @@ pub struct AppState {
     pub flush_healthy: Arc<AtomicBool>,
     pub merge_healthy: Arc<AtomicBool>,
     pub retention_healthy: Arc<AtomicBool>,
-    pub otlp_healthy: Arc<AtomicBool>,
     pub remote_cache: Option<Arc<RemoteCache>>,
     /// The tenant→retention snapshot, read by query handlers to clamp a
     /// requested range to what the tenant is still entitled to see.
@@ -77,7 +76,6 @@ pub struct AppStateDependencies {
     pub flush_healthy: Arc<AtomicBool>,
     pub merge_healthy: Arc<AtomicBool>,
     pub retention_healthy: Arc<AtomicBool>,
-    pub otlp_healthy: Arc<AtomicBool>,
     pub remote_cache: Option<Arc<RemoteCache>>,
     pub tenant_policy: Arc<TenantPolicy>,
     pub metrics: Arc<RuntimeMetrics>,
@@ -146,7 +144,6 @@ impl AppState {
             flush_healthy: dependencies.flush_healthy,
             merge_healthy: dependencies.merge_healthy,
             retention_healthy: dependencies.retention_healthy,
-            otlp_healthy: dependencies.otlp_healthy,
             remote_cache: dependencies.remote_cache,
             tenant_policy: dependencies.tenant_policy,
             metrics: dependencies.metrics,

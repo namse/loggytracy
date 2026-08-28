@@ -1,20 +1,10 @@
-use std::sync::Arc;
-use std::time::Duration;
-
-use opentelemetry_proto::tonic::collector::logs::v1::{
-    ExportLogsServiceRequest, ExportLogsServiceResponse,
-    logs_service_server::{LogsService, LogsServiceServer},
-};
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost014::Message;
-use tonic::{Code, Request, Response, Status};
-use tonic_types::{ErrorDetails, StatusExt};
 
 use crate::backpressure::IngestError;
-use crate::backpressure::IngestGate;
 use crate::config::Config;
 use crate::journal::Journal;
 use crate::otlp_log::normalize_request;
-use crate::shutdown::ShutdownState;
 use crate::trace_ingest::MAX_OTLP_REQUEST_BYTES;
 use axum::http::StatusCode;
 
@@ -22,55 +12,6 @@ use axum::http::StatusCode;
 /// reason: the request is normalized in memory before anything is appended, so
 /// the count has to be bounded before that work starts.
 pub const MAX_OTLP_LOG_RECORDS: usize = 100_000;
-
-/// OTLP log ingest.
-///
-/// The gRPC counterpart to the Loki push handler, landing in the same journal,
-/// the same memtable and the same part format. `ARCHITECTURE.md` has claimed
-/// OTLP ingest since the beginning while only the trace service was registered,
-/// so a collector exporting logs got `UNIMPLEMENTED`.
-#[derive(Clone)]
-pub struct LogIngestService {
-    journal: Arc<Journal>,
-    shutdown: Arc<ShutdownState>,
-    config: Arc<Config>,
-    ingest_gate: Arc<IngestGate>,
-    tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
-    tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
-    metrics: Arc<crate::metrics::RuntimeMetrics>,
-    clock: Arc<crate::clock::Clock>,
-}
-
-impl LogIngestService {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        journal: Arc<Journal>,
-        shutdown: Arc<ShutdownState>,
-        config: Arc<Config>,
-        ingest_gate: Arc<IngestGate>,
-        tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
-        tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
-        metrics: Arc<crate::metrics::RuntimeMetrics>,
-        clock: Arc<crate::clock::Clock>,
-    ) -> Self {
-        Self {
-            journal,
-            shutdown,
-            config,
-            ingest_gate,
-            tenant_quota,
-            tenant_policy,
-            metrics,
-            clock,
-        }
-    }
-
-    pub fn into_server(self) -> LogsServiceServer<Self> {
-        LogsServiceServer::new(self)
-            .max_decoding_message_size(MAX_OTLP_REQUEST_BYTES)
-            .max_encoding_message_size(64 * 1024)
-    }
-}
 
 /// Accepting one OTLP log export, independent of how it arrived.
 ///
@@ -80,9 +21,7 @@ impl LogIngestService {
 /// and forgotten on the other.
 pub struct OtlpLogIngest<'a> {
     pub journal: &'a Journal,
-    pub shutdown: &'a ShutdownState,
     pub config: &'a Config,
-    pub ingest_gate: &'a IngestGate,
     pub tenant_quota: &'a crate::tenant_quota::TenantQuota,
     pub tenant_policy: &'a crate::tenant_policy::TenantPolicy,
     pub metrics: &'a crate::metrics::RuntimeMetrics,
@@ -90,28 +29,6 @@ pub struct OtlpLogIngest<'a> {
 }
 
 impl OtlpLogIngest<'_> {
-    /// Refusals that do not depend on knowing the tenant, checked before the
-    /// transport goes looking for the header. A draining instance has to say
-    /// so even when the request is also malformed, or an operator reads a
-    /// planned shutdown as a client bug.
-    pub fn admit_transport(&self) -> Result<(), IngestError> {
-        if self.shutdown.is_fenced() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "this instance has been fenced by a newer writer and is shutting down".to_string(),
-            )
-                .into());
-        }
-        if self.shutdown.is_draining() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server is draining for shutdown".to_string(),
-            )
-                .into());
-        }
-        self.ingest_gate.check()
-    }
-
     /// What the size alone decides, before the body is decoded and before
     /// anyone knows whose it is.
     ///
@@ -126,23 +43,6 @@ impl OtlpLogIngest<'_> {
                 format!("OTLP request exceeds the maximum of {MAX_OTLP_REQUEST_BYTES} bytes"),
             )
                 .into());
-        }
-        Ok(())
-    }
-
-    /// Accept one export, however many tenants it turns out to name.
-    ///
-    /// `wire` is the encoded request when the transport still has it — the
-    /// HTTP protobuf body arrives as exactly the bytes the WAL wants, so they
-    /// are passed through instead of being re-encoded. gRPC and JSON hand
-    /// over a decoded message only, and those re-encode it here.
-    pub async fn accept(
-        &self,
-        request: ExportLogsServiceRequest,
-        wire: Option<Vec<u8>>,
-    ) -> Result<(), IngestError> {
-        for pending in self.enqueue_request(request, wire, None).await? {
-            pending.settle().await.map_err(journal_write_failed)?;
         }
         Ok(())
     }
@@ -282,99 +182,6 @@ pub fn journal_write_failed(error: std::io::Error) -> IngestError {
         format!("journal write failed: {error}"),
     )
         .into()
-}
-
-/// An HTTP-shaped refusal, spelled for a gRPC client.
-///
-/// OTLP exporters read the code, not the message, so this mapping is what
-/// decides whether a collector retries or drops the batch.
-///
-/// The two refusals that share a status code over HTTP's cousin do **not** share
-/// one here, because the OTLP specification's retry table is what a collector
-/// acts on and they want opposite actions:
-///
-/// * A **limit violation** — a body over `MAX_OTLP_REQUEST_BYTES`, more spans
-///   than `MAX_OTLP_SPANS` — is permanent for that batch. Retrying it produces
-///   the identical refusal forever. The specification names `INVALID_ARGUMENT`
-///   for exactly this ("to indicate non-retryable errors, the server is
-///   recommended to use code InvalidArgument"), and a client MUST NOT retry it,
-///   so the collector splits or drops the batch instead of looping on it.
-/// * **Backpressure** — the memtable or WAL backlog over its threshold, a
-///   tenant over its rate, too many bodies in flight — is temporary by
-///   construction, and `RESOURCE_EXHAUSTED` is where it belongs.
-///
-/// And backpressure carries `RetryInfo`, because on this transport that is what
-/// makes it backpressure at all. The specification treats `RESOURCE_EXHAUSTED`
-/// as retryable *only* when the server signals recovery is possible — "a client
-/// SHOULD interpret it as retryable only if the server signals that recovery is
-/// possible", by attaching `RetryInfo` — and says a client SHOULD **drop** the
-/// telemetry otherwise. A bare `RESOURCE_EXHAUSTED` is therefore not a softer
-/// refusal than `INVALID_ARGUMENT`; it is the same instruction to discard,
-/// which would make the architecture's own premise false on one of its two
-/// transports: a client can only hold data back if the server declines it.
-///
-/// The delay is the refusal's own `retry_after` — the identical field the HTTP
-/// transport renders as `Retry-After` — in the identical whole-second
-/// granularity ([`crate::backpressure::retry_after_seconds`]), so the two
-/// transports carry one instruction rather than two compatible ones. A 429 that
-/// somehow carried no delay still gets one: every producer sets it today
-/// (`backpressure::overloaded`, `tenant_quota`'s two refusals), and the fallback
-/// is here so that a fourth one added later cannot silently return the transport
-/// to telling collectors to drop.
-pub fn ingest_error_to_status(error: IngestError) -> Status {
-    match error.status {
-        StatusCode::SERVICE_UNAVAILABLE => Status::unavailable(error.message),
-        StatusCode::TOO_MANY_REQUESTS => {
-            let seconds = crate::backpressure::retry_after_seconds(
-                error.retry_after.unwrap_or(DEFAULT_RETRY_AFTER),
-            );
-            Status::with_error_details(
-                Code::ResourceExhausted,
-                error.message,
-                ErrorDetails::with_retry_info(Some(Duration::from_secs(seconds))),
-            )
-        }
-        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_REQUEST => {
-            Status::invalid_argument(error.message)
-        }
-        StatusCode::FORBIDDEN => Status::permission_denied(error.message),
-        _ => Status::internal(error.message),
-    }
-}
-
-/// The delay a throttled push is told to wait when its refusal named none.
-///
-/// Matches `Config::backpressure_retry_after`'s default rather than being a
-/// second number: this is a floor for a case that does not arise, not a policy.
-const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
-
-#[tonic::async_trait]
-impl LogsService for LogIngestService {
-    async fn export(
-        &self,
-        request: Request<ExportLogsServiceRequest>,
-    ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        let ingest = OtlpLogIngest {
-            journal: &self.journal,
-            shutdown: &self.shutdown,
-            config: &self.config,
-            ingest_gate: &self.ingest_gate,
-            tenant_quota: &self.tenant_quota,
-            tenant_policy: &self.tenant_policy,
-            metrics: &self.metrics,
-            clock: &self.clock,
-        };
-        ingest.admit_transport().map_err(ingest_error_to_status)?;
-        let request = request.into_inner();
-        ingest
-            .admit_size(request.encoded_len())
-            .map_err(ingest_error_to_status)?;
-        ingest
-            .accept(request, None)
-            .await
-            .map_err(ingest_error_to_status)?;
-        Ok(Response::new(ExportLogsServiceResponse::default()))
-    }
 }
 
 #[cfg(test)]

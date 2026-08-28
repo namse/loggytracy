@@ -3,6 +3,7 @@ mod app_state;
 mod backpressure;
 pub mod bloom;
 pub mod clock;
+mod collect;
 pub mod config;
 mod disk;
 // Shared with `benches/` and `bin/load`. One generator, so a load result and a
@@ -23,7 +24,6 @@ pub mod memtable;
 mod merge;
 mod metrics;
 pub mod object_storage;
-mod otlp_http;
 mod otlp_log;
 mod otlp_tenant;
 pub(crate) mod page_cache;

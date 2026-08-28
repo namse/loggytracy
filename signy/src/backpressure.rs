@@ -44,13 +44,38 @@ impl IntoResponse for IngestError {
     }
 }
 
-/// The delay a refusal promises, in the granularity both transports use.
+/// Refusals that belong to the instance rather than to any one record:
+/// fenced, draining, or already behind.
 ///
-/// `Retry-After` has whole seconds and nothing finer, and the two transports
-/// have to carry the *same* instruction rather than merely compatible ones — a
-/// gRPC `RetryInfo` of 1.7 s beside a header of 1 s is two answers to one
-/// question. So the header's granularity is the shared one and
-/// [`crate::log_ingest::ingest_error_to_status`] sends whole seconds too.
+/// Checked once for a whole batch and before a byte of it is decompressed, so
+/// a server in one of these states refuses the batch instead of taking part of
+/// it. It lived on each signal's ingest struct while every signal had its own
+/// transport; there is one route now, and one place this is decided.
+pub fn admit_batch(
+    shutdown: &crate::shutdown::ShutdownState,
+    gate: &IngestGate,
+) -> Result<(), IngestError> {
+    if shutdown.is_fenced() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this instance has been fenced by a newer writer and is shutting down".to_string(),
+        )
+            .into());
+    }
+    if shutdown.is_draining() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server is draining for shutdown".to_string(),
+        )
+            .into());
+    }
+    gate.check()
+}
+
+/// The delay a refusal promises, in `Retry-After`'s own granularity.
+///
+/// The header has whole seconds and nothing finer, so that is what a computed
+/// delay is rounded to.
 ///
 /// Rounded **up**, and never zero. `Retry-After: 0` reads as "retry
 /// immediately", which is the opposite of what an overloaded server is asking
@@ -173,23 +198,6 @@ over the limit of {limit}; too many pushes are in flight at once"
         }
     }
 
-    /// The same admission for OTLP over gRPC, in its own vocabulary.
-    ///
-    /// The gRPC transport is charged for what it can be charged for and no
-    /// more. There is no `Content-Length` on a gRPC request — the framing is
-    /// streamed — and tonic hands the service an already-decoded message, so
-    /// the wire size is gone by the time any code here could read it. What
-    /// bounds that path is tonic's own `max_decoding_message_size`
-    /// (`MAX_OTLP_REQUEST_BYTES`) times its concurrency, which is recorded as a
-    /// known limit rather than papered over: charging a flat ceiling per gRPC
-    /// push instead would refuse four concurrent 100 KB batches on a 2 GiB
-    /// container, which is a throughput regression wearing a memory bound's
-    /// clothes.
-    pub fn admit_body_grpc(&self, bytes: u64) -> Result<InflightBody, tonic::Status> {
-        self.admit_body(bytes)
-            .map_err(crate::log_ingest::ingest_error_to_status)
-    }
-
     fn charge(&self, bytes: u64) -> InflightBody {
         InflightBody {
             counter: self.inflight_body_bytes.clone(),
@@ -248,15 +256,6 @@ of {floor}; refusing writes so flush keeps room to run"
             )));
         }
         Ok(())
-    }
-
-    /// The same decision for OTLP, whose exporters read a status code rather
-    /// than a header. Rendered by the one mapping both gRPC services use, so
-    /// the refusal carries the `RetryInfo` that makes `RESOURCE_EXHAUSTED`
-    /// retryable instead of a bare code a collector is told to drop on.
-    pub fn check_grpc(&self) -> Result<(), tonic::Status> {
-        self.check()
-            .map_err(crate::log_ingest::ingest_error_to_status)
     }
 
     /// A gate over the given journal with its own metrics, for tests that are
@@ -353,27 +352,6 @@ mod tests {
         drop(permits);
     }
 
-    /// gRPC gets the OTLP specification's status rather than the HTTP one —
-    /// and the `RetryInfo` that makes that status mean "come back". Without it
-    /// the specification tells a collector to drop the batch, which would make
-    /// the in-flight ceiling a data-loss mechanism instead of a memory bound.
-    #[tokio::test]
-    async fn the_grpc_refusal_is_resource_exhausted_and_says_when_to_return() {
-        use tonic_types::StatusExt;
-
-        let gate = gate(Some(1000));
-        let _first = gate.admit_body(1000).expect("the first body fits");
-        let status = gate
-            .admit_body_grpc(1000)
-            .expect_err("the second body is refused");
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(
-            status
-                .get_details_retry_info()
-                .and_then(|info| info.retry_delay),
-            Some(Config::default().backpressure_retry_after),
-        );
-    }
     use crate::memtable::MemTable;
 
     fn disk_config(label: &str) -> Config {

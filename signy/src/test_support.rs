@@ -100,7 +100,6 @@ fn state_inner(
             flush_healthy: Arc::new(AtomicBool::new(true)),
             merge_healthy: Arc::new(AtomicBool::new(true)),
             retention_healthy: Arc::new(AtomicBool::new(true)),
-            otlp_healthy: Arc::new(AtomicBool::new(true)),
             remote_cache,
             tenant_policy,
             metrics: Arc::new(RuntimeMetrics::new()),

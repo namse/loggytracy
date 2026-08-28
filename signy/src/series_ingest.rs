@@ -12,25 +12,18 @@
 //! insert (`series::SeriesMemTable::insert`), which replay drives in the same
 //! append order live ingest did, so the totals reproduce.
 
-use std::sync::Arc;
-
-use opentelemetry_proto::tonic::collector::metrics::v1::{
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
-    metrics_service_server::{MetricsService, MetricsServiceServer},
-};
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::metrics::v1::{
     AggregationTemporality, ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint,
     metric, number_data_point,
 };
 use prost014::Message;
-use tonic::{Request, Response, Status};
 
-use crate::backpressure::{IngestError, IngestGate};
+use crate::backpressure::IngestError;
 use crate::config::Config;
 use crate::journal::Journal;
 use crate::otlp_log::normalize_attribute_key;
 use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
-use crate::shutdown::ShutdownState;
 use crate::tenant::TenantId;
 use crate::trace_ingest::MAX_OTLP_REQUEST_BYTES;
 use axum::http::StatusCode;
@@ -573,9 +566,7 @@ fn decompose_exponential(
 /// limit.
 pub struct OtlpMetricIngest<'a> {
     pub journal: &'a Journal,
-    pub shutdown: &'a ShutdownState,
     pub config: &'a Config,
-    pub ingest_gate: &'a IngestGate,
     pub tenant_quota: &'a crate::tenant_quota::TenantQuota,
     pub tenant_policy: &'a crate::tenant_policy::TenantPolicy,
     pub metrics: &'a crate::metrics::RuntimeMetrics,
@@ -583,24 +574,6 @@ pub struct OtlpMetricIngest<'a> {
 }
 
 impl OtlpMetricIngest<'_> {
-    pub fn admit_transport(&self) -> Result<(), IngestError> {
-        if self.shutdown.is_fenced() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "this instance has been fenced by a newer writer and is shutting down".to_string(),
-            )
-                .into());
-        }
-        if self.shutdown.is_draining() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server is draining for shutdown".to_string(),
-            )
-                .into());
-        }
-        self.ingest_gate.check()
-    }
-
     /// See [`crate::log_ingest::OtlpLogIngest::admit_size`]: the tenant is no
     /// longer knowable this early, and the size still is.
     pub fn admit_size(&self, encoded_len: usize) -> Result<(), IngestError> {
@@ -612,20 +585,6 @@ impl OtlpMetricIngest<'_> {
                 .into());
         }
         Ok(())
-    }
-
-    pub async fn accept(
-        &self,
-        request: ExportMetricsServiceRequest,
-    ) -> Result<MetricAcceptOutcome, IngestError> {
-        let (pending, outcome) = self.enqueue_request(request, None).await?;
-        for pending in pending {
-            pending
-                .settle()
-                .await
-                .map_err(crate::log_ingest::journal_write_failed)?;
-        }
-        Ok(outcome)
     }
 
     /// The metric counterpart to
@@ -763,8 +722,9 @@ still accepted; capacity returns as series idle past {:?} \
     }
 }
 
-/// What `accept` answered on the success path: everything a transport needs
-/// to build the OTLP `partial_success`.
+/// What an accepted export answered with: everything the OTLP
+/// `partial_success` needs.
+#[derive(Debug)]
 pub struct MetricAcceptOutcome {
     pub rejected_data_points: u64,
     pub rejection: Option<String>,
@@ -828,86 +788,13 @@ fn datapoint_count(metric: &opentelemetry_proto::tonic::metrics::v1::Metric) -> 
     }
 }
 
-#[derive(Clone)]
-pub struct MetricsIngestService {
-    journal: Arc<Journal>,
-    shutdown: Arc<ShutdownState>,
-    config: Arc<Config>,
-    ingest_gate: Arc<IngestGate>,
-    tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
-    tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
-    metrics: Arc<crate::metrics::RuntimeMetrics>,
-    clock: Arc<crate::clock::Clock>,
-}
-
-impl MetricsIngestService {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        journal: Arc<Journal>,
-        shutdown: Arc<ShutdownState>,
-        config: Arc<Config>,
-        ingest_gate: Arc<IngestGate>,
-        tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
-        tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
-        metrics: Arc<crate::metrics::RuntimeMetrics>,
-        clock: Arc<crate::clock::Clock>,
-    ) -> Self {
-        Self {
-            journal,
-            shutdown,
-            config,
-            ingest_gate,
-            tenant_quota,
-            tenant_policy,
-            metrics,
-            clock,
-        }
-    }
-
-    pub fn into_server(self) -> MetricsServiceServer<Self> {
-        MetricsServiceServer::new(self)
-            .max_decoding_message_size(MAX_OTLP_REQUEST_BYTES)
-            .max_encoding_message_size(64 * 1024)
-    }
-}
-
-#[tonic::async_trait]
-impl MetricsService for MetricsIngestService {
-    async fn export(
-        &self,
-        request: Request<ExportMetricsServiceRequest>,
-    ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
-        use crate::log_ingest::ingest_error_to_status;
-
-        let ingest = OtlpMetricIngest {
-            journal: &self.journal,
-            shutdown: &self.shutdown,
-            config: &self.config,
-            ingest_gate: &self.ingest_gate,
-            tenant_quota: &self.tenant_quota,
-            tenant_policy: &self.tenant_policy,
-            metrics: &self.metrics,
-            clock: &self.clock,
-        };
-        ingest.admit_transport().map_err(ingest_error_to_status)?;
-        let request = request.into_inner();
-        ingest
-            .admit_size(request.encoded_len())
-            .map_err(ingest_error_to_status)?;
-        let outcome = ingest
-            .accept(request)
-            .await
-            .map_err(ingest_error_to_status)?;
-        Ok(Response::new(ExportMetricsServiceResponse {
-            partial_success: outcome.partial_success(),
-        }))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backpressure::IngestGate;
     use crate::series::SeriesMemTable;
+    use crate::shutdown::ShutdownState;
+    use std::sync::Arc;
     use crate::tenant::test_tenant;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::metrics::v1::{
@@ -1241,7 +1128,48 @@ mod tests {
         );
     }
 
-    fn service_over(config: Config) -> (MetricsIngestService, Arc<SeriesMemTable>, Arc<Journal>) {
+    /// The collect route's own sequence over one record, so these tests
+    /// refuse what the route refuses and store what it stores. The tenant
+    /// rides in the payload, so what makes a request the test tenant's is the
+    /// resource `request_with` builds.
+    struct Ingest {
+        journal: Arc<Journal>,
+        shutdown: Arc<ShutdownState>,
+        config: Arc<Config>,
+        ingest_gate: Arc<IngestGate>,
+        tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
+        tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
+        metrics: Arc<crate::metrics::RuntimeMetrics>,
+        clock: Arc<crate::clock::Clock>,
+    }
+
+    impl Ingest {
+        async fn accept(
+            &self,
+            request: ExportMetricsServiceRequest,
+        ) -> Result<MetricAcceptOutcome, IngestError> {
+            let ingest = OtlpMetricIngest {
+                journal: &self.journal,
+                config: &self.config,
+                tenant_quota: &self.tenant_quota,
+                tenant_policy: &self.tenant_policy,
+                metrics: &self.metrics,
+                clock: &self.clock,
+            };
+            crate::backpressure::admit_batch(&self.shutdown, &self.ingest_gate)?;
+            ingest.admit_size(request.encoded_len())?;
+            let (pending, outcome) = ingest.enqueue_request(request, None).await?;
+            for pending in pending {
+                pending
+                    .settle()
+                    .await
+                    .map_err(crate::log_ingest::journal_write_failed)?;
+            }
+            Ok(outcome)
+        }
+    }
+
+    fn ingest_over(config: Config) -> (Ingest, Arc<SeriesMemTable>, Arc<Journal>) {
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let series_memtable = Arc::new(SeriesMemTable::new());
         let journal = Arc::new(
@@ -1254,26 +1182,17 @@ mod tests {
             .unwrap(),
         );
         let ingest_gate = IngestGate::for_test(&journal, &config);
-        let service = MetricsIngestService::new(
-            journal.clone(),
-            Arc::new(crate::shutdown::ShutdownState::new()),
-            Arc::new(config.clone()),
+        let ingest = Ingest {
+            journal: journal.clone(),
+            shutdown: Arc::new(crate::shutdown::ShutdownState::new()),
+            config: Arc::new(config.clone()),
             ingest_gate,
-            crate::tenant_quota::TenantQuota::for_test(&config),
-            Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
-            Arc::new(crate::metrics::RuntimeMetrics::new()),
-            crate::clock::Clock::system(),
-        );
-        (service, series_memtable, journal)
-    }
-
-    /// The tenant rides in the payload now, so the wrapper carries nothing:
-    /// what makes a request the test tenant's is the resource
-    /// `request_with` builds.
-    fn tenant_request(
-        request: ExportMetricsServiceRequest,
-    ) -> Request<ExportMetricsServiceRequest> {
-        Request::new(request)
+            tenant_quota: crate::tenant_quota::TenantQuota::for_test(&config),
+            tenant_policy: Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            metrics: Arc::new(crate::metrics::RuntimeMetrics::new()),
+            clock: crate::clock::Clock::system(),
+        };
+        (ingest, series_memtable, journal)
     }
 
     fn now_ns() -> u64 {
@@ -1303,9 +1222,9 @@ mod tests {
                 .join(format!("signy-metric-ingest-{}", uuid::Uuid::new_v4())),
             ..Config::default()
         };
-        let (service, series_memtable, journal) = service_over(config);
-        service
-            .export(tenant_request(small_request()))
+        let (ingest, series_memtable, journal) = ingest_over(config);
+        ingest
+            .accept(small_request())
             .await
             .unwrap();
         let live = series_memtable.sorted_samples(&test_tenant()).unwrap();
@@ -1334,7 +1253,7 @@ mod tests {
                 .join(format!("signy-metric-delta-{}", uuid::Uuid::new_v4())),
             ..Config::default()
         };
-        let (service, series_memtable, journal) = service_over(config);
+        let (ingest, series_memtable, journal) = ingest_over(config);
         let base = now_ns();
         for (offset, value) in [(0u64, 5.0), (1_000_000_000, 3.0), (2_000_000_000, 2.0)] {
             let request = request_with(
@@ -1349,7 +1268,7 @@ mod tests {
                 }],
                 None,
             );
-            service.export(tenant_request(request)).await.unwrap();
+            ingest.accept(request).await.unwrap();
         }
         let live = series_memtable.sorted_samples(&test_tenant()).unwrap();
         let totals: Vec<f64> = live
@@ -1380,13 +1299,10 @@ mod tests {
                 .join(format!("signy-metric-drain-{}", uuid::Uuid::new_v4())),
             ..Config::default()
         };
-        let (service, series_memtable, _journal) = service_over(config);
-        service.shutdown.begin_drain();
-        let status = service
-            .export(tenant_request(small_request()))
-            .await
-            .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unavailable);
+        let (ingest, series_memtable, _journal) = ingest_over(config);
+        ingest.shutdown.begin_drain();
+        let error = ingest.accept(small_request()).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(series_memtable.is_empty());
     }
 
@@ -1399,16 +1315,16 @@ mod tests {
             max_memtable_bytes: Some(1),
             ..Config::default()
         };
-        let (service, series_memtable, _journal) = service_over(config);
-        service
-            .export(tenant_request(small_request()))
+        let (ingest, series_memtable, _journal) = ingest_over(config);
+        ingest
+            .accept(small_request())
             .await
             .expect("the first export is under the limit");
-        let status = service
-            .export(tenant_request(small_request()))
+        let error = ingest
+            .accept(small_request())
             .await
             .expect_err("a full buffer must be refused");
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             series_memtable
                 .sorted_samples(&test_tenant())
@@ -1429,7 +1345,7 @@ mod tests {
                 .join(format!("signy-metric-cap-{}", uuid::Uuid::new_v4())),
             ..Config::default()
         };
-        let (service, series_memtable, _journal) = service_over(config);
+        let (ingest, series_memtable, _journal) = ingest_over(config);
         // 25 000 histogram datapoints × (2 bounds + 3) = 125 000 decomposed
         // samples: over the cap while the datapoint count alone is not.
         let point = HistogramDataPoint {
@@ -1451,8 +1367,8 @@ mod tests {
             }],
             None,
         );
-        let status = service.export(tenant_request(request)).await.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        let error = ingest.accept(request).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(series_memtable.is_empty());
     }
 
@@ -1533,7 +1449,7 @@ mod tests {
             max_active_series: 2,
             ..Config::default()
         };
-        let (service, series_memtable, journal) = service_over(config);
+        let (ingest, series_memtable, journal) = ingest_over(config);
         let base = now_ns();
         let known = request_with(
             vec![Metric {
@@ -1548,8 +1464,8 @@ mod tests {
             }],
             None,
         );
-        let response = service.export(tenant_request(known)).await.unwrap();
-        assert!(response.into_inner().partial_success.is_none());
+        let outcome = ingest.accept(known).await.unwrap();
+        assert!(outcome.partial_success().is_none());
 
         let mixed = request_with(
             vec![Metric {
@@ -1565,10 +1481,9 @@ mod tests {
             }],
             None,
         );
-        let response = service.export(tenant_request(mixed)).await.unwrap();
-        let partial = response
-            .into_inner()
-            .partial_success
+        let outcome = ingest.accept(mixed).await.unwrap();
+        let partial = outcome
+            .partial_success()
             .expect("a partial acceptance names what it refused");
         assert_eq!(partial.rejected_data_points, 2);
         assert!(
@@ -1614,10 +1529,10 @@ mod tests {
             max_active_series: 1,
             ..Config::default()
         };
-        let (service, series_memtable, _journal) = service_over(config);
+        let (ingest, series_memtable, _journal) = ingest_over(config);
         let base = now_ns();
-        service
-            .export(tenant_request(request_with(
+        ingest
+            .accept(request_with(
                 vec![Metric {
                     name: "queue_depth".to_string(),
                     data: Some(metric::Data::Gauge(Gauge {
@@ -1626,7 +1541,7 @@ mod tests {
                     ..Default::default()
                 }],
                 None,
-            )))
+            ))
             .await
             .unwrap();
         let all_new = request_with(
@@ -1639,10 +1554,10 @@ mod tests {
             }],
             None,
         );
-        let status = service.export(tenant_request(all_new)).await.unwrap_err();
+        let error = ingest.accept(all_new).await.unwrap_err();
         assert_eq!(
-            status.code(),
-            tonic::Code::ResourceExhausted,
+            error.status,
+            StatusCode::TOO_MANY_REQUESTS,
             "capacity returns at the idle horizon, so the refusal is retryable"
         );
         assert_eq!(series_memtable.active_series(&test_tenant()), 1);
@@ -1655,9 +1570,9 @@ mod tests {
                 .join(format!("signy-metric-flush-{}", uuid::Uuid::new_v4())),
             ..Config::default()
         };
-        let (service, series_memtable, journal) = service_over(config.clone());
-        service
-            .export(tenant_request(small_request()))
+        let (ingest, series_memtable, journal) = ingest_over(config.clone());
+        ingest
+            .accept(small_request())
             .await
             .unwrap();
         let live = series_memtable.sorted_samples(&test_tenant()).unwrap();
@@ -1725,7 +1640,7 @@ mod tests {
                 .join(format!("signy-metric-window-{}", uuid::Uuid::new_v4())),
             ..Config::default()
         };
-        let (service, series_memtable, _journal) = service_over(config);
+        let (ingest, series_memtable, _journal) = ingest_over(config);
         let request = request_with(
             vec![Metric {
                 name: "queue_depth".to_string(),
@@ -1737,8 +1652,8 @@ mod tests {
             }],
             None,
         );
-        let status = service.export(tenant_request(request)).await.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        let error = ingest.accept(request).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(series_memtable.is_empty());
     }
 }

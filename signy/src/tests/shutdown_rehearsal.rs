@@ -196,14 +196,17 @@ async fn m6_draining_rejects_new_ingest_and_readiness() {
         .unwrap_err();
     assert_eq!(ready_error.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
 
-    let push_error = crate::otlp_http::logs(
+    let collect_error = crate::collect::collect(
         axum::extract::State(state.clone()),
         axum::http::HeaderMap::new(),
-        axum::body::Bytes::new(),
+        axum::body::Body::empty(),
     )
     .await
     .unwrap_err();
-    assert_eq!(push_error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        collect_error.status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]
