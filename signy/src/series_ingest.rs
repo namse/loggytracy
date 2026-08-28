@@ -577,6 +577,8 @@ pub struct OtlpMetricIngest<'a> {
     pub config: &'a Config,
     pub ingest_gate: &'a IngestGate,
     pub tenant_quota: &'a crate::tenant_quota::TenantQuota,
+    pub tenant_policy: &'a crate::tenant_policy::TenantPolicy,
+    pub metrics: &'a crate::metrics::RuntimeMetrics,
     pub clock: &'a crate::clock::Clock,
 }
 
@@ -599,12 +601,9 @@ impl OtlpMetricIngest<'_> {
         self.ingest_gate.check()
     }
 
-    pub fn admit_tenant(
-        &self,
-        tenant: &crate::tenant::TenantId,
-        encoded_len: usize,
-    ) -> Result<(), IngestError> {
-        self.tenant_quota.admit_storage(tenant)?;
+    /// See [`crate::log_ingest::OtlpLogIngest::admit_size`]: the tenant is no
+    /// longer knowable this early, and the size still is.
+    pub fn admit_size(&self, encoded_len: usize) -> Result<(), IngestError> {
         if encoded_len > MAX_OTLP_REQUEST_BYTES {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -617,15 +616,60 @@ impl OtlpMetricIngest<'_> {
 
     pub async fn accept(
         &self,
-        tenant: crate::tenant::TenantId,
         request: ExportMetricsServiceRequest,
     ) -> Result<MetricAcceptOutcome, IngestError> {
-        let (pending, outcome) = self.enqueue(tenant, request, None).await?;
-        pending
-            .settle()
-            .await
-            .map_err(crate::log_ingest::journal_write_failed)?;
+        let (pending, outcome) = self.enqueue_request(request, None).await?;
+        for pending in pending {
+            pending
+                .settle()
+                .await
+                .map_err(crate::log_ingest::journal_write_failed)?;
+        }
         Ok(outcome)
+    }
+
+    /// The metric counterpart to
+    /// [`crate::log_ingest::OtlpLogIngest::enqueue_request`], with the same
+    /// ordering: the datapoint cap over the whole request and before the
+    /// split, the drop tally counted rather than answered, one journal record
+    /// per tenant.
+    ///
+    /// The `partial_success` the transports answer with is the groups' own,
+    /// summed — a series budget is the instance's and is spent across whoever
+    /// arrives in one request.
+    pub async fn enqueue_request(
+        &self,
+        request: ExportMetricsServiceRequest,
+        mark: Option<crate::journal::CollectMark>,
+    ) -> Result<(Vec<crate::journal::PendingAppend>, MetricAcceptOutcome), IngestError> {
+        let datapoints = count_datapoints(&request)?;
+        if datapoints > MAX_OTLP_METRIC_SAMPLES {
+            return Err(too_many_samples());
+        }
+
+        let split = crate::otlp_tenant::split_metrics(request, self.tenant_policy);
+        split.dropped.record(self.metrics, "metrics");
+
+        let last = split.groups.len().saturating_sub(1);
+        let mut pending = Vec::with_capacity(split.groups.len());
+        let mut merged = MetricAcceptOutcome {
+            rejected_data_points: 0,
+            rejection: None,
+        };
+        for (index, (tenant, group)) in split.groups.into_iter().enumerate() {
+            if let Err(error) = self.tenant_quota.admit_storage(&tenant) {
+                tracing::warn!(%tenant, reason = error.message, "dropping metrics for a tenant at its storage limit");
+                continue;
+            }
+            let mark = if index == last { mark } else { None };
+            let (append, outcome) = self.enqueue(tenant, group, mark).await?;
+            pending.push(append);
+            merged.rejected_data_points = merged
+                .rejected_data_points
+                .saturating_add(outcome.rejected_data_points);
+            merged.rejection = merged.rejection.or(outcome.rejection);
+        }
+        Ok((pending, merged))
     }
 
     pub async fn enqueue(
@@ -634,25 +678,6 @@ impl OtlpMetricIngest<'_> {
         request: ExportMetricsServiceRequest,
         mark: Option<crate::journal::CollectMark>,
     ) -> Result<(crate::journal::PendingAppend, MetricAcceptOutcome), IngestError> {
-        // The cheap pre-check: every datapoint decomposes into at least one
-        // sample, so a request past the cap on datapoints alone is refused
-        // before any decomposition work.
-        let datapoints = request
-            .resource_metrics
-            .iter()
-            .flat_map(|resource| resource.scope_metrics.iter())
-            .flat_map(|scope| scope.metrics.iter())
-            .map(datapoint_count)
-            .try_fold(0usize, |count, points| count.checked_add(points))
-            .ok_or_else(|| {
-                IngestError::from((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "OTLP metric datapoint count overflow".to_string(),
-                ))
-            })?;
-        if datapoints > MAX_OTLP_METRIC_SAMPLES {
-            return Err(too_many_samples());
-        }
         let samples = normalize_request(&tenant, &request).map_err(|error| match error {
             MetricIngestError::TooManySamples => too_many_samples(),
             other => IngestError::from((StatusCode::BAD_REQUEST, other.to_string())),
@@ -759,6 +784,26 @@ impl MetricAcceptOutcome {
     }
 }
 
+/// The cheap pre-check: every datapoint decomposes into at least one sample,
+/// so a request past the cap on datapoints alone is refused before any
+/// decomposition work. Counted over the whole request and before the split,
+/// so N groups cannot multiply it.
+fn count_datapoints(request: &ExportMetricsServiceRequest) -> Result<usize, IngestError> {
+    request
+        .resource_metrics
+        .iter()
+        .flat_map(|resource| resource.scope_metrics.iter())
+        .flat_map(|scope| scope.metrics.iter())
+        .map(datapoint_count)
+        .try_fold(0usize, |count, points| count.checked_add(points))
+        .ok_or_else(|| {
+            IngestError::from((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "OTLP metric datapoint count overflow".to_string(),
+            ))
+        })
+}
+
 fn too_many_samples() -> IngestError {
     // Non-retryable on purpose, like the span-count cap: the identical bytes
     // cannot become acceptable, so the collector must split the batch.
@@ -791,6 +836,7 @@ pub struct MetricsIngestService {
     ingest_gate: Arc<IngestGate>,
     tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
     tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
+    metrics: Arc<crate::metrics::RuntimeMetrics>,
     clock: Arc<crate::clock::Clock>,
 }
 
@@ -803,6 +849,7 @@ impl MetricsIngestService {
         ingest_gate: Arc<IngestGate>,
         tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
         tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
+        metrics: Arc<crate::metrics::RuntimeMetrics>,
         clock: Arc<crate::clock::Clock>,
     ) -> Self {
         Self {
@@ -812,6 +859,7 @@ impl MetricsIngestService {
             ingest_gate,
             tenant_quota,
             tenant_policy,
+            metrics,
             clock,
         }
     }
@@ -837,21 +885,17 @@ impl MetricsService for MetricsIngestService {
             config: &self.config,
             ingest_gate: &self.ingest_gate,
             tenant_quota: &self.tenant_quota,
+            tenant_policy: &self.tenant_policy,
+            metrics: &self.metrics,
             clock: &self.clock,
         };
         ingest.admit_transport().map_err(ingest_error_to_status)?;
-        let tenant = crate::tenant::from_grpc_metadata(
-            request.metadata(),
-            &self.config,
-            &self.tenant_policy,
-        )
-        .map_err(crate::tenant::TenantError::into_grpc)?;
         let request = request.into_inner();
         ingest
-            .admit_tenant(&tenant, request.encoded_len())
+            .admit_size(request.encoded_len())
             .map_err(ingest_error_to_status)?;
         let outcome = ingest
-            .accept(tenant, request)
+            .accept(request)
             .await
             .map_err(ingest_error_to_status)?;
         Ok(Response::new(ExportMetricsServiceResponse {
@@ -891,13 +935,21 @@ mod tests {
         }
     }
 
+    /// Every fixture request names the test tenant, because an export that
+    /// names none is dropped rather than stored. The attribute is added to
+    /// whatever resource the caller wanted, so a test about promoted
+    /// attributes still gets exactly the ones it asked for.
     fn request_with(
         metrics: Vec<Metric>,
         resource: Option<Resource>,
     ) -> ExportMetricsServiceRequest {
+        let mut resource = resource.unwrap_or_default();
+        resource
+            .attributes
+            .extend(crate::otlp_tenant::test_tenant_resource().attributes);
         ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
-                resource,
+                resource: Some(resource),
                 scope_metrics: vec![ScopeMetrics {
                     metrics,
                     ..Default::default()
@@ -1209,19 +1261,19 @@ mod tests {
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
             crate::clock::Clock::system(),
         );
         (service, series_memtable, journal)
     }
 
+    /// The tenant rides in the payload now, so the wrapper carries nothing:
+    /// what makes a request the test tenant's is the resource
+    /// `request_with` builds.
     fn tenant_request(
         request: ExportMetricsServiceRequest,
     ) -> Request<ExportMetricsServiceRequest> {
-        Request::from_parts(
-            crate::tenant::test_tenant_metadata(),
-            tonic::Extensions::default(),
-            request,
-        )
+        Request::new(request)
     }
 
     fn now_ns() -> u64 {

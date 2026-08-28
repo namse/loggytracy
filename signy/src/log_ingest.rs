@@ -37,6 +37,7 @@ pub struct LogIngestService {
     ingest_gate: Arc<IngestGate>,
     tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
     tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
+    metrics: Arc<crate::metrics::RuntimeMetrics>,
     clock: Arc<crate::clock::Clock>,
 }
 
@@ -49,6 +50,7 @@ impl LogIngestService {
         ingest_gate: Arc<IngestGate>,
         tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
         tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
+        metrics: Arc<crate::metrics::RuntimeMetrics>,
         clock: Arc<crate::clock::Clock>,
     ) -> Self {
         Self {
@@ -58,6 +60,7 @@ impl LogIngestService {
             ingest_gate,
             tenant_quota,
             tenant_policy,
+            metrics,
             clock,
         }
     }
@@ -81,6 +84,8 @@ pub struct OtlpLogIngest<'a> {
     pub config: &'a Config,
     pub ingest_gate: &'a IngestGate,
     pub tenant_quota: &'a crate::tenant_quota::TenantQuota,
+    pub tenant_policy: &'a crate::tenant_policy::TenantPolicy,
+    pub metrics: &'a crate::metrics::RuntimeMetrics,
     pub clock: &'a crate::clock::Clock,
 }
 
@@ -107,13 +112,14 @@ impl OtlpLogIngest<'_> {
         self.ingest_gate.check()
     }
 
-    /// What the tenant and the size decide, once both are known.
-    pub fn admit_tenant(
-        &self,
-        tenant: &crate::tenant::TenantId,
-        encoded_len: usize,
-    ) -> Result<(), IngestError> {
-        self.tenant_quota.admit_storage(tenant)?;
+    /// What the size alone decides, before the body is decoded and before
+    /// anyone knows whose it is.
+    ///
+    /// The tenant used to be half of this check, read off a header the
+    /// transport had in hand. It now lives inside the payload, so the only
+    /// thing knowable this early is how big the payload is — and that is the
+    /// half worth keeping early, since it is what bounds the decode.
+    pub fn admit_size(&self, encoded_len: usize) -> Result<(), IngestError> {
         if encoded_len > MAX_OTLP_REQUEST_BYTES {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -124,21 +130,78 @@ impl OtlpLogIngest<'_> {
         Ok(())
     }
 
+    /// Accept one export, however many tenants it turns out to name.
+    ///
     /// `wire` is the encoded request when the transport still has it — the
     /// HTTP protobuf body arrives as exactly the bytes the WAL wants, so they
     /// are passed through instead of being re-encoded. gRPC and JSON hand
     /// over a decoded message only, and those re-encode it here.
     pub async fn accept(
         &self,
-        tenant: crate::tenant::TenantId,
         request: ExportLogsServiceRequest,
         wire: Option<Vec<u8>>,
     ) -> Result<(), IngestError> {
-        self.enqueue(tenant, request, wire, None)
-            .await?
-            .settle()
-            .await
-            .map_err(journal_write_failed)
+        for pending in self.enqueue_request(request, wire, None).await? {
+            pending.settle().await.map_err(journal_write_failed)?;
+        }
+        Ok(())
+    }
+
+    /// File an export under the tenants its resources name, one journal record
+    /// per tenant.
+    ///
+    /// The record cap is counted over the whole request and before the split,
+    /// so N groups cannot multiply what one export may carry. What the split
+    /// throws away — a resource naming no tenant, an unparseable one, one this
+    /// instance does not serve — is counted and dropped here rather than
+    /// refused: the answer an ingest gives says whether the body arrived, and
+    /// nothing about whose it was.
+    ///
+    /// Groups are appended in order and a failure part way through leaves the
+    /// earlier ones durable. A retry then re-sends them, which is the same
+    /// at-least-once the WAL replay already has, and it cannot arise at all
+    /// while an export names one tenant — which is every export a collecty
+    /// forwards, since it keeps one record per export.
+    pub async fn enqueue_request(
+        &self,
+        request: ExportLogsServiceRequest,
+        wire: Option<Vec<u8>>,
+        mark: Option<crate::journal::CollectMark>,
+    ) -> Result<Vec<crate::journal::PendingAppend>, IngestError> {
+        let record_count = count_records(&request)?;
+        if record_count > MAX_OTLP_LOG_RECORDS {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("OTLP request contains more than {MAX_OTLP_LOG_RECORDS} log records"),
+            )
+                .into());
+        }
+
+        let split = crate::otlp_tenant::split_logs(request, self.tenant_policy);
+        split.dropped.record(self.metrics, "logs");
+        // Only an untouched single-tenant request is still described by the
+        // bytes that arrived. A split one is not, and neither is one a drop
+        // took a resource out of.
+        let mut wire = split.is_intact().then_some(wire).flatten();
+
+        let last = split.groups.len().saturating_sub(1);
+        let mut pending = Vec::with_capacity(split.groups.len());
+        for (index, (tenant, group)) in split.groups.into_iter().enumerate() {
+            // A tenant at its storage limit is dropped like an unserved one.
+            // A request may now carry several tenants, and one tenant's full
+            // plan must not refuse another's data; `signy_storage_limit_
+            // rejected_total`, which this bumps, is where it shows.
+            if let Err(error) = self.tenant_quota.admit_storage(&tenant) {
+                tracing::warn!(%tenant, reason = error.message, "dropping logs for a tenant at its storage limit");
+                continue;
+            }
+            // The mark accounts for the whole record, so it rides the last
+            // append: a crash before that one leaves the record unaccounted
+            // and the collecty offers it again.
+            let mark = if index == last { mark } else { None };
+            pending.push(self.enqueue(tenant, group, wire.take(), mark).await?);
+        }
+        Ok(pending)
     }
 
     /// The same admission and normalization, stopping at the point the writer
@@ -152,26 +215,6 @@ impl OtlpLogIngest<'_> {
         wire: Option<Vec<u8>>,
         mark: Option<crate::journal::CollectMark>,
     ) -> Result<crate::journal::PendingAppend, IngestError> {
-        let record_count = request
-            .resource_logs
-            .iter()
-            .flat_map(|resource| resource.scope_logs.iter())
-            .map(|scope| scope.log_records.len())
-            .try_fold(0usize, |count, records| count.checked_add(records))
-            .ok_or_else(|| {
-                IngestError::from((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "OTLP log record count overflow".to_string(),
-                ))
-            })?;
-        if record_count > MAX_OTLP_LOG_RECORDS {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("OTLP request contains more than {MAX_OTLP_LOG_RECORDS} log records"),
-            )
-                .into());
-        }
-
         // The WAL bytes are settled before normalization consumes the message:
         // the HTTP protobuf body arrives as exactly the bytes the WAL wants,
         // and the other transports re-encode the message they decoded.
@@ -213,6 +256,24 @@ impl OtlpLogIngest<'_> {
             .await
             .map_err(journal_write_failed)
     }
+}
+
+/// Records one export carries, counted before anything is split or decoded
+/// further, because the normalization this bounds happens per group and the
+/// cap is a whole-request one.
+fn count_records(request: &ExportLogsServiceRequest) -> Result<usize, IngestError> {
+    request
+        .resource_logs
+        .iter()
+        .flat_map(|resource| resource.scope_logs.iter())
+        .map(|scope| scope.log_records.len())
+        .try_fold(0usize, |count, records| count.checked_add(records))
+        .ok_or_else(|| {
+            IngestError::from((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "OTLP log record count overflow".to_string(),
+            ))
+        })
 }
 
 pub fn journal_write_failed(error: std::io::Error) -> IngestError {
@@ -299,21 +360,17 @@ impl LogsService for LogIngestService {
             config: &self.config,
             ingest_gate: &self.ingest_gate,
             tenant_quota: &self.tenant_quota,
+            tenant_policy: &self.tenant_policy,
+            metrics: &self.metrics,
             clock: &self.clock,
         };
         ingest.admit_transport().map_err(ingest_error_to_status)?;
-        let tenant = crate::tenant::from_grpc_metadata(
-            request.metadata(),
-            &self.config,
-            &self.tenant_policy,
-        )
-        .map_err(crate::tenant::TenantError::into_grpc)?;
         let request = request.into_inner();
         ingest
-            .admit_tenant(&tenant, request.encoded_len())
+            .admit_size(request.encoded_len())
             .map_err(ingest_error_to_status)?;
         ingest
-            .accept(tenant, request, None)
+            .accept(request, None)
             .await
             .map_err(ingest_error_to_status)?;
         Ok(Response::new(ExportLogsServiceResponse::default()))

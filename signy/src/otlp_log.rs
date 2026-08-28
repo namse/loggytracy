@@ -41,6 +41,12 @@ pub fn normalize_request(request: ExportLogsServiceRequest) -> Result<Vec<LogEnt
             .unwrap_or_default();
         let mut resource_metadata = Vec::with_capacity(resource_attributes.len());
         for attribute in resource_attributes {
+            // The tenant is how this row was filed, not something it is about.
+            // Left in, it would be a second copy of the isolation the `_tenant`
+            // column already enforces, and one a query could select on.
+            if crate::otlp_tenant::is_tenant_attribute(&attribute.key) {
+                continue;
+            }
             if let Some(value) = attribute.value {
                 resource_metadata.push((
                     normalize_attribute_key(&attribute.key),

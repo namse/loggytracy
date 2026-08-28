@@ -8,7 +8,6 @@ use prost014::Message;
 use tonic::{Request, Response, Status};
 
 use crate::backpressure::{IngestError, IngestGate};
-use crate::config::Config;
 use crate::journal::Journal;
 use crate::shutdown::ShutdownState;
 use crate::trace::normalize_request;
@@ -21,28 +20,29 @@ pub const MAX_OTLP_SPANS: usize = 100_000;
 pub struct TraceIngestService {
     journal: Arc<Journal>,
     shutdown: Arc<ShutdownState>,
-    config: Arc<Config>,
     ingest_gate: Arc<IngestGate>,
     tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
     tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
+    metrics: Arc<crate::metrics::RuntimeMetrics>,
 }
 
 impl TraceIngestService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         journal: Arc<Journal>,
         shutdown: Arc<ShutdownState>,
-        config: Arc<Config>,
         ingest_gate: Arc<IngestGate>,
         tenant_quota: Arc<crate::tenant_quota::TenantQuota>,
         tenant_policy: Arc<crate::tenant_policy::TenantPolicy>,
+        metrics: Arc<crate::metrics::RuntimeMetrics>,
     ) -> Self {
         Self {
             journal,
             shutdown,
-            config,
             ingest_gate,
             tenant_quota,
             tenant_policy,
+            metrics,
         }
     }
 
@@ -61,6 +61,8 @@ pub struct OtlpTraceIngest<'a> {
     pub shutdown: &'a ShutdownState,
     pub ingest_gate: &'a IngestGate,
     pub tenant_quota: &'a crate::tenant_quota::TenantQuota,
+    pub tenant_policy: &'a crate::tenant_policy::TenantPolicy,
+    pub metrics: &'a crate::metrics::RuntimeMetrics,
 }
 
 impl OtlpTraceIngest<'_> {
@@ -82,12 +84,9 @@ impl OtlpTraceIngest<'_> {
         self.ingest_gate.check()
     }
 
-    pub fn admit_tenant(
-        &self,
-        tenant: &crate::tenant::TenantId,
-        encoded_len: usize,
-    ) -> Result<(), IngestError> {
-        self.tenant_quota.admit_storage(tenant)?;
+    /// See [`crate::log_ingest::OtlpLogIngest::admit_size`]: the tenant is no
+    /// longer knowable this early, and the size still is.
+    pub fn admit_size(&self, encoded_len: usize) -> Result<(), IngestError> {
         if encoded_len > MAX_OTLP_REQUEST_BYTES {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -98,16 +97,48 @@ impl OtlpTraceIngest<'_> {
         Ok(())
     }
 
-    pub async fn accept(
+    pub async fn accept(&self, request: ExportTraceServiceRequest) -> Result<(), IngestError> {
+        for pending in self.enqueue_request(request, None).await? {
+            pending
+                .settle()
+                .await
+                .map_err(crate::log_ingest::journal_write_failed)?;
+        }
+        Ok(())
+    }
+
+    /// The trace counterpart to
+    /// [`crate::log_ingest::OtlpLogIngest::enqueue_request`], with the same
+    /// ordering: the span cap over the whole request and before the split, the
+    /// drop tally counted rather than answered, one journal record per tenant.
+    pub async fn enqueue_request(
         &self,
-        tenant: crate::tenant::TenantId,
         request: ExportTraceServiceRequest,
-    ) -> Result<(), IngestError> {
-        self.enqueue(tenant, request, None)
-            .await?
-            .settle()
-            .await
-            .map_err(crate::log_ingest::journal_write_failed)
+        mark: Option<crate::journal::CollectMark>,
+    ) -> Result<Vec<crate::journal::PendingAppend>, IngestError> {
+        let span_count = count_spans(&request)?;
+        if span_count > MAX_OTLP_SPANS {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("OTLP request contains more than {MAX_OTLP_SPANS} spans"),
+            )
+                .into());
+        }
+
+        let split = crate::otlp_tenant::split_traces(request, self.tenant_policy);
+        split.dropped.record(self.metrics, "traces");
+
+        let last = split.groups.len().saturating_sub(1);
+        let mut pending = Vec::with_capacity(split.groups.len());
+        for (index, (tenant, group)) in split.groups.into_iter().enumerate() {
+            if let Err(error) = self.tenant_quota.admit_storage(&tenant) {
+                tracing::warn!(%tenant, reason = error.message, "dropping spans for a tenant at its storage limit");
+                continue;
+            }
+            let mark = if index == last { mark } else { None };
+            pending.push(self.enqueue(tenant, group, mark).await?);
+        }
+        Ok(pending)
     }
 
     pub async fn enqueue(
@@ -116,25 +147,6 @@ impl OtlpTraceIngest<'_> {
         request: ExportTraceServiceRequest,
         mark: Option<crate::journal::CollectMark>,
     ) -> Result<crate::journal::PendingAppend, IngestError> {
-        let span_count = request
-            .resource_spans
-            .iter()
-            .flat_map(|resource| resource.scope_spans.iter())
-            .map(|scope| scope.spans.len())
-            .try_fold(0usize, |count, spans| count.checked_add(spans))
-            .ok_or_else(|| {
-                IngestError::from((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "OTLP span count overflow".to_string(),
-                ))
-            })?;
-        if span_count > MAX_OTLP_SPANS {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("OTLP request contains more than {MAX_OTLP_SPANS} spans"),
-            )
-                .into());
-        }
         let spans = normalize_request(&tenant, request.clone())
             .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
         let mut encoded = Vec::new();
@@ -151,6 +163,24 @@ impl OtlpTraceIngest<'_> {
     }
 }
 
+/// Spans one export carries, counted over the whole request before it is
+/// split: the cap bounds the normalization each group pays for, so N groups
+/// must not be able to multiply it.
+fn count_spans(request: &ExportTraceServiceRequest) -> Result<usize, IngestError> {
+    request
+        .resource_spans
+        .iter()
+        .flat_map(|resource| resource.scope_spans.iter())
+        .map(|scope| scope.spans.len())
+        .try_fold(0usize, |count, spans| count.checked_add(spans))
+        .ok_or_else(|| {
+            IngestError::from((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "OTLP span count overflow".to_string(),
+            ))
+        })
+}
+
 #[tonic::async_trait]
 impl TraceService for TraceIngestService {
     async fn export(
@@ -164,20 +194,16 @@ impl TraceService for TraceIngestService {
             shutdown: &self.shutdown,
             ingest_gate: &self.ingest_gate,
             tenant_quota: &self.tenant_quota,
+            tenant_policy: &self.tenant_policy,
+            metrics: &self.metrics,
         };
         ingest.admit_transport().map_err(ingest_error_to_status)?;
-        let tenant = crate::tenant::from_grpc_metadata(
-            request.metadata(),
-            &self.config,
-            &self.tenant_policy,
-        )
-        .map_err(crate::tenant::TenantError::into_grpc)?;
         let request = request.into_inner();
         ingest
-            .admit_tenant(&tenant, request.encoded_len())
+            .admit_size(request.encoded_len())
             .map_err(ingest_error_to_status)?;
         ingest
-            .accept(tenant, request)
+            .accept(request)
             .await
             .map_err(ingest_error_to_status)?;
         Ok(Response::new(ExportTraceServiceResponse::default()))
@@ -197,18 +223,16 @@ mod tests {
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use std::time::Duration;
 
+    /// The tenant rides in the payload now, so the wrapper carries nothing:
+    /// what makes a request the test tenant's is the resource `request` builds.
     fn tenant_request(request: ExportTraceServiceRequest) -> Request<ExportTraceServiceRequest> {
-        Request::from_parts(
-            crate::tenant::test_tenant_metadata(),
-            tonic::Extensions::default(),
-            request,
-        )
+        Request::new(request)
     }
 
     fn request() -> ExportTraceServiceRequest {
         ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
-                resource: None,
+                resource: Some(crate::otlp_tenant::test_tenant_resource()),
                 scope_spans: vec![ScopeSpans {
                     scope: None,
                     spans: vec![Span {
@@ -248,10 +272,10 @@ mod tests {
         let service = TraceIngestService::new(
             journal,
             shutdown,
-            Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
         );
 
         let status = service.export(tenant_request(request())).await.unwrap_err();
@@ -289,10 +313,10 @@ mod tests {
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
-            Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
         );
 
         service
@@ -332,10 +356,10 @@ mod tests {
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
-            Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
         );
         let response = service.export(tenant_request(request())).await.unwrap();
         assert!(response.into_inner().partial_success.is_none());
@@ -383,10 +407,10 @@ mod tests {
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
-            Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
         );
         let mut invalid = request();
         invalid.resource_spans[0].scope_spans[0].spans[0].trace_id = vec![0; 16];
@@ -416,10 +440,10 @@ mod tests {
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
-            Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
         );
         let mut oversized = request();
         oversized.resource_spans[0].scope_spans[0].spans[0].name =
@@ -455,10 +479,10 @@ mod tests {
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
-            Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
         );
         let mut too_many = request();
         too_many.resource_spans[0].scope_spans[0].spans = vec![Span::default(); MAX_OTLP_SPANS + 1];
@@ -512,10 +536,10 @@ mod tests {
         let service = TraceIngestService::new(
             journal,
             Arc::new(crate::shutdown::ShutdownState::new()),
-            Arc::new(config.clone()),
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
         );
         service.export(tenant_request(request())).await.unwrap();
         for _ in 0..100 {

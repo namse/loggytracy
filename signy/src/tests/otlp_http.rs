@@ -33,16 +33,36 @@
     }
 
     fn log_request(body: &str) -> ExportLogsServiceRequest {
+        log_request_for(&test_tenant(), body)
+    }
+
+    /// An export naming `tenant` in its resource, which is the only thing that
+    /// files it under one: nothing outside the payload says whose it is.
+    fn log_request_for(
+        tenant: &crate::tenant::TenantId,
+        body: &str,
+    ) -> ExportLogsServiceRequest {
         ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
-                    attributes: vec![KeyValue {
-                        key: "service.name".to_string(),
-                        value: Some(AnyValue {
-                            value: Some(any_value::Value::StringValue("checkout".to_string())),
-                        }),
-                        ..Default::default()
-                    }],
+                    attributes: vec![
+                        KeyValue {
+                            key: crate::otlp_tenant::TENANT_ATTRIBUTE.to_string(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue(
+                                    tenant.as_str().to_string(),
+                                )),
+                            }),
+                            ..Default::default()
+                        },
+                        KeyValue {
+                            key: "service.name".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("checkout".to_string())),
+                            }),
+                            ..Default::default()
+                        },
+                    ],
                     dropped_attributes_count: 0,
                     entity_refs: Vec::new(),
                 }),
@@ -75,7 +95,6 @@
             .method("POST")
             .uri(uri)
             .header(header::CONTENT_TYPE, content_type)
-            .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
             .body(axum::body::Body::from(body))
             .unwrap();
         let response = crate::build_router(state.clone())
@@ -225,10 +244,12 @@
 
     /// 403 and not 400: the request is well formed and there is nothing the
     /// client can change about it. With per-tenant policy enabled, the pushed
-    /// policies are the tenant registry — a tenant nothing was pushed for is
-    /// not served, on this transport like any other.
+    /// policies are the tenant registry — and a tenant nothing was pushed for
+    /// is *dropped* rather than refused: the answer an ingest gives says
+    /// whether the body arrived, and nothing about whose it was. The counter
+    /// is the only place the loss shows.
     #[tokio::test]
-    async fn an_export_from_a_tenant_without_a_pushed_policy_is_refused() {
+    async fn an_export_from_a_tenant_without_a_pushed_policy_is_dropped_silently() {
         let config = Config {
             data_dir: std::env::temp_dir()
                 .join(format!("signy-otlp-http-allow-{}", uuid::Uuid::new_v4())),
@@ -262,29 +283,163 @@
         let (status, _, _) = post(&state, "/v1/logs", "application/x-protobuf", body).await;
         assert_eq!(status, StatusCode::OK, "a listed tenant is accepted");
 
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/logs")
-            .header(header::CONTENT_TYPE, "application/x-protobuf")
-            .header(crate::tenant::TENANT_HEADER, "stranger")
-            .body(axum::body::Body::from(
-                log_request("refused").encode_to_vec(),
-            ))
-            .unwrap();
-        let response = crate::build_router(state.clone())
-            .oneshot(request)
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let stranger = crate::tenant::TenantId::parse("stranger").unwrap();
+        let body = log_request_for(&stranger, "refused").encode_to_vec();
+        let (status, _, _) = post(&state, "/v1/logs", "application/x-protobuf", body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the body arrived and decoded, which is all the status answers"
+        );
         assert!(
             memtable
-                .query(&crate::tenant::TenantId::parse("stranger").unwrap(), &[],
+                .query(
+                    &stranger,
+                    &[],
                     crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
                     10,
                     true
                 )
                 .is_empty(),
-            "a refused tenant must not have been written"
+            "an unserved tenant must not have been written"
+        );
+        assert_eq!(
+            state
+                .metrics
+                .ingest_dropped_tenant_not_served
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the drop is counted, because nothing else reports it"
+        );
+    }
+
+    /// An export nobody configured, and one configured with a value this
+    /// engine cannot store. Both are dropped, and counted apart from each
+    /// other so an operator knows which mistake was made.
+    #[tokio::test]
+    async fn an_export_naming_no_usable_tenant_is_dropped_under_its_own_reason() {
+        let (memtable, state) = fixture();
+        let mut anonymous = log_request("nobody said whose");
+        anonymous.resource_logs[0]
+            .resource
+            .as_mut()
+            .unwrap()
+            .attributes
+            .retain(|attribute| attribute.key != crate::otlp_tenant::TENANT_ATTRIBUTE);
+        let (status, _, _) = post(
+            &state,
+            "/v1/logs",
+            "application/x-protobuf",
+            anonymous.encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut malformed = log_request("a tenant id this is not");
+        for attribute in &mut malformed.resource_logs[0].resource.as_mut().unwrap().attributes {
+            if attribute.key == crate::otlp_tenant::TENANT_ATTRIBUTE {
+                attribute.value = Some(AnyValue {
+                    value: Some(any_value::Value::StringValue("not a tenant".to_string())),
+                });
+            }
+        }
+        let (status, _, _) = post(
+            &state,
+            "/v1/logs",
+            "application/x-protobuf",
+            malformed.encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(lines(&memtable).is_empty(), "neither export was stored");
+        assert_eq!(
+            state
+                .metrics
+                .ingest_dropped_no_tenant
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            state
+                .metrics
+                .ingest_dropped_invalid_tenant
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// One export, two tenants, two journal records. The bytes that arrived no
+    /// longer describe what is stored, so the passthrough gives way to a
+    /// re-encode per group — and each tenant sees only its own line.
+    #[tokio::test]
+    async fn an_export_naming_two_tenants_is_split_between_them() {
+        let (memtable, state) = fixture();
+        let acme = crate::tenant::TenantId::parse("acme").unwrap();
+        let beta = crate::tenant::TenantId::parse("beta").unwrap();
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![
+                log_request_for(&acme, "acme line").resource_logs.remove(0),
+                log_request_for(&beta, "beta line").resource_logs.remove(0),
+            ],
+        };
+        let (status, _, _) = post(
+            &state,
+            "/v1/logs",
+            "application/x-protobuf",
+            request.encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let read = |tenant: &crate::tenant::TenantId| -> Vec<String> {
+            memtable
+                .query(
+                    tenant,
+                    &[],
+                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    10,
+                    true,
+                )
+                .iter()
+                .flat_map(|stream| stream.entries.iter())
+                .map(|entry| entry.line.clone())
+                .collect()
+        };
+        assert_eq!(read(&acme), vec!["acme line".to_string()]);
+        assert_eq!(read(&beta), vec!["beta line".to_string()]);
+    }
+
+    /// The routing key is not something the row is about. Left in, it would be
+    /// a second copy of the isolation the tenant column already enforces, and
+    /// one a query could select on.
+    #[tokio::test]
+    async fn the_tenant_attribute_is_not_stored_as_metadata() {
+        let (memtable, state) = fixture();
+        let body = log_request("filed under the test tenant").encode_to_vec();
+        let (status, _, _) = post(&state, "/v1/logs", "application/x-protobuf", body).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let streams = memtable.query(
+            &test_tenant(),
+            &[],
+            crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+            10,
+            true,
+        );
+        let keys: Vec<String> = streams
+            .iter()
+            .flat_map(|stream| stream.entries.iter())
+            .flat_map(|entry| entry.structured_metadata.iter())
+            .map(|(key, _)| key.clone())
+            .collect();
+        assert!(
+            keys.iter().any(|key| key == "service_name"),
+            "the other resource attributes are still stored: {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|key| key.starts_with("tenant")),
+            "the routing key is not stored: {keys:?}"
         );
     }
 
@@ -293,7 +448,7 @@
         let (_memtable, state) = fixture();
         let request = ExportTraceServiceRequest {
             resource_spans: vec![opentelemetry_proto::tonic::trace::v1::ResourceSpans {
-                resource: None,
+                resource: Some(crate::otlp_tenant::test_tenant_resource()),
                 scope_spans: vec![opentelemetry_proto::tonic::trace::v1::ScopeSpans {
                     scope: None,
                     spans: vec![opentelemetry_proto::tonic::trace::v1::Span {
@@ -330,7 +485,7 @@
     fn span_request(mark: u8) -> ExportTraceServiceRequest {
         ExportTraceServiceRequest {
             resource_spans: vec![opentelemetry_proto::tonic::trace::v1::ResourceSpans {
-                resource: None,
+                resource: Some(crate::otlp_tenant::test_tenant_resource()),
                 scope_spans: vec![opentelemetry_proto::tonic::trace::v1::ScopeSpans {
                     scope: None,
                     spans: vec![opentelemetry_proto::tonic::trace::v1::Span {
@@ -386,18 +541,10 @@
         zstd::bulk::compress(&plain, 3).unwrap()
     }
 
+    /// A collecty names no tenant: it never decodes a payload, so it has
+    /// nothing to name one with. Each record inside the batch says whose it is.
     async fn post_collected(
         state: &Arc<AppState>,
-        signal: CollectSignal,
-        encoding: &str,
-        frames: Vec<u8>,
-    ) -> (StatusCode, String) {
-        post_collected_as(state, test_tenant().as_str(), signal, encoding, frames).await
-    }
-
-    async fn post_collected_as(
-        state: &Arc<AppState>,
-        tenant: &str,
         signal: CollectSignal,
         encoding: &str,
         frames: Vec<u8>,
@@ -408,7 +555,6 @@
                 .uri("/signy/api/v1/collect")
                 .header(header::CONTENT_TYPE, "application/x-protobuf")
                 .header(header::CONTENT_ENCODING, encoding)
-                .header(crate::tenant::TENANT_HEADER, tenant)
                 .header(crate::otlp_http::COLLECT_SIGNAL_HEADER, signal.as_str())
                 .body(axum::body::Body::from(frames))
                 .unwrap(),
@@ -433,7 +579,6 @@
                 .uri("/signy/api/v1/collect")
                 .header(header::CONTENT_TYPE, "application/x-protobuf")
                 .header(header::CONTENT_ENCODING, "zstd")
-                .header(crate::tenant::TENANT_HEADER, test_tenant().as_str())
                 .header(crate::otlp_http::COLLECT_SENDER_HEADER, sender)
                 .header(crate::otlp_http::COLLECT_SIGNAL_HEADER, signal.as_str())
                 .header(
@@ -818,10 +963,10 @@
         }
     }
 
-    /// A tenant nothing was pushed for is a policy mistake, and the batch
-    /// carrying it is still dropped: the collector has one queue per signal,
-    /// so holding it would stop every other application on the host behind one
-    /// misconfigured process.
+    /// A tenant nothing was pushed for is a policy mistake, and the record
+    /// carrying it is dropped rather than held: the collector has one queue per
+    /// signal, so holding it would stop every other application on the host
+    /// behind one misconfigured process. The rest of the batch still lands.
     #[tokio::test]
     async fn a_tenant_this_instance_does_not_serve_is_dropped_rather_than_held() {
         let config = Config {
@@ -853,17 +998,36 @@
             tenant_policy,
         );
 
-        let records = vec![log_request("held, not lost").encode_to_vec()];
+        let stranger = crate::tenant::TenantId::parse("stranger").unwrap();
+        let records = vec![
+            log_request_for(&stranger, "dropped").encode_to_vec(),
+            log_request("kept").encode_to_vec(),
+        ];
         let frames = zstd_frames(&records);
 
-        let (status, body) = post_collected_as(&state, "stranger", LOGS, "zstd", frames).await;
+        let (status, body) = post_collected(&state, LOGS, "zstd", frames).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(lines(&memtable).is_empty());
+        assert_eq!(
+            lines(&memtable),
+            vec!["kept".to_string()],
+            "one application's policy mistake does not take the batch with it"
+        );
+        assert!(
+            memtable
+                .query(
+                    &stranger,
+                    &[],
+                    crate::part::QueryTimeRange::closed(i64::MIN, i64::MAX),
+                    10,
+                    true
+                )
+                .is_empty()
+        );
         assert_eq!(
             state
                 .metrics
-                .collect_dropped_records
+                .ingest_dropped_tenant_not_served
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );

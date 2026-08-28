@@ -658,7 +658,7 @@ pub async fn run(config: Arc<Config>) {
             otlp_healthy: otlp_healthy.clone(),
             remote_cache,
             tenant_policy,
-            metrics,
+            metrics: metrics.clone(),
             shutdown: shutdown.clone(),
             clock: clock.clone(),
             delete_requests: Some(delete_requests),
@@ -699,10 +699,10 @@ pub async fn run(config: Arc<Config>) {
     let otlp_service = trace_ingest::TraceIngestService::new(
         otlp_journal.clone(),
         shutdown.clone(),
-        config.clone(),
         ingest_gate.clone(),
         tenant_quota.clone(),
         tenant_policy.clone(),
+        metrics.clone(),
     );
     // Logs, traces and metrics share the listener, the journal and the drain
     // signal. `ARCHITECTURE.md` has described OTLP as an ingest protocol from
@@ -715,6 +715,7 @@ pub async fn run(config: Arc<Config>) {
         ingest_gate.clone(),
         tenant_quota.clone(),
         tenant_policy.clone(),
+        metrics.clone(),
         clock.clone(),
     );
     let otlp_metric_service = crate::series_ingest::MetricsIngestService::new(
@@ -724,6 +725,7 @@ pub async fn run(config: Arc<Config>) {
         ingest_gate,
         tenant_quota,
         tenant_policy,
+        metrics.clone(),
         clock.clone(),
     );
     let otlp_task_health = otlp_healthy;

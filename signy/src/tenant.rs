@@ -1,15 +1,20 @@
 use std::fmt;
 use std::sync::Arc;
 
-pub const TENANT_HEADER: &str = "X-Scope-OrgID";
-/// gRPC metadata keys are lowercase.
-pub const TENANT_METADATA_KEY: &str = "x-scope-orgid";
+/// The header a *read* names its tenant with.
+///
+/// Writes do not use it: an export carries the tenant inside the payload, at
+/// [`crate::otlp_tenant::TENANT_ATTRIBUTE`]. A query has no payload to put it
+/// in, so it stays a header here, named after the attribute so the two spell
+/// one concept.
+pub const TENANT_HEADER: &str = "X-Tenant-Id";
 pub const MAX_TENANT_ID_BYTES: usize = 64;
 
 /// A validated tenant identifier.
 ///
-/// The raw value arrives from an untrusted header and ends up in object-store
-/// keys and local filesystem paths, so validation is applied once here and
+/// The raw value arrives from an untrusted header or an untrusted resource
+/// attribute and ends up in object-store keys and local filesystem paths, so
+/// validation is applied once here and
 /// the rest of the engine may assume every `TenantId` is already safe. Which
 /// tenants are *served* is the pushed policy set's decision
 /// ([`crate::tenant_policy::TenantPolicy::is_tenant_allowed`]): with
@@ -141,41 +146,15 @@ impl TenantError {
     pub fn into_http(self) -> (axum::http::StatusCode, String) {
         (self.http_status(), self.to_string())
     }
-
-    pub fn into_grpc(self) -> tonic::Status {
-        match self {
-            Self::NotAllowed(_) => tonic::Status::permission_denied(self.to_string()),
-            Self::Missing | Self::Invalid(_) => tonic::Status::invalid_argument(self.to_string()),
-        }
-    }
 }
 
-/// Resolve the tenant for an HTTP request.
+/// Resolve the tenant for a read.
 pub fn from_headers(
     headers: &axum::http::HeaderMap,
     config: &crate::config::Config,
     tenant_policy: &crate::tenant_policy::TenantPolicy,
 ) -> Result<TenantId, TenantError> {
     let raw = match headers.get(TENANT_HEADER) {
-        Some(value) => Some(
-            value
-                .to_str()
-                .map_err(|_| TenantError::Invalid("value is not valid ASCII".to_string()))?,
-        ),
-        None => None,
-    };
-    resolve(raw, config.missing_tenant.as_ref(), |tenant| {
-        tenant_policy.is_tenant_allowed(tenant)
-    })
-}
-
-/// Resolve the tenant for an OTLP gRPC request.
-pub fn from_grpc_metadata(
-    metadata: &tonic::metadata::MetadataMap,
-    config: &crate::config::Config,
-    tenant_policy: &crate::tenant_policy::TenantPolicy,
-) -> Result<TenantId, TenantError> {
-    let raw = match metadata.get(TENANT_METADATA_KEY) {
         Some(value) => Some(
             value
                 .to_str()
@@ -207,20 +186,6 @@ pub fn test_tenant_headers() -> axum::http::HeaderMap {
             .expect("the test tenant is a valid header value"),
     );
     headers
-}
-
-/// gRPC metadata naming [`test_tenant`].
-#[cfg(test)]
-pub fn test_tenant_metadata() -> tonic::metadata::MetadataMap {
-    let mut metadata = tonic::metadata::MetadataMap::new();
-    metadata.insert(
-        TENANT_METADATA_KEY,
-        test_tenant()
-            .as_str()
-            .parse()
-            .expect("the test tenant is a valid metadata value"),
-    );
-    metadata
 }
 
 #[cfg(test)]

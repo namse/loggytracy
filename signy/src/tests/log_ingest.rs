@@ -19,6 +19,7 @@
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
             crate::clock::Clock::system(),
         );
         (memtable, service)
@@ -32,12 +33,11 @@
         }
     }
 
+    /// The tenant rides in the payload now, so the wrapper carries nothing:
+    /// what makes a request the test tenant's is `request` below stamping the
+    /// attribute onto the resource.
     fn tenant_request(request: ExportLogsServiceRequest) -> Request<ExportLogsServiceRequest> {
-        Request::from_parts(
-            crate::tenant::test_tenant_metadata(),
-            tonic::Extensions::default(),
-            request,
-        )
+        Request::new(request)
     }
 
     fn now_ns() -> u64 {
@@ -51,13 +51,24 @@
         ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
-                    attributes: vec![KeyValue {
-                        key: "service.name".to_string(),
-                        value: Some(AnyValue {
-                            value: Some(any_value::Value::StringValue("checkout".to_string())),
-                        }),
-                        ..Default::default()
-                    }],
+                    attributes: vec![
+                        KeyValue {
+                            key: crate::otlp_tenant::TENANT_ATTRIBUTE.to_string(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue(
+                                    test_tenant().as_str().to_string(),
+                                )),
+                            }),
+                            ..Default::default()
+                        },
+                        KeyValue {
+                            key: "service.name".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("checkout".to_string())),
+                            }),
+                            ..Default::default()
+                        },
+                    ],
                     dropped_attributes_count: 0,
                     entity_refs: Vec::new(),
                 }),
@@ -166,6 +177,7 @@
             IngestGate::for_test(&journal, &config),
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
             crate::clock::Clock::system(),
         );
         let status = service
@@ -204,6 +216,7 @@
             ingest_gate,
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
             crate::clock::Clock::system(),
         );
 
@@ -252,6 +265,7 @@ specification tells it to drop the batch"
             IngestGate::for_test(&journal, &config),
             crate::tenant_quota::TenantQuota::for_test(&config),
             Arc::new(crate::tenant_policy::TenantPolicy::disabled()),
+            Arc::new(crate::metrics::RuntimeMetrics::new()),
             crate::clock::Clock::system(),
         );
 

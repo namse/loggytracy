@@ -28,10 +28,19 @@
     }
 
     fn otlp_body(app: &str, lines: &[(&str, i64)]) -> Vec<u8> {
+        otlp_body_for(crate::tenant::test_tenant().as_str(), app, lines)
+    }
+
+    /// An export naming `tenant` in its resource, which is the only thing that
+    /// files it under one.
+    fn otlp_body_for(tenant: &str, app: &str, lines: &[(&str, i64)]) -> Vec<u8> {
         ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
-                    attributes: vec![string_attribute("service.name", app)],
+                    attributes: vec![
+                        string_attribute(crate::otlp_tenant::TENANT_ATTRIBUTE, tenant),
+                        string_attribute("service.name", app),
+                    ],
                     ..Default::default()
                 }),
                 scope_logs: vec![ScopeLogs {
@@ -667,7 +676,7 @@
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        otlp_body(&format!("{tenant}-app"), &[(line, now)])
+        otlp_body_for(tenant, &format!("{tenant}-app"), &[(line, now)])
     }
 
 
@@ -705,7 +714,6 @@
                     .method("POST")
                     .uri("/v1/logs")
                     .header("content-type", "application/x-protobuf")
-                    .header(crate::tenant::TENANT_HEADER, tenant)
                     .body(axum::body::Body::from(tenant_push_body(tenant, line)))
                     .unwrap();
                 let response = crate::build_router(state).oneshot(request).await.unwrap();

@@ -25,6 +25,7 @@ mod metrics;
 pub mod object_storage;
 mod otlp_http;
 mod otlp_log;
+mod otlp_tenant;
 pub(crate) mod page_cache;
 pub mod part;
 pub mod part_registry;

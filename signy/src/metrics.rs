@@ -28,6 +28,19 @@ pub struct RuntimeMetrics {
     /// and a number that stays flat while a collector restarts is the sign
     /// that the numbering is not doing its job.
     pub collect_skipped_records: AtomicU64,
+    /// Resources thrown away because nothing said whose they were.
+    ///
+    /// The tenant rides in a resource attribute, and an export naming none
+    /// this instance serves is dropped rather than refused: the status code an
+    /// ingest answers says whether the body arrived, and nothing about who
+    /// sent it. These three counters are the only place that loss is visible,
+    /// and they are apart because they send an operator to three different
+    /// places — an exporter never configured, an exporter configured with a
+    /// value this engine cannot store, and a tenant the control plane has not
+    /// onboarded.
+    pub ingest_dropped_no_tenant: AtomicU64,
+    pub ingest_dropped_invalid_tenant: AtomicU64,
+    pub ingest_dropped_tenant_not_served: AtomicU64,
     /// Writes refused because the tenant is already storing everything its plan
     /// sells. It clears only when retention retires parts, which is why the
     /// refusal carries a long Retry-After.
@@ -152,6 +165,9 @@ impl RuntimeMetrics {
             collect_dropped_records: AtomicU64::new(0),
             collect_dropped_bytes: AtomicU64::new(0),
             collect_skipped_records: AtomicU64::new(0),
+            ingest_dropped_no_tenant: AtomicU64::new(0),
+            ingest_dropped_invalid_tenant: AtomicU64::new(0),
+            ingest_dropped_tenant_not_served: AtomicU64::new(0),
             query_quota_rejected: AtomicU64::new(0),
             storage_limit_rejected: AtomicU64::new(0),
             wal_replayed_records: AtomicU64::new(0),

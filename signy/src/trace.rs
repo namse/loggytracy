@@ -131,7 +131,15 @@ pub fn normalize_request(
 ) -> Result<Vec<TraceSpan>, TraceError> {
     let mut spans = Vec::new();
     for resource_spans in request.resource_spans {
-        let resource = resource_spans.resource;
+        // Stripped here rather than at the split, because the split hands the
+        // request on whole and the WAL keeps the bytes that arrived. Replay
+        // comes back through this function, so one removal covers both.
+        let resource = resource_spans.resource.map(|mut resource| {
+            resource
+                .attributes
+                .retain(|attribute| !crate::otlp_tenant::is_tenant_attribute(&attribute.key));
+            resource
+        });
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
                 spans.push(normalize_span(

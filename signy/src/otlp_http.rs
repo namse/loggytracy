@@ -120,6 +120,8 @@ pub async fn logs(
         config: &state.config,
         ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
+        tenant_policy: &state.tenant_policy,
+        metrics: &state.metrics,
         clock: &state.clock,
     };
     // Ahead of the request counter as well as the body work, the accounting
@@ -130,7 +132,7 @@ pub async fn logs(
         .metrics
         .ingest_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let result = logs_inner(&state, &ingest, headers, body).await;
+    let result = logs_inner(&ingest, headers, body).await;
     if result.is_err() {
         state
             .metrics
@@ -141,19 +143,16 @@ pub async fn logs(
 }
 
 async fn logs_inner(
-    state: &Arc<AppState>,
     ingest: &OtlpLogIngest<'_>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, IngestError> {
     let encoding = OtlpEncoding::from_headers(&headers)?;
-    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
-        .map_err(crate::tenant::TenantError::into_http)?;
-    // Charged on the wire size and before decoding, unlike the gRPC path which
-    // is handed an already-decoded message. This is the earlier of the two
-    // points and the better one: a tenant over its rate does not get to spend
-    // this instance's CPU on a body that will not be accepted.
-    ingest.admit_tenant(&tenant, body.len())?;
+    // The size is what this can charge before the decode. The tenant used to
+    // be charged here too, off a header, which spent no CPU on a body that
+    // would be refused; it lives inside the body now, so the storage limit is
+    // reached only after the decode and per tenant named.
+    ingest.admit_size(body.len())?;
     let request: ExportLogsServiceRequest = encoding.decode(&body)?;
     // A protobuf body is already the WAL's encoding of choice, so it rides
     // through untouched; a JSON body has no protobuf bytes to keep.
@@ -161,7 +160,7 @@ async fn logs_inner(
         OtlpEncoding::Protobuf => Some(body.to_vec()),
         OtlpEncoding::Json => None,
     };
-    ingest.accept(tenant, request, wire).await?;
+    ingest.accept(request, wire).await?;
     Ok(encoding.encode(&ExportLogsServiceResponse::default()))
 }
 
@@ -175,14 +174,14 @@ pub async fn traces(
         shutdown: &state.shutdown,
         ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
+        tenant_policy: &state.tenant_policy,
+        metrics: &state.metrics,
     };
     ingest.admit_transport()?;
     let encoding = OtlpEncoding::from_headers(&headers)?;
-    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
-        .map_err(crate::tenant::TenantError::into_http)?;
-    ingest.admit_tenant(&tenant, body.len())?;
+    ingest.admit_size(body.len())?;
     let request: ExportTraceServiceRequest = encoding.decode(&body)?;
-    ingest.accept(tenant, request).await?;
+    ingest.accept(request).await?;
     Ok(encoding.encode(&ExportTraceServiceResponse::default()))
 }
 
@@ -197,15 +196,15 @@ pub async fn metrics(
         config: &state.config,
         ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
+        tenant_policy: &state.tenant_policy,
+        metrics: &state.metrics,
         clock: &state.clock,
     };
     ingest.admit_transport()?;
     let encoding = OtlpEncoding::from_headers(&headers)?;
-    let tenant = crate::tenant::from_headers(&headers, &state.config, &state.tenant_policy)
-        .map_err(crate::tenant::TenantError::into_http)?;
-    ingest.admit_tenant(&tenant, body.len())?;
+    ingest.admit_size(body.len())?;
     let request: ExportMetricsServiceRequest = encoding.decode(&body)?;
-    let outcome = ingest.accept(tenant, request).await?;
+    let outcome = ingest.accept(request).await?;
     // A partial acceptance answers 200 with the OTLP `partial_success` naming
     // what was refused and why; only an all-refused export is an error.
     Ok(encoding.encode(&ExportMetricsServiceResponse {
@@ -311,12 +310,6 @@ async fn collect_inner(
             .into());
     }
 
-    // Resolved once and carried as a result: a tenant this instance does not
-    // serve is a per-record refusal like any other, and the loop below already
-    // knows what to do with one.
-    let tenant = crate::tenant::from_headers(headers, &state.config, &state.tenant_policy)
-        .map_err(crate::tenant::TenantError::into_http);
-
     let signal = collect_signal(headers)?;
     let sender = collect_sender(headers)?;
     let marks = state.journal.collect_marks();
@@ -358,7 +351,11 @@ async fn collect_inner(
     };
 
     let mut records = CollectedRecords::new(body)?;
-    let mut inflight: VecDeque<(InflightBody, PendingAppend)> = VecDeque::new();
+    // One record can be several appends now, because the tenant is read off
+    // each resource and one export may name more than one. They stay grouped
+    // so that `MAX_INFLIGHT_RECORDS` keeps bounding records, which is what the
+    // memory it defends is proportional to.
+    let mut inflight: VecDeque<(InflightBody, Vec<PendingAppend>)> = VecDeque::new();
     let mut index = 0u64;
 
     while let Some(payload) = records.next().await? {
@@ -384,7 +381,7 @@ async fn collect_inner(
         }
         let bytes = payload.len();
         let permit = admit_record(state, &mut inflight, bytes as u64).await?;
-        match enqueue_record(state, &tenant, signal, payload, mark).await {
+        match enqueue_record(state, signal, payload, mark).await {
             Ok(pending) => inflight.push_back((permit, pending)),
             // Permanent: a decode failure, a body past a limit, a tenant over
             // what it stores. Sending these back would only have collecty
@@ -521,7 +518,7 @@ fn collect_sender(
 /// answering an overload it caused.
 async fn admit_record(
     state: &Arc<AppState>,
-    inflight: &mut VecDeque<(InflightBody, PendingAppend)>,
+    inflight: &mut VecDeque<(InflightBody, Vec<PendingAppend>)>,
     bytes: u64,
 ) -> Result<InflightBody, IngestError> {
     loop {
@@ -538,34 +535,36 @@ async fn admit_record(
 }
 
 async fn settle_oldest(
-    inflight: &mut VecDeque<(InflightBody, PendingAppend)>,
+    inflight: &mut VecDeque<(InflightBody, Vec<PendingAppend>)>,
 ) -> Result<(), IngestError> {
     let Some((permit, pending)) = inflight.pop_front() else {
         return Ok(());
     };
-    let settled = pending
-        .settle()
-        .await
-        .map_err(crate::log_ingest::journal_write_failed);
+    let mut settled = Ok(());
+    // Every append of the record is awaited even after one has failed: they
+    // were all handed to the writer, and leaving a receiver undropped behind a
+    // failure would have the next settle read this record's answer.
+    for pending in pending {
+        let one = pending
+            .settle()
+            .await
+            .map_err(crate::log_ingest::journal_write_failed);
+        settled = settled.and(one);
+    }
     drop(permit);
     settled
 }
 
 async fn enqueue_record(
     state: &Arc<AppState>,
-    tenant: &Result<crate::tenant::TenantId, (StatusCode, String)>,
     signal: CollectSignal,
     payload: Vec<u8>,
     mark: Option<crate::journal::CollectMark>,
-) -> Result<PendingAppend, IngestError> {
-    let tenant = match tenant {
-        Ok(tenant) => tenant.clone(),
-        Err((status, message)) => return Err((*status, message.clone()).into()),
-    };
+) -> Result<Vec<PendingAppend>, IngestError> {
     match signal {
-        CollectSignal::Logs => collect_logs(state, tenant, payload, mark).await,
-        CollectSignal::Traces => collect_traces(state, tenant, payload, mark).await,
-        CollectSignal::Metrics => collect_metrics(state, tenant, payload, mark).await,
+        CollectSignal::Logs => collect_logs(state, payload, mark).await,
+        CollectSignal::Traces => collect_traces(state, payload, mark).await,
+        CollectSignal::Metrics => collect_metrics(state, payload, mark).await,
     }
 }
 
@@ -735,71 +734,74 @@ fn log_ingest(state: &Arc<AppState>) -> OtlpLogIngest<'_> {
         config: &state.config,
         ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
+        tenant_policy: &state.tenant_policy,
+        metrics: &state.metrics,
         clock: &state.clock,
     }
 }
 
 async fn collect_logs(
     state: &Arc<AppState>,
-    tenant: crate::tenant::TenantId,
     payload: Vec<u8>,
     mark: Option<crate::journal::CollectMark>,
-) -> Result<PendingAppend, IngestError> {
+) -> Result<Vec<PendingAppend>, IngestError> {
     let ingest = log_ingest(state);
-    ingest.admit_tenant(&tenant, payload.len())?;
+    ingest.admit_size(payload.len())?;
     let request = ExportLogsServiceRequest::decode(payload.as_slice()).map_err(|error| {
         IngestError::from((
             StatusCode::BAD_REQUEST,
             format!("OTLP protobuf decode failed: {error}"),
         ))
     })?;
-    ingest.enqueue(tenant, request, Some(payload), mark).await
+    ingest.enqueue_request(request, Some(payload), mark).await
 }
 
 async fn collect_traces(
     state: &Arc<AppState>,
-    tenant: crate::tenant::TenantId,
     payload: Vec<u8>,
     mark: Option<crate::journal::CollectMark>,
-) -> Result<PendingAppend, IngestError> {
+) -> Result<Vec<PendingAppend>, IngestError> {
     let ingest = OtlpTraceIngest {
         journal: &state.journal,
         shutdown: &state.shutdown,
         ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
+        tenant_policy: &state.tenant_policy,
+        metrics: &state.metrics,
     };
-    ingest.admit_tenant(&tenant, payload.len())?;
+    ingest.admit_size(payload.len())?;
     let request = ExportTraceServiceRequest::decode(payload.as_slice()).map_err(|error| {
         IngestError::from((
             StatusCode::BAD_REQUEST,
             format!("OTLP protobuf decode failed: {error}"),
         ))
     })?;
-    ingest.enqueue(tenant, request, mark).await
+    ingest.enqueue_request(request, mark).await
 }
 
 async fn collect_metrics(
     state: &Arc<AppState>,
-    tenant: crate::tenant::TenantId,
     payload: Vec<u8>,
     mark: Option<crate::journal::CollectMark>,
-) -> Result<PendingAppend, IngestError> {
+) -> Result<Vec<PendingAppend>, IngestError> {
     let ingest = OtlpMetricIngest {
         journal: &state.journal,
         shutdown: &state.shutdown,
         config: &state.config,
         ingest_gate: &state.ingest_gate,
         tenant_quota: &state.tenant_quota,
+        tenant_policy: &state.tenant_policy,
+        metrics: &state.metrics,
         clock: &state.clock,
     };
-    ingest.admit_tenant(&tenant, payload.len())?;
+    ingest.admit_size(payload.len())?;
     let request = ExportMetricsServiceRequest::decode(payload.as_slice()).map_err(|error| {
         IngestError::from((
             StatusCode::BAD_REQUEST,
             format!("OTLP protobuf decode failed: {error}"),
         ))
     })?;
-    let (pending, outcome) = ingest.enqueue(tenant, request, mark).await?;
+    let (pending, outcome) = ingest.enqueue_request(request, mark).await?;
     // The collect route answers a bare 200 — collecty reads the status and
     // nothing else — so a partial refusal has only the log to land in.
     if let Some(partial) = outcome.partial_success() {
