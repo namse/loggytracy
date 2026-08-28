@@ -289,9 +289,9 @@ impl CollectSignal {
 /// One collected batch, every signal, read as it arrives.
 ///
 /// collecty keeps a single queue, so what arrives here is a mix: records in
-/// arrival order, each naming its signal, each its own zstd frame. Every
-/// record is a complete export on its own, which is what makes reading the
-/// body a record at a time possible at all — nothing has to be held back
+/// arrival order, each naming its signal, all of them inside one zstd stream.
+/// Every record is a complete export on its own, which is what makes reading
+/// the body a record at a time possible at all — nothing has to be held back
 /// waiting for a later part of the batch to make sense of it.
 pub async fn collect(
     State(state): State<Arc<AppState>>,

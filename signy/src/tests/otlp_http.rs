@@ -360,7 +360,10 @@
     const TRACES_TAG: u8 = 2;
 
     /// The batch collecty ships: each payload behind its own record header,
-    /// each record its own zstd frame, all of it concatenated.
+    /// each record its own zstd frame, all of it concatenated. A real collecty
+    /// sends one stream over the whole segment, which decompresses the same
+    /// way — this shape is the harder one for the reader, so it is what the
+    /// tests use.
     fn zstd_frames(records: &[(u8, Vec<u8>)]) -> Vec<u8> {
         let mut frames = Vec::new();
         for (tag, payload) in records {
@@ -371,6 +374,18 @@
             frames.extend_from_slice(&zstd::bulk::compress(&plain, 3).unwrap());
         }
         frames
+    }
+
+    /// The shape a real collecty ships: one zstd stream over the whole
+    /// segment, the records back to back inside it.
+    fn zstd_stream(records: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut plain = Vec::new();
+        for (tag, payload) in records {
+            plain.push(*tag);
+            plain.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            plain.extend_from_slice(payload);
+        }
+        zstd::bulk::compress(&plain, 3).unwrap()
     }
 
     async fn post_collected(
@@ -456,6 +471,23 @@
             .iter()
             .map(|line| (LOGS_TAG, log_request(line).encode_to_vec()))
             .collect()
+    }
+
+    /// A segment is one compression over every record it holds, so the reader
+    /// cannot lean on a frame boundary to find where one ends.
+    #[tokio::test]
+    async fn a_segment_compressed_as_one_stream_is_read_a_record_at_a_time() {
+        let (memtable, state) = fixture();
+        let mut records = logs(&["first", "second", "third"]);
+        records.push((TRACES_TAG, span_request(1).encode_to_vec()));
+
+        let (status, body) = post_collected_from(&state, SENDER, 1, zstd_stream(&records)).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, r#"{"stored":1}"#);
+        let mut stored = lines(&memtable);
+        stored.sort();
+        assert_eq!(stored, vec!["first", "second", "third"]);
     }
 
     /// The whole point of the numbering: a collecty that died before it could

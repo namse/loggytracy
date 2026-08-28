@@ -37,8 +37,7 @@ disk.
 | Variable | Default | What it does |
 |---|---|---|
 | `COLLECTY_QUEUE_MAX_BYTES` | `1GiB` | One queue holds every signal, so this is the whole budget. **This number is how long signy may be down before data is lost.** At 1 MB/s of compressed logs it is about 17 minutes |
-| `COLLECTY_QUEUE_SEGMENT_BYTES` | `8MiB` | Segment roll size, and therefore the unit of everything else: one request carries one segment, dropping under a full queue takes one at a time, and a cut delivery re-sends one. Smaller segments lose less per drop and cost more requests |
-| `COLLECTY_FSYNC_INTERVAL` | `1s` | How often written records are forced to the device. **This is the loss window for a power cut**, and nothing else |
+| `COLLECTY_QUEUE_SEGMENT_BYTES` | `8MiB` | Segment close size, in compressed bytes, and therefore the unit of everything else: one request carries one segment, one `fsync` covers one, dropping under a full queue takes one at a time, and a cut delivery re-sends one. Smaller segments lose less per drop and cost more requests |
 
 When `COLLECTY_QUEUE_MAX_BYTES` is reached the oldest segment is unlinked and the
 application keeps running. Watch `collecty_queue_dropped_bytes_total`: any
@@ -48,7 +47,7 @@ movement means data was thrown away.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLECTY_SEGMENT_MAX_AGE` | `1s` | How long an open segment may keep collecting before it closes and becomes sendable. Nothing leaves the machine until a segment closes, so on a quiet host this is the delivery latency |
+| `COLLECTY_SEGMENT_MAX_AGE` | `1s` | How long an open segment may keep collecting before it closes and becomes sendable. Nothing leaves the machine and nothing is on the device until a segment closes, so on a quiet host this is both the delivery latency and **the loss window for a power cut** |
 | `COLLECTY_RETRY_INITIAL` | `100ms` | First backoff after signy declines |
 | `COLLECTY_RETRY_MAX` | `30s` | Backoff ceiling. Doubling, with up to 25% jitter |
 | `COLLECTY_SEND_TIMEOUT` | `30s` | How long one batch may wait for an answer before it counts as a retryable failure |
@@ -77,18 +76,21 @@ attributes.
 
 | Family | Kind | What it answers |
 |---|---|---|
-| `collecty_queue_backlog_bytes` | gauge | How far behind signy is. **The one to alert on** |
-| `collecty_queue_bytes` | gauge | What the segments occupy on disk |
+| `collecty_queue_bytes` | gauge | What the segments occupy on disk, which is also how far behind signy is — an answered segment is unlinked. **The one to alert on** |
 | `collecty_queue_segments` | gauge | Segment count |
 | `collecty_records_appended_total` | counter | Exports accepted from applications |
-| `collecty_bytes_appended_total` | counter | Compressed bytes written |
-| `collecty_records_sent_total` | counter | Exports signy accepted |
-| `collecty_batches_sent_total` | counter | Batches signy accepted |
+| `collecty_bytes_appended_total` | counter | Plain bytes accepted, before the segment compresses them. Against `collecty_bytes_sent_total` this is the ratio this host is achieving |
+| `collecty_segments_sent_total` | counter | Segments signy accepted |
 | `collecty_bytes_sent_total` | counter | Compressed bytes shipped |
-| `collecty_records_refused_total` | counter | Exports **dropped** because signy would not take the batch even alone. Any movement is data loss. Records signy itself drops are counted on its side, in `signy_collect_dropped_records_total` |
-| `collecty_send_retries_total` | counter | Batches signy declined and that were retried |
+| `collecty_segments_refused_total` | counter | Segments **dropped** because signy would not take them. Any movement is data loss. Records signy itself drops are counted on its side, in `signy_collect_dropped_records_total` |
+| `collecty_bytes_refused_total` | counter | Compressed bytes dropped the same way |
+| `collecty_send_retries_total` | counter | Deliveries signy declined and that were retried |
 | `collecty_queue_dropped_bytes_total` | counter | Bytes **dropped** because the queue was full. Any movement is data loss |
 | `collecty_queue_dropped_segments_total` | counter | Segments unlinked while full |
+
+Records are counted where they arrive and not where they leave: what a segment
+holds is inside its compression, and counting it on the way out would mean
+decompressing every segment to learn a number nothing acts on.
 
 ## Refusals at startup
 

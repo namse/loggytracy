@@ -15,8 +15,8 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Deployment | One process per machine or one sidecar per pod; both are supported and neither is assumed |
 | Ingest protocol | **OTLP over gRPC on a Unix domain socket**, all three signals |
 | Payload handling | **Never decoded.** The bytes that arrive are the bytes that are stored and the bytes that are sent |
-| Acknowledgement | After `write(2)`, before `fsync`. See "What an acknowledgement means" |
-| Durability | Append-only segments, crc32 per record, periodic `fsync`. **How far signy has got is not written down** — a segment it answered for is unlinked, so what is on disk is what is still owed |
+| Acknowledgement | After the record enters the open segment's compressor, before it is on the device. See "What an acknowledgement means" |
+| Durability | **The segment is the unit.** One zstd stream a segment, `fsync`ed as it closes, and there is no `fsync` before that. **How far signy has got is not written down** — a segment it answered for is unlinked, so what is on disk is what is still owed |
 | When the queue is full | **Drop the oldest segment.** The application is never refused for lack of disk |
 | Delivery | One closed segment in flight at a time, in queue order. A resend after a crash is **suppressed by signy**, not duplicated — see "Sending twice" |
 | Transport to signy | `POST /signy/api/v1/collect` with `Content-Encoding: zstd`, one route for all three signals |
@@ -39,22 +39,23 @@ messages back to back yields one message whose repeated fields are the
 concatenation. So joining the serialized bytes of N exports **is** the merged
 export — no decode, no re-encode, no field walking.
 
-**zstd frames concatenate.** A zstd stream may hold any number of frames, and
-decompressing the stream yields the concatenation of what each frame held. So
-joining N independently compressed frames **is** one stream that decompresses to
-the joined plaintext.
+**zstd compresses a stream, not a message.** A segment's records go into one
+encoder, one after another, and what the file holds when the segment closes is a
+single stream that decompresses to all of them joined. The second export costs
+almost nothing once the first has taught the compressor what this machine's data
+looks like.
 
 Only the first half is signal-specific: logs merge with logs, not with spans.
-One queue holds all three, so each export is compressed **behind a five byte
-header** naming its signal and its length, and the batch signy receives is a
-sequence of those records rather than one anonymous run of bytes. Splitting them
-apart again is a walk over the plaintext with no decoding in it; joining each
-signal's payloads is then the same free merge as before.
+One queue holds all three, so each export goes in **behind a five byte header**
+naming its signal and its length, and what signy receives is a sequence of those
+records rather than one anonymous run of bytes. Splitting them apart again is a
+walk over the plaintext with no decoding in it; joining each signal's payloads is
+then the same free merge as before.
 
 ```
-export₁ (logs)   ──encode──▶ [L]bytes₁ ──zstd──▶ frame₁ ─┐
-export₂ (traces) ──encode──▶ [T]bytes₂ ──zstd──▶ frame₂ ─┼─▶ frame₁‖frame₂‖frame₃
-export₃ (logs)   ──encode──▶ [L]bytes₃ ──zstd──▶ frame₃ ─┘      (the body sent)
+export₁ (logs)   ──encode──▶ [L]bytes₁ ─┐
+export₂ (traces) ──encode──▶ [T]bytes₂ ─┼─▶ one zstd stream ─▶ the segment file
+export₃ (logs)   ──encode──▶ [L]bytes₃ ─┘                       (the body sent)
                                                           │
               signy: one decompress ──────────────────────┴─▶ [L]bytes₁[T]bytes₂[L]bytes₃
                      one walk, one decode per signal ───────▶ logs:   bytes₁‖bytes₃
@@ -63,11 +64,11 @@ export₃ (logs)   ──encode──▶ [L]bytes₃ ──zstd──▶ frame�
 
 collecty compresses each export once, on arrival, and never touches it again.
 It does not decode on the way in, does not merge structurally, and does not
-recompress on the way out. The header is written before compression, so even it
-costs nothing on the send path.
+recompress on the way out. The file **is** the request body, byte for byte, so
+sending a segment is a read and a socket write with nothing in between.
 
 Both halves are pinned by tests in `src/wire.rs`
-(`concatenated_frames_decompress_to_the_concatenated_records`,
+(`one_stream_over_many_records_decompresses_to_all_of_them`,
 `concatenated_export_requests_decode_as_one_merged_request`,
 `a_batch_survives_both_layers_at_once`), and the whole path is pinned end to end
 by signy's `one_batch_of_mixed_signals_lands_in_every_store_it_names`.
@@ -94,17 +95,21 @@ Two ceilings guard memory:
   own length and holds it until the record is on disk, so the memory a burst can
   reach is a declared number rather than a product of concurrency and size.
 
-Compression and the queue append both run on a blocking thread. Compression is
-the only meaningful CPU this process spends.
+The append runs on a blocking thread, and compression happens inside it: the
+open segment's encoder is one piece of state, so the appends that feed it are
+serialised behind the queue's lock. That is the price of compressing across a
+segment rather than a record, and it buys back more than it costs at small
+export sizes, where per-record framing spent most of its time starting a new
+compressor. Compression is still the only meaningful CPU this process spends.
 
 ## What an acknowledgement means
 
-**A `200` means the bytes reached the kernel, not the device.** `Queue::append`
-does `write(2)` and returns; `fsync` happens on a timer (`COLLECTY_FSYNC_INTERVAL`,
-1 s) and when a segment rolls.
+**A `200` means the record is in the open segment's compressor, not that it is
+on the device or even in the kernel.** The encoder emits when a block fills, so
+`write(2)` happens in blocks and `fsync` happens once, when the segment closes.
 
-This was chosen over acknowledging after `fsync`, and the reason is that it is
-the option that leaves the **least** memory held anywhere:
+This was chosen over acknowledging later, and the reason is that it is the
+option that leaves the **least** memory held anywhere:
 
 - Acknowledging after `fsync` delays every response by a device sync. The
   application's exporter queue grows by exactly that delay, and collecty holds
@@ -112,22 +117,32 @@ the option that leaves the **least** memory held anywhere:
 - Acknowledging from an in-memory channel is no faster in practice and moves the
   bytes from the application's heap to collecty's — the same bytes, a different
   owner, and a channel-sized ceiling on top.
-- Acknowledging after `write` is the only one where the bytes leave user memory
-  entirely. Page cache is reclaimable, is not charged to either process's RSS,
-  and a cgroup counts it as reclaimable rather than as pressure.
+- Acknowledging on the way into the compressor is the only one where the bytes
+  leave user memory as themselves. What is held instead is the encoder's window,
+  which is one buffer for the whole segment however many records went through
+  it, and what reaches the page cache is reclaimable and charged to nobody's RSS.
 
-What that costs: a machine that loses power loses at most one `fsync` interval.
-A collecty that crashes or is redeployed loses nothing, because the kernel still
-holds what was written. The lost window belongs to a failure that takes the
-application on that machine with it, and signy already accepts a loss window of
-its own flush interval for the same class of event.
+What that costs: **a segment that has not closed is not promised to anyone.** A
+machine that loses power loses the open segment, which
+`COLLECTY_SEGMENT_MAX_AGE` (1 s) bounds. A collecty that crashes or is
+redeployed loses only what the encoder had not written yet — the kernel still
+holds the blocks that had reached it, and recovery reads them back.
+
+This is a real step back from acknowledging after `write(2)`, which is what the
+per-record framing allowed: there, a process crash lost nothing at all. It is
+the price of one stream a segment, and it is bounded by the same knob that
+already bounds how long a record waits before it leaves the machine.
+
+Flushing the encoder on a timer would buy the old window back, and it was
+measured and rejected: a flush ends a block early, and flushing often enough to
+matter is close to giving up the ratio this is all for.
 
 ## The disk queue
 
 One queue for every signal, under `{data_dir}/queue/`.
 
 ```
-00000000000000000000.seg   append-only segment, rolls at COLLECTY_QUEUE_SEGMENT_BYTES
+00000000000000000000.seg   one zstd stream, closed at COLLECTY_QUEUE_SEGMENT_BYTES
 00000000000000000001.seg
 identity                   20 bytes: sender id, crc32
 ```
@@ -136,57 +151,62 @@ That file is the whole of what the queue writes about itself. There is no
 cursor: a segment signy has answered for is unlinked on the spot, so the oldest
 file that is not still being written is the next one to send.
 
-A record is an 8-byte header and a zstd frame:
+**A segment has no framing of its own.** The file is a zstd stream and nothing
+else, and inside it the records sit back to back under the five byte header
+signy reads. There is no length and no checksum around them, because there is
+nowhere left for one to be useful: a stream is read from its start whatever
+happens, and the decoder is what says where the readable part ends.
 
-| bytes | field | why |
-|---|---|---|
-| 0..4 | compressed length | frames the record |
-| 4..8 | crc32 of the frame | says where a torn tail ends |
+**One stream per segment rather than one frame per record.** A frame a record
+was self-describing on disk — an 8 byte length and crc in front of each — and it
+paid for that in the only currency that matters here. Compressing across the
+segment instead, measured against this repository's corpus at 23 MiB of plain
+exports:
 
-It used to carry the decompressed length as well, so a batch could be sized
-against what signy would admit without decompressing it. Both the batch and
-that ceiling are gone.
+| exports of | a frame a record | one stream | | CPU |
+|---|---|---|---|---|
+| 512 records | 1.07 MiB | 0.88 MiB | −17% | 1.26× |
+| 64 records | 1.91 MiB | 0.93 MiB | −51% | 0.65× |
+| 8 records | 7.94 MiB | 0.87 MiB | −89% | 0.18× |
 
-**Why the crc and not a recorded byte offset.** The length alone catches the
-tail a *process* crash leaves — the header and the frame are two `write(2)`
-calls, and dying between them leaves a header whose length runs past the file.
-A *machine* crash is what the crc is for: the page cache goes with it, and a
-header half old and half new can carry a length that fits. Reading that as a
-record sends a frame signy cannot decompress, and the whole segment is refused
-and dropped — a torn tail traded for a whole segment.
+The small end is where a collector actually lives, and it is where a frame a
+record was worst: each one started a compressor that never saw enough data to
+learn anything. Compressing them together is *cheaper* there too — most of that
+CPU was frame setup. It costs a quarter more CPU at the large end, where framing
+was never the expensive part, and that is the one place this trade is not free.
 
-Writing down a known-good offset at each `fsync` would find the end too, and it
-would throw away everything since that `fsync` on every restart. The common
-crash is the process alone, where the page cache still holds all of it and
-walking recovers all of it. Four bytes a record is the cheaper side.
+What it cost is the acknowledgement, and that is written up above. What made it
+affordable is that a segment is now what a request carries: the file is sent
+verbatim, and it is never read while it is open.
 
-**The signal is inside the frame, not in this header.** Compressed, the frame
-holds five more bytes in front of the payload — one signal tag and the payload's
-length — and those are the bytes signy reads to split a segment apart. Putting the
-tag here instead would have been cheaper to read locally and useless remotely:
-the queue header never leaves this machine, and the sender would then have to
-rebuild an index for signy out of bytes it is otherwise free to `memcpy`. So the
-queue stays signal-agnostic and only the two ends of the wire know the tag.
+**The signal is inside the stream, not around it.** Each record carries one
+signal tag and the payload's length in front of it, and those are the bytes
+signy reads to split a segment apart. They go in before compression, so they
+cost nothing on the send path and the queue itself stays signal-agnostic — only
+the two ends of the wire know the tag.
 
-**One frame per record rather than one stream per segment.** A streaming
-compressor over a whole segment would compress better — measured at 28% fewer
-bytes for a normal export size and far more for small ones — and now that a
-segment is what a request carries, most of what stood in the way is gone: the
-file would be sent verbatim, and it is never read while it is open.
+**Recovery closes what a crash left open; it does not resume it.** An encoder's
+state is memory, and it died with the process, so there is no appending to an
+unfinished stream. On open, the last segment is decompressed as far as it goes —
+an unfinished stream reads to its last complete block and then says so — cut
+back to the last record that arrived **whole**, and written out again as a
+stream that ends properly. Then this run starts a segment of its own, under the
+next number.
 
-What is left is the acknowledgement. A record is acknowledged to the exporting
-application after `write(2)`, and a streaming compressor holds bytes in the
-encoder until it flushes, so the record would not be in the file yet. Closing
-that gap means either delaying the answer to the next flush or answering for
-something not yet written. That is the decision this has not made, and until it
-does the ratio is what it costs.
+The cut has to happen here rather than at signy: a batch whose last record is
+short is a `400`, and a `400` drops the segment. Cutting one record locally is
+the cheaper side of that trade by the whole segment.
 
-**Recovery.** On open, the last segment is walked from its start and truncated at
-the first record whose header does not fit, whose length runs past the file, or
-whose crc does not match. Earlier segments are not walked: a corrupt record found
-later, while reading, ends that segment and the reader moves to the next one.
-Trusting a bad length field to find the next boundary would be worse than losing
-the tail of one segment.
+Only the last segment can be unfinished, because closing a segment syncs it
+before the next one is created. Earlier ones are not touched, which is what
+keeps a restart from reading the whole backlog.
+
+**Corruption is signy's to find.** A frame a record could be checked locally
+with a crc, and a bad one ended the segment there. There is no equivalent inside
+a stream, and adding one would mean decompressing every segment on the way out
+to check what the receiver is about to check anyway. So a segment goes as it is;
+a stream that does not decompress is a `400`, and a `400` is a refusal, and a
+refusal drops the segment rather than retrying it forever.
 
 **Nothing records how far signy has got.** An earlier design kept the answered
 segment number beside the identity, and it said nothing the directory did not:
@@ -199,6 +219,11 @@ against a number to keep consistent with the files.
 under it, so a name that outlived the segment numbering would have every segment
 under that mark skipped as one already stored. A file that fails its crc yields
 a new name, and the queue comes back as a sender signy has never heard of.
+
+For the same reason **segment numbers are never reused**. The next number comes
+from the highest the directory ever held, not from the highest still in it, so a
+segment that recovery finds empty and unlinks does not hand its number to the
+one that follows.
 
 **Drop-oldest works in whole segments.** Rewriting a file to remove its head is
 expensive; unlinking is one syscall. If the cursor was inside the segment being
@@ -224,12 +249,17 @@ keeping a reader out of it is most of what makes the rest of this simple.
 default) closes it on a busy host; `COLLECTY_SEGMENT_MAX_AGE` (1 s) closes it on
 a quiet one, and that is the floor on how long a record waits before it leaves
 the machine. Both numbers also decide how much is re-sent when a delivery is
-cut, because what is re-sent is the segment.
+cut, and how much a power cut loses, because the segment is the unit of all
+three.
+
+The size is measured in **compressed** bytes that have reached the file, which
+the encoder emits a block at a time, so a segment overshoots by at most the last
+block before it notices.
 
 The request carries `Content-Encoding: zstd`, `x-collecty-sender` and
-`x-collecty-segment`, and the body is the segment's frames, concatenated. The
-twelve-byte on-disk header of each is stripped: it exists to find a torn tail
-and to size a segment, and signy has no use for it.
+`x-collecty-segment`, and the body is the segment file, byte for byte. Nothing
+is stripped, joined or re-encoded, because the queue has no framing of its own
+left to strip.
 
 ### Sending twice
 
@@ -283,7 +313,8 @@ both are visible: a warning per drop and
 `signy_collect_dropped_records_total`, which the runbook alerts on.
 
 What still reaches the table as a refusal is a segment that is wrong as a
-*whole*: not zstd, or framing that does not add up. The statuses this table
+*whole*: a stream that does not decompress, or framing behind it that does not
+add up. The statuses this table
 calls retryable stay retryable, because they are answered before any of the body
 is read: a fenced or draining instance, and a gate that is behind.
 
@@ -295,9 +326,11 @@ and a segment that always fails would block the queue head forever.
 **Halving is gone.** It used to narrow a refused batch by halves until one
 record was left and drop that one. signy now reads a segment a record at a time
 and drops what it will never take on its own side, so nothing that reaches the
-sender as a refusal is about a record — it is the segment's framing, and no
-amount of splitting finds anything. A refused segment is dropped whole, counted
-in `collecty_records_refused_total` by the records it held, and logged at error.
+sender as a refusal is about a record — it is the segment's stream or its
+framing, and no amount of splitting finds anything. Splitting is not even
+possible any more: the records are inside one compression. A refused segment is
+dropped whole, counted in `collecty_segments_refused_total` and
+`collecty_bytes_refused_total`, and logged at error.
 
 That is a blunter loss than the old search, and it is bounded by
 `COLLECTY_QUEUE_SEGMENT_BYTES` rather than by one record. A segment whose
