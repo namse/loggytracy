@@ -480,7 +480,7 @@
         let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_stream(&records)).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, r#"{"stored":1}"#);
+        assert_eq!(body, r#"{"stored":1,"rejected":0}"#);
         let mut stored = lines(&memtable);
         stored.sort();
         assert_eq!(stored, vec!["first", "fourth", "second", "third"]);
@@ -496,11 +496,11 @@
 
         let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, r#"{"stored":1}"#);
+        assert_eq!(body, r#"{"stored":1,"rejected":0}"#);
 
         let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, r#"{"stored":1}"#, "the answer does not move");
+        assert_eq!(body, r#"{"stored":1,"rejected":0}"#, "the answer does not move");
 
         let mut lines = lines(&memtable);
         lines.sort();
@@ -522,7 +522,7 @@
             post_collected_from(&state, SENDER, LOGS, 2, zstd_frames(&logs(&["second"]))).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, r#"{"stored":2}"#);
+        assert_eq!(body, r#"{"stored":2,"rejected":0}"#);
         let mut lines = lines(&memtable);
         lines.sort();
         assert_eq!(lines, vec!["first", "second"]);
@@ -552,7 +552,7 @@
         let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&records)).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, r#"{"stored":1}"#);
+        assert_eq!(body, r#"{"stored":1,"rejected":0}"#);
         let mut lines = lines(&memtable);
         lines.sort();
         assert_eq!(lines, vec!["fourth", "third"], "only what was still owed");
@@ -587,7 +587,7 @@
 
         let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, r#"{"stored":1}"#);
+        assert_eq!(body, r#"{"stored":1,"rejected":0}"#);
 
         let (status, body) = post_collected_from(&state, SENDER, LOGS, 1, zstd_frames(&records)).await;
         assert_eq!(status, StatusCode::OK, "{body}");

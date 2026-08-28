@@ -43,7 +43,6 @@ services:
       # Everything else is the engine's own default on purpose — see the
       # fairness rules in `docs/COMPARISON.md`.
       SIGNY_LISTEN_ADDR: 0.0.0.0:3100
-      SIGNY_OTLP_GRPC_ADDR: 0.0.0.0:4317
       SIGNY_DATA_DIR: /var/lib/signy
       # The cardinality ladder's one variable. At its default this engine
       # refuses new series at a *policy* number long before the container's

@@ -10,6 +10,29 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+/// signy's whole write surface. All three signals go to it; the header says
+/// which.
+const COLLECT_PATH: &str = "/signy/api/v1/collect";
+
+/// Which signal a batch carries, for the collect route's header.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl Signal {
+    fn collect_headers(self) -> &'static [(&'static str, &'static str)] {
+        const ZSTD: (&str, &str) = ("Content-Encoding", "zstd");
+        match self {
+            Signal::Logs => &[ZSTD, ("x-collecty-signal", "logs")],
+            Signal::Traces => &[ZSTD, ("x-collecty-signal", "traces")],
+            Signal::Metrics => &[ZSTD, ("x-collecty-signal", "metrics")],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Targets {
     /// Gated on the **response** percentiles: the service ones describe a rate
@@ -127,15 +150,24 @@ victoriametrics, got {other:?}"
         }
     }
 
-    /// Where OTLP logs are POSTed. Three spellings of the same endpoint:
-    /// signy serves the collector path bare, Loki nests it under `/otlp`,
-    /// VictoriaLogs under `/insert/opentelemetry` — all measured accepting the
-    /// identical protobuf body (2026-08-02, Loki 3.3.2 / VictoriaLogs v1.52.0).
-    /// VictoriaMetrics is the metric phases' target and takes OTLP *metrics*
-    /// at its own spelling of the collector path.
+    /// Where OTLP logs are POSTed.
+    ///
+    /// Three targets take the export bare, at three spellings of the
+    /// collector path: Loki nests it under `/otlp`, VictoriaLogs under
+    /// `/insert/opentelemetry`, VictoriaMetrics under `/opentelemetry` — all
+    /// measured accepting the identical protobuf body (2026-08-02, Loki 3.3.2
+    /// / VictoriaLogs v1.52.0).
+    ///
+    /// signy no longer has such an endpoint. Its OTLP push routes were removed
+    /// with its gRPC services, so a collecty's batch is the only way in, and
+    /// the bed sends what the one intended producer sends: the same export,
+    /// wrapped by [`Target::wrap_push`] and headed by [`Target::push_headers`].
+    /// The payload is still byte-identical across targets; the framing around
+    /// it is not, and `docs/LOAD_VALIDATION.md` records what that costs the
+    /// comparison.
     pub fn push_path(self) -> &'static str {
         match self {
-            Target::Signy => "/v1/logs",
+            Target::Signy => COLLECT_PATH,
             Target::Loki => "/otlp/v1/logs",
             Target::VictoriaLogs => "/insert/opentelemetry/v1/logs",
             Target::VictoriaMetrics => "/opentelemetry/v1/metrics",
@@ -146,9 +178,39 @@ victoriametrics, got {other:?}"
     /// refusal: a target with no metrics ingest cannot join the metrics bed.
     pub fn metric_push_path(self) -> Option<&'static str> {
         match self {
-            Target::Signy => Some("/v1/metrics"),
+            Target::Signy => Some(COLLECT_PATH),
             Target::VictoriaMetrics => Some("/opentelemetry/v1/metrics"),
             Target::Loki | Target::VictoriaLogs => None,
+        }
+    }
+
+    /// The headers signy's collect route needs and no other target sends: how
+    /// the batch is compressed, and which of the three signals it carries.
+    ///
+    /// No sender or segment header. Those number a collecty's queue, and a
+    /// harness has none — signy reads their absence as "nothing to resume"
+    /// and stores every record it is given.
+    pub fn push_headers(self, signal: Signal) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Target::Signy => signal.collect_headers(),
+            _ => &[],
+        }
+    }
+
+    /// One OTLP export, framed the way the endpoint takes it.
+    ///
+    /// For signy that is a one-record collecty batch: the payload behind its
+    /// length, zstd over the whole thing. Every other target takes the export
+    /// as it stands.
+    pub fn wrap_push(self, payload: Vec<u8>) -> Vec<u8> {
+        match self {
+            Target::Signy => {
+                let mut plain = Vec::with_capacity(4 + payload.len());
+                plain.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                plain.extend_from_slice(&payload);
+                zstd::bulk::compress(&plain, 3).expect("zstd compresses a batch")
+            }
+            _ => payload,
         }
     }
 
@@ -216,7 +278,6 @@ pub struct Config {
     pub target: Target,
     pub phase: Phase,
     pub http_address: String,
-    pub otlp_address: String,
     pub tier: String,
     pub seed: u64,
     pub duration_seconds: u64,
@@ -377,7 +438,6 @@ impl Config {
             target: Target::parse(&env_string("SIGNY_LOAD_TARGET", "signy"))?,
             phase: Phase::parse(&env_string("SIGNY_LOAD_PHASE", "load"))?,
             http_address: env_string("SIGNY_LOAD_ADDR", "127.0.0.1:3100"),
-            otlp_address: env_string("SIGNY_LOAD_OTLP_ADDR", "127.0.0.1:4317"),
             tier: env_string("SIGNY_LOAD_TIER", "B"),
             seed: env_u64("SIGNY_LOAD_SEED", 0x5eed_2026),
             duration_seconds,

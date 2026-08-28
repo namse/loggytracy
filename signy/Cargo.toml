@@ -24,17 +24,12 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 prost014 = { package = "prost", version = "0.14.4" }
-tonic = { version = "0.14.6", features = ["transport"] }
-# `RetryInfo` on a throttled gRPC push. The OTLP specification makes
-# `RESOURCE_EXHAUSTED` retryable *only* when the response carries one, so
-# without this the gRPC transport tells a collector to drop what the HTTP
-# transport tells it to hold. tonic's own sibling crate at tonic's own version:
-# the alternative was ~20 lines defining `google.rpc.Status`/`Any`/`RetryInfo`
-# against the `prost` already here, and its failure mode is silent — a wrong
-# `type_url` or details encoding still round-trips through a test that decodes
-# with the same definitions, and only a real collector would notice.
-tonic-types = "0.14.6"
-opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic", "trace", "logs", "metrics", "with-serde"] }
+# Messages, not services. `gen-tonic` would also generate the OTLP service
+# traits and servers and pull tonic's transport in with them; nothing serves
+# gRPC here — the collect route is the whole ingest surface — so what is wanted
+# is the generated `ExportLogsServiceRequest` and its siblings and nothing
+# else. The module they live under is still called `tonic`.
+opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic-messages", "trace", "logs", "metrics", "with-serde"] }
 regex = "1"
 regex-syntax = "0.8"
 serde = { version = "1", features = ["derive"] }

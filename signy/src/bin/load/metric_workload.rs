@@ -43,7 +43,7 @@ use prost014::Message;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use crate::config::{Config, MetricVerify};
+use crate::config::{Config, MetricVerify, Signal, Target};
 use crate::http::{Client, Request};
 
 const PUSH_CONTENT_TYPE: &str = "application/x-protobuf";
@@ -352,7 +352,7 @@ fn tenant_resource(tenant: &str) -> opentelemetry_proto::tonic::resource::v1::Re
     }
 }
 
-pub fn seed_bodies(corpus: &MetricCorpus, tenant: Option<&str>) -> Vec<SeedBody> {
+pub fn seed_bodies(corpus: &MetricCorpus, tenant: Option<&str>, target: Target) -> Vec<SeedBody> {
     let mut counters: Vec<CounterState> = corpus
         .instruments
         .iter()
@@ -487,7 +487,7 @@ pub fn seed_bodies(corpus: &MetricCorpus, tenant: Option<&str>) -> Vec<SeedBody>
             }],
         };
         bodies.push(SeedBody {
-            bytes: request.encode_to_vec(),
+            bytes: target.wrap_push(request.encode_to_vec()),
             datapoints,
             decomposed_samples: decomposed,
         });
@@ -539,21 +539,53 @@ impl Default for MetricSeedOutcome {
     }
 }
 
-/// A 2xx body is still inspected for OTLP `partial_success`: a seed that was
+/// A 2xx body is still inspected for what it refused: a seed that was
 /// partially rejected has not seeded the dataset, and reading only the status
 /// line would report it as complete.
-fn rejected_datapoints(body: &[u8]) -> u64 {
+///
+/// Two answers say it, because the two endpoints are not the same endpoint.
+/// VictoriaMetrics answers the OTLP `ExportMetricsServiceResponse` and names
+/// the count in its `partial_success`. signy has no OTLP endpoint left — the
+/// collect route is the whole of its ingest — and names the same count in the
+/// `rejected` field of its own JSON answer.
+fn rejected_datapoints(target: Target, body: &[u8]) -> u64 {
     if body.is_empty() {
         return 0;
     }
-    ExportMetricsServiceResponse::decode(body)
-        .ok()
-        .and_then(|response| response.partial_success)
-        .map(|partial| partial.rejected_data_points.max(0) as u64)
+    match target {
+        Target::Signy => json_number(body, "rejected"),
+        _ => ExportMetricsServiceResponse::decode(body)
+            .ok()
+            .and_then(|response| response.partial_success)
+            .map(|partial| partial.rejected_data_points.max(0) as u64)
+            .unwrap_or(0),
+    }
+}
+
+/// One unsigned field out of a flat JSON object, without a parser: the answer
+/// is written by this repository and is two numbers.
+fn json_number(body: &[u8], field: &str) -> u64 {
+    let body = String::from_utf8_lossy(body);
+    let key = format!("\"{field}\"");
+    let Some(at) = body.find(&key) else {
+        return 0;
+    };
+    body[at + key.len()..]
+        .trim_start()
+        .strip_prefix(':')
+        .map(|rest| rest.trim_start())
+        .map(|rest| {
+            rest.chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse().ok())
         .unwrap_or(0)
 }
 
 pub async fn run_metric_seed(cfg: &Config, corpus: &MetricCorpus) -> MetricSeedOutcome {
+    let push_headers = cfg.target.push_headers(Signal::Metrics);
+    let target = cfg.target;
     let Some(push_path) = cfg.target.metric_push_path() else {
         return MetricSeedOutcome {
             errors: 1,
@@ -569,7 +601,7 @@ victoriametrics",
     // signy reads the tenant out of the export, the others out of the header,
     // so exactly one of these two carries it.
     let in_body = header.is_none().then_some(corpus.tenant.as_str());
-    let bodies = Arc::new(Mutex::new(seed_bodies(corpus, in_body)));
+    let bodies = Arc::new(Mutex::new(seed_bodies(corpus, in_body, cfg.target)));
     let start = Instant::now();
 
     let workers: Vec<_> = (0..cfg.metric_verify.push_connections)
@@ -595,6 +627,7 @@ victoriametrics",
                                 path: push_path,
                                 body: &body.bytes,
                                 content_type: PUSH_CONTENT_TYPE,
+                                headers: push_headers,
                                 tenant: header
                                     .as_ref()
                                     .map(|(name, value)| (*name, value.as_str())),
@@ -604,7 +637,7 @@ victoriametrics",
                             Ok(response) => {
                                 *outcome.statuses.entry(response.status).or_default() += 1;
                                 if (200..300).contains(&response.status) {
-                                    let rejected = rejected_datapoints(&response.body);
+                                    let rejected = rejected_datapoints(target, &response.body);
                                     if rejected > 0 {
                                         outcome.rejected_datapoints += rejected;
                                         outcome.errors += 1;
@@ -928,7 +961,7 @@ mod tests {
 
     /// Every fixture names a tenant, because signy reads one out of the body.
     fn seed_bodies_for_test(corpus: &MetricCorpus) -> Vec<SeedBody> {
-        seed_bodies(corpus, Some("test-tenant"))
+        seed_bodies(corpus, Some("test-tenant"), Target::Loki)
     }
 
     #[test]
@@ -941,6 +974,7 @@ mod tests {
             3,
             1_772_000_000_000_000_000,
             Some("test-tenant"),
+            Target::Loki,
         );
         let offered: u64 = bodies.iter().map(|(_, datapoints)| *datapoints).sum();
         assert_eq!(offered, population.instruments().count() as u64);
@@ -982,6 +1016,7 @@ mod tests {
             0,
             1_772_000_000_000_000_000,
             Some("test-tenant"),
+            Target::Loki,
         );
         assert!(bodies.len() >= 3, "{} bodies", bodies.len());
         for (_, datapoints) in &bodies {
@@ -1220,11 +1255,15 @@ fn live_scrape_bodies(
     scrape: usize,
     ts_ns: i64,
     tenant: Option<&str>,
+    target: Target,
 ) -> Vec<(Vec<u8>, u64)> {
     let instruments: Vec<&Instrument> = population.instruments().collect();
     instruments
         .chunks(SCRAPE_CHUNK_INSTRUMENTS.max(1))
-        .map(|chunk| live_scrape_body(chunk, scrape, ts_ns, tenant))
+        .map(|chunk| {
+            let (payload, datapoints) = live_scrape_body(chunk, scrape, ts_ns, tenant);
+            (target.wrap_push(payload), datapoints)
+        })
         .collect()
 }
 
@@ -1373,6 +1412,7 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
         elapsed_seconds: 0.0,
         series_offered: 0,
     };
+    let push_headers = cfg.target.push_headers(Signal::Metrics);
     let Some(push_path) = cfg.target.metric_push_path() else {
         outcome.phases[0].1.errors = 1;
         outcome.phases[0].1.first_error = Some(format!(
@@ -1412,7 +1452,9 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
-        for (body, datapoints) in live_scrape_bodies(&population, scrape, now_ns, in_body) {
+        for (body, datapoints) in
+            live_scrape_bodies(&population, scrape, now_ns, in_body, cfg.target)
+        {
             let sent = Instant::now();
             let result = client
                 .request(&Request {
@@ -1420,6 +1462,7 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
                     path: push_path,
                     body: &body,
                     content_type: PUSH_CONTENT_TYPE,
+                    headers: push_headers,
                     tenant: header.as_ref().map(|(name, value)| (*name, value.as_str())),
                 })
                 .await;
@@ -1432,7 +1475,7 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
                 .1;
             match result {
                 Ok(response) => {
-                    let rejected = rejected_datapoints(&response.body);
+                    let rejected = rejected_datapoints(cfg.target, &response.body);
                     tally.record(response.status, datapoints, rejected, elapsed_ms);
                     if !(200..300).contains(&response.status) && response.status != 429 {
                         tally.errors += 1;

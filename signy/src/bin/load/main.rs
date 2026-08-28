@@ -39,15 +39,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use prost014::Message;
+
 use opentelemetry_proto::tonic::collector::trace::v1::{
-    ExportTraceServiceRequest, trace_service_client::TraceServiceClient,
+    ExportTraceServiceRequest,
 };
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::Instant;
 
-use config::{Config, Phase, Target};
+use config::{Config, Phase, Signal, Target};
 use http::{Client, Request};
 use stats::{GaugeSeries, LatencyPair, target_row, wal_backlog_drains};
 use workload::{ArrivalOrder, PushGenerator, QUERY_SHAPES, QueryGenerator, result_rows};
@@ -727,6 +729,7 @@ async fn wait_for_ready(cfg: &Config) -> Result<(), String> {
                 body: &[],
                 content_type: "",
                 tenant: None,
+                headers: &[],
             })
             .await
         {
@@ -767,6 +770,7 @@ async fn onboard_tenants(cfg: &Config, tenants: &[&str]) -> Result<(), String> {
                 body: body.as_bytes(),
                 content_type: "application/json",
                 tenant: None,
+                headers: &[],
             })
             .await
             .map_err(|error| format!("onboarding {tenant}: {error}"))?;
@@ -794,6 +798,7 @@ async fn scrape(client: &mut Client) -> Option<probe::Metrics> {
             body: &[],
             content_type: "",
             tenant: None,
+            headers: &[],
         };
         if let Ok(response) = client.request(&request).await
             && response.status == 200
@@ -887,6 +892,7 @@ async fn push_worker(
                 path: cfg.target.push_path(),
                 body: &job.body.bytes,
                 content_type: PUSH_CONTENT_TYPE,
+                headers: cfg.target.push_headers(Signal::Logs),
                 tenant: job
                     .body
                     .tenant_header
@@ -1009,6 +1015,7 @@ async fn query_worker(
                 body: &[],
                 content_type: "",
                 tenant: Some((job.plan.tenant.0, job.plan.tenant.1.as_str())),
+                headers: &[],
             })
             .await;
         let done = Instant::now();
@@ -1147,10 +1154,14 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
     outcome
 }
 
-/// Trace ingest, so the trace registry and the Tempo path are not idle while
-/// the log path is loaded. One request in flight by design — it is a garnish
-/// on the workload, not part of the measured rate — but its latency is still
-/// taken from the intended send, so a stall shows.
+/// Trace ingest, so the trace registry is not idle while the log path is
+/// loaded. One request in flight by design — it is a garnish on the workload,
+/// not part of the measured rate — but its latency is still taken from the
+/// intended send, so a stall shows.
+///
+/// It goes to the collect route like everything else signy takes. It used to
+/// have a listener of its own — `SIGNY_LOAD_OTLP_ADDR`, a gRPC `TraceService`
+/// on `:4317` — and both went with the engine's other ingest paths.
 async fn otlp_workload(
     cfg: Config,
     tenant: String,
@@ -1166,28 +1177,23 @@ async fn otlp_workload(
     let Some(interval) = cfg.otlp_interval() else {
         return outcome;
     };
-    let Ok(mut client) = TraceServiceClient::connect(format!("http://{}", cfg.otlp_address)).await
-    else {
-        eprintln!(
-            "warning: OTLP endpoint {} unavailable; trace ingest skipped",
-            cfg.otlp_address
-        );
-        return outcome;
-    };
-    outcome.connected = true;
+    let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
     let mut rng = signy::corpus::Rng::new(cfg.seed ^ OTLP_SEED_SALT);
     let mut intended = Instant::now();
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         tokio::time::sleep_until(intended).await;
         let sent = Instant::now();
-        let result = send_otlp(&mut client, &tenant, &mut rng).await;
+        let result = send_otlp(&mut client, &cfg, &tenant, &mut rng).await;
         let done = Instant::now();
         outcome.latency.record(
             duration_ms(sent.saturating_duration_since(intended)),
             duration_ms(done.saturating_duration_since(sent)),
         );
         match result {
-            Ok(()) => outcome.sent += 1,
+            Ok(()) => {
+                outcome.sent += 1;
+                outcome.connected = true;
+            }
             Err(_) => outcome.errors += 1,
         }
         intended += interval;
@@ -1196,7 +1202,8 @@ async fn otlp_workload(
 }
 
 async fn send_otlp(
-    client: &mut TraceServiceClient<tonic::transport::Channel>,
+    client: &mut Client,
+    cfg: &Config,
     tenant: &str,
     rng: &mut signy::corpus::Rng,
 ) -> Result<(), String> {
@@ -1205,10 +1212,10 @@ async fn send_otlp(
     let span_id = rng.next_u64().to_be_bytes().to_vec();
     let request = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
-            // The same tenancy gate the HTTP path goes through. signy reads it
-            // off the resource on every transport, so gRPC names it the same
-            // way; without it every export is dropped and the trace leg
-            // records latency for spans the server threw away.
+            // The same tenancy gate the log path goes through: signy reads the
+            // tenant off the resource, and without it every export is dropped
+            // and the trace leg records latency for spans the server threw
+            // away.
             resource: Some(opentelemetry_proto::tonic::resource::v1::Resource {
                 attributes: vec![crate::otlp::tenant_attribute(tenant)],
                 ..Default::default()
@@ -1227,11 +1234,21 @@ async fn send_otlp(
             ..Default::default()
         }],
     };
-    client
-        .export(tonic::Request::new(request))
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    let body = cfg.target.wrap_push(request.encode_to_vec());
+    let response = client
+        .request(&Request {
+            method: "POST",
+            path: cfg.target.push_path(),
+            body: &body,
+            content_type: PUSH_CONTENT_TYPE,
+            tenant: None,
+            headers: cfg.target.push_headers(Signal::Traces),
+        })
+        .await?;
+    match response.status {
+        200 | 204 => Ok(()),
+        status => Err(format!("the collect route answered {status}")),
+    }
 }
 
 /// What this corpus actually compresses to, through the engine's own writer.

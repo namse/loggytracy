@@ -62,8 +62,7 @@ COPY --from=build /src/target/release/signy /usr/local/bin/signy
 # An image's logs are read by a collector, not by a person at a terminal.
 ENV SIGNY_LOG_FORMAT=json
 ENV SIGNY_LISTEN_ADDR=0.0.0.0:3100
-ENV SIGNY_OTLP_GRPC_ADDR=0.0.0.0:4317
-EXPOSE 3100 4317
+EXPOSE 3100
 # No TLS in this process by design; put it behind a proxy inside a trust
 # boundary. See docs/ARCHITECTURE.md, "Transport security".
 ENTRYPOINT ["/usr/local/bin/signy"]

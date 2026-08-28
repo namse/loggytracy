@@ -149,7 +149,7 @@ async fn collect_inner(
             segment,
             "a segment this instance already has, answered unread"
         );
-        return Ok(answer(at));
+        return Ok(answer(at, 0));
     }
     if let Some((id, segment)) = sender
         && segment > at.segment
@@ -177,6 +177,7 @@ async fn collect_inner(
     // memory it defends is proportional to.
     let mut inflight: VecDeque<(InflightBody, Vec<PendingAppend>)> = VecDeque::new();
     let mut index = 0u64;
+    let mut rejected = 0u64;
 
     while let Some(payload) = records.next().await? {
         let seen = index;
@@ -202,7 +203,10 @@ async fn collect_inner(
         let bytes = payload.len();
         let permit = admit_record(state, &mut inflight, bytes as u64).await?;
         match enqueue_record(state, signal, payload, mark).await {
-            Ok(pending) => inflight.push_back((permit, pending)),
+            Ok((pending, refused)) => {
+                rejected += refused;
+                inflight.push_back((permit, pending));
+            }
             // Permanent: a decode failure, a body past a limit, a tenant over
             // what it stores. Sending these back would only have collecty
             // halve the batch to find them and drop them anyway, one wasted
@@ -263,15 +267,25 @@ async fn collect_inner(
         sender
             .map(|(id, _)| marks.position(&id, signal))
             .unwrap_or(crate::journal::Position::START),
+        rejected,
     ))
 }
 
-/// The one thing a collecty reads out of a success: the last segment this
-/// instance holds whole. Everything at or below it can be unlinked.
-fn answer(at: crate::journal::Position) -> Response {
+/// The last segment this instance holds whole, and what it would not keep.
+///
+/// `stored` is the one a collecty reads: everything at or below it can be
+/// unlinked. `rejected` is datapoints a metrics record lost to the active-series
+/// cap — the number the OTLP `partial_success` carried while the push routes
+/// existed, which has nowhere else to go now that they do not. A collecty
+/// ignores it; it exists so that a partial acceptance is visible to whoever is
+/// looking, rather than only in this process's log.
+fn answer(at: crate::journal::Position, rejected: u64) -> Response {
     (
         [(header::CONTENT_TYPE, "application/json")],
-        format!("{{\"stored\":{}}}", at.whole_segments()),
+        format!(
+            "{{\"stored\":{},\"rejected\":{rejected}}}",
+            at.whole_segments()
+        ),
     )
         .into_response()
 }
@@ -375,15 +389,20 @@ async fn settle_oldest(
     settled
 }
 
+/// The record's appends, and the datapoints it was not allowed to keep.
+///
+/// Only metrics can lose part of a record: a series past the active-series cap
+/// is refused while the rest of the export lands. Logs and traces are all or
+/// nothing, so their count is always zero.
 async fn enqueue_record(
     state: &Arc<AppState>,
     signal: CollectSignal,
     payload: Vec<u8>,
     mark: Option<crate::journal::CollectMark>,
-) -> Result<Vec<PendingAppend>, IngestError> {
+) -> Result<(Vec<PendingAppend>, u64), IngestError> {
     match signal {
-        CollectSignal::Logs => collect_logs(state, payload, mark).await,
-        CollectSignal::Traces => collect_traces(state, payload, mark).await,
+        CollectSignal::Logs => collect_logs(state, payload, mark).await.map(|p| (p, 0)),
+        CollectSignal::Traces => collect_traces(state, payload, mark).await.map(|p| (p, 0)),
         CollectSignal::Metrics => collect_metrics(state, payload, mark).await,
     }
 }
@@ -595,7 +614,7 @@ async fn collect_metrics(
     state: &Arc<AppState>,
     payload: Vec<u8>,
     mark: Option<crate::journal::CollectMark>,
-) -> Result<Vec<PendingAppend>, IngestError> {
+) -> Result<(Vec<PendingAppend>, u64), IngestError> {
     let ingest = OtlpMetricIngest {
         journal: &state.journal,
         config: &state.config,
@@ -612,8 +631,8 @@ async fn collect_metrics(
         ))
     })?;
     let (pending, outcome) = ingest.enqueue_request(request, mark).await?;
-    // The collect route answers a bare 200 — collecty reads the status and
-    // nothing else — so a partial refusal has only the log to land in.
+    // Logged as well as answered: a collecty reads the status and nothing
+    // else, so the log is where an operator finds the reason.
     if let Some(partial) = outcome.partial_success() {
         tracing::warn!(
             rejected_points = partial.rejected_data_points,
@@ -621,7 +640,7 @@ async fn collect_metrics(
             "collected metrics were partially refused"
         );
     }
-    Ok(pending)
+    Ok((pending, outcome.rejected_data_points))
 }
 
 #[cfg(test)]

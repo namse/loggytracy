@@ -24,6 +24,10 @@ pub struct Request<'a> {
     /// The tenant header to send, as `(name, value)`. `None` on a signy write:
     /// the tenant is inside the body there.
     pub tenant: Option<(&'a str, &'a str)>,
+    /// Anything else the endpoint needs, as `(name, value)`. signy's collect
+    /// route wants the batch's compression and which signal it carries; no
+    /// other request sends any.
+    pub headers: &'a [(&'a str, &'a str)],
 }
 
 pub struct Response {
@@ -94,6 +98,9 @@ impl Conn {
             .as_bytes(),
         );
         if let Some((name, value)) = request.tenant {
+            wire.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        for (name, value) in request.headers {
             wire.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
         if !request.content_type.is_empty() {

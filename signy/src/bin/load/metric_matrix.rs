@@ -837,6 +837,7 @@ async fn issue(
             body: &[],
             content_type: "",
             tenant: Some(tenant),
+            headers: &[],
         })
         .await;
     let elapsed = sent.elapsed().as_secs_f64() * 1000.0;

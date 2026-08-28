@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use crate::config::{Config, Target, Verify};
+use crate::config::{Config, Signal, Target, Verify};
 use crate::http::{Client, Request};
 use crate::stats::Series;
 use signy::corpus::{APPS, Corpus, CorpusSpec, LEVELS, PHRASES, STATUSES};
@@ -180,7 +180,12 @@ struct SeedBody {
 /// one and, more importantly, keeps the push sequence a pure function of the
 /// corpus: the same bytes leave this process in the same order for both
 /// systems.
-fn seed_bodies(corpus: &Corpus, entries_per_push: usize, tenant: Option<&str>) -> Vec<SeedBody> {
+fn seed_bodies(
+    corpus: &Corpus,
+    entries_per_push: usize,
+    tenant: Option<&str>,
+    target: Target,
+) -> Vec<SeedBody> {
     let mut bodies = Vec::new();
     for stream in &corpus.streams {
         for chunk in stream.entries.chunks(entries_per_push) {
@@ -188,7 +193,7 @@ fn seed_bodies(corpus: &Corpus, entries_per_push: usize, tenant: Option<&str>) -
             let batch: Vec<(signy::memtable::Labels, Vec<LogEntry>)> =
                 vec![((*stream.labels).clone(), chunk.to_vec())];
             bodies.push(SeedBody {
-                bytes: crate::otlp::encode_export_logs(&batch, tenant),
+                bytes: target.wrap_push(crate::otlp::encode_export_logs(&batch, tenant)),
                 rows: chunk.len(),
                 line_bytes,
             });
@@ -199,6 +204,7 @@ fn seed_bodies(corpus: &Corpus, entries_per_push: usize, tenant: Option<&str>) -
 
 pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
     let push_path = cfg.target.push_path();
+    let push_headers = cfg.target.push_headers(Signal::Logs);
     let tenant = corpus.tenant_ids[0].as_str();
     let header = cfg.target.push_tenant_header(tenant);
     // signy reads the tenant out of the export, the others out of the header,
@@ -208,6 +214,7 @@ pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
         corpus,
         cfg.verify.entries_per_push,
         in_body,
+        cfg.target,
     )));
     let start = Instant::now();
 
@@ -244,6 +251,7 @@ pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
                                 path: push_path,
                                 body: &body.bytes,
                                 content_type: PUSH_CONTENT_TYPE,
+                                headers: push_headers,
                                 tenant: header
                                     .as_ref()
                                     .map(|(name, value)| (*name, value.as_str())),
@@ -1479,6 +1487,7 @@ async fn issue(
             body: &[],
             content_type: "",
             tenant: Some(tenant),
+            headers: &[],
         })
         .await;
     let elapsed = sent.elapsed().as_secs_f64() * 1000.0;

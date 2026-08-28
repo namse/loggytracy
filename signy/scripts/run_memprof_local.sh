@@ -67,7 +67,6 @@ trap cleanup EXIT
 
 # shellcheck disable=SC2086
 env SIGNY_LISTEN_ADDR="127.0.0.1:$PORT" \
-    SIGNY_OTLP_GRPC_ADDR="127.0.0.1:$((PORT + 1000))" \
     SIGNY_DATA_DIR="$DATA" \
     ${M10_SERVER_ENV:-} \
     systemd-run --user --scope --quiet --unit="$UNIT" \

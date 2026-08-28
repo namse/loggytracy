@@ -12,6 +12,9 @@ use signy::memtable::LogEntry;
 
 /// One push, ready for the wire.
 pub struct PushBody {
+    /// What goes on the wire. For signy that is the export inside a one-record
+    /// collecty batch, compressed; for the others it is the export itself.
+    /// `encoded_bytes` is the export either way, so the two stay comparable.
     pub bytes: Vec<u8>,
     /// The tenant header to send, when the target reads one. `None` for signy:
     /// the tenant is a resource attribute inside `bytes`.
@@ -134,13 +137,15 @@ impl PushGenerator {
         // the others out of the header, so exactly one of the two carries it.
         let tenant = corpus.tenant_ids[tenant_index].as_str();
         let header = self.target.push_tenant_header(tenant);
-        let bytes = crate::otlp::encode_export_logs(&batch, header.is_none().then_some(tenant));
+        let payload = crate::otlp::encode_export_logs(&batch, header.is_none().then_some(tenant));
+        let encoded_bytes = payload.len();
+        let bytes = self.target.wrap_push(payload);
         PushBody {
             tenant_header: header,
             entries: batch.iter().map(|(_, entries)| entries.len()).sum(),
             streams: batch.len(),
             line_bytes,
-            encoded_bytes: bytes.len(),
+            encoded_bytes,
             out_of_order_entries,
             max_lateness_ms,
             bytes,

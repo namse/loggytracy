@@ -34,7 +34,6 @@ trap cleanup EXIT
 export SIGNY_DATA_DIR="$DATA_DIR"
 export SIGNY_OBJECT_STORE_URL="file://$REMOTE_DIR"
 export SIGNY_LISTEN_ADDR="127.0.0.1:3100"
-export SIGNY_OTLP_GRPC_ADDR="127.0.0.1:4317"
 # Tier B fault injection (seeded, reproducible). Read latency is what a restore
 # pays, so it stays on: the point of the small cache below is that the readers
 # miss.
