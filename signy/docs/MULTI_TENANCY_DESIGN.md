@@ -424,7 +424,8 @@ only, not a durability one. 256 MiB is comfortable on an OCI A1 (12 GB+).
 
 ### Tenant ID validation
 
-The tenant ID arrives in the `X-Scope-OrgID` header and flows into R2 object
+The tenant ID arrives in the `tenant.id` resource attribute of an export, or in
+the `X-Tenant-Id` header of a read, and flows into R2 object
 keys and local filesystem paths. `is_safe_path_component`
 (`object_storage/recovery.rs:439`) only rejects traversal, not hostile names.
 
@@ -549,7 +550,10 @@ This is the gap `PRODUCTION_READINESS_REVIEW.md:276` records as
 
 | Layer | State |
 |---|---|
-| Tenant identity | **done** — `tenant.rs` `TenantId` allowlist, `X-Scope-OrgID` on Loki push and OTLP gRPC metadata, `SIGNY_DEFAULT_TENANT` / `SIGNY_MISSING_TENANT_POLICY` |
+| Tenant identity | **done** — `tenant.rs` `TenantId` allowlist. A **write** names its tenant in the `tenant.id` OTLP resource attribute (`otlp_tenant.rs`), on both transports and all three signals; a **read** names it in the `X-Tenant-Id` header, with `SIGNY_MISSING_TENANT` as the single-tenant opt-in for a headerless one. Was a header on both until 2026-08-28: a collector that never decodes a payload cannot route on one, so the tenant moved inside the payload (issue #9) |
+| One export, several tenants | **done** — resources are grouped by tenant and one journal record is written per group. The received bytes still ride through to the WAL untouched when there is one group and nothing was dropped, which is every export collecty forwards. The record/span/datapoint caps are counted over the whole request and before the split, so N groups cannot multiply them |
+| Tenant refusal on a write | **a drop, not a refusal** — the status an ingest answers says whether the body arrived and nothing about whose it was. No tenant, an unparseable one, one not served, one at its storage limit: dropped, and counted in `signy_ingest_dropped_resources_total{reason=...}`. A request may carry several tenants, so one tenant's mistake must not refuse another's data in the same request. Reads still answer 400/403 — one read is one tenant |
+| The tenant attribute in storage | **stripped** — removed during normalization rather than off the wire, so the WAL keeps the bytes that arrived and replay strips it the same way. Left in, the routing key would become a queryable label in every log entry's structured metadata and on every span's resource, a second and unenforced copy of the isolation the tenant column already provides |
 | Journal | **done** — `LGY3` framed record carries the tenant; replay restores each record under its own tenant, and a pre-tenancy record falls back to the default tenant |
 | MemTable | **done** — `HashMap<TenantId, HashMap<Labels, …>>`; every read method requires a tenant |
 | Log part format | **done** — `_tenant` leading column, `(tenant, timestamp_ns)` sort, tenant-aligned row groups, per-tenant index in `meta.json` |
@@ -588,7 +592,9 @@ Ordered by dependency.
 
 ### 1. Tenant identity
 
-- [x] Extract `X-Scope-OrgID` in the Loki push path and the OTLP gRPC metadata.
+- [x] ~~Extract `X-Scope-OrgID` in the Loki push path and the OTLP gRPC metadata.~~ —
+      superseded 2026-08-28: a write's tenant is the `tenant.id` resource
+      attribute on both transports, and reads use `X-Tenant-Id`. See issue #9.
 - [x] Strict allowlist validation before journal append.
 - [x] Config for the missing-header policy (accept as default tenant vs reject).
 - [x] Thread tenant through `Journal::append` / `append_trace` records.

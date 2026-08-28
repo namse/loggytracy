@@ -35,6 +35,24 @@ groups:
             failing -- but the sender is losing headroom.
           runbook: docs/RUNBOOK.md#what-to-alert-on
 
+      - alert: SignyIngestResourcesDropped
+        expr: increase(signy_ingest_dropped_resources_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Exports are naming a tenant this instance will not file them under"
+          description: >-
+            An export named no tenant this instance serves, so those resources
+            were dropped -- and the sender was told its body arrived, because an
+            ingest answers whether the body arrived and nothing about whose it
+            was. This counter is the only signal that loss produces. The reason
+            label says where to go: no_tenant is an exporter with no tenant.id
+            resource attribute, invalid_tenant is one set to something outside
+            [a-zA-Z0-9_-]{1,64}, and tenant_not_served is a well-formed tenant
+            the control plane never pushed a policy for -- push it.
+          runbook: docs/RUNBOOK.md#what-to-alert-on
+
       - alert: SignyCollectRecordsDropped
         expr: increase(signy_collect_dropped_records_total[5m]) > 0
         for: 5m
@@ -43,14 +61,14 @@ groups:
         annotations:
           summary: "The collect route is dropping records it will never accept"
           description: >-
-            A batch from the collector carried records this instance cannot
-            take -- an undecodable body, a tenant it does not serve, a tenant at
-            its storage limit -- and they were dropped here. Deliberate: the
-            collector keeps one queue per machine, so holding them would stop
-            every other application on that host. But it is still data loss, and
-            this counter, signy_collect_dropped_bytes_total and the warning log
-            beside them are the only places it shows. The log carries the reason;
-            an unserved tenant is usually a policy nobody pushed.
+            A batch from the collector carried whole records this instance
+            cannot take -- an undecodable body, one past a limit -- and they
+            were dropped here. Deliberate: the collector keeps one queue per
+            machine, so holding them would stop every other application on that
+            host. But it is still data loss, and this counter,
+            signy_collect_dropped_bytes_total and the warning log beside them
+            are the only places it shows. A tenant problem is not here; that is
+            SignyIngestResourcesDropped.
           runbook: docs/RUNBOOK.md#what-to-alert-on
 
       - alert: SignyWalBacklogGrowing

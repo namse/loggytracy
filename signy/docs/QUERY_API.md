@@ -9,15 +9,20 @@ can correct itself. A test (`every_query_api_route_and_param_is_documented`)
 fails if a route or parameter exists in the code and not on this page.
 
 The engine assumes a secured channel ([`DEPLOYMENT.md`](DEPLOYMENT.md) §5):
-there is no TLS and no authentication in this process, and the tenant is
-whatever the `X-Scope-OrgID` header says. The gateway in front — fn0's
+there is no TLS and no authentication in this process, and the tenant a read
+sees is whatever the `X-Tenant-Id` header says. The gateway in front — fn0's
 control plane in the intended deployment — authenticates the caller and
 **overwrites** that header.
+
+Reads name their tenant in a header because they carry no payload to put it
+in. Writes do not: an OTLP export names its tenant in the `tenant.id` resource
+attribute, and signy reads no header on an ingest route. See
+[`MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md).
 
 Every example below works as written:
 
 ```sh
-curl -sH 'X-Scope-OrgID: acme' \
+curl -sH 'X-Tenant-Id: acme' \
   'http://127.0.0.1:3100/signy/api/v1/logs?start=-1h&attr=level=error&contains=timeout&limit=50'
 ```
 
@@ -101,7 +106,7 @@ stream.
 
 ```sh
 # Today's errors mentioning a user, oldest first
-curl -sH 'X-Scope-OrgID: acme' --get \
+curl -sH 'X-Tenant-Id: acme' --get \
   --data-urlencode 'start=2026-08-25T00:00:00+09:00' \
   --data-urlencode 'attr=level=error' \
   --data-urlencode 'contains=user_4711' \
@@ -109,7 +114,7 @@ curl -sH 'X-Scope-OrgID: acme' --get \
   'http://127.0.0.1:3100/signy/api/v1/logs'
 
 # Structured search over JSON lines: parsed fields become filterable
-curl -sH 'X-Scope-OrgID: acme' \
+curl -sH 'X-Tenant-Id: acme' \
   'http://127.0.0.1:3100/signy/api/v1/logs?start=-15m&parse=json&attr=status=500'
 ```
 
@@ -173,7 +178,7 @@ reconnect. Concurrent tails are capped by
 429 rather than queued.
 
 ```sh
-curl -sNH 'X-Scope-OrgID: acme' \
+curl -sNH 'X-Tenant-Id: acme' \
   'http://127.0.0.1:3100/signy/api/v1/logs/tail?attr=service_name=api&contains=ERROR'
 ```
 
@@ -220,7 +225,7 @@ stringified, and a lexicographic `>=` would answer wrongly without saying so.
 
 ```sh
 # Slow error traces from the api service, last hour
-curl -sH 'X-Scope-OrgID: acme' --get \
+curl -sH 'X-Tenant-Id: acme' --get \
   --data-urlencode 'start=-1h' \
   --data-urlencode 'attr=service.name=api' \
   --data-urlencode 'attr=status=error' \
@@ -254,7 +259,7 @@ omitted, and a trace with none left answers 404 — the same answer as an id
 that never existed here, because this engine cannot tell the two apart.
 
 ```sh
-curl -sH 'X-Scope-OrgID: acme' \
+curl -sH 'X-Tenant-Id: acme' \
   'http://127.0.0.1:3100/signy/api/v1/traces/0af7651916cd43dd8448eb211c80319c'
 ```
 
@@ -332,7 +337,7 @@ fold aggregates.
 
 ```sh
 # Request rate per service, last hour, 30s grid
-curl -sH 'X-Scope-OrgID: acme' --get \
+curl -sH 'X-Tenant-Id: acme' --get \
   --data-urlencode 'metric=http_requests_total' \
   --data-urlencode 'start=-1h' \
   --data-urlencode 'step=30s' \
@@ -367,7 +372,7 @@ This is the shape fn0's alert rules evaluate: compare `value` against the
 threshold; `agg=max` gives the worst instance in one line.
 
 ```sh
-curl -sH 'X-Scope-OrgID: acme' --get \
+curl -sH 'X-Tenant-Id: acme' --get \
   --data-urlencode 'metric=http_errors_total' \
   --data-urlencode 'func=rate' --data-urlencode 'range=60s' \
   --data-urlencode 'agg=max' \
@@ -393,7 +398,7 @@ computed by the client and cannot be re-aggregated — query the
 `<metric>{quantile="0.99"}` series with `/metrics/query` instead.
 
 ```sh
-curl -sH 'X-Scope-OrgID: acme' --get \
+curl -sH 'X-Tenant-Id: acme' --get \
   --data-urlencode 'metric=http_request_duration_seconds' \
   --data-urlencode 'q=0.99' \
   --data-urlencode 'start=-1h' --data-urlencode 'step=30s' \
@@ -458,7 +463,7 @@ Refusals are `application/json`:
 | Status | Meaning | Retry? |
 |---|---|---|
 | 400 | The request is malformed or over-broad; the message names the input and the governing limit | No — fix the request |
-| 401/403 | Tenant refusals from `X-Scope-OrgID` handling ([`MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md)) | No |
+| 401/403 | Tenant refusals from `X-Tenant-Id` handling ([`MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md)). Reads only: an ingest never answers one, because it never reads a tenant off a header | No |
 | 404 | Unknown route (the body lists the real ones) or unknown delete request | No |
 | 413 | The trace holds more spans or bytes than one response may carry (`SIGNY_MAX_TRACE_SPANS`, `SIGNY_MAX_QUERY_MEMORY_BYTES`), or a metric selector matched more than `SIGNY_MAX_METRIC_SERIES_PER_QUERY` series / `SIGNY_MAX_METRIC_POINTS_PER_QUERY` points | No — narrow the request or raise the knob |
 | 429 | Tenant query quota, tail cap, delete cap, or this instance's query memory pool is momentarily full | Yes — these clear on their own |

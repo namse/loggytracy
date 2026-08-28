@@ -34,17 +34,27 @@ environment variables (`OBJECT_STORE_*` takes precedence). For S3-compatible sto
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIGNY_MISSING_TENANT` | unset (reject) | Tenant a request without `X-Scope-OrgID` is filed under. **Unset — the default — rejects such requests with 400**: behind a gateway a missing header is the gateway failing, which should fail loudly rather than quietly pool everyone's data. Set it (any valid tenant id) for single-tenant deployments where nothing mints the header |
+| `SIGNY_MISSING_TENANT` | unset (reject) | Tenant a **read** without an `X-Tenant-Id` header is filed under. **Unset — the default — rejects such reads with 400**: behind a gateway a missing header is the gateway failing, which should fail loudly rather than quietly pool everyone's data. Set it (any valid tenant id) for single-tenant deployments where nothing mints the header. Writes are unaffected — their tenant is the `tenant.id` resource attribute, and an export naming none is dropped, since a default there would pool every misconfigured exporter into one tenant |
 | `SIGNY_DEFAULT_TENANT_MAX_STORED_BYTES` | none (unbounded) | Bytes a tenant may keep stored, for tenants with no pushed `max_stored_bytes`. A plain byte count, or `off`. **Set this before opening a free tier**: a tenant nothing was pushed for is one nobody sold anything to, and unbounded means the first of them decides how much disk the rest get |
 | `SIGNY_MAX_CONCURRENT_QUERIES_PER_TENANT` | 4 | Queries one tenant may run at once, so one tenant cannot take every permit of the shared query semaphore |
 
 **The pushed policies are the tenant registry**: only tenants the control plane
-has pushed a policy for are served, everything else receives 403. The admin API
-that pushes them carries no authentication of its own — signy is not built
-to be reachable from the outside network, and assumes every request arrives
-through a secured channel.
+has pushed a policy for are served. A **read** naming any other gets 403. A
+**write** naming any other is dropped, silently, and counted in
+`signy_ingest_dropped_resources_total{reason="tenant_not_served"}` — the status
+an ingest answers says whether the body arrived and nothing about whose it was,
+because one export may name several tenants and one application's mistake must
+not refuse another's data. The admin API that pushes policies carries no
+authentication of its own — signy is not built to be reachable from the outside
+network, and assumes every request arrives through a secured channel.
 
-**Note:** with `MISSING_TENANT` naming a tenant, headerless requests are served
+**A write names its tenant in the payload**, at the `tenant.id` resource
+attribute of the OTLP export, the same key for logs, traces and metrics on both
+transports. It is not configurable: a key both ends must agree on is a key that
+can be disagreed about, and the failure is silent. signy strips it before
+storage, so it never becomes a queryable label.
+
+**Note:** with `MISSING_TENANT` naming a tenant, headerless **reads** are served
 only once a policy has been pushed for that tenant — it is onboarded like any
 other.
 

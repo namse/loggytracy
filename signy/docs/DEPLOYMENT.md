@@ -192,21 +192,33 @@ start signy`, since a container stopped on purpose stays that way.
 ## 5. The gateway contract
 
 **signy is not built to be a server reachable from the outside network.**
-It has no TLS and no authentication — the admin API included — and it reads
-`X-Scope-OrgID` and believes it. It is provided on the assumption that every
+It has no TLS and no authentication — the admin API included — and it believes
+whatever names a tenant: the `X-Tenant-Id` header on a read, the `tenant.id`
+resource attribute on a write. It is provided on the assumption that every
 request reaches it through a secured channel; everything that makes that
 assumption true lives in front of it.
 
 - **Terminate TLS and authenticate at the gateway.** Only the gateway may reach
   the listener; bind it to loopback, or to a private interface with a firewall.
-- **Overwrite the tenant header, never append it.** A customer that sends its
-  own `X-Scope-OrgID` must not have it survive. Appending produces two header
-  values and the engine reads the first one, which is the client's. In nginx:
-  `proxy_set_header X-Scope-OrgID $verified_tenant;` replaces whatever arrived.
+- **Overwrite the read's tenant header, never append it.** A customer that
+  sends its own `X-Tenant-Id` must not have it survive. Appending produces two
+  header values and the engine reads the first one, which is the client's. In
+  nginx: `proxy_set_header X-Tenant-Id $verified_tenant;` replaces whatever
+  arrived.
+- **A write's tenant is inside the payload, and a gateway cannot overwrite it
+  with a header.** `tenant.id` is written by the exporting application's SDK,
+  so on the ingest routes a client names its own tenant and nothing here
+  disputes it. A deployment that needs that boundary enforced needs a stage
+  that rewrites the attribute — an OpenTelemetry Collector `transform`
+  processor — between the application and this engine. Without one, the
+  registry below is the only check.
 - The pushed policies are the tenant registry: anything the control plane has
-  not onboarded gets 403 — a second line behind the gateway, for the day
-  something reaches the port that should not have, and it never needs a restart
-  to change.
+  not onboarded is refused on a read and **dropped** on a write — a second line
+  behind the gateway, for the day something reaches the port that should not
+  have, and it never needs a restart to change. A write is dropped rather than
+  refused because one export may carry several tenants; watch
+  `signy_ingest_dropped_resources_total` for it, because the sender is told its
+  body arrived.
 - **Pass `/signy/api/v1/logs/tail` through unbuffered.** It is a
   chunked streaming response ([`QUERY_API.md`](QUERY_API.md)); a proxy that
   buffers response bodies turns a live tail into silence, and an idle timeout
@@ -215,7 +227,7 @@ assumption true lives in front of it.
 Verify it, rather than assuming it, once the gateway is up:
 
 ```
-curl -H 'X-Scope-OrgID: someone-elses-tenant' https://your-gateway/signy/api/v1/logs?start=-1m
+curl -H 'X-Tenant-Id: someone-elses-tenant' https://your-gateway/signy/api/v1/logs?start=-1m
 ```
 
 The engine should see your own tenant, not that one.
@@ -229,11 +241,15 @@ Onboarding a tenant *is* the policy push below: the moment the `PUT` answers
 200, that tenant's requests are served, with no restart and nothing else to
 call. Offboarding is the same API backwards — push `retention: "0"` to expire
 the data, then `DELETE …/retention` to return the tenant to unknown, which
-refuses its requests from then on. Requests without an `X-Scope-OrgID` header
-are rejected by default — the gateway mints the header here, so a missing one
-is the gateway failing, and it fails loudly. A deployment that instead wants
-headerless requests filed under a tenant sets `SIGNY_MISSING_TENANT` to
-its name and pushes a policy for it too; it is onboarded like any other.
+refuses its requests from then on — and drops its exports.
+
+Reads without an `X-Tenant-Id` header are rejected by default — the gateway
+mints the header here, so a missing one is the gateway failing, and it fails
+loudly. A deployment that instead wants headerless reads filed under a tenant
+sets `SIGNY_MISSING_TENANT` to its name and pushes a policy for it too; it is
+onboarded like any other. Writes have no such fallback: an export that names no
+tenant is dropped, because a default there would pool every misconfigured
+exporter's traffic into one tenant instead of reporting it.
 
 **Set defaults before opening a free tier.** A push may carry only `retention`
 and leave the limits out, and every omitted limit is unbounded by default — the
@@ -319,6 +335,7 @@ out of bed:
 | Object store unreachable | `signy_remote_healthy == 0` for 5m | Nothing becomes durable |
 | Disk filling | `signy_data_dir_free_bytes < 4e9` | Twice the refusal floor, so it is a warning and not a report |
 | Instance down | absent target for 2m | Nothing stops a restart loop here, so this is the only thing that reports one |
+| Exports dropped for their tenant | `increase(signy_ingest_dropped_resources_total[5m]) > 0` | Silent data loss. The sender was told its body arrived, so this counter is the only place it shows. The `reason` label says whether an exporter was never configured, was configured wrongly, or names a tenant nobody onboarded |
 
 **One of these cannot be alerted from this machine.** If the VM dies, Grafana
 dies with it and no alert is sent. Add an external dead man's switch — a

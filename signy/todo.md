@@ -308,13 +308,18 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
       together — and the shapes agree everywhere a window is fully covered, so no live dashboard is
       affected either way.
 
-Found while building the metrics bed, and not a metrics defect: **the log bed's next rerun will 403 at
-the seed phase.** The env tenant allowlist was removed after the last published run — the pushed policy
-is now the registry and an instance with no pushed tenants serves nobody — and `compare/run.sh` never
-onboards `verify-tenant-000` through the admin API. `run_metrics.sh` onboards its tenant explicitly
-(measured: metric-seed against a fresh instance answered `403 tenant verify-metrics is not served`
-until it did); `run.sh` needs the same call before its next rerun, which M12's deferred smoke run will
-hit first.
+Found while building the metrics bed, and not a metrics defect: **the log bed's next rerun would have
+403'd at the seed phase.** The env tenant allowlist was removed after the last published run — the
+pushed policy is now the registry and an instance with no pushed tenants serves nobody — and nothing
+onboarded `verify-tenant-000` through the admin API. **Fixed in `6c58ab0`**: the harness onboards its
+own tenants in all three phases (`run_load`, `run_verify`, `run_metric_verify`) and fails the run if a
+push does not take, so every script that drives it inherits the call.
+
+Worth keeping in view now that a tenant refusal on a write is a **drop rather than a 403**: had this
+been found after that change instead of before it, the bed would not have failed at all. It would have
+seeded into a void — every push answered `200`, nothing stored, and every query returning empty
+against a corpus the report says was written. The onboarding failure is now the only thing standing
+between that and a published comparison, which is why it exits the run rather than warning.
 
 ## M8 — the ruler (precondition for everything after it)
 

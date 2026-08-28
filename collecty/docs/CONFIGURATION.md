@@ -27,6 +27,13 @@ request (`Content-Type: application/x-protobuf`). The JSON encoding and a
 `Content-Encoding` are both refused with `415` — see
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for why neither can be stored.
 
+**The export has to name its tenant**, in the `tenant.id` resource attribute
+signy reads it from. collecty does not check this and cannot: checking would
+mean decoding, and not decoding is the point. An export that names no tenant
+signy serves is accepted here, queued, shipped, and dropped on arrival —
+counted in signy's `signy_ingest_dropped_resources_total` and nowhere on this
+side. Configure the exporting SDK, not collecty.
+
 ## What bounds memory
 
 | Variable | Default | What it does |
@@ -66,6 +73,7 @@ time a larger batch helps.
 
 | Variable | Default | What it does |
 |---|---|---|
+| `COLLECTY_TENANT` | unset | Which tenant collecty's **own** `collecty_*` metrics are filed under. The only tenant collecty has an opinion about: everything it forwards carries its own inside the payload, which collecty never decodes. **Unset, the metrics are not exported at all** — signy drops an export naming no tenant and says nothing back, so producing them would queue and ship bytes to be thrown away. The stderr summary runs either way. Validated at startup against `[a-zA-Z0-9_-]{1,64}`, the grammar signy parses one with, so a typo fails the process instead of turning every self-export into a silent drop |
 | `COLLECTY_REPORT_INTERVAL` | `60s` | How often `collecty_*` metrics are produced and the stderr summary is written |
 | `COLLECTY_ZSTD_LEVEL` | `3` | 1 to 22. See the measurement below before raising it |
 | `COLLECTY_LOG_FORMAT` | `text` | `json` for a log a collector will read |
@@ -88,11 +96,15 @@ single series with no attributes.
 | `collecty_bytes_appended_total` | counter | Plain bytes accepted, before the segment compresses them. Against `collecty_bytes_sent_total` this is the ratio this host is achieving |
 | `collecty_segments_sent_total` | counter | Segments signy accepted |
 | `collecty_bytes_sent_total` | counter | Compressed bytes shipped |
-| `collecty_segments_refused_total` | counter | Segments **dropped** because signy would not take them. Any movement is data loss. Records signy itself drops are counted on its side, in `signy_collect_dropped_records_total` |
+| `collecty_segments_refused_total` | counter | Segments **dropped** because signy would not take them. Any movement is data loss. Records signy itself drops are counted on its side, in `signy_collect_dropped_records_total`, and resources it drops for their tenant in `signy_ingest_dropped_resources_total` — neither of which moves anything here, because signy answers `200` for the segment either way |
 | `collecty_bytes_refused_total` | counter | Compressed bytes dropped the same way |
 | `collecty_send_retries_total` | counter | Deliveries signy declined and that were retried |
 | `collecty_queue_dropped_bytes_total` | counter | Bytes **dropped** because the queue was full. Any movement is data loss |
 | `collecty_queue_dropped_segments_total` | counter | Segments unlinked while full |
+
+These metrics are themselves an OTLP export, so they carry a tenant like any
+other — `COLLECTY_TENANT`, above. Without it they are not produced at all,
+because signy would drop them without saying so.
 
 Records are counted where they arrive and not where they leave: what a segment
 holds is inside its compression, and counting it on the way out would mean
@@ -106,6 +118,7 @@ The process exits with status 2 and one line on stderr when:
 - `COLLECTY_QUEUE_MAX_BYTES` is below `COLLECTY_QUEUE_SEGMENT_BYTES`
 - `COLLECTY_QUEUE_MAX_BYTES` cannot hold a single `COLLECTY_MAX_REQUEST_BYTES` export
 - `COLLECTY_ZSTD_LEVEL` is outside 1 to 22
+- `COLLECTY_TENANT` is set to something signy would not parse as a tenant id
 - a size or duration cannot be parsed
 
 Each of these would otherwise start a process that refuses or destroys every

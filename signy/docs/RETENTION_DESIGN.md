@@ -37,9 +37,11 @@ Rejected because retention is then **fixed at write time**. Upgrading from a
 3-day plan to a 30-day plan leaves the last three days of data dying on the old
 schedule. Making it retroactive requires either an event-driven backfill or a
 rewrite at merge, which is exactly the cost this design was supposed to avoid.
-It also requires a header (so a Loki-compatible deployment needs a fallback
-ladder), a new `LGY4` journal framing to carry retention through crash replay
-(the header is gone at replay time, same reason the tenant is framed today),
+It also requires the writer to name the retention alongside the tenant, and a
+new `LGY4` journal framing to carry it through crash replay — the record's
+tenant is framed for the same reason: replay reads the stored bytes back, and
+what decided the routing has to survive in the frame rather than in whatever
+carried it in,
 and a rewrite of the `part/metadata.rs:205` invariant that ties a partition
 name to its data's day.
 
@@ -194,8 +196,8 @@ GET    /signy/api/v1/admin/tenants
 **The pushed policies are also the tenant registry.** Only tenants that have
 a pushed policy are served at all: the `PUT` above is how a tenant is
 onboarded (its requests are accepted the moment the 200 arrives), and the
-`DELETE` offboards it (its requests get 403 from then on, while its data is
-kept).
+`DELETE` offboards it (its reads get 403 from then on and its exports are
+dropped and counted, while its data is kept).
 
 The admin routes carry no authentication of their own. signy is not
 built to be reachable from the outside network; it assumes every request —

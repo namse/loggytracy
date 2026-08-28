@@ -10,8 +10,12 @@
 # into the result JSON, so the published comparison shows the deviations as
 # Loki itself reports them rather than as this file claims them.
 
-# Compatibility: the harness sends `X-Scope-OrgID` on every request, which is
-# also how signy routes tenants. This is Loki's default.
+# Compatibility: the harness sends `X-Scope-OrgID` on every request to Loki.
+# This is Loki's default. signy no longer reads a header on a write at all --
+# its tenant is the `tenant.id` resource attribute inside the export -- so the
+# harness stamps one or sends the other depending on the target, and the two
+# beds are no longer byte-identical on the wire. What is *stored* still is:
+# signy strips the attribute before storage.
 auth_enabled: true
 
 server:

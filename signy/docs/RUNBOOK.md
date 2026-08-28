@@ -28,7 +28,7 @@ defaults that satisfy the four points below; this is the short form of why they 
    fenced and killed. This is intentional, but such a configuration must not be created — which is why the
    upgrade stops the old container before starting the new one, rather than the other way around.
 4. **Keep the listening address inside the trust boundary.** TLS and authentication are outside this process,
-   and `X-Scope-OrgID` is trusted without proof. Publishing a port with `-p` writes an iptables rule that
+   and a client names its own tenant. Publishing a port with `-p` writes an iptables rule that
    the host firewall does not get to see first, so the `127.0.0.1:` prefix is what holds this line.
 
 ## Sizing
@@ -60,7 +60,8 @@ without the other.
 | Signal | Condition | Meaning |
 |---|---|---|
 | `signy_ingest_throttled_total` | Increasing | Returning 429; flush cannot keep up with ingest |
-| `signy_collect_dropped_records_total` | Increasing | **Data loss.** A collected batch carried records this instance will never accept — a body it cannot decode, a tenant it does not serve, a tenant at its storage limit — and the collect route dropped them. Deliberate: the collector has one queue per machine, so holding them would stop every other application on that host. **Check the warning beside this counter for the reason: an unserved tenant is usually a policy that was never pushed, and the fix is to push it.** `signy_collect_dropped_bytes_total` is how much |
+| `signy_ingest_dropped_resources_total` | Increasing | **Data loss, and the only signal it produces.** An export named a tenant this instance will not file it under, so those resources were dropped and the sender was told its body arrived. The `reason` label says where to go. `no_tenant`: an exporter with no `tenant.id` resource attribute — nothing was ever configured. `invalid_tenant`: it is set to something outside `[a-zA-Z0-9_-]{1,64}`, or is not a string. `tenant_not_served`: a well-formed tenant the control plane never pushed a policy for — **push it**. Dropped rather than refused because one export may carry several tenants, and one application's mistake must not refuse another's data |
+| `signy_collect_dropped_records_total` | Increasing | **Data loss.** A collected batch carried whole records this instance will never accept — a body it cannot decode, one past a limit — and the collect route dropped them. Deliberate: the collector has one queue per machine, so holding them would stop every other application on that host. A tenant problem is *not* here; it is the counter above. `signy_collect_dropped_bytes_total` is how much |
 | `signy_wal_backlog_bytes` | Upward trend | Same cause, earlier signal |
 | `signy_data_dir_free_bytes` | Below `SIGNY_MIN_FREE_DISK_BYTES` × 2 | **Alert here, not at the floor.** At the floor ingest is already being refused; this is the warning before it. Divide by `signy_data_dir_total_bytes` for a percentage |
 | `signy_flush_errors_total` | Increasing while `flush_success_total` is flat | **Flush stopped.** Most dangerous state |

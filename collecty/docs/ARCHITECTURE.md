@@ -23,8 +23,8 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Transport to signy | `POST /signy/api/v1/collect` with `Content-Encoding: zstd`, one route for all three signals, each request naming its own |
 | Sender identity | Random 16 bytes made with the queue directory, in a file of their own. Not configurable, and not the hostname — it names the queue, not the machine |
 | What a request carries | **One closed segment, from its first record.** Never part of one, and never the segment still being written |
-| Tenancy | **None.** The tenant travels inside the payload as a resource attribute (obsy issue #9), so a collector that does not decode has nothing to do |
-| Self-observation | `collecty_*` metrics encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr |
+| Tenancy | **None for what it forwards.** The tenant travels inside the payload as the `tenant.id` resource attribute (obsy issue #9), so a collector that does not decode has nothing to do. Its own metrics are the exception — see below |
+| Self-observation | `collecty_*` metrics encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr. This is the one export collecty builds itself, so it is the one place it names a tenant: `COLLECTY_TENANT`, and unset means the export is not built |
 | Format versioning | **None.** Nothing on disk is versioned. A queue written by another build is deleted, not migrated |
 | Transport security | **None, by design.** No TLS and no authentication on either hop, so **the bind address is the access control**: the default is loopback, and anything wider is expected to stay inside a trust boundary |
 
@@ -345,28 +345,35 @@ stored again — `signy_collect_skipped_records_total` is where that shows.
 | 400, 413, 415, 422 | this *segment* is not acceptable | drop it and move on |
 | everything else, including 401/403/429/5xx and any connection failure | signy cannot take it *right now* | retry with backoff |
 
-The default is **retry, not drop**. A `403` from a misconfigured tenant policy
-must not destroy data, so only the four statuses that say "this body is wrong"
-are treated as permanent. Backoff is 100 ms doubling to 30 s with jitter.
+The default is **retry, not drop**: only the four statuses that say "this body
+is wrong" are treated as permanent, and everything else is assumed temporary so
+that a passing fault cannot destroy data. Backoff is 100 ms doubling to 30 s
+with jitter. A misconfigured tenant policy no longer appears here at all — see
+below.
 
 `n` is normally the segment that was just sent. It can be *higher* — signy
 answered an earlier attempt collecty never heard — and then everything up to it
 is unlinked at once.
 
 A single bad *record* does not reach this table. A record signy will never
-accept — an undecodable body, a tenant at its storage limit — is dropped there,
-logged, counted in `signy_collect_dropped_records_total`, and the segment still
-finishes with a `200`. Sending it back would only have collecty guess which
-record it meant, and drop it anyway.
+accept — an undecodable body, one past a limit — is dropped there, logged,
+counted in `signy_collect_dropped_records_total`, and the segment still finishes
+with a `200`. Sending it back would only have collecty guess which record it
+meant, and drop it anyway.
 
-**signy drops on every client error, including `403`.** That is wider than this
-table, and the queue being shared is the reason. One application exporting under
-a tenant signy does not serve would otherwise stop every other application's
-logs, spans and metrics behind it on that machine — a mistake in one process
-becomes an outage for the host. The same goes for a tenant at its storage limit,
-whose `429` clears only when retention retires parts. Both are real data loss and
-both are visible: a warning per drop and
-`signy_collect_dropped_records_total`, which the runbook alerts on.
+**A tenant signy will not serve never becomes a status at all.** signy reads the
+tenant off each resource inside the record, so what it answers says whether the
+body arrived and nothing about whose it was: a resource naming no tenant, an
+unparseable one, one signy does not serve, or one at its storage limit is dropped
+and counted in `signy_ingest_dropped_resources_total`, and the rest of the record
+lands. The queue being shared is why that is the right shape. One application
+exporting under a tenant signy does not serve would otherwise stop every other
+application's logs, spans and metrics behind it on that machine — a mistake in
+one process becomes an outage for the host. It is still real data loss, and the
+counter with a warning beside it is where it shows.
+
+**signy drops on every client error it does answer.** That is wider than this
+table, and the shared queue is the same reason.
 
 What still reaches the table as a refusal is a segment that is wrong as a
 *whole*: a stream that does not decompress, or framing behind it that does not
@@ -429,6 +436,12 @@ else does.
   so a refusal it cannot act on becomes a halving search it should not have to
   run — and with one queue per signal, a batch that can never be accepted blocks
   every application on the machine that ships that signal.
+- signy must read each record's tenant out of the record itself, at the
+  `tenant.id` resource attribute, and must not require a tenant on the request.
+  collecty has one queue per signal and not one per tenant, so a batch carries
+  whatever the machine's applications exported; a request-level tenant would
+  make every batch a single tenant's, which is the one thing collecty cannot
+  arrange without decoding.
 - signy must remember, per sender **and signal**, the segment in
   `x-collecty-segment` and how far into it it has got, and answer with the last
   segment of that signal it holds whole. Without that a resend is stored twice,

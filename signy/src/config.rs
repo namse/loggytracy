@@ -36,9 +36,10 @@ impl LogFormat {
 pub struct Config {
     /// Loopback by default, and deliberately so.
     ///
-    /// There is no TLS and no authentication in this process, and
-    /// `X-Scope-OrgID` is trusted without proof — so the listener has to sit
-    /// inside a trust boundary something else draws. A default of `0.0.0.0`
+    /// There is no TLS and no authentication in this process, and a client
+    /// names its own tenant — in a resource attribute on a write, a header on
+    /// a read, neither of them proved — so the listener has to sit inside a
+    /// trust boundary something else draws. A default of `0.0.0.0`
     /// makes the unsafe configuration the one you get by not deciding, and the
     /// mistake is invisible: it works. Binding loopback fails the other way,
     /// where the symptom is a connection refused and the startup log says
@@ -46,11 +47,16 @@ pub struct Config {
     pub listen_addr: String,
     pub otlp_grpc_addr: String,
     pub data_dir: PathBuf,
-    /// Tenant a request without `X-Scope-OrgID` is attributed to, or `None` —
+    /// Tenant a **read** without a tenant header is attributed to, or `None` —
     /// the default — to reject such requests with 400. The opt-in exists for
     /// single-tenant deployments with no gateway minting the header; behind a
     /// gateway a missing header is the gateway failing, which should fail
     /// loudly rather than quietly pool everyone's data in one tenant.
+    ///
+    /// Writes have no such fallback. Their tenant is inside the export, and an
+    /// export naming none is dropped: a default there would silently pool the
+    /// traffic of every misconfigured exporter into one tenant, which is the
+    /// failure this knob exists to make loud.
     pub missing_tenant: Option<TenantId>,
     pub max_batch_bytes: usize,
     /// How long the journal writer waits for more records before writing the

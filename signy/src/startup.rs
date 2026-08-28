@@ -841,7 +841,7 @@ fn announce_bind(addr: &str, knob: &str) {
         tracing::warn!(
             %addr,
             "bound to a non-loopback address: this process has no TLS and no authentication, \
-        and X-Scope-OrgID is trusted without proof. Keep it inside a trust boundary"
+        and a client names its own tenant. Keep it inside a trust boundary"
         );
     }
 }
@@ -852,9 +852,9 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     /// The default has to be the safe one, because the unsafe configuration is
-    /// the one that works. There is no TLS or authentication here and
-    /// `X-Scope-OrgID` is trusted without proof, so a listener reachable from
-    /// off the machine is a decision, not a default.
+    /// the one that works. There is no TLS or authentication here and a client
+    /// names its own tenant, so a listener reachable from off the machine is a
+    /// decision, not a default.
     #[test]
     fn the_default_listeners_stay_inside_the_machine() {
         let config = Config::default();
