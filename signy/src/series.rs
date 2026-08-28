@@ -198,6 +198,23 @@ struct SeriesBuffer {
     /// vector in.
     spill: Vec<(i64, f64)>,
     last_ts: Option<i64>,
+    /// The newest timestamp this series was **admitted** for, set when the
+    /// slot is reserved and before any sample has reached the buffer.
+    ///
+    /// Admission and insert are not the same moment: `admit_datapoints`
+    /// reserves the slot under the cap, and the samples arrive later, when the
+    /// journal writer applies the record. A collected batch admits up to
+    /// `MAX_INFLIGHT_RECORDS` records before the first one settles, so that
+    /// gap is wide. Without this the eviction pass reads a reservation — no
+    /// samples, no `last_ts` — as a series nothing ever arrived for, evicts it,
+    /// and hands the slot it was holding to the next new series in the same
+    /// batch. The cap then does not hold: a batch admits more series than it
+    /// allows and reports fewer refusals than it made.
+    ///
+    /// It never keeps a genuinely idle series alive, because a reservation is
+    /// made for samples at this timestamp or later, so it is never newer than
+    /// `last_ts` once the samples land.
+    admitted_ts: Option<i64>,
     /// The timestamps the *buffered* samples span, maintained on insert and
     /// moved out with them at `begin_flush`. Discovery reads them to answer a
     /// window without decoding a chunk, which is the whole reason those routes
@@ -215,6 +232,7 @@ impl SeriesBuffer {
             open: gorilla::Encoder::new(),
             spill: Vec::new(),
             last_ts: None,
+            admitted_ts: None,
             buffered: None,
             running_total: None,
         }
@@ -386,10 +404,13 @@ impl SeriesMemTable {
                     continue;
                 }
             }
+            let newest = group.iter().map(|sample| sample.ts_ns).max();
             let mut reserved = 0u64;
             for labels in new_labels {
                 reserved += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
-                tenant_series.insert((*labels).clone(), SeriesBuffer::new());
+                let mut buffer = SeriesBuffer::new();
+                buffer.admitted_ts = newest;
+                tenant_series.insert((*labels).clone(), buffer);
                 self.counters
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -429,8 +450,11 @@ impl SeriesMemTable {
         let mut freed = 0u64;
         let mut evicted = 0u64;
         tenant_series.retain(|labels, buffer| {
-            let idle =
-                !buffer.has_samples() && buffer.last_ts.is_none_or(|last| last < idle_cutoff_ns);
+            let idle = !buffer.has_samples()
+                && buffer.last_ts.is_none_or(|last| last < idle_cutoff_ns)
+                && buffer
+                    .admitted_ts
+                    .is_none_or(|admitted| admitted < idle_cutoff_ns);
             if idle {
                 freed += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
                 evicted += 1;

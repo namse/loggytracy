@@ -362,6 +362,142 @@
 
     const LOGS: CollectSignal = CollectSignal::Logs;
     const TRACES: CollectSignal = CollectSignal::Traces;
+    const METRICS: CollectSignal = CollectSignal::Metrics;
+
+    /// One gauge datapoint per `instance`, all at the same timestamp, so a run
+    /// of them is a run of distinct series.
+    fn metric_request(instances: &[&str]) -> ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+            number_data_point,
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(crate::otlp_tenant::test_tenant_resource()),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "queue_depth".to_string(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: instances
+                                .iter()
+                                .map(|instance| NumberDataPoint {
+                                    attributes: vec![KeyValue {
+                                        key: "instance".to_string(),
+                                        value: Some(AnyValue {
+                                            value: Some(any_value::Value::StringValue(
+                                                (*instance).to_string(),
+                                            )),
+                                        }),
+                                        ..Default::default()
+                                    }],
+                                    time_unix_nano: now,
+                                    value: Some(number_data_point::Value::AsDouble(1.0)),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn series(state: &Arc<AppState>) -> usize {
+        state
+            .journal
+            .series_memtable()
+            .sorted_samples(&test_tenant())
+            .map(|samples| samples.len())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_collected_batch_of_metrics_reaches_the_series_memtable() {
+        let (_memtable, state) = fixture();
+        let records = vec![
+            metric_request(&["a"]).encode_to_vec(),
+            metric_request(&["b"]).encode_to_vec(),
+        ];
+
+        let (status, body) = post_collected(&state, METRICS, "zstd", zstd_frames(&records)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, r#"{"stored":0,"rejected":0}"#);
+        assert_eq!(series(&state), 2);
+    }
+
+    /// The count the OTLP `partial_success` used to carry.
+    ///
+    /// It was the push routes' answer, and they are gone; a collecty reads only
+    /// the status, so without this the refusal would exist nowhere but the
+    /// server's own log. Summed over the batch, because a batch is many records
+    /// and the answer is one.
+    #[tokio::test]
+    async fn a_partially_refused_metrics_batch_says_how_much_it_refused() {
+        let (_memtable, state) = fixture_with(|config| {
+            config.max_active_series = 1;
+        });
+        let records = vec![
+            metric_request(&["a"]).encode_to_vec(),
+            metric_request(&["a", "b", "c"]).encode_to_vec(),
+        ];
+
+        let (status, body) = post_collected(&state, METRICS, "zstd", zstd_frames(&records)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the known series still landed, so the batch was not refused"
+        );
+        assert_eq!(body, r#"{"stored":0,"rejected":2}"#);
+        assert_eq!(series(&state), 1);
+    }
+
+    /// The cap is the tenant's, not the request's.
+    ///
+    /// A batch admits up to `MAX_INFLIGHT_RECORDS` records before the first one
+    /// settles, so a series can hold a reserved slot with no samples in it for
+    /// the length of a batch. The eviction pass that runs under admission
+    /// pressure read that as a series nothing ever arrived for and handed its
+    /// slot to the next new series in the same batch: measured at
+    /// `max_active_series = 1`, two records that split as one batch stored two
+    /// series and reported one refusal, while the identical two records sent as
+    /// two batches stored one and reported two. Same records, same cap, two
+    /// answers — so the number the knob names was a property of how a collecty
+    /// happened to pack its segment.
+    #[tokio::test]
+    async fn the_series_cap_holds_across_a_batch_the_way_it_holds_across_two() {
+        let records = vec![
+            metric_request(&["a"]).encode_to_vec(),
+            metric_request(&["a", "b", "c"]).encode_to_vec(),
+        ];
+
+        let (_memtable, one) = fixture_with(|config| config.max_active_series = 1);
+        let (_status, together) =
+            post_collected(&one, METRICS, "zstd", zstd_frames(&records)).await;
+
+        let (_memtable, apart) = fixture_with(|config| config.max_active_series = 1);
+        let mut separately = Vec::new();
+        for record in &records {
+            let (_status, body) =
+                post_collected(&apart, METRICS, "zstd", zstd_frames(std::slice::from_ref(record)))
+                    .await;
+            separately.push(body);
+        }
+
+        assert_eq!(together, r#"{"stored":0,"rejected":2}"#);
+        assert_eq!(separately[1], r#"{"stored":0,"rejected":2}"#);
+        assert_eq!(series(&one), 1);
+        assert_eq!(series(&apart), series(&one));
+    }
 
     /// The batch collecty ships: each payload behind its own length, each
     /// record its own zstd frame, all of it concatenated. A real collecty
