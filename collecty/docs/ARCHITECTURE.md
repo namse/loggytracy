@@ -75,6 +75,28 @@ by signy's `a_batch_per_signal_lands_in_the_store_its_request_names`.
 
 ## Receiving
 
+### The supported wire, and it is the only one
+
+**OTLP over HTTP/1.1, protobuf, uncompressed.** `POST /v1/logs`,
+`POST /v1/traces`, `POST /v1/metrics`, `Content-Type: application/x-protobuf`,
+no `Content-Encoding`.
+
+This is the whole stack's ingest wire, not just collecty's. signy's own OTLP
+push routes and its OTLP gRPC listener were removed (obsy, 2026-08-28): its one
+write route takes a collecty batch and nothing else, so an application that
+cannot reach collecty cannot reach signy either. Two consequences, both
+exporter configuration:
+
+- **OTLP JSON is not accepted anywhere.** collecty refuses it below, and there
+  is no longer a second endpoint that decoded it.
+- **OTLP gRPC is not accepted anywhere.** An SDK or Collector exporting over
+  gRPC has to be pointed at this port over HTTP instead. Adding a gRPC receiver
+  here is possible and is deliberately not done: it would be a second framing
+  to keep byte-identical with the first, and the passthrough property below is
+  the design.
+
+### How it works
+
 An HTTP/1.1 server on a TCP port, serving the three OTLP/HTTP export paths.
 The request body **is** the serialized export request, so there is nothing to
 decode and nothing to unwrap: the bytes hyper hands over are the bytes that go

@@ -100,15 +100,15 @@ docker run -d --name signy \
   --env-file /etc/signy/signy.env \
   -v /var/lib/signy:/var/lib/signy \
   -p 127.0.0.1:3100:3100 \
-  -p 127.0.0.1:4317:4317 \
   ghcr.io/namse/signy:<sha>
 ```
 
 The image already sets `SIGNY_DATA_DIR=/var/lib/signy` and
-`SIGNY_LOG_FORMAT=json`, binds both listeners to `0.0.0.0`, and runs as uid
-10001. What is left on the command line is the part the image cannot know: this
-machine's disk, this deployment's credentials, and who is allowed to reach the
-ports.
+`SIGNY_LOG_FORMAT=json`, binds the listener to `0.0.0.0`, and runs as uid
+10001. There is one port: writes, reads, the admin API and `/metrics` all
+arrive on `3100`. What is left on the command line is the part the image cannot
+know: this machine's disk, this deployment's credentials, and who is allowed to
+reach the port.
 
 Four flags carry the weight here.
 
@@ -207,11 +207,17 @@ assumption true lives in front of it.
   arrived.
 - **A write's tenant is inside the payload, and a gateway cannot overwrite it
   with a header.** `tenant.id` is written by the exporting application's SDK,
-  so on the ingest routes a client names its own tenant and nothing here
+  so on the collect route a client names its own tenant and nothing here
   disputes it. A deployment that needs that boundary enforced needs a stage
   that rewrites the attribute — an OpenTelemetry Collector `transform`
-  processor — between the application and this engine. Without one, the
+  processor — between the application and collecty. collecty cannot do it: it
+  never decodes a payload, which is the point of it. Without such a stage, the
   registry below is the only check.
+- **Only a collecty writes.** `POST /signy/api/v1/collect` is the whole write
+  surface; the OTLP push routes and the gRPC listener are gone, so an
+  application cannot reach this engine directly even by accident. Applications
+  export OTLP/HTTP to collecty, and collecty's disk queue is what holds their
+  telemetry when this engine refuses.
 - The pushed policies are the tenant registry: anything the control plane has
   not onboarded is refused on a read and **dropped** on a write — a second line
   behind the gateway, for the day something reaches the port that should not
@@ -268,7 +274,6 @@ AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
 
 SIGNY_LISTEN_ADDR=127.0.0.1:3100
-SIGNY_OTLP_GRPC_ADDR=127.0.0.1:4317
 
 # Free tier: what an onboarded tenant gets for fields its plan never named.
 SIGNY_DEFAULT_TENANT_MAX_STORED_BYTES=1073741824
@@ -381,8 +386,9 @@ docker rm signy
 docker run -d --name signy ... ghcr.io/namse/signy:<sha>
 ```
 
-There is one instance, so a restart is a gap in ingest — clients hold their own
-WAL across it and resend. What matters is that the old process was allowed to
+There is one instance, so a restart is a gap in ingest — collecty holds its
+disk queue across it and resends from the last segment this engine reported
+storing whole. What matters is that the old process was allowed to
 finish its force-flush, which is what `--stop-timeout=-1` is for, and the two
 lines in the middle are how you know it did. **Read them before `docker rm`.**
 Removing the container deletes its logs and its exit code together, and they are

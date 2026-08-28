@@ -5,7 +5,7 @@ ship on their own.
 
 | Component | Directory | What it is |
 |---|---|---|
-| **signy** | [`signy/`](signy/) | The storage and query engine. Ingests logs, traces and metrics over OTLP and answers a first-party HTTP API. Single machine, single writer, S3-compatible object storage as the source of truth, local disk as an evictable cache, and one declared memory budget divided into arenas. |
+| **signy** | [`signy/`](signy/) | The storage and query engine. Takes collecty's batches on one route and answers a first-party HTTP API. Single machine, single writer, S3-compatible object storage as the source of truth, local disk as an evictable cache, and one declared memory budget divided into arenas. |
 | **collecty** | [`collecty/`](collecty/) | The collector. Takes OTLP/HTTP, writes it zstd-compressed to an append-only disk queue, and ships it to signy in batches. It never decodes a payload: a segment is one zstd stream over the exports as they arrived, and the file is the request body byte for byte. |
 
 `obsy` is the product and the name of this repository. It is deliberately not a
@@ -15,6 +15,29 @@ visible: signy's knobs are `SIGNY_*`, its metric families are `signy_*`, its
 routes are `/signy/...`, its headers are `X-Signy-*` and its image is
 `ghcr.io/namse/signy`. Image tags do not derive from the repository name, so
 signy's image and collecty's stay distinct.
+
+## How telemetry gets in
+
+```
+app ──OTLP/HTTP──▶ collecty ──▶ signy
+```
+
+**That is the only way in, and it is one way on purpose.** signy has a single
+write route, `POST /signy/api/v1/collect`; its OTLP push endpoints and its OTLP
+gRPC listener were removed. An engine an application can push to directly has no
+queue in front of it, so a refusal it gives — draining for a restart, flush
+behind, disk low — is telemetry lost unless that application happens to hold it.
+collecty's append-only disk queue is the thing that holds it, and a queue only
+helps when nothing can go around it.
+
+So the supported wire, for the whole stack, is **OTLP over HTTP/1.1, protobuf,
+uncompressed**, on `POST /v1/logs`, `/v1/traces` and `/v1/metrics` at collecty.
+Two things follow, and they are exporter configuration rather than
+limitations to work around:
+
+- **No OTLP JSON.** collecty refuses it with `415` — it never decodes a
+  payload, so it cannot re-encode one — and nothing downstream accepts it either.
+- **No OTLP gRPC.** Point the exporter at collecty over HTTP.
 
 ## Layout
 

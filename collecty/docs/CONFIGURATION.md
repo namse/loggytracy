@@ -27,6 +27,12 @@ request (`Content-Type: application/x-protobuf`). The JSON encoding and a
 `Content-Encoding` are both refused with `415` — see
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for why neither can be stored.
 
+**This is the stack's only ingest wire, not merely collecty's.** signy takes a
+collecty batch and nothing else — its OTLP push routes and its OTLP gRPC
+listener were removed — so OTLP/HTTP 1.1, protobuf, uncompressed is what an
+exporter must be configured for. There is nowhere to send OTLP JSON, and
+nowhere to send OTLP over gRPC.
+
 **The export has to name its tenant**, in the `tenant.id` resource attribute
 signy reads it from. collecty does not check this and cannot: checking would
 mean decoding, and not decoding is the point. An export that names no tenant

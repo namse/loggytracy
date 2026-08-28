@@ -88,6 +88,32 @@ It tests **what our code does under load**. The backend does not matter.
 None of these items **depends on which object-store backend is used.** Therefore, a load run with
 `file://` + latency injection (Tier B) is sufficient, and MinIO is optional.
 
+### What the harness sends, since 2026-08-28
+
+The bed used to POST `/v1/logs` and `/v1/metrics` and export traces over gRPC.
+Those paths were removed — `POST /signy/api/v1/collect` is the whole write
+surface now — so the harness sends what the one intended producer sends: the
+same OTLP export, framed as a one-record collecty batch (the payload behind its
+length, zstd over it) under `Content-Encoding: zstd` and `x-collecty-signal`.
+It sends no sender or segment header: those number a collecty's queue and a
+harness has none, which signy reads as "nothing to resume".
+
+**Two numbers moved and one did not**, which matters for reading a result
+against an older one:
+
+- **`encoded_bytes` did not move.** It is the OTLP export, identical across
+  every target, so the cross-system throughput and ratio axes are unchanged.
+- **`wire_bytes` moved for signy and only for signy.** It is now the compressed
+  frame rather than the export, so it is no longer comparable with Loki's or
+  VictoriaLogs' on that axis — it is a smaller number measuring a different
+  thing.
+- **Push latency includes work neither the harness nor the engine did before**:
+  the harness compresses each body, the engine decompresses it as it streams.
+  A push p95 from before this date and one from after are not the same
+  measurement. Nothing has been re-measured yet, so
+  [`LOAD_RESULTS.md`](LOAD_RESULTS.md) and [`COMPARISON.md`](COMPARISON.md)
+  still describe the older wire.
+
 ---
 
 ## What is not validated (remaining risks)

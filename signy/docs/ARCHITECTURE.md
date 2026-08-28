@@ -49,9 +49,9 @@ elsewhere in these docs.
 | Indexes | Stream index + per-block trigram bloom filter (no inverted index) |
 | Query language | None — a query is a flat AND of URL filters; refusals teach the accepted set |
 | API | First-party flat-filter query API for logs, traces and metrics ([`QUERY_API.md`](QUERY_API.md)); the Loki and Tempo compatibility surfaces were removed with the read-path decision (issue #3, M12), and the first-party trace endpoints (M13, issue #7) are their replacement. The metric surface arrived with M14 as seven routes under `/signy/api/v1/metrics/` |
-| Ingest protocols | **OTLP only**, over gRPC (`:4317`) or HTTP (`POST /v1/logs`, `/v1/traces`, `/v1/metrics`) — all three signals on both transports. Loki push is removed — see [`VISION.md`](VISION.md), "Ingest is OTLP" |
+| Ingest protocols | **collecty only** — one route, `POST /signy/api/v1/collect`, taking a collecty's zstd batch of OTLP exports for any of the three signals. The OTLP push routes (`/v1/logs`, `/v1/traces`, `/v1/metrics`) and the OTLP gRPC services on `:4317` are removed; applications export to collecty, which ships here. See [`VISION.md`](VISION.md), "Ingest is OTLP", and "Ingest is collecty's" below |
 | Query protocol | **First-party HTTP API** (GET + URL filters, NDJSON out). The viewer is the fn0 control plane behind the gateway; agents drive the same endpoints with `curl` |
-| Transport security | **TLS is unsupported.** Only plain HTTP/gRPC is provided; a reverse proxy or service mesh handles end-to-end encryption |
+| Transport security | **TLS is unsupported.** Only plain HTTP is provided; a reverse proxy or service mesh handles end-to-end encryption |
 | Multi-tenancy | Multi-tenant. A write names its tenant in the `tenant.id` resource attribute, a read in the `X-Tenant-Id` header, and tenants are the unit of quota and retention |
 | Validation environment | **Do not test against S3** (neither real cloud nor local MinIO). Trust the `object_store` crate and test our code closely up to the crate boundary |
 
@@ -59,7 +59,7 @@ elsewhere in these docs.
 
 TLS termination is not this process's responsibility. Certificate issuance, renewal, SNI, and mTLS
 policies belong to layers that already handle them well (reverse proxy, ingress, or service mesh),
-while the engine provides only plain HTTP and plain gRPC. S3 access in the storage layer uses HTTPS
+while the engine provides only plain HTTP. S3 access in the storage layer uses HTTPS
 through `object_store`, so it is unaffected by this decision.
 
 Therefore, deployments must satisfy the following requirements.
@@ -156,11 +156,10 @@ storage, and query paths.
   their concurrency limit answer `429` or `422`. The **storage** quota answers neither: it is a
   property of the tenant rather than of the instance, so an export over it is dropped and counted like
   any other tenant refusal.
-  Over gRPC a backpressure refusal is `RESOURCE_EXHAUSTED` **carrying `RetryInfo`**: the OTLP
-  specification makes a bare `RESOURCE_EXHAUSTED` non-retryable and tells the client to drop the
-  telemetry, so the attachment is what makes "the client holds its data because the server declined
-  it" true on that transport rather than only on HTTP. A *limit* violation is the opposite
-  instruction — permanent for that batch — and answers `INVALID_ARGUMENT` with no `RetryInfo`.
+  A backpressure refusal carries `Retry-After`, which is what makes "the client holds its data
+  because the server declined it" true: collecty stops the segment there and offers it again. A
+  *limit* violation is the opposite instruction — permanent for that record — and is dropped and
+  counted rather than answered, since resending the identical bytes produces the identical refusal.
 - **Observability**: rejection counters are on `/metrics` without tenant labels (a label per tenant
   multiplies every series by the tenant count); per-tenant numbers are the admin usage endpoint's.
   `signy_ingest_dropped_resources_total{reason=...}` is the one counter that has to be watched rather
@@ -173,8 +172,8 @@ storage, and query paths.
   when retention retires the oldest parts and choosing which of a customer's logs to destroy is not this
   engine's call.
 - **Current state**: Identification, validation, isolation, per-tenant retention, and the stock quotas
-  (stored bytes, query concurrency) are implemented. `tenant.id` is read off the resource on OTLP
-  HTTP and gRPC and recorded in WAL records (the owner survives restart), while MemTable, part, trace
+  (stored bytes, query concurrency) are implemented. `tenant.id` is read off the resource of every
+  collected export and recorded in WAL records (the owner survives restart), while MemTable, part, trace
   part, query, and catalog reads all require a tenant argument. Only `/metrics` retains a process-wide
   operator aggregation. **Durable usage accounting and tier partitioning** remain, along with adaptive
   (resource-pressure-based) throttling in place of the removed per-tenant rates.
@@ -195,9 +194,9 @@ problem the stream model had does not exist here.
 ## Write path
 
 ```
-Alloy ──▶ Ingest API
-            │
-            ▼
+app ──OTLP/HTTP──▶ collecty ──POST /signy/api/v1/collect──▶ signy
+                   (disk queue)                              │
+                                                             ▼
          Journal append (sequential write, group commit: N MB or T ms, whichever comes first)
             │ Batch ack after fsync
             ▼
@@ -211,6 +210,17 @@ Alloy ──▶ Ingest API
 ```
 
 - Crash recovery = journal replay. Part size is independent of ingest speed.
+- **Ingest is collecty's.** One route takes writes, and only a collecty is expected to call it.
+  An engine an application can push to directly has no queue in front of it, so a refusal it gives
+  is telemetry lost unless the application happens to hold it; collecty's append-only disk queue is
+  what makes a refusal survivable, and it only helps when nothing can go around it. So the OTLP push
+  routes and the gRPC services were removed rather than left as a second way in.
+  A batch is one signal's exports back to back inside one zstd stream, each behind its length. The
+  server reads it a record at a time and never holds the batch, which is why the route carries no
+  body limit — how large a batch may be is collecty's decision, made on how long it is willing to
+  wait for an answer. The answer is `{"stored":n,"rejected":m}`: `stored` is the last segment held
+  whole, which is what a collecty may unlink, and `rejected` is datapoints a metrics record lost to
+  the active-series cap.
 - Background merge: small parts → large parts (LSM-style). Daily time partitions.
 - Sort out-of-order timestamps during merge. The allowed window for late data outside partition boundaries is configurable.
 
