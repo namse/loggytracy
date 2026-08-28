@@ -341,7 +341,18 @@ pub struct SeedBody {
     pub decomposed_samples: u64,
 }
 
-pub fn seed_bodies(corpus: &MetricCorpus) -> Vec<SeedBody> {
+/// `tenant` is stamped on the resource when the target reads its tenant out of
+/// the payload rather than a header — signy, and only signy.
+/// A resource naming nothing but the tenant. The metric corpus promotes no
+/// resource attributes of its own, so this is the whole of it.
+fn tenant_resource(tenant: &str) -> opentelemetry_proto::tonic::resource::v1::Resource {
+    opentelemetry_proto::tonic::resource::v1::Resource {
+        attributes: vec![crate::otlp::tenant_attribute(tenant)],
+        ..Default::default()
+    }
+}
+
+pub fn seed_bodies(corpus: &MetricCorpus, tenant: Option<&str>) -> Vec<SeedBody> {
     let mut counters: Vec<CounterState> = corpus
         .instruments
         .iter()
@@ -467,7 +478,7 @@ pub fn seed_bodies(corpus: &MetricCorpus) -> Vec<SeedBody> {
 
         let request = ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
-                resource: None,
+                resource: tenant.map(tenant_resource),
                 scope_metrics: vec![ScopeMetrics {
                     metrics,
                     ..Default::default()
@@ -554,14 +565,17 @@ victoriametrics",
             ..MetricSeedOutcome::default()
         };
     };
-    let tenant = cfg.target.tenant_header(&corpus.tenant);
-    let bodies = Arc::new(Mutex::new(seed_bodies(corpus)));
+    let header = cfg.target.push_tenant_header(&corpus.tenant);
+    // signy reads the tenant out of the export, the others out of the header,
+    // so exactly one of these two carries it.
+    let in_body = header.is_none().then_some(corpus.tenant.as_str());
+    let bodies = Arc::new(Mutex::new(seed_bodies(corpus, in_body)));
     let start = Instant::now();
 
     let workers: Vec<_> = (0..cfg.metric_verify.push_connections)
         .map(|_| {
             let bodies = bodies.clone();
-            let tenant = tenant.clone();
+            let header = header.clone();
             let address = cfg.http_address.clone();
             let timeout = cfg.request_timeout();
             tokio::spawn(async move {
@@ -581,7 +595,9 @@ victoriametrics",
                                 path: push_path,
                                 body: &body.bytes,
                                 content_type: PUSH_CONTENT_TYPE,
-                                tenant: Some(&tenant),
+                                tenant: header
+                                    .as_ref()
+                                    .map(|(name, value)| (*name, value.as_str())),
                             })
                             .await;
                         match result {
@@ -693,9 +709,9 @@ mod tests {
 
     #[test]
     fn the_corpus_is_a_pure_function_of_seed_and_knobs() {
-        let first = seed_bodies(&metric_corpus(7, &verify_for_test()));
-        let second = seed_bodies(&metric_corpus(7, &verify_for_test()));
-        let other_seed = seed_bodies(&metric_corpus(8, &verify_for_test()));
+        let first = seed_bodies_for_test(&metric_corpus(7, &verify_for_test()));
+        let second = seed_bodies_for_test(&metric_corpus(7, &verify_for_test()));
+        let other_seed = seed_bodies_for_test(&metric_corpus(8, &verify_for_test()));
         assert_eq!(first.len(), second.len());
         for (a, b) in first.iter().zip(&second) {
             assert_eq!(a.bytes, b.bytes, "same seed, same bytes");
@@ -748,7 +764,7 @@ mod tests {
         // The body encoder starts every counter at zero from its own first
         // scrape; decode the generation's first scrape and check its total is
         // its first increment, not a continuation.
-        let bodies = seed_bodies(&corpus);
+        let bodies = seed_bodies_for_test(&corpus);
         let request = ExportMetricsServiceRequest::decode(
             bodies[later_generation.first_scrape].bytes.as_slice(),
         )
@@ -811,7 +827,7 @@ mod tests {
     #[test]
     fn histogram_bucket_counts_are_cumulative_and_consistent_with_count() {
         let corpus = metric_corpus(7, &verify_for_test());
-        let bodies = seed_bodies(&corpus);
+        let bodies = seed_bodies_for_test(&corpus);
         let last = ExportMetricsServiceRequest::decode(
             bodies.last().expect("bodies exist").bytes.as_slice(),
         )
@@ -843,7 +859,7 @@ mod tests {
     #[test]
     fn the_sample_census_matches_what_the_bodies_carry() {
         let corpus = metric_corpus(7, &verify_for_test());
-        let bodies = seed_bodies(&corpus);
+        let bodies = seed_bodies_for_test(&corpus);
         let datapoints: u64 = bodies.iter().map(|body| body.datapoints).sum();
         let decomposed: u64 = bodies.iter().map(|body| body.decomposed_samples).sum();
         assert_eq!(datapoints, corpus.datapoint_count());
@@ -910,12 +926,22 @@ mod tests {
         );
     }
 
+    /// Every fixture names a tenant, because signy reads one out of the body.
+    fn seed_bodies_for_test(corpus: &MetricCorpus) -> Vec<SeedBody> {
+        seed_bodies(corpus, Some("test-tenant"))
+    }
+
     #[test]
     fn a_live_scrape_encodes_every_live_instrument_once() {
         let verify = verify_for_test();
         let mut population = LivePopulation::new(7, &verify);
         population.churn(7, verify.churn_replace_per_scrape);
-        let bodies = live_scrape_bodies(&population, 3, 1_772_000_000_000_000_000);
+        let bodies = live_scrape_bodies(
+            &population,
+            3,
+            1_772_000_000_000_000_000,
+            Some("test-tenant"),
+        );
         let offered: u64 = bodies.iter().map(|(_, datapoints)| *datapoints).sum();
         assert_eq!(offered, population.instruments().count() as u64);
         let encoded: u64 = bodies
@@ -951,7 +977,12 @@ mod tests {
         verify.explosion_series = SCRAPE_CHUNK_INSTRUMENTS * 2 + 1;
         let mut population = LivePopulation::new(7, &verify);
         population.explode(7, verify.explosion_series);
-        let bodies = live_scrape_bodies(&population, 0, 1_772_000_000_000_000_000);
+        let bodies = live_scrape_bodies(
+            &population,
+            0,
+            1_772_000_000_000_000_000,
+            Some("test-tenant"),
+        );
         assert!(bodies.len() >= 3, "{} bodies", bodies.len());
         for (_, datapoints) in &bodies {
             assert!(
@@ -1188,15 +1219,21 @@ fn live_scrape_bodies(
     population: &LivePopulation,
     scrape: usize,
     ts_ns: i64,
+    tenant: Option<&str>,
 ) -> Vec<(Vec<u8>, u64)> {
     let instruments: Vec<&Instrument> = population.instruments().collect();
     instruments
         .chunks(SCRAPE_CHUNK_INSTRUMENTS.max(1))
-        .map(|chunk| live_scrape_body(chunk, scrape, ts_ns))
+        .map(|chunk| live_scrape_body(chunk, scrape, ts_ns, tenant))
         .collect()
 }
 
-fn live_scrape_body(instruments: &[&Instrument], scrape: usize, ts_ns: i64) -> (Vec<u8>, u64) {
+fn live_scrape_body(
+    instruments: &[&Instrument],
+    scrape: usize,
+    ts_ns: i64,
+    tenant: Option<&str>,
+) -> (Vec<u8>, u64) {
     let mut gauges: BTreeMap<&str, Vec<NumberDataPoint>> = BTreeMap::new();
     let mut sums: BTreeMap<&str, Vec<NumberDataPoint>> = BTreeMap::new();
     let mut hists: BTreeMap<&str, Vec<HistogramDataPoint>> = BTreeMap::new();
@@ -1296,7 +1333,7 @@ fn live_scrape_body(instruments: &[&Instrument], scrape: usize, ts_ns: i64) -> (
     }
     let request = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
-            resource: None,
+            resource: tenant.map(tenant_resource),
             scope_metrics: vec![ScopeMetrics {
                 metrics,
                 ..Default::default()
@@ -1344,7 +1381,8 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
         ));
         return outcome;
     };
-    let tenant = cfg.target.tenant_header(&verify.tenant);
+    let header = cfg.target.push_tenant_header(&verify.tenant);
+    let in_body = header.is_none().then_some(verify.tenant.as_str());
     let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
     let mut population = LivePopulation::new(cfg.seed, verify);
     let interval = std::time::Duration::from_secs(verify.scrape_interval_seconds.max(1) as u64);
@@ -1374,7 +1412,7 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
-        for (body, datapoints) in live_scrape_bodies(&population, scrape, now_ns) {
+        for (body, datapoints) in live_scrape_bodies(&population, scrape, now_ns, in_body) {
             let sent = Instant::now();
             let result = client
                 .request(&Request {
@@ -1382,7 +1420,7 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
                     path: push_path,
                     body: &body,
                     content_type: PUSH_CONTENT_TYPE,
-                    tenant: Some(&tenant),
+                    tenant: header.as_ref().map(|(name, value)| (*name, value.as_str())),
                 })
                 .await;
             let elapsed_ms = sent.elapsed().as_secs_f64() * 1000.0;

@@ -21,7 +21,9 @@ pub struct Request<'a> {
     pub path: &'a str,
     pub body: &'a [u8],
     pub content_type: &'a str,
-    pub tenant: Option<&'a str>,
+    /// The tenant header to send, as `(name, value)`. `None` on a signy write:
+    /// the tenant is inside the body there.
+    pub tenant: Option<(&'a str, &'a str)>,
 }
 
 pub struct Response {
@@ -91,8 +93,8 @@ impl Conn {
             )
             .as_bytes(),
         );
-        if let Some(tenant) = request.tenant {
-            wire.extend_from_slice(format!("X-Scope-OrgID: {tenant}\r\n").as_bytes());
+        if let Some((name, value)) = request.tenant {
+            wire.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
         if !request.content_type.is_empty() {
             wire.extend_from_slice(

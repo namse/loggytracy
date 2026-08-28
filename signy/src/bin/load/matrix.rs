@@ -180,7 +180,7 @@ struct SeedBody {
 /// one and, more importantly, keeps the push sequence a pure function of the
 /// corpus: the same bytes leave this process in the same order for both
 /// systems.
-fn seed_bodies(corpus: &Corpus, entries_per_push: usize) -> Vec<SeedBody> {
+fn seed_bodies(corpus: &Corpus, entries_per_push: usize, tenant: Option<&str>) -> Vec<SeedBody> {
     let mut bodies = Vec::new();
     for stream in &corpus.streams {
         for chunk in stream.entries.chunks(entries_per_push) {
@@ -188,7 +188,7 @@ fn seed_bodies(corpus: &Corpus, entries_per_push: usize) -> Vec<SeedBody> {
             let batch: Vec<(signy::memtable::Labels, Vec<LogEntry>)> =
                 vec![((*stream.labels).clone(), chunk.to_vec())];
             bodies.push(SeedBody {
-                bytes: crate::otlp::encode_export_logs(&batch),
+                bytes: crate::otlp::encode_export_logs(&batch, tenant),
                 rows: chunk.len(),
                 line_bytes,
             });
@@ -199,14 +199,22 @@ fn seed_bodies(corpus: &Corpus, entries_per_push: usize) -> Vec<SeedBody> {
 
 pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
     let push_path = cfg.target.push_path();
-    let tenant = cfg.target.tenant_header(corpus.tenant_ids[0].as_str());
-    let bodies = Arc::new(Mutex::new(seed_bodies(corpus, cfg.verify.entries_per_push)));
+    let tenant = corpus.tenant_ids[0].as_str();
+    let header = cfg.target.push_tenant_header(tenant);
+    // signy reads the tenant out of the export, the others out of the header,
+    // so exactly one of these two carries it.
+    let in_body = header.is_none().then_some(tenant);
+    let bodies = Arc::new(Mutex::new(seed_bodies(
+        corpus,
+        cfg.verify.entries_per_push,
+        in_body,
+    )));
     let start = Instant::now();
 
     let workers: Vec<_> = (0..cfg.verify.push_connections)
         .map(|_| {
             let bodies = bodies.clone();
-            let tenant = tenant.clone();
+            let header = header.clone();
             let address = cfg.http_address.clone();
             let timeout = cfg.request_timeout();
             tokio::spawn(async move {
@@ -236,7 +244,9 @@ pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
                                 path: push_path,
                                 body: &body.bytes,
                                 content_type: PUSH_CONTENT_TYPE,
-                                tenant: Some(&tenant),
+                                tenant: header
+                                    .as_ref()
+                                    .map(|(name, value)| (*name, value.as_str())),
                             })
                             .await;
                         match result {
@@ -1459,7 +1469,7 @@ struct Timing {
 async fn issue(
     client: &mut Client,
     query: &Query,
-    tenant: &str,
+    tenant: (&str, &str),
 ) -> (f64, u16, Vec<u8>, Option<String>) {
     let sent = Instant::now();
     let result = client
@@ -1492,13 +1502,14 @@ async fn issue(
 /// has already run, so nothing about the second issue is the first one still
 /// being resident in a way the first was not.
 pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
-    let tenant = cfg.target.tenant_header(corpus.tenant_ids[0].as_str());
+    let (header, value) = cfg.target.read_tenant_header(corpus.tenant_ids[0].as_str());
+    let tenant = (header, value.as_str());
     let queries = build_queries(cfg, corpus);
     let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
     let mut timings: Vec<Timing> = Vec::with_capacity(queries.len());
 
     for query in &queries {
-        let (elapsed, status, body, error) = issue(&mut client, query, &tenant).await;
+        let (elapsed, status, body, error) = issue(&mut client, query, tenant).await;
         let answer = if status == 200 {
             match digest_for(cfg.target, &body, query) {
                 Ok(answer) => Some(answer),
@@ -1529,7 +1540,7 @@ pub async fn run_matrix(cfg: &Config, corpus: &Corpus) -> Value {
 
     for _ in 0..cfg.verify.repeats {
         for (index, query) in queries.iter().enumerate() {
-            let (elapsed, status, body, error) = issue(&mut client, query, &tenant).await;
+            let (elapsed, status, body, error) = issue(&mut client, query, tenant).await;
             let timing = &mut timings[index];
             timing.warm_ms.push(elapsed);
             if status != 200 {

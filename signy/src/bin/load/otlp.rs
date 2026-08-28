@@ -53,6 +53,18 @@ pub fn sanitize_key(name: &str) -> String {
         .collect()
 }
 
+/// The resource attribute signy reads a tenant from.
+///
+/// Only signy gets it: Loki and VictoriaLogs still name their tenant in a
+/// header, so the bodies are no longer byte-identical across targets. What is
+/// stored still is — signy strips this key before storage — so the digests the
+/// comparison compares are unaffected.
+pub const TENANT_ATTRIBUTE: &str = "tenant.id";
+
+pub fn tenant_attribute(tenant: &str) -> KeyValue {
+    string_attribute(TENANT_ATTRIBUTE.to_string(), tenant)
+}
+
 fn string_attribute(key: String, value: &str) -> KeyValue {
     KeyValue {
         key,
@@ -65,16 +77,22 @@ fn string_attribute(key: String, value: &str) -> KeyValue {
 
 /// One `ExportLogsServiceRequest`: a `ResourceLogs` per stream, the stream
 /// labels as mapped resource attributes, each entry's structured metadata as
-/// record attributes. The same bytes go to every target.
-pub fn encode_export_logs(batch: &[(Labels, Vec<LogEntry>)]) -> Vec<u8> {
+/// record attributes.
+///
+/// `tenant` is stamped on every resource when the target reads its tenant out
+/// of the payload, which is signy and only signy.
+pub fn encode_export_logs(batch: &[(Labels, Vec<LogEntry>)], tenant: Option<&str>) -> Vec<u8> {
     let request = ExportLogsServiceRequest {
         resource_logs: batch
             .iter()
             .map(|(labels, entries)| ResourceLogs {
                 resource: Some(Resource {
-                    attributes: labels
-                        .iter()
-                        .map(|(name, value)| string_attribute(resource_attribute_name(name), value))
+                    attributes: tenant
+                        .map(tenant_attribute)
+                        .into_iter()
+                        .chain(labels.iter().map(|(name, value)| {
+                            string_attribute(resource_attribute_name(name), value)
+                        }))
                         .collect(),
                     ..Default::default()
                 }),
@@ -132,7 +150,7 @@ mod tests {
             line: "hello".to_string(),
             structured_metadata: vec![("trace_id".to_string(), "abc123".to_string())],
         }];
-        let bytes = encode_export_logs(&[(labels, entries)]);
+        let bytes = encode_export_logs(&[(labels, entries)], None);
         let decoded = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
         assert_eq!(decoded.resource_logs.len(), 1);
         let resource = decoded.resource_logs[0]

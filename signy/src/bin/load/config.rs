@@ -83,7 +83,32 @@ victoriametrics, got {other:?}"
         }
     }
 
-    /// What to put in `X-Scope-OrgID` for this system.
+    /// The header a **read** names its tenant with, and its value.
+    ///
+    /// A query carries no payload, so every target still names its tenant in a
+    /// header here. signy's is `X-Tenant-Id`, named after the attribute its
+    /// writes use.
+    pub fn read_tenant_header(self, tenant: &str) -> (&'static str, String) {
+        let name = match self {
+            Target::Signy => "X-Tenant-Id",
+            _ => "X-Scope-OrgID",
+        };
+        (name, self.tenant_header(tenant))
+    }
+
+    /// The header a **write** names its tenant with, if it has one.
+    ///
+    /// signy has none: its tenant rides inside the export, as the `tenant.id`
+    /// resource attribute, so a push that also sent a header would be naming
+    /// it twice and testing neither.
+    pub fn push_tenant_header(self, tenant: &str) -> Option<(&'static str, String)> {
+        match self {
+            Target::Signy => None,
+            _ => Some(("X-Scope-OrgID", self.tenant_header(tenant))),
+        }
+    }
+
+    /// What to put in a tenant header for this system.
     ///
     /// VictoriaLogs reads that header as its numeric `AccountID` and refuses
     /// anything that is not a `uint32` — `verify-tenant-000` comes back as
@@ -92,7 +117,7 @@ victoriametrics, got {other:?}"
     /// across. The comparison corpus is single-tenant, so account `0` holds all
     /// of it and nothing is lost; a multi-tenant comparison would need a
     /// name-to-number mapping and would be measuring something else.
-    pub fn tenant_header(self, tenant: &str) -> String {
+    fn tenant_header(self, tenant: &str) -> String {
         match self {
             Target::Signy | Target::Loki => tenant.to_string(),
             // Single-node VictoriaMetrics has no tenancy at all and ignores the

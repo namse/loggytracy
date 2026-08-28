@@ -607,7 +607,7 @@ async fn run_load(cfg: Config) {
     let sampler = tokio::spawn(sampler(cfg.clone(), stop.clone(), run_start));
     let otlp = tokio::spawn(otlp_workload(
         cfg.clone(),
-        cfg.target.tenant_header(corpus.tenant_ids[0].as_str()),
+        corpus.tenant_ids[0].as_str().to_string(),
         stop.clone(),
         deadline,
     ));
@@ -870,7 +870,11 @@ async fn push_worker(
                 path: cfg.target.push_path(),
                 body: &job.body.bytes,
                 content_type: PUSH_CONTENT_TYPE,
-                tenant: Some(&job.body.tenant),
+                tenant: job
+                    .body
+                    .tenant_header
+                    .as_ref()
+                    .map(|(name, value)| (*name, value.as_str())),
             })
             .await;
         let done = Instant::now();
@@ -987,7 +991,7 @@ async fn query_worker(
                 path: &job.plan.path,
                 body: &[],
                 content_type: "",
-                tenant: Some(&job.plan.tenant),
+                tenant: Some((job.plan.tenant.0, job.plan.tenant.1.as_str())),
             })
             .await;
         let done = Instant::now();
@@ -1184,6 +1188,14 @@ async fn send_otlp(
     let span_id = rng.next_u64().to_be_bytes().to_vec();
     let request = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
+            // The same tenancy gate the HTTP path goes through. signy reads it
+            // off the resource on every transport, so gRPC names it the same
+            // way; without it every export is dropped and the trace leg
+            // records latency for spans the server threw away.
+            resource: Some(opentelemetry_proto::tonic::resource::v1::Resource {
+                attributes: vec![crate::otlp::tenant_attribute(tenant)],
+                ..Default::default()
+            }),
             scope_spans: vec![ScopeSpans {
                 spans: vec![Span {
                     trace_id,
@@ -1198,18 +1210,8 @@ async fn send_otlp(
             ..Default::default()
         }],
     };
-    let mut export = tonic::Request::new(request);
-    // The same tenancy gate the HTTP path goes through, spelled in gRPC
-    // metadata. Without it every export is refused and the trace leg reports
-    // latency for requests the server never accepted.
-    export.metadata_mut().insert(
-        "x-scope-orgid",
-        tenant
-            .parse()
-            .map_err(|_| format!("{tenant} is not a valid gRPC metadata value"))?,
-    );
     client
-        .export(export)
+        .export(tonic::Request::new(request))
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())

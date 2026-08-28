@@ -827,7 +827,7 @@ struct Timing {
 async fn issue(
     client: &mut Client,
     query: &MetricQuery,
-    tenant: &str,
+    tenant: (&str, &str),
 ) -> (f64, u16, Vec<u8>, Option<String>) {
     let sent = Instant::now();
     let result = client
@@ -856,13 +856,14 @@ async fn issue(
 /// Cold pass over every query, then the warm repeats — the same separation,
 /// for the same reason, as the log matrix.
 pub async fn run_metric_matrix(cfg: &Config) -> Value {
-    let tenant = cfg.target.tenant_header(&cfg.metric_verify.tenant);
+    let (header, value) = cfg.target.read_tenant_header(&cfg.metric_verify.tenant);
+    let tenant = (header, value.as_str());
     let queries = build_metric_queries(cfg);
     let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
     let mut timings: Vec<Timing> = Vec::with_capacity(queries.len());
 
     for query in &queries {
-        let (elapsed, status, body, error) = issue(&mut client, query, &tenant).await;
+        let (elapsed, status, body, error) = issue(&mut client, query, tenant).await;
         let answer = if status == 200 {
             match digest_metric_for(cfg.target, &body) {
                 Ok(answer) => Some(answer),
@@ -893,7 +894,7 @@ pub async fn run_metric_matrix(cfg: &Config) -> Value {
 
     for _ in 0..cfg.metric_verify.repeats {
         for (index, query) in queries.iter().enumerate() {
-            let (elapsed, status, body, error) = issue(&mut client, query, &tenant).await;
+            let (elapsed, status, body, error) = issue(&mut client, query, tenant).await;
             let timing = &mut timings[index];
             timing.warm_ms.push(elapsed);
             if status != 200 {

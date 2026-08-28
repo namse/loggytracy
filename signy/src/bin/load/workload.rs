@@ -13,7 +13,9 @@ use signy::memtable::LogEntry;
 /// One push, ready for the wire.
 pub struct PushBody {
     pub bytes: Vec<u8>,
-    pub tenant: String,
+    /// The tenant header to send, when the target reads one. `None` for signy:
+    /// the tenant is a resource attribute inside `bytes`.
+    pub tenant_header: Option<(&'static str, String)>,
     pub entries: usize,
     pub line_bytes: usize,
     pub encoded_bytes: usize,
@@ -128,12 +130,13 @@ impl PushGenerator {
         }
 
         // The OTLP body every target ingests — see `otlp::encode_export_logs`
-        // for the label mapping it applies.
-        let bytes = crate::otlp::encode_export_logs(&batch);
+        // for the label mapping it applies. signy reads the tenant out of it,
+        // the others out of the header, so exactly one of the two carries it.
+        let tenant = corpus.tenant_ids[tenant_index].as_str();
+        let header = self.target.push_tenant_header(tenant);
+        let bytes = crate::otlp::encode_export_logs(&batch, header.is_none().then_some(tenant));
         PushBody {
-            tenant: self
-                .target
-                .tenant_header(corpus.tenant_ids[tenant_index].as_str()),
+            tenant_header: header,
             entries: batch.iter().map(|(_, entries)| entries.len()).sum(),
             streams: batch.len(),
             line_bytes,
@@ -199,7 +202,9 @@ impl QueryShape {
 pub struct QueryPlan {
     pub shape: QueryShape,
     pub path: String,
-    pub tenant: String,
+    /// The tenant header a read names its tenant with. Every target has one:
+    /// a query carries no payload to put it in.
+    pub tenant: (&'static str, String),
     pub expression: String,
 }
 
@@ -244,7 +249,7 @@ impl QueryGenerator {
     pub fn next_plan(&mut self, now_seconds: i64) -> QueryPlan {
         let shape = self.pick_shape();
         let stream = &self.corpus.streams[self.rng.below(self.corpus.streams.len())];
-        let tenant = stream.tenant.as_str().to_string();
+        let tenant = self.target.read_tenant_header(stream.tenant.as_str());
         // The selector comes off a stream that exists, so a query that returns
         // nothing means the engine did not find it rather than that the
         // harness asked for something never written.
@@ -521,12 +526,9 @@ mod tests {
             let body = generator.next_body(1_772_000_000_000_000_000);
             assert_eq!(body.entries, 100);
             assert!(body.streams > 1, "a push should carry several streams");
-            assert!(
-                corpus
-                    .tenant_ids
-                    .iter()
-                    .any(|id| id.as_str() == body.tenant)
-            );
+            // signy takes the tenant out of the body, so the header is absent
+            // and the export is what has to name one.
+            assert!(body.tenant_header.is_none());
             assert!(!body.bytes.is_empty());
         }
     }
@@ -599,7 +601,7 @@ mod tests {
                 corpus
                     .tenant_ids
                     .iter()
-                    .any(|id| id.as_str() == plan.tenant)
+                    .any(|id| id.as_str() == plan.tenant.1)
             );
             if plan.shape == QueryShape::Heavy {
                 // The heavy shape deliberately selects every stream and asks
