@@ -16,10 +16,11 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Ingest protocol | **OTLP over gRPC on a Unix domain socket**, all three signals |
 | Payload handling | **Never decoded.** The bytes that arrive are the bytes that are stored and the bytes that are sent |
 | Acknowledgement | After the record enters the open segment's compressor, before it is on the device. See "What an acknowledgement means" |
+| Queue layout | **One queue per signal**, each numbering its segments from one. A segment holds one signal's exports and no others |
 | Durability | **The segment is the unit.** One zstd stream a segment, `fsync`ed as it closes, and there is no `fsync` before that. **How far signy has got is not written down** — a segment it answered for is unlinked, so what is on disk is what is still owed |
-| When the queue is full | **Drop the oldest segment.** The application is never refused for lack of disk |
-| Delivery | One closed segment in flight at a time, in queue order. A resend after a crash is **suppressed by signy**, not duplicated — see "Sending twice" |
-| Transport to signy | `POST /signy/api/v1/collect` with `Content-Encoding: zstd`, one route for all three signals |
+| When the queue is full | **Drop the oldest segment**, whichever signal it belongs to. The application is never refused for lack of disk |
+| Delivery | One closed segment in flight at a time, oldest first across the three signals. A resend after a crash is **suppressed by signy**, not duplicated — see "Sending twice" |
+| Transport to signy | `POST /signy/api/v1/collect` with `Content-Encoding: zstd`, one route for all three signals, each request naming its own |
 | Sender identity | Random 16 bytes made with the queue directory, in a file of their own. Not configurable, and not the hostname — it names the queue, not the machine |
 | What a request carries | **One closed segment, from its first record.** Never part of one, and never the segment still being written |
 | Tenancy | **None.** The tenant travels inside the payload as a resource attribute (obsy issue #9), so a collector that does not decode has nothing to do |
@@ -46,20 +47,19 @@ almost nothing once the first has taught the compressor what this machine's data
 looks like.
 
 Only the first half is signal-specific: logs merge with logs, not with spans.
-One queue holds all three, so each export goes in **behind a five byte header**
-naming its signal and its length, and what signy receives is a sequence of those
-records rather than one anonymous run of bytes. Splitting them apart again is a
-walk over the plaintext with no decoding in it; joining each signal's payloads is
-then the same free merge as before.
+That is why a queue is per signal — a segment holds one, and the request names
+it. Inside the segment each export goes in **behind a four byte length**, so
+what signy receives is a sequence of records rather than one anonymous run of
+bytes. Splitting them apart again is a walk over the plaintext with no decoding
+in it; joining the payloads is then the same free merge as before.
 
 ```
-export₁ (logs)   ──encode──▶ [L]bytes₁ ─┐
-export₂ (traces) ──encode──▶ [T]bytes₂ ─┼─▶ one zstd stream ─▶ the segment file
-export₃ (logs)   ──encode──▶ [L]bytes₃ ─┘                       (the body sent)
-                                                          │
-              signy: one decompress ──────────────────────┴─▶ [L]bytes₁[T]bytes₂[L]bytes₃
-                     one walk, one decode per signal ───────▶ logs:   bytes₁‖bytes₃
-                                                              traces: bytes₂
+export₁ (logs) ──encode──▶ [4]bytes₁ ─┐
+export₂ (logs) ──encode──▶ [4]bytes₂ ─┼─▶ one zstd stream ─▶ logs/…001.seg
+export₃ (logs) ──encode──▶ [4]bytes₃ ─┘                       (the body sent)
+                                                        │
+            signy: one decompress ──────────────────────┴─▶ [4]bytes₁[4]bytes₂[4]bytes₃
+                   one walk, one decode ──────────────────▶ logs: bytes₁‖bytes₂‖bytes₃
 ```
 
 collecty compresses each export once, on arrival, and never touches it again.
@@ -71,7 +71,7 @@ Both halves are pinned by tests in `src/wire.rs`
 (`one_stream_over_many_records_decompresses_to_all_of_them`,
 `concatenated_export_requests_decode_as_one_merged_request`,
 `a_batch_survives_both_layers_at_once`), and the whole path is pinned end to end
-by signy's `one_batch_of_mixed_signals_lands_in_every_store_it_names`.
+by signy's `a_batch_per_signal_lands_in_the_store_its_request_names`.
 
 ## Receiving
 
@@ -147,23 +147,33 @@ operator already has a reason to think about.
 
 ## The disk queue
 
-One queue for every signal, under `{data_dir}/queue/`.
+One queue per signal, under `{data_dir}/queue/`.
 
 ```
-00000000000000000000.seg   one zstd stream, closed at COLLECTY_QUEUE_SEGMENT_BYTES
-00000000000000000001.seg
-identity                   20 bytes: sender id, crc32
+identity                          20 bytes: sender id, crc32
+logs/00000000000000000001.seg     one zstd stream, closed at COLLECTY_QUEUE_SEGMENT_BYTES
+logs/00000000000000000002.seg
+traces/00000000000000000001.seg   its own numbering, from one
+metrics/00000000000000000001.seg
 ```
 
 That file is the whole of what the queue writes about itself. There is no
 cursor: a segment signy has answered for is unlinked on the spot, so the oldest
 file that is not still being written is the next one to send.
 
+**A segment holds one signal.** Three signals in one stream meant the
+compressor learning three shapes at once and a request signy had to fan out
+record by record. Apart, only exports that look alike are compressed together
+and a batch goes down one ingest path. What it costs is one open segment per
+signal instead of one, so a quiet host closes up to three segments per
+`COLLECTY_SEGMENT_MAX_AGE` rather than one, and sends up to three requests where
+it used to send one.
+
 **A segment has no framing of its own.** The file is a zstd stream and nothing
-else, and inside it the records sit back to back under the five byte header
-signy reads. There is no length and no checksum around them, because there is
-nowhere left for one to be useful: a stream is read from its start whatever
-happens, and the decoder is what says where the readable part ends.
+else, and inside it the records sit back to back under the four byte length
+signy reads. There is no checksum around them, because there is nowhere left
+for one to be useful: a stream is read from its start whatever happens, and the
+decoder is what says where the readable part ends.
 
 **One stream per segment rather than one frame per record.** A frame a record
 was self-describing on disk — an 8 byte length and crc in front of each — and it
@@ -187,27 +197,26 @@ What it cost is the acknowledgement, and that is written up above. What made it
 affordable is that a segment is now what a request carries: the file is sent
 verbatim, and it is never read while it is open.
 
-**The signal is inside the stream, not around it.** Each record carries one
-signal tag and the payload's length in front of it, and those are the bytes
-signy reads to split a segment apart. They go in before compression, so they
-cost nothing on the send path and the queue itself stays signal-agnostic — only
-the two ends of the wire know the tag.
+**The signal is the segment, not the record.** A record used to carry a signal
+tag in front of its length, which was the same answer repeated in front of every
+export in the file. Now the segment holds one signal and the request names it in
+`x-collecty-signal`, said once for the whole body.
 
 **Recovery closes what a crash left open; it does not resume it.** An encoder's
 state is memory, and it died with the process, so there is no appending to an
-unfinished stream. On open, the last segment is decompressed as far as it goes —
-an unfinished stream reads to its last complete block and then says so — cut
-back to the last record that arrived **whole**, and written out again as a
-stream that ends properly. Then this run starts a segment of its own, under the
-next number.
+unfinished stream. On open, each signal's last segment is decompressed as far as
+it goes — an unfinished stream reads to its last complete block and then says
+so — cut back to the last record that arrived **whole**, and written out again
+as a stream that ends properly. Then this run starts a segment of its own under
+that signal's next number.
 
 The cut has to happen here rather than at signy: a batch whose last record is
 short is a `400`, and a `400` drops the segment. Cutting one record locally is
 the cheaper side of that trade by the whole segment.
 
-Only the last segment can be unfinished, because closing a segment syncs it
-before the next one is created. Earlier ones are not touched, which is what
-keeps a restart from reading the whole backlog.
+Only the last segment of a signal can be unfinished, because closing a segment
+syncs it before the next one is created. Earlier ones are not touched, which is
+what keeps a restart from reading the whole backlog.
 
 **Corruption is signy's to find.** A frame a record could be checked locally
 with a crc, and a bad one ended the segment there. There is no equivalent inside
@@ -226,16 +235,29 @@ against a number to keep consistent with the files.
 **The identity is replaced rather than repaired.** signy holds a high-water mark
 under it, so a name that outlived the segment numbering would have every segment
 under that mark skipped as one already stored. A file that fails its crc yields
-a new name, and the queue comes back as a sender signy has never heard of.
+a new name, and the queue comes back as a sender signy has never heard of. One
+identity covers all three signals: it names the queue directory, and the three
+live in it together.
 
 For the same reason **segment numbers are never reused**. The next number comes
-from the highest the directory ever held, not from the highest still in it, so a
-segment that recovery finds empty and unlinks does not hand its number to the
-one that follows.
+from the highest that signal's directory ever held, not from the highest still
+in it, so a segment that recovery finds empty and unlinks does not hand its
+number to the one that follows.
+
+**What orders the three signals against each other is memory.** A number places
+a segment among its own signal's and nowhere else, and both the order segments
+are sent in and the order they are dropped in are meant to be the order they
+stopped collecting. So the queue stamps a segment as it closes it, and nothing
+of that reaches the disk: at open the order is read back off the files' own
+timestamps, which record the same moment. A filesystem too coarse to separate
+two of them costs a pair sent out of order, which signy does not care about —
+each signal's own numbering is what it reads.
 
 **Drop-oldest works in whole segments.** Rewriting a file to remove its head is
-expensive; unlinking is one syscall. If the cursor was inside the segment being
-dropped it jumps to the start of the next one.
+expensive; unlinking is one syscall. The budget is the whole queue's rather than
+a share per signal, so a host that only ships logs spends all of it on them; and
+what it takes when the budget is crossed is the segment that has been waiting
+longest, which can belong to a signal other than the one being appended to.
 
 **Dropped records are counted in bytes, not in records.** Counting records would
 mean walking every segment at startup to know how many each holds, which is a
@@ -249,14 +271,17 @@ two differ.
 
 ## Sending
 
-One sender task, one closed segment in flight at a time, in queue order. The
-open segment is never read: it is the one thing the intake is appending to, and
-keeping a reader out of it is most of what makes the rest of this simple.
+One sender task, one closed segment in flight at a time, oldest first across the
+three signals. The open segments are never read: they are the ones the intake is
+appending to, and keeping a reader out of them is most of what makes the rest of
+this simple.
 
-**A segment closes on size or on age.** `COLLECTY_QUEUE_SEGMENT_BYTES` (8 MiB by
-default) closes it on a busy host; `COLLECTY_SEGMENT_MAX_AGE` (1 s) closes it on
-a quiet one, and that is the floor on how long a record waits before it leaves
-the machine. Both numbers also decide how much is re-sent when a delivery is
+**A segment closes on size or on age**, and each signal keeps its own of both.
+`COLLECTY_QUEUE_SEGMENT_BYTES` (8 MiB by default) closes it on a busy host;
+`COLLECTY_SEGMENT_MAX_AGE` (1 s) closes it on a quiet one, and that is the floor
+on how long a record waits before it leaves the machine. A busy signal no longer
+carries a quiet one's records out with it, and a quiet one no longer waits
+behind a busy one. Both numbers also decide how much is re-sent when a delivery is
 cut, and how much a power cut loses, because the segment is the unit of all
 three.
 
@@ -264,10 +289,10 @@ The size is measured in **compressed** bytes that have reached the file, which
 the encoder emits a block at a time, so a segment overshoots by at most the last
 block before it notices.
 
-The request carries `Content-Encoding: zstd`, `x-collecty-sender` and
-`x-collecty-segment`, and the body is the segment file, byte for byte. Nothing
-is stripped, joined or re-encoded, because the queue has no framing of its own
-left to strip.
+The request carries `Content-Encoding: zstd`, `x-collecty-sender`,
+`x-collecty-signal` and `x-collecty-segment`, and the body is the segment file,
+byte for byte. Nothing is stripped, joined or re-encoded, because the queue has
+no framing of its own left to strip.
 
 ### Sending twice
 
@@ -275,10 +300,12 @@ The body carries no numbers and does not need to. **A segment is sent from its
 first record every time**, so signy counts as it reads and record *i* of the
 body is record *i* of that segment, on every attempt.
 
-signy remembers, per sender, which segment it is reading and how many of its
-records it has stored. A segment it already has whole is answered from the
-headers with the body unread. One it has part of is counted off to where it
-stopped, and only the rest is stored.
+signy remembers, per sender **and signal**, which segment it is reading and how
+many of its records it has stored. A segment it already has whole is answered
+from the headers with the body unread. One it has part of is counted off to
+where it stopped, and only the rest is stored. The three streams are numbered
+apart and arrive interleaved, so one position per sender would have each signal
+walking the others' back.
 
 That closes the window this design used to leave open. The cursor was written
 after the answer arrived, so a collecty that died in between — or an answer lost
@@ -293,7 +320,7 @@ stored again — `signy_collect_skipped_records_total` is where that shows.
 
 | Answer | Meaning | Action |
 |---|---|---|
-| 2xx | the segment is durable in signy; the body is `{"stored":n}` | advance the cursor to `n` and unlink everything at or below it |
+| 2xx | the segment is durable in signy; the body is `{"stored":n}` | unlink everything of that signal at or below `n` |
 | 400, 413, 415, 422 | this *segment* is not acceptable | drop it and move on |
 | everything else, including 401/403/429/5xx and any connection failure | signy cannot take it *right now* | retry with backoff |
 
@@ -373,17 +400,18 @@ else does.
 
 ## Where this depends on signy
 
-- `/signy/api/v1/collect` must exist, accept `Content-Encoding: zstd`, and read
-  the five byte record header this document describes.
+- `/signy/api/v1/collect` must exist, accept `Content-Encoding: zstd`, read the
+  signal out of `x-collecty-signal`, and read the four byte record header this
+  document describes.
 - signy must drop a record it will never accept rather than refusing the batch
   that carries it. collecty cannot tell one record from another without decoding,
   so a refusal it cannot act on becomes a halving search it should not have to
-  run — and with one queue for the machine, a batch that can never be accepted
-  blocks every application on it.
-- signy must remember, per sender, the segment in `x-collecty-segment` and how
-  far into it it has got, and answer with the last segment it holds whole.
-  Without that a resend is stored twice, which logs collapse on merge and spans
-  and metric samples do not.
+  run — and with one queue per signal, a batch that can never be accepted blocks
+  every application on the machine that ships that signal.
+- signy must remember, per sender **and signal**, the segment in
+  `x-collecty-segment` and how far into it it has got, and answer with the last
+  segment of that signal it holds whole. Without that a resend is stored twice,
+  which logs collapse on merge and spans and metric samples do not.
 - signy must tolerate duplicates it does not catch. Its own recovery is still
   at-least-once across a flush boundary, so a restart there can replay records
   already in parts.

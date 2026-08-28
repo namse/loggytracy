@@ -36,18 +36,18 @@ disk.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLECTY_QUEUE_MAX_BYTES` | `1GiB` | One queue holds every signal, so this is the whole budget. **This number is how long signy may be down before data is lost.** At 1 MB/s of compressed logs it is about 17 minutes |
+| `COLLECTY_QUEUE_MAX_BYTES` | `1GiB` | The whole budget, shared by the three signals' queues rather than split between them. **This number is how long signy may be down before data is lost.** At 1 MB/s of compressed logs it is about 17 minutes |
 | `COLLECTY_QUEUE_SEGMENT_BYTES` | `8MiB` | Segment close size, in compressed bytes, and therefore the unit of everything else: one request carries one segment, one `fsync` covers one, dropping under a full queue takes one at a time, and a cut delivery re-sends one. Smaller segments lose less per drop and cost more requests |
 
-When `COLLECTY_QUEUE_MAX_BYTES` is reached the oldest segment is unlinked and the
-application keeps running. Watch `collecty_queue_dropped_bytes_total`: any
-movement means data was thrown away.
+When `COLLECTY_QUEUE_MAX_BYTES` is reached the oldest segment is unlinked —
+whichever signal it belongs to — and the application keeps running. Watch
+`collecty_queue_dropped_bytes_total`: any movement means data was thrown away.
 
 ## What controls sending
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLECTY_SEGMENT_MAX_AGE` | `1s` | How long an open segment may keep collecting before it closes and becomes sendable. Nothing leaves the machine and nothing is on the device until a segment closes, so on a quiet host this is both the delivery latency and **the loss window for a power cut** |
+| `COLLECTY_SEGMENT_MAX_AGE` | `1s` | How long an open segment may keep collecting before it closes and becomes sendable. Nothing leaves the machine and nothing is on the device until a segment closes, so on a quiet host this is both the delivery latency and **the loss window for a power cut**. Each signal keeps its own age, so a quiet host closes up to three segments per interval rather than one |
 | `COLLECTY_RETRY_INITIAL` | `100ms` | First backoff after signy declines |
 | `COLLECTY_RETRY_MAX` | `30s` | Backoff ceiling. Doubling, with up to 25% jitter |
 | `COLLECTY_SEND_TIMEOUT` | `30s` | How long one batch may wait for an answer before it counts as a retryable failure |
@@ -71,13 +71,13 @@ queued behind it, which is why the stderr summary exists.
 
 ### The metrics
 
-One queue and one sender, so every family is a single series with no
-attributes.
+One sender and one set of counters across the three queues, so every family is a
+single series with no attributes.
 
 | Family | Kind | What it answers |
 |---|---|---|
 | `collecty_queue_bytes` | gauge | What the segments occupy on disk, which is also how far behind signy is — an answered segment is unlinked. **The one to alert on** |
-| `collecty_queue_segments` | gauge | Segment count |
+| `collecty_queue_segments` | gauge | Segment count across the three signals, never below three: each holds an open segment of its own |
 | `collecty_records_appended_total` | counter | Exports accepted from applications |
 | `collecty_bytes_appended_total` | counter | Plain bytes accepted, before the segment compresses them. Against `collecty_bytes_sent_total` this is the ratio this host is achieving |
 | `collecty_segments_sent_total` | counter | Segments signy accepted |
