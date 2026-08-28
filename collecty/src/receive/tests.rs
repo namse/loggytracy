@@ -80,32 +80,34 @@ impl Harness {
             .expect("a connected channel")
     }
 
+    /// Every record the queue is holding, under the signal of the segment it
+    /// is in — which is the only place the signal is written down now.
     fn records(&self) -> Vec<(Signal, Vec<u8>)> {
-        let body = self.sealed_body();
-        if body.is_empty() {
-            return Vec::new();
-        }
-        let plain = crate::wire::decompress(&body, body.len() * 8).expect("a stream");
-        crate::wire::split_records(&plain)
-            .expect("framed records")
+        self.sealed()
             .into_iter()
-            .map(|(signal, payload)| (signal, payload.to_vec()))
+            .flat_map(|(signal, body)| {
+                let plain = crate::wire::decompress(&body, body.len() * 8).expect("a stream");
+                crate::wire::split_records(&plain)
+                    .expect("framed records")
+                    .into_iter()
+                    .map(|payload| (signal, payload.to_vec()))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
-    /// What the sender would ship: the open segment closed, then read whole.
-    /// Several segments' bodies run together here, which decompresses the same
-    /// way — zstd streams concatenate.
-    fn sealed_body(&self) -> Vec<u8> {
+    /// What the sender would ship: every open segment closed, then read whole,
+    /// oldest first.
+    fn sealed(&self) -> Vec<(Signal, Vec<u8>)> {
         self.queue.seal_if_due().expect("a seal");
-        let mut body = Vec::new();
-        while let Some(seq) = self.queue.oldest_sealed() {
-            let sealed = self.queue.read_segment(seq).expect("a segment");
-            body.extend_from_slice(&sealed.body);
-            self.queue.commit(seq).expect("a commit");
+        let mut bodies = Vec::new();
+        while let Some((signal, seq)) = self.queue.oldest_sealed() {
+            let sealed = self.queue.read_segment(signal, seq).expect("a segment");
+            bodies.push((signal, sealed.body));
+            self.queue.commit(signal, seq).expect("a commit");
             self.queue.seal_if_due().expect("a seal");
         }
-        body
+        bodies
     }
 
     async fn stop(mut self) {
@@ -147,8 +149,10 @@ async fn an_export_is_stored_as_a_frame_that_decompresses_to_the_request() {
     harness.stop().await;
 }
 
+/// Three exports, three segments: nothing shares a segment with another
+/// signal, and the order they arrived in is the order they are sent in.
 #[tokio::test]
-async fn every_signal_lands_in_the_one_queue_tagged_with_itself() {
+async fn every_signal_lands_in_a_segment_of_its_own() {
     let harness = Harness::start("receive-signals", DEFAULT_MAX_REQUEST_BYTES).await;
     let channel = harness.channel().await;
 
@@ -169,12 +173,9 @@ async fn every_signal_lands_in_the_one_queue_tagged_with_itself() {
         .await
         .expect("an accepted metric export");
 
-    let tags: Vec<Signal> = harness
-        .records()
-        .into_iter()
-        .map(|(signal, _)| signal)
-        .collect();
-    assert_eq!(tags, vec![Signal::Logs, Signal::Traces, Signal::Metrics]);
+    let sealed = harness.sealed();
+    let signals: Vec<Signal> = sealed.iter().map(|(signal, _)| *signal).collect();
+    assert_eq!(signals, vec![Signal::Logs, Signal::Traces, Signal::Metrics]);
     harness.stop().await;
 }
 
@@ -243,11 +244,13 @@ async fn separate_exports_reassemble_into_one_merged_request() {
             .expect("an accepted export");
     }
 
-    let body = harness.sealed_body();
-    let plain = crate::wire::decompress(&body, body.len() * 8).expect("plain");
+    let sealed = harness.sealed();
+    assert_eq!(sealed.len(), 1, "one signal, one segment");
+    let (signal, body) = &sealed[0];
+    assert_eq!(*signal, Signal::Logs);
+    let plain = crate::wire::decompress(body, body.len() * 8).expect("plain");
     let mut payloads = Vec::new();
-    for (signal, payload) in crate::wire::split_records(&plain).expect("framed records") {
-        assert_eq!(signal, Signal::Logs);
+    for payload in crate::wire::split_records(&plain).expect("framed records") {
         payloads.extend_from_slice(payload);
     }
     let merged = ExportLogsServiceRequest::decode(payloads.as_slice()).expect("a merged request");

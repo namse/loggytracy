@@ -79,9 +79,12 @@ impl Intake {
         // append is still the blocking pool's work.
         let queue = self.queue.clone();
         tokio::task::spawn_blocking(move || {
-            queue.append(&Record {
-                plain: wire::frame_record(signal, &payload),
-            })
+            queue.append(
+                signal,
+                &Record {
+                    plain: wire::frame_record(&payload),
+                },
+            )
         })
         .await
         .map_err(|error| Status::internal(format!("the spool task did not finish: {error}")))?

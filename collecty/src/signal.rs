@@ -32,16 +32,17 @@ impl Signal {
             .find(|signal| signal.grpc_method_path() == path)
     }
 
-    pub fn tag(self) -> u8 {
+    /// Which of the three queues this signal owns.
+    ///
+    /// A slot in memory and nothing else. The signal is named on the wire and
+    /// in the queue's directory names, so there is no number anywhere for this
+    /// to have to agree with.
+    pub fn index(self) -> usize {
         match self {
-            Signal::Logs => 1,
-            Signal::Traces => 2,
-            Signal::Metrics => 3,
+            Signal::Logs => 0,
+            Signal::Traces => 1,
+            Signal::Metrics => 2,
         }
-    }
-
-    pub fn from_tag(tag: u8) -> Option<Signal> {
-        Signal::ALL.into_iter().find(|signal| signal.tag() == tag)
     }
 }
 
@@ -67,11 +68,9 @@ mod tests {
     }
 
     #[test]
-    fn every_signal_round_trips_through_its_tag() {
-        for signal in Signal::ALL {
-            assert_eq!(Signal::from_tag(signal.tag()), Some(signal));
+    fn every_signal_has_a_slot_of_its_own() {
+        for (slot, signal) in Signal::ALL.into_iter().enumerate() {
+            assert_eq!(signal.index(), slot);
         }
-        assert_eq!(Signal::from_tag(0), None);
-        assert_eq!(Signal::from_tag(4), None);
     }
 }

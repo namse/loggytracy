@@ -3,7 +3,6 @@ mod corpus;
 
 use std::io::Write;
 
-use collecty::signal::Signal;
 use collecty::wire;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
@@ -11,7 +10,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 /// compresses: the encoder is opened once and fed a record at a time.
 fn segment(records: usize, exports: usize, level: i32) -> std::io::Result<Vec<u8>> {
     let export = corpus::export_bytes(records);
-    let plain = wire::frame_record(Signal::Logs, &export);
+    let plain = wire::frame_record(&export);
     let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level)?;
     for _ in 0..exports {
         encoder.write_all(std::hint::black_box(&plain))?;

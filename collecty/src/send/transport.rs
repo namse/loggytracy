@@ -10,10 +10,16 @@ use hyper_util::rt::TokioExecutor;
 
 use super::{DeliverFuture, Outcome, Shipment, Transport};
 
-/// Which collecty the segment came from, and which segment it is. Together
-/// they are what signy needs to skip what it already stored, so a resend after
-/// a crash costs bandwidth and nothing else.
+/// Which collecty the segment came from, which of its three streams it
+/// belongs to, and which segment of that stream it is. Together they are what
+/// signy needs to skip what it already stored, so a resend after a crash costs
+/// bandwidth and nothing else.
+///
+/// The signal is here rather than in front of every record because a segment
+/// holds one signal's exports and no others. It is the same answer for the
+/// whole body, so the body says it once.
 pub const SENDER_HEADER: &str = "x-collecty-sender";
+pub const SIGNAL_HEADER: &str = "x-collecty-signal";
 pub const SEGMENT_HEADER: &str = "x-collecty-segment";
 const REASON_LIMIT: usize = 512;
 
@@ -49,6 +55,7 @@ impl Transport for HttpTransport {
                 .header(CONTENT_TYPE, "application/x-protobuf")
                 .header(CONTENT_ENCODING, "zstd")
                 .header(SENDER_HEADER, shipment.sender.to_string())
+                .header(SIGNAL_HEADER, shipment.signal.as_str())
                 .header(SEGMENT_HEADER, shipment.segment.to_string())
                 .body(Full::new(shipment.body))
             {

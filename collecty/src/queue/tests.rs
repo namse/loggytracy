@@ -8,7 +8,7 @@ use crate::wire::{self, ZSTD_LEVEL};
 
 fn record(body: &[u8]) -> Record {
     Record {
-        plain: wire::frame_record(Signal::Logs, body),
+        plain: wire::frame_record(body),
     }
 }
 
@@ -25,8 +25,11 @@ fn eager() -> QueueLimits {
     }
 }
 
-fn path_of(scratch: &Scratch, seq: u64) -> std::path::PathBuf {
-    scratch.path().join(format!("{seq:020}.seg"))
+fn path_of(scratch: &Scratch, signal: Signal, seq: u64) -> std::path::PathBuf {
+    scratch
+        .path()
+        .join(signal.as_str())
+        .join(format!("{seq:020}.seg"))
 }
 
 /// A closed segment's records, as signy would read them: one zstd stream, and
@@ -36,7 +39,7 @@ fn records_of(sealed: &SealedSegment) -> Vec<Vec<u8>> {
     wire::split_records(&plain)
         .expect("framed records")
         .into_iter()
-        .map(|(_, payload)| payload.to_vec())
+        .map(<[u8]>::to_vec)
         .collect()
 }
 
@@ -45,10 +48,10 @@ fn records_of(sealed: &SealedSegment) -> Vec<Vec<u8>> {
 fn drain(queue: &Queue) -> Vec<Vec<u8>> {
     let mut records = Vec::new();
     queue.seal_if_due().expect("a seal");
-    while let Some(seq) = queue.oldest_sealed() {
-        let sealed = queue.read_segment(seq).expect("a segment");
+    while let Some((signal, seq)) = queue.oldest_sealed() {
+        let sealed = queue.read_segment(signal, seq).expect("a segment");
         records.extend(records_of(&sealed));
-        queue.commit(seq).expect("a commit");
+        queue.commit(signal, seq).expect("a commit");
         queue.seal_if_due().expect("a seal");
     }
     records
@@ -80,17 +83,19 @@ fn a_closed_segment_is_one_stream_over_every_record_it_took() {
     let queue = open(&scratch, eager());
     let bodies = lines(5);
     for body in &bodies {
-        queue.append(&record(body)).expect("an append");
+        queue
+            .append(Signal::Logs, &record(body))
+            .expect("an append");
     }
 
     queue.seal_if_due().expect("a seal");
-    let seq = queue.oldest_sealed().expect("a closed segment");
-    let sealed = queue.read_segment(seq).expect("a segment");
+    let (signal, seq) = queue.oldest_sealed().expect("a closed segment");
+    let sealed = queue.read_segment(signal, seq).expect("a segment");
 
     assert_eq!(records_of(&sealed), bodies);
     assert_eq!(
         sealed.body,
-        std::fs::read(path_of(&scratch, seq)).expect("the file"),
+        std::fs::read(path_of(&scratch, signal, seq)).expect("the file"),
         "the file is the body, byte for byte"
     );
 }
@@ -103,17 +108,23 @@ fn a_segment_compresses_across_its_records() {
     let queue = open(&scratch, eager());
     let bodies = lines(200);
     for body in &bodies {
-        queue.append(&record(body)).expect("an append");
+        queue
+            .append(Signal::Logs, &record(body))
+            .expect("an append");
     }
 
     queue.seal_if_due().expect("a seal");
-    let seq = queue.oldest_sealed().expect("a closed segment");
-    let together = queue.read_segment(seq).expect("a segment").body.len();
+    let (signal, seq) = queue.oldest_sealed().expect("a closed segment");
+    let together = queue
+        .read_segment(signal, seq)
+        .expect("a segment")
+        .body
+        .len();
 
     let apart: usize = bodies
         .iter()
         .map(|body| {
-            zstd::bulk::compress(&wire::frame_record(Signal::Logs, body), ZSTD_LEVEL)
+            zstd::bulk::compress(&wire::frame_record(body), ZSTD_LEVEL)
                 .expect("a frame")
                 .len()
         })
@@ -132,7 +143,7 @@ fn the_open_segment_is_not_offered() {
     let scratch = Scratch::new("open");
     let queue = open(&scratch, QueueLimits::default());
     queue
-        .append(&record(b"still being written"))
+        .append(Signal::Logs, &record(b"still being written"))
         .expect("an append");
 
     assert!(queue.oldest_sealed().is_none());
@@ -149,14 +160,16 @@ fn an_open_segment_closes_once_it_is_old_enough() {
             ..QueueLimits::default()
         },
     );
-    queue.append(&record(b"waiting")).expect("an append");
+    queue
+        .append(Signal::Logs, &record(b"waiting"))
+        .expect("an append");
 
     queue.seal_if_due().expect("a seal");
     assert!(queue.oldest_sealed().is_none(), "not old enough yet");
 
     std::thread::sleep(Duration::from_millis(40));
     queue.seal_if_due().expect("a seal");
-    assert_eq!(queue.oldest_sealed(), Some(1));
+    assert_eq!(queue.oldest_sealed(), Some((Signal::Logs, 1)));
 }
 
 /// An empty queue must not roll segments forever while nothing arrives. The
@@ -171,29 +184,42 @@ fn an_empty_segment_is_never_closed() {
         queue.seal_if_due().expect("a seal");
     }
 
-    assert_eq!(queue.stats().segments, 1);
+    assert_eq!(
+        queue.stats().segments,
+        Signal::ALL.len(),
+        "the open segment of each signal and nothing else"
+    );
     assert!(queue.oldest_sealed().is_none());
 
-    queue.append(&record(b"arrived")).expect("an append");
+    queue
+        .append(Signal::Logs, &record(b"arrived"))
+        .expect("an append");
     queue.seal_if_due().expect("a seal");
-    assert_eq!(queue.oldest_sealed(), Some(1));
+    assert_eq!(queue.oldest_sealed(), Some((Signal::Logs, 1)));
 }
 
 #[test]
 fn an_answered_segment_is_removed_and_not_offered_again() {
     let scratch = Scratch::new("commit");
     let queue = open(&scratch, eager());
-    queue.append(&record(b"first")).expect("an append");
+    queue
+        .append(Signal::Logs, &record(b"first"))
+        .expect("an append");
     queue.seal_if_due().expect("a seal");
-    queue.append(&record(b"second")).expect("an append");
+    queue
+        .append(Signal::Logs, &record(b"second"))
+        .expect("an append");
     queue.seal_if_due().expect("a seal");
 
-    let seq = queue.oldest_sealed().expect("a closed segment");
-    assert_eq!(seq, 1);
-    queue.commit(seq).expect("a commit");
+    let (signal, seq) = queue.oldest_sealed().expect("a closed segment");
+    assert_eq!((signal, seq), (Signal::Logs, 1));
+    queue.commit(signal, seq).expect("a commit");
 
-    assert!(!path_of(&scratch, 1).exists(), "the file is unlinked");
-    assert_eq!(queue.oldest_sealed(), Some(2));
+    assert!(
+        !path_of(&scratch, Signal::Logs, 1).exists(),
+        "the file is unlinked"
+    );
+    assert_eq!(queue.oldest_sealed(), Some((Signal::Logs, 2)));
 }
 
 #[test]
@@ -201,11 +227,15 @@ fn a_reopened_queue_keeps_what_signy_has_not_answered_for() {
     let scratch = Scratch::new("reopen");
     let sender = {
         let queue = open(&scratch, eager());
-        queue.append(&record(b"answered")).expect("an append");
+        queue
+            .append(Signal::Logs, &record(b"answered"))
+            .expect("an append");
         queue.seal_if_due().expect("a seal");
-        queue.append(&record(b"still owed")).expect("an append");
+        queue
+            .append(Signal::Logs, &record(b"still owed"))
+            .expect("an append");
         queue.seal_if_due().expect("a seal");
-        queue.commit(1).expect("a commit");
+        queue.commit(Signal::Logs, 1).expect("a commit");
         queue.sender_id()
     };
 
@@ -222,16 +252,26 @@ fn a_reopened_queue_closes_the_old_segment_and_opens_a_new_one() {
     {
         let queue = open(&scratch, QueueLimits::default());
         queue
-            .append(&record(b"before the restart"))
+            .append(Signal::Logs, &record(b"before the restart"))
             .expect("an append");
         queue.seal().expect("a seal on the way out");
     }
 
     let queue = open(&scratch, eager());
-    assert_eq!(queue.oldest_sealed(), Some(1), "the old one is sendable");
-    queue.append(&record(b"after it")).expect("an append");
-    assert_eq!(queue.oldest_sealed(), Some(1), "and not appended to");
-    assert_eq!(queue.stats().segments, 2);
+    assert_eq!(
+        queue.oldest_sealed(),
+        Some((Signal::Logs, 1)),
+        "the old one is sendable"
+    );
+    queue
+        .append(Signal::Logs, &record(b"after it"))
+        .expect("an append");
+    assert_eq!(
+        queue.oldest_sealed(),
+        Some((Signal::Logs, 1)),
+        "and not appended to"
+    );
+    assert_eq!(queue.stats().segments, Signal::ALL.len() + 1);
 
     assert_eq!(
         drain(&queue),
@@ -248,13 +288,15 @@ fn a_segment_left_behind_by_a_crash_is_offered_again() {
     let scratch = Scratch::new("stale");
     {
         let queue = open(&scratch, eager());
-        queue.append(&record(b"answered")).expect("an append");
+        queue
+            .append(Signal::Logs, &record(b"answered"))
+            .expect("an append");
         queue.seal_if_due().expect("a seal");
     }
-    assert!(path_of(&scratch, 1).exists());
+    assert!(path_of(&scratch, Signal::Logs, 1).exists());
 
     let queue = open(&scratch, eager());
-    assert_eq!(queue.oldest_sealed(), Some(1));
+    assert_eq!(queue.oldest_sealed(), Some((Signal::Logs, 1)));
     assert_eq!(drain(&queue), vec![b"answered".to_vec()]);
 }
 
@@ -269,7 +311,9 @@ fn a_crash_keeps_the_records_that_reached_the_file() {
     {
         let queue = open(&scratch, QueueLimits::default());
         for body in &bodies {
-            queue.append(&record(body)).expect("an append");
+            queue
+                .append(Signal::Logs, &record(body))
+                .expect("an append");
         }
     }
 
@@ -294,13 +338,15 @@ fn a_torn_tail_is_cut_back_to_the_last_whole_record() {
     {
         let queue = open(&scratch, QueueLimits::default());
         for body in &bodies {
-            queue.append(&record(body)).expect("an append");
+            queue
+                .append(Signal::Logs, &record(body))
+                .expect("an append");
         }
     }
 
     let mut file = std::fs::OpenOptions::new()
         .append(true)
-        .open(path_of(&scratch, 1))
+        .open(path_of(&scratch, Signal::Logs, 1))
         .expect("the segment");
     file.write_all(&[9u8; 7]).expect("a torn write");
     drop(file);
@@ -320,12 +366,14 @@ fn a_recovered_segment_is_closed_before_it_is_offered() {
     {
         let queue = open(&scratch, QueueLimits::default());
         for body in lines(4000) {
-            queue.append(&record(&body)).expect("an append");
+            queue
+                .append(Signal::Logs, &record(&body))
+                .expect("an append");
         }
     }
 
     let queue = open(&scratch, eager());
-    let sealed = queue.read_segment(1).expect("a segment");
+    let sealed = queue.read_segment(Signal::Logs, 1).expect("a segment");
     wire::decompress(&sealed.body, sealed.body.len() * 8).expect("a stream that ends properly");
 }
 
@@ -336,11 +384,11 @@ fn a_segment_that_decompresses_to_nothing_is_dropped() {
     {
         let queue = open(&scratch, QueueLimits::default());
         queue
-            .append(&record(b"never reached the file"))
+            .append(Signal::Logs, &record(b"never reached the file"))
             .expect("an append");
     }
     assert_eq!(
-        std::fs::metadata(path_of(&scratch, 1))
+        std::fs::metadata(path_of(&scratch, Signal::Logs, 1))
             .expect("a segment")
             .len(),
         0,
@@ -352,9 +400,11 @@ fn a_segment_that_decompresses_to_nothing_is_dropped() {
     // every segment under that mark as one it already stored.
     let queue = open(&scratch, eager());
     assert!(drain(&queue).is_empty());
-    queue.append(&record(b"after it")).expect("an append");
+    queue
+        .append(Signal::Logs, &record(b"after it"))
+        .expect("an append");
     queue.seal_if_due().expect("a seal");
-    assert_eq!(queue.oldest_sealed(), Some(2));
+    assert_eq!(queue.oldest_sealed(), Some((Signal::Logs, 2)));
 }
 
 #[test]
@@ -373,7 +423,9 @@ fn the_oldest_segment_is_dropped_when_the_queue_is_full() {
     // Bodies zstd cannot shrink, so the segments are the size they look.
     let bodies: Vec<Vec<u8>> = (0..40).map(|index| noise(index, 400)).collect();
     for body in &bodies {
-        queue.append(&record(body)).expect("an append");
+        queue
+            .append(Signal::Logs, &record(body))
+            .expect("an append");
         queue.seal_if_due().expect("a seal");
     }
 
@@ -400,7 +452,9 @@ fn a_record_larger_than_the_whole_queue_is_refused() {
             ..QueueLimits::default()
         },
     );
-    let error = queue.append(&record(&[0u8; 100])).expect_err("a refusal");
+    let error = queue
+        .append(Signal::Logs, &record(&[0u8; 100]))
+        .expect_err("a refusal");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
@@ -412,9 +466,11 @@ fn an_unreadable_identity_is_replaced() {
     let scratch = Scratch::new("identity");
     let before = {
         let queue = open(&scratch, eager());
-        queue.append(&record(b"first")).expect("an append");
+        queue
+            .append(Signal::Logs, &record(b"first"))
+            .expect("an append");
         queue.seal_if_due().expect("a seal");
-        queue.commit(1).expect("a commit");
+        queue.commit(Signal::Logs, 1).expect("a commit");
         queue.sender_id()
     };
 
@@ -432,7 +488,9 @@ async fn a_waiter_wakes_when_a_segment_closes() {
     let waiter = tokio::spawn(async move { waiting.wait_for_sealed().await });
 
     tokio::time::sleep(Duration::from_millis(20)).await;
-    queue.append(&record(b"arrived")).expect("an append");
+    queue
+        .append(Signal::Logs, &record(b"arrived"))
+        .expect("an append");
     queue.seal_if_due().expect("a seal");
 
     tokio::time::timeout(Duration::from_secs(1), waiter)
@@ -447,13 +505,17 @@ async fn a_waiter_wakes_when_a_segment_closes() {
 fn an_answered_segment_leaves_the_queue_smaller() {
     let scratch = Scratch::new("backlog");
     let queue = open(&scratch, eager());
-    queue.append(&record(&[1u8; 100])).expect("an append");
+    queue
+        .append(Signal::Logs, &record(&[1u8; 100]))
+        .expect("an append");
     queue.seal_if_due().expect("a seal");
-    queue.append(&record(&[2u8; 100])).expect("an append");
+    queue
+        .append(Signal::Logs, &record(&[2u8; 100]))
+        .expect("an append");
     queue.seal_if_due().expect("a seal");
 
     let before = queue.stats().queued_bytes;
-    queue.commit(1).expect("a commit");
+    queue.commit(Signal::Logs, 1).expect("a commit");
 
     assert!(queue.stats().queued_bytes < before);
 }
@@ -466,7 +528,9 @@ fn appended_bytes_are_what_arrived_and_queued_bytes_are_what_is_kept() {
     let queue = open(&scratch, eager());
     let bodies = lines(200);
     for body in &bodies {
-        queue.append(&record(body)).expect("an append");
+        queue
+            .append(Signal::Logs, &record(body))
+            .expect("an append");
     }
     queue.seal_if_due().expect("a seal");
 
@@ -478,4 +542,158 @@ fn appended_bytes_are_what_arrived_and_queued_bytes_are_what_is_kept() {
     assert_eq!(stats.appended_records, bodies.len() as u64);
     assert_eq!(stats.appended_bytes, plain);
     assert!(stats.queued_bytes < plain);
+}
+
+/// A segment holds one signal and nothing else, and each signal numbers its
+/// own from one. Nothing on disk puts two signals' segments in one order,
+/// which is why the wire carries the signal beside the number.
+#[test]
+fn a_segment_holds_one_signal_and_each_signal_numbers_its_own() {
+    let scratch = Scratch::new("split");
+    let queue = open(&scratch, eager());
+    queue
+        .append(Signal::Logs, &record(b"a log line"))
+        .expect("an append");
+    queue
+        .append(Signal::Traces, &record(b"a span"))
+        .expect("an append");
+    queue.seal_if_due().expect("a seal");
+
+    let logs = queue.read_segment(Signal::Logs, 1).expect("a segment");
+    let traces = queue.read_segment(Signal::Traces, 1).expect("a segment");
+    assert_eq!(records_of(&logs), vec![b"a log line".to_vec()]);
+    assert_eq!(records_of(&traces), vec![b"a span".to_vec()]);
+
+    let mut closed = Vec::new();
+    while let Some((signal, seq)) = queue.oldest_sealed() {
+        closed.push((signal, seq));
+        queue.commit(signal, seq).expect("a commit");
+    }
+    assert_eq!(
+        closed,
+        vec![(Signal::Logs, 1), (Signal::Traces, 1)],
+        "a signal that took nothing closed nothing, and both start at one"
+    );
+}
+
+/// Numbers only order a signal against itself, so what orders the three
+/// against each other is the order they were created in.
+#[test]
+fn the_oldest_segment_goes_first_whichever_signal_it_is() {
+    let scratch = Scratch::new("order");
+    let queue = open(&scratch, eager());
+    let order = [
+        (Signal::Traces, 1),
+        (Signal::Logs, 1),
+        (Signal::Traces, 2),
+        (Signal::Metrics, 1),
+    ];
+    for (signal, _) in order {
+        queue
+            .append(signal, &record(b"one record"))
+            .expect("an append");
+        queue.seal_if_due().expect("a seal");
+    }
+
+    let mut sent = Vec::new();
+    while let Some((signal, seq)) = queue.oldest_sealed() {
+        sent.push((signal, seq));
+        queue.commit(signal, seq).expect("a commit");
+    }
+    assert_eq!(sent, order);
+}
+
+/// The budget is the whole queue's rather than a share per signal, and what it
+/// takes when it is exceeded is the segment that has been waiting longest —
+/// which can belong to a signal other than the one being appended to.
+#[test]
+fn the_oldest_segment_is_dropped_whichever_signal_it_is() {
+    let scratch = Scratch::new("drop-across");
+    let queue = open(
+        &scratch,
+        QueueLimits {
+            max_bytes: 2048,
+            ..eager()
+        },
+    );
+    // Bodies zstd cannot shrink, so the segments are the size they look.
+    queue
+        .append(Signal::Traces, &record(&noise(1, 900)))
+        .expect("an append");
+    queue.seal_if_due().expect("a seal");
+    for index in 0..4 {
+        queue
+            .append(Signal::Logs, &record(&noise(index + 2, 900)))
+            .expect("an append");
+        queue.seal_if_due().expect("a seal");
+    }
+
+    assert!(
+        !path_of(&scratch, Signal::Traces, 1).exists(),
+        "the traces segment was the oldest, so it went first"
+    );
+    assert!(queue.stats().dropped_segments > 0);
+    assert!(queue.stats().queued_bytes <= 2048);
+}
+
+/// The stamps that order the three signals are memory, and memory dies with
+/// the process. What a restart has left is the files' own timestamps, and they
+/// are enough to put them back in the order they were written.
+#[test]
+fn the_order_across_signals_survives_a_restart() {
+    let scratch = Scratch::new("order-restart");
+    {
+        let queue = open(&scratch, eager());
+        // A filesystem's timestamps are not infinitely fine, and two segments
+        // written inside one tick are indistinguishable to a restart.
+        for signal in [Signal::Metrics, Signal::Traces, Signal::Logs] {
+            queue
+                .append(signal, &record(signal.as_str().as_bytes()))
+                .expect("an append");
+            queue.seal_if_due().expect("a seal");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    let queue = open(&scratch, eager());
+    let mut sent = Vec::new();
+    while let Some((signal, seq)) = queue.oldest_sealed() {
+        sent.push(signal);
+        queue.commit(signal, seq).expect("a commit");
+    }
+    assert_eq!(
+        sent,
+        vec![Signal::Metrics, Signal::Traces, Signal::Logs],
+        "oldest first, not signal order"
+    );
+}
+
+/// A signal only closes a segment because its own has been collecting too
+/// long. A busy one no longer carries a quiet one's records out with it.
+#[test]
+fn a_signal_closes_on_its_own_age() {
+    let scratch = Scratch::new("age-apart");
+    let queue = open(
+        &scratch,
+        QueueLimits {
+            max_segment_age: Duration::from_millis(40),
+            ..QueueLimits::default()
+        },
+    );
+    queue
+        .append(Signal::Logs, &record(b"an early log"))
+        .expect("an append");
+    std::thread::sleep(Duration::from_millis(50));
+    queue
+        .append(Signal::Traces, &record(b"a late span"))
+        .expect("an append");
+
+    queue.seal_if_due().expect("a seal");
+    assert_eq!(queue.oldest_sealed(), Some((Signal::Logs, 1)));
+    queue.commit(Signal::Logs, 1).expect("a commit");
+    assert_eq!(
+        queue.oldest_sealed(),
+        None,
+        "the span is not old enough to go yet"
+    );
 }

@@ -1,23 +1,24 @@
 use std::io::Read;
 
-use crate::signal::Signal;
-
 pub const ZSTD_LEVEL: i32 = 3;
 
-pub const RECORD_HEADER_BYTES: usize = 5;
+pub const RECORD_HEADER_BYTES: usize = 4;
 
-/// A record as it goes into a segment: a signal tag, the payload's length, and
-/// the payload. Uncompressed — the segment compresses the whole of itself as
-/// one zstd stream, so nothing here knows about compression.
-pub fn frame_record(signal: Signal, payload: &[u8]) -> Vec<u8> {
+/// A record as it goes into a segment: the payload's length and the payload.
+/// Uncompressed — the segment compresses the whole of itself as one zstd
+/// stream, so nothing here knows about compression.
+///
+/// Nothing here names a signal either. A segment holds one signal's records
+/// and says so on the wire, so repeating the answer in front of every record
+/// would be paying per export to learn what the request already carries.
+pub fn frame_record(payload: &[u8]) -> Vec<u8> {
     let mut plain = Vec::with_capacity(RECORD_HEADER_BYTES + payload.len());
-    plain.push(signal.tag());
     plain.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     plain.extend_from_slice(payload);
     plain
 }
 
-pub fn split_records(plain: &[u8]) -> Result<Vec<(Signal, &[u8])>, String> {
+pub fn split_records(plain: &[u8]) -> Result<Vec<&[u8]>, String> {
     let mut records = Vec::new();
     let mut at = 0;
     while at < plain.len() {
@@ -27,10 +28,7 @@ pub fn split_records(plain: &[u8]) -> Result<Vec<(Signal, &[u8])>, String> {
                 plain.len() - at
             ));
         };
-        let Some(signal) = Signal::from_tag(header[0]) else {
-            return Err(format!("{} is not a signal tag", header[0]));
-        };
-        let len = u32::from_le_bytes(header[1..5].try_into().expect("four bytes")) as usize;
+        let len = u32::from_le_bytes(header.try_into().expect("four bytes")) as usize;
         at += RECORD_HEADER_BYTES;
         let Some(payload) = plain.get(at..at + len) else {
             return Err(format!(
@@ -39,12 +37,12 @@ pub fn split_records(plain: &[u8]) -> Result<Vec<(Signal, &[u8])>, String> {
             ));
         };
         at += len;
-        records.push((signal, payload));
+        records.push(payload);
     }
     Ok(records)
 }
 
-/// How much of `plain` is whole, well-formed records.
+/// How much of `plain` is whole records.
 ///
 /// What a crash leaves in a segment ends wherever the encoder happened to be,
 /// which is not a record boundary. signy refuses a batch whose last record is
@@ -56,10 +54,7 @@ pub fn whole_records_len(plain: &[u8]) -> usize {
         let Some(header) = plain.get(at..at + RECORD_HEADER_BYTES) else {
             return at;
         };
-        if Signal::from_tag(header[0]).is_none() {
-            return at;
-        }
-        let len = u32::from_le_bytes(header[1..5].try_into().expect("four bytes")) as usize;
+        let len = u32::from_le_bytes(header.try_into().expect("four bytes")) as usize;
         let end = at + RECORD_HEADER_BYTES + len;
         if end > plain.len() {
             return at;
@@ -127,20 +122,14 @@ mod tests {
         let first = b"the first request's bytes, long enough to be worth compressing";
         let second = b"the second request's bytes, also long enough to be worth it";
 
-        let mut plain = frame_record(Signal::Logs, first);
-        plain.extend_from_slice(&frame_record(Signal::Traces, second));
+        let mut plain = frame_record(first);
+        plain.extend_from_slice(&frame_record(second));
         let body = zstd::encode_all(plain.as_slice(), ZSTD_LEVEL).unwrap();
 
         let decompressed = decompress(&body, plain.len()).unwrap();
         let records = split_records(&decompressed).unwrap();
 
-        assert_eq!(
-            records,
-            vec![
-                (Signal::Logs, first.as_slice()),
-                (Signal::Traces, second.as_slice())
-            ]
-        );
+        assert_eq!(records, vec![first.as_slice(), second.as_slice()]);
     }
 
     #[test]
@@ -166,15 +155,14 @@ mod tests {
 
         let mut written = Vec::new();
         for request in &requests {
-            written.extend_from_slice(&frame_record(Signal::Logs, &request.encode_to_vec()));
+            written.extend_from_slice(&frame_record(&request.encode_to_vec()));
         }
         let body = zstd::encode_all(written.as_slice(), ZSTD_LEVEL).unwrap();
 
         let plain = decompress(&body, written.len()).unwrap();
         assert_eq!(plain, written);
         let mut merged_bytes = Vec::new();
-        for (signal, payload) in split_records(&plain).unwrap() {
-            assert_eq!(signal, Signal::Logs);
+        for payload in split_records(&plain).unwrap() {
             merged_bytes.extend_from_slice(payload);
         }
         let merged = ExportLogsServiceRequest::decode(merged_bytes.as_slice()).unwrap();
@@ -189,10 +177,10 @@ mod tests {
     /// kept is the last record that arrived whole.
     #[test]
     fn a_recovered_stream_is_cut_at_the_last_whole_record() {
-        let mut plain = frame_record(Signal::Logs, b"first");
-        plain.extend_from_slice(&frame_record(Signal::Traces, b"second"));
+        let mut plain = frame_record(b"first");
+        plain.extend_from_slice(&frame_record(b"second"));
         let whole = plain.len();
-        plain.extend_from_slice(&frame_record(Signal::Logs, b"cut short"));
+        plain.extend_from_slice(&frame_record(b"cut short"));
         plain.truncate(whole + RECORD_HEADER_BYTES + 3);
 
         assert_eq!(whole_records_len(&plain), whole);
@@ -202,32 +190,18 @@ mod tests {
         plain.truncate(whole);
         assert_eq!(
             split_records(&plain).unwrap(),
-            vec![
-                (Signal::Logs, b"first".as_slice()),
-                (Signal::Traces, b"second".as_slice())
-            ]
+            vec![b"first".as_slice(), b"second".as_slice()]
         );
     }
 
     #[test]
     fn a_record_that_claims_more_than_it_carries_is_refused() {
         let mut plain = Vec::new();
-        plain.push(Signal::Logs.tag());
         plain.extend_from_slice(&64u32.to_le_bytes());
         plain.extend_from_slice(b"only eight");
 
         let error = split_records(&plain).unwrap_err();
         assert!(error.contains("claims 64 bytes"), "{error}");
-    }
-
-    #[test]
-    fn a_record_under_an_unknown_tag_is_refused() {
-        let mut plain = Vec::new();
-        plain.push(9);
-        plain.extend_from_slice(&0u32.to_le_bytes());
-
-        let error = split_records(&plain).unwrap_err();
-        assert!(error.contains("not a signal tag"), "{error}");
     }
 
     #[test]

@@ -12,6 +12,7 @@ use bytes::Bytes;
 use tokio::sync::watch;
 
 use crate::queue::{Queue, SealedSegment, SenderId};
+use crate::signal::Signal;
 
 pub use transport::HttpTransport;
 
@@ -32,13 +33,15 @@ pub enum Outcome {
 /// One segment on its way to signy.
 ///
 /// The body is the segment file, byte for byte: one zstd stream over every
-/// record the segment took. The sender and the segment number are what let
-/// signy skip what it already stored: a segment is sent from its first record
-/// every time, so signy counts as it reads and knows exactly which records it
-/// has seen before.
+/// record the segment took. The sender, the signal and the segment number are
+/// what let signy skip what it already stored: each signal is a stream of its
+/// own, numbered from one, and a segment is sent from its first record every
+/// time, so signy counts as it reads and knows exactly which records it has
+/// seen before.
 pub struct Shipment {
     pub body: Bytes,
     pub sender: SenderId,
+    pub signal: Signal,
     pub segment: u64,
 }
 
@@ -100,12 +103,12 @@ impl<T: Transport> Sender<T> {
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) {
         while !*shutdown.borrow() {
             // Before looking for work: a quiet host would otherwise hold its
-            // records until the open segment filled.
+            // records until a segment filled.
             if let Err(error) = self.queue.seal_if_due() {
-                tracing::error!(%error, "the open segment could not be closed");
+                tracing::error!(%error, "an open segment could not be closed");
             }
 
-            let Some(seq) = self.queue.oldest_sealed() else {
+            let Some((signal, seq)) = self.queue.oldest_sealed() else {
                 tokio::select! {
                     _ = self.queue.wait_for_sealed() => {}
                     _ = tokio::time::sleep(self.config.retry_initial) => {}
@@ -115,11 +118,17 @@ impl<T: Transport> Sender<T> {
             };
 
             let queue = self.queue.clone();
-            let segment = tokio::task::spawn_blocking(move || queue.read_segment(seq)).await;
+            let segment =
+                tokio::task::spawn_blocking(move || queue.read_segment(signal, seq)).await;
             let segment = match segment {
                 Ok(Ok(segment)) => segment,
                 Ok(Err(error)) => {
-                    tracing::error!(%error, segment = seq, "the segment could not be read");
+                    tracing::error!(
+                        %error,
+                        signal = signal.as_str(),
+                        segment = seq,
+                        "the segment could not be read"
+                    );
                     tokio::time::sleep(self.config.retry_initial).await;
                     continue;
                 }
@@ -138,7 +147,7 @@ impl<T: Transport> Sender<T> {
         segment: SealedSegment,
         shutdown: &mut watch::Receiver<bool>,
     ) {
-        let SealedSegment { seq, body } = segment;
+        let SealedSegment { signal, seq, body } = segment;
         let bytes = body.len() as u64;
         let body = Bytes::from(body);
 
@@ -150,13 +159,14 @@ impl<T: Transport> Sender<T> {
             let shipment = Shipment {
                 body: body.clone(),
                 sender: self.queue.sender_id(),
+                signal,
                 segment: seq,
             };
             match self.transport.deliver(shipment).await {
                 Outcome::Accepted(stored) => {
                     self.stats.sent_segments.fetch_add(1, Ordering::Relaxed);
                     self.stats.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
-                    self.commit(stored.max(seq));
+                    self.commit(signal, stored.max(seq));
                     return;
                 }
                 // Permanent for this segment's shape rather than its content:
@@ -166,19 +176,21 @@ impl<T: Transport> Sender<T> {
                 Outcome::Refused(reason) => {
                     tracing::error!(
                         reason,
+                        signal = signal.as_str(),
                         segment = seq,
                         bytes,
                         "dropping a segment signy refuses to accept"
                     );
                     self.stats.refused_segments.fetch_add(1, Ordering::Relaxed);
                     self.stats.refused_bytes.fetch_add(bytes, Ordering::Relaxed);
-                    self.commit(seq);
+                    self.commit(signal, seq);
                     return;
                 }
                 Outcome::Retry(reason) => {
                     self.stats.retries.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         reason,
+                        signal = signal.as_str(),
                         segment = seq,
                         backoff_ms = backoff.as_millis() as u64,
                         "signy did not take the segment"
@@ -193,8 +205,8 @@ impl<T: Transport> Sender<T> {
         }
     }
 
-    fn commit(&self, acked: u64) {
-        if let Err(error) = self.queue.commit(acked) {
+    fn commit(&self, signal: Signal, acked: u64) {
+        if let Err(error) = self.queue.commit(signal, acked) {
             tracing::error!(%error, "the cursor could not be advanced");
         }
     }

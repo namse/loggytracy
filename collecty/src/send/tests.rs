@@ -5,11 +5,12 @@ use parking_lot::Mutex;
 
 use super::*;
 use crate::queue::{Queue, QueueLimits, Record};
+use crate::signal::Signal;
 use crate::test_support::Scratch;
 
 struct Scripted {
     respond: Box<dyn Fn(&Bytes) -> Outcome + Send + Sync>,
-    segments: Mutex<Vec<u64>>,
+    segments: Mutex<Vec<(Signal, u64)>>,
     bytes: Mutex<Vec<usize>>,
 }
 
@@ -22,7 +23,7 @@ impl Scripted {
         })
     }
 
-    fn segments(&self) -> Vec<u64> {
+    fn segments(&self) -> Vec<(Signal, u64)> {
         self.segments.lock().clone()
     }
 
@@ -34,7 +35,9 @@ impl Scripted {
 impl Transport for Scripted {
     fn deliver<'a>(&'a self, shipment: Shipment) -> DeliverFuture<'a> {
         Box::pin(async move {
-            self.segments.lock().push(shipment.segment);
+            self.segments
+                .lock()
+                .push((shipment.signal, shipment.segment));
             self.bytes.lock().push(shipment.body.len());
             (self.respond)(&shipment.body)
         })
@@ -45,6 +48,7 @@ fn shipment(body: &'static [u8]) -> Shipment {
     Shipment {
         body: Bytes::from_static(body),
         sender: crate::queue::SenderId::generate().expect("an id"),
+        signal: Signal::Logs,
         segment: 1,
     }
 }
@@ -64,9 +68,12 @@ fn queue_with(scratch: &Scratch, bodies: &[Vec<u8>]) -> Arc<Queue> {
         Arc::new(Queue::open(scratch.path(), eager(), crate::wire::ZSTD_LEVEL).expect("a queue"));
     for body in bodies {
         queue
-            .append(&Record {
-                plain: body.clone(),
-            })
+            .append(
+                Signal::Logs,
+                &Record {
+                    plain: body.clone(),
+                },
+            )
             .expect("an append");
         queue.seal_if_due().expect("a seal");
     }
@@ -75,15 +82,15 @@ fn queue_with(scratch: &Scratch, bodies: &[Vec<u8>]) -> Arc<Queue> {
 
 fn records(count: usize) -> Vec<Vec<u8>> {
     (0..count)
-        .map(|index| crate::wire::frame_record(crate::signal::Signal::Logs, &[index as u8; 32]))
+        .map(|index| crate::wire::frame_record(&[index as u8; 32]))
         .collect()
 }
 
 async fn deliver_all<T: Transport>(sender: &Sender<T>, queue: &Queue) {
     let (_tx, mut rx) = watch::channel(false);
     queue.seal_if_due().expect("a seal");
-    while let Some(seq) = queue.oldest_sealed() {
-        let segment = queue.read_segment(seq).expect("a segment");
+    while let Some((signal, seq)) = queue.oldest_sealed() {
+        let segment = queue.read_segment(signal, seq).expect("a segment");
         sender.deliver(segment, &mut rx).await;
         queue.seal_if_due().expect("a seal");
     }
@@ -98,7 +105,10 @@ async fn a_delivered_segment_advances_the_cursor_and_unlinks_the_file() {
 
     deliver_all(&sender, &queue).await;
 
-    assert_eq!(transport.segments(), vec![1, 2, 3]);
+    assert_eq!(
+        transport.segments(),
+        vec![(Signal::Logs, 1), (Signal::Logs, 2), (Signal::Logs, 3)]
+    );
     assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 3);
     assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 3);
     assert!(!queue.has_sealed());
@@ -126,7 +136,10 @@ async fn a_retried_segment_is_sent_whole_again() {
     tokio::time::pause();
     deliver_all(&sender, &queue).await;
 
-    assert_eq!(transport.segments(), vec![1, 1, 1]);
+    assert_eq!(
+        transport.segments(),
+        vec![(Signal::Logs, 1), (Signal::Logs, 1), (Signal::Logs, 1)]
+    );
     let sizes = transport.bytes();
     assert!(sizes[0] > 0);
     assert!(
@@ -149,7 +162,7 @@ async fn a_refused_segment_is_dropped_whole_and_counted() {
     let transport = Scripted::new(|body: &Bytes| {
         let plain = crate::wire::decompress(body, body.len() * 8).expect("a stream");
         let records = crate::wire::split_records(&plain).expect("framed records");
-        if records[0].1[0] == 0 {
+        if records[0][0] == 0 {
             Outcome::Refused("signy cannot read this".to_string())
         } else {
             Outcome::Accepted(0)
@@ -159,7 +172,10 @@ async fn a_refused_segment_is_dropped_whole_and_counted() {
 
     deliver_all(&sender, &queue).await;
 
-    assert_eq!(transport.segments(), vec![1, 2]);
+    assert_eq!(
+        transport.segments(),
+        vec![(Signal::Logs, 1), (Signal::Logs, 2)]
+    );
     assert_eq!(sender.stats().refused_segments.load(Ordering::Relaxed), 1);
     assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 1);
     assert!(!queue.has_sealed());
@@ -173,15 +189,19 @@ async fn shutdown_stops_a_retry_loop_without_advancing_the_cursor() {
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
 
     let (tx, mut rx) = watch::channel(false);
-    let seq = queue.oldest_sealed().expect("a closed segment");
-    let segment = queue.read_segment(seq).expect("a segment");
+    let (signal, seq) = queue.oldest_sealed().expect("a closed segment");
+    let segment = queue.read_segment(signal, seq).expect("a segment");
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let _ = tx.send(true);
     });
     sender.deliver(segment, &mut rx).await;
 
-    assert_eq!(queue.oldest_sealed(), Some(1), "the segment is still owed");
+    assert_eq!(
+        queue.oldest_sealed(),
+        Some((Signal::Logs, 1)),
+        "the segment is still owed"
+    );
     assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 0);
 }
 
@@ -191,7 +211,9 @@ async fn the_run_loop_closes_the_open_segment_and_ships_it() {
     let queue =
         Arc::new(Queue::open(scratch.path(), eager(), crate::wire::ZSTD_LEVEL).expect("a queue"));
     for body in records(3) {
-        queue.append(&Record { plain: body }).expect("an append");
+        queue
+            .append(Signal::Logs, &Record { plain: body })
+            .expect("an append");
     }
     let transport = Scripted::new(|_| Outcome::Accepted(0));
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
@@ -205,7 +227,7 @@ async fn the_run_loop_closes_the_open_segment_and_ships_it() {
 
     // One segment, because nothing closed it between the appends, and it went
     // whole.
-    assert_eq!(transport.segments(), vec![1]);
+    assert_eq!(transport.segments(), vec![(Signal::Logs, 1)]);
     assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 1);
     assert_eq!(queue.stats().appended_records, 3);
     assert!(!queue.has_sealed());
@@ -224,7 +246,7 @@ async fn an_answer_beyond_the_segment_clears_everything_under_it() {
 
     assert_eq!(
         transport.segments(),
-        vec![1],
+        vec![(Signal::Logs, 1)],
         "the rest were already stored"
     );
     assert!(
@@ -233,7 +255,7 @@ async fn an_answer_beyond_the_segment_clears_everything_under_it() {
     );
 }
 
-type SeenRequest = (String, String, String, String);
+type SeenRequest = (String, String, String, String, String);
 
 async fn fake_signy(status: http::StatusCode, seen: Arc<Mutex<Vec<SeenRequest>>>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -264,6 +286,7 @@ async fn fake_signy(status: http::StatusCode, seen: Arc<Mutex<Vec<SeenRequest>>>
                                 request.uri().path().to_string(),
                                 header("content-encoding"),
                                 header(super::transport::SENDER_HEADER),
+                                header(super::transport::SIGNAL_HEADER),
                                 header(super::transport::SEGMENT_HEADER),
                             ));
                             http::Response::builder().status(status).body(
@@ -288,6 +311,7 @@ async fn a_success_over_http_carries_the_encoding_and_who_sent_which_segment() {
     let address = fake_signy(http::StatusCode::OK, seen.clone()).await;
     let transport = HttpTransport::new(format!("http://{address}"), Duration::from_secs(5));
     let mut shipment = shipment(b"frames");
+    shipment.signal = Signal::Traces;
     shipment.segment = 7;
     let sender = shipment.sender.to_string();
 
@@ -304,6 +328,7 @@ async fn a_success_over_http_carries_the_encoding_and_who_sent_which_segment() {
             "/signy/api/v1/collect".to_string(),
             "zstd".to_string(),
             sender,
+            "traces".to_string(),
             "7".to_string()
         )]
     );

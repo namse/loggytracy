@@ -1,14 +1,23 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 const SEGMENT_SUFFIX: &str = ".seg";
 const TEMPORARY_SUFFIX: &str = ".tmp";
 
+/// A segment file as the directory describes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SegmentMeta {
+pub struct SegmentFile {
     pub seq: u64,
     pub bytes: u64,
+    /// When it was last written.
+    ///
+    /// Numbering runs per signal, so a number places a segment among its own
+    /// signal's and nowhere else. This is the only thing left that puts three
+    /// signals' segments in one order, and it is read once, at open, to
+    /// recover the order this process then keeps in memory.
+    pub modified: SystemTime,
 }
 
 /// The open segment: one zstd stream, written until the segment closes.
@@ -85,8 +94,8 @@ pub fn remove(dir: &Path, seq: u64) -> io::Result<()> {
     std::fs::remove_file(path(dir, seq))
 }
 
-pub fn list(dir: &Path) -> io::Result<Vec<SegmentMeta>> {
-    let mut metas = Vec::new();
+pub fn list(dir: &Path) -> io::Result<Vec<SegmentFile>> {
+    let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -97,13 +106,15 @@ pub fn list(dir: &Path) -> io::Result<Vec<SegmentMeta>> {
         let Ok(seq) = digits.parse::<u64>() else {
             continue;
         };
-        metas.push(SegmentMeta {
+        let metadata = entry.metadata()?;
+        files.push(SegmentFile {
             seq,
-            bytes: entry.metadata()?.len(),
+            bytes: metadata.len(),
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         });
     }
-    metas.sort_by_key(|meta| meta.seq);
-    Ok(metas)
+    files.sort_by_key(|file| file.seq);
+    Ok(files)
 }
 
 /// A rewrite that a crash interrupted. The segment it was repairing is still

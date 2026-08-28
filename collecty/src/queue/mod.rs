@@ -12,7 +12,9 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 pub use identity::SenderId;
-use segment::{SegmentMeta, SegmentWriter};
+use segment::SegmentWriter;
+
+use crate::signal::Signal;
 
 /// Segments are numbered from one so that zero can mean "signy has none of
 /// them" in the cursor and in signy's own memory.
@@ -56,8 +58,16 @@ pub struct QueueStats {
     pub dropped_segments: u64,
 }
 
+/// The disk queue: one stream of segments per signal, under one identity.
+///
+/// A segment holds one signal's records and nothing else, so the exports
+/// compressed together are the ones that look alike, and a request signy takes
+/// goes down one ingest path. What that costs is the ordering: numbering runs
+/// per signal, so nothing on disk puts two signals' segments in one order and
+/// the queue keeps that order in memory instead.
 pub struct Queue {
-    dir: PathBuf,
+    /// Indexed by `Signal::index`.
+    dirs: [PathBuf; Signal::ALL.len()],
     sender: SenderId,
     limits: QueueLimits,
     level: i32,
@@ -66,18 +76,43 @@ pub struct Queue {
 }
 
 struct Inner {
-    segments: VecDeque<SegmentMeta>,
+    /// Indexed by `Signal::index`.
+    signals: [SignalQueue; Signal::ALL.len()],
+    /// The last arrival stamp handed out. Never written down: it orders the
+    /// segments this process is holding, and a restart works the order out
+    /// again from what the files say.
+    stamped: u64,
+    stats: QueueStats,
+}
+
+/// One signal's segments. Its own numbering, its own open segment, its own age.
+struct SignalQueue {
+    segments: VecDeque<Held>,
     active: SegmentWriter,
     /// When the open segment took its first record. `None` while it is empty,
     /// so an idle collector does not roll empty segments forever, and the only
     /// honest answer to "is it empty" — the file can still be nothing while
     /// the encoder holds a block's worth.
     active_since: Option<Instant>,
-    stats: QueueStats,
 }
 
-/// One record on its way into a segment: a signal tag, a length, and an OTLP
-/// export. Uncompressed — the segment compresses.
+struct Held {
+    seq: u64,
+    bytes: u64,
+    /// Where this segment falls among all three signals', oldest first.
+    ///
+    /// A number is only comparable inside its own signal now, and both the
+    /// order segments are sent in and the one they are dropped in are meant to
+    /// be the order they stopped collecting. So the queue stamps a segment as
+    /// it closes it, and at open reads that order back off the files' own
+    /// timestamps, which record the same moment.
+    ///
+    /// Zero while the segment is open. Only a closed one is ever compared.
+    stamp: u64,
+}
+
+/// One record on its way into a segment: a length and an OTLP export.
+/// Uncompressed — the segment compresses.
 pub struct Record {
     pub plain: Vec<u8>,
 }
@@ -86,8 +121,10 @@ pub struct Record {
 ///
 /// `body` is the file, byte for byte. One zstd stream over every record the
 /// segment took, which is exactly what the wire wants, so nothing is parsed,
-/// unwrapped or copied on the way out.
+/// unwrapped or copied on the way out. The signal travels beside it rather
+/// than inside it: every record in there is one, and the request says which.
 pub struct SealedSegment {
+    pub signal: Signal,
     pub seq: u64,
     pub body: Vec<u8>,
 }
@@ -96,41 +133,6 @@ impl Queue {
     pub fn open(dir: &Path, limits: QueueLimits, level: i32) -> io::Result<Queue> {
         std::fs::create_dir_all(dir)?;
         segment::sweep_temporaries(dir)?;
-        let mut metas = segment::list(dir)?;
-
-        // From the highest number the directory ever held, not from the
-        // highest still there: signy holds a high-water mark under this
-        // sender's name, and numbering that went backwards would have it skip
-        // every segment under that mark as one it already stored.
-        let next = metas
-            .last()
-            .map(|meta| meta.seq + 1)
-            .unwrap_or(FIRST_SEGMENT);
-
-        // A stream cannot be resumed: the encoder's state went with the
-        // process that held it. So the segment a previous run left open is
-        // closed where it stopped, and this run starts a fresh one. Only the
-        // last segment can be unfinished — a roll closes and syncs the old
-        // segment before it creates the next one.
-        if let Some(last) = metas.pop() {
-            match segment::reseal(dir, last.seq, level)? {
-                Some(bytes) => metas.push(SegmentMeta {
-                    seq: last.seq,
-                    bytes,
-                }),
-                None => tracing::warn!(
-                    segment = last.seq,
-                    "a segment a crash left with nothing readable in it is dropped"
-                ),
-            }
-        }
-
-        let active = SegmentWriter::create(dir, next, level)?;
-        let queued_bytes = metas.iter().map(|meta| meta.bytes).sum();
-        metas.push(SegmentMeta {
-            seq: next,
-            bytes: 0,
-        });
 
         // An identity file that cannot be read is replaced rather than
         // repaired. Keeping the name while the segment numbering restarted
@@ -145,19 +147,94 @@ impl Queue {
             }
         };
 
+        let dirs = Signal::ALL.map(|signal| dir.join(signal.as_str()));
+        let mut recovered = Vec::new();
+        let mut queued_bytes = 0;
+        // From the highest number the signal's directory ever held, not from
+        // the highest still there: signy holds a high-water mark per sender
+        // and signal, and numbering that went backwards would have it skip
+        // every segment under that mark as one it already stored. Taken before
+        // recovery runs, so a segment it finds empty and unlinks does not hand
+        // its number to the one that follows.
+        let mut nexts = [FIRST_SEGMENT; Signal::ALL.len()];
+        for (slot, dir) in dirs.iter().enumerate() {
+            std::fs::create_dir_all(dir)?;
+            segment::sweep_temporaries(dir)?;
+            let mut files = segment::list(dir)?;
+            if let Some(last) = files.last() {
+                nexts[slot] = last.seq + 1;
+            }
+
+            // A stream cannot be resumed: the encoder's state went with the
+            // process that held it. So the segment a previous run left open is
+            // closed where it stopped, and this run starts a fresh one. Only
+            // the last segment of a signal can be unfinished — a roll closes
+            // and syncs the old segment before it creates the next one.
+            if let Some(mut last) = files.pop() {
+                match segment::reseal(dir, last.seq, level)? {
+                    Some(bytes) => {
+                        last.bytes = bytes;
+                        files.push(last);
+                    }
+                    None => tracing::warn!(
+                        signal = Signal::ALL[slot].as_str(),
+                        segment = last.seq,
+                        "a segment a crash left with nothing readable in it is dropped"
+                    ),
+                }
+            }
+
+            queued_bytes += files.iter().map(|file| file.bytes).sum::<u64>();
+            recovered.extend(files.into_iter().map(|file| (slot, file)));
+        }
+
+        // The order the three signals closed their segments in, back off the
+        // one thing that still records it. Ties fall to the signal's own
+        // numbering, which is an order even when a filesystem's timestamps are
+        // too coarse to be one.
+        recovered.sort_by_key(|(slot, file)| (file.modified, *slot, file.seq));
+
+        let mut stamped = 0;
+        let mut segments = Signal::ALL.map(|_| VecDeque::new());
+        for (slot, file) in recovered {
+            stamped += 1;
+            segments[slot].push_back(Held {
+                seq: file.seq,
+                bytes: file.bytes,
+                stamp: stamped,
+            });
+        }
+
+        let mut signals = Vec::with_capacity(Signal::ALL.len());
+        for (slot, dir) in dirs.iter().enumerate() {
+            let next = nexts[slot];
+            let active = SegmentWriter::create(dir, next, level)?;
+            segments[slot].push_back(Held {
+                seq: next,
+                bytes: 0,
+                stamp: 0,
+            });
+            signals.push(SignalQueue {
+                segments: std::mem::take(&mut segments[slot]),
+                active,
+                active_since: None,
+            });
+        }
+
         // How far signy has got is not read back from anywhere, because the
         // files say it: one it has answered for was unlinked on the spot. A
         // crash between the answer and the unlink leaves a segment behind, and
         // offering it again costs one request that signy answers unread.
         Ok(Queue {
-            dir: dir.to_path_buf(),
+            dirs,
             sender,
             limits,
             level,
             inner: Mutex::new(Inner {
-                segments: metas.into(),
-                active,
-                active_since: None,
+                signals: signals
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("one queue per signal")),
+                stamped,
                 stats: QueueStats {
                     queued_bytes,
                     ..QueueStats::default()
@@ -171,7 +248,7 @@ impl Queue {
         self.sender
     }
 
-    pub fn append(&self, record: &Record) -> io::Result<()> {
+    pub fn append(&self, signal: Signal, record: &Record) -> io::Result<()> {
         let plain_len = record.plain.len() as u64;
         if plain_len > self.limits.max_bytes {
             return Err(io::Error::new(
@@ -188,6 +265,8 @@ impl Queue {
         // Against the plain length, which is all that is known before the
         // record is compressed. It only ever overstates what the record will
         // occupy, so the queue errs towards keeping room rather than filling.
+        // The budget is the whole queue's, not a share per signal: a host that
+        // only ships logs should be free to spend all of it on them.
         while inner.stats.queued_bytes + plain_len > self.limits.max_bytes {
             self.drop_oldest(&mut inner)?;
         }
@@ -195,20 +274,21 @@ impl Queue {
         // After crossing rather than before: the compressed size of a record
         // is not known until it has been written, and the encoder emits in
         // blocks, so a segment overshoots by at most the last block.
-        if inner.active.written() >= self.limits.max_segment_bytes {
-            self.roll(&mut inner)?;
+        if inner.signals[signal.index()].active.written() >= self.limits.max_segment_bytes {
+            self.roll(&mut inner, signal)?;
         }
 
-        inner.active.write_all(&record.plain)?;
-        if inner.active_since.is_none() {
-            inner.active_since = Some(Instant::now());
+        let queue = &mut inner.signals[signal.index()];
+        queue.active.write_all(&record.plain)?;
+        if queue.active_since.is_none() {
+            queue.active_since = Some(Instant::now());
         }
 
-        let written = inner.active.written();
-        let back = inner
+        let written = queue.active.written();
+        let back = queue
             .segments
             .back_mut()
-            .expect("a queue always holds its active segment");
+            .expect("a signal always holds its active segment");
         let grew = written - back.bytes;
         back.bytes = written;
         inner.stats.queued_bytes += grew;
@@ -220,44 +300,41 @@ impl Queue {
         Ok(())
     }
 
-    /// Close the open segment if it has been collecting for long enough.
+    /// Close every open segment that has been collecting for long enough.
     ///
     /// Called by the sender before it looks for work: without it a quiet host
-    /// would hold its records until the segment filled, which at eight
-    /// mebibytes could be hours.
+    /// would hold its records until a segment filled, which at eight mebibytes
+    /// could be hours. Each signal keeps its own age, so a busy one does not
+    /// carry a quiet one's records out with it any more.
     pub fn seal_if_due(&self) -> io::Result<()> {
         let mut inner = self.inner.lock();
-        let Some(since) = inner.active_since else {
-            return Ok(());
-        };
-        if since.elapsed() < self.limits.max_segment_age {
-            return Ok(());
+        for signal in Signal::ALL {
+            let due = inner.signals[signal.index()]
+                .active_since
+                .is_some_and(|since| since.elapsed() >= self.limits.max_segment_age);
+            if due {
+                self.roll(&mut inner, signal)?;
+            }
         }
-        self.roll(&mut inner)
+        Ok(())
     }
 
-    /// Close the open segment whatever its age. What a clean shutdown does, so
-    /// that the records it holds are on the device rather than left for the
-    /// next process to recover.
+    /// Close every open segment whatever its age. What a clean shutdown does,
+    /// so that the records they hold are on the device rather than left for
+    /// the next process to recover.
     pub fn seal(&self) -> io::Result<()> {
         let mut inner = self.inner.lock();
-        self.roll(&mut inner)
+        for signal in Signal::ALL {
+            self.roll(&mut inner, signal)?;
+        }
+        Ok(())
     }
 
-    /// The lowest-numbered closed segment. Everything on disk is still owed,
-    /// so this is simply the oldest one that is not still being written.
-    pub fn oldest_sealed(&self) -> Option<u64> {
-        let inner = self.inner.lock();
-        let active = inner
-            .segments
-            .back()
-            .expect("a queue always holds its active segment")
-            .seq;
-        inner
-            .segments
-            .iter()
-            .map(|meta| meta.seq)
-            .find(|seq| *seq != active)
+    /// The closed segment that has been waiting longest, whichever signal it
+    /// belongs to. Everything on disk is still owed, so this is simply the
+    /// oldest one that is not still being written.
+    pub fn oldest_sealed(&self) -> Option<(Signal, u64)> {
+        oldest_sealed(&self.inner.lock())
     }
 
     pub fn has_sealed(&self) -> bool {
@@ -280,87 +357,119 @@ impl Queue {
     /// a batch it cannot read is a `400`, which is a refusal, which drops the
     /// segment. Checking here would mean decompressing every segment twice to
     /// reach the same place.
-    pub fn read_segment(&self, seq: u64) -> io::Result<SealedSegment> {
+    pub fn read_segment(&self, signal: Signal, seq: u64) -> io::Result<SealedSegment> {
         let mut body = Vec::new();
-        segment::open_for_read(&self.dir, seq)?.read_to_end(&mut body)?;
-        Ok(SealedSegment { seq, body })
+        segment::open_for_read(&self.dirs[signal.index()], seq)?.read_to_end(&mut body)?;
+        Ok(SealedSegment { signal, seq, body })
     }
 
-    /// signy has every segment up to and including this one, so they are
-    /// unlinked. That is the whole of the bookkeeping: nothing is written down
-    /// about how far signy has got, because what is left on disk says it.
-    pub fn commit(&self, acked: u64) -> io::Result<()> {
+    /// signy has every segment of this signal up to and including this one, so
+    /// they are unlinked. That is the whole of the bookkeeping: nothing is
+    /// written down about how far signy has got, because what is left on disk
+    /// says it.
+    pub fn commit(&self, signal: Signal, acked: u64) -> io::Result<()> {
         let mut inner = self.inner.lock();
-        let active = inner
+        let dir = &self.dirs[signal.index()];
+        let queue = &mut inner.signals[signal.index()];
+        let active = queue
             .segments
             .back()
-            .expect("a queue always holds its active segment")
+            .expect("a signal always holds its active segment")
             .seq;
-        while let Some(front) = inner.segments.front() {
+        let mut freed = 0;
+        while let Some(front) = queue.segments.front() {
             if front.seq > acked || front.seq == active {
                 break;
             }
-            let meta = inner.segments.pop_front().expect("just inspected");
-            segment::remove(&self.dir, meta.seq)?;
-            inner.stats.queued_bytes -= meta.bytes;
+            let held = queue.segments.pop_front().expect("just inspected");
+            segment::remove(dir, held.seq)?;
+            freed += held.bytes;
         }
+        inner.stats.queued_bytes -= freed;
         Ok(())
     }
 
     pub fn stats(&self) -> QueueStats {
         let inner = self.inner.lock();
         QueueStats {
-            segments: inner.segments.len(),
+            segments: inner.signals.iter().map(|queue| queue.segments.len()).sum(),
             ..inner.stats
         }
     }
 
-    fn roll(&self, inner: &mut Inner) -> io::Result<()> {
+    fn roll(&self, inner: &mut Inner, signal: Signal) -> io::Result<()> {
         // The file can still be empty while the encoder holds a block's worth,
         // so what says the segment is empty is that nothing was appended.
-        if inner.active_since.is_none() {
+        if inner.signals[signal.index()].active_since.is_none() {
             return Ok(());
         }
-        let next = inner
+        inner.stamped += 1;
+        let stamp = inner.stamped;
+        let queue = &mut inner.signals[signal.index()];
+        let next = queue
             .segments
             .back()
-            .expect("a queue always holds its active segment")
+            .expect("a signal always holds its active segment")
             .seq
             + 1;
 
         // Closing writes out what the encoder held and forces the lot to the
         // device, so the segment's true size is only known here.
-        let bytes = inner.active.finish()?;
-        let back = inner
+        let bytes = queue.active.finish()?;
+        let back = queue
             .segments
             .back_mut()
-            .expect("a queue always holds its active segment");
-        inner.stats.queued_bytes += bytes - back.bytes;
+            .expect("a signal always holds its active segment");
+        let grew = bytes - back.bytes;
         back.bytes = bytes;
+        back.stamp = stamp;
 
-        inner.active = SegmentWriter::create(&self.dir, next, self.level)?;
-        inner.active_since = None;
-        inner.segments.push_back(SegmentMeta {
+        queue.active = SegmentWriter::create(&self.dirs[signal.index()], next, self.level)?;
+        queue.active_since = None;
+        queue.segments.push_back(Held {
             seq: next,
             bytes: 0,
+            stamp: 0,
         });
+        inner.stats.queued_bytes += grew;
         self.appended.notify_waiters();
         Ok(())
     }
 
     fn drop_oldest(&self, inner: &mut Inner) -> io::Result<()> {
-        if inner.segments.len() == 1 {
-            self.roll(inner)?;
+        if oldest_sealed(inner).is_none() {
+            for signal in Signal::ALL {
+                self.roll(inner, signal)?;
+            }
         }
-        if inner.segments.len() == 1 {
-            // An empty active segment cannot be rolled and cannot be dropped.
+        let Some((signal, _)) = oldest_sealed(inner) else {
+            // Three empty active segments, which cannot be rolled and cannot
+            // be dropped.
             return Ok(());
-        }
-        let meta = inner.segments.pop_front().expect("length exceeds one");
-        segment::remove(&self.dir, meta.seq)?;
-        inner.stats.queued_bytes -= meta.bytes;
-        inner.stats.dropped_bytes += meta.bytes;
+        };
+        let queue = &mut inner.signals[signal.index()];
+        let held = queue.segments.pop_front().expect("just found sealed");
+        segment::remove(&self.dirs[signal.index()], held.seq)?;
+        inner.stats.queued_bytes -= held.bytes;
+        inner.stats.dropped_bytes += held.bytes;
         inner.stats.dropped_segments += 1;
         Ok(())
     }
+}
+
+/// The oldest closed segment across the three signals, by the order they were
+/// closed. A signal holding only its open segment has none.
+fn oldest_sealed(inner: &Inner) -> Option<(Signal, u64)> {
+    inner
+        .signals
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, queue)| {
+            let front = queue.segments.front()?;
+            // The open segment is always the back one, so a single held
+            // segment is the one still being written.
+            (queue.segments.len() > 1).then_some((front.stamp, Signal::ALL[slot], front.seq))
+        })
+        .min_by_key(|(stamp, _, _)| *stamp)
+        .map(|(_, signal, seq)| (signal, seq))
 }
