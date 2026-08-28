@@ -69,9 +69,13 @@ export SIGNY_CACHE_MAX_BYTES="${SIGNY_CACHE_MAX_BYTES:-8388608}"
 export SIGNY_CACHE_EVICTION_INTERVAL="${SIGNY_CACHE_EVICTION_INTERVAL:-3s}"
 export SIGNY_FLUSH_MAX_INTERVAL="${SIGNY_FLUSH_MAX_INTERVAL:-2s}"
 export SIGNY_MERGE_INTERVAL="${SIGNY_MERGE_INTERVAL:-8s}"
-export SIGNY_RETENTION_PERIOD="${SIGNY_RETENTION_PERIOD:-20s}"
 export SIGNY_RETENTION_GRACE_PERIOD="${SIGNY_RETENTION_GRACE_PERIOD:-5s}"
 export SIGNY_RETENTION_INTERVAL="${SIGNY_RETENTION_INTERVAL:-5s}"
+# The retention period is per-tenant now, and the harness pushes it when it
+# onboards its tenants. The server-wide SIGNY_RETENTION_PERIOD this line used
+# to export stopped being read when retention moved into the tenant policy,
+# so the retention leg above had been running against nothing.
+export SIGNY_LOAD_TENANT_RETENTION="${SIGNY_LOAD_TENANT_RETENTION:-20s}"
 
 "./$BIN_DIR/signy" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!

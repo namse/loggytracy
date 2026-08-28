@@ -229,6 +229,10 @@ async fn run_metric_verify(cfg: Config) {
     }
     let memory_source = cfg.memory_source();
     let corpus = metric_workload::metric_corpus(cfg.seed, &cfg.metric_verify);
+    if let Err(error) = onboard_tenants(&cfg, &[corpus.tenant.as_str()]).await {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     eprintln!(
         "{} phase {:?}: {} instruments, {} decomposed series, {} scrapes",
         cfg.target.name(),
@@ -414,6 +418,11 @@ async fn run_verify(cfg: Config) {
         cfg.verify.rows
     );
     let corpus = matrix::verify_corpus(&cfg);
+    let tenants: Vec<&str> = corpus.tenant_ids.iter().map(|id| id.as_str()).collect();
+    if let Err(error) = onboard_tenants(&cfg, &tenants).await {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 
     // Anonymous memory has to be *sampled*, not read at the ends: the cgroup's
     // own `memory.peak` is a high-water mark but includes reclaimable page
@@ -548,6 +557,11 @@ async fn run_load(cfg: Config) {
         eprintln!("server at {} is not ready: {error}", cfg.http_address);
         std::process::exit(1);
     }
+    let tenants: Vec<&str> = corpus.tenant_ids.iter().map(|id| id.as_str()).collect();
+    if let Err(error) = onboard_tenants(&cfg, &tenants).await {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 
     let mut probe_client = Client::new(&cfg.http_address, cfg.request_timeout());
     let start_metrics = scrape(&mut probe_client).await.unwrap_or_default();
@@ -591,7 +605,12 @@ async fn run_load(cfg: Config) {
         .map(|_| tokio::spawn(query_worker(cfg.clone(), query_rx.clone(), warmup_end)))
         .collect();
     let sampler = tokio::spawn(sampler(cfg.clone(), stop.clone(), run_start));
-    let otlp = tokio::spawn(otlp_workload(cfg.clone(), stop.clone(), deadline));
+    let otlp = tokio::spawn(otlp_workload(
+        cfg.clone(),
+        cfg.target.tenant_header(corpus.tenant_ids[0].as_str()),
+        stop.clone(),
+        deadline,
+    ));
 
     // The stop condition is checked here rather than in each pacer so that
     // "enough work happened" and "long enough happened" are one decision.
@@ -703,6 +722,46 @@ async fn wait_for_ready(cfg: &Config) -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Err(last)
+}
+
+/// Onboard the tenants this run pushes under.
+///
+/// signy's tenant registry *is* the set of pushed retention policies: a
+/// tenant nobody has pushed a policy for is not served, and every push under
+/// it comes back 403. So the harness onboards its own tenants first, the way
+/// a control plane would. The comparison targets have no such API and no
+/// such gate, which is why this is signy-only.
+///
+/// A failure here ends the run. A harness offering a rate that nothing
+/// accepts still fills in every field of the result, and an idle server's
+/// numbers are not distinguishable from a fast one's after the fact.
+async fn onboard_tenants(cfg: &Config, tenants: &[&str]) -> Result<(), String> {
+    if cfg.target != Target::Signy {
+        return Ok(());
+    }
+    let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
+    let body = format!("{{\"retention\": \"{}\"}}", cfg.tenant_retention);
+    for tenant in tenants {
+        let path = format!("/signy/api/v1/admin/tenants/{tenant}/retention");
+        let response = client
+            .request(&Request {
+                method: "PUT",
+                path: &path,
+                body: body.as_bytes(),
+                content_type: "application/json",
+                tenant: None,
+            })
+            .await
+            .map_err(|error| format!("onboarding {tenant}: {error}"))?;
+        if response.status != 200 {
+            return Err(format!(
+                "onboarding {tenant} answered {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body).trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Two attempts, because the second is what survives an idle keep-alive.
@@ -1071,7 +1130,12 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
 /// the log path is loaded. One request in flight by design — it is a garnish
 /// on the workload, not part of the measured rate — but its latency is still
 /// taken from the intended send, so a stall shows.
-async fn otlp_workload(cfg: Config, stop: Arc<AtomicBool>, deadline: Instant) -> OtlpOutcome {
+async fn otlp_workload(
+    cfg: Config,
+    tenant: String,
+    stop: Arc<AtomicBool>,
+    deadline: Instant,
+) -> OtlpOutcome {
     let mut outcome = OtlpOutcome::default();
     // Loki has no trace ingest, so a trace workload would be load one side
     // carries and the other does not.
@@ -1095,7 +1159,7 @@ async fn otlp_workload(cfg: Config, stop: Arc<AtomicBool>, deadline: Instant) ->
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         tokio::time::sleep_until(intended).await;
         let sent = Instant::now();
-        let result = send_otlp(&mut client, &mut rng).await;
+        let result = send_otlp(&mut client, &tenant, &mut rng).await;
         let done = Instant::now();
         outcome.latency.record(
             duration_ms(sent.saturating_duration_since(intended)),
@@ -1112,6 +1176,7 @@ async fn otlp_workload(cfg: Config, stop: Arc<AtomicBool>, deadline: Instant) ->
 
 async fn send_otlp(
     client: &mut TraceServiceClient<tonic::transport::Channel>,
+    tenant: &str,
     rng: &mut signy::corpus::Rng,
 ) -> Result<(), String> {
     let now = unix_nanos();
@@ -1133,8 +1198,18 @@ async fn send_otlp(
             ..Default::default()
         }],
     };
+    let mut export = tonic::Request::new(request);
+    // The same tenancy gate the HTTP path goes through, spelled in gRPC
+    // metadata. Without it every export is refused and the trace leg reports
+    // latency for requests the server never accepted.
+    export.metadata_mut().insert(
+        "x-scope-orgid",
+        tenant
+            .parse()
+            .map_err(|_| format!("{tenant} is not a valid gRPC metadata value"))?,
+    );
     client
-        .export(tonic::Request::new(request))
+        .export(export)
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())

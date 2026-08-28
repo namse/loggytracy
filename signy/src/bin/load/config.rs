@@ -212,6 +212,13 @@ pub struct Config {
 
     pub corpus_rows: usize,
     pub tenants: usize,
+    /// The retention pushed when onboarding this run's tenants.
+    ///
+    /// signy has no server-wide retention period any more: a tenant's policy
+    /// is the only place one lives, and pushing it is also what onboards the
+    /// tenant. `infinite` keeps a run that is not measuring retention from
+    /// deleting its own corpus out from under itself.
+    pub tenant_retention: String,
     pub streams: usize,
     pub labels_per_stream: usize,
     pub metadata_pairs: usize,
@@ -369,6 +376,7 @@ impl Config {
 
             corpus_rows: env_usize("SIGNY_LOAD_CORPUS_ROWS", 50_000).max(1),
             tenants: env_usize("SIGNY_LOAD_TENANTS", 4).max(1),
+            tenant_retention: env_string("SIGNY_LOAD_TENANT_RETENTION", "infinite"),
             streams: env_usize("SIGNY_LOAD_STREAMS", 256).max(1),
             labels_per_stream: env_usize("SIGNY_LOAD_LABELS_PER_STREAM", 6).clamp(1, 10),
             metadata_pairs: env_usize("SIGNY_LOAD_METADATA_PAIRS", 2),
