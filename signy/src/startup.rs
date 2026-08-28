@@ -802,10 +802,10 @@ mod tests {
 
     #[test]
     fn a_bind_address_is_classified_by_host_not_by_spelling() {
-        for addr in ["127.0.0.1:3100", "localhost:3100", "[::1]:4317"] {
+        for addr in ["127.0.0.1:3100", "localhost:3100", "[::1]:3100"] {
             assert!(is_loopback_addr(addr), "{addr}");
         }
-        for addr in ["0.0.0.0:3100", "10.0.0.4:3100", "[::]:4317"] {
+        for addr in ["0.0.0.0:3100", "10.0.0.4:3100", "[::]:3100"] {
             assert!(!is_loopback_addr(addr), "{addr}");
         }
     }
