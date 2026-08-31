@@ -332,6 +332,12 @@ pub struct SeriesCounters {
 const SERIES_OVERHEAD_BYTES: u64 = 320;
 const SPILL_SAMPLE_BYTES: u64 = 16;
 const ADMITTED_SAMPLE_BYTES: u64 = 64;
+/// The temporary accounting charge for a series whose only buffered sample
+/// still fits in the inline representation.  This is the timestamp and the
+/// f64 value; a one-sample series does not need a Gorilla writer or spill
+/// vector until it either receives another sample or crosses a flush
+/// boundary.
+const INLINE_SAMPLE_BYTES: u64 = 16;
 
 /// A handle into a tenant's sample-buffer arena.
 ///
@@ -450,6 +456,167 @@ impl SeriesBuffer {
     fn has_samples(&self) -> bool {
         !self.closed.is_empty() || !self.open.is_empty() || !self.spill.is_empty()
     }
+
+    fn accounted_bytes(&self) -> u64 {
+        self.closed
+            .iter()
+            .map(|chunk| chunk.len() as u64)
+            .sum::<u64>()
+            .saturating_add(self.open.byte_len() as u64)
+            .saturating_add(self.spill.len() as u64 * SPILL_SAMPLE_BYTES)
+    }
+}
+
+/// Storage for one live series' samples.
+///
+/// The common cardinality shape is one sample per series.  Keeping that
+/// sample here avoids constructing the three `Vec` headers and an encoder
+/// that a Gorilla stream carries.  A second sample promotes the value to the
+/// normal stream, and flush/abort do the same before crossing the existing
+/// chunk boundary.  The stream itself remains boxed so the enum's inline size
+/// is just the larger of the two scalar sample fields and a pointer.
+enum SeriesBufferStorage {
+    Empty,
+    Inline { ts_ns: i64, value: f64 },
+    Stream(Box<SeriesBuffer>),
+}
+
+impl SeriesBufferStorage {
+    fn has_samples(&self) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::Inline { .. } => true,
+            Self::Stream(stream) => stream.has_samples(),
+        }
+    }
+
+    fn accounted_bytes(&self) -> u64 {
+        match self {
+            Self::Empty => 0,
+            Self::Inline { .. } => INLINE_SAMPLE_BYTES,
+            Self::Stream(stream) => stream.accounted_bytes(),
+        }
+    }
+
+    /// Promote this value to the existing Gorilla stream representation.
+    /// Empty is useful only as the freshly allocated arena slot; callers that
+    /// need a sample always invoke this after checking `has_samples` or while
+    /// inserting one.
+    fn into_stream(self, last_ts: Option<i64>) -> SeriesBuffer {
+        match self {
+            Self::Empty => SeriesBuffer::new(),
+            Self::Inline { ts_ns, value } => {
+                let mut stream = SeriesBuffer::new();
+                if last_ts.is_some_and(|last| ts_ns < last) {
+                    stream.spill.push((ts_ns, value));
+                } else {
+                    stream.open.append(ts_ns, value);
+                }
+                stream
+            }
+            Self::Stream(stream) => *stream,
+        }
+    }
+
+    /// Append a sample, promoting an inline first sample when needed.  The
+    /// returned value is the change in the same byte estimate used by the
+    /// memtable's accounting counters.
+    fn append(&mut self, last_ts: Option<i64>, ts_ns: i64, value: f64) -> u64 {
+        let before = self.accounted_bytes();
+        if let Self::Inline {
+            ts_ns: first_ts,
+            value: first_value,
+        } = self
+        {
+            let first_ts = *first_ts;
+            let first_value = *first_value;
+            let mut stream = SeriesBuffer::new();
+            if last_ts.is_some_and(|last| first_ts < last) {
+                stream.spill.push((first_ts, first_value));
+            } else {
+                stream.open.append(first_ts, first_value);
+            }
+            *self = Self::Stream(Box::new(stream));
+        }
+
+        match self {
+            Self::Empty => {
+                *self = Self::Inline { ts_ns, value };
+            }
+            Self::Inline { .. } => unreachable!("inline storage was promoted above"),
+            Self::Stream(stream) => {
+                if last_ts.is_some_and(|last| ts_ns < last) {
+                    stream.spill.push((ts_ns, value));
+                } else {
+                    stream.open.append(ts_ns, value);
+                }
+            }
+        }
+        self.accounted_bytes().saturating_sub(before)
+    }
+
+    /// Add this storage's samples to a caller-owned sorted-sample scratch
+    /// vector without changing the storage.
+    fn extend_samples(&self, samples: &mut Vec<(i64, f64)>) -> Result<(), String> {
+        match self {
+            Self::Empty => {}
+            Self::Inline { ts_ns, value } => samples.push((*ts_ns, *value)),
+            Self::Stream(stream) => {
+                for chunk in &stream.closed {
+                    samples.extend(gorilla::decode_all(chunk)?);
+                }
+                if !stream.open.is_empty() {
+                    samples.extend(gorilla::decode_all(&stream.open.clone().close())?);
+                }
+                samples.extend(stream.spill.iter().copied());
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore a snapshot in front of samples that arrived while its flush
+    /// was in flight.  Abort deliberately promotes an inline value: once the
+    /// two generations share a buffer, the existing stream/chunk machinery
+    /// is the single ordering representation again.
+    fn prepend_aborted(
+        &mut self,
+        mut chunks: Vec<Vec<u8>>,
+        mut spill: Vec<(i64, f64)>,
+        current_last_ts: Option<i64>,
+    ) {
+        match self {
+            Self::Empty => {
+                *self = Self::Stream(Box::new(SeriesBuffer {
+                    closed: chunks,
+                    open: gorilla::Encoder::new(),
+                    spill,
+                }));
+            }
+            Self::Inline { ts_ns, value } => {
+                let current = (*ts_ns, *value);
+                let mut stream = SeriesBuffer {
+                    closed: chunks,
+                    open: gorilla::Encoder::new(),
+                    spill: Vec::new(),
+                };
+                // This is the same test insert used when the inline sample
+                // was first recorded.  An older concurrent sample belongs to
+                // spill; an in-order one belongs in the open stream.
+                if current_last_ts.is_some_and(|last| current.0 < last) {
+                    stream.spill.push(current);
+                } else {
+                    stream.open.append(current.0, current.1);
+                }
+                stream.spill.append(&mut spill);
+                *self = Self::Stream(Box::new(stream));
+            }
+            Self::Stream(stream) => {
+                chunks.append(&mut stream.closed);
+                stream.closed = chunks;
+                stream.spill.append(&mut spill);
+            }
+        }
+    }
 }
 
 /// Per-tenant index and sample arena.  The index's value is compact persistent
@@ -457,7 +624,7 @@ impl SeriesBuffer {
 #[derive(Default)]
 struct TenantSeries {
     states: HashMap<SeriesLabels, SeriesState>,
-    buffers: HashMap<SeriesBufferId, SeriesBuffer>,
+    buffers: HashMap<SeriesBufferId, SeriesBufferStorage>,
     next_buffer_id: u32,
 }
 
@@ -475,7 +642,7 @@ impl TenantSeries {
             let id = SeriesBufferId(NonZeroU32::new(raw).expect("non-zero buffer id"));
             if !self.buffers.contains_key(&id) {
                 self.next_buffer_id = raw;
-                self.buffers.insert(id, SeriesBuffer::new());
+                self.buffers.insert(id, SeriesBufferStorage::Empty);
                 return id;
             }
         }
@@ -485,7 +652,7 @@ impl TenantSeries {
         state
             .buffer_id
             .and_then(|id| self.buffers.get(&id))
-            .is_some_and(SeriesBuffer::has_samples)
+            .is_some_and(SeriesBufferStorage::has_samples)
     }
 }
 
@@ -979,14 +1146,7 @@ impl SeriesMemTable {
                 .buffers
                 .get_mut(&buffer_id)
                 .expect("series state points at its sample buffer");
-            if last_ts.is_some_and(|last| ts_ns < last) {
-                buffer.spill.push((ts_ns, value));
-                added += SPILL_SAMPLE_BYTES;
-            } else {
-                let before = buffer.open.byte_len();
-                buffer.open.append(ts_ns, value);
-                added += (buffer.open.byte_len() - before) as u64;
-            }
+            added += buffer.append(last_ts, ts_ns, value);
             let state = tenant_series
                 .states
                 .get_mut(&labels)
@@ -1011,13 +1171,14 @@ impl SeriesMemTable {
         let mut flushing = self.flushing.write();
         let mut tenants: BTreeMap<TenantId, Vec<SnapshotSeries>> = BTreeMap::new();
         let mut moved = 0u64;
+        let mut snapshot_bytes = 0u64;
         for (tenant, series_map) in inner.iter_mut() {
             let mut list = Vec::new();
             for (labels, state) in series_map.states.iter_mut() {
                 let Some(buffer_id) = state.buffer_id else {
                     continue;
                 };
-                let Some(mut buffer) = series_map.buffers.remove(&buffer_id) else {
+                let Some(buffer) = series_map.buffers.remove(&buffer_id) else {
                     state.buffer_id = None;
                     continue;
                 };
@@ -1025,13 +1186,19 @@ impl SeriesMemTable {
                     state.buffer_id = None;
                     continue;
                 }
+                // A one-sample value has no stream to move yet.  Flushes use
+                // the established chunk format, so promote it here before
+                // taking the stream fields below.
+                let accounted = buffer.accounted_bytes();
+                let mut buffer = buffer.into_stream(state.last_ts());
                 let mut chunks = std::mem::take(&mut buffer.closed);
                 let open = std::mem::take(&mut buffer.open);
                 if !open.is_empty() {
                     chunks.push(open.close());
                 }
                 let spill = std::mem::take(&mut buffer.spill);
-                moved += chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>()
+                moved += accounted;
+                snapshot_bytes += chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>()
                     + spill.len() as u64 * SPILL_SAMPLE_BYTES;
                 state.buffer_id = None;
                 list.push(SnapshotSeries {
@@ -1057,7 +1224,8 @@ impl SeriesMemTable {
             }
         }
         saturating_release(&self.inner_bytes, moved);
-        self.flushing_bytes.fetch_add(moved, Ordering::Relaxed);
+        self.flushing_bytes
+            .fetch_add(snapshot_bytes, Ordering::Relaxed);
         let snapshot = Arc::new(SeriesSnapshot { tenants });
         *flushing = Some(snapshot.clone());
         snapshot
@@ -1080,6 +1248,7 @@ impl SeriesMemTable {
         // without putting the bytes back is what made a later eviction
         // subtract what was never added.
         let mut restored_state = 0u64;
+        let mut restored_buffer = 0u64;
         for (tenant, list) in snapshot.tenants {
             let tenant_series = inner.entry(tenant).or_default();
             for series in list {
@@ -1104,17 +1273,23 @@ impl SeriesMemTable {
                         .buffer_id = Some(id);
                     id
                 };
+                let current_last_ts = tenant_series
+                    .states
+                    .get(&series.labels)
+                    .and_then(SeriesState::last_ts);
                 let buffer = tenant_series
                     .buffers
                     .get_mut(&buffer_id)
                     .expect("series state points at its sample buffer");
+                let before = buffer.accounted_bytes();
                 // The snapshot's samples are older than anything inserted
                 // since, so its chunks go to the front and its spill stays
-                // spill.
-                let mut chunks = series.chunks;
-                chunks.append(&mut buffer.closed);
-                buffer.closed = chunks;
-                buffer.spill.extend(series.spill);
+                // spill.  `prepend_aborted` promotes an inline concurrent
+                // sample to the stream while retaining the insertion-order
+                // distinction between its open stream and spill.
+                buffer.prepend_aborted(series.chunks, series.spill, current_last_ts);
+                restored_buffer =
+                    restored_buffer.saturating_add(buffer.accounted_bytes().saturating_sub(before));
                 tenant_series
                     .states
                     .get_mut(&series.labels)
@@ -1123,9 +1298,15 @@ impl SeriesMemTable {
             }
         }
         drop(inner);
-        let returned = self.flushing_bytes.swap(0, Ordering::Relaxed);
-        self.inner_bytes
-            .fetch_add(returned.saturating_add(restored_state), Ordering::Relaxed);
+        // Recompute the live-buffer delta around the restore so an inline
+        // concurrent sample is charged at 16 bytes before abort and at its
+        // promoted Gorilla size afterwards; adding the snapshot bytes
+        // separately would double-count that conversion.
+        self.flushing_bytes.store(0, Ordering::Relaxed);
+        self.inner_bytes.fetch_add(
+            restored_state.saturating_add(restored_buffer),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1250,13 +1431,7 @@ impl SeriesMemTable {
             && let Some(buffer_id) = state.buffer_id
             && let Some(buffer) = series.buffers.get(&buffer_id)
         {
-            for chunk in &buffer.closed {
-                samples.extend(gorilla::decode_all(chunk)?);
-            }
-            if !buffer.open.is_empty() {
-                samples.extend(gorilla::decode_all(&buffer.open.clone().close())?);
-            }
-            samples.extend(buffer.spill.iter().copied());
+            buffer.extend_samples(&mut samples)?;
         }
         drop(inner);
         samples.sort_by_key(|(ts, _)| *ts);
@@ -1297,13 +1472,7 @@ impl SeriesMemTable {
                     continue;
                 }
                 let entry = result.entry(labels.clone()).or_default();
-                for chunk in &buffer.closed {
-                    entry.extend(gorilla::decode_all(chunk)?);
-                }
-                if !buffer.open.is_empty() {
-                    entry.extend(gorilla::decode_all(&buffer.open.clone().close())?);
-                }
-                entry.extend(buffer.spill.iter().copied());
+                buffer.extend_samples(entry)?;
             }
         }
         for samples in result.values_mut() {
@@ -1440,6 +1609,134 @@ mod tests {
             &vec![(100, 1.0), (150, 9.0), (200, 2.0), (200, 3.0)]
         );
         assert!(memtable.approximate_size() > 0);
+    }
+
+    #[test]
+    fn a_first_sample_stays_inline_until_the_second_sample_promotes_it() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "inline");
+        memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+
+        {
+            let inner = memtable.inner.read();
+            let tenant_series = inner.get(&test_tenant()).expect("tenant was inserted");
+            let state = tenant_series
+                .states
+                .get(&series)
+                .expect("series was inserted");
+            let buffer_id = state.buffer_id.expect("sample has a buffer");
+            assert!(matches!(
+                tenant_series.buffers.get(&buffer_id),
+                Some(SeriesBufferStorage::Inline {
+                    ts_ns: 100,
+                    value: 1.0
+                })
+            ));
+        }
+        assert_eq!(
+            memtable.approximate_size(),
+            series.byte_len() + SERIES_OVERHEAD_BYTES as usize + INLINE_SAMPLE_BYTES as usize
+        );
+
+        memtable.insert(vec![sample(&series, 200, 2.0, SampleKind::Gauge)]);
+        let inner = memtable.inner.read();
+        let tenant_series = inner.get(&test_tenant()).expect("tenant was inserted");
+        let state = tenant_series
+            .states
+            .get(&series)
+            .expect("series was inserted");
+        let buffer_id = state.buffer_id.expect("second sample has a buffer");
+        assert!(matches!(
+            tenant_series.buffers.get(&buffer_id),
+            Some(SeriesBufferStorage::Stream(_))
+        ));
+        drop(inner);
+        assert_eq!(
+            memtable.sorted_samples(&test_tenant()).unwrap()[&series],
+            vec![(100, 1.0), (200, 2.0)]
+        );
+    }
+
+    #[test]
+    fn a_single_inline_sample_promotes_to_the_existing_chunk_on_flush() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "flush-inline");
+        memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+        let state_bytes = series.byte_len() + SERIES_OVERHEAD_BYTES as usize;
+
+        let snapshot = memtable.begin_flush();
+        let flushed = &snapshot.tenants[&test_tenant()][0];
+        assert_eq!(
+            gorilla::decode_all(&flushed.chunks[0]).unwrap(),
+            vec![(100, 1.0)]
+        );
+        assert!(flushed.spill.is_empty());
+        assert_eq!(
+            memtable.approximate_size(),
+            state_bytes + flushed.chunks[0].len()
+        );
+        memtable.commit_flush();
+        assert_eq!(memtable.approximate_size(), state_bytes);
+    }
+
+    #[test]
+    fn abort_promotes_a_concurrent_inline_sample_and_preserves_order() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "abort-inline");
+        memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+        let snapshot = memtable.begin_flush();
+        memtable.insert(vec![sample(&series, 200, 2.0, SampleKind::Gauge)]);
+
+        {
+            let inner = memtable.inner.read();
+            let tenant_series = inner.get(&test_tenant()).expect("tenant was inserted");
+            let state = tenant_series
+                .states
+                .get(&series)
+                .expect("series was inserted");
+            let buffer_id = state.buffer_id.expect("concurrent sample has a buffer");
+            assert!(matches!(
+                tenant_series.buffers.get(&buffer_id),
+                Some(SeriesBufferStorage::Inline {
+                    ts_ns: 200,
+                    value: 2.0
+                })
+            ));
+        }
+
+        memtable.abort_flush(snapshot);
+        let inner = memtable.inner.read();
+        let tenant_series = inner.get(&test_tenant()).expect("tenant was inserted");
+        let state = tenant_series
+            .states
+            .get(&series)
+            .expect("series was inserted");
+        let buffer_id = state.buffer_id.expect("aborted samples have a buffer");
+        assert!(matches!(
+            tenant_series.buffers.get(&buffer_id),
+            Some(SeriesBufferStorage::Stream(_))
+        ));
+        drop(inner);
+        assert_eq!(
+            memtable.sorted_samples(&test_tenant()).unwrap()[&series],
+            vec![(100, 1.0), (200, 2.0)]
+        );
+    }
+
+    #[test]
+    fn a_lone_older_sample_promotes_to_spill_on_flush() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "older-inline");
+        memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+        memtable.begin_flush();
+        memtable.commit_flush();
+
+        memtable.insert(vec![sample(&series, 50, 2.0, SampleKind::Gauge)]);
+        let snapshot = memtable.begin_flush();
+        let flushed = &snapshot.tenants[&test_tenant()][0];
+        assert!(flushed.chunks.is_empty());
+        assert_eq!(flushed.spill, vec![(50, 2.0)]);
+        memtable.commit_flush();
     }
 
     #[test]

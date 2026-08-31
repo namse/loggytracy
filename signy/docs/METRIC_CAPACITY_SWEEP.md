@@ -120,6 +120,7 @@ guards; the cgroup remained the hard boundary.
 | 3,500,000 | 3,500,013 | 1,987 MiB | pass |
 | 3,750,000 | 3,670,010 | 1,972 MiB | cgroup OOM |
 | 4,000,000 | 3,670,010 | 1,966 MiB | cgroup OOM |
+| 10,000,000 | 3,670,010 | 2,030 MiB | cgroup OOM |
 
 The measured raw boundary is therefore **3.5 million series, with an
 uncertainty of at most 250,000** for this workload and image. The accepted
