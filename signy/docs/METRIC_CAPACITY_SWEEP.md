@@ -130,3 +130,27 @@ safe production limit: flush/compaction overlap, allocator retention, query
 traffic, and a different label shape can move it substantially. The artifacts
 are under `compare/target/metric-capacity-probe-initial/`; use a fresh output
 directory for any changed image, memory limit, or workload.
+
+### Shape probe at the failure point
+
+The fixed 10,000,000-series probe was repeated after the one-sample inline
+buffer and probe-only structural gauges landed. It again stopped at 3,670,010
+accepted series (`anon_peak_bytes=2,030 MiB`). The last successful scrape,
+about one second before the kill, reported:
+
+| gauge | value |
+|---|---:|
+| `signy_series_states_len` | 3,605,010 |
+| `signy_series_states_capacity` | 3,670,016 |
+| `signy_series_buffers_len` | 15,000 |
+| `signy_series_buffers_inline` | 15,000 |
+| `signy_series_flushing_series` | 1,030,000 |
+| `signy_series_label_interner_len` | 3,605,010 |
+| `signy_series_label_interner_capacity` | 3,670,016 |
+
+The state-map capacity and accepted-series plateau coincide at 3,670,016
+(within the sampler's one-second lag), while only 15,000 series still have
+sample buffers. This identifies persistent index/interner growth and its
+resize peak—not the one-sample buffer—as the next capacity limiter. The
+instrumented artifacts are under
+`compare/target/metric-capacity-probe-shape-10m/`.
