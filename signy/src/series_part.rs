@@ -1514,6 +1514,45 @@ mod tests {
     }
 
     #[test]
+    fn catalogs_for_live_parts_share_repeated_label_payloads() {
+        let root = temp_root("catalog-interning");
+        let labels = labels("queue_depth", "a");
+
+        let first = SeriesMemTable::new();
+        first.insert(vec![sample(
+            "test-tenant",
+            &labels,
+            1_772_000_000_000_000_000,
+            1.0,
+        )]);
+        let first_parts = flush_series_snapshot(&first.begin_flush(), &root).unwrap();
+
+        let second = SeriesMemTable::new();
+        second.insert(vec![sample(
+            "test-tenant",
+            &labels,
+            1_772_000_001_000_000_000,
+            2.0,
+        )]);
+        let second_parts = flush_series_snapshot(&second.begin_flush(), &root).unwrap();
+
+        let first_reader = SeriesPartReader::open(first_parts[0].clone()).unwrap();
+        let second_reader = SeriesPartReader::open(second_parts[0].clone()).unwrap();
+        let first_labels = &first_reader.tenant_catalog(&test_tenant())[0].labels;
+        let second_labels = &second_reader.tenant_catalog(&test_tenant())[0].labels;
+        assert!(first_labels.shares_storage(second_labels));
+        assert_eq!(
+            first_reader.tenant_catalog(&test_tenant())[0].labels,
+            labels
+        );
+        assert_eq!(
+            second_reader.tenant_catalog(&test_tenant())[0].labels,
+            labels
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_corrupt_artifact_refuses_to_load() {
         let memtable = SeriesMemTable::new();
         memtable.insert(vec![sample(

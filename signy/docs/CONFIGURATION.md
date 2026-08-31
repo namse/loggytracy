@@ -112,6 +112,7 @@ Set both timestamp knobs to `off` only when bulk-loading historical data.
 | Variable | Default | Description |
 |---|---|---|
 | `SIGNY_MEMORY_BUDGET` | 60% of the detected limit (`off` disables) | Bytes the engine budgets for itself. Unset, the process reads cgroup v2 `memory.max` (falling back to `/proc/meminfo` `MemTotal`) and takes 60% — VictoriaLogs' own contract, and the one measured surviving the sustained 2 GiB workload that OOM-killed both this engine and Loki (`todo.md`, soak section, 2026-08-08). The budget re-seeds the **defaults** of the ceilings below; every explicit knob still overrides its derived value |
+| `SIGNY_CAPACITY_PROBE` | `false` | **Dangerous test-only switch.** Set to `1` only in a disposable cgroup capacity experiment. It bypasses metric cardinality admission and shared metric/WAL/in-flight ingest backpressure so the kernel cgroup, rather than an application guard, exposes the raw OOM boundary. Request-size/sample, timestamp, tenant/storage, and disk-safety checks remain active. Startup emits a warning and `/metrics` exposes `signy_capacity_probe 1`; it is empty/disabled by default and is never enabled by the Compose defaults |
 
 When the budget is active the following defaults are computed from it, with the
 shares taken from the re-measured attribution (`docs/MEMORY_ATTRIBUTION.md`,

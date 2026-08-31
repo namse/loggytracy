@@ -267,6 +267,12 @@ pub struct Config {
     /// comparing runs needs to know whether a number was declared, derived,
     /// or absent.
     pub memory_budget_source: String,
+    /// Dangerous, opt-in capacity experiment mode. When enabled, metric
+    /// cardinality and metric/shared ingest backpressure limits are bypassed
+    /// so an isolated cgroup run can find the raw OOM boundary. Input,
+    /// tenant, storage and cgroup limits still apply. This must never be
+    /// enabled in a production deployment.
+    pub capacity_probe: bool,
     /// Shared reservation pool for metric flush and metric compaction. The
     /// operation-specific ceilings still come from `flush_chunk_bytes` and
     /// `merge_max_memory_bytes`; this handle only coordinates their overlap.
@@ -351,6 +357,7 @@ impl Default for Config {
             malloc_trim_interval: Some(Duration::from_secs(60)),
             memory_budget_bytes: None,
             memory_budget_source: "off (Config::default)".to_string(),
+            capacity_probe: false,
             background_memory_pool: Arc::new(crate::query_memory::BackgroundMemoryPool::new(
                 1024 * 1024 * 1024,
             )),
@@ -536,6 +543,7 @@ impl Config {
             )?,
             memory_budget_bytes,
             memory_budget_source,
+            capacity_probe: env_bool("SIGNY_CAPACITY_PROBE", defaults.capacity_probe)?,
             listen_addr: env_string("SIGNY_LISTEN_ADDR", defaults.listen_addr),
             data_dir: std::env::var("SIGNY_DATA_DIR")
                 .map(PathBuf::from)
@@ -971,6 +979,27 @@ where
     std::env::var(name).unwrap_or_else(|_| default.into())
 }
 
+fn env_bool(name: &str, default: bool) -> Result<bool, String> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(default);
+    };
+    parse_bool(name, &raw, default)
+}
+
+/// Parse an explicit boolean knob without silently turning a typo into the
+/// dangerous or surprising side. Empty values are the unset form so Compose
+/// can pass `${SIGNY_CAPACITY_PROBE:-}` without enabling probe mode.
+fn parse_bool(name: &str, raw: &str, default: bool) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(default),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "invalid {name} {other:?}: expected true/false, 1/0, on/off, or an empty value"
+        )),
+    }
+}
+
 fn env_usize(name: &str, default: usize) -> Result<usize, String> {
     env_value(name, default)
 }
@@ -1123,6 +1152,17 @@ fn positive_duration(name: &str, value: Duration) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capacity_probe_is_explicit_and_defaults_off() {
+        assert!(!Config::default().capacity_probe);
+        assert!(parse_bool("SIGNY_CAPACITY_PROBE", "1", false).unwrap());
+        assert!(parse_bool("SIGNY_CAPACITY_PROBE", "true", false).unwrap());
+        assert!(!parse_bool("SIGNY_CAPACITY_PROBE", "0", true).unwrap());
+        assert!(!parse_bool("SIGNY_CAPACITY_PROBE", "off", true).unwrap());
+        assert!(!parse_bool("SIGNY_CAPACITY_PROBE", "", false).unwrap());
+        assert!(parse_bool("SIGNY_CAPACITY_PROBE", "maybe", false).is_err());
+    }
+
     #[test]
     fn the_log_format_accepts_both_shapes_and_refuses_a_third() {
         assert_eq!(

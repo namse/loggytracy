@@ -34,6 +34,19 @@ Compose project name and alternate host ports:
     SIGNY_PORT=3111 VICTORIAMETRICS_PORT=3141 MIMIR_PORT=3151 \
     compare/run_metric_capacity.sh --targets 'signy victoriametrics mimir'
 
+The optional probe mode is deliberately Signy-only:
+
+    CAPACITY_SWEEP_PROBE=1 \
+    compare/run_metric_capacity.sh --targets signy --lower 10000 --upper 10000
+
+`--probe` is equivalent to `CAPACITY_SWEEP_PROBE=1`. It passes
+`SIGNY_CAPACITY_PROBE=1` to the Signy container and load process and records
+`probe: true` in the manifest and every trial. The script rejects probe mode
+for VictoriaMetrics or Mimir. Probe mode may change Signy's admission and
+memory behavior while that experimental path is being developed; treat it as
+disposable-only, use a fresh output/project, and do not compare its results to
+normal-mode artifacts.
+
 The search exponentially ramps candidates (lower, lower*ramp_factor, ...)
 until the first failing point, then binary-searches the bracket. A candidate
 passes only if the harness observed 100% series, request, and datapoint acceptance,
@@ -43,7 +56,8 @@ as safe_saturation=true, but it is not a capacity pass.
 
 Artifacts are written incrementally and are safe to resume:
 
-- trials.jsonl: one complete record per target/candidate, including offered,
+- trials.jsonl: one complete record per target/candidate, including probe mode,
+  offered,
   accepted, and refused series/datapoints, HTTP status counts, anonymous
   peak, cgroup memory.peak, cgroup limit, alive/OOM state, elapsed time, and
   latency.

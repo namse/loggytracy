@@ -48,6 +48,9 @@ services:
       # byte-budget admission policy in charge; capacity experiments must not
       # inherit the old 500,000-series policy cap.
       SIGNY_MAX_ACTIVE_SERIES: ${SIGNY_MAX_ACTIVE_SERIES:-}
+      # The capacity sweep supplies this only for the disposable Signy probe
+      # mode. Empty is the normal, unchanged runtime behavior.
+      SIGNY_CAPACITY_PROBE: ${SIGNY_CAPACITY_PROBE:-}
     stop_grace_period: 120s
 
   loki:

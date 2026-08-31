@@ -174,6 +174,13 @@ impl IngestGate {
     /// forever with nothing in flight to wait for. Progress is the invariant;
     /// the ceiling only decides how many bodies share the server.
     pub fn admit_body(&self, bytes: u64) -> Result<InflightBody, IngestError> {
+        if self.config.capacity_probe {
+            // Capacity probes deliberately remove this server-side queue
+            // bound. The cgroup remains the experiment's hard limit, while
+            // the body-size and sample-count guards still run in the signal
+            // ingesters after this admission point.
+            return Ok(self.charge(0));
+        }
         let Some(limit) = self.config.max_inflight_push_bytes else {
             return Ok(self.charge(0));
         };
@@ -224,23 +231,25 @@ over the limit of {limit}; too many pushes are in flight at once"
     /// the server declines it. Acknowledging while flush is stalled instead
     /// turns a recoverable backlog into an OOM.
     pub fn check(&self) -> Result<(), IngestError> {
-        let buffered_bytes = self.buffered_bytes();
-        if let Some(limit) = self.config.max_memtable_bytes
-            && buffered_bytes > limit
-        {
-            return Err(self.overloaded(format!(
-                "memtable holds {buffered_bytes} bytes, over the limit of {limit}; \
+        if !self.config.capacity_probe {
+            let buffered_bytes = self.buffered_bytes();
+            if let Some(limit) = self.config.max_memtable_bytes
+                && buffered_bytes > limit
+            {
+                return Err(self.overloaded(format!(
+                    "memtable holds {buffered_bytes} bytes, over the limit of {limit}; \
 flush is not keeping up"
-            )));
-        }
-        let backlog_bytes = self.journal.wal_backlog_bytes();
-        if let Some(limit) = self.config.max_wal_backlog_bytes
-            && backlog_bytes > limit
-        {
-            return Err(self.overloaded(format!(
-                "WAL backlog is {backlog_bytes} bytes, over the limit of {limit}; \
+                )));
+            }
+            let backlog_bytes = self.journal.wal_backlog_bytes();
+            if let Some(limit) = self.config.max_wal_backlog_bytes
+                && backlog_bytes > limit
+            {
+                return Err(self.overloaded(format!(
+                    "WAL backlog is {backlog_bytes} bytes, over the limit of {limit}; \
 flush is not keeping up"
-            )));
+                )));
+            }
         }
         // Last, because it is the condition the other two exist to prevent
         // reaching. Both limits above bound something this process controls and
@@ -351,6 +360,49 @@ mod tests {
             "with no ceiling there is nothing to account against"
         );
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn capacity_probe_bypasses_ingest_memory_and_inflight_limits() {
+        let config = Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("signy-capacity-probe-{}", uuid::Uuid::new_v4())),
+            capacity_probe: true,
+            max_memtable_bytes: Some(1),
+            max_wal_backlog_bytes: Some(1),
+            max_inflight_push_bytes: Some(1),
+            min_free_disk_bytes: None,
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let journal = Arc::new(
+            crate::journal::Journal::spawn(&config, Arc::new(crate::memtable::MemTable::new()))
+                .unwrap(),
+        );
+        // Make the normal memtable guard observably over its deliberately tiny
+        // threshold. Probe mode must leave the cgroup as the only memory
+        // boundary, not these application-level guards.
+        journal.log_memtable().insert(
+            crate::tenant::test_tenant(),
+            vec![crate::memtable::LogEntry {
+                timestamp_ns: 1,
+                line: "probe".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        );
+        let gate = IngestGate::new(
+            journal,
+            Arc::new(config),
+            Arc::new(RuntimeMetrics::new()),
+            Arc::new(crate::disk::DiskSpace::unknown()),
+        );
+        assert!(gate.check().is_ok());
+        let permit = gate
+            .admit_body(16 * 1024 * 1024)
+            .expect("probe does not reject a body for its in-flight budget");
+        assert_eq!(gate.inflight_body_bytes(), 0);
+        drop(permit);
+        assert_eq!(gate.metrics.ingest_throttled.load(Ordering::Relaxed), 0);
     }
 
     use crate::memtable::MemTable;

@@ -1285,6 +1285,7 @@
         assert!(!rendered.contains("signy_query_latency_ms_count 4"));
         assert!(rendered.contains("# TYPE signy_query_latency_ms histogram"));
         assert!(rendered.contains("signy_build_info{"));
+        assert!(rendered.contains("signy_capacity_probe 0\n"));
     }
 
     /// The scrape renders whatever the retention worker last published. It

@@ -59,6 +59,14 @@ async fn run(malloc_tuned: bool) {
         applied = malloc_tuned,
         "glibc malloc tuning (SIGNY_MALLOC_TUNING=off to disable)"
     );
+    if config.capacity_probe {
+        tracing::warn!(
+            capacity_probe = true,
+            "DANGEROUS CAPACITY PROBE ENABLED: metric/cardinality and ingest backpressure limits are bypassed; use only in an isolated cgroup test"
+        );
+    } else {
+        tracing::info!(capacity_probe = false, "capacity probe disabled");
+    }
     config.log_memory_budget();
     signy::run(config).await;
 }

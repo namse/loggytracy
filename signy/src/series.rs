@@ -18,9 +18,12 @@
 //! counter reset on every flush interval.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use parking_lot::Mutex;
 use parking_lot::RwLock;
 
 use crate::gorilla;
@@ -36,6 +39,81 @@ pub const METRIC_NAME_LABEL: &str = "__name__";
 /// parts, so equality is `memcmp` and no surface re-sorts or re-escapes.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SeriesLabels(Arc<[u8]>);
+
+/// A process-local, weak string interner for canonical series identities.
+///
+/// A metric label set is present in the active memtable and, after a flush,
+/// often in several part catalogs at once.  Keeping a separate `Vec<u8>` for
+/// each of those copies made catalog memory grow with the number of parts,
+/// even though all copies represented the same identity.  The interner shares
+/// the immutable `Arc<[u8]>` payload while at least one owner is alive.
+///
+/// Values are weak on purpose: this is a cache of allocations, not a second
+/// owner of every label ever observed.  Dead entries are removed incrementally
+/// from the shard that receives new identities, so a churn workload does not
+/// turn the optimization into an unbounded label store.  Hashes select a
+/// shard only; equality is still checked against the complete canonical bytes,
+/// so a hash collision can never merge two series.
+struct LabelInterner {
+    shards: Vec<Mutex<LabelInternerShard>>,
+}
+
+struct LabelInternerShard {
+    by_hash: HashMap<u64, std::sync::Weak<[u8]>>,
+    registrations_since_sweep: usize,
+}
+
+const LABEL_INTERNER_SHARDS: usize = 64;
+const LABEL_INTERNER_SWEEP_INTERVAL: usize = 4096;
+
+static LABEL_INTERNER: OnceLock<LabelInterner> = OnceLock::new();
+
+impl LabelInterner {
+    fn global() -> &'static Self {
+        LABEL_INTERNER.get_or_init(|| LabelInterner {
+            shards: (0..LABEL_INTERNER_SHARDS)
+                .map(|_| {
+                    Mutex::new(LabelInternerShard {
+                        by_hash: HashMap::new(),
+                        registrations_since_sweep: 0,
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    fn intern(&self, labels: SeriesLabels) -> SeriesLabels {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        labels.0.hash(&mut hasher);
+        let hash = hasher.finish();
+        let shard_index = (hash as usize) % self.shards.len();
+        let mut shard = self.shards[shard_index].lock();
+        // Keep the full byte comparison after the hash lookup.  The hash is a
+        // routing aid, never the series identity.
+        if let Some(weak) = shard.by_hash.get(&hash) {
+            if let Some(existing) = weak.upgrade() {
+                if existing.as_ref() == labels.0.as_ref() {
+                    return SeriesLabels(existing);
+                }
+                // A hash collision cannot merge identities.  Keeping the
+                // existing entry also means the colliding label remains an
+                // ordinary, correctly comparable Arc without allocating a
+                // collision bucket for the overwhelmingly common case.
+                return labels;
+            }
+            shard.by_hash.remove(&hash);
+        }
+        shard
+            .by_hash
+            .insert(hash, std::sync::Arc::downgrade(&labels.0));
+        shard.registrations_since_sweep += 1;
+        if shard.registrations_since_sweep >= LABEL_INTERNER_SWEEP_INTERVAL {
+            shard.registrations_since_sweep = 0;
+            shard.by_hash.retain(|_, weak| weak.strong_count() != 0);
+        }
+        labels
+    }
+}
 
 impl SeriesLabels {
     /// Canonicalize a pair set. Pairs are sorted by key; on a duplicate key
@@ -58,7 +136,21 @@ impl SeriesLabels {
     /// crossed a checksum, not a validator — callers that read them from disk
     /// decode `pairs()` once to fail early on corruption.
     pub fn from_canonical(bytes: Vec<u8>) -> Self {
-        Self(bytes.into())
+        Self(bytes.into()).intern()
+    }
+
+    /// Return a copy of this identity whose immutable byte payload is shared
+    /// with any other live copy in this process.  This is intentionally an
+    /// explicit operation rather than part of every `from_pairs` call: label
+    /// normalization is a hot ingest path, while only identities retained by
+    /// the memtable or part catalog need process-wide sharing.
+    pub(crate) fn intern(self) -> Self {
+        LabelInterner::global().intern(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_storage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -474,7 +566,7 @@ impl SeriesMemTable {
                 buffer.admitted_ts = requested_newest
                     .get(&(tenant.clone(), label.clone()))
                     .copied();
-                tenant_series.insert(label.clone(), buffer);
+                tenant_series.insert(label.clone().intern(), buffer);
                 self.counters
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -653,7 +745,7 @@ impl SeriesMemTable {
                 reserved += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
                 let mut buffer = SeriesBuffer::new();
                 buffer.admitted_ts = newest;
-                tenant_series.insert((*labels).clone(), buffer);
+                tenant_series.insert((*labels).clone().intern(), buffer);
                 self.counters
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -740,7 +832,7 @@ impl SeriesMemTable {
                         .fetch_add(1, Ordering::Relaxed);
                     self.counters.active_series.fetch_add(1, Ordering::Relaxed);
                     tenant_series
-                        .entry(sample.labels.clone())
+                        .entry(sample.labels.clone().intern())
                         .or_insert_with(SeriesBuffer::new)
                 }
             };
@@ -843,7 +935,7 @@ impl SeriesMemTable {
                     restored_state += series.labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
                 }
                 let buffer = tenant_series
-                    .entry(series.labels)
+                    .entry(series.labels.intern())
                     .or_insert_with(SeriesBuffer::new);
                 // The snapshot's samples are older than anything inserted
                 // since, so its chunks go to the front and its spill stays
@@ -1110,6 +1202,23 @@ mod tests {
             vec![("k".to_string(), "datapoint".to_string())]
         );
         assert_eq!(labels("up", "a").metric_name().as_deref(), Some("up"));
+    }
+
+    #[test]
+    fn live_canonical_labels_share_their_payload_without_changing_identity() {
+        let labels = labels("up", "a");
+        let retained = labels.clone().intern();
+        let from_part = SeriesLabels::from_canonical(labels.as_bytes().to_vec());
+        assert!(Arc::ptr_eq(&retained.0, &from_part.0));
+        assert_eq!(retained, from_part);
+
+        let different = SeriesLabels::from_pairs(vec![
+            (METRIC_NAME_LABEL.to_string(), "up".to_string()),
+            ("instance".to_string(), "b".to_string()),
+        ])
+        .intern();
+        assert!(!Arc::ptr_eq(&retained.0, &different.0));
+        assert_ne!(retained, different);
     }
 
     #[test]

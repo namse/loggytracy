@@ -22,7 +22,9 @@ TOLERANCE=$(env_or CAPACITY_SWEEP_TOLERANCE 10000)
 RAMP_FACTOR=$(env_or CAPACITY_SWEEP_RAMP_FACTOR 2)
 HOLD_SECONDS=$(env_or CAPACITY_SWEEP_HOLD_SECONDS 1)
 ANCHOR_NS=$(env_or CAPACITY_SWEEP_ANCHOR_NS "$(( $(date +%s) * 1000000000 - 3600000000000 ))")
+PROBE_VALUE=$(env_or CAPACITY_SWEEP_PROBE 0)
 DRY_RUN=false
+PROBE=false
 
 usage() {
   cat <<'EOF'
@@ -36,6 +38,7 @@ Usage: compare/run_metric_capacity.sh [options]
   --ramp-factor N      exponential-ramp multiplier (default: 2)
   --hold-seconds N     seconds to keep the one-shot population observable
   --out DIR            artifact directory (default: target/metric-capacity)
+  --probe              enable the disposable Signy-only capacity probe
   --dry-run            validate and print the plan; do not use Docker
   -h, --help           show this help
 
@@ -54,11 +57,20 @@ while (($# > 0)); do
     --ramp-factor) (($# >= 2)) || { echo "--ramp-factor needs a value" >&2; exit 2; }; RAMP_FACTOR=$2; shift 2 ;;
     --hold-seconds) (($# >= 2)) || { echo "--hold-seconds needs a value" >&2; exit 2; }; HOLD_SECONDS=$2; shift 2 ;;
     --out) (($# >= 2)) || { echo "--out needs a value" >&2; exit 2; }; OUT=$2; shift 2 ;;
+    --probe) PROBE=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ "$PROBE" == false ]]; then
+  case "${PROBE_VALUE,,}" in
+    1|true|yes) PROBE=true ;;
+    0|false|no) PROBE=false ;;
+    *) echo "CAPACITY_SWEEP_PROBE must be 0 or 1" >&2; exit 2 ;;
+  esac
+fi
 
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
 for pair in "lower:$LOWER" "upper:$UPPER" "tolerance:$TOLERANCE" \
@@ -77,10 +89,18 @@ for target in $TARGETS; do
     *) echo "unsupported capacity target: $target" >&2; exit 2 ;;
   esac
 done
+if [[ "$PROBE" == true ]]; then
+  for target in $TARGETS; do
+    [[ "$target" == signy ]] || {
+      echo "--probe is only supported with the signy target (got $target)" >&2
+      exit 2
+    }
+  done
+fi
 
 if [[ "$DRY_RUN" == true ]]; then
-  printf 'targets=%s\nmemory=%s\nlower=%s\nupper=%s\ntolerance=%s\nramp_factor=%s\nhold_seconds=%s\nout=%s\n' \
-    "$TARGETS" "$MEMORY" "$LOWER" "$UPPER" "$TOLERANCE" "$RAMP_FACTOR" "$HOLD_SECONDS" "$OUT"
+  printf 'targets=%s\nmemory=%s\nlower=%s\nupper=%s\ntolerance=%s\nramp_factor=%s\nhold_seconds=%s\nprobe=%s\nout=%s\n' \
+    "$TARGETS" "$MEMORY" "$LOWER" "$UPPER" "$TOLERANCE" "$RAMP_FACTOR" "$HOLD_SECONDS" "$PROBE" "$OUT"
   exit 0
 fi
 
@@ -94,10 +114,12 @@ JSONL="$OUT/trials.jsonl"
 CSV="$OUT/trials.csv"
 MANIFEST="$OUT/manifest.json"
 touch "$JSONL"
+CSV_HEADER='recorded_at,target,probe,requested_series,offered_series,accepted_series,refused_series,offered_datapoints,accepted_datapoints,refused_datapoints,partial_rejected_datapoints,status_200,status_429,anon_peak_bytes,cgroup_memory_peak_bytes,cgroup_limit_bytes,alive,oom_killed,harness_exit,elapsed_seconds,latency_max_ms,pass,safe_saturation,result_path,stderr_path'
 if [[ ! -s "$CSV" ]]; then
-  printf '%s\n' \
-    'recorded_at,target,requested_series,offered_series,accepted_series,refused_series,offered_datapoints,accepted_datapoints,refused_datapoints,partial_rejected_datapoints,status_200,status_429,anon_peak_bytes,cgroup_memory_peak_bytes,cgroup_limit_bytes,alive,oom_killed,harness_exit,elapsed_seconds,latency_max_ms,pass,safe_saturation,result_path,stderr_path' \
-    >"$CSV"
+  printf '%s\n' "$CSV_HEADER" >"$CSV"
+elif [[ "$(head -n 1 "$CSV")" != "$CSV_HEADER" ]]; then
+  echo "existing CSV has an incompatible schema; use a new --out directory" >&2
+  exit 2
 fi
 if [[ ! -e "$MANIFEST" ]]; then
   jq -n \
@@ -106,16 +128,32 @@ if [[ ! -e "$MANIFEST" ]]; then
     --argjson lower "$LOWER" --argjson upper "$UPPER" \
     --argjson tolerance "$TOLERANCE" --argjson ramp_factor "$RAMP_FACTOR" \
     --argjson hold_seconds "$HOLD_SECONDS" --argjson anchor_ns "$ANCHOR_NS" \
+    --argjson probe "$PROBE" \
     '{schema: 1, generated_at: $generated_at, memory: $memory,
       targets: ($targets | split(" ") | map(select(length > 0))),
       lower: $lower, upper: $upper, tolerance: $tolerance,
       ramp_factor: $ramp_factor, hold_seconds: $hold_seconds,
-      metric_anchor_ns: $anchor_ns,
+      metric_anchor_ns: $anchor_ns, probe: $probe,
       definition: "largest trial with alive=true, oom_killed=false, 100% series/request/datapoint acceptance, and anon_peak_bytes < cgroup_limit_bytes"}' \
     >"$MANIFEST"
+else
+  manifest_probe=$(jq -r '.probe // false' "$MANIFEST" 2>/dev/null) || {
+    echo "existing manifest is invalid or predates probe recording; use a new --out directory" >&2
+    exit 2
+  }
+  [[ "$manifest_probe" == "$PROBE" ]] || {
+    echo "existing manifest probe=$manifest_probe does not match requested probe=$PROBE; use a new --out directory" >&2
+    exit 2
+  }
 fi
 
-compose() { docker compose --profile metrics "$@"; }
+compose() {
+  if [[ "$PROBE" == true ]]; then
+    SIGNY_CAPACITY_PROBE=1 docker compose --profile metrics "$@"
+  else
+    SIGNY_CAPACITY_PROBE= docker compose --profile metrics "$@"
+  fi
+}
 port_of() {
   case "$1" in
     signy) env_or SIGNY_PORT 3110 ;;
@@ -166,7 +204,8 @@ csv_quote() {
 trial_exists() {
   local target=$1 candidate=$2
   [[ -s "$JSONL" ]] && jq -e --arg target "$target" --argjson candidate "$candidate" \
-    'select(.target == $target and .requested_series == $candidate)' "$JSONL" >/dev/null 2>&1
+    --argjson probe "$PROBE" \
+    'select(.target == $target and .requested_series == $candidate and (.probe // false) == $probe)' "$JSONL" >/dev/null 2>&1
 }
 LAST_PASS=false
 
@@ -179,7 +218,8 @@ run_trial() {
 
   if trial_exists "$target" "$candidate"; then
     LAST_PASS=$(jq -r --arg target "$target" --argjson candidate "$candidate" \
-      'select(.target == $target and .requested_series == $candidate) | .pass' "$JSONL" | tail -1)
+      --argjson probe "$PROBE" \
+      'select(.target == $target and .requested_series == $candidate and (.probe // false) == $probe) | .pass' "$JSONL" | tail -1)
     echo "reuse $target candidate=$candidate pass=$LAST_PASS" >&2
     return 0
   fi
@@ -196,26 +236,31 @@ run_trial() {
   limit=$(cat "$cg/memory.max" 2>/dev/null || echo 0)
   [[ "$limit" =~ ^[0-9]+$ ]] || limit=0
 
-  SIGNY_LOAD_TARGET="$target" \
-  SIGNY_LOAD_PHASE=metric-load \
-  SIGNY_LOAD_ADDR="127.0.0.1:$(port_of "$target")" \
-  SIGNY_LOAD_CGROUP="$cg" \
-  SIGNY_LOAD_SEED=1592598566 \
-  SIGNY_LOAD_METRIC_ANCHOR_NS="$ANCHOR_NS" \
-  SIGNY_LOAD_METRIC_SCRAPES=4 \
-  SIGNY_LOAD_METRIC_SCRAPE_SECONDS=1 \
-  SIGNY_LOAD_METRIC_SERVICES=1 \
-  SIGNY_LOAD_METRIC_INSTANCES=1 \
-  SIGNY_LOAD_METRIC_GAUGES=1 \
-  SIGNY_LOAD_METRIC_COUNTERS=1 \
-  SIGNY_LOAD_METRIC_CONNECTIONS=1 \
-  SIGNY_LOAD_METRIC_STEADY_SECONDS=0 \
-  SIGNY_LOAD_METRIC_CHURN_SECONDS=0 \
-  SIGNY_LOAD_METRIC_CHURN_REPLACE=0 \
-  SIGNY_LOAD_METRIC_EXPLOSION_SECONDS="$HOLD_SECONDS" \
-  SIGNY_LOAD_METRIC_EXPLOSION_SERIES="$candidate" \
-  SIGNY_LOAD_RESULT_PATH="$result" \
-    "$LOAD_BIN" >"$stdout" 2>"$stderr" || harness_exit=$?
+  local -a load_env=(
+    "SIGNY_LOAD_TARGET=$target"
+    "SIGNY_LOAD_PHASE=metric-load"
+    "SIGNY_LOAD_ADDR=127.0.0.1:$(port_of "$target")"
+    "SIGNY_LOAD_CGROUP=$cg"
+    "SIGNY_LOAD_SEED=1592598566"
+    "SIGNY_LOAD_METRIC_ANCHOR_NS=$ANCHOR_NS"
+    "SIGNY_LOAD_METRIC_SCRAPES=4"
+    "SIGNY_LOAD_METRIC_SCRAPE_SECONDS=1"
+    "SIGNY_LOAD_METRIC_SERVICES=1"
+    "SIGNY_LOAD_METRIC_INSTANCES=1"
+    "SIGNY_LOAD_METRIC_GAUGES=1"
+    "SIGNY_LOAD_METRIC_COUNTERS=1"
+    "SIGNY_LOAD_METRIC_CONNECTIONS=1"
+    "SIGNY_LOAD_METRIC_STEADY_SECONDS=0"
+    "SIGNY_LOAD_METRIC_CHURN_SECONDS=0"
+    "SIGNY_LOAD_METRIC_CHURN_REPLACE=0"
+    "SIGNY_LOAD_METRIC_EXPLOSION_SECONDS=$HOLD_SECONDS"
+    "SIGNY_LOAD_METRIC_EXPLOSION_SERIES=$candidate"
+    "SIGNY_LOAD_RESULT_PATH=$result"
+  )
+  if [[ "$PROBE" == true ]]; then
+    load_env+=(SIGNY_CAPACITY_PROBE=1)
+  fi
+  env -u SIGNY_CAPACITY_PROBE "${load_env[@]}" "$LOAD_BIN" >"$stdout" 2>"$stderr" || harness_exit=$?
 
   alive=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo false)
   oom=$(docker inspect -f '{{.State.OOMKilled}}' "$container" 2>/dev/null || echo true)
@@ -266,6 +311,7 @@ run_trial() {
   record=$(jq -cn \
     --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg target "$target" \
     --arg result_path "$result" --arg stderr_path "$stderr" \
+    --argjson probe "$PROBE" \
     --argjson requested_series "$candidate" --argjson offered_series "$offered_series" \
     --argjson accepted_series "$accepted_series" --argjson refused_series "$refused_series" \
     --argjson offered_datapoints "$offered_dp" --argjson accepted_datapoints "$accepted_dp" \
@@ -276,7 +322,7 @@ run_trial() {
     --argjson oom_killed "$oom" --argjson harness_exit "$harness_exit" \
     --argjson elapsed_seconds "$elapsed" --argjson latency_max_ms "$latency" \
     --argjson statuses "$statuses_json" --argjson pass "$pass" --argjson safe_saturation "$safe" \
-    '{recorded_at: $recorded_at, target: $target, requested_series: $requested_series,
+    '{recorded_at: $recorded_at, target: $target, probe: $probe, requested_series: $requested_series,
       offered_series: $offered_series, accepted_series: $accepted_series,
       refused_series: $refused_series, offered_datapoints: $offered_datapoints,
       accepted_datapoints: $accepted_datapoints, refused_datapoints: $refused_datapoints,
@@ -291,6 +337,7 @@ run_trial() {
   {
     csv_quote "$(jq -r .recorded_at <<<"$record")"; printf ','
     csv_quote "$target"; printf ','
+    csv_quote "$PROBE"; printf ','
     for value in "$candidate" "$offered_series" "$accepted_series" "$refused_series" \
       "$offered_dp" "$accepted_dp" "$refused_dp" "$partial_dp" "$status_200" "$status_429" \
       "$anon_peak" "$cgroup_peak" "$limit" "$alive" "$oom" "$harness_exit" "$elapsed" "$latency" \

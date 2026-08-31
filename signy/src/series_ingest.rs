@@ -662,7 +662,11 @@ impl OtlpMetricIngest<'_> {
             .now_ns()
             .saturating_sub(self.config.metric_series_idle_timeout.as_nanos() as i64);
         let admissions = series_memtable
-            .admit_request(&group_refs, self.config.max_active_series, idle_cutoff)
+            .admit_request(
+                &group_refs,
+                (!self.config.capacity_probe).then_some(self.config.max_active_series).flatten(),
+                idle_cutoff,
+            )
             .map_err(|error| {
                 self.metrics
                     .ingest_throttled
@@ -688,7 +692,12 @@ impl OtlpMetricIngest<'_> {
         let total_growth = growth.iter().copied().sum();
         let mut permit = self
             .journal
-            .try_reserve_metric_bytes(total_growth, self.config.max_memtable_bytes)
+            .try_reserve_metric_bytes(
+                total_growth,
+                (!self.config.capacity_probe)
+                    .then_some(self.config.max_memtable_bytes)
+                    .flatten(),
+            )
             .ok_or_else(|| {
                 self.metrics
                     .ingest_throttled
@@ -1502,6 +1511,40 @@ mod tests {
         .unwrap();
         assert_eq!(replayed.sorted_samples(&test_tenant()).unwrap(), live);
         assert_eq!(replayed.active_series(&test_tenant()), 2);
+    }
+
+    #[tokio::test]
+    async fn capacity_probe_bypasses_metric_cardinality_and_memory_admission() {
+        let config = Config {
+            data_dir: std::env::temp_dir()
+                .join(format!("signy-metric-probe-{}", uuid::Uuid::new_v4())),
+            capacity_probe: true,
+            max_active_series: Some(1),
+            max_memtable_bytes: Some(1),
+            max_wal_backlog_bytes: Some(1),
+            max_inflight_push_bytes: Some(1),
+            min_free_disk_bytes: None,
+            ..Config::default()
+        };
+        let (ingest, series_memtable, _journal) = ingest_over(config);
+        let accepted = ingest
+            .accept(request_with(
+                vec![Metric {
+                    name: "queue_depth".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![
+                            gauge_point(now_ns(), 1.0, vec![attr("instance", "a")]),
+                            gauge_point(now_ns(), 2.0, vec![attr("instance", "b")]),
+                        ],
+                    })),
+                    ..Default::default()
+                }],
+                None,
+            ))
+            .await
+            .expect("probe accepts beyond the configured metric guards");
+        assert!(accepted.partial_success().is_none());
+        assert_eq!(series_memtable.active_series(&test_tenant()), 2);
     }
 
     #[tokio::test]
