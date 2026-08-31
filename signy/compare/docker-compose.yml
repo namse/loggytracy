@@ -44,12 +44,10 @@ services:
       # fairness rules in `docs/COMPARISON.md`.
       SIGNY_LISTEN_ADDR: 0.0.0.0:3100
       SIGNY_DATA_DIR: /var/lib/signy
-      # The cardinality ladder's one variable. At its default this engine
-      # refuses new series at a *policy* number long before the container's
-      # memory is the thing that binds — which is what the first published run
-      # measured and what makes "who dies first in 2 GiB" unanswerable. Raising
-      # it out of the way is how that question gets asked.
-      SIGNY_MAX_ACTIVE_SERIES: ${SIGNY_MAX_ACTIVE_SERIES:-500000}
+      # Optional emergency cardinality guard. An empty value leaves the
+      # byte-budget admission policy in charge; capacity experiments must not
+      # inherit the old 500,000-series policy cap.
+      SIGNY_MAX_ACTIVE_SERIES: ${SIGNY_MAX_ACTIVE_SERIES:-}
     stop_grace_period: 120s
 
   loki:
@@ -95,8 +93,25 @@ services:
       - victoriametrics-data:/victoria-metrics-data
     stop_grace_period: 120s
 
+  # Grafana Mimir's monolithic, local-filesystem deployment. It is kept in the
+  # metrics profile so the log comparison does not start an unrelated metrics
+  # process. The image is pinned: a capacity number must identify the server
+  # version it measured.
+  mimir:
+    <<: *memory
+    profiles: ["metrics"]
+    image: grafana/mimir:3.1.4
+    command: -config.file=/etc/mimir/mimir.yaml
+    ports:
+      - "${MIMIR_PORT:-3150}:9009"
+    volumes:
+      - ./mimir-config.yaml:/etc/mimir/mimir.yaml:ro
+      - mimir-data:/data
+    stop_grace_period: 120s
+
 volumes:
   signy-data:
   loki-data:
   victorialogs-data:
   victoriametrics-data:
+  mimir-data:

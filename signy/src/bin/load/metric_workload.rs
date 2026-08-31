@@ -590,8 +590,7 @@ pub async fn run_metric_seed(cfg: &Config, corpus: &MetricCorpus) -> MetricSeedO
         return MetricSeedOutcome {
             errors: 1,
             first_error: Some(format!(
-                "target {} has no OTLP metrics ingest; the metric phases accept signy and \
-victoriametrics",
+                "target {} has no OTLP metrics ingest",
                 cfg.target.name()
             )),
             ..MetricSeedOutcome::default()
@@ -976,11 +975,11 @@ mod tests {
             Some("test-tenant"),
             Target::Loki,
         );
-        let offered: u64 = bodies.iter().map(|(_, datapoints)| *datapoints).sum();
+        let offered: u64 = bodies.iter().map(|(_, datapoints, _)| *datapoints).sum();
         assert_eq!(offered, population.instruments().count() as u64);
         let encoded: u64 = bodies
             .iter()
-            .map(|(bytes, _)| {
+            .map(|(bytes, _, _)| {
                 let decoded =
                     ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
                 decoded
@@ -1019,7 +1018,7 @@ mod tests {
             Target::Loki,
         );
         assert!(bodies.len() >= 3, "{} bodies", bodies.len());
-        for (_, datapoints) in &bodies {
+        for (_, datapoints, _) in &bodies {
             assert!(
                 *datapoints as usize <= SCRAPE_CHUNK_INSTRUMENTS,
                 "no body carries more instruments than one export's worth"
@@ -1028,7 +1027,7 @@ mod tests {
         assert_eq!(
             bodies
                 .iter()
-                .map(|(_, datapoints)| *datapoints)
+                .map(|(_, datapoints, _)| *datapoints)
                 .sum::<u64>(),
             population.instruments().count() as u64,
             "splitting drops nothing"
@@ -1038,18 +1037,21 @@ mod tests {
     #[test]
     fn a_phase_tally_reads_acceptance_from_what_partial_success_refused() {
         let mut tally = PhaseTally::default();
-        tally.record(200, 100, 0, 1.0);
+        tally.record(200, 100, 0, 100, 1.0);
         assert_eq!(tally.acceptance(), 1.0);
-        tally.record(200, 100, 50, 1.0);
+        tally.record(200, 100, 50, 100, 1.0);
         assert_eq!(tally.datapoints_rejected, 50);
         assert_eq!(tally.acceptance(), 150.0 / 200.0);
-        tally.record(429, 100, 0, 1.0);
+        tally.record(429, 100, 0, 100, 1.0);
         assert_eq!(tally.requests_refused, 1);
         assert_eq!(
             tally.acceptance(),
             150.0 / 300.0,
             "a whole-request refusal counts against acceptance like any unaccepted offer"
         );
+        assert_eq!(tally.series_offered, 300);
+        assert_eq!(tally.series_accepted, 150);
+        assert_eq!(tally.series_rejected, 150);
     }
 
     #[test]
@@ -1094,6 +1096,12 @@ pub struct PhaseTally {
     pub datapoints_rejected: u64,
     /// Requests refused whole (429), which is the all-new-series case.
     pub requests_refused: u64,
+    /// Series identities carried by this phase. The capacity harness uses a
+    /// one-shot scrape, so these are distinct series rather than repeated
+    /// reports of the same identity.
+    pub series_offered: u64,
+    pub series_accepted: u64,
+    pub series_rejected: u64,
     pub errors: u64,
     pub first_error: Option<String>,
     pub statuses: BTreeMap<u16, u64>,
@@ -1110,16 +1118,33 @@ impl PhaseTally {
         self.datapoints_accepted as f64 / self.datapoints_offered as f64
     }
 
-    fn record(&mut self, status: u16, offered: u64, rejected: u64, elapsed_ms: f64) {
+    fn record(
+        &mut self,
+        status: u16,
+        offered: u64,
+        rejected: u64,
+        offered_series: u64,
+        elapsed_ms: f64,
+    ) {
         self.scrapes += 1;
         self.datapoints_offered += offered;
+        self.series_offered += offered_series;
         *self.statuses.entry(status).or_default() += 1;
         self.latency.push(elapsed_ms);
         if (200..300).contains(&status) {
             self.datapoints_rejected += rejected;
             self.datapoints_accepted += offered.saturating_sub(rejected);
+            // OTLP reports partial acceptance by datapoint, not by the
+            // decomposed Prometheus series it may create. Capacity trials use
+            // gauge-only burst identities, making this exact for the series
+            // under test; baseline histogram series are only a fixed prefix.
+            self.series_rejected += rejected.min(offered_series);
+            self.series_accepted += offered_series.saturating_sub(rejected);
         } else if status == 429 {
             self.requests_refused += 1;
+            self.series_rejected += offered_series;
+        } else {
+            self.series_rejected += offered_series;
         }
     }
 }
@@ -1256,13 +1281,20 @@ fn live_scrape_bodies(
     ts_ns: i64,
     tenant: Option<&str>,
     target: Target,
-) -> Vec<(Vec<u8>, u64)> {
+) -> Vec<(Vec<u8>, u64, u64)> {
     let instruments: Vec<&Instrument> = population.instruments().collect();
     instruments
         .chunks(SCRAPE_CHUNK_INSTRUMENTS.max(1))
         .map(|chunk| {
             let (payload, datapoints) = live_scrape_body(chunk, scrape, ts_ns, tenant);
-            (target.wrap_push(payload), datapoints)
+            let series = chunk
+                .iter()
+                .map(|instrument| match instrument.kind {
+                    InstrumentKind::Gauge | InstrumentKind::Counter => 1,
+                    InstrumentKind::Histogram => HISTOGRAM_BOUNDS.len() as u64 + 3,
+                })
+                .sum();
+            (target.wrap_push(payload), datapoints, series)
         })
         .collect()
 }
@@ -1452,7 +1484,7 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
-        for (body, datapoints) in
+        for (body, datapoints, series) in
             live_scrape_bodies(&population, scrape, now_ns, in_body, cfg.target)
         {
             let sent = Instant::now();
@@ -1476,7 +1508,7 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
             match result {
                 Ok(response) => {
                     let rejected = rejected_datapoints(cfg.target, &response.body);
-                    tally.record(response.status, datapoints, rejected, elapsed_ms);
+                    tally.record(response.status, datapoints, rejected, series, elapsed_ms);
                     if !(200..300).contains(&response.status) && response.status != 429 {
                         tally.errors += 1;
                         tally.first_error.get_or_insert_with(|| {
@@ -1494,6 +1526,8 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
                 Err(error) => {
                     tally.scrapes += 1;
                     tally.datapoints_offered += datapoints;
+                    tally.series_offered += series;
+                    tally.series_rejected += series;
                     tally.errors += 1;
                     tally.latency.push(elapsed_ms);
                     tally.first_error.get_or_insert(error);

@@ -610,6 +610,7 @@ pub fn build_queries(cfg: &Config, corpus: &Corpus) -> Vec<Query> {
                     Target::VictoriaMetrics => {
                         unreachable!("main refuses the log phases for victoriametrics")
                     }
+                    Target::Mimir => unreachable!("main refuses the log phases for mimir"),
                 };
                 let basis_fields: Vec<String> = match shape {
                     Shape::LabelOnly | Shape::LineFilter => vec!["service_name".to_string()],
@@ -1157,6 +1158,10 @@ pub fn digest_for(target: Target, body: &[u8], query: &Query) -> Result<Answer, 
         Target::Loki => digest_response(body, &query.basis_fields),
         Target::VictoriaLogs => digest_logsql_response(body, &query.basis_fields, query.step_ns),
         Target::VictoriaMetrics => Err(format!(
+            "target {} answers the metric matrix, not the log one",
+            target.name()
+        )),
+        Target::Mimir => Err(format!(
             "target {} answers the metric matrix, not the log one",
             target.name()
         )),

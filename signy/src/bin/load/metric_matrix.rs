@@ -808,6 +808,10 @@ pub fn digest_metric_for(target: Target, body: &[u8]) -> Result<MetricAnswer, St
     match target {
         Target::Signy => digest_first_party_metric_response(body),
         Target::VictoriaMetrics => digest_prometheus_response(body),
+        Target::Mimir => Err(format!(
+            "target {} is ingest-only in the capacity bed; Mimir query comparison is out of scope",
+            target.name()
+        )),
         Target::Loki | Target::VictoriaLogs => Err(format!(
             "target {} answers the log matrix, not the metric one",
             target.name()

@@ -81,6 +81,10 @@ pub enum Target {
     /// before any workload is built, because a log run against a metrics
     /// engine would measure nothing either claim is about.
     VictoriaMetrics,
+    /// Grafana Mimir's monolithic OTLP metrics endpoint. The capacity bed
+    /// drives this target only for metric-load: Mimir's PromQL query surface
+    /// is intentionally outside the existing metric matrix.
+    Mimir,
 }
 
 impl Target {
@@ -90,9 +94,10 @@ impl Target {
             "loki" => Ok(Target::Loki),
             "victorialogs" | "victoria-logs" | "vl" => Ok(Target::VictoriaLogs),
             "victoriametrics" | "victoria-metrics" | "vm" => Ok(Target::VictoriaMetrics),
+            "mimir" | "grafana-mimir" => Ok(Target::Mimir),
             other => Err(format!(
-                "SIGNY_LOAD_TARGET must be signy, loki, victorialogs or \
-victoriametrics, got {other:?}"
+                "SIGNY_LOAD_TARGET must be signy, loki, victorialogs, victoriametrics or \
+mimir, got {other:?}"
             )),
         }
     }
@@ -103,6 +108,7 @@ victoriametrics, got {other:?}"
             Target::Loki => "loki",
             Target::VictoriaLogs => "victorialogs",
             Target::VictoriaMetrics => "victoriametrics",
+            Target::Mimir => "mimir",
         }
     }
 
@@ -147,6 +153,7 @@ victoriametrics, got {other:?}"
             // header; "0" keeps the request identical to the VictoriaLogs one
             // rather than inventing a third spelling.
             Target::VictoriaLogs | Target::VictoriaMetrics => "0".to_string(),
+            Target::Mimir => tenant.to_string(),
         }
     }
 
@@ -171,6 +178,7 @@ victoriametrics, got {other:?}"
             Target::Loki => "/otlp/v1/logs",
             Target::VictoriaLogs => "/insert/opentelemetry/v1/logs",
             Target::VictoriaMetrics => "/opentelemetry/v1/metrics",
+            Target::Mimir => "/otlp/v1/metrics",
         }
     }
 
@@ -180,6 +188,7 @@ victoriametrics, got {other:?}"
         match self {
             Target::Signy => Some(COLLECT_PATH),
             Target::VictoriaMetrics => Some("/opentelemetry/v1/metrics"),
+            Target::Mimir => Some("/otlp/v1/metrics"),
             Target::Loki | Target::VictoriaLogs => None,
         }
     }
@@ -223,6 +232,7 @@ victoriametrics, got {other:?}"
         match self {
             Target::Signy | Target::Loki => "/ready",
             Target::VictoriaLogs | Target::VictoriaMetrics => "/health",
+            Target::Mimir => "/ready",
         }
     }
 }
@@ -679,4 +689,28 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mimir_uses_the_native_otlp_metrics_route_and_readiness_probe() {
+        let target = Target::parse("grafana-mimir").expect("Mimir target parses");
+        assert_eq!(target, Target::Mimir);
+        assert_eq!(target.metric_push_path(), Some("/otlp/v1/metrics"));
+        assert_eq!(target.ready_path(), "/ready");
+        assert_eq!(
+            target.push_tenant_header("tenant"),
+            Some(("X-Scope-OrgID", "tenant".into()))
+        );
+    }
+
+    #[test]
+    fn metric_target_aliases_are_stable_for_script_routing() {
+        assert_eq!(Target::parse("vm").unwrap(), Target::VictoriaMetrics);
+        assert_eq!(Target::parse("mimir").unwrap().name(), "mimir");
+        assert_eq!(Target::Mimir.metric_push_path(), Some("/otlp/v1/metrics"));
+    }
 }

@@ -421,6 +421,9 @@ impl QueryGenerator {
             crate::config::Target::VictoriaMetrics => {
                 unreachable!("main refuses the log load phase for victoriametrics")
             }
+            crate::config::Target::Mimir => {
+                unreachable!("main refuses the log load phase for mimir")
+            }
         };
         QueryPlan {
             shape,
@@ -475,6 +478,9 @@ pub fn result_rows(target: crate::config::Target, body: &[u8]) -> u64 {
             .count() as u64,
         crate::config::Target::VictoriaMetrics => {
             unreachable!("main refuses the log load phase for victoriametrics")
+        }
+        crate::config::Target::Mimir => {
+            unreachable!("main refuses the log load phase for mimir")
         }
     }
 }

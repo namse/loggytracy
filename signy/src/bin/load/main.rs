@@ -195,15 +195,25 @@ async fn main() {
     // refusal here is what lets the per-target code below treat the wrong
     // pairing as unreachable instead of half-supporting it.
     let target_fits = match cfg.phase {
-        Phase::Load | Phase::Seed | Phase::Matrix => cfg.target != Target::VictoriaMetrics,
-        Phase::MetricSeed | Phase::MetricMatrix | Phase::MetricLoad => {
+        Phase::Load | Phase::Seed | Phase::Matrix => {
+            matches!(
+                cfg.target,
+                Target::Signy | Target::Loki | Target::VictoriaLogs
+            )
+        }
+        Phase::MetricSeed | Phase::MetricMatrix => {
             matches!(cfg.target, Target::Signy | Target::VictoriaMetrics)
         }
+        Phase::MetricLoad => matches!(
+            cfg.target,
+            Target::Signy | Target::VictoriaMetrics | Target::Mimir
+        ),
     };
     if !target_fits {
         eprintln!(
             "target {} does not answer the {:?} phase: the log phases accept signy, loki \
-and victorialogs; the metric phases accept signy and victoriametrics",
+and victorialogs; metric seed/matrix accept signy and victoriametrics; metric-load also \
+accepts mimir",
             cfg.target.name(),
             cfg.phase
         );
@@ -343,6 +353,9 @@ async fn run_metric_verify(cfg: Config) {
                                 "datapoints_accepted": tally.datapoints_accepted,
                                 "datapoints_rejected": tally.datapoints_rejected,
                                 "requests_refused": tally.requests_refused,
+                                "series_offered": tally.series_offered,
+                                "series_accepted": tally.series_accepted,
+                                "series_rejected": tally.series_rejected,
                                 "acceptance": tally.acceptance(),
                                 "errors": tally.errors,
                                 "first_error": tally.first_error,
@@ -1144,6 +1157,9 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
                 Target::VictoriaMetrics => {
                     unreachable!("main refuses the log load phase for victoriametrics")
                 }
+                Target::Mimir => {
+                    unreachable!("main refuses the log load phase for mimir")
+                }
             },
             None => outcome.scrape_errors += 1,
         }
@@ -1547,6 +1563,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         Target::VictoriaMetrics => {
             unreachable!("main refuses the log load phase for victoriametrics")
         }
+        Target::Mimir => unreachable!("main refuses the log load phase for mimir"),
     };
 
     let mut per_shape = serde_json::Map::new();
