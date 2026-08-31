@@ -18,8 +18,9 @@
 //! counter reset on every flush interval.
 
 use std::borrow::Borrow;
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -749,11 +750,104 @@ impl SeriesBufferStorage {
     }
 }
 
+const SERIES_STATE_SHARDS: usize = 64;
+
+/// A layout-sharded series index. Each shard is an ordinary HashMap; shards
+/// are not locks and all callers still hold the tenant-wide memtable lock.
+/// Splitting growth across maps prevents one 7-million-entry rehash from
+/// allocating a second table of the entire index while the old table is live.
+/// Full canonical labels remain the map keys and equality is still checked by
+/// HashMap, so the routing hash is never an identity shortcut.
+struct SeriesStates {
+    shards: [HashMap<SeriesLabels, SeriesState>; SERIES_STATE_SHARDS],
+    route: RandomState,
+    len: usize,
+}
+
+impl Default for SeriesStates {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| HashMap::new()),
+            route: RandomState::new(),
+            len: 0,
+        }
+    }
+}
+
+impl SeriesStates {
+    fn shard_for<Q: ?Sized + Hash>(&self, key: &Q) -> usize {
+        (self.route.hash_one(key) as usize) & (SERIES_STATE_SHARDS - 1)
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn capacity(&self) -> usize {
+        self.shards.iter().map(HashMap::capacity).sum::<usize>()
+    }
+
+    fn contains_key(&self, labels: &SeriesLabels) -> bool {
+        self.shards[self.shard_for(labels)].contains_key(labels)
+    }
+
+    fn get(&self, labels: &SeriesLabels) -> Option<&SeriesState> {
+        self.shards[self.shard_for(labels)].get(labels)
+    }
+
+    fn get_mut(&mut self, labels: &SeriesLabels) -> Option<&mut SeriesState> {
+        let shard = self.shard_for(labels);
+        self.shards[shard].get_mut(labels)
+    }
+
+    fn get_key_value<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> Option<(&SeriesLabels, &SeriesState)>
+    where
+        SeriesLabels: Borrow<Q>,
+    {
+        let shard = self.shard_for(key);
+        self.shards[shard].get_key_value(key)
+    }
+
+    fn insert(&mut self, labels: SeriesLabels, state: SeriesState) -> Option<SeriesState> {
+        let shard = self.shard_for(&labels);
+        let previous = self.shards[shard].insert(labels, state);
+        if previous.is_none() {
+            self.len += 1;
+        }
+        previous
+    }
+
+    fn remove(&mut self, labels: &SeriesLabels) -> Option<SeriesState> {
+        let shard = self.shard_for(labels);
+        let previous = self.shards[shard].remove(labels);
+        if previous.is_some() {
+            self.len = self.len.saturating_sub(1);
+        }
+        previous
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &SeriesLabels> {
+        self.shards.iter().flat_map(|shard| shard.keys())
+    }
+
+    fn values(&self) -> impl Iterator<Item = &SeriesState> {
+        self.shards.iter().flat_map(|shard| shard.values())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&SeriesLabels, &SeriesState)> {
+        self.shards.iter().flat_map(|shard| shard.iter())
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&SeriesLabels, &mut SeriesState)> {
+        self.shards.iter_mut().flat_map(|shard| shard.iter_mut())
+    }
+}
+
 /// Per-tenant index and sample arena.  The index's value is compact persistent
 /// state; only buffered series have an entry in `buffers`.
 #[derive(Default)]
 struct TenantSeries {
-    states: HashMap<SeriesLabels, SeriesState>,
+    states: SeriesStates,
     buffers: HashMap<SeriesBufferId, SeriesBufferStorage>,
     reservations: HashMap<SeriesLabels, ReservationState>,
     next_buffer_id: u32,
@@ -1044,7 +1138,7 @@ impl SeriesMemTable {
                     .filter(|label| {
                         inner
                             .get(tenant)
-                            .is_none_or(|series| !series.states.contains_key(*label))
+                            .is_none_or(|series| !series.states.contains_key(label))
                     })
                     .count()
                     .min(usize::MAX.saturating_sub(existing))
@@ -1250,7 +1344,7 @@ impl SeriesMemTable {
             let mut new_labels: Vec<&SeriesLabels> = group
                 .iter()
                 .map(|sample| &sample.labels)
-                .filter(|labels| !tenant_series.states.contains_key(*labels))
+                .filter(|labels| !tenant_series.states.contains_key(labels))
                 .collect();
             new_labels.sort();
             new_labels.dedup();
@@ -1699,7 +1793,7 @@ impl SeriesMemTable {
             }
         }
         if let Some(series) = self.inner.read().get(tenant) {
-            for (key, state) in &series.states {
+            for (key, state) in series.states.iter() {
                 let bounds = state
                     .buffer_id
                     .and_then(|id| series.buffers.get(&id))
@@ -1769,7 +1863,7 @@ impl SeriesMemTable {
         }
         let inner = self.inner.read();
         if let Some(series_map) = inner.get(tenant) {
-            for (labels, state) in &series_map.states {
+            for (labels, state) in series_map.states.iter() {
                 let Some(buffer_id) = state.buffer_id else {
                     continue;
                 };
@@ -1853,6 +1947,42 @@ mod tests {
             "persistent series state must fit in 24 bytes (got {})",
             std::mem::size_of::<SeriesState>()
         );
+    }
+
+    #[test]
+    fn sharded_series_states_keep_full_key_lookup_and_iteration() {
+        let mut states = SeriesStates::default();
+        let series_labels: Vec<_> = (0..1_000)
+            .map(|index| labels("queue_depth", &format!("shard-{index}")))
+            .collect();
+        for (index, label) in series_labels.iter().enumerate() {
+            states.insert(
+                label.clone(),
+                SeriesState {
+                    last_ts: index as i64,
+                    flags: SeriesState::HAS_LAST_TS,
+                    ..SeriesState::default()
+                },
+            );
+        }
+        assert_eq!(states.len(), series_labels.len());
+        assert!(states.capacity() >= states.len());
+        for label in &series_labels {
+            let (stored, state) = states
+                .get_key_value(label.as_bytes())
+                .expect("borrowed canonical bytes find their full key");
+            assert_eq!(stored, label);
+            assert!(state.last_ts().is_some());
+        }
+        assert_eq!(states.iter().count(), series_labels.len());
+        assert_eq!(states.values().count(), series_labels.len());
+        let removed = states
+            .remove(&series_labels[17])
+            .expect("present before removal");
+        assert_eq!(removed.last_ts(), Some(17));
+        assert_eq!(states.len(), series_labels.len() - 1);
+        states.insert(series_labels[17].clone(), SeriesState::default());
+        assert_eq!(states.len(), series_labels.len());
     }
 
     #[test]
@@ -2294,8 +2424,8 @@ mod tests {
         memtable.abort_flush(snapshot);
         assert_eq!(
             memtable.approximate_size(),
-            state_bytes + 20,
-            "abort_flush restores exactly the encoded sample charge"
+            state_bytes + INLINE_SAMPLE_BYTES as usize,
+            "abort_flush restores exactly the inline sample charge"
         );
         let second = memtable.begin_flush();
         assert_eq!(
