@@ -700,12 +700,25 @@ impl SeriesBufferStorage {
     ) {
         match self {
             Self::Empty => {
-                *self = Self::Stream(Box::new(SeriesBuffer {
-                    closed: chunks,
-                    open: gorilla::Encoder::new(),
-                    spill,
-                    bounds: None,
-                }));
+                // A flush promotes a lone inline sample solely to cross the
+                // on-disk chunk format. If abort has no concurrent sample,
+                // decode that one internally-produced chunk and put it back
+                // inline, avoiding a boxed stream plus three dynamic headers.
+                if chunks.len() == 1
+                    && spill.is_empty()
+                    && let Ok(mut decoded) = gorilla::decode_all(&chunks[0])
+                    && decoded.len() == 1
+                {
+                    let (ts_ns, value) = decoded.pop().expect("singleton decoded above");
+                    *self = Self::Inline { ts_ns, value };
+                } else {
+                    *self = Self::Stream(Box::new(SeriesBuffer {
+                        closed: chunks,
+                        open: gorilla::Encoder::new(),
+                        spill,
+                        bounds: None,
+                    }));
+                }
             }
             Self::Inline { ts_ns, value } => {
                 let current = (*ts_ns, *value);
@@ -2230,6 +2243,23 @@ mod tests {
         memtable.commit_flush();
         assert!(memtable.is_empty());
         assert_eq!(memtable.active_series(&test_tenant()), 1, "state is kept");
+    }
+
+    #[test]
+    fn aborting_a_singleton_flush_restores_inline_storage() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "singleton-abort");
+        memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+        let snapshot = memtable.begin_flush();
+        assert_eq!(memtable.memory_stats().stream_buffers, 0);
+        memtable.abort_flush(snapshot);
+        let stats = memtable.memory_stats();
+        assert_eq!(stats.inline_buffers, 1);
+        assert_eq!(stats.stream_buffers, 0);
+        assert_eq!(
+            memtable.sorted_samples(&test_tenant()).unwrap()[&series],
+            vec![(100, 1.0)]
+        );
     }
 
     #[test]
