@@ -624,12 +624,17 @@ async fn collect_metrics(
         clock: &state.clock,
     };
     ingest.admit_size(payload.len())?;
-    let request = ExportMetricsServiceRequest::decode(payload.as_slice()).map_err(|error| {
-        IngestError::from((
-            StatusCode::BAD_REQUEST,
-            format!("OTLP protobuf decode failed: {error}"),
-        ))
-    })?;
+    let request = {
+        // Scoped so the guard ends before the await below: a suspended task
+        // would otherwise leave its label on a worker thread.
+        let _arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
+        ExportMetricsServiceRequest::decode(payload.as_slice()).map_err(|error| {
+            IngestError::from((
+                StatusCode::BAD_REQUEST,
+                format!("OTLP protobuf decode failed: {error}"),
+            ))
+        })?
+    };
     let (pending, outcome) = ingest.enqueue_request(request, mark).await?;
     // Logged as well as answered: a collecty reads the status and nothing
     // else, so the log is where an operator finds the reason.

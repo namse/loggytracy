@@ -93,7 +93,7 @@ echo "cgroup=$CG memory.max=$(cat "$CG/memory.max") swap.max=$(cat "$CG/memory.s
 # gauges: a gap between them is then visible in one row rather than inferred
 # across two files.
 (
-  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,mp_series_memtable,mp_series_catalog,active_series,metric_parts"
+  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,mp_series_memtable,mp_series_catalog,active_series,metric_parts,series_memtable_gauge"
   T0=$(date +%s.%N)
   while [ -d "$CG" ]; do
     now=$(date +%s.%N)
@@ -124,11 +124,12 @@ echo "cgroup=$CG memory.max=$(cat "$CG/memory.max") swap.max=$(cat "$CG/memory.s
       /^signy_memprof_header_bytes /{h=$2}
       /^signy_active_series /{as=$2}
       /^signy_metric_part_count /{mpc=$2}
-      END{printf "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+      /^signy_series_memtable_bytes /{smb=$2}
+      END{printf "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
           v["other"], v["ingest"], v["wal"], v["flush"], v["merge"],
           v["query"], v["sidecar"], v["part_meta"], v["row_group_cache"], h,
           i["arena"], i["mmapped"], i["in_use"], i["free"],
-          v["series_memtable"], v["series_catalog"], as, mpc}')
+          v["series_memtable"], v["series_catalog"], as, mpc, smb}')
     printf '%s,%s,%s,%s,%s,%s,%s\n' \
       "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
       "$cur" "$peak" "$cg" "$gg" "${threads:-0}" "$mp"
@@ -204,8 +205,8 @@ kill -0 "$SERVER_PID" 2>/dev/null && ALIVE=true
         printf "  live=%.1f instrument_header=%.1f anon/live=%.2f free/anon=%.2f\n", live, s[30]/m, s[4]/m/live, s[34]/s[4]
         printf "  gauges   memtable=%.1f wal_backlog=%.1f parts=%s rg_cache_gauge=%.1f ingest_live/memtable=%.2f\n", \
                s[10]/m, s[13]/m, s[14], s[17]/m, s[22]/(s[10]+1)
-        printf "  metrics  series_memtable=%.1f series_catalog=%.1f active_series=%s metric_parts=%s\n", \
-               s[35]/m, s[36]/m, s[37], s[38]
+        printf "  metrics  series_memtable=%.1f series_catalog=%.1f active_series=%s metric_parts=%s accounted=%.1f\n", \
+               s[35]/m, s[36]/m, s[37], s[38], s[39]/m
         if (s[37]+0 > 0) {
           printf "  per_series memtable=%.0fB catalog=%.0fB catalog_per_part=%.0fB anon=%.0fB\n", \
                  s[35]/s[37], s[36]/s[37], (s[38]+0>0 ? s[36]/s[37]/s[38] : 0), s[4]/s[37]

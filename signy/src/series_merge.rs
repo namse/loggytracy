@@ -209,6 +209,10 @@ pub async fn compact_once(
         return Ok(false);
     };
 
+    // Everything from here to `write_record` is synchronous, so the arena
+    // guard is safe to hold across it and is dropped before the first await.
+    let arena = crate::memprof::enter(crate::memprof::Arena::Merge);
+
     // Read every input's series and merge per (tenant, labels). The merged
     // samples ride the snapshot's spill vectors, whose whole contract is
     // "unsorted samples the writer will time-sort" — a compaction is a
@@ -275,6 +279,7 @@ pub async fn compact_once(
             .collect::<Result<_, _>>()?,
     };
     let record_path = write_record(metrics_root, &new_parts[0].meta.id, &record)?;
+    drop(arena);
 
     if let Some(cache) = remote {
         // One CAS replaces the inputs with the output; a conflict means

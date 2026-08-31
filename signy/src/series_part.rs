@@ -166,6 +166,10 @@ pub fn flush_series_snapshot(
     if snapshot.is_empty() {
         return Ok(Vec::new());
     }
+    // Charged like the log flush: the partition map, the re-encoded chunks and
+    // the catalog this builds are the writer's, not its caller's — and one of
+    // its callers is compaction.
+    let _arena = crate::memprof::enter(crate::memprof::Arena::Flush);
     fs::create_dir_all(metrics_root.join(".tmp"))?;
 
     // Merge the snapshot's per-series entries (an aborted flush leaves more

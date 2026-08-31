@@ -637,6 +637,10 @@ impl OtlpMetricIngest<'_> {
         request: ExportMetricsServiceRequest,
         mark: Option<crate::journal::CollectMark>,
     ) -> Result<(crate::journal::PendingAppend, MetricAcceptOutcome), IngestError> {
+        // Dropped before the journal await below. `admit_datapoints` nests its
+        // own arena inside this one, so what stays here is the decode's
+        // output: the normalized samples and the re-encoded filtered request.
+        let arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
         let samples = normalize_request(&tenant, &request).map_err(|error| match error {
             MetricIngestError::TooManySamples => too_many_samples(),
             other => IngestError::from((StatusCode::BAD_REQUEST, other.to_string())),
@@ -690,6 +694,7 @@ impl OtlpMetricIngest<'_> {
                 format!("failed to encode request: {error}"),
             )
         })?;
+        drop(arena);
         let pending = self
             .journal
             .enqueue_metrics(tenant, encoded, samples, mark)
