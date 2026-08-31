@@ -161,6 +161,20 @@ struct SampleOutcome {
     wal_backlog: GaugeSeries,
     memtable_bytes: GaugeSeries,
     part_count: GaugeSeries,
+    /// Capacity-probe-only shape gauges.  The server emits these only when its
+    /// own raw-capacity switch is enabled, so normal load runs retain no
+    /// structural series and pay only the existing `/metrics` scrape.
+    series_states_len: GaugeSeries,
+    series_states_capacity: GaugeSeries,
+    series_buffers_len: GaugeSeries,
+    series_buffers_capacity: GaugeSeries,
+    series_buffers_empty: GaugeSeries,
+    series_buffers_inline: GaugeSeries,
+    series_buffers_stream: GaugeSeries,
+    series_flushing_series: GaugeSeries,
+    series_flushing_tenants: GaugeSeries,
+    series_interner_len: GaugeSeries,
+    series_interner_capacity: GaugeSeries,
     rss: GaugeSeries,
     anon: GaugeSeries,
     health_samples: u64,
@@ -252,6 +266,7 @@ async fn run_metric_verify(cfg: Config) {
         corpus.scrapes
     );
 
+    let run_start = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
     let anon_peak = Arc::new(AtomicU64::new(0));
     let anon_watch = tokio::spawn({
@@ -270,6 +285,12 @@ async fn run_metric_verify(cfg: Config) {
             }
         }
     });
+    // The structural series gauges are emitted only by the server's
+    // capacity-probe mode.  Reuse the normal sampler there so the result keeps
+    // the same sampled timeline and peak summaries as the long load report;
+    // ordinary metric seed/matrix runs do not start this extra scrape loop.
+    let series_sampler = (cfg.capacity_probe && cfg.target == Target::Signy)
+        .then(|| tokio::spawn(sampler(cfg.clone(), stop.clone(), run_start)));
 
     let mut report = json!({
         "phase": match cfg.phase {
@@ -378,6 +399,16 @@ async fn run_metric_verify(cfg: Config) {
 
     stop.store(true, Ordering::Relaxed);
     let _ = anon_watch.await;
+    let samples = match series_sampler {
+        Some(task) => task.await.unwrap_or_default(),
+        None => SampleOutcome::default(),
+    };
+    let end_metrics = if cfg.capacity_probe && cfg.target == Target::Signy {
+        let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
+        scrape(&mut client).await.unwrap_or_default()
+    } else {
+        probe::Metrics::new()
+    };
     let memory_after = memory_source
         .as_ref()
         .ok()
@@ -394,6 +425,9 @@ async fn run_metric_verify(cfg: Config) {
         "anon_bytes_end": memory_after.as_ref().and_then(|memory| memory.anon_bytes),
         "file_bytes_end": memory_after.as_ref().and_then(|memory| memory.file_bytes),
     });
+    if cfg.capacity_probe && !samples.series_states_len.samples.is_empty() {
+        report["series_memory"] = series_memory_report(&samples, &end_metrics);
+    }
     report["config"] = serde_json::to_value(&cfg).expect("config serialization");
     report["verdict"] = json!(if ok { "PASS" } else { "FAIL" });
 
@@ -1124,6 +1158,54 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
                     outcome
                         .part_count
                         .push(elapsed, probe::gauge(&metrics, "signy_part_count"));
+                    if cfg.capacity_probe {
+                        // Structural gauges are enabled by the server only in
+                        // probe mode.  Keep their complete sampled shape so a
+                        // trial can inspect the path to OOM, not just its
+                        // terminal population and one peak RSS number.
+                        outcome
+                            .series_states_len
+                            .push(elapsed, probe::gauge(&metrics, "signy_series_states_len"));
+                        outcome.series_states_capacity.push(
+                            elapsed,
+                            probe::gauge(&metrics, "signy_series_states_capacity"),
+                        );
+                        outcome
+                            .series_buffers_len
+                            .push(elapsed, probe::gauge(&metrics, "signy_series_buffers_len"));
+                        outcome.series_buffers_capacity.push(
+                            elapsed,
+                            probe::gauge(&metrics, "signy_series_buffers_capacity"),
+                        );
+                        outcome.series_buffers_empty.push(
+                            elapsed,
+                            probe::gauge(&metrics, "signy_series_buffers_empty"),
+                        );
+                        outcome.series_buffers_inline.push(
+                            elapsed,
+                            probe::gauge(&metrics, "signy_series_buffers_inline"),
+                        );
+                        outcome.series_buffers_stream.push(
+                            elapsed,
+                            probe::gauge(&metrics, "signy_series_buffers_stream"),
+                        );
+                        outcome.series_flushing_series.push(
+                            elapsed,
+                            probe::gauge(&metrics, "signy_series_flushing_series"),
+                        );
+                        outcome.series_flushing_tenants.push(
+                            elapsed,
+                            probe::gauge(&metrics, "signy_series_flushing_tenants"),
+                        );
+                        outcome.series_interner_len.push(
+                            elapsed,
+                            probe::gauge(&metrics, "signy_series_label_interner_len"),
+                        );
+                        outcome.series_interner_capacity.push(
+                            elapsed,
+                            probe::gauge(&metrics, "signy_series_label_interner_capacity"),
+                        );
+                    }
                     if let Some(healthy) = metrics.get("signy_remote_healthy") {
                         outcome.health_samples += 1;
                         outcome.health_healthy += u64::from(*healthy >= 1.0);
@@ -1315,6 +1397,68 @@ struct ReportInputs<'a> {
     start_metrics: probe::Metrics,
     end_metrics: probe::Metrics,
     ended_on: &'static str,
+}
+
+fn series_memory_report(samples: &SampleOutcome, terminal: &probe::Metrics) -> Value {
+    json!({
+        "states_len": {
+            "summary": samples.series_states_len.summary(),
+            "samples": samples.series_states_len.points(),
+        },
+        "states_capacity": {
+            "summary": samples.series_states_capacity.summary(),
+            "samples": samples.series_states_capacity.points(),
+        },
+        "buffers_len": {
+            "summary": samples.series_buffers_len.summary(),
+            "samples": samples.series_buffers_len.points(),
+        },
+        "buffers_capacity": {
+            "summary": samples.series_buffers_capacity.summary(),
+            "samples": samples.series_buffers_capacity.points(),
+        },
+        "buffers_empty": {
+            "summary": samples.series_buffers_empty.summary(),
+            "samples": samples.series_buffers_empty.points(),
+        },
+        "buffers_inline": {
+            "summary": samples.series_buffers_inline.summary(),
+            "samples": samples.series_buffers_inline.points(),
+        },
+        "buffers_stream": {
+            "summary": samples.series_buffers_stream.summary(),
+            "samples": samples.series_buffers_stream.points(),
+        },
+        "flushing_series": {
+            "summary": samples.series_flushing_series.summary(),
+            "samples": samples.series_flushing_series.points(),
+        },
+        "flushing_tenants": {
+            "summary": samples.series_flushing_tenants.summary(),
+            "samples": samples.series_flushing_tenants.points(),
+        },
+        "interner_len": {
+            "summary": samples.series_interner_len.summary(),
+            "samples": samples.series_interner_len.points(),
+        },
+        "interner_capacity": {
+            "summary": samples.series_interner_capacity.summary(),
+            "samples": samples.series_interner_capacity.points(),
+        },
+        "terminal": {
+            "states_len": probe::gauge(terminal, "signy_series_states_len"),
+            "states_capacity": probe::gauge(terminal, "signy_series_states_capacity"),
+            "buffers_len": probe::gauge(terminal, "signy_series_buffers_len"),
+            "buffers_capacity": probe::gauge(terminal, "signy_series_buffers_capacity"),
+            "buffers_empty": probe::gauge(terminal, "signy_series_buffers_empty"),
+            "buffers_inline": probe::gauge(terminal, "signy_series_buffers_inline"),
+            "buffers_stream": probe::gauge(terminal, "signy_series_buffers_stream"),
+            "flushing_series": probe::gauge(terminal, "signy_series_flushing_series"),
+            "flushing_tenants": probe::gauge(terminal, "signy_series_flushing_tenants"),
+            "interner_len": probe::gauge(terminal, "signy_series_label_interner_len"),
+            "interner_capacity": probe::gauge(terminal, "signy_series_label_interner_capacity"),
+        },
+    })
 }
 
 fn build_report(inputs: ReportInputs<'_>) -> Value {
@@ -1682,6 +1826,9 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
             "part_meta_bytes": probe::gauge(&end_metrics, "signy_part_meta_bytes"),
         },
     });
+    if cfg.capacity_probe && !samples.series_states_len.samples.is_empty() {
+        report["gauges"]["series_memory"] = series_memory_report(&samples, &end_metrics);
+    }
     report["object_store_operations"] = json!({
         "puts": probe::object_store_op_delta(&start_metrics, &end_metrics, "put"),
         "gets": probe::object_store_op_delta(&start_metrics, &end_metrics, "get"),

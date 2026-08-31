@@ -5,6 +5,7 @@
     use crate::memtable::{LogEntry, MemTable};
     use crate::part::{self, Row};
     use crate::part_registry::PartRegistry;
+    use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
     use tower::ServiceExt;
 
     /// Engine-level tests build their queries through the shared flat grammar
@@ -1286,6 +1287,51 @@
         assert!(rendered.contains("# TYPE signy_query_latency_ms histogram"));
         assert!(rendered.contains("signy_build_info{"));
         assert!(rendered.contains("signy_capacity_probe 0\n"));
+        assert!(
+            !rendered.contains("signy_series_states_len"),
+            "structural series gauges are probe-only:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_probe_metrics_render_series_container_shape() {
+        let data_dir = temp_dir();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            capacity_probe: true,
+            ..Config::default()
+        };
+        let state = state_with_config(config, Arc::new(MemTable::new()), Arc::new(PartRegistry::new()));
+        let labels = SeriesLabels::from_pairs(vec![
+            (METRIC_NAME_LABEL.to_string(), "queue_depth".to_string()),
+            ("instance".to_string(), "probe".to_string()),
+        ]);
+        state.journal.series_memtable().insert(vec![MetricSample {
+            tenant: test_tenant(),
+            labels,
+            ts_ns: 1,
+            value: 1.0,
+            kind: SampleKind::Gauge,
+            datapoint_index: 0,
+        }]);
+
+        let rendered = metrics(State(state.clone())).await;
+        assert!(rendered.contains("signy_series_states_len 1\n"));
+        assert!(rendered.contains("signy_series_buffers_len 1\n"));
+        assert!(rendered.contains("signy_series_buffers_inline 1\n"));
+        assert!(rendered.contains("signy_series_buffers_stream 0\n"));
+        assert!(rendered.contains("signy_series_flushing_series 0\n"));
+        assert!(rendered.contains("signy_series_label_interner_len "));
+        assert!(rendered.contains("signy_series_label_interner_capacity "));
+
+        let snapshot = state.journal.series_memtable().begin_flush();
+        let rendered = metrics(State(state.clone())).await;
+        assert!(rendered.contains("signy_series_states_len 1\n"));
+        assert!(rendered.contains("signy_series_buffers_len 0\n"));
+        assert!(rendered.contains("signy_series_buffers_inline 0\n"));
+        assert!(rendered.contains("signy_series_flushing_series 1\n"));
+        state.journal.series_memtable().commit_flush();
+        drop(snapshot);
     }
 
     /// The scrape renders whatever the retention worker last published. It

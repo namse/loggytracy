@@ -114,6 +114,22 @@ impl LabelInterner {
         }
         labels
     }
+
+    /// Aggregate the weak interner's map population.  The interner is sharded
+    /// only to keep registration contention low; the diagnostic is deliberately
+    /// process-wide and sums the shards so a capacity probe can compare it to
+    /// the series index without exposing a shard dimension.
+    fn stats(&self) -> (usize, usize) {
+        self.shards
+            .iter()
+            .fold((0usize, 0usize), |(len, capacity), shard| {
+                let shard = shard.lock();
+                (
+                    len.saturating_add(shard.by_hash.len()),
+                    capacity.saturating_add(shard.by_hash.capacity()),
+                )
+            })
+    }
 }
 
 impl SeriesLabels {
@@ -323,6 +339,27 @@ pub struct SeriesCounters {
     /// Whole exports refused because the shared memtable byte budget had no
     /// room for their projected sample buffers.
     pub metric_memory_rejected_total: AtomicU64,
+}
+
+/// Point-in-time shape of the metric index and sample arena.
+///
+/// These are intentionally structural observations rather than admission
+/// inputs: `/metrics` and the disposable capacity probe can show which map or
+/// buffer representation accounts for memory without changing the production
+/// 429 policy or the persisted series format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeriesMemoryStats {
+    pub states_len: usize,
+    pub states_capacity: usize,
+    pub buffers_len: usize,
+    pub buffers_capacity: usize,
+    pub empty_buffers: usize,
+    pub inline_buffers: usize,
+    pub stream_buffers: usize,
+    pub flushing_series: usize,
+    pub flushing_tenants: usize,
+    pub interner_len: usize,
+    pub interner_capacity: usize,
 }
 
 // The old 160-byte estimate omitted allocator/container overhead.  The M10
@@ -737,6 +774,80 @@ impl SeriesMemTable {
 
     pub fn counters(&self) -> &SeriesCounters {
         &self.counters
+    }
+
+    /// Current container populations used by the metric index and its sample
+    /// arena.  The snapshot takes the same read locks as query/discovery and
+    /// never walks encoded samples, so an operator scrape can inspect the
+    /// shape even while a large flush is in flight.
+    pub fn memory_stats(&self) -> SeriesMemoryStats {
+        let (
+            states_len,
+            states_capacity,
+            buffers_len,
+            buffers_capacity,
+            empty_buffers,
+            inline_buffers,
+            stream_buffers,
+        ) = {
+            let inner = self.inner.read();
+            inner.values().fold(
+                (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize),
+                |(
+                    states_len,
+                    states_capacity,
+                    buffers_len,
+                    buffers_capacity,
+                    empty_buffers,
+                    inline_buffers,
+                    stream_buffers,
+                ),
+                 tenant| {
+                    let (empty, inline, stream) = tenant.buffers.values().fold(
+                        (0usize, 0usize, 0usize),
+                        |(empty, inline, stream), buffer| match buffer {
+                            SeriesBufferStorage::Empty => (empty + 1, inline, stream),
+                            SeriesBufferStorage::Inline { .. } => (empty, inline + 1, stream),
+                            SeriesBufferStorage::Stream(_) => (empty, inline, stream + 1),
+                        },
+                    );
+                    (
+                        states_len.saturating_add(tenant.states.len()),
+                        states_capacity.saturating_add(tenant.states.capacity()),
+                        buffers_len.saturating_add(tenant.buffers.len()),
+                        buffers_capacity.saturating_add(tenant.buffers.capacity()),
+                        empty_buffers.saturating_add(empty),
+                        inline_buffers.saturating_add(inline),
+                        stream_buffers.saturating_add(stream),
+                    )
+                },
+            )
+        };
+        let (flushing_series, flushing_tenants) = self
+            .flushing
+            .read()
+            .as_ref()
+            .map(|snapshot| {
+                (
+                    snapshot.tenants.values().map(Vec::len).sum::<usize>(),
+                    snapshot.tenants.len(),
+                )
+            })
+            .unwrap_or_default();
+        let (interner_len, interner_capacity) = LabelInterner::global().stats();
+        SeriesMemoryStats {
+            states_len,
+            states_capacity,
+            buffers_len,
+            buffers_capacity,
+            empty_buffers,
+            inline_buffers,
+            stream_buffers,
+            flushing_series,
+            flushing_tenants,
+            interner_len,
+            interner_capacity,
+        }
     }
 
     /// Reserve every series in an export under one write lock.
@@ -1660,6 +1771,42 @@ mod tests {
             memtable.sorted_samples(&test_tenant()).unwrap()[&series],
             vec![(100, 1.0), (200, 2.0)]
         );
+    }
+
+    #[test]
+    fn memory_stats_reports_inline_stream_and_flushing_populations() {
+        let memtable = SeriesMemTable::new();
+        let inline = labels("queue_depth", "stats-inline");
+        let stream = labels("queue_depth", "stats-stream");
+        memtable.insert(vec![sample(&inline, 100, 1.0, SampleKind::Gauge)]);
+        memtable.insert(vec![
+            sample(&stream, 100, 1.0, SampleKind::Gauge),
+            sample(&stream, 200, 2.0, SampleKind::Gauge),
+        ]);
+
+        let stats = memtable.memory_stats();
+        assert_eq!(stats.states_len, 2);
+        assert!(stats.states_capacity >= stats.states_len);
+        assert_eq!(stats.buffers_len, 2);
+        assert!(stats.buffers_capacity >= stats.buffers_len);
+        assert_eq!(stats.empty_buffers, 0);
+        assert_eq!(stats.inline_buffers, 1);
+        assert_eq!(stats.stream_buffers, 1);
+        assert_eq!(stats.flushing_series, 0);
+        assert_eq!(stats.flushing_tenants, 0);
+        assert!(stats.interner_len > 0);
+        assert!(stats.interner_capacity >= stats.interner_len);
+
+        let snapshot = memtable.begin_flush();
+        let stats = memtable.memory_stats();
+        assert_eq!(stats.buffers_len, 0);
+        assert_eq!(stats.inline_buffers, 0);
+        assert_eq!(stats.stream_buffers, 0);
+        assert_eq!(stats.flushing_series, 2);
+        assert_eq!(stats.flushing_tenants, 1);
+        memtable.commit_flush();
+        assert_eq!(memtable.memory_stats().flushing_series, 0);
+        drop(snapshot);
     }
 
     #[test]

@@ -287,6 +287,11 @@ metric-matrix or metric-load, got {other:?}"
 pub struct Config {
     pub target: Target,
     pub phase: Phase,
+    /// Whether this invocation is paired with signy's disposable raw-capacity
+    /// probe.  The server uses the same switch to publish structural gauges;
+    /// keeping it in the harness lets the sampler retain those gauges only for
+    /// probe trials.
+    pub capacity_probe: bool,
     pub http_address: String,
     pub tier: String,
     pub seed: u64,
@@ -447,6 +452,7 @@ impl Config {
         Ok(Self {
             target: Target::parse(&env_string("SIGNY_LOAD_TARGET", "signy"))?,
             phase: Phase::parse(&env_string("SIGNY_LOAD_PHASE", "load"))?,
+            capacity_probe: env_bool("SIGNY_CAPACITY_PROBE", false),
             http_address: env_string("SIGNY_LOAD_ADDR", "127.0.0.1:3100"),
             tier: env_string("SIGNY_LOAD_TIER", "B"),
             seed: env_u64("SIGNY_LOAD_SEED", 0x5eed_2026),
@@ -689,6 +695,18 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name)
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+    {
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes") => true,
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no") => false,
+        _ => default,
+    }
 }
 
 #[cfg(test)]

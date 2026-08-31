@@ -358,7 +358,7 @@ fn series_ladder_metrics(state: &AppState) -> String {
     use std::sync::atomic::Ordering;
     let series = state.journal.series_memtable();
     let counters = series.counters();
-    format!(
+    let mut body = format!(
         "# HELP signy_active_series Live metric series index entries across tenants. \
 The optional SIGNY_MAX_ACTIVE_SERIES emergency guard is process-wide; normal \
 admission is charged against the shared byte budget.\n\
@@ -410,7 +410,61 @@ signy_metric_memtable_reserved_bytes {}\n",
             .load(Ordering::Relaxed),
         series.approximate_size(),
         state.journal.metric_reserved_bytes(),
-    )
+    );
+    // These gauges intentionally belong only to the disposable raw-capacity
+    // probe.  Summing millions of HashMap lengths/capacities and walking every
+    // arena entry on each production scrape would turn operator telemetry into
+    // measurable ingest contention; normal mode already has the cheap byte and
+    // active-series gauges above.  The probe is explicitly asking for this
+    // structural attribution, so it opts into the walk via its existing switch.
+    if state.config.capacity_probe {
+        let stats = series.memory_stats();
+        body.push_str(&format!(
+            "# HELP signy_series_states_len Live metric index entries across all tenants.\n\
+# TYPE signy_series_states_len gauge\n\
+signy_series_states_len {}\n\
+# HELP signy_series_states_capacity Sum of the backing capacities of tenant state maps.\n\
+# TYPE signy_series_states_capacity gauge\n\
+signy_series_states_capacity {}\n\
+# HELP signy_series_buffers_len Live sample-arena entries.\n\
+# TYPE signy_series_buffers_len gauge\n\
+signy_series_buffers_len {}\n\
+# HELP signy_series_buffers_capacity Sum of the backing capacities of tenant sample arenas.\n\
+# TYPE signy_series_buffers_capacity gauge\n\
+signy_series_buffers_capacity {}\n\
+# TYPE signy_series_buffers_empty gauge\n\
+signy_series_buffers_empty {}\n\
+# HELP signy_series_buffers_inline One-sample sample-arena entries that have not been promoted to Gorilla.\n\
+# TYPE signy_series_buffers_inline gauge\n\
+signy_series_buffers_inline {}\n\
+# HELP signy_series_buffers_stream Sample-arena entries using the boxed Gorilla stream.\n\
+# TYPE signy_series_buffers_stream gauge\n\
+signy_series_buffers_stream {}\n\
+# HELP signy_series_flushing_series Series entries held by the in-flight flush snapshot.\n\
+# TYPE signy_series_flushing_series gauge\n\
+signy_series_flushing_series {}\n\
+# TYPE signy_series_flushing_tenants gauge\n\
+signy_series_flushing_tenants {}\n\
+# HELP signy_series_label_interner_len Weak label-interner hash entries across shards.\n\
+# TYPE signy_series_label_interner_len gauge\n\
+signy_series_label_interner_len {}\n\
+# HELP signy_series_label_interner_capacity Sum of weak label-interner shard capacities.\n\
+# TYPE signy_series_label_interner_capacity gauge\n\
+signy_series_label_interner_capacity {}\n",
+            stats.states_len,
+            stats.states_capacity,
+            stats.buffers_len,
+            stats.buffers_capacity,
+            stats.empty_buffers,
+            stats.inline_buffers,
+            stats.stream_buffers,
+            stats.flushing_series,
+            stats.flushing_tenants,
+            stats.interner_len,
+            stats.interner_capacity,
+        ));
+    }
+    body
 }
 
 fn journal_writer_metrics(state: &AppState) -> String {
