@@ -47,7 +47,9 @@ RUN apt-get update \
 # The uid and gid are pinned because a bind mount carries the host's numbers
 # through untranslated, so docs/DEPLOYMENT.md has to name a number to chown to.
 RUN groupadd --system --gid 10001 signy \
-    && useradd --system --create-home --uid 10001 --gid 10001 signy
+    && useradd --system --create-home --uid 10001 --gid 10001 signy \
+    && mkdir -p /var/lib/signy \
+    && chown signy:signy /var/lib/signy
 USER signy
 WORKDIR /var/lib/signy
 VOLUME ["/var/lib/signy"]

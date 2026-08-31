@@ -272,7 +272,7 @@ pub async fn compact_once(
     }
 
     // The visibility transition, atomic against queries exactly as flush's is.
-    let opened = SeriesRegistry::open_parts(new_parts.clone())?;
+    let opened = registry.open_parts_shared(new_parts.clone())?;
     let input_ids: Vec<String> = input_descriptors
         .iter()
         .map(|part| part.id.clone())

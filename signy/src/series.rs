@@ -17,6 +17,7 @@
 //! total — because a flush that reset the running total would manufacture a
 //! counter reset on every flush interval.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroU32;
@@ -41,13 +42,21 @@ pub const METRIC_NAME_LABEL: &str = "__name__";
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SeriesLabels(Arc<[u8]>);
 
-/// A process-local, weak string interner for canonical series identities.
+impl Borrow<[u8]> for SeriesLabels {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// A process-local, weak string interner for canonical catalog identities.
 ///
-/// A metric label set is present in the active memtable and, after a flush,
-/// often in several part catalogs at once.  Keeping a separate `Vec<u8>` for
-/// each of those copies made catalog memory grow with the number of parts,
-/// even though all copies represented the same identity.  The interner shares
-/// the immutable `Arc<[u8]>` payload while at least one owner is alive.
+/// Part catalogs often contain the same label set in several parts. Keeping a
+/// separate `Vec<u8>` for each catalog copy made catalog memory grow with the
+/// number of parts, even though all copies represented the same identity. The
+/// interner shares the immutable `Arc<[u8]>` payload while at least one catalog
+/// owner is alive. Active series deliberately do not register here: their
+/// index owns its canonical bytes directly and does not need a process-wide
+/// map entry on the cardinality hot path.
 ///
 /// Values are weak on purpose: this is a cache of allocations, not a second
 /// owner of every label ever observed.  Dead entries are removed incrementally
@@ -83,26 +92,49 @@ impl LabelInterner {
         })
     }
 
-    fn intern(&self, labels: SeriesLabels) -> SeriesLabels {
+    fn hash(bytes: &[u8]) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        labels.0.hash(&mut hasher);
-        let hash = hasher.finish();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn lookup(&self, bytes: &[u8]) -> Option<SeriesLabels> {
+        let hash = Self::hash(bytes);
         let shard_index = (hash as usize) % self.shards.len();
-        let mut shard = self.shards[shard_index].lock();
+        let shard = self.shards[shard_index].lock();
         // Keep the full byte comparison after the hash lookup.  The hash is a
         // routing aid, never the series identity.
-        if let Some(weak) = shard.by_hash.get(&hash) {
-            if let Some(existing) = weak.upgrade() {
-                if existing.as_ref() == labels.0.as_ref() {
-                    return SeriesLabels(existing);
-                }
-                // A hash collision cannot merge identities.  Keeping the
-                // existing entry also means the colliding label remains an
-                // ordinary, correctly comparable Arc without allocating a
-                // collision bucket for the overwhelmingly common case.
-                return labels;
+        if let Some(weak) = shard.by_hash.get(&hash)
+            && let Some(existing) = weak.upgrade()
+            && existing.as_ref() == bytes
+        {
+            return Some(SeriesLabels(existing));
+        }
+        // A hash collision cannot merge identities. Keeping the existing
+        // entry also means the colliding label remains an ordinary, correctly
+        // comparable Arc without allocating a collision bucket for the
+        // overwhelmingly common case.
+        None
+    }
+
+    /// Intern a label that came from a catalog. The weak pool is deliberately
+    /// populated only by catalog misses, never by active-series admission.
+    fn intern_catalog(&self, labels: SeriesLabels) -> SeriesLabels {
+        if let Some(existing) = self.lookup(&labels.0) {
+            return existing;
+        }
+        let hash = Self::hash(&labels.0);
+        let shard_index = (hash as usize) % self.shards.len();
+        let mut shard = self.shards[shard_index].lock();
+        if let Some(weak) = shard.by_hash.get(&hash)
+            && let Some(existing) = weak.upgrade()
+        {
+            if existing.as_ref() == labels.0.as_ref() {
+                return SeriesLabels(existing);
             }
-            shard.by_hash.remove(&hash);
+            // A collision is not an identity match; leave the existing entry
+            // intact and keep this label as an ordinary Arc.
+            return labels;
         }
         shard
             .by_hash
@@ -113,6 +145,35 @@ impl LabelInterner {
             shard.by_hash.retain(|_, weak| weak.strong_count() != 0);
         }
         labels
+    }
+
+    /// Reuse an existing catalog allocation, but do not add a fresh active
+    /// series to the pool. This keeps the pool proportional to historical
+    /// catalog-only labels rather than cardinality.
+    fn reuse_catalog_or_self(&self, labels: SeriesLabels) -> SeriesLabels {
+        self.lookup(&labels.0).unwrap_or(labels)
+    }
+
+    fn register_evicted(&self, labels: &SeriesLabels) {
+        let hash = Self::hash(&labels.0);
+        let shard_index = (hash as usize) % self.shards.len();
+        let mut shard = self.shards[shard_index].lock();
+        if let Some(weak) = shard.by_hash.get(&hash)
+            && let Some(existing) = weak.upgrade()
+        {
+            if existing.as_ref() == labels.0.as_ref() {
+                return;
+            }
+            return;
+        }
+        shard
+            .by_hash
+            .insert(hash, std::sync::Arc::downgrade(&labels.0));
+        shard.registrations_since_sweep += 1;
+        if shard.registrations_since_sweep >= LABEL_INTERNER_SWEEP_INTERVAL {
+            shard.registrations_since_sweep = 0;
+            shard.by_hash.retain(|_, weak| weak.strong_count() != 0);
+        }
     }
 
     /// Aggregate the weak interner's map population.  The interner is sharded
@@ -162,7 +223,11 @@ impl SeriesLabels {
     /// normalization is a hot ingest path, while only identities retained by
     /// the memtable or part catalog need process-wide sharing.
     pub(crate) fn intern(self) -> Self {
-        LabelInterner::global().intern(self)
+        LabelInterner::global().intern_catalog(self)
+    }
+
+    pub(crate) fn reuse_catalog_or_self(self) -> Self {
+        LabelInterner::global().reuse_catalog_or_self(self)
     }
 
     #[cfg(test)]
@@ -822,6 +887,30 @@ impl SeriesMemTable {
         &self.counters
     }
 
+    /// Resolve a bounded batch of canonical catalog labels against the live
+    /// tenant index. The returned keys clone only their `Arc` payload, so an
+    /// active label does not allocate a second byte buffer. Keeping one read
+    /// guard for the batch avoids a lock round-trip per catalog row.
+    pub(crate) fn resolve_live_label_batch(
+        &self,
+        tenant: &TenantId,
+        canonical: &[&[u8]],
+    ) -> Vec<Option<SeriesLabels>> {
+        let inner = self.inner.read();
+        let Some(series) = inner.get(tenant) else {
+            return vec![None; canonical.len()];
+        };
+        canonical
+            .iter()
+            .map(|bytes| {
+                series
+                    .states
+                    .get_key_value(*bytes)
+                    .map(|(labels, _)| labels.clone())
+            })
+            .collect()
+    }
+
     /// Current container populations used by the metric index and its sample
     /// arena.  The snapshot takes the same read locks as query/discovery and
     /// never walks encoded samples, so an operator scrape can inspect the
@@ -973,9 +1062,10 @@ impl SeriesMemTable {
                 if tenant_series.states.contains_key(label) {
                     continue;
                 }
-                tenant_series
-                    .states
-                    .insert(label.clone().intern(), SeriesState::default());
+                tenant_series.states.insert(
+                    label.clone().reuse_catalog_or_self(),
+                    SeriesState::default(),
+                );
                 self.counters
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -1183,9 +1273,10 @@ impl SeriesMemTable {
             let mut reserved = 0u64;
             for labels in new_labels {
                 reserved += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
-                tenant_series
-                    .states
-                    .insert((*labels).clone().intern(), SeriesState::default());
+                tenant_series.states.insert(
+                    (*labels).clone().reuse_catalog_or_self(),
+                    SeriesState::default(),
+                );
                 if let Some(admitted_ts) = newest {
                     tenant_series.mark_admitted(labels, admitted_ts);
                 }
@@ -1244,6 +1335,9 @@ impl SeriesMemTable {
             })
             .collect();
         for (labels, buffer_id) in idle {
+            // Keep only a weak hint for catalogs that still own the payload;
+            // the pool never becomes an owner of evicted series.
+            LabelInterner::global().register_evicted(&labels);
             if let Some(state) = tenant_series.states.remove(&labels)
                 && let Some(id) = state.buffer_id.or(buffer_id)
             {
@@ -1293,9 +1387,10 @@ impl SeriesMemTable {
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
                 self.counters.active_series.fetch_add(1, Ordering::Relaxed);
-                tenant_series
-                    .states
-                    .insert(labels.clone().intern(), SeriesState::default());
+                tenant_series.states.insert(
+                    labels.clone().reuse_catalog_or_self(),
+                    SeriesState::default(),
+                );
             }
             let buffer_id = if let Some(id) = tenant_series
                 .states
@@ -1450,9 +1545,10 @@ impl SeriesMemTable {
             for series in list {
                 if !tenant_series.states.contains_key(&series.labels) {
                     restored_state += series.labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
-                    tenant_series
-                        .states
-                        .insert(series.labels.clone().intern(), SeriesState::default());
+                    tenant_series.states.insert(
+                        series.labels.clone().reuse_catalog_or_self(),
+                        SeriesState::default(),
+                    );
                 }
                 let buffer_id = if let Some(id) = tenant_series
                     .states

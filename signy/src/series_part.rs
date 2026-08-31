@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::bloom::BloomFilter;
 use crate::gorilla;
 use crate::part::partition_of;
-use crate::series::{SeriesLabels, SeriesSnapshot};
+use crate::series::{SeriesLabels, SeriesMemTable, SeriesSnapshot};
 use crate::tenant::TenantId;
 
 pub const SERIES_DATA_FILE: &str = "data.bin";
@@ -1118,16 +1118,34 @@ pub struct SeriesPartReader {
 
 impl SeriesPartReader {
     pub fn open(part: SeriesPart) -> Result<Self, String> {
-        Self::open_internal(part, true)
+        Self::open_internal(part, true, None)
     }
 
     /// Open from the catalog artifacts alone: the data body may be evicted to
     /// the object store, and selection must not need it back.
     pub fn open_cached(part: SeriesPart) -> Result<Self, String> {
-        Self::open_internal(part, false)
+        Self::open_internal(part, false, None)
     }
 
-    fn open_internal(part: SeriesPart, require_data: bool) -> Result<Self, String> {
+    pub(crate) fn open_with_memtable(
+        part: SeriesPart,
+        memtable: &SeriesMemTable,
+    ) -> Result<Self, String> {
+        Self::open_internal(part, true, Some(memtable))
+    }
+
+    pub(crate) fn open_cached_with_memtable(
+        part: SeriesPart,
+        memtable: &SeriesMemTable,
+    ) -> Result<Self, String> {
+        Self::open_internal(part, false, Some(memtable))
+    }
+
+    fn open_internal(
+        part: SeriesPart,
+        require_data: bool,
+        memtable: Option<&SeriesMemTable>,
+    ) -> Result<Self, String> {
         if require_data && !part.data_path().exists() {
             return Err(format!(
                 "metric data body is missing: {}",
@@ -1142,7 +1160,12 @@ impl SeriesPartReader {
         let bloom_bytes = fs::read(part.bloom_path()).map_err(|error| error.to_string())?;
         let bloom = decode_series_bloom(&bloom_bytes)?;
         let index_bytes = fs::read(part.index_path()).map_err(|error| error.to_string())?;
-        let catalog = decode_catalog(&index_bytes, part.meta.series_count as usize)?;
+        let catalog = decode_catalog_with_memtable(
+            &index_bytes,
+            part.meta.series_count as usize,
+            &part.meta.tenants,
+            memtable,
+        )?;
         Ok(Self {
             part,
             bloom,
@@ -1218,7 +1241,21 @@ fn decode_series_bloom(bytes: &[u8]) -> Result<BloomFilter, String> {
     BloomFilter::decode(&bytes[8..end])
 }
 
-fn decode_catalog(bytes: &[u8], expected_count: usize) -> Result<Vec<CatalogEntry>, String> {
+struct RawCatalogEntry<'a> {
+    labels: &'a [u8],
+    offset: u64,
+    length: u64,
+    sample_count: u32,
+    min_ts_ns: i64,
+    max_ts_ns: i64,
+}
+
+fn decode_catalog_with_memtable(
+    bytes: &[u8],
+    expected_count: usize,
+    segments: &[SeriesTenantSegment],
+    memtable: Option<&SeriesMemTable>,
+) -> Result<Vec<CatalogEntry>, String> {
     if bytes.len() < 8 || &bytes[..4] != SERIES_INDEX_MAGIC {
         return Err("metric index magic or header mismatch".to_string());
     }
@@ -1238,27 +1275,81 @@ fn decode_catalog(bytes: &[u8], expected_count: usize) -> Result<Vec<CatalogEntr
         offset = end;
         Ok(slice)
     };
+    if memtable.is_some() {
+        let mut next = 0usize;
+        for segment in segments {
+            let start = segment.series_start as usize;
+            let end = segment.series_end as usize;
+            if start != next || end < start || end > count {
+                return Err("metric index tenant segments do not tile catalog".to_string());
+            }
+            next = end;
+        }
+        if next != count {
+            return Err("metric index tenant segments do not cover catalog".to_string());
+        }
+    }
+    let ranges: Vec<(usize, usize, Option<&TenantId>)> = if memtable.is_some() {
+        segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.series_start as usize,
+                    segment.series_end as usize,
+                    Some(&segment.tenant),
+                )
+            })
+            .collect()
+    } else {
+        vec![(0, count, None)]
+    };
     let mut catalog = Vec::with_capacity(count);
-    for _ in 0..count {
-        let labels_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
-        let labels = SeriesLabels::from_canonical(take(labels_len)?.to_vec());
-        let chunk_offset = u64::from_le_bytes(take(8)?.try_into().unwrap());
-        let chunk_length = u64::from_le_bytes(take(8)?.try_into().unwrap());
-        let sample_count = u32::from_le_bytes(take(4)?.try_into().unwrap());
-        let min_ts_ns = i64::from_le_bytes(take(8)?.try_into().unwrap());
-        let max_ts_ns = i64::from_le_bytes(take(8)?.try_into().unwrap());
-        // The canonical bytes come from our own file, but they cross a
-        // checksum, not a validator — decode them once so a corrupt entry
-        // fails here rather than in a query's rendering.
-        labels.pairs()?;
-        catalog.push(CatalogEntry {
-            labels,
-            offset: chunk_offset,
-            length: chunk_length,
-            sample_count,
-            min_ts_ns,
-            max_ts_ns,
-        });
+    for (start, end, tenant) in ranges {
+        let mut ordinal = start;
+        while ordinal < end {
+            let batch_end = (ordinal + 4096).min(end);
+            let mut batch = Vec::with_capacity(batch_end - ordinal);
+            for _ in ordinal..batch_end {
+                let labels_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+                let labels = take(labels_len)?;
+                let chunk_offset = u64::from_le_bytes(take(8)?.try_into().unwrap());
+                let chunk_length = u64::from_le_bytes(take(8)?.try_into().unwrap());
+                let sample_count = u32::from_le_bytes(take(4)?.try_into().unwrap());
+                let min_ts_ns = i64::from_le_bytes(take(8)?.try_into().unwrap());
+                let max_ts_ns = i64::from_le_bytes(take(8)?.try_into().unwrap());
+                batch.push(RawCatalogEntry {
+                    labels,
+                    offset: chunk_offset,
+                    length: chunk_length,
+                    sample_count,
+                    min_ts_ns,
+                    max_ts_ns,
+                });
+            }
+            let borrowed: Vec<&[u8]> = batch.iter().map(|entry| entry.labels).collect();
+            let live = tenant
+                .zip(memtable)
+                .map(|(tenant, memtable)| memtable.resolve_live_label_batch(tenant, &borrowed));
+            for (index, entry) in batch.iter().enumerate() {
+                let labels = live
+                    .as_ref()
+                    .and_then(|labels| labels[index].clone())
+                    .unwrap_or_else(|| SeriesLabels::from_canonical(entry.labels.to_vec()));
+                // The canonical bytes come from our own file, but they cross a
+                // checksum, not a validator — decode them once so a corrupt entry
+                // fails here rather than in a query's rendering.
+                labels.pairs()?;
+                catalog.push(CatalogEntry {
+                    labels,
+                    offset: entry.offset,
+                    length: entry.length,
+                    sample_count: entry.sample_count,
+                    min_ts_ns: entry.min_ts_ns,
+                    max_ts_ns: entry.max_ts_ns,
+                });
+            }
+            ordinal = batch_end;
+        }
     }
     if offset != bytes.len() {
         return Err("metric index has trailing bytes".to_string());
@@ -1548,6 +1639,30 @@ mod tests {
         assert_eq!(
             second_reader.tenant_catalog(&test_tenant())[0].labels,
             labels
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn catalog_open_reuses_the_live_memtable_label_without_pool_registration() {
+        let root = temp_root("catalog-live-source");
+        let memtable = SeriesMemTable::new();
+        let labels = labels("queue_depth", "active");
+        memtable.insert(vec![sample(
+            "test-tenant",
+            &labels,
+            1_772_000_000_000_000_000,
+            1.0,
+        )]);
+        let parts = flush_series_snapshot(&memtable.begin_flush(), &root).unwrap();
+        let reader = SeriesPartReader::open_with_memtable(parts[0].clone(), &memtable).unwrap();
+        let live = memtable.resolve_live_label_batch(&test_tenant(), &[labels.as_bytes()])[0]
+            .clone()
+            .expect("the flushed series remains active in the memtable");
+        assert!(
+            reader.tenant_catalog(&test_tenant())[0]
+                .labels
+                .shares_storage(&live)
         );
         std::fs::remove_dir_all(&root).ok();
     }

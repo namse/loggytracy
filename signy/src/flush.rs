@@ -316,6 +316,9 @@ async fn flush_once(
     let flush_chunk_bytes = config.flush_chunk_bytes;
     let background_memory_pool = config.background_memory_pool.clone();
     let merge_max_memory_bytes = config.merge_max_memory_bytes;
+    let series_label_source = series_registry
+        .label_source()
+        .and_then(|source| source.upgrade());
     let result = match tokio::task::spawn_blocking({
         let parts_root = parts_root.clone();
         let traces_root = config.data_dir.join("traces");
@@ -412,7 +415,10 @@ async fn flush_once(
                     return Err(rollback(error, &log_parts, &trace_parts, &series_parts));
                 }
             };
-            let opened_series = match SeriesRegistry::open_parts(series_parts.clone()) {
+            let opened_series = match SeriesRegistry::open_parts_with_label_source(
+                series_parts.clone(),
+                series_label_source,
+            ) {
                 Ok(opened) => opened,
                 Err(error) => {
                     return Err(rollback(error, &log_parts, &trace_parts, &series_parts));
