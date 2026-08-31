@@ -629,3 +629,107 @@ Two attribution gaps the run itself exposed, so the table is read correctly:
 Also observed, recorded rather than diagnosed: between t≈445 and t≈465 the
 query success counter froze for ~20 s while merge ran and the WAL backlog
 climbed — the shape of the run's 1 % query 504 rate (48/4,926).
+
+---
+
+## The metric path, measured on build `df601dd` (2026-08-31)
+
+[`COMPARISON_METRICS.md`](COMPARISON_METRICS.md) left the same shape of number
+unexplained that M9 left for logs: at a 2 GiB container, 520 288 series offered,
+signy peaked at **1 037.8 MiB** and refused 24 288 datapoints at
+`max_active_series`, while VictoriaMetrics took every one of them at **627.3
+MiB**. The engine's own accounting charges a series its canonical label bytes
+plus `SERIES_OVERHEAD_BYTES = 160`, which puts half a million series near
+160 MiB — a sixfold gap against what the container held.
+
+Two arenas were added to close it (`series_memtable`, `series_catalog`), and a
+first run showed the profile could not answer at all: **`other` peaked at
+361.7 MiB**, larger than either named arena, because the metric decode, flush
+and compaction sat outside every guard — `ingest`, `flush` and `merge` all read
+a flat zero for a metrics-only workload. Those three now enter the arena their
+role already names, and `other` reads **0.4 MiB**.
+
+### Reproducing it
+
+```sh
+# Absolute anon, on the production allocator (jemalloc), no instrument tax
+SIGNY_LOAD_METRIC_CHURN_REPLACE=2000 SIGNY_LOAD_METRIC_EXPLOSION_SERIES=500000 \
+  cargo run --release --bin memory_gate -- --scenario metrics --budget 2GiB --seconds 480
+
+# The arena split
+export SIGNY_LOAD_METRIC_ANCHOR_NS=1 SIGNY_LOAD_METRIC_CHURN_REPLACE=2000 \
+       SIGNY_LOAD_METRIC_EXPLOSION_SERIES=500000 \
+       SIGNY_LOAD_METRIC_STEADY_SECONDS=96 SIGNY_LOAD_METRIC_CHURN_SECONDS=240 \
+       SIGNY_LOAD_METRIC_EXPLOSION_SECONDS=144
+M10_PHASE=metric-load M10_LIMIT=2G M10_FEATURES=memprof \
+  scripts/run_memprof_local.sh metrics-churn
+```
+
+The gate run reproduces the bed's shape: **748.1 MiB** peak anon, 20 requests
+refused in the explosion phase, 460 744 of 560 032 datapoints accepted. The
+bed's own 1 037.8 MiB is higher because it runs the query matrix concurrently;
+the ingest shape is the same.
+
+### The attribution, at the instrumented run's anon peak
+
+482 320 active series, 10 open metric parts, peak `anon` 677.1 MiB.
+
+| arena | MiB | per series | what it is |
+|---|---|---|---|
+| `series_memtable` | 201.1 | 437 B | live series entries: buffer struct, open Gorilla stream, spill |
+| `flush` | 130.7 | — | **transient**: the partition map and re-encoded chunks of a flush in progress |
+| `series_catalog` | 88.5 | 192 B | one `CatalogEntry` per series per open part, labels included |
+| `merge` | 71.0 | — | **transient**: compaction's merged map |
+| `ingest` | 55.2 | 120 B | the decode's `SeriesLabels`, which the memtable then keeps by `Arc` |
+| `other` | 0.4 | — | untagged remainder |
+| instrument header | 31.4 | — | memprof's 16 bytes per live allocation |
+| **live** | **546.9** | | |
+| allocator, not returned | ~130 | — | `anon − live`; ratio 1.24 |
+
+### Four things this says
+
+**1. The memtable's accounting undercounts by ~1.7×.** At the same instant,
+`signy_series_memtable_bytes` read **117.1 MiB** against the arena's 201.1 MiB —
+254 B charged per series against 437 B held. Counting the labels the decode
+allocates and the memtable retains (`ingest`, 120 B/series), the real figure is
+about **557 B per live series** against 254 B charged. `SERIES_OVERHEAD_BYTES`
+is the constant to re-derive, and this is the number to derive it from.
+
+**2. The catalog is residency the accounting has never seen.** A
+`SeriesPartReader` decodes its part's whole catalog — a full `SeriesLabels`
+allocation per series — and holds it for as long as the registry holds the
+part, `open_cached` included, so an offloaded body does not release it. Traces
+keep only blooms; logs keep a cached Parquet footer. Metrics is the only signal
+that keeps a per-row structure resident, and at 192 B per active series it is
+the same order as the memtable it is invisible beside. Measured at 186.9 MiB in
+the partially-tagged run and 88.5 MiB here, so treat it as **190–400 B per
+series** and part-count-dependent rather than as one number.
+
+**3. The peak instant is a flush and a compaction, not steady state.** `flush`
+and `merge` together held **201.7 MiB** at the peak and read 0.0 forty seconds
+earlier. They are not residency, and they are what decides the high-water mark.
+
+**4. Compaction materializes its whole group before writing.** `compact_once`
+builds a `BTreeMap<TenantId, BTreeMap<SeriesLabels, Vec<(i64, f64)>>>` over
+every input part's every series and every sample, and only then calls the flush
+writer. That is the shape [`MEMORY_BUDGET_GATE.md`](MEMORY_BUDGET_GATE.md)
+already fixed once on the log side, where a rewrite that materialized its group
+held 829 of 847 live MiB at the settle peak and streaming it is what moved the
+gate. The metric compactor repeats it.
+
+### Reading the table correctly
+
+* **The instrumented build is not on jemalloc.** memprof installs its own
+  tagging global allocator over `System`, so the `anon`, the 1.24 ratio and the
+  `glibc arena/free` lines are glibc's behaviour, not the production binary's.
+  The *split between arenas* is what this run establishes; the absolute peak
+  comes from the gate run above.
+* **`ingest` is charged where the bytes are allocated, not where they live.**
+  The 55.2 MiB plateau does not fall after the journal write because
+  `normalize_request` allocates the `SeriesLabels` the memtable then holds by
+  `Arc`. Nesting works as documented — `admit_datapoints` enters
+  `series_memtable` inside the ingest guard — so the buffer is separated from
+  the labels, and both belong to the memtable's true cost.
+* **`series_catalog` is likewise charged at decode.** Compaction clones those
+  `Arc`s into its merged map, so a catalog entry can outlive the reader that
+  decoded it while still being charged here.
