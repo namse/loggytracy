@@ -458,11 +458,16 @@ impl SeriesBuffer {
     }
 
     fn accounted_bytes(&self) -> u64 {
+        let open = if self.open.is_empty() {
+            0
+        } else {
+            self.open.byte_len() as u64
+        };
         self.closed
             .iter()
             .map(|chunk| chunk.len() as u64)
             .sum::<u64>()
-            .saturating_add(self.open.byte_len() as u64)
+            .saturating_add(open)
             .saturating_add(self.spill.len() as u64 * SPILL_SAMPLE_BYTES)
     }
 }
@@ -1158,8 +1163,8 @@ impl SeriesMemTable {
             state.clear_admitted_after_insert();
             state.observe(ts_ns);
         }
-        drop(inner);
         self.inner_bytes.fetch_add(added, Ordering::Relaxed);
+        drop(inner);
     }
 
     /// Move every buffered sample into a snapshot the flush owns, keeping the
@@ -1684,8 +1689,10 @@ mod tests {
         let memtable = SeriesMemTable::new();
         let series = labels("queue_depth", "abort-inline");
         memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+        let state_bytes = series.byte_len() + SERIES_OVERHEAD_BYTES as usize;
         let snapshot = memtable.begin_flush();
         memtable.insert(vec![sample(&series, 200, 2.0, SampleKind::Gauge)]);
+        assert_eq!(memtable.approximate_size(), state_bytes + 20 + 16);
 
         {
             let inner = memtable.inner.read();
@@ -1705,6 +1712,9 @@ mod tests {
         }
 
         memtable.abort_flush(snapshot);
+        // The snapshot's 20-byte chunk and the concurrent inline sample are
+        // now one stream (20-byte closed chunk + 20-byte open chunk).
+        assert_eq!(memtable.approximate_size(), state_bytes + 40);
         let inner = memtable.inner.read();
         let tenant_series = inner.get(&test_tenant()).expect("tenant was inserted");
         let state = tenant_series
