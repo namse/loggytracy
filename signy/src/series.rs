@@ -1565,11 +1565,16 @@ impl SeriesMemTable {
         let mut snapshot_bytes = 0u64;
         for (tenant, series_map) in inner.iter_mut() {
             let mut list = Vec::new();
+            // The arena is only needed while samples are live.  Taking the
+            // map before draining it releases the large bucket allocation at
+            // the end of this flush instead of retaining cardinality-sized
+            // capacity on every tenant's otherwise compact state index.
+            let mut buffers = std::mem::take(&mut series_map.buffers);
             for (labels, state) in series_map.states.iter_mut() {
                 let Some(buffer_id) = state.buffer_id else {
                     continue;
                 };
-                let Some(buffer) = series_map.buffers.remove(&buffer_id) else {
+                let Some(buffer) = buffers.remove(&buffer_id) else {
                     state.buffer_id = None;
                     continue;
                 };
@@ -1606,6 +1611,13 @@ impl SeriesMemTable {
                     bounds,
                 });
             }
+            debug_assert!(
+                buffers.is_empty(),
+                "every allocated sample buffer must be referenced by a live state"
+            );
+            // `buffers` is dropped here.  `series_map.buffers` is already a
+            // fresh empty map, so its capacity remains zero until the next
+            // sample actually needs an arena slot.
             if !list.is_empty() {
                 tenants.insert(tenant.clone(), list);
             }
@@ -2123,6 +2135,7 @@ mod tests {
         let snapshot = memtable.begin_flush();
         let stats = memtable.memory_stats();
         assert_eq!(stats.buffers_len, 0);
+        assert_eq!(stats.buffers_capacity, 0);
         assert_eq!(stats.inline_buffers, 0);
         assert_eq!(stats.stream_buffers, 0);
         assert_eq!(stats.flushing_series, 2);
@@ -2130,6 +2143,35 @@ mod tests {
         memtable.commit_flush();
         assert_eq!(memtable.memory_stats().flushing_series, 0);
         drop(snapshot);
+    }
+
+    #[test]
+    fn begin_flush_releases_drained_buffer_capacity_and_keeps_state_reusable() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "drained-arena");
+        memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+        assert!(memtable.memory_stats().buffers_capacity > 0);
+
+        let snapshot = memtable.begin_flush();
+        let stats = memtable.memory_stats();
+        assert_eq!(stats.buffers_len, 0);
+        assert_eq!(stats.buffers_capacity, 0);
+        assert_eq!(memtable.active_series(&test_tenant()), 1);
+        assert_eq!(memtable.series_labels(&test_tenant()), vec![series.clone()]);
+        assert_eq!(
+            snapshot.tenants[&test_tenant()][0]
+                .sorted_samples()
+                .unwrap(),
+            vec![(100, 1.0)]
+        );
+
+        memtable.commit_flush();
+        memtable.insert(vec![sample(&series, 200, 2.0, SampleKind::Gauge)]);
+        assert!(memtable.memory_stats().buffers_capacity > 0);
+        assert_eq!(
+            memtable.sorted_samples(&test_tenant()).unwrap()[&series],
+            vec![(200, 2.0)]
+        );
     }
 
     #[test]
