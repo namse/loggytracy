@@ -165,3 +165,39 @@ cgroup OOM (`anon_peak_bytes=2,039 MiB`). The last scrape reported
 inline, and no flush snapshot was live. This is a substantial improvement over
 the previous 3,670,010 plateau, but it is still below the 10-million target.
 The artifact is under `compare/target/metric-capacity-probe-state24-10m/`.
+
+### Catalog-source and singleton-buffer reductions
+
+Two follow-up probes separated the remaining resident state from the
+one-sample buffer representation. Sharing active labels with the part-catalog
+source removed the process-wide weak interner from the cardinality path, and
+demoting an aborted singleton stream back to the 16-byte inline form removed
+the boxed Gorilla stream that otherwise remained after a flush abort. The
+fixed 10,000,000-series probes reached, respectively:
+
+| change | accepted series | anon peak | last state shape |
+|---|---:|---:|---|
+| catalog-source resolver | 6,610,010 | 2,027 MiB | `states_capacity=7,340,032`, `buffers_len=900,000`, `buffers_stream=895,000` |
+| singleton demotion | 7,340,010 | 2,034 MiB | `states_capacity=7,340,032`, `buffers_len=25,000`, `buffers_inline=25,000` |
+
+The second result moved the failure to the persistent active-series index:
+nearly all accepted states were already flushed and only 25,000 inline sample
+buffers remained. The artifacts are under
+`compare/target/metric-capacity-probe-catalog-source-10m/` and
+`compare/target/metric-capacity-probe-singleton-10m/`.
+
+### Sharded active-series index (2026-08-31)
+
+The `SeriesStates` index was then split into 64 ordinary `HashMap` shards
+behind the existing tenant-wide lock. This limits a single resize allocation
+to one shard and keeps full-label equality; it does not change the steady
+state payload of a map entry. The one fixed 10,000,000-series probe still hit
+the 2 GiB cgroup boundary after **6,255,010 accepted series**
+(`anon_peak_bytes=2,037 MiB`, `oom_killed=true`). The last scrape reported
+`states_capacity=7,340,032`, `buffers_capacity=1,835,008`,
+`buffers_inline=1,090,000`, and no interner entries. Thus sharding removes
+the monolithic rehash cliff but does not provide the roughly 40% payload
+reduction needed for 10 million series; the next optimization target is the
+per-series canonical label allocation/representation, not more HashMap
+growth tuning. The artifact is under
+`compare/target/metric-capacity-probe-sharded-10m/`.
