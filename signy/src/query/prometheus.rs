@@ -356,7 +356,8 @@ fn series_ladder_metrics(state: &AppState) -> String {
     let counters = series.counters();
     format!(
         "# HELP signy_active_series Live metric series index entries across tenants. \
-Bounded per tenant by SIGNY_MAX_ACTIVE_SERIES.\n\
+The optional SIGNY_MAX_ACTIVE_SERIES emergency guard is process-wide; normal \
+admission is charged against the shared byte budget.\n\
 # TYPE signy_active_series gauge\n\
 signy_active_series {}\n\
 # TYPE signy_series_created_total counter\n\
@@ -365,16 +366,28 @@ signy_series_created_total {}\n\
 horizon (SIGNY_METRIC_SERIES_IDLE_TIMEOUT); their history stays in parts.\n\
 # TYPE signy_series_evicted_idle_total counter\n\
 signy_series_evicted_idle_total {}\n\
-# HELP signy_series_rejected_total New series refused at the max_active_series \
-boundary. Known series are never refused by this rung.\n\
+# HELP signy_series_rejected_total New series refused at the optional \
+process-wide SIGNY_MAX_ACTIVE_SERIES emergency boundary.\n\
 # TYPE signy_series_rejected_total counter\n\
 signy_series_rejected_total {}\n\
 # TYPE signy_metric_datapoints_rejected_total counter\n\
 signy_metric_datapoints_rejected_total {}\n\
 # TYPE signy_metric_samples_rejected_total counter\n\
 signy_metric_samples_rejected_total {}\n\
+# HELP signy_metric_cardinality_rejected_total Metric exports refused whole by \
+the optional process-wide active-series emergency guard.\n\
+# TYPE signy_metric_cardinality_rejected_total counter\n\
+signy_metric_cardinality_rejected_total {}\n\
+# HELP signy_metric_memory_rejected_total Metric exports refused whole because \
+the shared process-wide memtable byte budget had no room.\n\
+# TYPE signy_metric_memory_rejected_total counter\n\
+signy_metric_memory_rejected_total {}\n\
 # TYPE signy_series_memtable_bytes gauge\n\
-signy_series_memtable_bytes {}\n",
+signy_series_memtable_bytes {}\n\
+# HELP signy_metric_memtable_reserved_bytes Projected metric sample bytes held \
+by queued journal appends.\n\
+# TYPE signy_metric_memtable_reserved_bytes gauge\n\
+signy_metric_memtable_reserved_bytes {}\n",
         counters.active_series.load(Ordering::Relaxed),
         counters.series_created_total.load(Ordering::Relaxed),
         counters.series_evicted_idle_total.load(Ordering::Relaxed),
@@ -385,7 +398,14 @@ signy_series_memtable_bytes {}\n",
         counters
             .metric_samples_rejected_total
             .load(Ordering::Relaxed),
+        counters
+            .metric_cardinality_rejected_total
+            .load(Ordering::Relaxed),
+        counters
+            .metric_memory_rejected_total
+            .load(Ordering::Relaxed),
         series.approximate_size(),
+        state.journal.metric_reserved_bytes(),
     )
 }
 
@@ -664,4 +684,3 @@ fn tenant_policy_gauges(state: &AppState) -> TenantPolicyGauges {
             .as_secs(),
     }
 }
-

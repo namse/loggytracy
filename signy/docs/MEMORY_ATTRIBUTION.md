@@ -60,8 +60,10 @@ Stated first, in the discipline [`COMPARISON.md`](COMPARISON.md) sets.
   the time series. The allocator keeps its own per-arena high-water marks, which
   do catch them, and those are reported separately and are explicitly *not*
   simultaneous with each other.
-* **No alternative allocator was tried.** jemalloc or mimalloc would be a new
-  dependency, and this phase adds none. What was varied is glibc's own tuning.
+* **The early attribution runs used glibc only.** They did not compare an
+  alternative allocator; later work moved the production binary through
+  jemalloc and, since 2026-08-31, mimalloc. The historical glibc figures below
+  must not be read as a measurement of the current production allocator.
 
 ---
 
@@ -652,7 +654,7 @@ role already names, and `other` reads **0.4 MiB**.
 ### Reproducing it
 
 ```sh
-# Absolute anon, on the production allocator (jemalloc), no instrument tax
+# Absolute anon, on the production allocator (mimalloc), no instrument tax
 SIGNY_LOAD_METRIC_CHURN_REPLACE=2000 SIGNY_LOAD_METRIC_EXPLOSION_SERIES=500000 \
   cargo run --release --bin memory_gate -- --scenario metrics --budget 2GiB --seconds 480
 
@@ -665,10 +667,33 @@ M10_PHASE=metric-load M10_LIMIT=2G M10_FEATURES=memprof \
   scripts/run_memprof_local.sh metrics-churn
 ```
 
-The gate run reproduces the bed's shape: **748.1 MiB** peak anon, 20 requests
-refused in the explosion phase, 460 744 of 560 032 datapoints accepted. The
-bed's own 1 037.8 MiB is higher because it runs the query matrix concurrently;
-the ingest shape is the same.
+The earlier pre-mimalloc baseline was **748.1 MiB** peak anon with 20 requests
+refused in the explosion phase, accepting 460 744 of 560 032 datapoints. That
+number is retained as historical context only: its allocator and lifecycle
+configuration differ, so subtracting it from either result below would not
+isolate the effect of one structural change.
+
+With mimalloc and the old 10% budget-derived memtable ceiling, the first
+post-admission run peaked at **374.23 MiB** anon but refused **58** whole
+exports, accepting only **270 744 of 560 032** explosion datapoints. The 25%
+ceiling was then validated on the same 2 GiB/480 s workload:
+
+| result | value |
+|---|---:|
+| verdict | **UNDER_BUDGET** |
+| peak anon | **655.527 MiB (32.008% of 2 GiB)** |
+| cgroup `memory.peak` (including page cache) | **957.1445 MiB** |
+| settle anon | **454.7148 MiB** |
+| OOM kills | **0** |
+| requests refused | **0** (`200=114`) |
+| explosion accepted | **560 032 / 560 032** |
+| churn accepted | **102 912 / 102 912** |
+| steady accepted | **2 880 / 2 880** |
+
+The validation run therefore both admits the full comparison-bed offer and
+stays well below the cgroup limit. Its higher peak than the first 10% run is
+expected because it processes the previously refused work; it is not evidence
+that the allocator alone or the share alone caused a particular delta.
 
 ### The attribution, at the instrumented run's anon peak
 
@@ -719,7 +744,7 @@ gate. The metric compactor repeats it.
 
 ### Reading the table correctly
 
-* **The instrumented build is not on jemalloc.** memprof installs its own
+* **The instrumented build is not on mimalloc.** memprof installs its own
   tagging global allocator over `System`, so the `anon`, the 1.24 ratio and the
   `glibc arena/free` lines are glibc's behaviour, not the production binary's.
   The *split between arenas* is what this run establishes; the absolute peak
@@ -733,3 +758,30 @@ gate. The metric compactor repeats it.
 * **`series_catalog` is likewise charged at decode.** Compaction clones those
   `Arc`s into its merged map, so a catalog entry can outlive the reader that
   decoded it while still being charged here.
+
+### The derived memtable ceiling after streaming (2026-08-31)
+
+The first byte-admission run used the old budget-derived ceiling of 10%:
+122.9 MiB from a 60% declared budget on a 2 GiB cgroup. That ceiling was below
+the measured metric resident set and produced **58 whole-export `429`s**,
+accepting only **270,744 of 560,032** offered datapoints. The same run's
+streaming flush/compaction build peaked at **374.23 MiB anonymous memory**, so
+the refusal was the derived ceiling rather than cgroup pressure. This was the
+first post-admission run, not the final validation.
+
+The default is now **25% of the declared budget** for the shared
+log/trace/metric memtables. At that setup this is **307.2 MiB (322.1 million bytes)**. It is large
+enough for the measured ~482k-series memtable (201.1 MiB in the instrumented
+run) with churn and conservative sample reservations, while the engine still
+declares only 60% of the cgroup and leaves the rest for allocator retention,
+query/cache state, request queues, and runtime overhead. The gate remains a
+hard byte boundary: metric admission rejects the complete export with
+`429`/`Retry-After` when the shared ceiling cannot fit it; an explicit
+`SIGNY_MAX_MEMTABLE_BYTES` continues to override the derived value.
+
+The second run validated this derivation on the comparison bed: it was
+`UNDER_BUDGET`, accepted **560,032/560,032** explosion datapoints with no
+refusals, and peaked at **655.527 MiB anon** (32.008% of the 2 GiB cgroup),
+with **454.715 MiB** at settle and no OOM kill. This is the measured result for
+the current workload, not a claim that every workload has a 500k-series
+capacity; explicit overrides remain the operator's responsibility.

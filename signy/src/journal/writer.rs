@@ -74,6 +74,7 @@ impl Journal {
         let writer_metrics = metrics.clone();
         let writer_marks = collect_marks.clone();
         let writer_dir = dir.clone();
+        let metric_reserved_bytes = Arc::new(AtomicU64::new(0));
         tokio::spawn(async move {
             let result = writer_loop(
                 rx,
@@ -107,6 +108,7 @@ impl Journal {
             trace_memtable,
             series_memtable,
             backlog,
+            metric_reserved_bytes,
         })
     }
 
@@ -163,6 +165,8 @@ impl Journal {
             Vec::new(),
             Vec::new(),
             mark,
+            None,
+            None,
         )
         .await
     }
@@ -195,6 +199,8 @@ impl Journal {
             spans,
             Vec::new(),
             mark,
+            None,
+            None,
         )
         .await
     }
@@ -232,8 +238,63 @@ impl Journal {
             Vec::new(),
             samples,
             mark,
+            None,
+            None,
         )
         .await
+    }
+
+    /// Enqueue every tenant portion of one metric export as one channel
+    /// command. Sending the portions individually lets a closed/full journal
+    /// accept and possibly fsync an earlier tenant before a later send fails.
+    /// A single command makes channel admission all-or-nothing; the writer
+    /// also writes and inserts all of its items in one fsync batch.
+    pub(crate) async fn enqueue_metrics_reserved_batch(
+        &self,
+        records: Vec<ReservedMetricAppend>,
+    ) -> Result<Vec<PendingAppend>, IoError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut items = Vec::with_capacity(records.len());
+        let mut pending = Vec::with_capacity(records.len());
+        let queued_at = Instant::now();
+        for record in records {
+            let payload = compress_payload(&record.data)?;
+            let framed_len = TENANT_RECORD_PREFIX_SIZE
+                + record.tenant.as_str().len()
+                + payload.len();
+            if framed_len > MAX_RECORD_BYTES {
+                return Err(IoError::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "journal record is too large: {framed_len} bytes (maximum {MAX_RECORD_BYTES})"
+                    ),
+                ));
+            }
+            let (done_tx, done_rx) = oneshot::channel();
+            pending.push(PendingAppend(done_rx));
+            items.push(AppendItem {
+                kind: TENANT_RECORD_KIND_OTLP_METRICS,
+                payload,
+                tenant: Some(record.tenant),
+                entries: Vec::new(),
+                traces: Vec::new(),
+                metric_samples: record.samples,
+                metric_memory_permit: Some(record.metric_memory_permit),
+                metric_series_admission: Some(record.metric_series_admission),
+                mark: record.mark,
+                queued_at,
+                done: done_tx,
+            });
+        }
+
+        self.tx
+            .send(JournalCmd::AppendBatch(items))
+            .await
+            .map_err(|_| IoError::new(std::io::ErrorKind::BrokenPipe, "journal writer closed"))?;
+        Ok(pending)
     }
 
     /// A number to remember with nothing to store under it.
@@ -250,6 +311,8 @@ impl Journal {
             Vec::new(),
             Vec::new(),
             Some(mark),
+            None,
+            None,
         )
         .await
     }
@@ -268,6 +331,8 @@ impl Journal {
         traces: Vec<TraceSpan>,
         metric_samples: Vec<MetricSample>,
         mark: Option<CollectMark>,
+        metric_memory_permit: Option<MetricMemoryPermit>,
+        metric_series_admission: Option<crate::series::SeriesAdmission>,
     ) -> Result<PendingAppend, IoError> {
         let framed_len = tenant
             .as_ref()
@@ -294,6 +359,8 @@ impl Journal {
                 entries,
                 traces,
                 metric_samples,
+                metric_memory_permit,
+                metric_series_admission,
                 mark,
                 queued_at,
                 done: done_tx,
@@ -309,6 +376,48 @@ impl Journal {
 
     pub fn series_memtable(&self) -> Arc<SeriesMemTable> {
         self.series_memtable.clone()
+    }
+
+    /// Reserve the projected growth of one or more metric exports against the
+    /// same process-wide memtable ceiling used by logs and traces.  The
+    /// caller has already inserted the reserved series entries; this permit
+    /// covers the sample buffers that the journal writer will grow before it
+    /// releases the charge after insertion.
+    pub(crate) fn try_reserve_metric_bytes(
+        &self,
+        bytes: u64,
+        limit: Option<u64>,
+    ) -> Option<MetricMemoryPermit> {
+        let Some(limit) = limit else {
+            return Some(MetricMemoryPermit {
+                counter: self.metric_reserved_bytes.clone(),
+                bytes: 0,
+            });
+        };
+        let observed = self
+            .log_memtable()
+            .approximate_size()
+            .saturating_add(self.trace_memtable().approximate_size())
+            .saturating_add(self.series_memtable().approximate_size()) as u64;
+        let result = self.metric_reserved_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |reserved| {
+                observed
+                    .saturating_add(reserved)
+                    .checked_add(bytes)
+                    .filter(|total| *total <= limit)
+                    .map(|_| reserved.saturating_add(bytes))
+            },
+        );
+        result.ok().map(|_| MetricMemoryPermit {
+            counter: self.metric_reserved_bytes.clone(),
+            bytes,
+        })
+    }
+
+    pub fn metric_reserved_bytes(&self) -> u64 {
+        self.metric_reserved_bytes.load(Ordering::Acquire)
     }
 
     pub async fn checkpoint(&self) -> Result<CheckpointSnapshot, IoError> {
@@ -437,6 +546,61 @@ async fn writer_loop(
                         Ok(Some(JournalCmd::Append(item))) => {
                             batch_bytes += item_len(&item);
                             batch.push(item);
+                        }
+                        Ok(Some(JournalCmd::AppendBatch(items))) => {
+                            batch_bytes = batch_bytes.saturating_add(
+                                items.iter().map(item_len).fold(0usize, usize::saturating_add),
+                            );
+                            batch.extend(items);
+                        }
+                        Ok(Some(JournalCmd::Checkpoint { done })) => {
+                            pending_checkpoint = Some(done);
+                            break;
+                        }
+                        Ok(Some(JournalCmd::Compact { offset, done })) => {
+                            pending_compact = Some((offset, done));
+                            break;
+                        }
+                        Ok(None) => {
+                            closed = true;
+                            break;
+                        }
+                        Err(()) => break,
+                    }
+                }
+            }
+            JournalCmd::AppendBatch(items) => {
+                batch_bytes = items
+                    .iter()
+                    .map(item_len)
+                    .fold(0usize, usize::saturating_add);
+                batch.extend(items);
+                // A batch command is already an enqueue-atomic metric
+                // export. It may share this fsync with neighboring appends,
+                // but no part of the command can arrive independently.
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(max_batch_ms);
+                while batch_bytes < max_batch_bytes {
+                    let next = if max_batch_ms == 0 {
+                        match rx.try_recv() {
+                            Ok(command) => Ok(Some(command)),
+                            Err(mpsc::error::TryRecvError::Empty) => Err(()),
+                            Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
+                        }
+                    } else {
+                        tokio::time::timeout_at(deadline, rx.recv())
+                            .await
+                            .map_err(|_| ())
+                    };
+                    match next {
+                        Ok(Some(JournalCmd::Append(item))) => {
+                            batch_bytes = batch_bytes.saturating_add(item_len(&item));
+                            batch.push(item);
+                        }
+                        Ok(Some(JournalCmd::AppendBatch(items))) => {
+                            batch_bytes = batch_bytes.saturating_add(
+                                items.iter().map(item_len).fold(0usize, usize::saturating_add),
+                            );
+                            batch.extend(items);
                         }
                         Ok(Some(JournalCmd::Checkpoint { done })) => {
                             pending_checkpoint = Some(done);
@@ -579,6 +743,10 @@ async fn writer_loop(
                         }
                         trace_memtable.insert(item.traces);
                         series_memtable.insert(item.metric_samples);
+                        if let Some(admission) = item.metric_series_admission {
+                            admission.commit();
+                        }
+                        drop(item.metric_memory_permit);
                         let _ = item.done.send(Ok(()));
                     }
                     let inserted = Instant::now();

@@ -357,7 +357,8 @@ pub fn normalize_request(
 /// walks agree. This is what the WAL stores on a partial acceptance, so
 /// replay decomposes into exactly the admitted samples and a refused series
 /// cannot be resurrected by a restart.
-pub fn filter_request(
+#[cfg(test)]
+fn filter_request(
     request: &ExportMetricsServiceRequest,
     admitted: &std::collections::HashSet<u32>,
 ) -> ExportMetricsServiceRequest {
@@ -573,6 +574,12 @@ pub struct OtlpMetricIngest<'a> {
     pub clock: &'a crate::clock::Clock,
 }
 
+struct PreparedMetricGroup {
+    tenant: TenantId,
+    encoded: Vec<u8>,
+    samples: Vec<MetricSample>,
+}
+
 impl OtlpMetricIngest<'_> {
     /// See [`crate::log_ingest::OtlpLogIngest::admit_size`]: the tenant is no
     /// longer knowable this early, and the size still is.
@@ -588,14 +595,11 @@ impl OtlpMetricIngest<'_> {
     }
 
     /// The metric counterpart to
-    /// [`crate::log_ingest::OtlpLogIngest::enqueue_request`], with the same
-    /// ordering: the datapoint cap over the whole request and before the
-    /// split, the drop tally counted rather than answered, one journal record
-    /// per tenant.
+    /// [`crate::log_ingest::OtlpLogIngest::enqueue_request`].  All tenant
+    /// groups are normalized and admitted before the first journal append, so
+    /// memory/cardinality pressure can only accept or reject the complete
+    /// export.  The append itself remains one WAL record per tenant.
     ///
-    /// The `partial_success` the transports answer with is the groups' own,
-    /// summed — a series budget is the instance's and is spent across whoever
-    /// arrives in one request.
     pub async fn enqueue_request(
         &self,
         request: ExportMetricsServiceRequest,
@@ -609,127 +613,129 @@ impl OtlpMetricIngest<'_> {
         let split = crate::otlp_tenant::split_metrics(request, self.tenant_policy);
         split.dropped.record(self.metrics, "metrics");
 
-        let last = split.groups.len().saturating_sub(1);
-        let mut pending = Vec::with_capacity(split.groups.len());
-        let mut merged = MetricAcceptOutcome {
-            rejected_data_points: 0,
-            rejection: None,
-        };
-        for (index, (tenant, group)) in split.groups.into_iter().enumerate() {
+        // Normalization and re-encoding are synchronous. Keep their temporary
+        // protobuf/label allocations in the ingest arena, but end the guard
+        // before the admission/journal awaits below.
+        let ingest_arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
+        let mut groups = Vec::with_capacity(split.groups.len());
+        for (tenant, group) in split.groups {
             if let Err(error) = self.tenant_quota.admit_storage(&tenant) {
                 tracing::warn!(%tenant, reason = error.message, "dropping metrics for a tenant at its storage limit");
                 continue;
             }
-            let mark = if index == last { mark } else { None };
-            let (append, outcome) = self.enqueue(tenant, group, mark).await?;
-            pending.push(append);
-            merged.rejected_data_points = merged
-                .rejected_data_points
-                .saturating_add(outcome.rejected_data_points);
-            merged.rejection = merged.rejection.or(outcome.rejection);
+            let samples = normalize_request(&tenant, &group).map_err(|error| match error {
+                MetricIngestError::TooManySamples => too_many_samples(),
+                other => IngestError::from((StatusCode::BAD_REQUEST, other.to_string())),
+            })?;
+            let window = crate::ingest::TimestampWindow::from_config(self.config, self.clock);
+            for sample in &samples {
+                window
+                    .validate(sample.ts_ns)
+                    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+            }
+            let encoded = group.encode_to_vec();
+            groups.push(PreparedMetricGroup {
+                tenant,
+                encoded,
+                samples,
+            });
         }
-        Ok((pending, merged))
+        drop(ingest_arena);
+        self.enqueue_prepared(groups, mark).await
     }
 
-    pub async fn enqueue(
+    async fn enqueue_prepared(
         &self,
-        tenant: crate::tenant::TenantId,
-        request: ExportMetricsServiceRequest,
+        groups: Vec<PreparedMetricGroup>,
         mark: Option<crate::journal::CollectMark>,
-    ) -> Result<(crate::journal::PendingAppend, MetricAcceptOutcome), IngestError> {
-        // Dropped before the journal await below. `admit_datapoints` nests its
-        // own arena inside this one, so what stays here is the decode's
-        // output: the normalized samples and the re-encoded filtered request.
-        let arena = crate::memprof::enter(crate::memprof::Arena::Ingest);
-        let samples = normalize_request(&tenant, &request).map_err(|error| match error {
-            MetricIngestError::TooManySamples => too_many_samples(),
-            other => IngestError::from((StatusCode::BAD_REQUEST, other.to_string())),
-        })?;
-        let window = crate::ingest::TimestampWindow::from_config(self.config, self.clock);
-        for sample in &samples {
-            window
-                .validate(sample.ts_ns)
-                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    ) -> Result<(Vec<crate::journal::PendingAppend>, MetricAcceptOutcome), IngestError> {
+        if groups.is_empty() {
+            return Ok((Vec::new(), MetricAcceptOutcome::default()));
         }
-        // The max_active_series rung. Decided before anything is journaled,
-        // per datapoint, with idle capacity reclaimed under pressure — see
-        // `SeriesMemTable::admit_datapoints`.
         let series_memtable = self.journal.series_memtable();
+        let group_refs: Vec<_> = groups
+            .iter()
+            .map(|group| (&group.tenant, group.samples.as_slice()))
+            .collect();
         let idle_cutoff = self
             .clock
             .now_ns()
             .saturating_sub(self.config.metric_series_idle_timeout.as_nanos() as i64);
-        let admission = series_memtable.admit_datapoints(
-            &tenant,
-            &samples,
-            self.config.max_active_series,
-            idle_cutoff,
-        );
-        if admission.rejected_any() && admission.admitted.is_empty() {
-            // Everything was refused: a 429, because capacity does return —
-            // at the idle horizon — and the collector should retry then.
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                self.refusal_message(&admission),
+        let admissions = series_memtable
+            .admit_request(&group_refs, self.config.max_active_series, idle_cutoff)
+            .map_err(|error| {
+                self.metrics
+                    .ingest_throttled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                IngestError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: format!(
+                        "metric export needs {} new series but the process-wide limit of {} live series is already at {}; retry after capacity returns (SIGNY_MAX_ACTIVE_SERIES)",
+                        error.new_series, error.limit, error.active_series
+                    ),
+                    retry_after: Some(self.config.backpressure_retry_after),
+                }
+            })?;
+        let growth: Vec<u64> = groups
+            .iter()
+            .map(|group| {
+                crate::series::SeriesMemTable::estimate_sample_bytes(&[(
+                    &group.tenant,
+                    group.samples.as_slice(),
+                )])
+            })
+            .collect();
+        let total_growth = growth.iter().copied().sum();
+        let mut permit = self
+            .journal
+            .try_reserve_metric_bytes(total_growth, self.config.max_memtable_bytes)
+            .ok_or_else(|| {
+                self.metrics
+                    .ingest_throttled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                series_memtable
+                    .counters()
+                    .metric_memory_rejected_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                IngestError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: format!(
+                        "metric export needs {total_growth} bytes of memtable space but the process-wide budget is full; flush is not keeping up"
+                    ),
+                    retry_after: Some(self.config.backpressure_retry_after),
+                }
+            })?;
+        let last = groups.len() - 1;
+        let records = groups
+            .into_iter()
+            .zip(admissions)
+            .zip(growth)
+            .map(|((group, admission), bytes)| (group, admission, bytes))
+            .enumerate()
+            .map(
+                |(index, (group, admission, bytes))| crate::journal::ReservedMetricAppend {
+                    tenant: group.tenant,
+                    data: group.encoded,
+                    samples: group.samples,
+                    mark: (index == last).then_some(mark).flatten(),
+                    metric_memory_permit: permit.split(bytes),
+                    metric_series_admission: admission,
+                },
             )
-                .into());
-        }
-        // On a partial acceptance the WAL gets the *filtered* request, so a
-        // replay cannot resurrect the refused series and blow the budget the
-        // refusal defended.
-        let (wire_request, samples) = if admission.rejected_any() {
-            let filtered = filter_request(&request, &admission.admitted);
-            let samples: Vec<_> = samples
-                .into_iter()
-                .filter(|sample| admission.admitted.contains(&sample.datapoint_index))
-                .collect();
-            (filtered, samples)
-        } else {
-            (request, samples)
-        };
-        let mut encoded = Vec::new();
-        wire_request.encode(&mut encoded).map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("failed to encode request: {error}"),
-            )
-        })?;
-        drop(arena);
+            .collect();
         let pending = self
             .journal
-            .enqueue_metrics(tenant, encoded, samples, mark)
+            .enqueue_metrics_reserved_batch(records)
             .await
             .map_err(crate::log_ingest::journal_write_failed)?;
-        Ok((
-            pending,
-            MetricAcceptOutcome {
-                rejected_data_points: admission.rejected_datapoints,
-                rejection: admission
-                    .rejected_any()
-                    .then(|| self.refusal_message(&admission)),
-            },
-        ))
-    }
-
-    /// The teaching refusal: the count, the limit, the knob, and the horizon
-    /// at which capacity returns.
-    fn refusal_message(&self, admission: &crate::series::AdmitOutcome) -> String {
-        format!(
-            "{} new series across {} datapoints refused: the tenant holds its \
-max_active_series limit of {} live series (SIGNY_MAX_ACTIVE_SERIES). Known series are \
-still accepted; capacity returns as series idle past {:?} \
-(SIGNY_METRIC_SERIES_IDLE_TIMEOUT)",
-            admission.rejected_new_series,
-            admission.rejected_datapoints,
-            self.config.max_active_series,
-            self.config.metric_series_idle_timeout,
-        )
+        Ok((pending, MetricAcceptOutcome::default()))
     }
 }
 
-/// What an accepted export answered with: everything the OTLP
-/// `partial_success` needs.
-#[derive(Debug)]
+/// What an accepted export answered with.  Memory/cardinality pressure is
+/// rejected before an append, so accepted exports currently carry no partial
+/// success; the fields remain for compatibility with the collect response.
+#[derive(Debug, Default)]
 pub struct MetricAcceptOutcome {
     pub rejected_data_points: u64,
     pub rejection: Option<String>,
@@ -1318,25 +1324,14 @@ mod tests {
             ..Config::default()
         };
         let (ingest, series_memtable, _journal) = ingest_over(config);
-        ingest
-            .accept(small_request())
-            .await
-            .expect("the first export is under the limit");
         let error = ingest
             .accept(small_request())
             .await
-            .expect_err("a full buffer must be refused");
+            .expect_err("a request that cannot fit the byte budget is refused");
         assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            series_memtable
-                .sorted_samples(&test_tenant())
-                .unwrap()
-                .values()
-                .next()
-                .unwrap()
-                .len(),
-            1,
-            "the refused export must not have been appended"
+        assert!(
+            series_memtable.is_empty(),
+            "rejection happens before WAL insert"
         );
     }
 
@@ -1444,11 +1439,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn past_the_cap_known_series_keep_landing_and_new_ones_get_partial_success() {
+    async fn past_the_cap_refuses_the_whole_export() {
         let config = Config {
             data_dir: std::env::temp_dir()
                 .join(format!("signy-metric-ladder-{}", uuid::Uuid::new_v4())),
-            max_active_series: 2,
+            max_active_series: Some(2),
             ..Config::default()
         };
         let (ingest, series_memtable, journal) = ingest_over(config);
@@ -1483,30 +1478,16 @@ mod tests {
             }],
             None,
         );
-        let outcome = ingest.accept(mixed).await.unwrap();
-        let partial = outcome
-            .partial_success()
-            .expect("a partial acceptance names what it refused");
-        assert_eq!(partial.rejected_data_points, 2);
-        assert!(
-            partial.error_message.contains("SIGNY_MAX_ACTIVE_SERIES"),
-            "{}",
-            partial.error_message
-        );
-        assert!(
-            partial
-                .error_message
-                .contains("SIGNY_METRIC_SERIES_IDLE_TIMEOUT"),
-            "{}",
-            partial.error_message
-        );
+        let error = ingest
+            .accept(mixed)
+            .await
+            .expect_err("memory/cardinality pressure refuses the complete export");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.retry_after.is_some());
 
         let live = series_memtable.sorted_samples(&test_tenant()).unwrap();
         assert_eq!(live.len(), 2, "no refused series exists");
-        assert!(
-            live.values().any(|samples| samples.len() == 2),
-            "the known series took its second sample"
-        );
+        assert!(live.values().all(|samples| samples.len() == 1));
 
         // The WAL was filtered: replay reproduces the admitted state, not the
         // refusal-inflated one — the budget survives a restart mid-explosion.
@@ -1528,7 +1509,7 @@ mod tests {
         let config = Config {
             data_dir: std::env::temp_dir()
                 .join(format!("signy-metric-429-{}", uuid::Uuid::new_v4())),
-            max_active_series: 1,
+            max_active_series: Some(1),
             ..Config::default()
         };
         let (ingest, series_memtable, _journal) = ingest_over(config);

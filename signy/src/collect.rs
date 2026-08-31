@@ -389,11 +389,11 @@ async fn settle_oldest(
     settled
 }
 
-/// The record's appends, and the datapoints it was not allowed to keep.
+/// The record's appends and the legacy metric refusal count.
 ///
-/// Only metrics can lose part of a record: a series past the active-series cap
-/// is refused while the rest of the export lands. Logs and traces are all or
-/// nothing, so their count is always zero.
+/// Metric memory/cardinality pressure is export-wide and is returned as 429;
+/// it never becomes a partial-success count.  The count remains in the wire
+/// response for compatibility with old callers and stays zero on this path.
 async fn enqueue_record(
     state: &Arc<AppState>,
     signal: CollectSignal,
@@ -418,13 +418,12 @@ async fn enqueue_record(
 /// `signy_ingest_dropped_resources_total` is where that loss shows instead of
 /// here.
 ///
-/// **`429`, a tenant storing everything its plan sells.** It clears when
-/// retention retires parts, which is not a timescale a disk queue can wait out.
-/// The other `429`, the one an overloaded instance answers, cannot reach here:
-/// it comes from the gate, and the gate is checked once for the whole batch
-/// before any of this runs.
+/// Every `429` is retryable.  In particular, metric memory/cardinality
+/// admission now reaches this point after the request was decoded; dropping
+/// it here would defeat the collector's durable queue and turn backpressure
+/// into silent loss.
 fn never_acceptable(status: StatusCode) -> bool {
-    status.is_client_error()
+    status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS
 }
 
 /// The batch's records, handed out as the socket produces them.

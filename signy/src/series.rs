@@ -151,7 +151,9 @@ pub struct MetricSample {
     pub datapoint_index: u32,
 }
 
-/// What the `max_active_series` ladder rung did with one export's samples.
+/// Legacy per-datapoint admission result retained for in-memory callers.
+/// Live OTLP ingest uses [`SeriesMemTable::admit_request`] and refuses a
+/// complete export under memory/cardinality pressure.
 pub struct AdmitOutcome {
     /// Datapoint indices whose series were all admitted. Samples and WAL
     /// bytes for the rest must be dropped by the caller.
@@ -159,6 +161,49 @@ pub struct AdmitOutcome {
     pub rejected_datapoints: u64,
     pub rejected_samples: u64,
     pub rejected_new_series: u64,
+}
+
+/// The series entries reserved by one metric export.
+///
+/// Admission happens before the journal append, so the entries have to be
+/// visible while the append is in flight (otherwise two concurrent exports can
+/// both reserve the same last byte).  The writer owns this value after the
+/// append is queued.  A successful insert commits it; dropping it on a failed
+/// append releases its reference; a failed append additionally removes an
+/// empty entry once no other in-flight append still relies on it.
+pub struct SeriesAdmission {
+    owner: Arc<SeriesMemTable>,
+    reserved_series: Vec<(TenantId, SeriesLabels)>,
+    committed: bool,
+}
+
+impl SeriesAdmission {
+    pub fn reserved_series_count(&self) -> usize {
+        self.reserved_series.len()
+    }
+
+    pub fn commit(mut self) {
+        self.owner.commit_admission(&self.reserved_series);
+        self.committed = true;
+    }
+}
+
+impl Drop for SeriesAdmission {
+    fn drop(&mut self) {
+        if self.committed || self.reserved_series.is_empty() {
+            return;
+        }
+        self.owner.rollback_admission(&self.reserved_series);
+    }
+}
+
+/// A request-wide admission failure.  Unlike the old per-datapoint ladder,
+/// memory/cardinality pressure refuses the complete export.
+#[derive(Debug)]
+pub struct AdmissionError {
+    pub new_series: usize,
+    pub active_series: usize,
+    pub limit: usize,
 }
 
 impl AdmitOutcome {
@@ -176,17 +221,24 @@ pub struct SeriesCounters {
     pub active_series: AtomicU64,
     pub series_created_total: AtomicU64,
     pub series_evicted_idle_total: AtomicU64,
-    /// New series refused at the `max_active_series` boundary.
+    /// New series refused by the legacy per-datapoint helper.
     pub series_rejected_total: AtomicU64,
     pub metric_datapoints_rejected_total: AtomicU64,
     pub metric_samples_rejected_total: AtomicU64,
+    /// Whole exports refused by the process-wide emergency count guard.
+    pub metric_cardinality_rejected_total: AtomicU64,
+    /// Whole exports refused because the shared memtable byte budget had no
+    /// room for their projected sample buffers.
+    pub metric_memory_rejected_total: AtomicU64,
 }
 
-/// Fixed overhead charged per live series beyond its canonical bytes: map
-/// entry, buffer struct, encoder header. An estimate the memory gate audits
-/// from outside (`memprof`), not a promise.
-const SERIES_OVERHEAD_BYTES: u64 = 160;
+// The old 160-byte estimate omitted allocator/container overhead.  The M10
+// attribution measured roughly 1.7x the estimate, so reserve a conservative
+// 320 bytes per live entry.  This is deliberately a byte charge, not a
+// cardinality proxy: labels still contribute their actual canonical length.
+const SERIES_OVERHEAD_BYTES: u64 = 320;
 const SPILL_SAMPLE_BYTES: u64 = 16;
+const ADMITTED_SAMPLE_BYTES: u64 = 64;
 
 struct SeriesBuffer {
     /// Chunks returned by aborted flushes, oldest first. Closed streams
@@ -211,10 +263,15 @@ struct SeriesBuffer {
     /// batch. The cap then does not hold: a batch admits more series than it
     /// allows and reports fewer refusals than it made.
     ///
-    /// It never keeps a genuinely idle series alive, because a reservation is
-    /// made for samples at this timestamp or later, so it is never newer than
-    /// `last_ts` once the samples land.
+    /// `admission_refs` separately protects this empty state while one or more
+    /// journal appends are in flight, including old samples that would
+    /// otherwise look idle before they reach the writer.
     admitted_ts: Option<i64>,
+    /// Number of in-flight journal appends that rely on this empty entry.
+    /// A later admission may observe an earlier reservation; keeping this
+    /// count prevents one append's rollback from removing the entry out from
+    /// under the later one.
+    admission_refs: usize,
     /// The timestamps the *buffered* samples span, maintained on insert and
     /// moved out with them at `begin_flush`. Discovery reads them to answer a
     /// window without decoding a chunk, which is the whole reason those routes
@@ -233,6 +290,7 @@ impl SeriesBuffer {
             spill: Vec::new(),
             last_ts: None,
             admitted_ts: None,
+            admission_refs: 0,
             buffered: None,
             running_total: None,
         }
@@ -335,8 +393,188 @@ impl SeriesMemTable {
         &self.counters
     }
 
-    /// The `max_active_series` rung, decided per datapoint under one write
-    /// lock so two concurrent exports cannot both reserve the last capacity.
+    /// Reserve every series in an export under one write lock.
+    ///
+    /// `groups` contains the tenant-split pieces of one OTLP export.  The
+    /// caller must pass all pieces together: checking them one tenant at a
+    /// time would make a multi-tenant request partially accepted under a
+    /// global cardinality guard.  The returned reservations are in the same
+    /// order as `groups` and are transferred to the journal append items.
+    pub fn admit_request(
+        self: &Arc<Self>,
+        groups: &[(&TenantId, &[MetricSample])],
+        max_active: Option<usize>,
+        idle_cutoff_ns: i64,
+    ) -> Result<Vec<SeriesAdmission>, AdmissionError> {
+        let _arena = crate::memprof::enter(crate::memprof::Arena::SeriesMemtable);
+        let mut inner = self.inner.write();
+
+        // Preserve the existing lazy idle-eviction behaviour.  It is done
+        // before the guard is evaluated and under the same write lock, so a
+        // concurrent admission cannot observe a slot that is about to return.
+        for tenant_series in inner.values_mut() {
+            let freed = Self::evict_idle_locked(tenant_series, idle_cutoff_ns, &self.counters);
+            saturating_release(&self.inner_bytes, freed);
+        }
+
+        let mut requested: BTreeMap<TenantId, BTreeSet<SeriesLabels>> = BTreeMap::new();
+        let mut requested_newest: BTreeMap<(TenantId, SeriesLabels), i64> = BTreeMap::new();
+        for (tenant, samples) in groups {
+            let labels = requested.entry((*tenant).clone()).or_default();
+            for sample in samples.iter() {
+                labels.insert(sample.labels.clone());
+                requested_newest
+                    .entry(((*tenant).clone(), sample.labels.clone()))
+                    .and_modify(|newest| *newest = (*newest).max(sample.ts_ns))
+                    .or_insert(sample.ts_ns);
+            }
+        }
+        let active = self.counters.active_series.load(Ordering::Relaxed) as usize;
+        let new_count = requested
+            .iter()
+            .map(|(tenant, labels)| {
+                let existing = inner.get(tenant).map_or(0, HashMap::len);
+                labels
+                    .iter()
+                    .filter(|label| {
+                        inner
+                            .get(tenant)
+                            .is_none_or(|series| !series.contains_key(*label))
+                    })
+                    .count()
+                    .min(usize::MAX.saturating_sub(existing))
+            })
+            .sum::<usize>();
+        if let Some(limit) = max_active
+            && active.saturating_add(new_count) > limit
+        {
+            self.counters
+                .metric_cardinality_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .series_rejected_total
+                .fetch_add(new_count as u64, Ordering::Relaxed);
+            return Err(AdmissionError {
+                new_series: new_count,
+                active_series: active,
+                limit,
+            });
+        }
+
+        // Make every requested label visible before returning.  This is what
+        // serializes concurrent admissions; the samples themselves arrive at
+        // the writer only after the WAL fsync.
+        for (tenant, labels) in &requested {
+            let tenant_series = inner.entry(tenant.clone()).or_default();
+            for label in labels {
+                if tenant_series.contains_key(label) {
+                    continue;
+                }
+                let mut buffer = SeriesBuffer::new();
+                buffer.admitted_ts = requested_newest
+                    .get(&(tenant.clone(), label.clone()))
+                    .copied();
+                tenant_series.insert(label.clone(), buffer);
+                self.counters
+                    .series_created_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.active_series.fetch_add(1, Ordering::Relaxed);
+                self.inner_bytes.fetch_add(
+                    label.byte_len() as u64 + SERIES_OVERHEAD_BYTES,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+
+        let mut admissions = Vec::with_capacity(groups.len());
+        for (tenant, samples) in groups {
+            let mut reserved_series = Vec::new();
+            let mut seen = BTreeSet::new();
+            for sample in samples.iter() {
+                if !seen.insert(sample.labels.clone()) {
+                    continue;
+                }
+                if let Some(buffer) = inner
+                    .get_mut(*tenant)
+                    .and_then(|series| series.get_mut(&sample.labels))
+                {
+                    // Empty entries are reservations, including one made by
+                    // a concurrent request. Hold a reference for this append
+                    // so that the other request cannot roll the entry back
+                    // while this append is still in flight.
+                    if !buffer.has_samples() {
+                        buffer.admission_refs = buffer.admission_refs.saturating_add(1);
+                        reserved_series.push(((*tenant).clone(), sample.labels.clone()));
+                    }
+                }
+            }
+            admissions.push(SeriesAdmission {
+                owner: self.clone(),
+                reserved_series,
+                committed: false,
+            });
+        }
+        Ok(admissions)
+    }
+
+    /// Conservative growth estimate for samples that have been admitted but
+    /// not inserted by the journal writer yet.  Existing series still grow a
+    /// Gorilla stream, and out-of-order samples use a spill vector; charging
+    /// the canonical label allocation plus 64 bytes per sample covers both
+    /// without pretending compression is a stable memory contract.  The
+    /// normalized request owns one canonical label allocation per sample until
+    /// the writer inserts it, so this temporary copy is part of admission too.
+    pub fn estimate_sample_bytes(groups: &[(&TenantId, &[MetricSample])]) -> u64 {
+        groups
+            .iter()
+            .flat_map(|(_, samples)| samples.iter())
+            .map(|sample| (sample.labels.byte_len() as u64).saturating_add(ADMITTED_SAMPLE_BYTES))
+            .sum()
+    }
+
+    fn commit_admission(&self, reserved_series: &[(TenantId, SeriesLabels)]) {
+        let mut inner = self.inner.write();
+        for (tenant, labels) in reserved_series {
+            let Some(buffer) = inner
+                .get_mut(tenant)
+                .and_then(|series| series.get_mut(labels))
+            else {
+                continue;
+            };
+            buffer.admission_refs = buffer.admission_refs.saturating_sub(1);
+        }
+    }
+
+    fn rollback_admission(&self, reserved_series: &[(TenantId, SeriesLabels)]) {
+        let mut inner = self.inner.write();
+        let mut freed = 0u64;
+        let mut removed = 0u64;
+        for (tenant, labels) in reserved_series {
+            let Some(series) = inner.get_mut(tenant) else {
+                continue;
+            };
+            let remove = if let Some(buffer) = series.get_mut(labels) {
+                buffer.admission_refs = buffer.admission_refs.saturating_sub(1);
+                !buffer.has_samples() && buffer.admission_refs == 0
+            } else {
+                false
+            };
+            if remove {
+                series.remove(labels);
+                freed = freed.saturating_add(labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES);
+                removed += 1;
+            }
+        }
+        saturating_release(&self.inner_bytes, freed);
+        let current = self.counters.active_series.load(Ordering::Relaxed);
+        self.counters
+            .active_series
+            .fetch_sub(removed.min(current), Ordering::Relaxed);
+    }
+
+    /// Legacy per-datapoint helper, retained for callers that use the series
+    /// table directly.  Transport ingest uses [`Self::admit_request`], whose
+    /// memory/cardinality decision is whole-export and process-wide.
     ///
     /// A datapoint whose series are all known is admitted unconditionally —
     /// steady traffic never notices an explosion. A datapoint needing new
@@ -459,7 +697,8 @@ impl SeriesMemTable {
                 && buffer.last_ts.is_none_or(|last| last < idle_cutoff_ns)
                 && buffer
                     .admitted_ts
-                    .is_none_or(|admitted| admitted < idle_cutoff_ns);
+                    .is_none_or(|admitted| admitted < idle_cutoff_ns)
+                && buffer.admission_refs == 0;
             if idle {
                 freed += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
                 evicted += 1;
@@ -492,7 +731,9 @@ impl SeriesMemTable {
                 None => {
                     // Reached by replay, whose WAL was already filtered by
                     // admission; live ingest reserves its entries in
-                    // `admit_datapoints` and lands here on the Some arm.
+                    // `admit_request` and lands here on the Some arm unless
+                    // another request rolled an uncommitted reservation back
+                    // after this request was admitted.
                     added += sample.labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
                     self.counters
                         .series_created_total
@@ -658,7 +899,7 @@ impl SeriesMemTable {
     }
 
     /// Live series for a tenant — entries whose state is held, flushed or
-    /// not. This is the number `max_active_series` will meter.
+    /// not. The emergency count guard meters the process-wide sum.
     pub fn active_series(&self, tenant: &TenantId) -> usize {
         self.inner
             .read()
@@ -1037,6 +1278,77 @@ mod tests {
             1
         );
         assert_eq!(memtable.counters().active_series.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn request_admission_is_global_and_refuses_all_tenants_atomically() {
+        let memtable = Arc::new(SeriesMemTable::new());
+        let first_tenant = test_tenant();
+        let second_tenant = TenantId::parse("other").unwrap();
+        let first_labels = labels("queue_depth", "first");
+        let second_labels = labels("queue_depth", "second");
+        let mut first = sample(&first_labels, 100, 1.0, SampleKind::Gauge);
+        let mut second = sample(&second_labels, 100, 1.0, SampleKind::Gauge);
+        first.tenant = first_tenant.clone();
+        second.tenant = second_tenant.clone();
+        let groups = vec![
+            (&first_tenant, std::slice::from_ref(&first)),
+            (&second_tenant, std::slice::from_ref(&second)),
+        ];
+        let error = match memtable.admit_request(&groups, Some(1), i64::MIN) {
+            Ok(_) => panic!("the process-wide guard counts both tenants"),
+            Err(error) => error,
+        };
+        assert_eq!(error.new_series, 2);
+        assert_eq!(memtable.active_series(&first_tenant), 0);
+        assert_eq!(memtable.active_series(&second_tenant), 0);
+    }
+
+    #[test]
+    fn dropped_request_admission_rolls_back_reserved_series() {
+        let memtable = Arc::new(SeriesMemTable::new());
+        let tenant = test_tenant();
+        let labels = labels("queue_depth", "reserved");
+        let sample = sample(&labels, 100, 1.0, SampleKind::Gauge);
+        let groups = vec![(&tenant, std::slice::from_ref(&sample))];
+        let admissions = memtable
+            .admit_request(&groups, None, i64::MIN)
+            .expect("the empty table has room");
+        assert_eq!(memtable.active_series(&tenant), 1);
+        drop(admissions);
+        assert_eq!(
+            memtable.active_series(&tenant),
+            0,
+            "a journal enqueue failure must not leave a phantom series"
+        );
+        assert_eq!(memtable.approximate_size(), 0);
+    }
+
+    #[test]
+    fn concurrent_empty_reservations_keep_each_other_alive() {
+        let memtable = Arc::new(SeriesMemTable::new());
+        let tenant = test_tenant();
+        let labels = labels("queue_depth", "shared");
+        let sample = sample(&labels, 100, 1.0, SampleKind::Gauge);
+        let groups = vec![(&tenant, std::slice::from_ref(&sample))];
+
+        let first = memtable
+            .admit_request(&groups, None, i64::MIN)
+            .expect("the first request has room");
+        let second = memtable
+            .admit_request(&groups, None, i64::MAX)
+            .expect("the second request shares the reserved entry");
+        assert_eq!(memtable.active_series(&tenant), 1);
+
+        // The first request failed after the second had already observed its
+        // empty reservation. Its rollback must release only its own ref.
+        drop(first);
+        assert_eq!(memtable.active_series(&tenant), 1);
+        assert!(memtable.approximate_size() > 0);
+
+        drop(second);
+        assert_eq!(memtable.active_series(&tenant), 0);
+        assert_eq!(memtable.approximate_size(), 0);
     }
 
     #[test]

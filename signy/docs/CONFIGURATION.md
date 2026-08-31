@@ -124,11 +124,30 @@ value beside the budget and its source.
 | `MERGE_MAX_INPUT_BYTES` | half the merge budget | 32 MiB |
 | `QUERY_MEMORY_BUDGET_BYTES` and `MAX_QUERY_MEMORY_BYTES` | 25% | 8 MiB |
 | `ROW_GROUP_CACHE_MAX_BYTES` | 12.5% | 16 MiB |
-| `MAX_MEMTABLE_BYTES` | 10% (accounted bytes; resident cost measured ~1.73×) | 32 MiB |
+| `MAX_MEMTABLE_BYTES` | 25% of the declared budget (256 MiB when the budget is off) | 32 MiB |
 | `SIDECAR_CACHE_MAX_BYTES` | 10% | 32 MiB |
 
-The nominal shares sum to 72.5%: the remainder covers flush (which rides
-ingest), the part sidecars, and the metering gap above.
+The listed nominal shares sum to 87.5%. The remaining 12.5% of the declared
+budget, plus the 40% of the cgroup deliberately left outside
+`SIGNY_MEMORY_BUDGET`, covers flush chunks, WAL and request queues, allocator
+retention, and process/runtime state. `MAX_MEMTABLE_BYTES` is the shared
+log/trace/metric ceiling; metric admission reserves projected sample bytes
+against it before the WAL append.
+
+The 25% memtable share is intentional. In the first 2026-08-31 post-admission
+run, the old 10% derived ceiling (122.9 MiB at this budget) produced 58
+whole-export `429`s and accepted only 270,744 of 560,032 offered datapoints;
+that run peaked at 374.23 MiB anonymous memory. The new 25% ceiling is 307.2
+MiB (322.1 million bytes). On the same 2 GiB/480 s workload it was validated
+as `UNDER_BUDGET`: 560,032/560,032 explosion datapoints, 102,912/102,912
+churn datapoints, 2,880/2,880 steady datapoints, no refusals (`200=114`), and
+655.527 MiB peak anon (957.1445 MiB cgroup `memory.peak`, including page
+cache), with 454.715 MiB at settle and zero OOM kills. Explicit
+`SIGNY_MAX_MEMTABLE_BYTES` still overrides this derived value.
+
+The earlier 748.1 MiB / 20-refusal result was measured with a different
+allocator and configuration; it is historical context, not a pure before/after
+measurement of this share.
 
 **Measured capacity at this budget** (24-hour soak, 2 GiB container, retention
 30 m, 2026-08-12): the engine sustains **the full offered 20 k eps — 19,999.8,
@@ -174,7 +193,7 @@ run-by-run history.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIGNY_MAX_MEMTABLE_BYTES` | 256 MiB (`off` allowed; budget-derived) | Return 429 when the two memtables exceed this combined size |
+| `SIGNY_MAX_MEMTABLE_BYTES` | 256 MiB (`off` allowed; 25% when budget-derived) | Return 429 when the shared log/trace/metric memtables and projected metric append bytes exceed this combined size |
 | `SIGNY_MAX_WAL_BACKLOG_BYTES` | 1 GiB (`off` allowed) | Return 429 when unflushed WAL exceeds this size |
 | `SIGNY_MAX_INFLIGHT_PUSH_BYTES` | 128 MiB (`off` allowed; budget-derived at 5%) | Return 429 when request bodies admitted and not yet answered exceed this size. The other two bound buffers this server owns; this one bounds what its callers hand it, which was otherwise `concurrency × 16 MiB` with nothing limiting concurrency. Safe at any value: an idle server always admits one body, so a ceiling below one legal push cannot refuse it forever. Measured in flight on the comparison bed: 0.3 MiB — this closes a hole rather than recovering memory. Read it live as `signy_inflight_push_bytes`. Charged per **record** as a collected batch is decoded, not per request: the route holds one record and the handful behind it awaiting an fsync, and a batch that reaches the ceiling waits on its own records rather than refusing itself |
 | `SIGNY_MIN_FREE_DISK_BYTES` | 2 GiB | Free space on the data directory's filesystem below which ingest is refused with 429, or `off`. **The last guard, not the first** — eviction bounds the cache and the backlog limit bounds the WAL; this covers what neither does. Past it a flush cannot write, which is the worst state this engine has. Must not be below `FLUSH_MAX_BYTES` |
@@ -263,7 +282,7 @@ Small catalog files such as `meta.json` are not evicted; the data body and the b
 | `SIGNY_MAX_CONCURRENT_TRACE_SCANS` | 8 | The trace surface's own scan slots — a trace scan decodes whole-span payloads, so it does not compete for the log scanner's |
 | `SIGNY_MAX_TRACE_QUERY_RUNTIME` | `30s` | |
 | `SIGNY_MAX_TRACE_RESTORE_RUNTIME` | `25s` | Cache-miss restore timeout for trace parts |
-| `SIGNY_MAX_ACTIVE_SERIES` | 500,000 | Live metric series per tenant (M14). At the limit a datapoint for an *unknown* series is refused via OTLP `partial_success` naming the count, the limit and the horizon; known series are always accepted. The default is a guess until the memory gate calibrates the per-series cost |
+| `SIGNY_MAX_ACTIVE_SERIES` | `off` | Optional process-wide emergency limit on live metric series. The normal guard is the shared, byte-based `SIGNY_MAX_MEMTABLE_BYTES`; when this explicit count guard fires, the complete metric export is refused with `429` and `Retry-After` (there is no partial-success filtering) |
 | `SIGNY_METRIC_SERIES_IDLE_TIMEOUT` | `600s` | How long a metric series may go without a sample before its index state is evicted (once flushed) and its capacity returns. History stays in parts; a returning series is re-created, and the one artifact — a delta counter restarting — is a counter reset `rate` absorbs |
 | `SIGNY_MAX_METRIC_SERIES_PER_QUERY` | 10,000 | Most series one metric query may select; over it the request is refused with 413 before any chunk is decoded |
 | `SIGNY_MAX_METRIC_POINTS_PER_QUERY` | 2,000,000 | Most `series × steps` output points one metric query may ask for — the bound the memory reservation is sized from |

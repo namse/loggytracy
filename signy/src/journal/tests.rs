@@ -95,6 +95,93 @@
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn a_failed_metric_batch_enqueue_rolls_back_every_tenant_portion() {
+        let dir = tmp_dir("metric_batch_send_failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        let series_memtable = Arc::new(crate::series::SeriesMemTable::new());
+        let journal = Journal {
+            tx,
+            collect_marks: Arc::new(CollectMarks::load(&dir)),
+            wal_path: dir.join(WAL_FILE),
+            ckpt_path: dir.join(CKPT_FILE),
+            healthy: Arc::new(AtomicBool::new(true)),
+            metrics: Arc::new(JournalMetrics::default()),
+            memtable: Arc::new(MemTable::new()),
+            trace_memtable: Arc::new(TraceMemTable::new()),
+            series_memtable: series_memtable.clone(),
+            backlog: Arc::new(WalBacklog::default()),
+            metric_reserved_bytes: Arc::new(AtomicU64::new(0)),
+        };
+        let first_tenant = test_tenant();
+        let second_tenant = TenantId::parse("other").unwrap();
+        let first_labels = crate::series::SeriesLabels::from_pairs(vec![
+            (crate::series::METRIC_NAME_LABEL.to_string(), "one".to_string()),
+        ]);
+        let second_labels = crate::series::SeriesLabels::from_pairs(vec![
+            (crate::series::METRIC_NAME_LABEL.to_string(), "two".to_string()),
+        ]);
+        let first_sample = crate::series::MetricSample {
+            tenant: first_tenant.clone(),
+            labels: first_labels,
+            ts_ns: 1,
+            value: 1.0,
+            kind: crate::series::SampleKind::Gauge,
+            datapoint_index: 0,
+        };
+        let second_sample = crate::series::MetricSample {
+            tenant: second_tenant.clone(),
+            labels: second_labels,
+            ts_ns: 1,
+            value: 2.0,
+            kind: crate::series::SampleKind::Gauge,
+            datapoint_index: 0,
+        };
+        let groups = vec![
+            (&first_tenant, std::slice::from_ref(&first_sample)),
+            (&second_tenant, std::slice::from_ref(&second_sample)),
+        ];
+        let mut admissions = series_memtable
+            .admit_request(&groups, None, i64::MIN)
+            .unwrap()
+            .into_iter();
+        let first_admission = admissions.next().unwrap();
+        let second_admission = admissions.next().unwrap();
+        let first_permit = journal.try_reserve_metric_bytes(1, Some(u64::MAX)).unwrap();
+        let second_permit = journal.try_reserve_metric_bytes(1, Some(u64::MAX)).unwrap();
+        drop(rx);
+
+        let error = match journal
+            .enqueue_metrics_reserved_batch(vec![
+                ReservedMetricAppend {
+                    tenant: first_tenant.clone(),
+                    data: Vec::new(),
+                    samples: vec![first_sample],
+                    mark: None,
+                    metric_memory_permit: first_permit,
+                    metric_series_admission: first_admission,
+                },
+                ReservedMetricAppend {
+                    tenant: second_tenant.clone(),
+                    data: Vec::new(),
+                    samples: vec![second_sample],
+                    mark: None,
+                    metric_memory_permit: second_permit,
+                    metric_series_admission: second_admission,
+                },
+            ])
+            .await
+        {
+            Ok(_) => panic!("a closed journal rejects the complete batch"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(series_memtable.active_series(&first_tenant), 0);
+        assert_eq!(series_memtable.active_series(&second_tenant), 0);
+        assert_eq!(journal.metric_reserved_bytes(), 0);
+    }
+
     /// The push path's four phases are measured, and by the writer task rather
     /// than by the caller.
     ///

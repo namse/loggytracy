@@ -20,7 +20,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::OpenOptions;
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -159,6 +160,7 @@ pub fn pair_token(key: &str, value: &str) -> Vec<u8> {
 /// Writes the flushing snapshot without taking ownership of it — the buffer
 /// stays shared with the memtable until the flush commits, exactly like the
 /// trace writer.
+#[allow(dead_code)]
 pub fn flush_series_snapshot(
     snapshot: &SeriesSnapshot,
     metrics_root: &Path,
@@ -231,10 +233,640 @@ pub fn flush_series_snapshot(
     Ok(parts)
 }
 
+/// Re-flush a set of parts without materialising the complete merge in a
+/// `tenant -> labels -> samples` map.
+///
+/// Parts are already ordered by tenant and labels. A small k-way heap merges
+/// those catalog streams, and a second heap merges the current series' sample
+/// streams. Consequently the live sample state is one Gorilla chunk and one
+/// sample per input part, independent of the number of series in the group.
+/// The output format is the same as [`flush_series_snapshot`].
+pub fn compact_series_parts(
+    readers: &[std::sync::Arc<SeriesPartReader>],
+    metrics_root: &Path,
+) -> io::Result<Vec<SeriesPart>> {
+    if readers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let partition = readers[0].part().meta.partition.clone();
+    if readers
+        .iter()
+        .any(|reader| reader.part().meta.partition != partition)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "metric compaction group spans partitions",
+        ));
+    }
+
+    fs::create_dir_all(metrics_root.join(".tmp"))?;
+    let id = format!("{}-{}", partition.replace('-', ""), uuid::Uuid::new_v4());
+    let tmp_dir = metrics_root.join(".tmp").join(&id);
+    let final_dir = metrics_root.join(&partition).join(&id);
+    let result = (|| -> io::Result<SeriesPart> {
+        if tmp_dir.exists() {
+            fs::remove_dir_all(&tmp_dir)?;
+        }
+        fs::create_dir_all(&tmp_dir)?;
+        write_streaming_series_part_files(&tmp_dir, &id, &partition, readers)?;
+        if let Some(parent) = final_dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&tmp_dir, &final_dir)?;
+        sync_dir(final_dir.parent().unwrap_or(metrics_root))?;
+        sync_dir(metrics_root)?;
+        load_series_part(&final_dir).map_err(io::Error::other)
+    })();
+
+    match result {
+        Ok(part) => Ok(vec![part]),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            let _ = crate::part::remove_part_dirs(std::slice::from_ref(&final_dir));
+            Err(error)
+        }
+    }
+}
+
+/// A cursor over one part's tenant-major catalog. It stores only its current
+/// ordinal; the catalog itself remains owned by the part reader.
+struct CatalogCursor {
+    reader: std::sync::Arc<SeriesPartReader>,
+    tenant: usize,
+    entry: usize,
+}
+
+impl CatalogCursor {
+    fn new(reader: std::sync::Arc<SeriesPartReader>) -> Self {
+        Self {
+            reader,
+            tenant: 0,
+            entry: 0,
+        }
+    }
+
+    fn current(&self, stream: usize) -> Option<CatalogHead> {
+        let segment = self.reader.part().meta.tenants.get(self.tenant)?;
+        let entries = self.reader.tenant_catalog(&segment.tenant);
+        let entry = entries.get(self.entry)?.clone();
+        Some(CatalogHead {
+            stream,
+            reader: self.reader.clone(),
+            tenant: segment.tenant.clone(),
+            entry,
+        })
+    }
+
+    fn advance(&mut self) {
+        let Some(segment) = self.reader.part().meta.tenants.get(self.tenant) else {
+            return;
+        };
+        self.entry += 1;
+        if self.entry >= (segment.series_end - segment.series_start) as usize {
+            self.tenant += 1;
+            self.entry = 0;
+        }
+    }
+}
+
+/// One heap head. The input stream index is the final tie-breaker so equal
+/// labels retain the old compactor's input order, which also preserves stable
+/// ordering for duplicate timestamps.
+struct CatalogHead {
+    stream: usize,
+    reader: std::sync::Arc<SeriesPartReader>,
+    tenant: TenantId,
+    entry: CatalogEntry,
+}
+
+impl PartialEq for CatalogHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.tenant == other.tenant
+            && self.entry.labels == other.entry.labels
+            && self.stream == other.stream
+    }
+}
+
+impl Eq for CatalogHead {}
+
+impl PartialOrd for CatalogHead {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CatalogHead {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .tenant
+            .cmp(&self.tenant)
+            .then_with(|| other.entry.labels.cmp(&self.entry.labels))
+            .then_with(|| other.stream.cmp(&self.stream))
+    }
+}
+
+struct SampleHead {
+    stream: usize,
+    decoder: gorilla::OwnedDecoder,
+    sample: (i64, f64),
+}
+
+impl PartialEq for SampleHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.sample.0 == other.sample.0 && self.stream == other.stream
+    }
+}
+
+impl Eq for SampleHead {}
+
+impl PartialOrd for SampleHead {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SampleHead {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .sample
+            .0
+            .cmp(&self.sample.0)
+            .then_with(|| other.stream.cmp(&self.stream))
+    }
+}
+
+struct MergedSeriesSamples {
+    heap: std::collections::BinaryHeap<SampleHead>,
+}
+
+impl MergedSeriesSamples {
+    fn new(heads: &[CatalogHead]) -> io::Result<Self> {
+        let mut heap = std::collections::BinaryHeap::with_capacity(heads.len());
+        for head in heads {
+            let mut decoder = head
+                .reader
+                .read_series_decoder(&head.entry)
+                .map_err(io::Error::other)?;
+            let Some(sample) = decoder.next().transpose().map_err(io::Error::other)? else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric catalog entry has no samples",
+                ));
+            };
+            heap.push(SampleHead {
+                stream: head.stream,
+                decoder,
+                sample,
+            });
+        }
+        Ok(Self { heap })
+    }
+
+    fn next_sample(&mut self) -> io::Result<Option<(i64, f64)>> {
+        let Some(mut head) = self.heap.pop() else {
+            return Ok(None);
+        };
+        let sample = head.sample;
+        if let Some(next) = head.decoder.next() {
+            head.sample = next.map_err(io::Error::other)?;
+            self.heap.push(head);
+        }
+        Ok(Some(sample))
+    }
+}
+
+struct StreamingSeriesPartWriter {
+    data: BufWriter<fs::File>,
+    index: BufWriter<fs::File>,
+    data_path: PathBuf,
+    index_path: PathBuf,
+    bloom_path: PathBuf,
+    bloom: BloomFilter,
+    data_offset: u64,
+    series_count: u32,
+    sample_count: u64,
+    part_min: i64,
+    part_max: i64,
+    segments: Vec<SeriesTenantSegment>,
+    current_tenant: Option<TenantId>,
+    current_series_start: u32,
+    current_segment_start: u64,
+    current_segment_samples: u64,
+}
+
+impl StreamingSeriesPartWriter {
+    fn new(dir: &Path, bloom_items: usize) -> io::Result<Self> {
+        let data_path = dir.join(SERIES_DATA_FILE);
+        let index_path = dir.join(SERIES_INDEX_FILE);
+        let bloom_path = dir.join(SERIES_BLOOM_FILE);
+        let mut data = BufWriter::new(fs::File::create(&data_path)?);
+        data.write_all(SERIES_DATA_MAGIC)?;
+        let mut index = BufWriter::new(fs::File::create(&index_path)?);
+        index.write_all(SERIES_INDEX_MAGIC)?;
+        // The catalog count is not known until the stream reaches EOF. It is
+        // patched after the bounded writer has flushed its bytes.
+        index.write_all(&0u32.to_le_bytes())?;
+        Ok(Self {
+            data,
+            index,
+            data_path,
+            index_path,
+            bloom_path,
+            bloom: BloomFilter::with_capacity(bloom_items.max(1), BLOOM_FPP),
+            data_offset: SERIES_DATA_MAGIC.len() as u64,
+            series_count: 0,
+            sample_count: 0,
+            part_min: i64::MAX,
+            part_max: i64::MIN,
+            segments: Vec::new(),
+            current_tenant: None,
+            current_series_start: 0,
+            current_segment_start: 0,
+            current_segment_samples: 0,
+        })
+    }
+
+    fn start_tenant(&mut self, tenant: &TenantId) {
+        if self.current_tenant.as_ref() == Some(tenant) {
+            return;
+        }
+        self.finish_tenant();
+        self.current_tenant = Some(tenant.clone());
+        self.current_series_start = self.series_count;
+        self.current_segment_start = self.data_offset;
+        self.current_segment_samples = 0;
+    }
+
+    fn finish_tenant(&mut self) {
+        let Some(tenant) = self.current_tenant.take() else {
+            return;
+        };
+        self.segments.push(SeriesTenantSegment {
+            tenant,
+            series_start: self.current_series_start,
+            series_end: self.series_count,
+            sample_count: self.current_segment_samples,
+            bytes: crate::part::ByteRange {
+                start: self.current_segment_start,
+                end: self.data_offset,
+            },
+        });
+    }
+
+    fn write_series(
+        &mut self,
+        tenant: &TenantId,
+        labels: &SeriesLabels,
+        samples: &mut MergedSeriesSamples,
+    ) -> io::Result<()> {
+        self.write_series_values(
+            tenant,
+            labels,
+            std::iter::from_fn(|| samples.next_sample().transpose()),
+        )
+    }
+
+    fn write_series_values<I>(
+        &mut self,
+        tenant: &TenantId,
+        labels: &SeriesLabels,
+        samples: I,
+    ) -> io::Result<()>
+    where
+        I: IntoIterator<Item = io::Result<(i64, f64)>>,
+    {
+        self.start_tenant(tenant);
+        let offset = self.data_offset;
+        let mut encoder = gorilla::Encoder::new();
+        let mut count = 0u64;
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for sample in samples {
+            let (ts, value) = sample?;
+            encoder.append(ts, value);
+            count += 1;
+            min_ts = min_ts.min(ts);
+            max_ts = max_ts.max(ts);
+        }
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metric writer encountered an empty series",
+            ));
+        }
+        let chunk = encoder.close();
+        self.data.write_all(&chunk)?;
+        self.data_offset = self
+            .data_offset
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| io::Error::other("metric data offset overflow"))?;
+
+        let labels_len = u32::try_from(labels.as_bytes().len())
+            .map_err(|_| io::Error::other("metric labels exceed index field width"))?;
+        let sample_count = u32::try_from(count)
+            .map_err(|_| io::Error::other("metric series exceeds index sample-count width"))?;
+        self.index.write_all(&labels_len.to_le_bytes())?;
+        self.index.write_all(labels.as_bytes())?;
+        self.index.write_all(&offset.to_le_bytes())?;
+        self.index.write_all(&(chunk.len() as u64).to_le_bytes())?;
+        self.index.write_all(&sample_count.to_le_bytes())?;
+        self.index.write_all(&min_ts.to_le_bytes())?;
+        self.index.write_all(&max_ts.to_le_bytes())?;
+
+        for (key, value) in labels.pairs().map_err(io::Error::other)? {
+            self.bloom.insert(&pair_token(&key, &value));
+        }
+        self.series_count = self
+            .series_count
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("metric series count overflow"))?;
+        self.sample_count = self
+            .sample_count
+            .checked_add(count)
+            .ok_or_else(|| io::Error::other("metric sample count overflow"))?;
+        self.current_segment_samples = self
+            .current_segment_samples
+            .checked_add(count)
+            .ok_or_else(|| io::Error::other("metric tenant sample count overflow"))?;
+        self.part_min = self.part_min.min(min_ts);
+        self.part_max = self.part_max.max(max_ts);
+        Ok(())
+    }
+
+    fn finish(mut self, id: &str, partition: &str, metrics_root: &Path) -> io::Result<()> {
+        self.finish_tenant();
+        let data_path = self.data_path.clone();
+        let index_path = self.index_path.clone();
+        self.data.flush()?;
+        self.index.flush()?;
+        close_writer(self.data, &data_path)?;
+        close_writer(self.index, &index_path)?;
+
+        let mut index = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&index_path)?;
+        index.seek(SeekFrom::Start(SERIES_INDEX_MAGIC.len() as u64))?;
+        index.write_all(&self.series_count.to_le_bytes())?;
+        index.sync_all()?;
+        sync_dir(index_path.parent().unwrap_or(metrics_root))?;
+
+        let mut bloom_file = BufWriter::new(fs::File::create(&self.bloom_path)?);
+        bloom_file.write_all(SERIES_BLOOM_MAGIC)?;
+        let bloom_len = u32::try_from(self.bloom.encoded_len())
+            .map_err(|_| io::Error::other("metric bloom exceeds file field width"))?;
+        bloom_file.write_all(&bloom_len.to_le_bytes())?;
+        self.bloom.write_encoded(&mut bloom_file)?;
+        bloom_file.flush()?;
+        close_writer(bloom_file, &self.bloom_path)?;
+
+        let mut meta = SeriesMetaFile {
+            id: id.to_string(),
+            partition: partition.to_string(),
+            min_ts_ns: self.part_min,
+            max_ts_ns: self.part_max,
+            series_count: self.series_count,
+            sample_count: self.sample_count,
+            tenants: self.segments,
+            integrity: SeriesPartIntegrity {
+                data_crc32: crc32_file(&data_path)?,
+                index_crc32: crc32_file(&index_path)?,
+                bloom_crc32: crc32_file(&self.bloom_path)?,
+                metadata_crc32: 0,
+            },
+        };
+        meta.integrity.metadata_crc32 = metadata_crc32(&meta).map_err(io::Error::other)?;
+        let encoded = serde_json::to_vec_pretty(&meta).map_err(io::Error::other)?;
+        let meta_path = self.bloom_path.with_file_name(SERIES_META_FILE);
+        fs::write(&meta_path, encoded)?;
+        sync_file(&meta_path)?;
+        Ok(())
+    }
+}
+
+fn close_writer(writer: BufWriter<fs::File>, path: &Path) -> io::Result<()> {
+    let file = writer.into_inner().map_err(|error| error.into_error())?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn crc32_file(path: &Path) -> io::Result<u32> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize())
+}
+
+fn write_streaming_series_part_files(
+    dir: &Path,
+    id: &str,
+    partition: &str,
+    readers: &[std::sync::Arc<SeriesPartReader>],
+) -> io::Result<()> {
+    // The upper bound is intentionally the total number of label pairs in the
+    // inputs. Duplicate series/pairs only make this filter less full than its
+    // sizing estimate; no set of all labels is retained just to size a bloom.
+    let mut bloom_items = 0usize;
+    for reader in readers {
+        for segment in &reader.part().meta.tenants {
+            for entry in reader.tenant_catalog(&segment.tenant) {
+                let pairs = entry.labels.pairs().map_err(io::Error::other)?;
+                bloom_items = bloom_items
+                    .checked_add(pairs.len())
+                    .ok_or_else(|| io::Error::other("metric bloom item count overflow"))?;
+            }
+        }
+    }
+    let mut writer = StreamingSeriesPartWriter::new(dir, bloom_items)?;
+    let mut cursors: Vec<_> = readers.iter().cloned().map(CatalogCursor::new).collect();
+    let mut heap = std::collections::BinaryHeap::with_capacity(cursors.len());
+    for (stream, cursor) in cursors.iter().enumerate() {
+        if let Some(head) = cursor.current(stream) {
+            heap.push(head);
+        }
+    }
+
+    while let Some(first) = heap.pop() {
+        let tenant = first.tenant.clone();
+        let labels = first.entry.labels.clone();
+        let mut heads = vec![first];
+        while heap
+            .peek()
+            .is_some_and(|head| head.tenant == tenant && head.entry.labels == labels)
+        {
+            heads.push(heap.pop().expect("heap head was present"));
+        }
+        let mut samples = MergedSeriesSamples::new(&heads)?;
+        writer.write_series(&tenant, &labels, &mut samples)?;
+        for head in heads {
+            let cursor = &mut cursors[head.stream];
+            cursor.advance();
+            if let Some(next) = cursor.current(head.stream) {
+                heap.push(next);
+            }
+        }
+    }
+    if writer.series_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metric compaction produced an empty part",
+        ));
+    }
+    writer.finish(id, partition, dir)
+}
+
 /// One partition's samples, grouped `tenant -> series -> sorted samples` —
 /// which is exactly the catalog order the files are written in.
 type PartitionSeries = BTreeMap<TenantId, BTreeMap<SeriesLabels, Vec<(i64, f64)>>>;
 
+/// Flush a snapshot in bounded batches of series/sample bytes.
+///
+/// Unlike the legacy [`flush_series_snapshot`], this never constructs a map
+/// for the complete snapshot. A source series is decoded and sorted once,
+/// grouped by day, then appended to the current batch. Once the batch reaches
+/// `chunk_bytes`, each partition is written and committed before the next
+/// batch is assembled. One very large series can still occupy one batch; that
+/// is the indivisible unit of the metric format, but cardinality elsewhere in
+/// the snapshot no longer multiplies its memory.
+pub fn flush_series_snapshot_chunked(
+    snapshot: &SeriesSnapshot,
+    metrics_root: &Path,
+    chunk_bytes: u64,
+) -> io::Result<Vec<SeriesPart>> {
+    if snapshot.is_empty() {
+        return Ok(Vec::new());
+    }
+    let _arena = crate::memprof::enter(crate::memprof::Arena::Flush);
+    fs::create_dir_all(metrics_root.join(".tmp"))?;
+
+    let mut batches: BTreeMap<String, PartitionSeries> = BTreeMap::new();
+    let mut batch_bytes = 0u64;
+    let mut parts = Vec::new();
+    let mut committed_dirs = Vec::new();
+    let chunk_bytes = chunk_bytes.max(1);
+
+    for (tenant, list) in &snapshot.tenants {
+        for series in list {
+            let samples = series.sorted_samples().map_err(io::Error::other)?;
+            if samples.is_empty() {
+                continue;
+            }
+            let mut by_partition: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
+            for sample in samples {
+                by_partition
+                    .entry(partition_of(sample.0))
+                    .or_default()
+                    .push(sample);
+            }
+            for (partition, partition_samples) in by_partition {
+                batch_bytes = batch_bytes.saturating_add(
+                    (partition_samples.len() as u64)
+                        .saturating_mul(16)
+                        .saturating_add(series.labels.byte_len() as u64),
+                );
+                batches
+                    .entry(partition)
+                    .or_default()
+                    .entry(tenant.clone())
+                    .or_default()
+                    .entry(series.labels.clone())
+                    .or_default()
+                    .extend(partition_samples);
+            }
+            if batch_bytes >= chunk_bytes {
+                commit_snapshot_batch(&mut batches, metrics_root, &mut parts, &mut committed_dirs)?;
+                batch_bytes = 0;
+            }
+        }
+    }
+    if !batches.is_empty() {
+        commit_snapshot_batch(&mut batches, metrics_root, &mut parts, &mut committed_dirs)?;
+    }
+    Ok(parts)
+}
+
+fn commit_snapshot_batch(
+    batches: &mut BTreeMap<String, PartitionSeries>,
+    metrics_root: &Path,
+    parts: &mut Vec<SeriesPart>,
+    committed_dirs: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    let batch = std::mem::take(batches);
+    for (partition, tenants) in batch {
+        let id = format!("{}-{}", partition.replace('-', ""), uuid::Uuid::new_v4());
+        let tmp_dir = metrics_root.join(".tmp").join(&id);
+        let final_dir = metrics_root.join(&partition).join(&id);
+        let result = (|| -> io::Result<SeriesPart> {
+            fs::create_dir_all(&tmp_dir)?;
+            write_streaming_partition_series(&tmp_dir, &id, &partition, &tenants)?;
+            if let Some(parent) = final_dir.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&tmp_dir, &final_dir)?;
+            committed_dirs.push(final_dir.clone());
+            sync_dir(final_dir.parent().unwrap_or(metrics_root))?;
+            sync_dir(metrics_root)?;
+            load_series_part(&final_dir).map_err(io::Error::other)
+        })();
+        match result {
+            Ok(part) => parts.push(part),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&tmp_dir);
+                rollback_series_dirs(committed_dirs);
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rollback_series_dirs(dirs: &[PathBuf]) {
+    for dir in dirs.iter().rev() {
+        if let Err(error) = crate::part::remove_part_dirs(std::slice::from_ref(dir)) {
+            tracing::warn!(%error, ?dir, "metric flush rollback failed");
+        }
+    }
+}
+
+fn write_streaming_partition_series(
+    dir: &Path,
+    id: &str,
+    partition: &str,
+    tenants: &PartitionSeries,
+) -> io::Result<()> {
+    let mut bloom_items = 0usize;
+    for series_map in tenants.values() {
+        for labels in series_map.keys() {
+            let count = labels.pairs().map_err(io::Error::other)?.len();
+            bloom_items = bloom_items
+                .checked_add(count)
+                .ok_or_else(|| io::Error::other("metric bloom item count overflow"))?;
+        }
+    }
+    let mut writer = StreamingSeriesPartWriter::new(dir, bloom_items)?;
+    for (tenant, series_map) in tenants {
+        for (labels, samples) in series_map {
+            writer.write_series_values(
+                tenant,
+                labels,
+                samples.iter().copied().map(Ok::<_, io::Error>),
+            )?;
+        }
+    }
+    writer.finish(id, partition, dir)
+}
+
+#[allow(dead_code)]
 fn write_series_part_files(
     dir: &Path,
     id: &str,
@@ -541,22 +1173,34 @@ impl SeriesPartReader {
 
     /// One series' samples, time-sorted as written.
     pub fn read_series(&self, entry: &CatalogEntry) -> Result<Vec<(i64, f64)>, String> {
+        self.read_series_decoder(entry)?.collect()
+    }
+
+    /// Open one series' chunk as an owned decoder. Keeping the decoder's
+    /// chunk and cursor together lets a compaction merge one sample at a time
+    /// without retaining a `Vec` for every series in the input group.
+    pub fn read_series_decoder(
+        &self,
+        entry: &CatalogEntry,
+    ) -> Result<gorilla::OwnedDecoder, String> {
         let mut file = fs::File::open(self.part.data_path()).map_err(|error| error.to_string())?;
         file.seek(SeekFrom::Start(entry.offset))
             .map_err(|error| error.to_string())?;
-        let mut chunk = vec![0u8; entry.length as usize];
+        let length = usize::try_from(entry.length)
+            .map_err(|_| "metric chunk length does not fit in memory".to_string())?;
+        let mut chunk = vec![0u8; length];
         file.read_exact(&mut chunk)
             .map_err(|error| error.to_string())?;
-        let samples = gorilla::decode_all(&chunk)?;
-        if samples.len() != entry.sample_count as usize {
+        let decoder = gorilla::OwnedDecoder::new(chunk)?;
+        if decoder.declared_count() != entry.sample_count {
             return Err(format!(
-                "metric chunk in {} decoded {} samples, catalog says {}",
+                "metric chunk in {} declares {} samples, catalog says {}",
                 self.part.meta.id,
-                samples.len(),
+                decoder.declared_count(),
                 entry.sample_count
             ));
         }
-        Ok(samples)
+        Ok(decoder)
     }
 }
 
@@ -630,8 +1274,7 @@ fn metadata_crc32(meta: &SeriesMetaFile) -> Result<u32, String> {
 }
 
 fn validate_file_crc(path: &Path, expected: u32, label: &str) -> Result<(), String> {
-    let bytes = fs::read(path).map_err(|error| format!("failed to read {label}: {error}"))?;
-    if crc32fast::hash(&bytes) != expected {
+    if crc32_file(path).map_err(|error| format!("failed to read {label}: {error}"))? != expected {
         return Err(format!("{label} checksum mismatch: {}", path.display()));
     }
     Ok(())
@@ -705,6 +1348,49 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn chunked_snapshot_flush_matches_batch_output() {
+        let memtable = SeriesMemTable::new();
+        let mut samples = Vec::new();
+        for series_index in 0..9 {
+            let series = labels("queue_depth", &format!("instance-{series_index}"));
+            for sample_index in 0..3 {
+                samples.push(sample(
+                    "test-tenant",
+                    &series,
+                    1_772_000_000_000_000_000 + sample_index * 1_000_000_000,
+                    (series_index * 10 + sample_index) as f64,
+                ));
+            }
+        }
+        memtable.insert(samples);
+        let snapshot = memtable.begin_flush();
+        let batch_root = temp_root("batch-equivalent");
+        let chunked_root = temp_root("chunked-equivalent");
+        let batch_parts = flush_series_snapshot(&snapshot, &batch_root).unwrap();
+        let chunked_parts = flush_series_snapshot_chunked(&snapshot, &chunked_root, 1).unwrap();
+        assert!(chunked_parts.len() > batch_parts.len());
+
+        let read = |parts: &[SeriesPart]| {
+            let mut all = BTreeMap::<SeriesLabels, Vec<(i64, f64)>>::new();
+            for part in parts {
+                let reader = SeriesPartReader::open(part.clone()).unwrap();
+                for entry in reader.tenant_catalog(&test_tenant()) {
+                    all.entry(entry.labels.clone())
+                        .or_default()
+                        .extend(reader.read_series(entry).unwrap());
+                }
+            }
+            for samples in all.values_mut() {
+                samples.sort_by_key(|(ts, _)| *ts);
+            }
+            all
+        };
+        assert_eq!(read(&chunked_parts), read(&batch_parts));
+        std::fs::remove_dir_all(&batch_root).ok();
+        std::fs::remove_dir_all(&chunked_root).ok();
     }
 
     #[test]

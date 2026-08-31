@@ -125,8 +125,9 @@ read speed with its write capacity, and the price was being paid twice.** The
 measured two commits earlier, and it is why the ladder is re-run after any change
 to the flush path.
 
-**What sets it is flush, not durability.** At every refusing rung
-`memtable_buffered` pins against the 122.9 MiB `max_memtable_bytes` — the gate
+**What set that historical rung was flush, not durability.** At every refusing
+rung `memtable_buffered` pinned against the then-derived 122.9 MiB
+`max_memtable_bytes` — the gate
 whose message is "flush is not keeping up" — while the WAL backlog peaks two
 orders of magnitude below its own limit. At 30 k, where nothing is refused, the
 memtable sits at 78.0 MiB and the flush loop is 88% busy rather than 95%. The
@@ -617,21 +618,21 @@ The claim, in the same falsifiable form as the log claim above:
 > machine, signy answers the fn0 dashboard shapes — a windowed counter
 > `rate` and its label-grouped `sum`, over its own flat-parameter API — not
 > materially worse than VictoriaMetrics, which has spent a decade on exactly
-> this; and when a series-churn workload pushes active series past what the
-> limit can index, signy keeps ingesting every known series and
-> answering every query, refusing only the *new* series with a named
-> `partial_success` that publishes how many it refused — rather than
-> slowing, swapping, or dying. Without giving up ingest throughput or disk
-> footprint in the steady phase.
+> this; and when a series-churn workload fills the resident-byte budget,
+> signy keeps its process below the memory watermark and returns `429` for a
+> complete export with `Retry-After`. The collector's durable queue retries it
+> after flush makes room, rather than the process slowing into an OOM or
+> silently dropping samples.
 
 The two halves differ by design, not by tuning. The steady half concedes
 VictoriaMetrics its maturity — Gorilla-family sample encoding runs near the
 encoding family's entropy limit, and there is no headroom worth chasing. The
 churn half names the structural difference: VictoriaMetrics sizes its index
-to the workload, signy sizes the workload to its budget — idle series
-leave the index at a declared horizon, and past `max_active_series` the
-refusal is per new series, named, counted, and published, while known series
-never notice.
+to the workload, signy sizes resident state to its budget — idle series leave
+the index at a declared horizon, and the shared byte governor rejects a
+complete export only when the process cannot safely reserve its projected
+state. `max_active_series` is an opt-in emergency guard, not the normal
+workload ceiling.
 
 It is abandoned if VictoriaMetrics inside the same limit both survives the
 same churn with at least the same sample acceptance *and* beats signy
@@ -644,9 +645,9 @@ a differentiator, and the document publishes the loss.
 at 2 GiB).
 
 *The churn half happened, and it is not yet a differentiator.* Offered
-520 288 series, signy refused 24 288 datapoints by name at its
-`max_active_series` default of 500 000, kept every steady and churn-phase
-datapoint, and survived — the behaviour the claim describes. VictoriaMetrics
+520 288 series, the earlier build refused 24 288 datapoints by name at its
+then-default `max_active_series` of 500 000. The current build uses the
+resident-byte governor and keeps the count guard off by default. VictoriaMetrics
 accepted all 520 288 without refusing anything, peaking at **627 MiB against
 signy's 1 038**. So the competitor held more series in less memory and
 never had to degrade at all: "refuses rather than dies" is not a

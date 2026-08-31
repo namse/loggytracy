@@ -212,6 +212,7 @@ over the limit of {limit}; too many pushes are in flight at once"
         (self.journal.log_memtable().approximate_size() as u64)
             .saturating_add(self.journal.trace_memtable().approximate_size() as u64)
             .saturating_add(self.journal.series_memtable().approximate_size() as u64)
+            .saturating_add(self.journal.metric_reserved_bytes())
     }
 
     /// Refuse the write when the durable path is already behind.

@@ -314,12 +314,32 @@ async fn flush_once(
 
     let row_group_size = config.row_group_size;
     let flush_chunk_bytes = config.flush_chunk_bytes;
+    let background_memory_pool = config.background_memory_pool.clone();
+    let merge_max_memory_bytes = config.merge_max_memory_bytes;
     let result = match tokio::task::spawn_blocking({
         let parts_root = parts_root.clone();
         let traces_root = config.data_dir.join("traces");
         let metrics_root = config.data_dir.join("metrics");
         move || {
             let _arena = crate::memprof::enter(crate::memprof::Arena::Flush);
+            // The metric snapshot builder keeps one bounded batch plus the
+            // current series and writer state. Reserve twice its chunk size
+            // from the pool shared with metric compaction before any part is
+            // written; contention leaves the snapshot untouched for retry.
+            let _metric_flush_permit = if series_snapshot_for_flush.is_empty() {
+                None
+            } else {
+                Some(
+                    background_memory_pool
+                        .try_reserve(flush_chunk_bytes.saturating_mul(2), merge_max_memory_bytes)
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock,
+                                "metric flush memory reservation unavailable",
+                            )
+                        })?,
+                )
+            };
             let build_started = std::time::Instant::now();
             let log_parts = part::flush_snapshot_chunked(
                 &snapshot_for_flush,
@@ -363,19 +383,21 @@ async fn flush_once(
                     )),
                 }
             };
-            let series_parts =
-                match series_part::flush_series_snapshot(&series_snapshot_for_flush, &metrics_root)
-                {
-                    Ok(parts) => parts,
-                    Err(error) => {
-                        return Err(rollback(
-                            format!("metric flush failed: {error}"),
-                            &log_parts,
-                            &trace_parts,
-                            &[],
-                        ));
-                    }
-                };
+            let series_parts = match series_part::flush_series_snapshot_chunked(
+                &series_snapshot_for_flush,
+                &metrics_root,
+                flush_chunk_bytes,
+            ) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    return Err(rollback(
+                        format!("metric flush failed: {error}"),
+                        &log_parts,
+                        &trace_parts,
+                        &[],
+                    ));
+                }
+            };
             let build = build_started.elapsed();
             let open_started = std::time::Instant::now();
             let opened_log = match PartRegistry::open_parts(log_parts.clone()) {

@@ -91,6 +91,21 @@ impl BloomFilter {
         out
     }
 
+    /// Number of bytes emitted by [`Self::write_encoded`].
+    pub fn encoded_len(&self) -> usize {
+        12 + self.bits.len()
+    }
+
+    /// Write the encoded filter without allocating a second buffer the size
+    /// of the bitmap. The metric compactor keeps its output bounded, so a
+    /// large filter must be streamed directly to its file.
+    pub fn write_encoded<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(MAGIC)?;
+        writer.write_all(&(self.num_bits as u32).to_le_bytes())?;
+        writer.write_all(&self.k.to_le_bytes())?;
+        writer.write_all(&self.bits)
+    }
+
     pub fn decode(buf: &[u8]) -> Result<Self, String> {
         if buf.len() < 12 {
             return Err("bloom buffer too short".to_string());

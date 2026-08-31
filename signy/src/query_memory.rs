@@ -29,6 +29,82 @@ const UNIT_BYTES: u64 = 1024;
 /// How much a reservation grows per semaphore touch.
 pub const RESERVATION_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
+/// A synchronous byte pool for background writers.
+///
+/// Flush and compaction run on blocking threads, so they cannot await the
+/// query semaphore without holding a runtime worker hostage. Their work is
+/// therefore admitted with a non-blocking reservation: if another background
+/// rewrite owns the declared budget, the caller leaves its input untouched and
+/// retries on the next tick. The permit is RAII, so both success and every
+/// error path return the bytes.
+pub struct BackgroundMemoryPool {
+    capacity_bytes: u64,
+    reserved_bytes: Mutex<u64>,
+}
+
+/// One background writer's bounded slice of the shared pool.
+pub struct BackgroundMemoryPermit {
+    pool: Arc<BackgroundMemoryPool>,
+    bytes: u64,
+}
+
+impl BackgroundMemoryPool {
+    pub fn new(capacity_bytes: u64) -> Self {
+        Self {
+            capacity_bytes,
+            reserved_bytes: Mutex::new(0),
+        }
+    }
+
+    pub fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
+    }
+
+    pub fn reserved_bytes(&self) -> u64 {
+        *self
+            .reserved_bytes
+            .lock()
+            .expect("background memory pool poisoned")
+    }
+
+    /// Try to reserve `bytes`, capped by the operation's configured hard
+    /// limit. A caller that gets `None` must not start its write.
+    pub fn try_reserve(
+        self: &Arc<Self>,
+        bytes: u64,
+        hard_limit: u64,
+    ) -> Option<BackgroundMemoryPermit> {
+        if bytes == 0 || bytes > hard_limit {
+            return None;
+        }
+        let limit = self.capacity_bytes.min(hard_limit);
+        let mut reserved = self
+            .reserved_bytes
+            .lock()
+            .expect("background memory pool poisoned");
+        let next = reserved.checked_add(bytes)?;
+        if next > limit {
+            return None;
+        }
+        *reserved = next;
+        Some(BackgroundMemoryPermit {
+            pool: self.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for BackgroundMemoryPermit {
+    fn drop(&mut self) {
+        let mut reserved = self
+            .pool
+            .reserved_bytes
+            .lock()
+            .expect("background memory pool poisoned");
+        *reserved = reserved.saturating_sub(self.bytes);
+    }
+}
+
 /// The refusal's opening words, shared by the code that writes it and the code
 /// that classifies it.
 ///
@@ -149,6 +225,27 @@ impl QueryMemoryReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_pool_refuses_while_held_and_releases_on_drop() {
+        let pool = Arc::new(BackgroundMemoryPool::new(10));
+        let permit = pool.try_reserve(10, 10).expect("first writer admitted");
+        assert_eq!(pool.reserved_bytes(), 10);
+        assert!(pool.try_reserve(1, 10).is_none());
+        drop(permit);
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert!(pool.try_reserve(10, 10).is_some());
+    }
+
+    #[test]
+    fn background_pool_never_allows_an_operation_past_its_hard_limit() {
+        let pool = Arc::new(BackgroundMemoryPool::new(100));
+        assert!(pool.try_reserve(101, 100).is_none());
+        let _permit = pool
+            .try_reserve(50, 60)
+            .expect("reservation under the hard limit");
+        assert_eq!(pool.reserved_bytes(), 50);
+    }
 
     #[tokio::test]
     async fn the_pool_refuses_growth_past_its_budget_and_recovers() {

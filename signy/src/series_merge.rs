@@ -1,8 +1,8 @@
 //! The metric compactor (M14, issue #8): size-tiered, per partition, metric-
 //! specific. Traces set no merge precedent and the log `merge/` machinery is
-//! Parquet-shaped, so this shares the *flush writer* instead — a compaction is
-//! literally a re-flush of its inputs' samples through
-//! `series_part::flush_series_snapshot`.
+//! Parquet-shaped, so this uses the metric part writer's streaming re-flush
+//! path — a compaction rewrites its inputs without materialising their full
+//! sample set.
 //!
 //! Tiers are constants, not knobs, until a load run says otherwise
 //! (`todo.md`, M14): L0 under 16 MiB of chunk bytes, L1 under 256 MiB, L2 the
@@ -28,7 +28,6 @@ use tokio::time::interval;
 
 use crate::config::Config;
 use crate::object_storage::{MetricManifestPart, RemoteCache, is_inputs_changed_error};
-use crate::series::{SeriesLabels, SeriesSnapshot, SnapshotSeries};
 use crate::series_part::{self, SeriesPartReader};
 use crate::series_registry::SeriesRegistry;
 use crate::shutdown::wait_for_drain;
@@ -54,6 +53,7 @@ fn chunk_bytes(meta: &crate::series_part::SeriesPartMeta) -> u64 {
 
 /// The inclusive timestamp span of a merged series, which the snapshot the
 /// writer takes carries so nothing downstream has to decode to learn it.
+#[cfg(test)]
 fn sample_bounds(samples: &[(i64, f64)]) -> Option<(i64, i64)> {
     let first = samples.first()?.0;
     let last = samples.last()?.0;
@@ -213,45 +213,10 @@ pub async fn compact_once(
     // guard is safe to hold across it and is dropped before the first await.
     let arena = crate::memprof::enter(crate::memprof::Arena::Merge);
 
-    // Read every input's series and merge per (tenant, labels). The merged
-    // samples ride the snapshot's spill vectors, whose whole contract is
-    // "unsorted samples the writer will time-sort" — a compaction is a
-    // re-flush, so the flush writer is the one writer.
-    let mut tenants: std::collections::BTreeMap<
-        crate::tenant::TenantId,
-        std::collections::BTreeMap<SeriesLabels, Vec<(i64, f64)>>,
-    > = std::collections::BTreeMap::new();
-    for reader in &inputs {
-        for segment in &reader.part().meta.tenants {
-            let merged = tenants.entry(segment.tenant.clone()).or_default();
-            for entry in reader.tenant_catalog(&segment.tenant) {
-                merged
-                    .entry(entry.labels.clone())
-                    .or_default()
-                    .extend(reader.read_series(entry)?);
-            }
-        }
-    }
-    let snapshot = SeriesSnapshot {
-        tenants: tenants
-            .into_iter()
-            .map(|(tenant, series)| {
-                (
-                    tenant,
-                    series
-                        .into_iter()
-                        .map(|(labels, spill)| SnapshotSeries {
-                            labels,
-                            bounds: sample_bounds(&spill),
-                            chunks: Vec::new(),
-                            spill,
-                        })
-                        .collect(),
-                )
-            })
-            .collect(),
-    };
-    let new_parts = series_part::flush_series_snapshot(&snapshot, metrics_root)
+    // Input catalogs and sample chunks are merged one head at a time. The
+    // streaming writer preserves the same tenant/labels ordering and stable
+    // duplicate-timestamp order as the old snapshot materialisation path.
+    let new_parts = series_part::compact_series_parts(&inputs, metrics_root)
         .map_err(|error| format!("compaction failed to write its replacement part: {error}"))?;
     if new_parts.is_empty() {
         return Ok(false);
@@ -364,6 +329,16 @@ pub async fn compact_loop(
         // Drain the debt this tick found; each pass re-selects, so a burst of
         // small flushes converges instead of compacting once per interval.
         loop {
+            let Some(_background_permit) = config
+                .background_memory_pool
+                .try_reserve(config.merge_max_memory_bytes, config.merge_max_memory_bytes)
+            else {
+                // Flush owns the shared background budget. Leave the parts in
+                // place and retry the compaction on the next tick rather than
+                // materialising work that cannot be admitted safely.
+                tracing::debug!("metric compaction waiting for background memory");
+                break;
+            };
             match compact_once(&registry, &metrics_root, remote_cache.as_deref()).await {
                 Ok(true) => {
                     healthy.store(true, Ordering::Release);
@@ -385,7 +360,10 @@ pub async fn compact_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesMemTable};
+    use crate::series::{
+        METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels, SeriesMemTable, SeriesSnapshot,
+        SnapshotSeries,
+    };
     use crate::tenant::test_tenant;
 
     fn labels(name: &str, instance: &str) -> SeriesLabels {
@@ -508,6 +486,41 @@ mod tests {
         assert!(read_records(&root).unwrap().is_empty());
         let discovered = series_part::discover_series_parts(&root).unwrap();
         assert_eq!(discovered.len(), registry.part_count());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn streaming_compaction_merges_overlapping_series_stably() {
+        let root = temp_root("streaming-overlap");
+        let series = labels("queue_depth", "a");
+        // Every part contains the same timestamps. The old snapshot merge's
+        // stable sort retained input order for equal timestamps; the sample
+        // heap must do the same while holding only one decoder per input.
+        for _ in 0..COMPACT_MIN_PARTS {
+            flush_one_part(&root, &series, 1_772_000_000_000_000_000, 4);
+        }
+        let registry = registry_over(&root);
+        let inputs = select_inputs(&registry.snapshot()).expect("the tier is complete");
+        let mut expected = Vec::new();
+        for reader in &inputs {
+            expected.extend(
+                reader
+                    .read_series(&reader.tenant_catalog(&test_tenant())[0])
+                    .unwrap(),
+            );
+        }
+        expected.sort_by_key(|(ts, _)| *ts);
+
+        let parts = series_part::compact_series_parts(&inputs, &root).unwrap();
+        assert_eq!(parts.len(), 1);
+        let reader = SeriesPartReader::open(parts.into_iter().next().unwrap()).unwrap();
+        assert_eq!(
+            reader
+                .read_series(&reader.tenant_catalog(&test_tenant())[0])
+                .unwrap(),
+            expected,
+            "overlapping samples retain stable timestamp ordering"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

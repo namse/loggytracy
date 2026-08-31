@@ -19,6 +19,8 @@
 //! in the chunk rather than beside it so a chunk is self-describing wherever
 //! it lands (memtable, part, journal-less abort path).
 
+use std::borrow::Cow;
+
 /// Bit-packed writer. Bits fill each byte from the high end, the direction
 /// every Gorilla description assumes.
 #[derive(Clone)]
@@ -59,13 +61,24 @@ impl BitWriter {
 
 /// Bit-packed reader over a chunk's bitstream.
 struct BitReader<'a> {
-    bytes: &'a [u8],
+    bytes: Cow<'a, [u8]>,
     position: usize,
 }
 
 impl<'a> BitReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
+        Self {
+            bytes: Cow::Borrowed(bytes),
+            // The first four bytes are the decoder's sample-count header.
+            position: 32,
+        }
+    }
+
+    fn owned(bytes: Vec<u8>) -> BitReader<'static> {
+        BitReader {
+            bytes: Cow::Owned(bytes),
+            position: 32,
+        }
     }
 
     fn read_bit(&mut self) -> Result<bool, String> {
@@ -256,7 +269,7 @@ impl<'a> Decoder<'a> {
         }
         let count = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         Ok(Self {
-            reader: BitReader::new(&chunk[4..]),
+            reader: BitReader::new(chunk),
             remaining: count,
             total: count,
             prev_ts: 0,
@@ -314,6 +327,51 @@ impl<'a> Decoder<'a> {
         self.prev_ts = ts;
         self.prev_bits = bits;
         Ok((ts, f64::from_bits(bits)))
+    }
+}
+
+/// A Gorilla decoder that owns its input chunk.
+///
+/// The ordinary [`Decoder`] borrows a chunk, which is the right shape for the
+/// query path. A streaming metric compaction needs one decoder per input
+/// series in a k-way merge, however, and cannot keep self-referential
+/// `Vec<u8>`/decoder pairs. This owned variant keeps each current chunk alive
+/// while yielding it one sample at a time; at most one chunk per input series
+/// is resident instead of materialising an entire merged series.
+pub struct OwnedDecoder {
+    inner: Decoder<'static>,
+}
+
+impl OwnedDecoder {
+    pub fn new(chunk: Vec<u8>) -> Result<Self, String> {
+        if chunk.len() < 4 {
+            return Err("gorilla chunk is shorter than its count header".to_string());
+        }
+        let count = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        Ok(Self {
+            inner: Decoder {
+                reader: BitReader::owned(chunk),
+                remaining: count,
+                total: count,
+                prev_ts: 0,
+                prev_delta: 0,
+                prev_bits: 0,
+                leading: 0,
+                trailing: 0,
+            },
+        })
+    }
+
+    pub fn declared_count(&self) -> u32 {
+        self.inner.total
+    }
+}
+
+impl Iterator for OwnedDecoder {
+    type Item = Result<(i64, f64), String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
     }
 }
 
@@ -426,6 +484,21 @@ mod tests {
         .map(|(index, value)| (index as i64 * 1_000, *value))
         .collect();
         round_trip(&samples);
+    }
+
+    #[test]
+    fn owned_decoder_round_trips_without_changing_the_borrowed_path() {
+        let samples = vec![(10, 1.0), (10, 2.0), (12, 3.0), (20, 4.0)];
+        let mut encoder = Encoder::new();
+        for (ts, value) in &samples {
+            encoder.append(*ts, *value);
+        }
+        let chunk = encoder.close();
+        let decoder = OwnedDecoder::new(chunk).expect("owned decoder opens");
+        let decoded: Vec<_> = decoder
+            .collect::<Result<_, _>>()
+            .expect("owned decoder reads");
+        assert_eq!(decoded, samples);
     }
 
     #[test]

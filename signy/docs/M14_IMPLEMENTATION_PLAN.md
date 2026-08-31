@@ -242,11 +242,10 @@ condition. The claim's wording lives in `VISION.md`; its two conditions are:
    label-grouped `sum` over the flat-parameter API — answer not materially
    worse than VictoriaMetrics, without giving up ingest throughput or disk
    footprint.
-2. **Churn:** when a series-churn workload pushes active series past what the
-   limit can index, signy keeps ingesting known series and answering
-   queries, refusing only the *new* series with a named `partial_success`
-   while publishing how many it refused — rather than slowing, swapping, or
-   dying.
+2. **Churn:** when a series-churn workload fills the resident-byte budget,
+   signy keeps ingesting within the process memory watermark and answers a
+   complete export with `429` + `Retry-After`; the collector retries after
+   flush makes room rather than the process slowing, swapping, or dying.
 
 Abandonment: if VictoriaMetrics inside the same limit both survives the same
 churn with at least the same sample acceptance *and* beats signy
@@ -316,7 +315,8 @@ the declared budget, which is the whole game.
 
 The ladder, in order, each rung observable in `RuntimeMetrics`
 (`active_series` gauge; `series_created_total`, `series_evicted_idle_total`,
-`series_rejected_total`, `metric_samples_rejected_total` counters):
+`series_rejected_total`, `metric_cardinality_rejected_total`, and
+`metric_memory_rejected_total` counters):
 
 1. **Early flush.** Sample memory (Gorilla chunks) is reclaimed by the
    ordinary flush path when the memtable share of the budget fills —
@@ -328,18 +328,14 @@ The ladder, in order, each rung observable in `RuntimeMetrics`
    delta sums, absorbed by rate). This makes *churn* — pod restarts replacing
    label sets — a bounded cost: dead series leave the budget at the timeout
    horizon. The sweep runs on the flush cadence, longest-idle first.
-3. **New-series refusal.** When a tenant's index holds `max_active_series`
-   live series (default 500 000; the memory gate calibrates the default
-   against the measured per-series cost), a datapoint for an *unknown* series
-   is rejected; datapoints for known series are accepted unconditionally. The
-   response is OTLP `partial_success` (`rejected_data_points`,
-   `error_message` naming the count, the limit, the knob
-   `SIGNY_MAX_ACTIVE_SERIES`, and the idle-timeout horizon at which
-   capacity returns); HTTP stays 200 unless every datapoint was rejected
-   (then 429). This is the designed behavior under cardinality explosion: the
-   explosion is contained to the series that caused it, steady traffic never
-   notices, and the refusal count is a first-class published number in the
-   bed.
+3. **Process-wide byte admission.** The normal guard is the shared
+   `max_memtable_bytes` budget, charged with canonical label bytes, calibrated
+   per-series state overhead, and a conservative sample-buffer reservation.
+   All tenant groups in one export are admitted under one decision before the
+   first WAL append. If the reservation does not fit, the complete export is
+   answered with `429` and `Retry-After`; no datapoint is filtered into a
+   partial success. `SIGNY_MAX_ACTIVE_SERIES` is disabled by default and is
+   retained only as an optional process-wide emergency count guard.
 4. **IngestGate.** The existing gate (WAL backlog, memtable bytes, disk
    floor) still fronts everything; nothing new.
 
@@ -491,7 +487,7 @@ validation) plus `CONFIGURATION.md`:
 | knob | default |
 |---|---|
 | `SIGNY_MAX_METRIC_SAMPLES` (per request, post-decomposition) | 100 000 |
-| `SIGNY_MAX_ACTIVE_SERIES` (per tenant) | 500 000 |
+| `SIGNY_MAX_ACTIVE_SERIES` (process-wide emergency guard, optional) | off |
 | `SIGNY_METRIC_SERIES_IDLE_TIMEOUT` | 10m |
 | `SIGNY_MAX_CONCURRENT_METRIC_SCANS` | 8 |
 | `SIGNY_MAX_METRIC_QUERY_RUNTIME` | 30s |
@@ -567,9 +563,10 @@ runnable throughout.
 - [ ] All five OTLP metric types ingest over HTTP and gRPC, decompose per
   §3, and survive restart via journal replay (replay-equals-live pinned by
   test).
-- [ ] Under `max_active_series` pressure, known-series samples are accepted,
-  new series are refused via OTLP `partial_success` naming
-  count/limit/knob/horizon, and the counters move.
+- [ ] Under the optional process-wide `max_active_series` pressure, a complete
+  metric export is refused with `429` + `Retry-After`, and no new series or
+  WAL record is left behind. Under byte-budget pressure the same whole-export
+  contract applies; the memory/cardinality counters move.
 - [ ] Idle series leave the index at the timeout; a returning series works;
   the reset artifact is absorbed by `rate`.
 - [ ] Metric parts flush, offload, restore, expire, and compact;
@@ -602,12 +599,14 @@ runnable throughout.
 - **Rate semantics are the VictoriaMetrics definition** (user decision).
   fn0's alert math inherits it; the `QUERY_API.md` section states the
   deviation from Prometheus explicitly.
-- **`max_active_series` is per-tenant** (user decision), matching every
-  other quota. A many-tenant deployment can still sum past the budget; the
-  arena metering and early flush (ladder rungs 1–2) are the global backstop.
-- **The per-series memory estimate** behind the 500 000 default is a guess
-  until `memprof` measures it; Phase 4 measures, Phase 9's gate calibrates,
-  and the default is corrected before publication.
+- **`max_active_series` is process-wide and opt-in.** It is an emergency
+  operational guard, not the normal cardinality policy. The shared byte
+  budget applies across tenants and signals, with no fixed default series
+  ceiling.
+- **The per-series memory estimate** is charged conservatively from measured
+  allocator/container overhead rather than using a fixed count proxy; the
+  live metric sample reservation is released by the journal writer after
+  insertion and rolled back on an append failure.
 - **Float digests may still disagree cross-engine** on rate/quantile
   shapes; the methodology's answer (withhold the ratios, say so in "What I
   do not trust") applies — the risk is a thinner published table, not a

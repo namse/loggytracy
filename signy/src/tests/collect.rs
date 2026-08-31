@@ -434,16 +434,13 @@
         assert_eq!(series(&state), 2);
     }
 
-    /// The count the OTLP `partial_success` used to carry.
-    ///
-    /// It was the push routes' answer, and they are gone; a collecty reads only
-    /// the status, so without this the refusal would exist nowhere but the
-    /// server's own log. Summed over the batch, because a batch is many records
-    /// and the answer is one.
+    /// Cardinality pressure is an export-level decision.  The first export is
+    /// durable, while the following export is refused as a whole with 429;
+    /// no partial-success filtering is performed.
     #[tokio::test]
-    async fn a_partially_refused_metrics_batch_says_how_much_it_refused() {
+    async fn a_metric_export_past_the_count_guard_is_refused_whole() {
         let (_memtable, state) = fixture_with(|config| {
-            config.max_active_series = 1;
+            config.max_active_series = Some(1);
         });
         let records = vec![
             metric_request(&["a"]).encode_to_vec(),
@@ -452,27 +449,12 @@
 
         let (status, body) = post_collected(&state, METRICS, "zstd", zstd_frames(&records)).await;
 
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "the known series still landed, so the batch was not refused"
-        );
-        assert_eq!(body, r#"{"stored":0,"rejected":2}"#);
-        assert_eq!(series(&state), 1);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(body.contains("SIGNY_MAX_ACTIVE_SERIES"), "{body}");
     }
 
-    /// The cap is the tenant's, not the request's.
-    ///
-    /// A batch admits up to `MAX_INFLIGHT_RECORDS` records before the first one
-    /// settles, so a series can hold a reserved slot with no samples in it for
-    /// the length of a batch. The eviction pass that runs under admission
-    /// pressure read that as a series nothing ever arrived for and handed its
-    /// slot to the next new series in the same batch: measured at
-    /// `max_active_series = 1`, two records that split as one batch stored two
-    /// series and reported one refusal, while the identical two records sent as
-    /// two batches stored one and reported two. Same records, same cap, two
-    /// answers — so the number the knob names was a property of how a collecty
-    /// happened to pack its segment.
+    /// The emergency count guard is process-wide and is evaluated per export,
+    /// independent of how a collecty packs its records.
     #[tokio::test]
     async fn the_series_cap_holds_across_a_batch_the_way_it_holds_across_two() {
         let records = vec![
@@ -480,23 +462,26 @@
             metric_request(&["a", "b", "c"]).encode_to_vec(),
         ];
 
-        let (_memtable, one) = fixture_with(|config| config.max_active_series = 1);
-        let (_status, together) =
+        let (_memtable, one) = fixture_with(|config| config.max_active_series = Some(1));
+        let (together_status, together) =
             post_collected(&one, METRICS, "zstd", zstd_frames(&records)).await;
 
-        let (_memtable, apart) = fixture_with(|config| config.max_active_series = 1);
+        let (_memtable, apart) = fixture_with(|config| config.max_active_series = Some(1));
         let mut separately = Vec::new();
         for record in &records {
-            let (_status, body) =
+        let (status, body) =
                 post_collected(&apart, METRICS, "zstd", zstd_frames(std::slice::from_ref(record)))
                     .await;
-            separately.push(body);
+            separately.push((status, body));
         }
 
-        assert_eq!(together, r#"{"stored":0,"rejected":2}"#);
-        assert_eq!(separately[1], r#"{"stored":0,"rejected":2}"#);
-        assert_eq!(series(&one), 1);
-        assert_eq!(series(&apart), series(&one));
+        assert_eq!(together_status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(together.contains("SIGNY_MAX_ACTIVE_SERIES"), "{together}");
+        assert_eq!(separately[1].0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(separately[1].1.contains("SIGNY_MAX_ACTIVE_SERIES"));
+        // The first record was handed to the journal before the second one
+        // hit the guard.  Its pending append is owned by the writer and may
+        // still be settling when the collect response is returned.
     }
 
     /// The batch collecty ships: each payload behind its own length, each

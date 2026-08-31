@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::tenant::TenantId;
@@ -220,10 +221,10 @@ pub struct Config {
     pub max_concurrent_trace_scans: usize,
     pub max_trace_query_runtime: Duration,
     pub max_trace_restore_runtime: Duration,
-    /// Live metric series a tenant may hold before a datapoint for an
-    /// *unknown* series is refused — the cardinality defence of the M14
-    /// degradation ladder. Known series are accepted unconditionally.
-    pub max_active_series: usize,
+    /// Optional process-wide emergency guard on live metric series. Normal
+    /// admission is byte-budgeted by `max_memtable_bytes`; this count guard is
+    /// disabled by default and, when explicitly set, refuses a whole export.
+    pub max_active_series: Option<usize>,
     /// Most series one metric query may select; over it the request is
     /// refused before any chunk is decoded.
     pub max_metric_series_per_query: usize,
@@ -266,6 +267,10 @@ pub struct Config {
     /// comparing runs needs to know whether a number was declared, derived,
     /// or absent.
     pub memory_budget_source: String,
+    /// Shared reservation pool for metric flush and metric compaction. The
+    /// operation-specific ceilings still come from `flush_chunk_bytes` and
+    /// `merge_max_memory_bytes`; this handle only coordinates their overlap.
+    pub background_memory_pool: Arc<crate::query_memory::BackgroundMemoryPool>,
 }
 
 impl Default for Config {
@@ -332,9 +337,9 @@ impl Default for Config {
             max_concurrent_trace_scans: 8,
             max_trace_query_runtime: Duration::from_secs(30),
             max_trace_restore_runtime: Duration::from_secs(25),
-            // A guess until memprof measures the per-series cost; the memory
-            // gate calibrates it before the M14 comparison publishes.
-            max_active_series: 500_000,
+            // The byte budget is the normal cardinality guard. Keep the old
+            // count knob available as an explicit emergency override only.
+            max_active_series: None,
             metric_series_idle_timeout: Duration::from_secs(600),
             max_metric_series_per_query: 10_000,
             max_metric_points_per_query: 2_000_000,
@@ -346,6 +351,9 @@ impl Default for Config {
             malloc_trim_interval: Some(Duration::from_secs(60)),
             memory_budget_bytes: None,
             memory_budget_source: "off (Config::default)".to_string(),
+            background_memory_pool: Arc::new(crate::query_memory::BackgroundMemoryPool::new(
+                1024 * 1024 * 1024,
+            )),
         }
     }
 }
@@ -470,14 +478,17 @@ fn resolve_memory_budget(
 /// explicit knob overrides its derived value by construction, because the
 /// derivation runs before the environment is read.
 ///
-/// The shares are the re-measured attribution
-/// (`docs/MEMORY_ATTRIBUTION.md`, build `b9165b0`): at the coincident live
-/// peak merge held 607 MiB, the memtable's real cost 441 (accounted × ~1.73),
-/// query + the row-group cache ~490, flush 111, sidecars 128. Nominal shares
-/// below sum to 72.5% of the budget; the rest is flush (which rides ingest),
-/// the sidecars (unbounded until their eviction lands), and slack for the
-/// metering gap. Floors keep a tiny budget from deriving ceilings below what
-/// [`Config::validate`] or one reservation chunk requires.
+/// The shares are derived from the measured attribution and the current
+/// streaming lifecycle (`docs/MEMORY_ATTRIBUTION.md`). In particular, the
+/// metric gate at a 2 GiB cgroup with a 60% declared budget rejected 58 whole
+/// exports when this was only 10%: the 122.9 MiB ceiling admitted 270,744 of
+/// 560,032 offered datapoints. The streaming flush/merge path then measured a
+/// 374 MiB anonymous peak, so a 25% memtable share (about 307 MiB at that
+/// budget) leaves room for the comparison bed's roughly 500k active series
+/// while the declared budget still leaves 40% of the cgroup to absorb
+/// allocator retention and other process state. Floors keep a tiny budget from
+/// deriving ceilings below what [`Config::validate`] or one reservation chunk
+/// requires.
 fn derive_defaults_from_budget(defaults: &mut Config, budget_bytes: u64) {
     const MIB: u64 = 1024 * 1024;
     let merge = (budget_bytes / 4).max(64 * MIB);
@@ -488,10 +499,13 @@ fn derive_defaults_from_budget(defaults: &mut Config, budget_bytes: u64) {
     defaults.max_query_memory_bytes = query_pool;
     defaults.row_group_cache_max_bytes = Some((budget_bytes / 8).max(16 * MIB));
     defaults.sidecar_cache_max_bytes = Some((budget_bytes / 10).max(32 * MIB));
-    // Accounted bytes; the memtable's resident cost is ~1.73× this
-    // (`docs/MEMORY_ATTRIBUTION.md`), so 10% accounted is ~17% real.
-    defaults.max_memtable_bytes = Some((budget_bytes / 10).max(32 * MIB));
-    // In-flight bodies are not in the 72.5% above: they were outside the
+    // A quarter of the declared budget is the shared log/trace/metric
+    // memtable ceiling. The metric admission path charges conservative
+    // resident bytes, including the measured series-state overhead, so this
+    // is a real refusal boundary rather than a series-count proxy. Streaming
+    // flush and merge keep their transients in their own bounded workers.
+    defaults.max_memtable_bytes = Some((budget_bytes / 4).max(32 * MIB));
+    // In-flight bodies are not in the 87.5% above: they were outside the
     // accounting entirely until this bound existed, and the attribution
     // measured them at 0.3 MiB. 5% is therefore a ceiling on an outlier rather
     // than a share of anything, floored at one legal OTLP request so a small
@@ -511,6 +525,10 @@ impl Config {
         if let Some(budget) = memory_budget_bytes {
             derive_defaults_from_budget(&mut defaults, budget);
         }
+        let merge_max_memory_bytes = env_positive_u64(
+            "SIGNY_MERGE_MAX_MEMORY_BYTES",
+            defaults.merge_max_memory_bytes,
+        )?;
         let config = Self {
             malloc_trim_interval: env_duration(
                 "SIGNY_MALLOC_TRIM_INTERVAL",
@@ -587,10 +605,7 @@ impl Config {
                 "SIGNY_MERGE_MAX_INPUT_BYTES",
                 defaults.merge_max_input_bytes,
             )?,
-            merge_max_memory_bytes: env_positive_u64(
-                "SIGNY_MERGE_MAX_MEMORY_BYTES",
-                defaults.merge_max_memory_bytes,
-            )?,
+            merge_max_memory_bytes,
             merge_max_groups_per_tick: env_positive_usize(
                 "SIGNY_MERGE_MAX_GROUPS_PER_TICK",
                 defaults.merge_max_groups_per_tick,
@@ -708,7 +723,7 @@ impl Config {
                 "SIGNY_MAX_TRACE_RESTORE_RUNTIME",
                 defaults.max_trace_restore_runtime,
             )?,
-            max_active_series: env_positive_usize(
+            max_active_series: env_optional_usize(
                 "SIGNY_MAX_ACTIVE_SERIES",
                 defaults.max_active_series,
             )?,
@@ -744,6 +759,9 @@ impl Config {
                 "SIGNY_SHUTDOWN_FLUSH_WARN_AFTER",
                 defaults.shutdown_flush_warn_after,
             )?,
+            background_memory_pool: Arc::new(crate::query_memory::BackgroundMemoryPool::new(
+                merge_max_memory_bytes,
+            )),
         };
         config.validate()?;
         Ok(config)
@@ -758,8 +776,10 @@ impl Config {
     /// process actually holds itself to rather than a product it hopes never
     /// multiplies out.
     ///
-    /// Still an upper bound rather than an estimate for the whole, and the
-    /// log says so.
+    /// This deliberately excludes resident memtables and caches, which have
+    /// their own byte ceilings and are logged beside this value. It is an
+    /// upper bound for simultaneously materialized query/merge work, not a
+    /// complete RSS prediction.
     pub fn peak_materialized_bytes(&self) -> u64 {
         self.query_memory_budget_bytes
             .saturating_add(self.merge_max_memory_bytes)
@@ -916,7 +936,9 @@ selected above the read budget can never be merged",
         )?;
         positive_duration("max_trace_query_runtime", self.max_trace_query_runtime)?;
         positive_duration("max_trace_restore_runtime", self.max_trace_restore_runtime)?;
-        positive_usize("max_active_series", self.max_active_series)?;
+        if let Some(max_active) = self.max_active_series {
+            positive_usize("max_active_series", max_active)?;
+        }
         positive_duration(
             "metric_series_idle_timeout",
             self.metric_series_idle_timeout,
@@ -959,6 +981,26 @@ fn env_positive_usize(name: &str, default: usize) -> Result<usize, String> {
         return Err(format!("invalid {name}: value must be greater than zero"));
     }
     Ok(value)
+}
+
+/// An optional positive count. Empty, `off`, and `none` disable the guard.
+fn env_optional_usize(name: &str, default: Option<usize>) -> Result<Option<usize>, String> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(default);
+    };
+    let value = raw.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let parsed: usize = value
+        .parse()
+        .map_err(|error| format!("invalid {name} {raw:?}: {error}"))?;
+    if parsed == 0 {
+        return Err(format!(
+            "invalid {name}: use 'off' to disable the limit rather than zero"
+        ));
+    }
+    Ok(Some(parsed))
 }
 
 fn env_value<T>(name: &str, default: T) -> Result<T, String>
@@ -1148,7 +1190,7 @@ mod tests {
         assert_eq!(config.max_query_memory_bytes, budget / 4);
         assert_eq!(config.row_group_cache_max_bytes, Some(budget / 8));
         assert_eq!(config.sidecar_cache_max_bytes, Some(budget / 10));
-        assert_eq!(config.max_memtable_bytes, Some(budget / 10));
+        assert_eq!(config.max_memtable_bytes, Some(budget / 4));
         config.memory_budget_bytes = Some(budget);
         config.validate().unwrap();
     }
@@ -1295,6 +1337,10 @@ mod tests {
         // 2026-08-08.)
         let config = Config::default();
         assert_eq!(config.memory_budget_bytes, None);
+        assert_eq!(
+            config.max_active_series, None,
+            "the fixed cardinality guard is opt-in"
+        );
         assert_eq!(config.merge_max_memory_bytes, 1024 * 1024 * 1024);
         assert_eq!(config.merge_max_input_bytes, 512 * 1024 * 1024);
         // Detection itself must be sane where it works at all.

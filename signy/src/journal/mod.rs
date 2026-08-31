@@ -98,6 +98,51 @@ impl PendingAppend {
     }
 }
 
+/// Bytes reserved by a metric export while its WAL append is queued or being
+/// inserted.  The reservation is owned by the journal append item, so a
+/// failed send/write releases it even though the HTTP task has already
+/// returned an error.
+pub(crate) struct MetricMemoryPermit {
+    counter: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl MetricMemoryPermit {
+    pub(crate) fn split(&mut self, bytes: u64) -> Self {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        Self {
+            counter: self.counter.clone(),
+            bytes,
+        }
+    }
+}
+
+impl Drop for MetricMemoryPermit {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let _ = self
+            .counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(self.bytes))
+            });
+    }
+}
+
+/// One tenant's portion of a metric export. The journal accepts a vector of
+/// these in a single channel command so splitting an export by tenant cannot
+/// turn a later enqueue failure into an earlier partial acceptance.
+pub(crate) struct ReservedMetricAppend {
+    pub(crate) tenant: TenantId,
+    pub(crate) data: Vec<u8>,
+    pub(crate) samples: Vec<MetricSample>,
+    pub(crate) mark: Option<CollectMark>,
+    pub(crate) metric_memory_permit: MetricMemoryPermit,
+    pub(crate) metric_series_admission: crate::series::SeriesAdmission,
+}
+
 pub struct CheckpointSnapshot {
     pub offset: u64,
     pub snapshot: Arc<MemTableSnapshot>,
@@ -188,8 +233,10 @@ fn decode_tenant_record(data: &[u8]) -> Result<Option<TenantRecord<'_>>, String>
     Ok(Some((tenant, kind, &data[tenant_end..])))
 }
 
+#[allow(clippy::large_enum_variant)]
 enum JournalCmd {
     Append(AppendItem),
+    AppendBatch(Vec<AppendItem>),
     Checkpoint {
         done: oneshot::Sender<Result<CheckpointSnapshot, IoError>>,
     },
@@ -213,6 +260,8 @@ struct AppendItem {
     entries: Vec<LogEntry>,
     traces: Vec<TraceSpan>,
     metric_samples: Vec<MetricSample>,
+    metric_memory_permit: Option<MetricMemoryPermit>,
+    metric_series_admission: Option<crate::series::SeriesAdmission>,
     /// Where this record sat in the queue of the collecty that sent it, when
     /// one did. The writer takes the highest per sender in a batch and writes
     /// it as a record of its own, so the mark and the records it covers share
@@ -283,6 +332,7 @@ pub struct Journal {
     trace_memtable: Arc<TraceMemTable>,
     series_memtable: Arc<SeriesMemTable>,
     backlog: Arc<WalBacklog>,
+    metric_reserved_bytes: Arc<AtomicU64>,
 }
 
 /// Durable WAL bytes the flush loop has not yet retired.
