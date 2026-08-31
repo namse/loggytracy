@@ -154,3 +154,14 @@ sample buffers. This identifies persistent index/interner growth and its
 resize peak—not the one-sample buffer—as the next capacity limiter. The
 instrumented artifacts are under
 `compare/target/metric-capacity-probe-shape-10m/`.
+
+### State-24-byte patch
+
+The next fixed 10,000,000-series probe used the transient reservation/bounds
+split (`SeriesState <= 24` bytes). It reached 6,555,010 accepted series before
+cgroup OOM (`anon_peak_bytes=2,039 MiB`). The last scrape reported
+`states_len=6,555,010`, `states_capacity=7,340,032`, and the same
+`interner_len/capacity`; 460,000 sample buffers remained, of which 35,000 were
+inline, and no flush snapshot was live. This is a substantial improvement over
+the previous 3,670,010 plateau, but it is still below the 10-million target.
+The artifact is under `compare/target/metric-capacity-probe-state24-10m/`.
