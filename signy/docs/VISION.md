@@ -87,8 +87,8 @@ yet the per-arena accounted refusal this section sketches — the shares above
 remain the target shape. The allocator-retention multiplier this section said
 to measure and publish was measured, published, and then retired outright:
 the 24-hour soak showed glibc's retained-free creep killing 2 GiB in hours
-with every knob applied, and the production allocator is **jemalloc** since
-`8592094`. And the number an operator actually asks this invariant for, from
+with every knob applied. The production allocator was **jemalloc** from
+`8592094` and is **mimalloc** since 2026-08-31. And the number an operator actually asks this invariant for, from
 the completed 24-hour soak at a 2 GiB container (2026-08-10): **sustained
 capacity is the whole offered 20 k eps** — 19,999.8, nothing throttled — for
 24 hours and 1.73 billion events, with anon flat between 1.47 and 1.57 GiB,

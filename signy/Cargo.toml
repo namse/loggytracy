@@ -49,7 +49,7 @@ object_store = { version = "0.12", features = ["aws"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
-tikv-jemallocator = "0.7.0"
+mimalloc = { version = "0.1", default-features = false }
 # `statvfs`, for the one thing this process measures about the machine under it:
 # how much room is left on the disk the WAL cannot do without.
 libc = "0.2"

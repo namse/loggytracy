@@ -6,32 +6,33 @@ use signy::config::Config;
 #[global_allocator]
 static ALLOCATOR: signy::memprof::ProfilingAllocator = signy::memprof::ProfilingAllocator;
 
-/// jemalloc, because the soak measured glibc out (todo.md, 2026-08-09): with
-/// every gauged resident flat, glibc-retained free crept until the 2 GiB kill
-/// — 4.05 hours even with the fixed thresholds, the arena cap and a
-/// `malloc_trim` timer, because a free chunk on a page it shares with a live
-/// one can never be returned. jemalloc's decay-based purge returns freed
-/// runs continuously, which is the property the competitors get from the Go
-/// runtime for free. The memprof build keeps its instrumented wrapper over
-/// glibc — its job is live-byte attribution, and the glibc tuning stays
-/// active there.
+/// mimalloc. glibc was measured out first (todo.md, 2026-08-09): with every
+/// gauged resident flat, glibc-retained free crept until the 2 GiB kill — 4.05
+/// hours even with the fixed thresholds, the arena cap and a `malloc_trim`
+/// timer, because a free chunk on a page it shares with a live one can never
+/// be returned. What replaced it has to return freed pages on its own, which
+/// is the property the competitors get from the Go runtime for free; jemalloc
+/// held that role from 2026-08-09 and mimalloc takes it on 2026-08-31.
+///
+/// The memprof build keeps its instrumented wrapper over glibc — its job is
+/// live-byte attribution, and the glibc tuning stays active there, which is
+/// why an arena split and an absolute footprint must not be read off the same
+/// run ([`docs/MEMORY_ATTRIBUTION.md`](../docs/MEMORY_ATTRIBUTION.md)).
 #[cfg(not(feature = "memprof"))]
 #[global_allocator]
-static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-// jemalloc runs at its own defaults, and that is a measured choice: a
-// five-way 600 s sweep on the soak rig (todo.md, 2026-08-09) read
-// `background_thread:true` and `dirty_decay_ms:30000` inside the defaults'
-// run-to-run spread on every axis, and the apparent throughput gap against
-// glibc dissolved once 600 s runs were compared with 600 s runs — both
-// allocators throttle ~7% in the cold-start transient and recover by the
-// hour mark. An operator A/B reaches jemalloc through `_RJEM_MALLOC_CONF`
-// (the `MALLOC_CONF` name is not consulted in this prefixed build).
+// mimalloc runs at its own defaults. The jemalloc sweep it replaces found no
+// setting that beat the defaults (a five-way 600 s sweep on the soak rig,
+// todo.md 2026-08-09), and nothing here has yet measured mimalloc's own knobs,
+// so the defaults are what this build claims — not what it has proven best.
+// An operator A/B reaches them through `MIMALLOC_*` environment variables;
+// `purge_delay` is the one that decides how fast freed pages go back.
 
 fn main() {
     // Before the runtime exists: M_ARENA_MAX only bounds arenas not yet
     // created, and tokio's workers each create one on first contention.
-    // Under jemalloc this is a no-op and logs `applied = false`.
+    // Under mimalloc this is a no-op and logs `applied = false`.
     let malloc_tuned = signy::malloc_tuning::apply_from_env();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -85,7 +85,7 @@ pub fn apply_from_env() -> bool {
     apply(arena_max, mmap_threshold)
 }
 
-// The production binary's allocator is jemalloc (`src/main.rs`), so glibc
+// The production binary's allocator is mimalloc (`src/main.rs`), so glibc
 // tuning targets a heap nothing uses: it applies only in the memprof build,
 // whose instrumented wrapper still allocates through glibc.
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "memprof"))]
