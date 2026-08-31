@@ -86,6 +86,9 @@ signy_part_bytes {}\n\
 signy_part_count {}\n\
 # TYPE signy_trace_part_count gauge\n\
 signy_trace_part_count {}\n\
+# HELP signy_metric_part_count Open metric parts. Each holds its whole series catalog resident, offloaded body or not, so this is the multiplier on a series' catalog residency.\n\
+# TYPE signy_metric_part_count gauge\n\
+signy_metric_part_count {}\n\
 # TYPE signy_remote_healthy gauge\n\
 signy_remote_healthy {}\n\
 # HELP signy_remote_consecutive_failures Object-store failures since the last success. The health flag hides these below its threshold, so this is where a degrading store shows before it is declared down.\n\
@@ -236,6 +239,7 @@ signy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         disk.bytes,
         state.parts.part_count(),
         state.trace_parts.part_count(),
+        state.series_parts.part_count(),
         remote_healthy as u8,
         state
             .remote_cache

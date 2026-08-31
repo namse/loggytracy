@@ -353,6 +353,11 @@ impl SeriesMemTable {
         max_active: usize,
         idle_cutoff_ns: i64,
     ) -> AdmitOutcome {
+        // A reservation allocates the entry that outlives this call: the
+        // canonical label bytes and the `SeriesBuffer` that holds the open
+        // Gorilla stream. Charged where it lives rather than to the ingest
+        // decode that happened to trigger it.
+        let _arena = crate::memprof::enter(crate::memprof::Arena::SeriesMemtable);
         let mut outcome = AdmitOutcome {
             admitted: std::collections::HashSet::new(),
             rejected_datapoints: 0,
@@ -475,6 +480,9 @@ impl SeriesMemTable {
         if samples.is_empty() {
             return;
         }
+        // Same arena as the reservation: what grows here is the open stream
+        // and the spill vector of an entry that stays until it is evicted.
+        let _arena = crate::memprof::enter(crate::memprof::Arena::SeriesMemtable);
         let mut added = 0u64;
         let mut inner = self.inner.write();
         for sample in samples {

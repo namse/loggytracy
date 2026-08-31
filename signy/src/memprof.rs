@@ -51,10 +51,19 @@ pub enum Arena {
     /// Decoded row groups a `PartReader` keeps for later scans, bounded by
     /// `row_group_cache_max_bytes`.
     RowGroupCache = 8,
+    /// The metric memtable's live series: the buffer struct, the canonical
+    /// label bytes it keys on, and the open Gorilla stream each one holds
+    /// between flushes.
+    SeriesMemtable = 9,
+    /// The catalog and bloom a `SeriesPartReader` holds for as long as it
+    /// lives — one entry per series per part, each carrying that series'
+    /// canonical labels. Kept even when the part's body is offloaded, so this
+    /// is resident per stored part rather than per active series.
+    SeriesCatalog = 10,
 }
 
 impl Arena {
-    pub const ALL: [Arena; 9] = [
+    pub const ALL: [Arena; 11] = [
         Arena::Other,
         Arena::Ingest,
         Arena::Wal,
@@ -64,6 +73,8 @@ impl Arena {
         Arena::Sidecar,
         Arena::PartMeta,
         Arena::RowGroupCache,
+        Arena::SeriesMemtable,
+        Arena::SeriesCatalog,
     ];
 
     pub fn name(self) -> &'static str {
@@ -77,6 +88,8 @@ impl Arena {
             Arena::Sidecar => "sidecar",
             Arena::PartMeta => "part_meta",
             Arena::RowGroupCache => "row_group_cache",
+            Arena::SeriesMemtable => "series_memtable",
+            Arena::SeriesCatalog => "series_catalog",
         }
     }
 }

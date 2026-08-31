@@ -498,6 +498,11 @@ impl SeriesPartReader {
                 part.data_path().display()
             ));
         }
+        // The bloom and the catalog outlive this call — a reader holds both
+        // for as long as the registry holds it, offloaded body or not — so
+        // they are charged to their own arena rather than to whoever happened
+        // to open the part.
+        let _arena = crate::memprof::enter(crate::memprof::Arena::SeriesCatalog);
         let bloom_bytes = fs::read(part.bloom_path()).map_err(|error| error.to_string())?;
         let bloom = decode_series_bloom(&bloom_bytes)?;
         let index_bytes = fs::read(part.index_path()).map_err(|error| error.to_string())?;

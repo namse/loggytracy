@@ -41,6 +41,8 @@ CONNS="${M10_CONNECTIONS:-8}"
 QUERY_EPS="${M10_QUERY_EPS:-5}"
 # The comparison bed's seed, so this run's corpus is the bed's corpus.
 SEED="${M10_SEED:-1592598566}"
+# `load` drives the log workload; `metric-load` drives M14's series-churn one.
+PHASE="${M10_PHASE:-load}"
 BIN="${M10_BIN:-$ROOT/target/release/signy}"
 PORT="${M10_PORT:-3151}"
 UNIT="m10-$NAME"
@@ -91,7 +93,7 @@ echo "cgroup=$CG memory.max=$(cat "$CG/memory.max") swap.max=$(cat "$CG/memory.s
 # gauges: a gap between them is then visible in one row rather than inferred
 # across two files.
 (
-  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free"
+  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,mp_series_memtable,mp_series_catalog,active_series,metric_parts"
   T0=$(date +%s.%N)
   while [ -d "$CG" ]; do
     now=$(date +%s.%N)
@@ -120,10 +122,13 @@ echo "cgroup=$CG memory.max=$(cat "$CG/memory.max") swap.max=$(cat "$CG/memory.s
       /^signy_memprof_live_bytes\{/{v[$3]=$NF}
       /^signy_memprof_malloc_bytes\{/{i[$3]=$NF}
       /^signy_memprof_header_bytes /{h=$2}
-      END{printf "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+      /^signy_active_series /{as=$2}
+      /^signy_metric_part_count /{mpc=$2}
+      END{printf "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
           v["other"], v["ingest"], v["wal"], v["flush"], v["merge"],
           v["query"], v["sidecar"], v["part_meta"], v["row_group_cache"], h,
-          i["arena"], i["mmapped"], i["in_use"], i["free"]}')
+          i["arena"], i["mmapped"], i["in_use"], i["free"],
+          v["series_memtable"], v["series_catalog"], as, mpc}')
     printf '%s,%s,%s,%s,%s,%s,%s\n' \
       "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
       "$cur" "$peak" "$cg" "$gg" "${threads:-0}" "$mp"
@@ -149,7 +154,7 @@ PROF_PID=$!
 WATCH_PID=$!
 
 SIGNY_LOAD_TARGET=signy \
-SIGNY_LOAD_PHASE=load \
+SIGNY_LOAD_PHASE="$PHASE" \
 SIGNY_LOAD_ADDR="127.0.0.1:$PORT" \
 SIGNY_LOAD_CGROUP="$CG" \
 SIGNY_LOAD_TIER=memprof \
@@ -190,7 +195,7 @@ kill -0 "$SERVER_PID" 2>/dev/null && ALIVE=true
       m = 1048576.0
       printf "duration_s=%s\nanon_peak_mib=%.1f\nfile_at_peak_mib=%.1f\n", r[1], r[4]/m, r[5]/m
       if (bestm > 0) {
-        live = (s[21]+s[22]+s[23]+s[24]+s[25]+s[26]+s[27]+s[28]+s[29])/m
+        live = (s[21]+s[22]+s[23]+s[24]+s[25]+s[26]+s[27]+s[28]+s[29]+s[35]+s[36])/m
         printf "at_last_scrape_t=%s\n", s[1]
         printf "  cgroup   anon=%.1f file=%.1f threads=%s\n", s[4]/m, s[5]/m, s[20]
         printf "  glibc    arena=%.1f mmapped=%.1f in_use=%.1f free=%.1f\n", s[31]/m, s[32]/m, s[33]/m, s[34]/m
@@ -199,6 +204,12 @@ kill -0 "$SERVER_PID" 2>/dev/null && ALIVE=true
         printf "  live=%.1f instrument_header=%.1f anon/live=%.2f free/anon=%.2f\n", live, s[30]/m, s[4]/m/live, s[34]/s[4]
         printf "  gauges   memtable=%.1f wal_backlog=%.1f parts=%s rg_cache_gauge=%.1f ingest_live/memtable=%.2f\n", \
                s[10]/m, s[13]/m, s[14], s[17]/m, s[22]/(s[10]+1)
+        printf "  metrics  series_memtable=%.1f series_catalog=%.1f active_series=%s metric_parts=%s\n", \
+               s[35]/m, s[36]/m, s[37], s[38]
+        if (s[37]+0 > 0) {
+          printf "  per_series memtable=%.0fB catalog=%.0fB catalog_per_part=%.0fB anon=%.0fB\n", \
+                 s[35]/s[37], s[36]/s[37], (s[38]+0>0 ? s[36]/s[37]/s[38] : 0), s[4]/s[37]
+        }
       }
     }' "$OUT/mem.csv"
   echo "server_log_tail:"; sed 's/\x1b\[[0-9;]*m//g' "$SERVER_LOG" | tail -3
