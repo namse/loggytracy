@@ -47,6 +47,13 @@ memory behavior while that experimental path is being developed; treat it as
 disposable-only, use a fresh output/project, and do not compare its results to
 normal-mode artifacts.
 
+When the requirement is a specific target rather than the exact OOM boundary,
+set `--lower` and `--upper` to that same target. For example, the 10-million
+acceptance gate is:
+
+    compare/run_metric_capacity.sh --targets signy --probe \
+      --lower 10000000 --upper 10000000 --hold-seconds 1
+
 The search exponentially ramps candidates (lower, lower*ramp_factor, ...)
 until the first failing point, then binary-searches the bracket. A candidate
 passes only if the harness observed 100% series, request, and datapoint acceptance,
@@ -97,3 +104,28 @@ A one-shot burst also measures resident ingest capacity, not the number of
 historical series retained on disk. Mimir is included for ingest only; its
 query API is deliberately outside run_metrics.sh and this sweep. A result
 within the binary-search tolerance is an interval, not an exact threshold.
+
+## Signy raw-capacity probe (2026-08-31)
+
+Before reintroducing a production backpressure threshold, the disposable
+Signy-only probe was run with mimalloc, a 2 GiB Docker memory and memswap limit,
+and the same one-shot OTLP workload. `SIGNY_CAPACITY_PROBE=1` bypasses the
+application's metric cardinality, memtable, WAL-backlog, and in-flight-body
+guards; the cgroup remained the hard boundary.
+
+| requested series | accepted series | anon peak | result |
+|---:|---:|---:|---|
+| 2,000,000 | 2,000,013 | 1,793 MiB | pass |
+| 3,000,000 | 3,000,013 | 1,800 MiB | pass |
+| 3,500,000 | 3,500,013 | 1,987 MiB | pass |
+| 3,750,000 | 3,670,010 | 1,972 MiB | cgroup OOM |
+| 4,000,000 | 3,670,010 | 1,966 MiB | cgroup OOM |
+
+The measured raw boundary is therefore **3.5 million series, with an
+uncertainty of at most 250,000** for this workload and image. The accepted
+count in the failing trials is the last batch reached before the kernel killed
+the process, not a valid capacity. These numbers are an OOM boundary, not a
+safe production limit: flush/compaction overlap, allocator retention, query
+traffic, and a different label shape can move it substantially. The artifacts
+are under `compare/target/metric-capacity-probe-initial/`; use a fresh output
+directory for any changed image, memory limit, or workload.

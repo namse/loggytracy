@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -332,6 +333,100 @@ const SERIES_OVERHEAD_BYTES: u64 = 320;
 const SPILL_SAMPLE_BYTES: u64 = 16;
 const ADMITTED_SAMPLE_BYTES: u64 = 64;
 
+/// A handle into a tenant's sample-buffer arena.
+///
+/// `Option<NonZeroU32>` is four bytes, whereas `Option<u32>` is eight: the
+/// zero value is reserved for "no samples are buffered".  The arena only
+/// contains entries that currently have samples, so a flushed series does not
+/// retain three empty `Vec` headers and an empty Gorilla encoder in its index
+/// value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SeriesBufferId(NonZeroU32);
+
+/// State that must survive a successful flush for a series.
+///
+/// This is intentionally separate from [`SeriesBuffer`].  Most live series in
+/// a cardinality workload have already flushed their samples, but still need
+/// to remain discoverable in the active-series index.  Keeping the sample
+/// vectors inline made those historical identities pay for four empty dynamic
+/// containers each.
+#[derive(Default)]
+struct SeriesState {
+    buffer_id: Option<SeriesBufferId>,
+    admission_refs: u32,
+    flags: u8,
+    last_ts: i64,
+    admitted_ts: i64,
+    buffered_min: i64,
+    buffered_max: i64,
+    running_total: f64,
+}
+
+impl SeriesState {
+    const HAS_LAST_TS: u8 = 1;
+    const HAS_ADMITTED_TS: u8 = 2;
+    const HAS_BUFFERED: u8 = 4;
+    const HAS_RUNNING_TOTAL: u8 = 8;
+
+    fn last_ts(&self) -> Option<i64> {
+        (self.flags & Self::HAS_LAST_TS != 0).then_some(self.last_ts)
+    }
+
+    fn admitted_ts(&self) -> Option<i64> {
+        (self.flags & Self::HAS_ADMITTED_TS != 0).then_some(self.admitted_ts)
+    }
+
+    fn set_admitted_ts(&mut self, ts_ns: Option<i64>) {
+        if let Some(ts_ns) = ts_ns {
+            self.admitted_ts = ts_ns;
+            self.flags |= Self::HAS_ADMITTED_TS;
+        }
+    }
+
+    fn running_total(&self) -> Option<f64> {
+        (self.flags & Self::HAS_RUNNING_TOTAL != 0).then_some(self.running_total)
+    }
+
+    fn set_running_total(&mut self, total: f64) {
+        self.running_total = total;
+        self.flags |= Self::HAS_RUNNING_TOTAL;
+    }
+
+    fn bounds(&self) -> Option<(i64, i64)> {
+        (self.flags & Self::HAS_BUFFERED != 0).then_some((self.buffered_min, self.buffered_max))
+    }
+
+    fn take_bounds(&mut self) -> Option<(i64, i64)> {
+        let bounds = self.bounds();
+        self.flags &= !Self::HAS_BUFFERED;
+        bounds
+    }
+
+    fn observe(&mut self, ts_ns: i64) {
+        if let Some((min, max)) = self.bounds() {
+            self.buffered_min = min.min(ts_ns);
+            self.buffered_max = max.max(ts_ns);
+        } else {
+            self.buffered_min = ts_ns;
+            self.buffered_max = ts_ns;
+            self.flags |= Self::HAS_BUFFERED;
+        }
+    }
+
+    fn absorb(&mut self, bounds: Option<(i64, i64)>) {
+        if let Some((min, max)) = bounds {
+            self.observe(min);
+            self.observe(max);
+        }
+    }
+
+    fn clear_admitted_after_insert(&mut self) {
+        if self.admission_refs == 0 {
+            self.flags &= !Self::HAS_ADMITTED_TS;
+        }
+    }
+}
+
 struct SeriesBuffer {
     /// Chunks returned by aborted flushes, oldest first. Closed streams
     /// cannot be appended to, so they wait here for the next flush.
@@ -341,37 +436,6 @@ struct SeriesBuffer {
     /// one. The Gorilla stream is append-ordered; the flush merge-sorts this
     /// vector in.
     spill: Vec<(i64, f64)>,
-    last_ts: Option<i64>,
-    /// The newest timestamp this series was **admitted** for, set when the
-    /// slot is reserved and before any sample has reached the buffer.
-    ///
-    /// Admission and insert are not the same moment: `admit_datapoints`
-    /// reserves the slot under the cap, and the samples arrive later, when the
-    /// journal writer applies the record. A collected batch admits up to
-    /// `MAX_INFLIGHT_RECORDS` records before the first one settles, so that
-    /// gap is wide. Without this the eviction pass reads a reservation — no
-    /// samples, no `last_ts` — as a series nothing ever arrived for, evicts it,
-    /// and hands the slot it was holding to the next new series in the same
-    /// batch. The cap then does not hold: a batch admits more series than it
-    /// allows and reports fewer refusals than it made.
-    ///
-    /// `admission_refs` separately protects this empty state while one or more
-    /// journal appends are in flight, including old samples that would
-    /// otherwise look idle before they reach the writer.
-    admitted_ts: Option<i64>,
-    /// Number of in-flight journal appends that rely on this empty entry.
-    /// A later admission may observe an earlier reservation; keeping this
-    /// count prevents one append's rollback from removing the entry out from
-    /// under the later one.
-    admission_refs: usize,
-    /// The timestamps the *buffered* samples span, maintained on insert and
-    /// moved out with them at `begin_flush`. Discovery reads them to answer a
-    /// window without decoding a chunk, which is the whole reason those routes
-    /// can promise an exact answer cheaply.
-    buffered: Option<(i64, i64)>,
-    /// Delta-conversion state. Survives `begin_flush` deliberately — see the
-    /// module doc.
-    running_total: Option<f64>,
 }
 
 impl SeriesBuffer {
@@ -380,30 +444,48 @@ impl SeriesBuffer {
             closed: Vec::new(),
             open: gorilla::Encoder::new(),
             spill: Vec::new(),
-            last_ts: None,
-            admitted_ts: None,
-            admission_refs: 0,
-            buffered: None,
-            running_total: None,
         }
     }
 
     fn has_samples(&self) -> bool {
         !self.closed.is_empty() || !self.open.is_empty() || !self.spill.is_empty()
     }
+}
 
-    fn observe(&mut self, ts_ns: i64) {
-        self.buffered = Some(match self.buffered {
-            Some((min, max)) => (min.min(ts_ns), max.max(ts_ns)),
-            None => (ts_ns, ts_ns),
-        });
+/// Per-tenant index and sample arena.  The index's value is compact persistent
+/// state; only buffered series have an entry in `buffers`.
+#[derive(Default)]
+struct TenantSeries {
+    states: HashMap<SeriesLabels, SeriesState>,
+    buffers: HashMap<SeriesBufferId, SeriesBuffer>,
+    next_buffer_id: u32,
+}
+
+impl TenantSeries {
+    fn alloc_buffer(&mut self) -> SeriesBufferId {
+        // A process cannot have four billion simultaneously buffered series;
+        // still, skip zero and any live id so the handle remains valid if the
+        // counter wraps after a very long-running process.
+        let mut raw = self.next_buffer_id;
+        loop {
+            raw = raw.wrapping_add(1);
+            if raw == 0 {
+                continue;
+            }
+            let id = SeriesBufferId(NonZeroU32::new(raw).expect("non-zero buffer id"));
+            if !self.buffers.contains_key(&id) {
+                self.next_buffer_id = raw;
+                self.buffers.insert(id, SeriesBuffer::new());
+                return id;
+            }
+        }
     }
 
-    fn absorb(&mut self, bounds: Option<(i64, i64)>) {
-        if let Some((min, max)) = bounds {
-            self.observe(min);
-            self.observe(max);
-        }
+    fn has_samples(&self, state: &SeriesState) -> bool {
+        state
+            .buffer_id
+            .and_then(|id| self.buffers.get(&id))
+            .is_some_and(SeriesBuffer::has_samples)
     }
 }
 
@@ -463,7 +545,7 @@ impl SeriesSnapshot {
 }
 
 pub struct SeriesMemTable {
-    inner: RwLock<BTreeMap<TenantId, HashMap<SeriesLabels, SeriesBuffer>>>,
+    inner: RwLock<BTreeMap<TenantId, TenantSeries>>,
     flushing: RwLock<Option<Arc<SeriesSnapshot>>>,
     inner_bytes: AtomicU64,
     flushing_bytes: AtomicU64,
@@ -525,13 +607,13 @@ impl SeriesMemTable {
         let new_count = requested
             .iter()
             .map(|(tenant, labels)| {
-                let existing = inner.get(tenant).map_or(0, HashMap::len);
+                let existing = inner.get(tenant).map_or(0, |series| series.states.len());
                 labels
                     .iter()
                     .filter(|label| {
                         inner
                             .get(tenant)
-                            .is_none_or(|series| !series.contains_key(*label))
+                            .is_none_or(|series| !series.states.contains_key(*label))
                     })
                     .count()
                     .min(usize::MAX.saturating_sub(existing))
@@ -559,14 +641,16 @@ impl SeriesMemTable {
         for (tenant, labels) in &requested {
             let tenant_series = inner.entry(tenant.clone()).or_default();
             for label in labels {
-                if tenant_series.contains_key(label) {
+                if tenant_series.states.contains_key(label) {
                     continue;
                 }
-                let mut buffer = SeriesBuffer::new();
-                buffer.admitted_ts = requested_newest
-                    .get(&(tenant.clone(), label.clone()))
-                    .copied();
-                tenant_series.insert(label.clone().intern(), buffer);
+                let mut state = SeriesState::default();
+                state.set_admitted_ts(
+                    requested_newest
+                        .get(&(tenant.clone(), label.clone()))
+                        .copied(),
+                );
+                tenant_series.states.insert(label.clone().intern(), state);
                 self.counters
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -586,16 +670,16 @@ impl SeriesMemTable {
                 if !seen.insert(sample.labels.clone()) {
                     continue;
                 }
-                if let Some(buffer) = inner
+                if let Some(state) = inner
                     .get_mut(*tenant)
-                    .and_then(|series| series.get_mut(&sample.labels))
+                    .and_then(|series| series.states.get_mut(&sample.labels))
                 {
                     // Empty entries are reservations, including one made by
                     // a concurrent request. Hold a reference for this append
                     // so that the other request cannot roll the entry back
                     // while this append is still in flight.
-                    if !buffer.has_samples() {
-                        buffer.admission_refs = buffer.admission_refs.saturating_add(1);
+                    if state.buffer_id.is_none() {
+                        state.admission_refs = state.admission_refs.saturating_add(1);
                         reserved_series.push(((*tenant).clone(), sample.labels.clone()));
                     }
                 }
@@ -627,13 +711,13 @@ impl SeriesMemTable {
     fn commit_admission(&self, reserved_series: &[(TenantId, SeriesLabels)]) {
         let mut inner = self.inner.write();
         for (tenant, labels) in reserved_series {
-            let Some(buffer) = inner
+            let Some(state) = inner
                 .get_mut(tenant)
-                .and_then(|series| series.get_mut(labels))
+                .and_then(|series| series.states.get_mut(labels))
             else {
                 continue;
             };
-            buffer.admission_refs = buffer.admission_refs.saturating_sub(1);
+            state.admission_refs = state.admission_refs.saturating_sub(1);
         }
     }
 
@@ -645,14 +729,18 @@ impl SeriesMemTable {
             let Some(series) = inner.get_mut(tenant) else {
                 continue;
             };
-            let remove = if let Some(buffer) = series.get_mut(labels) {
-                buffer.admission_refs = buffer.admission_refs.saturating_sub(1);
-                !buffer.has_samples() && buffer.admission_refs == 0
+            let remove = if let Some(state) = series.states.get_mut(labels) {
+                state.admission_refs = state.admission_refs.saturating_sub(1);
+                state.buffer_id.is_none() && state.admission_refs == 0
             } else {
                 false
             };
             if remove {
-                series.remove(labels);
+                if let Some(state) = series.states.remove(labels)
+                    && let Some(id) = state.buffer_id
+                {
+                    series.buffers.remove(&id);
+                }
                 freed = freed.saturating_add(labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES);
                 removed += 1;
             }
@@ -708,11 +796,12 @@ impl SeriesMemTable {
             let mut new_labels: Vec<&SeriesLabels> = group
                 .iter()
                 .map(|sample| &sample.labels)
-                .filter(|labels| !tenant_series.contains_key(*labels))
+                .filter(|labels| !tenant_series.states.contains_key(*labels))
                 .collect();
             new_labels.sort();
             new_labels.dedup();
-            if !new_labels.is_empty() && tenant_series.len() + new_labels.len() > max_active {
+            if !new_labels.is_empty() && tenant_series.states.len() + new_labels.len() > max_active
+            {
                 // One eviction pass per export: a second would find nothing
                 // new, and the refusal below must not degrade into a scan per
                 // datapoint.
@@ -722,7 +811,7 @@ impl SeriesMemTable {
                         Self::evict_idle_locked(tenant_series, idle_cutoff_ns, &self.counters);
                     saturating_release(&self.inner_bytes, evicted);
                 }
-                if tenant_series.len() + new_labels.len() > max_active {
+                if tenant_series.states.len() + new_labels.len() > max_active {
                     outcome.rejected_datapoints += 1;
                     outcome.rejected_samples += group.len() as u64;
                     outcome.rejected_new_series += new_labels.len() as u64;
@@ -743,9 +832,11 @@ impl SeriesMemTable {
             let mut reserved = 0u64;
             for labels in new_labels {
                 reserved += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
-                let mut buffer = SeriesBuffer::new();
-                buffer.admitted_ts = newest;
-                tenant_series.insert((*labels).clone().intern(), buffer);
+                let mut state = SeriesState::default();
+                state.set_admitted_ts(newest);
+                tenant_series
+                    .states
+                    .insert((*labels).clone().intern(), state);
                 self.counters
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -769,34 +860,44 @@ impl SeriesMemTable {
         let mut evicted = 0u64;
         let mut freed = 0u64;
         for tenant_series in inner.values_mut() {
-            let before = tenant_series.len() as u64;
+            let before = tenant_series.states.len() as u64;
             freed += Self::evict_idle_locked(tenant_series, idle_cutoff_ns, &self.counters);
-            evicted += before - tenant_series.len() as u64;
+            evicted += before - tenant_series.states.len() as u64;
         }
         saturating_release(&self.inner_bytes, freed);
         evicted
     }
 
     fn evict_idle_locked(
-        tenant_series: &mut HashMap<SeriesLabels, SeriesBuffer>,
+        tenant_series: &mut TenantSeries,
         idle_cutoff_ns: i64,
         counters: &SeriesCounters,
     ) -> u64 {
         let mut freed = 0u64;
         let mut evicted = 0u64;
-        tenant_series.retain(|labels, buffer| {
-            let idle = !buffer.has_samples()
-                && buffer.last_ts.is_none_or(|last| last < idle_cutoff_ns)
-                && buffer
-                    .admitted_ts
-                    .is_none_or(|admitted| admitted < idle_cutoff_ns)
-                && buffer.admission_refs == 0;
-            if idle {
-                freed += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
-                evicted += 1;
+        let idle: Vec<(SeriesLabels, Option<SeriesBufferId>)> = tenant_series
+            .states
+            .iter()
+            .filter_map(|(labels, state)| {
+                let has_samples = tenant_series.has_samples(state);
+                let idle = !has_samples
+                    && state.last_ts().is_none_or(|last| last < idle_cutoff_ns)
+                    && state
+                        .admitted_ts()
+                        .is_none_or(|admitted| admitted < idle_cutoff_ns)
+                    && state.admission_refs == 0;
+                idle.then(|| (labels.clone(), state.buffer_id))
+            })
+            .collect();
+        for (labels, buffer_id) in idle {
+            if let Some(state) = tenant_series.states.remove(&labels)
+                && let Some(id) = state.buffer_id.or(buffer_id)
+            {
+                tenant_series.buffers.remove(&id);
             }
-            !idle
-        });
+            freed += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+            evicted += 1;
+        }
         counters
             .series_evicted_idle_total
             .fetch_add(evicted, Ordering::Relaxed);
@@ -817,43 +918,85 @@ impl SeriesMemTable {
         let mut added = 0u64;
         let mut inner = self.inner.write();
         for sample in samples {
-            let tenant_series = inner.entry(sample.tenant).or_default();
-            let buffer = match tenant_series.get_mut(&sample.labels) {
-                Some(buffer) => buffer,
-                None => {
-                    // Reached by replay, whose WAL was already filtered by
-                    // admission; live ingest reserves its entries in
-                    // `admit_request` and lands here on the Some arm unless
-                    // another request rolled an uncommitted reservation back
-                    // after this request was admitted.
-                    added += sample.labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
-                    self.counters
-                        .series_created_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.counters.active_series.fetch_add(1, Ordering::Relaxed);
-                    tenant_series
-                        .entry(sample.labels.clone().intern())
-                        .or_insert_with(SeriesBuffer::new)
+            let MetricSample {
+                tenant,
+                labels,
+                ts_ns,
+                value: raw_value,
+                kind,
+                ..
+            } = sample;
+            let tenant_series = inner.entry(tenant).or_default();
+            if !tenant_series.states.contains_key(&labels) {
+                // Reached by replay, whose WAL was already filtered by
+                // admission; live ingest reserves its entries in
+                // `admit_request` and lands here on the existing state arm
+                // unless another request rolled an uncommitted reservation
+                // back after this request was admitted.
+                added += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                self.counters
+                    .series_created_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.active_series.fetch_add(1, Ordering::Relaxed);
+                tenant_series
+                    .states
+                    .insert(labels.clone().intern(), SeriesState::default());
+            }
+            let buffer_id = if let Some(id) = tenant_series
+                .states
+                .get(&labels)
+                .and_then(|state| state.buffer_id)
+            {
+                id
+            } else {
+                let id = tenant_series.alloc_buffer();
+                tenant_series
+                    .states
+                    .get_mut(&labels)
+                    .expect("series state inserted before buffer")
+                    .buffer_id = Some(id);
+                id
+            };
+            let value = {
+                let state = tenant_series
+                    .states
+                    .get_mut(&labels)
+                    .expect("series state exists for every sample");
+                match kind {
+                    SampleKind::Gauge | SampleKind::Cumulative => raw_value,
+                    SampleKind::Delta => {
+                        let total = state.running_total().unwrap_or(0.0) + raw_value;
+                        state.set_running_total(total);
+                        total
+                    }
                 }
             };
-            let value = match sample.kind {
-                SampleKind::Gauge | SampleKind::Cumulative => sample.value,
-                SampleKind::Delta => {
-                    let total = buffer.running_total.unwrap_or(0.0) + sample.value;
-                    buffer.running_total = Some(total);
-                    total
-                }
-            };
-            if buffer.last_ts.is_some_and(|last| sample.ts_ns < last) {
-                buffer.spill.push((sample.ts_ns, value));
+            let last_ts = tenant_series
+                .states
+                .get(&labels)
+                .and_then(SeriesState::last_ts);
+            let buffer = tenant_series
+                .buffers
+                .get_mut(&buffer_id)
+                .expect("series state points at its sample buffer");
+            if last_ts.is_some_and(|last| ts_ns < last) {
+                buffer.spill.push((ts_ns, value));
                 added += SPILL_SAMPLE_BYTES;
             } else {
                 let before = buffer.open.byte_len();
-                buffer.open.append(sample.ts_ns, value);
+                buffer.open.append(ts_ns, value);
                 added += (buffer.open.byte_len() - before) as u64;
-                buffer.last_ts = Some(sample.ts_ns);
             }
-            buffer.observe(sample.ts_ns);
+            let state = tenant_series
+                .states
+                .get_mut(&labels)
+                .expect("series state exists for every sample");
+            if last_ts.is_none_or(|last| ts_ns >= last) {
+                state.last_ts = ts_ns;
+                state.flags |= SeriesState::HAS_LAST_TS;
+            }
+            state.clear_admitted_after_insert();
+            state.observe(ts_ns);
         }
         drop(inner);
         self.inner_bytes.fetch_add(added, Ordering::Relaxed);
@@ -870,8 +1013,16 @@ impl SeriesMemTable {
         let mut moved = 0u64;
         for (tenant, series_map) in inner.iter_mut() {
             let mut list = Vec::new();
-            for (labels, buffer) in series_map.iter_mut() {
+            for (labels, state) in series_map.states.iter_mut() {
+                let Some(buffer_id) = state.buffer_id else {
+                    continue;
+                };
+                let Some(mut buffer) = series_map.buffers.remove(&buffer_id) else {
+                    state.buffer_id = None;
+                    continue;
+                };
                 if !buffer.has_samples() {
+                    state.buffer_id = None;
                     continue;
                 }
                 let mut chunks = std::mem::take(&mut buffer.closed);
@@ -882,11 +1033,12 @@ impl SeriesMemTable {
                 let spill = std::mem::take(&mut buffer.spill);
                 moved += chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>()
                     + spill.len() as u64 * SPILL_SAMPLE_BYTES;
+                state.buffer_id = None;
                 list.push(SnapshotSeries {
                     labels: labels.clone(),
                     chunks,
                     spill,
-                    bounds: buffer.buffered.take(),
+                    bounds: state.take_bounds(),
                 });
             }
             if !list.is_empty() {
@@ -931,12 +1083,31 @@ impl SeriesMemTable {
         for (tenant, list) in snapshot.tenants {
             let tenant_series = inner.entry(tenant).or_default();
             for series in list {
-                if !tenant_series.contains_key(&series.labels) {
+                if !tenant_series.states.contains_key(&series.labels) {
                     restored_state += series.labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                    tenant_series
+                        .states
+                        .insert(series.labels.clone().intern(), SeriesState::default());
                 }
+                let buffer_id = if let Some(id) = tenant_series
+                    .states
+                    .get(&series.labels)
+                    .and_then(|state| state.buffer_id)
+                {
+                    id
+                } else {
+                    let id = tenant_series.alloc_buffer();
+                    tenant_series
+                        .states
+                        .get_mut(&series.labels)
+                        .expect("series state inserted before buffer")
+                        .buffer_id = Some(id);
+                    id
+                };
                 let buffer = tenant_series
-                    .entry(series.labels.intern())
-                    .or_insert_with(SeriesBuffer::new);
+                    .buffers
+                    .get_mut(&buffer_id)
+                    .expect("series state points at its sample buffer");
                 // The snapshot's samples are older than anything inserted
                 // since, so its chunks go to the front and its spill stays
                 // spill.
@@ -944,7 +1115,11 @@ impl SeriesMemTable {
                 chunks.append(&mut buffer.closed);
                 buffer.closed = chunks;
                 buffer.spill.extend(series.spill);
-                buffer.absorb(series.bounds);
+                tenant_series
+                    .states
+                    .get_mut(&series.labels)
+                    .expect("series state exists for aborted snapshot")
+                    .absorb(series.bounds);
             }
         }
         drop(inner);
@@ -954,11 +1129,12 @@ impl SeriesMemTable {
     }
 
     pub fn is_empty(&self) -> bool {
-        let has_inner = self
-            .inner
-            .read()
-            .values()
-            .any(|series| series.values().any(SeriesBuffer::has_samples));
+        let has_inner = self.inner.read().values().any(|series| {
+            series
+                .states
+                .values()
+                .any(|state| series.has_samples(state))
+        });
         if has_inner {
             return false;
         }
@@ -975,7 +1151,12 @@ impl SeriesMemTable {
         let flushing = self.flushing.read();
         let mut tenants: BTreeSet<TenantId> = inner
             .iter()
-            .filter(|(_, series)| series.values().any(SeriesBuffer::has_samples))
+            .filter(|(_, series)| {
+                series
+                    .states
+                    .values()
+                    .any(|state| series.has_samples(state))
+            })
             .map(|(tenant, _)| tenant.clone())
             .collect();
         if let Some(snapshot) = flushing.as_ref() {
@@ -996,7 +1177,7 @@ impl SeriesMemTable {
         self.inner
             .read()
             .get(tenant)
-            .map(|series| series.len())
+            .map(|series| series.states.len())
             .unwrap_or(0)
     }
 
@@ -1007,7 +1188,7 @@ impl SeriesMemTable {
         self.inner
             .read()
             .get(tenant)
-            .map(|series| series.keys().cloned().collect())
+            .map(|series| series.states.keys().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -1033,8 +1214,8 @@ impl SeriesMemTable {
             }
         }
         if let Some(series) = self.inner.read().get(tenant) {
-            for (key, buffer) in series {
-                if buffer.has_samples() && ranges_overlap(buffer.buffered, start_ns, end_ns) {
+            for (key, state) in &series.states {
+                if series.has_samples(state) && ranges_overlap(state.bounds(), start_ns, end_ns) {
                     labels.insert(key.clone());
                 }
             }
@@ -1064,7 +1245,11 @@ impl SeriesMemTable {
             }
         }
         let inner = self.inner.read();
-        if let Some(buffer) = inner.get(tenant).and_then(|series| series.get(labels)) {
+        if let Some(series) = inner.get(tenant)
+            && let Some(state) = series.states.get(labels)
+            && let Some(buffer_id) = state.buffer_id
+            && let Some(buffer) = series.buffers.get(&buffer_id)
+        {
             for chunk in &buffer.closed {
                 samples.extend(gorilla::decode_all(chunk)?);
             }
@@ -1101,7 +1286,13 @@ impl SeriesMemTable {
         }
         let inner = self.inner.read();
         if let Some(series_map) = inner.get(tenant) {
-            for (labels, buffer) in series_map {
+            for (labels, state) in &series_map.states {
+                let Some(buffer_id) = state.buffer_id else {
+                    continue;
+                };
+                let Some(buffer) = series_map.buffers.get(&buffer_id) else {
+                    continue;
+                };
                 if !buffer.has_samples() {
                     continue;
                 }
@@ -1172,6 +1363,18 @@ mod tests {
             kind,
             datapoint_index: 0,
         }
+    }
+
+    #[test]
+    fn flushed_series_state_does_not_inline_sample_storage() {
+        assert!(
+            std::mem::size_of::<SeriesState>() < std::mem::size_of::<SeriesBuffer>(),
+            "persistent series state must stay smaller than the sample buffer"
+        );
+        assert!(
+            std::mem::size_of::<SeriesState>() <= 64,
+            "series index values are expected to remain compact"
+        );
     }
 
     #[test]
