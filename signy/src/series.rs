@@ -322,11 +322,39 @@ pub struct SeriesMemoryStats {
     pub flushing_tenants: usize,
 }
 
-// The old 160-byte estimate omitted allocator/container overhead.  The M10
-// attribution measured roughly 1.7x the estimate, so reserve a conservative
-// 320 bytes per live entry.  This is deliberately a byte charge, not a
-// cardinality proxy: labels still contribute their actual canonical length.
-const SERIES_OVERHEAD_BYTES: u64 = 320;
+/// What one row of a hash table costs, entry plus hashbrown's control byte.
+/// Taken from the types rather than written down, so a field added to
+/// `SeriesState` cannot quietly stop being charged.
+const STATE_ENTRY_BYTES: u64 = (std::mem::size_of::<(SeriesLabels, SeriesState)>() + 1) as u64;
+const BUFFER_ENTRY_BYTES: u64 =
+    (std::mem::size_of::<(SeriesBufferId, SeriesBufferStorage)>() + 1) as u64;
+const RESERVATION_ENTRY_BYTES: u64 =
+    (std::mem::size_of::<(SeriesLabels, ReservationState)>() + 1) as u64;
+
+/// The table behind `capacity` usable slots. hashbrown keeps one eighth of its
+/// buckets free, so a table with room for `capacity` entries allocated
+/// `capacity * 8 / 7` of them.
+fn table_bytes(capacity: usize, entry_bytes: u64) -> u64 {
+    (capacity as u64)
+        .saturating_mul(8)
+        .div_ceil(7)
+        .saturating_mul(entry_bytes)
+}
+
+/// The bytes an allocator hands out for one canonical label: the `Arc`'s two
+/// reference counts plus the payload, rounded up to eight-byte granularity.
+///
+/// The charge used to be `byte_len()` plus a flat 320, a number derived in M10
+/// from a memtable that inlined sample vectors in every index value and shared
+/// its label allocations with part catalogs. Neither is true any more — the
+/// state is 24 bytes, a flushed series is retired outright, and a mapped
+/// catalog owns nothing — so the constant had become a guess about a shape
+/// that no longer exists. What replaces it is arithmetic: this for the
+/// payload, [`table_bytes`] over the maps' own `capacity()` for the
+/// containers.
+fn label_alloc_bytes(byte_len: usize) -> u64 {
+    (byte_len as u64).saturating_add(16).next_multiple_of(8)
+}
 const SPILL_SAMPLE_BYTES: u64 = 16;
 const ADMITTED_SAMPLE_BYTES: u64 = 64;
 /// The temporary accounting charge for a series whose only buffered sample
@@ -1060,10 +1088,8 @@ impl SeriesMemTable {
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
                 self.counters.active_series.fetch_add(1, Ordering::Relaxed);
-                self.inner_bytes.fetch_add(
-                    label.byte_len() as u64 + SERIES_OVERHEAD_BYTES,
-                    Ordering::Relaxed,
-                );
+                self.inner_bytes
+                    .fetch_add(label_alloc_bytes(label.byte_len()), Ordering::Relaxed);
             }
         }
 
@@ -1169,7 +1195,7 @@ impl SeriesMemTable {
                 .is_some_and(|state| state.buffer_id.is_none() && refs == 0);
             if remove_state {
                 series.states.remove(labels);
-                freed = freed.saturating_add(labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES);
+                freed = freed.saturating_add(label_alloc_bytes(labels.byte_len()));
                 removed += 1;
             }
             if refs == 0 && (state_has_buffer || remove_state) {
@@ -1262,7 +1288,7 @@ impl SeriesMemTable {
             let newest = group.iter().map(|sample| sample.ts_ns).max();
             let mut reserved = 0u64;
             for labels in new_labels {
-                reserved += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                reserved += label_alloc_bytes(labels.byte_len());
                 tenant_series
                     .states
                     .insert((*labels).clone(), SeriesState::default());
@@ -1330,7 +1356,7 @@ impl SeriesMemTable {
                 tenant_series.buffers.remove(&id);
             }
             tenant_series.reservations.remove(&labels);
-            freed += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+            freed += label_alloc_bytes(labels.byte_len());
             evicted += 1;
         }
         counters
@@ -1368,7 +1394,7 @@ impl SeriesMemTable {
                 // `admit_request` and lands here on the existing state arm
                 // unless another request rolled an uncommitted reservation
                 // back after this request was admitted.
-                added += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                added += label_alloc_bytes(labels.byte_len());
                 self.counters
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -1578,7 +1604,7 @@ impl SeriesMemTable {
                 {
                     tenant_series.buffers.remove(&id);
                 }
-                freed += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                freed += label_alloc_bytes(labels.byte_len());
                 retired += 1;
             }
             tenant_series.states.shrink_slack();
@@ -1612,7 +1638,7 @@ impl SeriesMemTable {
             let tenant_series = inner.entry(tenant).or_default();
             for series in list {
                 if !tenant_series.states.contains_key(&series.labels) {
-                    restored_state += series.labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                    restored_state += label_alloc_bytes(series.labels.byte_len());
                     tenant_series
                         .states
                         .insert(series.labels.clone(), SeriesState::default());
@@ -1704,10 +1730,32 @@ impl SeriesMemTable {
         tenants
     }
 
+    /// What the metric memtable holds, as the admission gate sees it: the
+    /// payload it was handed plus the tables it is holding that payload in.
+    ///
+    /// The container half is read from the maps rather than accumulated
+    /// alongside them. A counter has to be right at every call site and stays
+    /// wrong once it drifts; `capacity()` cannot drift, and it makes the two
+    /// discontinuities that actually move memory — a rehash doubling a shard,
+    /// a retirement handing one back — visible to the gate at the instant
+    /// they happen.
     pub fn approximate_size(&self) -> usize {
         self.inner_bytes
             .load(Ordering::Relaxed)
-            .saturating_add(self.flushing_bytes.load(Ordering::Relaxed)) as usize
+            .saturating_add(self.flushing_bytes.load(Ordering::Relaxed))
+            .saturating_add(self.container_bytes()) as usize
+    }
+
+    fn container_bytes(&self) -> u64 {
+        self.inner.read().values().fold(0u64, |total, tenant| {
+            total
+                .saturating_add(table_bytes(tenant.states.capacity(), STATE_ENTRY_BYTES))
+                .saturating_add(table_bytes(tenant.buffers.capacity(), BUFFER_ENTRY_BYTES))
+                .saturating_add(table_bytes(
+                    tenant.reservations.capacity(),
+                    RESERVATION_ENTRY_BYTES,
+                ))
+        })
     }
 
     /// Live series for a tenant — entries whose state is held, flushed or
@@ -1885,6 +1933,15 @@ mod tests {
         ])
     }
 
+    /// What the gate is charged for, minus the tables it is charged for
+    /// holding. These tests are about the payload half — that a charge lands
+    /// on insert, moves with a flush and comes back on an abort — and the
+    /// container half moves with `HashMap::capacity()`, which is the subject
+    /// of its own test rather than of every one of these.
+    fn payload_bytes(memtable: &SeriesMemTable) -> usize {
+        memtable.approximate_size() - memtable.container_bytes() as usize
+    }
+
     fn sample(labels: &SeriesLabels, ts: i64, value: f64, kind: SampleKind) -> MetricSample {
         MetricSample {
             tenant: test_tenant(),
@@ -1989,7 +2046,7 @@ mod tests {
             sorted.get(&series).unwrap(),
             &vec![(100, 1.0), (150, 9.0), (200, 2.0), (200, 3.0)]
         );
-        assert!(memtable.approximate_size() > 0);
+        assert!(payload_bytes(&memtable) > 0);
     }
 
     #[test]
@@ -2015,8 +2072,8 @@ mod tests {
             ));
         }
         assert_eq!(
-            memtable.approximate_size(),
-            series.byte_len() + SERIES_OVERHEAD_BYTES as usize + INLINE_SAMPLE_BYTES as usize
+            payload_bytes(&memtable),
+            label_alloc_bytes(series.byte_len()) as usize + INLINE_SAMPLE_BYTES as usize
         );
 
         memtable.insert(vec![sample(&series, 200, 2.0, SampleKind::Gauge)]);
@@ -2107,7 +2164,7 @@ mod tests {
         let memtable = SeriesMemTable::new();
         let series = labels("queue_depth", "flush-inline");
         memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
-        let state_bytes = series.byte_len() + SERIES_OVERHEAD_BYTES as usize;
+        let state_bytes = label_alloc_bytes(series.byte_len()) as usize;
 
         let snapshot = memtable.begin_flush();
         let flushed = &snapshot.tenants[&test_tenant()][0];
@@ -2117,11 +2174,11 @@ mod tests {
         );
         assert!(flushed.spill.is_empty());
         assert_eq!(
-            memtable.approximate_size(),
+            payload_bytes(&memtable),
             state_bytes + flushed.chunks[0].len()
         );
         memtable.commit_flush();
-        assert_eq!(memtable.approximate_size(), state_bytes);
+        assert_eq!(payload_bytes(&memtable), state_bytes);
     }
 
     #[test]
@@ -2129,10 +2186,10 @@ mod tests {
         let memtable = SeriesMemTable::new();
         let series = labels("queue_depth", "abort-inline");
         memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
-        let state_bytes = series.byte_len() + SERIES_OVERHEAD_BYTES as usize;
+        let state_bytes = label_alloc_bytes(series.byte_len()) as usize;
         let snapshot = memtable.begin_flush();
         memtable.insert(vec![sample(&series, 200, 2.0, SampleKind::Gauge)]);
-        assert_eq!(memtable.approximate_size(), state_bytes + 20 + 16);
+        assert_eq!(payload_bytes(&memtable), state_bytes + 20 + 16);
 
         {
             let inner = memtable.inner.read();
@@ -2154,7 +2211,7 @@ mod tests {
         memtable.abort_flush(snapshot);
         // The snapshot's 20-byte chunk and the concurrent inline sample are
         // now one stream (20-byte closed chunk + 20-byte open chunk).
-        assert_eq!(memtable.approximate_size(), state_bytes + 40);
+        assert_eq!(payload_bytes(&memtable), state_bytes + 40);
         let inner = memtable.inner.read();
         let tenant_series = inner.get(&test_tenant()).expect("tenant was inserted");
         let state = tenant_series
@@ -2381,30 +2438,30 @@ mod tests {
     fn size_accounting_moves_with_the_flush_and_back_on_abort() {
         let memtable = SeriesMemTable::new();
         let series = labels("queue_depth", "a");
-        let state_bytes = series.byte_len() + SERIES_OVERHEAD_BYTES as usize;
+        let state_bytes = label_alloc_bytes(series.byte_len()) as usize;
         memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
-        let before = memtable.approximate_size();
+        let before = payload_bytes(&memtable);
         assert_eq!(before, state_bytes + INLINE_SAMPLE_BYTES as usize);
         let snapshot = memtable.begin_flush();
         assert_eq!(
-            memtable.approximate_size(),
+            payload_bytes(&memtable),
             state_bytes + snapshot.tenants[&test_tenant()][0].chunks[0].len(),
             "begin_flush moves the sample charge to flushing"
         );
         memtable.abort_flush(snapshot);
         assert_eq!(
-            memtable.approximate_size(),
+            payload_bytes(&memtable),
             state_bytes + INLINE_SAMPLE_BYTES as usize,
             "abort_flush restores exactly the inline sample charge"
         );
         let second = memtable.begin_flush();
         assert_eq!(
-            memtable.approximate_size(),
+            payload_bytes(&memtable),
             state_bytes + second.tenants[&test_tenant()][0].chunks[0].len(),
             "a second begin_flush does not duplicate bytes"
         );
         memtable.commit_flush();
-        assert_eq!(memtable.approximate_size(), state_bytes);
+        assert_eq!(payload_bytes(&memtable), state_bytes);
     }
 
     fn indexed(
@@ -2515,6 +2572,71 @@ mod tests {
     }
 
     #[test]
+    fn a_label_is_charged_for_the_allocation_it_needs_not_its_length() {
+        // Two reference counts and eight-byte granularity. Charging
+        // `byte_len()` alone under-charged every series by at least the
+        // header, which at ten million series is a hundred and sixty
+        // megabytes the gate could not see.
+        assert_eq!(label_alloc_bytes(0), 16);
+        assert_eq!(label_alloc_bytes(100), 120);
+        assert_eq!(label_alloc_bytes(104), 120);
+        assert_eq!(label_alloc_bytes(105), 128);
+    }
+
+    #[test]
+    fn the_container_charge_follows_the_tables_rather_than_a_constant() {
+        let memtable = SeriesMemTable::new();
+        assert_eq!(
+            memtable.container_bytes(),
+            0,
+            "an empty table costs nothing"
+        );
+
+        let burst: Vec<MetricSample> = (0..8_000)
+            .map(|index| {
+                sample(
+                    &labels("queue_depth", &format!("charge-{index}")),
+                    100,
+                    1.0,
+                    SampleKind::Gauge,
+                )
+            })
+            .collect();
+        memtable.insert(burst);
+        let grown = memtable.container_bytes();
+        let stats = memtable.memory_stats();
+        assert_eq!(
+            grown,
+            table_bytes(stats.states_capacity, STATE_ENTRY_BYTES)
+                + table_bytes(stats.buffers_capacity, BUFFER_ENTRY_BYTES)
+                + memtable
+                    .inner
+                    .read()
+                    .values()
+                    .map(|tenant| table_bytes(
+                        tenant.reservations.capacity(),
+                        RESERVATION_ENTRY_BYTES
+                    ))
+                    .sum::<u64>(),
+            "the charge is the tables' own capacity, not an estimate of it"
+        );
+        assert!(
+            memtable.approximate_size() as u64 > grown,
+            "and it is charged on top of the payload, not instead of it"
+        );
+
+        let snapshot = memtable.begin_flush();
+        memtable.commit_flush();
+        assert_eq!(memtable.retire_flushed(&snapshot), 8_000);
+        assert!(
+            memtable.container_bytes() * 4 < grown,
+            "a retirement that hands the table back has to show in the gate: \
+             {} against {grown}",
+            memtable.container_bytes()
+        );
+    }
+
+    #[test]
     fn a_flushed_gauge_leaves_the_index_and_takes_its_charge_with_it() {
         let memtable = SeriesMemTable::new();
         let series = labels("queue_depth", "retired");
@@ -2532,7 +2654,7 @@ mod tests {
         assert_eq!(memtable.active_series(&test_tenant()), 0);
         assert!(memtable.series_labels(&test_tenant()).is_empty());
         assert_eq!(
-            memtable.approximate_size(),
+            payload_bytes(&memtable),
             0,
             "the charge leaves with the entry, exactly as the idle sweep's does"
         );
@@ -2639,18 +2761,18 @@ mod tests {
     fn a_retired_series_that_reports_again_is_charged_exactly_once() {
         let memtable = SeriesMemTable::new();
         let series = labels("queue_depth", "returning");
-        let state_bytes = (series.byte_len() + SERIES_OVERHEAD_BYTES as usize) as u64;
+        let state_bytes = (label_alloc_bytes(series.byte_len()) as usize) as u64;
 
         memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
         let snapshot = memtable.begin_flush();
         memtable.commit_flush();
         memtable.retire_flushed(&snapshot);
-        assert_eq!(memtable.approximate_size(), 0);
+        assert_eq!(payload_bytes(&memtable), 0);
 
         memtable.insert(vec![sample(&series, 200, 2.0, SampleKind::Gauge)]);
         assert_eq!(memtable.active_series(&test_tenant()), 1);
         assert_eq!(
-            memtable.approximate_size() as u64,
+            payload_bytes(&memtable) as u64,
             state_bytes + INLINE_SAMPLE_BYTES,
             "the returning series is a new entry and is charged like one"
         );
@@ -2703,7 +2825,7 @@ mod tests {
             0,
             "a journal enqueue failure must not leave a phantom series"
         );
-        assert_eq!(memtable.approximate_size(), 0);
+        assert_eq!(payload_bytes(&memtable), 0);
     }
 
     #[test]
@@ -2726,11 +2848,11 @@ mod tests {
         // empty reservation. Its rollback must release only its own ref.
         drop(first);
         assert_eq!(memtable.active_series(&tenant), 1);
-        assert!(memtable.approximate_size() > 0);
+        assert!(payload_bytes(&memtable) > 0);
 
         drop(second);
         assert_eq!(memtable.active_series(&tenant), 0);
-        assert_eq!(memtable.approximate_size(), 0);
+        assert_eq!(payload_bytes(&memtable), 0);
     }
 
     #[test]
@@ -2812,7 +2934,7 @@ positive-delta sum is defined to absorb"
         // The flush then fails and puts the samples back.
         memtable.abort_flush(snapshot);
         assert_eq!(memtable.active_series(&test_tenant()), 1);
-        let after_abort = memtable.approximate_size();
+        let after_abort = payload_bytes(&memtable);
         assert!(after_abort > 0);
 
         // Flushing and evicting for real must not take the accounting below
@@ -2821,7 +2943,7 @@ positive-delta sum is defined to absorb"
         memtable.commit_flush();
         assert_eq!(memtable.evict_idle(i64::MAX), 1);
         assert_eq!(
-            memtable.approximate_size(),
+            payload_bytes(&memtable),
             0,
             "every byte added has been released exactly once"
         );

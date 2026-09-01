@@ -507,10 +507,14 @@ fn derive_defaults_from_budget(defaults: &mut Config, budget_bytes: u64) {
     defaults.row_group_cache_max_bytes = Some((budget_bytes / 8).max(16 * MIB));
     defaults.sidecar_cache_max_bytes = Some((budget_bytes / 10).max(32 * MIB));
     // A quarter of the declared budget is the shared log/trace/metric
-    // memtable ceiling. The metric admission path charges conservative
-    // resident bytes, including the measured series-state overhead, so this
-    // is a real refusal boundary rather than a series-count proxy. Streaming
-    // flush and merge keep their transients in their own bounded workers.
+    // memtable ceiling. The metric side charges what it actually holds — the
+    // label allocations and sample bytes it was handed, plus the tables it
+    // holds them in, read from those tables' own capacity — so this is a real
+    // refusal boundary rather than a series-count proxy. Note what it now
+    // bounds: a flushed series is retired outright, so this is the flush
+    // window's working set and not the tenant's cardinality, which lives in
+    // the mapped part catalogs. Streaming flush and merge keep their
+    // transients in their own bounded workers.
     defaults.max_memtable_bytes = Some((budget_bytes / 4).max(32 * MIB));
     // In-flight bodies are not in the 87.5% above: they were outside the
     // accounting entirely until this bound existed, and the attribution
