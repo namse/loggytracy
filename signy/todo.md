@@ -199,9 +199,13 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
 - [ ] **Compactor tier constants are constants, not knobs** (8 parts per tier, ~16 MiB / ~256 MiB
       promotion), until a load run says otherwise. If the bed's object-store counts or query fan-in blame
       the tiers, that measurement is the reason to promote them to configuration — not before.
-- [ ] **Exponential histograms are downscaled to ≤ 64 `le` buckets at ingest** (decided with the user,
-      2026-08-26). Lossy and irreversible for stored data; native storage is the recorded future work if
-      fn0 ever needs tighter tail quantiles than bucket boundaries give.
+- [x] **Exponential histograms are downscaled to ≤ 64 finite boundaries at ingest** (decided with the
+      user, 2026-08-26). Lossy and irreversible for stored data, and it stays that way: what changed on
+      2026-09-01 is that the cap no longer bounds *cardinality*. A histogram is stored as one series
+      carrying its bucket vector, with `_bucket{le=}`, `_sum` and `_count` synthesized on read, so
+      sixty-four boundaries are a schema inside one identity rather than sixty-seven of them. Issue #12.
+      Native *resolution* — keeping the exponential representation rather than boundary-limited
+      buckets — remains the recorded future work if fn0 ever needs tighter tail quantiles.
 - [ ] **OTLP exemplars are dropped** at the decomposition, documented in `QUERY_API.md` when Phase 7
       writes it.
 - [ ] **Retention stays per-tenant, not per-signal.** Metrics reuse the tenant's single period via a
@@ -268,10 +272,20 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
       `__name__` could binary search rather than scan. Both matter more now that the mapping made time
       the limiter rather than memory.
 
-- [ ] **Native histogram storage is filed as issue #12.** One exponential histogram costs up to 67
-      series today (`bounds + 3`, downscaled to 64 finite boundaries), which against the `$1` plan's
-      500-active-series line is 13% of a project's allowance for one instrument. Every optimization
-      above makes *one series* cheaper; this is the only lever that changes the *number* of them.
+- [x] **Native histogram storage, issue #12, done 2026-09-01.** One exponential histogram cost up to 67
+      series (`bounds + 3`, downscaled to 64 finite boundaries) — 13% of a `$1` project's whole
+      500-series allowance for one instrument. It is one series now, and the names it used to be are
+      synthesized on read so the API contract and the VictoriaMetrics comparison are untouched.
+
+      Two things fell out that were not the point. The rescale churn is gone: a widening range used to
+      change every boundary and therefore mint a fresh set of 67 identities, abandoning the old ones to
+      the catalogs for the whole retention window, and is now a new run inside the same series' chunk.
+      And the sample cap `MAX_OTLP_METRIC_SAMPLES` now bounds datapoints rather than resolution.
+
+      The encoding is the part that could have gone wrong. Counts written plainly are eight bytes a
+      bucket a point — at 64 buckets, five times what the Gorilla fan-out paid — so a chunk delta-codes
+      each bucket against the point before it and writes the boundary schema once per run. Measured at
+      **79 bytes a point** for a 64-bucket histogram over a hundred scrapes.
 
 - [x] **The value disagreement is diagnosed, and it is two unrelated things.** The published run's
       per-answer records settled it (`docs/artifacts/m14/metric-matrix_*.json`, 2026-08-27); every

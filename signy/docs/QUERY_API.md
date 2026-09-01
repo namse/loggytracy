@@ -349,8 +349,13 @@ curl -sH 'X-Tenant-Id: acme' --get \
 ```
 
 What ingest already decided, visible on this surface: exponential OTLP
-histograms are downscaled to at most 64 `le` buckets at ingest (quantile
-precision is boundary-limited, like any bucketed histogram); OTLP summaries
+histograms are downscaled to at most 64 finite bucket boundaries at ingest
+(quantile precision is boundary-limited, like any bucketed histogram). A
+histogram is **stored as one series** carrying its whole bucket vector, and
+`<name>_bucket{le=...}`, `<name>_sum` and `<name>_count` are synthesized when a
+selector asks for them — an instrument costs one identity in the index and the
+catalogs rather than `bounds + 3`, and every name it used to answer as still
+answers. OTLP summaries
 become `{quantile="…"}` gauge series plus `_sum`/`_count`; delta-temporality
 sums are accumulated into running totals at ingest, and a series that churns
 away and returns restarts its total — a counter reset, which `rate` absorbs;
