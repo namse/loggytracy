@@ -39,24 +39,27 @@ pub(crate) struct MetricScanOutcome {
 }
 
 /// Whether a series identity passes the request's name and label filters.
-fn metric_labels_match(
-    labels: &SeriesLabels,
-    metric: &Option<String>,
-    filters: &[MetricFilter],
-) -> Result<bool, String> {
-    let pairs = labels.pairs()?;
-    let lookup = |key: &str| -> Option<String> {
-        pairs
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.clone())
+/// Whether one series' canonical labels satisfy the selector.
+///
+/// Takes the bytes rather than a `SeriesLabels` because the caller usually
+/// has no owned identity yet: this runs on every catalog row in the query's
+/// window, and only a row that matches is worth materializing. A malformed
+/// payload reads as no match rather than as an error — these bytes crossed a
+/// checksum and were decoded once when the part opened, so corruption is
+/// caught before a query can see it.
+fn metric_labels_match(labels: &[u8], metric: &Option<String>, filters: &[MetricFilter]) -> bool {
+    let lookup = |key: &str| {
+        crate::series::canonical_pairs(labels)
+            .filter_map(Result::ok)
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value)
     };
     if let Some(metric) = metric
-        && lookup(crate::series::METRIC_NAME_LABEL).as_deref() != Some(metric.as_str())
+        && lookup(crate::series::METRIC_NAME_LABEL) != Some(metric.as_str())
     {
-        return Ok(false);
+        return false;
     }
-    Ok(filters.iter().all(|filter| filter.matches(&lookup)))
+    filters.iter().all(|filter| filter.matches(&lookup))
 }
 
 async fn scan_metric_series(
@@ -104,7 +107,7 @@ async fn scan_metric_series(
         let mut selected: std::collections::BTreeMap<SeriesLabels, Sources> =
             std::collections::BTreeMap::new();
         for labels in memtable.series_labels(&tenant) {
-            if metric_labels_match(&labels, &request.metric, &request.filters)? {
+            if metric_labels_match(labels.as_bytes(), &request.metric, &request.filters) {
                 selected.entry(labels).or_insert(Sources {
                     in_memtable: true,
                     parts: Vec::new(),
@@ -127,7 +130,7 @@ async fn scan_metric_series(
                 if !entry.overlaps(window) {
                     continue;
                 }
-                if !metric_labels_match(&entry.labels, &request.metric, &request.filters)? {
+                if !metric_labels_match(entry.labels.as_bytes(), &request.metric, &request.filters) {
                     continue;
                 }
                 let sources = selected.entry(entry.labels.clone()).or_insert(Sources {

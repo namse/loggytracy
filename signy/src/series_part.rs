@@ -1448,9 +1448,13 @@ fn decode_catalog_with_memtable(
                     .and_then(|labels| labels[index].clone())
                     .unwrap_or_else(|| SeriesLabels::from_canonical(entry.labels.to_vec()));
                 // The canonical bytes come from our own file, but they cross a
-                // checksum, not a validator — decode them once so a corrupt entry
-                // fails here rather than in a query's rendering.
-                labels.pairs()?;
+                // checksum, not a validator — walk them once so a corrupt entry
+                // fails here rather than in a query's rendering. The walk
+                // borrows: validating a part used to allocate two `String`s
+                // per label of every series it held.
+                for pair in labels.pair_slices() {
+                    pair?;
+                }
                 catalog.push(CatalogEntry {
                     labels,
                     offset: entry.offset,

@@ -502,12 +502,12 @@ pub(crate) enum MetricFilter {
 }
 
 impl MetricFilter {
-    pub(crate) fn matches(&self, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    pub(crate) fn matches<'a>(&self, lookup: &dyn Fn(&str) -> Option<&'a str>) -> bool {
         match self {
-            Self::Eq { key, value } => lookup(key).unwrap_or_default() == *value,
-            Self::Neq { key, value } => lookup(key).unwrap_or_default() != *value,
-            Self::Re { key, regex } => regex.is_match(&lookup(key).unwrap_or_default()),
-            Self::NRe { key, regex } => !regex.is_match(&lookup(key).unwrap_or_default()),
+            Self::Eq { key, value } => lookup(key).unwrap_or_default() == value.as_str(),
+            Self::Neq { key, value } => lookup(key).unwrap_or_default() != value.as_str(),
+            Self::Re { key, regex } => regex.is_match(lookup(key).unwrap_or_default()),
+            Self::NRe { key, regex } => !regex.is_match(lookup(key).unwrap_or_default()),
         }
     }
 }

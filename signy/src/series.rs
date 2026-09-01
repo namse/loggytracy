@@ -263,6 +263,16 @@ impl SeriesLabels {
         self.0.len()
     }
 
+    /// Walk the canonical encoding without allocating.
+    ///
+    /// The allocating [`Self::pairs`] is for a caller that keeps the strings;
+    /// a caller that only *tests* them — the selection walk, which asks this
+    /// of every catalog row in the query's window — has no reason to build
+    /// two `String`s per label to throw them away.
+    pub fn pair_slices(&self) -> CanonicalPairs<'_> {
+        canonical_pairs(&self.0)
+    }
+
     /// Decode back into pairs. The encoding was built from valid pairs, so a
     /// failure here is corruption and is an error, not a lossy render.
     pub fn pairs(&self) -> Result<Vec<(String, String)>, String> {
@@ -312,6 +322,52 @@ impl std::fmt::Debug for SeriesLabels {
             }
             Err(_) => write!(f, "<corrupt series labels>"),
         }
+    }
+}
+
+/// Borrowing walk over the canonical `len,key,len,value` encoding. Yields
+/// `Err` once and then stops: a malformed payload is corruption, and the
+/// callers that must treat it as such say so by propagating it.
+pub fn canonical_pairs(bytes: &[u8]) -> CanonicalPairs<'_> {
+    CanonicalPairs { bytes, at: 0 }
+}
+
+pub struct CanonicalPairs<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> CanonicalPairs<'a> {
+    fn take(&mut self) -> Result<&'a str, String> {
+        let len_end = self.at + 4;
+        let len_bytes: [u8; 4] = self
+            .bytes
+            .get(self.at..len_end)
+            .ok_or("series labels truncated")?
+            .try_into()
+            .map_err(|_| "series labels truncated")?;
+        let end = len_end + u32::from_le_bytes(len_bytes) as usize;
+        let text = self
+            .bytes
+            .get(len_end..end)
+            .ok_or("series labels truncated")?;
+        self.at = end;
+        std::str::from_utf8(text).map_err(|error| format!("series label not UTF-8: {error}"))
+    }
+}
+
+impl<'a> Iterator for CanonicalPairs<'a> {
+    type Item = Result<(&'a str, &'a str), String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.at >= self.bytes.len() {
+            return None;
+        }
+        let pair = self.take().and_then(|key| Ok((key, self.take()?)));
+        if pair.is_err() {
+            self.at = self.bytes.len();
+        }
+        Some(pair)
     }
 }
 
@@ -2672,6 +2728,36 @@ mod tests {
         assert_eq!(error.new_series, 2);
         assert_eq!(memtable.active_series(&first_tenant), 0);
         assert_eq!(memtable.active_series(&second_tenant), 0);
+    }
+
+    #[test]
+    fn the_borrowing_pair_walk_agrees_with_the_allocating_one() {
+        let series = SeriesLabels::from_pairs(vec![
+            (METRIC_NAME_LABEL.to_string(), "queue_depth".to_string()),
+            ("instance".to_string(), "a".to_string()),
+            ("empty".to_string(), String::new()),
+        ]);
+        let owned = series.pairs().unwrap();
+        let borrowed: Vec<(String, String)> = series
+            .pair_slices()
+            .map(|pair| {
+                let (key, value) = pair.unwrap();
+                (key.to_string(), value.to_string())
+            })
+            .collect();
+        assert_eq!(owned, borrowed);
+    }
+
+    #[test]
+    fn a_truncated_canonical_payload_stops_the_walk_with_an_error() {
+        let series = SeriesLabels::from_pairs(vec![(
+            METRIC_NAME_LABEL.to_string(),
+            "queue_depth".to_string(),
+        )]);
+        let truncated = &series.as_bytes()[..series.byte_len() - 1];
+        let results: Vec<_> = canonical_pairs(truncated).collect();
+        assert_eq!(results.len(), 1, "the walk stops rather than looping");
+        assert!(results[0].is_err());
     }
 
     #[test]

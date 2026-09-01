@@ -46,9 +46,7 @@ fn discover_series(
         .series_memtable()
         .series_labels_in_range(tenant, start_ns, end_ns)
     {
-        if metric_labels_match(&labels, &params.metric, &params.filters)
-            .map_err(ApiError::from_engine)?
-        {
+        if metric_labels_match(labels.as_bytes(), &params.metric, &params.filters) {
             series.insert(labels);
         }
     }
@@ -61,9 +59,7 @@ fn discover_series(
             if !entry.overlaps(window) {
                 continue;
             }
-            if metric_labels_match(&entry.labels, &params.metric, &params.filters)
-                .map_err(ApiError::from_engine)?
-            {
+            if metric_labels_match(entry.labels.as_bytes(), &params.metric, &params.filters) {
                 series.insert(entry.labels.clone());
             }
         }
