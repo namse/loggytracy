@@ -222,17 +222,56 @@ Deferred items this plan minted, so they are not re-litigated mid-build:
       `an_abort_that_recreates_an_evicted_series_keeps_the_accounting_sound` and
       `releasing_more_bytes_than_were_taken_clamps_at_zero`.
 
-- [ ] **The churn axis was reached but not won, and the limit that bound was policy rather than memory.**
-      Measured 2026-08-27, both engines at a 2 GiB container, 520 288 series offered: signy refused
-      24 288 datapoints (five whole-request 429s) at its `max_active_series` default of 500 000 while
-      peaking at 1 037.8 MiB, and VictoriaMetrics accepted every one of them at 627.3 MiB. So the engine
-      contained the burst exactly as designed — and the competitor held *more* series in *less* memory
-      without needing to refuse anything. Two things follow and neither is a tuning task. The default
-      limit binds far below what the budget it is supposed to protect can actually hold, which is the
-      calibration the plan deferred to the memory gate and which has still not been done. And the claim's
-      churn half, as worded, is satisfied by behaviour that the comparison does not reward: "refuses
-      rather than dies" is not a differentiator against an engine that neither refused nor died. The
-      wording is the thing to revisit, after the gate says what a series actually costs.
+- [x] **The churn axis is won, and what bound it was never memory.** Measured 2026-08-27, both engines
+      at a 2 GiB container, 520 288 series offered: signy refused 24 288 datapoints (five whole-request
+      429s) at its `max_active_series` default of 500 000 while peaking at 1 037.8 MiB, and
+      VictoriaMetrics accepted every one of them at 627.3 MiB. The competitor held *more* series in
+      *less* memory without refusing anything, and the two things that followed were both structural.
+
+      Closed 2026-09-01, recorded in [`docs/METRIC_CAPACITY_SWEEP.md`](docs/METRIC_CAPACITY_SWEEP.md).
+      Normal mode now takes **eight million series with zero refusals at 215 MiB** — a fifth of the
+      memory for fifteen times the series — and refuses with named 429s and stays alive past that. The
+      probe path reaches 28 million at 1 443 MiB where VictoriaMetrics OOM-killed at 16.8 million. So
+      the claim's churn half no longer rests on "refuses rather than dies" against an engine that did
+      neither: this one holds more *and* refuses rather than dying.
+
+      Three changes did it, each gated by its own probe and each with a loss published beside it. A
+      flushed gauge or cumulative series is **retired from the active index** the moment its samples are
+      durable, because the only reason it stayed was `last_ts` and that reason ends at a part boundary.
+      The **part catalog is mapped** rather than read: `index.bin` became a fixed-stride row array with
+      the labels in a `labels.bin` beside it, a selector tests a row's bytes in place, and what was
+      anonymous memory the kernel could only OOM on became page cache it can reclaim — the 20-million
+      normal-mode run touched the cgroup limit exactly and survived, 890 MiB anonymous against 1 098 MiB
+      of file. And **`SERIES_OVERHEAD_BYTES` is gone**: the calibration this item asked for turned out
+      not to be a better constant but no constant at all, since the maps can be asked their own
+      `capacity()` and a label allocation is arithmetic.
+
+      Two losses are in the document rather than only here: bounding the weak label pool cost 2.3 million
+      series and 1 063 timed-out requests before the sweep was paced by attempts instead of insertions,
+      and the mapping trades memory for time — 28 million series ingest in five times the wall clock of
+      ten million, with push p99 at 1.4 s. That trade is the one VictoriaMetrics makes too.
+
+- [ ] **What binds the metric path now is the memtable's *share*, not any per-series cost.** Refusal
+      begins around 10.7 million offered where the probe path reaches 28 million with the guards off, so
+      the remaining factor is 2.6x rather than the 35x a stale constant was worth. That gap is
+      `max_memtable_bytes` = a quarter of the declared budget, shared by the log, trace and metric
+      memtables with no per-signal floor — which is also how one tenant's cardinality burst can push
+      another tenant's log ingest into a 429. Raising the share, giving each signal a floor, or leaving
+      it alone are all defensible; none of them is a measurement, so this is a decision to make rather
+      than a number to find. Note what the ceiling now bounds: a flushed series is retired, so it is the
+      flush window's working set and not the tenant's cardinality, and refusal is therefore a
+      throughput boundary — the same 20 million offered more slowly is accepted whole.
+
+- [ ] **Two query-side reductions are known and unmeasured.** The selection walk does not consult the
+      bloom — only `pin_metric_parts` does — so every part whose time range overlaps has its whole row
+      array read whether or not it can hold the metric; and the rows are label-sorted, so an exact
+      `__name__` could binary search rather than scan. Both matter more now that the mapping made time
+      the limiter rather than memory.
+
+- [ ] **Native histogram storage is filed as issue #12.** One exponential histogram costs up to 67
+      series today (`bounds + 3`, downscaled to 64 finite boundaries), which against the `$1` plan's
+      500-active-series line is 13% of a project's allowance for one instrument. Every optimization
+      above makes *one series* cheaper; this is the only lever that changes the *number* of them.
 
 - [x] **The value disagreement is diagnosed, and it is two unrelated things.** The published run's
       per-answer records settled it (`docs/artifacts/m14/metric-matrix_*.json`, 2026-08-27); every
