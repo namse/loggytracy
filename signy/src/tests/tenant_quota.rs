@@ -60,7 +60,7 @@
                     tenant: TenantId::parse(name).unwrap(),
                     labels: labels.clone(),
                     ts_ns: 1_772_000_000_000_000_000 + index * 1_000_000_000,
-                    value: index as f64,
+                    value: crate::series::MetricValue::Scalar(index as f64),
                     kind: SampleKind::Gauge,
                     datapoint_index: 0,
                 })

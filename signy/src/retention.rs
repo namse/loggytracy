@@ -813,7 +813,9 @@ mod tests {
         owner: &str,
         ts: i64,
     ) -> crate::series_part::SeriesPart {
-        use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
+        use crate::series::{
+            METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesLabels,
+        };
         let memtable = crate::series::SeriesMemTable::new();
         memtable.insert(vec![MetricSample {
             tenant: tenant(owner),
@@ -822,7 +824,7 @@ mod tests {
                 "queue_depth".to_string(),
             )]),
             ts_ns: ts,
-            value: 1.0,
+            value: MetricValue::Scalar(1.0),
             kind: SampleKind::Gauge,
             datapoint_index: 0,
         }]);

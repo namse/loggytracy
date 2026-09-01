@@ -65,7 +65,7 @@
     }
 
     fn metric_parts_for(root: &Path, base_ts: i64) -> Vec<crate::series_part::SeriesPart> {
-        use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
+        use crate::series::{METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesLabels};
         let memtable = crate::series::SeriesMemTable::new();
         let labels = SeriesLabels::from_pairs(vec![
             (METRIC_NAME_LABEL.to_string(), "queue_depth".to_string()),
@@ -77,7 +77,7 @@
                     tenant: test_tenant(),
                     labels: labels.clone(),
                     ts_ns: base_ts + index * 1_000_000_000,
-                    value: index as f64,
+                    value: MetricValue::Scalar(index as f64),
                     kind: SampleKind::Gauge,
                     datapoint_index: 0,
                 })

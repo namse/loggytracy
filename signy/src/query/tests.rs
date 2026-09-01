@@ -5,7 +5,7 @@
     use crate::memtable::{LogEntry, MemTable};
     use crate::part::{self, Row};
     use crate::part_registry::PartRegistry;
-    use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
+    use crate::series::{METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesLabels};
     use tower::ServiceExt;
 
     /// Engine-level tests build their queries through the shared flat grammar
@@ -1310,7 +1310,7 @@
             tenant: test_tenant(),
             labels,
             ts_ns: 1,
-            value: 1.0,
+            value: MetricValue::Scalar(1.0),
             kind: SampleKind::Gauge,
             datapoint_index: 0,
         }]);
@@ -3650,7 +3650,7 @@ fn insert_metric_samples(
                 tenant: test_tenant(),
                 labels: labels.clone(),
                 ts_ns: *ts_ns,
-                value: *value,
+                value: MetricValue::Scalar(*value),
                 kind: crate::series::SampleKind::Gauge,
                 datapoint_index: 0,
             })

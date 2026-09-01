@@ -232,12 +232,67 @@ pub struct HistogramPoint {
     pub count: u64,
 }
 
+impl HistogramPoint {
+    /// The bytes a buffered point holds beyond the schema it shares.
+    fn accounted_bytes(&self) -> u64 {
+        (self.cumulative.len() as u64)
+            .saturating_mul(8)
+            .saturating_add(HISTOGRAM_POINT_BYTES)
+    }
+
+    /// Whether two points are counted against the same boundaries. A pointer
+    /// comparison first because the schema is shared: an instrument that does
+    /// not rescale hands out the same `Arc` for every datapoint.
+    fn same_schema(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.bounds, &other.bounds) || self.bounds == other.bounds
+    }
+
+    /// Fold a delta-temporality observation into a running total.
+    ///
+    /// A schema change is treated as a counter reset — the same rule the
+    /// scalar path applies when an evicted series comes back, and the only
+    /// honest one: cumulative-by-boundary counts cannot be re-bucketed onto
+    /// different boundaries without inventing a distribution inside them.
+    fn accumulate(&mut self, delta: &Self) {
+        if !self.same_schema(delta) {
+            *self = delta.clone();
+            return;
+        }
+        for (total, increment) in self.cumulative.iter_mut().zip(&delta.cumulative) {
+            *total = total.saturating_add(*increment);
+        }
+        self.count = self.count.saturating_add(delta.count);
+        self.sum = match (self.sum, delta.sum) {
+            (Some(total), Some(increment)) => Some(total + increment),
+            (total, None) => total,
+            (None, increment) => increment,
+        };
+    }
+}
+
+/// What one decomposed datapoint carries. A scalar is a gauge, a counter or
+/// one `le` bucket; a histogram is a whole instrument in one series.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MetricValue {
+    Scalar(f64),
+    Histogram(HistogramPoint),
+}
+
+impl MetricValue {
+    pub fn as_scalar(&self) -> Option<f64> {
+        match self {
+            Self::Scalar(value) => Some(*value),
+            Self::Histogram(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MetricSample {
     pub tenant: TenantId,
     pub labels: SeriesLabels,
     pub ts_ns: i64,
-    pub value: f64,
+    pub value: MetricValue,
     pub kind: SampleKind,
     /// Which OTLP datapoint of its request this sample came from, in the
     /// deterministic traversal order `series_ingest` assigns. The admission
@@ -391,6 +446,10 @@ const ADMITTED_SAMPLE_BYTES: u64 = 64;
 /// vector until it either receives another sample or crosses a flush
 /// boundary.
 const INLINE_SAMPLE_BYTES: u64 = 16;
+/// A buffered histogram point's fixed part: its timestamp, the counts
+/// vector's header, the family totals, and the pointer to a schema it shares
+/// with every other point of its series.
+const HISTOGRAM_POINT_BYTES: u64 = 56;
 
 /// A handle into a tenant's sample-buffer arena.
 ///
@@ -399,7 +458,7 @@ const INLINE_SAMPLE_BYTES: u64 = 16;
 /// contains entries that currently have samples, so a flushed series does not
 /// retain three empty `Vec` headers and an empty Gorilla encoder in its index
 /// value.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SeriesBufferId(NonZeroU32);
 
 /// State that must survive a successful flush for a series.
@@ -414,24 +473,46 @@ struct SeriesState {
     buffer_id: Option<SeriesBufferId>,
     flags: u8,
     last_ts: i64,
-    running_total: f64,
+    /// A delta series' running total, discriminated by `flags`: the bits of an
+    /// `f64` for a scalar, an arena id for a histogram. One slot rather than
+    /// two because a series is one or the other, and every series pays for
+    /// this struct.
+    total_bits: u64,
 }
 
 impl SeriesState {
     const HAS_LAST_TS: u8 = 1;
     const HAS_RUNNING_TOTAL: u8 = 2;
+    const HAS_HISTOGRAM_TOTAL: u8 = 4;
 
     fn last_ts(&self) -> Option<i64> {
         (self.flags & Self::HAS_LAST_TS != 0).then_some(self.last_ts)
     }
 
     fn running_total(&self) -> Option<f64> {
-        (self.flags & Self::HAS_RUNNING_TOTAL != 0).then_some(self.running_total)
+        (self.flags & Self::HAS_RUNNING_TOTAL != 0).then_some(f64::from_bits(self.total_bits))
     }
 
     fn set_running_total(&mut self, total: f64) {
-        self.running_total = total;
-        self.flags |= Self::HAS_RUNNING_TOTAL;
+        self.total_bits = total.to_bits();
+        self.flags = (self.flags & !Self::HAS_HISTOGRAM_TOTAL) | Self::HAS_RUNNING_TOTAL;
+    }
+
+    fn histogram_total_id(&self) -> Option<SeriesBufferId> {
+        (self.flags & Self::HAS_HISTOGRAM_TOTAL != 0)
+            .then(|| NonZeroU32::new(self.total_bits as u32).map(SeriesBufferId))
+            .flatten()
+    }
+
+    fn set_histogram_total_id(&mut self, id: SeriesBufferId) {
+        self.total_bits = u64::from(id.0.get());
+        self.flags = (self.flags & !Self::HAS_RUNNING_TOTAL) | Self::HAS_HISTOGRAM_TOTAL;
+    }
+
+    /// Whether storage could rebuild this series' state from the parts it has
+    /// already written. A delta total of either kind could not be.
+    fn carries_a_total(&self) -> bool {
+        self.flags & (Self::HAS_RUNNING_TOTAL | Self::HAS_HISTOGRAM_TOTAL) != 0
     }
 }
 
@@ -493,6 +574,16 @@ impl SeriesBuffer {
     }
 }
 
+/// A histogram series' buffered points. There is no encoder here: the points
+/// are held as they arrived and encoded once, at flush, because a histogram
+/// chunk compresses against the boundary schema they share rather than one
+/// value at a time.
+#[derive(Default)]
+struct HistogramBuffer {
+    points: Vec<(i64, HistogramPoint)>,
+    bounds: Option<(i64, i64)>,
+}
+
 /// Storage for one live series' samples.
 ///
 /// The common cardinality shape is one sample per series.  Keeping that
@@ -505,6 +596,7 @@ enum SeriesBufferStorage {
     Empty,
     Inline { ts_ns: i64, value: f64 },
     Stream(Box<SeriesBuffer>),
+    Histogram(Box<HistogramBuffer>),
 }
 
 impl SeriesBufferStorage {
@@ -513,6 +605,7 @@ impl SeriesBufferStorage {
             Self::Empty => false,
             Self::Inline { .. } => true,
             Self::Stream(stream) => stream.has_samples(),
+            Self::Histogram(histogram) => !histogram.points.is_empty(),
         }
     }
 
@@ -521,6 +614,11 @@ impl SeriesBufferStorage {
             Self::Empty => 0,
             Self::Inline { .. } => INLINE_SAMPLE_BYTES,
             Self::Stream(stream) => stream.accounted_bytes(),
+            Self::Histogram(histogram) => histogram
+                .points
+                .iter()
+                .map(|(_, point)| point.accounted_bytes())
+                .sum(),
         }
     }
 
@@ -529,6 +627,7 @@ impl SeriesBufferStorage {
             Self::Empty => None,
             Self::Inline { ts_ns, .. } => Some((*ts_ns, *ts_ns)),
             Self::Stream(stream) => stream.bounds,
+            Self::Histogram(histogram) => histogram.bounds,
         }
     }
 
@@ -537,6 +636,12 @@ impl SeriesBufferStorage {
             Self::Empty => {}
             Self::Inline { .. } => {}
             Self::Stream(stream) => stream.observe(ts_ns),
+            Self::Histogram(histogram) => {
+                histogram.bounds = Some(match histogram.bounds {
+                    Some((min, max)) => (min.min(ts_ns), max.max(ts_ns)),
+                    None => (ts_ns, ts_ns),
+                });
+            }
         }
     }
 
@@ -557,6 +662,7 @@ impl SeriesBufferStorage {
                 bounds
             }
             Self::Stream(stream) => stream.bounds.take(),
+            Self::Histogram(histogram) => histogram.bounds.take(),
         }
     }
 
@@ -578,7 +684,28 @@ impl SeriesBufferStorage {
                 Self::Stream(Box::new(stream))
             }
             Self::Stream(stream) => Self::Stream(stream),
+            // A histogram series never becomes a Gorilla stream: its points
+            // are already in the shape the flush writes.
+            Self::Histogram(histogram) => Self::Histogram(histogram),
         }
+    }
+
+    /// Append one histogram observation, promoting a freshly allocated arena
+    /// slot on the way. Returns the change in accounted bytes.
+    fn append_histogram(&mut self, ts_ns: i64, point: HistogramPoint) -> u64 {
+        let before = self.accounted_bytes();
+        if !matches!(self, Self::Histogram(_)) {
+            debug_assert!(
+                matches!(self, Self::Empty),
+                "a series is scalar or histogram for the life of its buffer"
+            );
+            *self = Self::Histogram(Box::default());
+        }
+        if let Self::Histogram(histogram) = self {
+            histogram.points.push((ts_ns, point));
+        }
+        self.observe(ts_ns);
+        self.accounted_bytes().saturating_sub(before)
     }
 
     /// Append a sample, promoting an inline first sample when needed.  The
@@ -615,6 +742,9 @@ impl SeriesBufferStorage {
                     stream.open.append(ts_ns, value);
                 }
             }
+            Self::Histogram(_) => {
+                debug_assert!(false, "a scalar sample reached a histogram series");
+            }
         }
         self.observe(ts_ns);
         self.accounted_bytes().saturating_sub(before)
@@ -634,6 +764,12 @@ impl SeriesBufferStorage {
                     samples.extend(gorilla::decode_all(&stream.open.clone().close())?);
                 }
                 samples.extend(stream.spill.iter().copied());
+            }
+            // A histogram series has no scalar samples to add. The read path
+            // asks for its points instead; a caller that reached here wanted
+            // one shape and found the other.
+            Self::Histogram(_) => {
+                return Err("a histogram series has no scalar samples".to_string());
             }
         }
         Ok(())
@@ -695,6 +831,12 @@ impl SeriesBufferStorage {
                 chunks.append(&mut stream.closed);
                 stream.closed = chunks;
                 stream.spill.append(&mut spill);
+            }
+            Self::Histogram(_) => {
+                debug_assert!(
+                    chunks.is_empty() && spill.is_empty(),
+                    "a histogram series' abort carries points, not chunks"
+                );
             }
         }
     }
@@ -813,7 +955,12 @@ struct TenantSeries {
     states: SeriesStates,
     buffers: HashMap<SeriesBufferId, SeriesBufferStorage>,
     reservations: HashMap<SeriesLabels, ReservationState>,
+    /// Running totals for delta-temporality histogram series. Held in an
+    /// arena rather than in the index value so that the series which have no
+    /// total — very nearly all of them — pay nothing for the ones that do.
+    histogram_totals: HashMap<SeriesBufferId, HistogramPoint>,
     next_buffer_id: u32,
+    next_total_id: u32,
 }
 
 impl TenantSeries {
@@ -833,6 +980,33 @@ impl TenantSeries {
                 self.buffers.insert(id, SeriesBufferStorage::Empty);
                 return id;
             }
+        }
+    }
+
+    fn alloc_histogram_total(&mut self) -> SeriesBufferId {
+        let mut raw = self.next_total_id;
+        loop {
+            raw = raw.wrapping_add(1);
+            if raw == 0 {
+                continue;
+            }
+            let id = SeriesBufferId(NonZeroU32::new(raw).expect("non-zero total id"));
+            if !self.histogram_totals.contains_key(&id) {
+                self.next_total_id = raw;
+                return id;
+            }
+        }
+    }
+
+    /// Free everything an index entry owned. Called wherever a state leaves,
+    /// so a retirement or an eviction cannot strand an arena slot in a map
+    /// that only states are walked to clean.
+    fn release(&mut self, state: &SeriesState, fallback_buffer: Option<SeriesBufferId>) {
+        if let Some(id) = state.buffer_id.or(fallback_buffer) {
+            self.buffers.remove(&id);
+        }
+        if let Some(id) = state.histogram_total_id() {
+            self.histogram_totals.remove(&id);
         }
     }
 
@@ -903,17 +1077,29 @@ fn ranges_overlap(bounds: Option<(i64, i64)>, start_ns: i64, end_ns: i64) -> boo
 /// closed chunks oldest-first, plus the out-of-order spill.
 pub struct SnapshotSeries {
     pub labels: SeriesLabels,
+    /// A scalar series' Gorilla chunks and out-of-order spill. Empty for a
+    /// histogram series, which carries `points` instead — one of the two is
+    /// always empty, and [`Self::is_histogram`] is how a caller tells.
     pub chunks: Vec<Vec<u8>>,
     pub spill: Vec<(i64, f64)>,
+    /// A histogram series' observations, in arrival order.
+    pub points: Vec<(i64, HistogramPoint)>,
     /// The timestamps these samples span, carried so an abort can return them
     /// to the buffer without decoding what it is putting back.
     pub bounds: Option<(i64, i64)>,
 }
 
 impl SnapshotSeries {
+    pub fn is_histogram(&self) -> bool {
+        !self.points.is_empty()
+    }
+
     /// Every sample, time-sorted — the form the flush writes and the read
     /// path merges.
     pub fn sorted_samples(&self) -> Result<Vec<(i64, f64)>, String> {
+        if self.is_histogram() {
+            return Err("a histogram series has no scalar samples".to_string());
+        }
         let mut samples = Vec::new();
         for chunk in &self.chunks {
             samples.extend(gorilla::decode_all(chunk)?);
@@ -994,6 +1180,7 @@ impl SeriesMemTable {
                             SeriesBufferStorage::Empty => (empty + 1, inline, stream),
                             SeriesBufferStorage::Inline { .. } => (empty, inline + 1, stream),
                             SeriesBufferStorage::Stream(_) => (empty, inline, stream + 1),
+                            SeriesBufferStorage::Histogram(_) => (empty, inline, stream + 1),
                         },
                     );
                     (
@@ -1378,10 +1565,8 @@ impl SeriesMemTable {
             })
             .collect();
         for (labels, buffer_id) in idle {
-            if let Some(state) = tenant_series.states.remove(&labels)
-                && let Some(id) = state.buffer_id.or(buffer_id)
-            {
-                tenant_series.buffers.remove(&id);
+            if let Some(state) = tenant_series.states.remove(&labels) {
+                tenant_series.release(&state, buffer_id);
             }
             tenant_series.reservations.remove(&labels);
             freed += label_alloc_bytes(labels.byte_len());
@@ -1446,19 +1631,57 @@ impl SeriesMemTable {
                     .buffer_id = Some(id);
                 id
             };
-            let value = {
-                let state = tenant_series
-                    .states
-                    .get_mut(&labels)
-                    .expect("series state exists for every sample");
-                match kind {
-                    SampleKind::Gauge | SampleKind::Cumulative => raw_value,
-                    SampleKind::Delta => {
-                        let total = state.running_total().unwrap_or(0.0) + raw_value;
-                        state.set_running_total(total);
-                        total
-                    }
+            // A delta observation is folded into the series' running total
+            // here, so storage only ever holds cumulative values and a replay
+            // through this same fold reproduces them.
+            let resolved = match raw_value {
+                MetricValue::Scalar(raw) => {
+                    let state = tenant_series
+                        .states
+                        .get_mut(&labels)
+                        .expect("series state exists for every sample");
+                    MetricValue::Scalar(match kind {
+                        SampleKind::Gauge | SampleKind::Cumulative => raw,
+                        SampleKind::Delta => {
+                            let total = state.running_total().unwrap_or(0.0) + raw;
+                            state.set_running_total(total);
+                            total
+                        }
+                    })
                 }
+                MetricValue::Histogram(point) => match kind {
+                    SampleKind::Gauge | SampleKind::Cumulative => MetricValue::Histogram(point),
+                    SampleKind::Delta => {
+                        let existing = tenant_series
+                            .states
+                            .get(&labels)
+                            .and_then(SeriesState::histogram_total_id);
+                        let total_id = match existing {
+                            Some(id) => id,
+                            None => {
+                                let id = tenant_series.alloc_histogram_total();
+                                tenant_series
+                                    .states
+                                    .get_mut(&labels)
+                                    .expect("series state exists for every sample")
+                                    .set_histogram_total_id(id);
+                                id
+                            }
+                        };
+                        // The first delta seeds the total; every later one
+                        // folds into it.
+                        let total = match tenant_series.histogram_totals.entry(total_id) {
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                entry.get_mut().accumulate(&point);
+                                entry.get().clone()
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(point).clone()
+                            }
+                        };
+                        MetricValue::Histogram(total)
+                    }
+                },
             };
             let last_ts = tenant_series
                 .states
@@ -1468,7 +1691,10 @@ impl SeriesMemTable {
                 .buffers
                 .get_mut(&buffer_id)
                 .expect("series state points at its sample buffer");
-            added += buffer.append(last_ts, ts_ns, value);
+            added += match resolved {
+                MetricValue::Scalar(value) => buffer.append(last_ts, ts_ns, value),
+                MetricValue::Histogram(point) => buffer.append_histogram(ts_ns, point),
+            };
             {
                 let state = tenant_series
                     .states
@@ -1518,11 +1744,31 @@ impl SeriesMemTable {
                 // the established chunk format, so promote it here before
                 // taking the stream fields below.
                 let accounted = buffer.accounted_bytes();
+                if let SeriesBufferStorage::Histogram(mut histogram) = buffer {
+                    let bounds = histogram.bounds.take();
+                    let points = std::mem::take(&mut histogram.points);
+                    moved += accounted;
+                    snapshot_bytes += points
+                        .iter()
+                        .map(|(_, point)| point.accounted_bytes())
+                        .sum::<u64>();
+                    state.buffer_id = None;
+                    list.push(SnapshotSeries {
+                        labels: labels.clone(),
+                        chunks: Vec::new(),
+                        spill: Vec::new(),
+                        points,
+                        bounds,
+                    });
+                    continue;
+                }
                 let mut buffer = buffer.into_stream(state.last_ts());
                 let bounds = buffer.take_bounds();
                 let mut buffer = match buffer {
                     SeriesBufferStorage::Stream(stream) => *stream,
-                    SeriesBufferStorage::Empty | SeriesBufferStorage::Inline { .. } => {
+                    SeriesBufferStorage::Empty
+                    | SeriesBufferStorage::Inline { .. }
+                    | SeriesBufferStorage::Histogram(_) => {
                         unreachable!("flush promotion must produce a stream")
                     }
                 };
@@ -1540,6 +1786,7 @@ impl SeriesMemTable {
                     labels: labels.clone(),
                     chunks,
                     spill,
+                    points: Vec::new(),
                     bounds,
                 });
             }
@@ -1621,16 +1868,14 @@ impl SeriesMemTable {
                 // reservation belongs to would strand it in a map that only
                 // eviction walks, and eviction walks states.
                 let retire = !tenant_series.has_samples(state)
-                    && state.running_total().is_none()
+                    && !state.carries_a_total()
                     && !tenant_series.reservations.contains_key(labels);
                 let buffer_id = state.buffer_id;
                 if !retire {
                     continue;
                 }
-                if let Some(state) = tenant_series.states.remove(labels)
-                    && let Some(id) = state.buffer_id.or(buffer_id)
-                {
-                    tenant_series.buffers.remove(&id);
+                if let Some(state) = tenant_series.states.remove(labels) {
+                    tenant_series.release(&state, buffer_id);
                 }
                 freed += label_alloc_bytes(labels.byte_len());
                 retired += 1;
@@ -1695,6 +1940,25 @@ impl SeriesMemTable {
                     .get_mut(&buffer_id)
                     .expect("series state points at its sample buffer");
                 let before = buffer.accounted_bytes();
+                if !series.points.is_empty() {
+                    // A histogram series' abort puts its points back in front
+                    // of anything that arrived while the flush was in flight,
+                    // which is the same ordering rule the chunks follow.
+                    if let SeriesBufferStorage::Empty = buffer {
+                        *buffer = SeriesBufferStorage::Histogram(Box::new(HistogramBuffer {
+                            points: series.points,
+                            bounds: None,
+                        }));
+                    } else if let SeriesBufferStorage::Histogram(histogram) = buffer {
+                        let mut restored = series.points;
+                        restored.append(&mut histogram.points);
+                        histogram.points = restored;
+                    }
+                    restored_buffer = restored_buffer
+                        .saturating_add(buffer.accounted_bytes().saturating_sub(before));
+                    buffer.absorb(series.bounds);
+                    continue;
+                }
                 // The snapshot's samples are older than anything inserted
                 // since, so its chunks go to the front and its spill stays
                 // spill.  `prepend_aborted` promotes an inline concurrent
@@ -1940,6 +2204,7 @@ fn unwrap_snapshot(snapshot: Arc<SeriesSnapshot>) -> SeriesSnapshot {
                             labels: series.labels.clone(),
                             chunks: series.chunks.clone(),
                             spill: series.spill.clone(),
+                            points: series.points.clone(),
                             bounds: series.bounds,
                         })
                         .collect(),
@@ -1966,6 +2231,31 @@ mod tests {
     /// on insert, moves with a flush and comes back on an abort — and the
     /// container half moves with `HashMap::capacity()`, which is the subject
     /// of its own test rather than of every one of these.
+    fn histogram(bounds: &[f64], cumulative: &[u64], count: u64) -> HistogramPoint {
+        HistogramPoint {
+            bounds: bounds.iter().copied().collect(),
+            cumulative: cumulative.to_vec(),
+            sum: Some(1.0),
+            count,
+        }
+    }
+
+    fn histogram_sample(
+        labels: &SeriesLabels,
+        ts: i64,
+        point: HistogramPoint,
+        kind: SampleKind,
+    ) -> MetricSample {
+        MetricSample {
+            tenant: test_tenant(),
+            labels: labels.clone(),
+            ts_ns: ts,
+            value: MetricValue::Histogram(point),
+            kind,
+            datapoint_index: 0,
+        }
+    }
+
     fn payload_bytes(memtable: &SeriesMemTable) -> usize {
         memtable.approximate_size() - memtable.container_bytes() as usize
     }
@@ -1975,7 +2265,7 @@ mod tests {
             tenant: test_tenant(),
             labels: labels.clone(),
             ts_ns: ts,
-            value,
+            value: MetricValue::Scalar(value),
             kind,
             datapoint_index: 0,
         }
@@ -2597,6 +2887,191 @@ mod tests {
         let results: Vec<_> = canonical_pairs(truncated).collect();
         assert_eq!(results.len(), 1, "the walk stops rather than looping");
         assert!(results[0].is_err());
+    }
+
+    #[test]
+    fn a_cumulative_histogram_is_one_series_carrying_its_whole_shape() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("http_request_duration_seconds", "a");
+        memtable.insert(vec![histogram_sample(
+            &series,
+            100,
+            histogram(&[0.005, 0.01], &[3, 7], 10),
+            SampleKind::Cumulative,
+        )]);
+
+        assert_eq!(
+            memtable.active_series(&test_tenant()),
+            1,
+            "an instrument that used to cost five series costs one"
+        );
+        let snapshot = memtable.begin_flush();
+        let flushed = &snapshot.tenants[&test_tenant()][0];
+        assert!(flushed.is_histogram());
+        assert!(flushed.chunks.is_empty() && flushed.spill.is_empty());
+        assert_eq!(flushed.points.len(), 1);
+        assert_eq!(flushed.points[0].0, 100);
+        assert_eq!(flushed.points[0].1.cumulative, vec![3, 7]);
+        assert_eq!(flushed.points[0].1.count, 10);
+        assert_eq!(flushed.bounds, Some((100, 100)));
+    }
+
+    #[test]
+    fn a_delta_histogram_accumulates_bucket_by_bucket() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("http_request_duration_seconds", "delta");
+        let bounds = [0.005, 0.01];
+        memtable.insert(vec![histogram_sample(
+            &series,
+            100,
+            histogram(&bounds, &[1, 2], 3),
+            SampleKind::Delta,
+        )]);
+        memtable.insert(vec![histogram_sample(
+            &series,
+            200,
+            histogram(&bounds, &[2, 5], 7),
+            SampleKind::Delta,
+        )]);
+
+        let snapshot = memtable.begin_flush();
+        let points = &snapshot.tenants[&test_tenant()][0].points;
+        assert_eq!(points[0].1.cumulative, vec![1, 2]);
+        assert_eq!(
+            points[1].1.cumulative,
+            vec![3, 7],
+            "storage only ever holds cumulative values, on every bucket"
+        );
+        assert_eq!(points[1].1.count, 10);
+        assert_eq!(points[1].1.sum, Some(2.0));
+    }
+
+    #[test]
+    fn a_delta_histogram_survives_the_flush_that_would_retire_a_gauge() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("http_request_duration_seconds", "kept");
+        memtable.insert(vec![histogram_sample(
+            &series,
+            100,
+            histogram(&[0.005], &[1], 1),
+            SampleKind::Delta,
+        )]);
+        let snapshot = memtable.begin_flush();
+        memtable.commit_flush();
+        assert_eq!(
+            memtable.retire_flushed(&snapshot),
+            0,
+            "nothing on disk can rebuild a running total, whatever its shape"
+        );
+
+        memtable.insert(vec![histogram_sample(
+            &series,
+            200,
+            histogram(&[0.005], &[2], 2),
+            SampleKind::Delta,
+        )]);
+        let second = memtable.begin_flush();
+        assert_eq!(
+            second.tenants[&test_tenant()][0].points[0].1.cumulative,
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn a_rescaled_delta_histogram_reads_as_a_counter_reset() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("http_request_duration_seconds", "rescaled");
+        memtable.insert(vec![histogram_sample(
+            &series,
+            100,
+            histogram(&[0.005, 0.01], &[1, 2], 3),
+            SampleKind::Delta,
+        )]);
+        // An exponential histogram whose observed range widened comes back on
+        // different boundaries. Counts against one set of bounds cannot be
+        // re-bucketed onto another without inventing a distribution inside
+        // them, so the total starts again — which is exactly what an evicted
+        // scalar series does.
+        memtable.insert(vec![histogram_sample(
+            &series,
+            200,
+            histogram(&[0.01, 0.05], &[4, 6], 6),
+            SampleKind::Delta,
+        )]);
+
+        let snapshot = memtable.begin_flush();
+        let points = &snapshot.tenants[&test_tenant()][0].points;
+        assert_eq!(points[1].1.cumulative, vec![4, 6]);
+        assert_eq!(&*points[1].1.bounds, &[0.01, 0.05]);
+    }
+
+    #[test]
+    fn an_aborted_histogram_flush_puts_its_points_back_in_front() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("http_request_duration_seconds", "abort");
+        memtable.insert(vec![histogram_sample(
+            &series,
+            100,
+            histogram(&[0.005], &[1], 1),
+            SampleKind::Cumulative,
+        )]);
+        let snapshot = memtable.begin_flush();
+        memtable.insert(vec![histogram_sample(
+            &series,
+            200,
+            histogram(&[0.005], &[2], 2),
+            SampleKind::Cumulative,
+        )]);
+        memtable.abort_flush(snapshot);
+
+        let recovered = memtable.begin_flush();
+        let points = &recovered.tenants[&test_tenant()][0].points;
+        assert_eq!(
+            points.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![100, 200],
+            "the aborted generation is older than what arrived under it"
+        );
+    }
+
+    #[test]
+    fn the_state_total_slot_holds_one_kind_at_a_time() {
+        let mut state = SeriesState::default();
+        assert!(state.running_total().is_none() && state.histogram_total_id().is_none());
+
+        state.set_running_total(7.5);
+        assert_eq!(state.running_total(), Some(7.5));
+        assert!(state.histogram_total_id().is_none());
+        assert!(state.carries_a_total());
+
+        let id = SeriesBufferId(NonZeroU32::new(3).unwrap());
+        state.set_histogram_total_id(id);
+        assert_eq!(state.histogram_total_id(), Some(id));
+        assert!(
+            state.running_total().is_none(),
+            "one slot, and the flags say which reading of it is live"
+        );
+    }
+
+    #[test]
+    fn a_histogram_series_refuses_to_answer_as_scalar_samples() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("http_request_duration_seconds", "shape");
+        memtable.insert(vec![histogram_sample(
+            &series,
+            100,
+            histogram(&[0.005], &[1], 1),
+            SampleKind::Cumulative,
+        )]);
+        let snapshot = memtable.begin_flush();
+        // Until the part writer can encode a histogram chunk, a flush that
+        // reaches one fails loudly and the abort path keeps the points. The
+        // alternative — writing nothing and committing — is the silent loss
+        // this ordering exists to avoid.
+        assert!(
+            snapshot.tenants[&test_tenant()][0]
+                .sorted_samples()
+                .is_err()
+        );
     }
 
     #[test]

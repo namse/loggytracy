@@ -1507,7 +1507,7 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesMemTable};
+    use crate::series::{METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesMemTable};
     use crate::tenant::test_tenant;
 
     fn labels(name: &str, instance: &str) -> SeriesLabels {
@@ -1522,7 +1522,7 @@ mod tests {
             tenant: TenantId::parse(tenant).unwrap(),
             labels: series.clone(),
             ts_ns: ts,
-            value,
+            value: MetricValue::Scalar(value),
             kind: SampleKind::Gauge,
             datapoint_index: 0,
         }

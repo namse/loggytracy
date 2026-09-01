@@ -23,7 +23,9 @@ use crate::backpressure::IngestError;
 use crate::config::Config;
 use crate::journal::Journal;
 use crate::otlp_log::normalize_attribute_key;
-use crate::series::{HistogramPoint, METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
+use crate::series::{
+    HistogramPoint, METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesLabels,
+};
 use crate::tenant::TenantId;
 use crate::trace_ingest::MAX_OTLP_REQUEST_BYTES;
 use axum::http::StatusCode;
@@ -123,7 +125,7 @@ impl Decomposition {
             tenant: tenant.clone(),
             labels,
             ts_ns,
-            value,
+            value: MetricValue::Scalar(value),
             kind,
             datapoint_index: self.datapoint,
         });
@@ -944,7 +946,7 @@ mod tests {
         assert_eq!(samples.len(), 1);
         let sample = &samples[0];
         assert_eq!(sample.ts_ns, 100);
-        assert_eq!(sample.value, 7.5);
+        assert_eq!(sample.value, MetricValue::Scalar(7.5));
         assert_eq!(sample.kind, SampleKind::Gauge);
         assert_eq!(
             label(sample, METRIC_NAME_LABEL).as_deref(),
@@ -1124,10 +1126,14 @@ mod tests {
                 .find(|sample| label(sample, "le").as_deref() == Some(le))
                 .unwrap_or_else(|| panic!("bucket le={le} exists"))
         };
-        assert_eq!(bucket("0.005").value, 3.0);
-        assert_eq!(bucket("0.01").value, 7.0, "le counts are cumulative");
-        assert_eq!(bucket("0.025").value, 9.0);
-        assert_eq!(bucket("+Inf").value, 10.0);
+        assert_eq!(bucket("0.005").value.as_scalar(), Some(3.0));
+        assert_eq!(
+            bucket("0.01").value.as_scalar(),
+            Some(7.0),
+            "le counts are cumulative"
+        );
+        assert_eq!(bucket("0.025").value.as_scalar(), Some(9.0));
+        assert_eq!(bucket("+Inf").value.as_scalar(), Some(10.0));
         assert_eq!(
             bucket("0.005").labels.metric_name().as_deref(),
             Some("http_request_duration_seconds_bucket")
@@ -1138,7 +1144,7 @@ mod tests {
                 sample.labels.metric_name().as_deref() == Some("http_request_duration_seconds_sum")
             })
             .unwrap();
-        assert_eq!(sum.value, 1.25);
+        assert_eq!(sum.value.as_scalar(), Some(1.25));
         let count = samples
             .iter()
             .find(|sample| {
@@ -1146,7 +1152,7 @@ mod tests {
                     == Some("http_request_duration_seconds_count")
             })
             .unwrap();
-        assert_eq!(count.value, 10.0);
+        assert_eq!(count.value.as_scalar(), Some(10.0));
         assert!(
             samples
                 .iter()
@@ -1202,12 +1208,13 @@ mod tests {
         // The smallest bucket absorbed the zero bucket.
         let mut last = 0.0;
         for bucket in &buckets {
-            assert!(bucket.value >= last, "le counts stay cumulative");
-            last = bucket.value;
+            let value = bucket.value.as_scalar().expect("a bucket is a scalar");
+            assert!(value >= last, "le counts stay cumulative");
+            last = value;
         }
         let first = buckets.first().unwrap();
         assert!(
-            first.value >= 5.0,
+            first.value.as_scalar().expect("a bucket is a scalar") >= 5.0,
             "the zero count folds into the smallest bound"
         );
         assert_eq!(
@@ -1217,7 +1224,7 @@ mod tests {
                 .as_deref(),
             Some("+Inf")
         );
-        assert_eq!(buckets.last().unwrap().value, 205.0);
+        assert_eq!(buckets.last().unwrap().value.as_scalar(), Some(205.0));
     }
 
     #[test]
@@ -1253,11 +1260,11 @@ mod tests {
             .iter()
             .find(|sample| label(sample, "quantile").as_deref() == Some("0.99"))
             .unwrap();
-        assert_eq!(p99.value, 0.25);
+        assert_eq!(p99.value.as_scalar(), Some(0.25));
         assert_eq!(p99.kind, SampleKind::Gauge);
         assert!(samples.iter().any(|sample| {
             sample.labels.metric_name().as_deref() == Some("gc_pause_seconds_count")
-                && sample.value == 42.0
+                && sample.value == MetricValue::Scalar(42.0)
                 && sample.kind == SampleKind::Cumulative
         }));
     }

@@ -1,3 +1,4 @@
+use crate::series::MetricValue;
     use super::*;
     use crate::memtable::MemTable;
     use crate::tenant::test_tenant;
@@ -126,7 +127,7 @@
             tenant: first_tenant.clone(),
             labels: first_labels,
             ts_ns: 1,
-            value: 1.0,
+            value: MetricValue::Scalar(1.0),
             kind: crate::series::SampleKind::Gauge,
             datapoint_index: 0,
         };
@@ -134,7 +135,7 @@
             tenant: second_tenant.clone(),
             labels: second_labels,
             ts_ns: 1,
-            value: 2.0,
+            value: MetricValue::Scalar(2.0),
             kind: crate::series::SampleKind::Gauge,
             datapoint_index: 0,
         };

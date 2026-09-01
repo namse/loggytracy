@@ -361,8 +361,8 @@ pub async fn compact_loop(
 mod tests {
     use super::*;
     use crate::series::{
-        METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels, SeriesMemTable, SeriesSnapshot,
-        SnapshotSeries,
+        METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesLabels, SeriesMemTable,
+        SeriesSnapshot, SnapshotSeries,
     };
     use crate::tenant::test_tenant;
 
@@ -378,7 +378,7 @@ mod tests {
             tenant: test_tenant(),
             labels: series.clone(),
             ts_ns: ts,
-            value,
+            value: MetricValue::Scalar(value),
             kind: SampleKind::Gauge,
             datapoint_index: 0,
         }
@@ -562,6 +562,7 @@ mod tests {
                         bounds: sample_bounds(&spill),
                         chunks: Vec::new(),
                         spill,
+                        points: Vec::new(),
                     })
                     .collect(),
             )]
