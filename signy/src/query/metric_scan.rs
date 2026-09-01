@@ -101,7 +101,7 @@ async fn scan_metric_series(
             in_memtable: bool,
             parts: Vec<(
                 Arc<crate::series_part::SeriesPartReader>,
-                crate::series_part::CatalogEntry,
+                crate::series_part::ChunkRef,
             )>,
         }
         let mut selected: std::collections::BTreeMap<SeriesLabels, Sources> =
@@ -126,18 +126,21 @@ async fn scan_metric_series(
                 continue;
             }
             let window = reader.window(decode_start_ns, request.end_ns);
-            for entry in reader.tenant_catalog(&tenant) {
-                if !entry.overlaps(window) {
+            for row in reader.tenant_catalog(&tenant).iter() {
+                if !row.overlaps(window) {
                     continue;
                 }
-                if !metric_labels_match(entry.labels.as_bytes(), &request.metric, &request.filters) {
+                if !metric_labels_match(row.labels, &request.metric, &request.filters) {
                     continue;
                 }
-                let sources = selected.entry(entry.labels.clone()).or_insert(Sources {
+                // Only a row that matched becomes an owned identity. The walk
+                // above touched the 28-byte row array and nothing else.
+                let labels = SeriesLabels::from_canonical(row.labels.to_vec());
+                let sources = selected.entry(labels).or_insert(Sources {
                     in_memtable: false,
                     parts: Vec::new(),
                 });
-                sources.parts.push((reader.clone(), entry.clone()));
+                sources.parts.push((reader.clone(), row.chunk));
             }
         }
 
@@ -177,8 +180,8 @@ selector, shorten the window, or coarsen step",
             } else {
                 Vec::new()
             };
-            for (reader, entry) in &sources.parts {
-                samples.extend(reader.read_series(entry)?);
+            for (reader, chunk) in &sources.parts {
+                samples.extend(reader.read_series(*chunk)?);
             }
             samples.retain(|(ts, _)| *ts >= decode_start_ns && *ts <= request.end_ns);
             samples.sort_by_key(|(ts, _)| *ts);

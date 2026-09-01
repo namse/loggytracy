@@ -55,12 +55,12 @@ fn discover_series(
             continue;
         }
         let window = reader.window(start_ns, end_ns);
-        for entry in reader.tenant_catalog(tenant) {
-            if !entry.overlaps(window) {
+        for row in reader.tenant_catalog(tenant).iter() {
+            if !row.overlaps(window) {
                 continue;
             }
-            if metric_labels_match(entry.labels.as_bytes(), &params.metric, &params.filters) {
-                series.insert(entry.labels.clone());
+            if metric_labels_match(row.labels, &params.metric, &params.filters) {
+                series.insert(SeriesLabels::from_canonical(row.labels.to_vec()));
             }
         }
     }

@@ -50,6 +50,11 @@ futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 mimalloc = { version = "0.1", default-features = false }
+# The metric catalog is read through a mapping rather than into the heap: a
+# part's rows stay addressable for as long as the part is registered, and page
+# cache the kernel can reclaim is not the same resource as anonymous memory it
+# can only OOM on.
+memmap2 = "0.9"
 # `statvfs`, for the one thing this process measures about the machine under it:
 # how much room is left on the disk the WAL cannot do without.
 libc = "0.2"

@@ -7,12 +7,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Weak;
 
 use parking_lot::RwLock;
 
 use crate::object_storage::MetricManifest;
-use crate::series::SeriesMemTable;
 use crate::series_part::{SeriesPart, SeriesPartReader, discover_series_parts};
 use crate::tenant::TenantId;
 
@@ -20,7 +18,6 @@ pub struct SeriesRegistry {
     inner: RwLock<HashMap<String, Arc<SeriesPartReader>>>,
     stored_bytes: RwLock<HashMap<TenantId, u64>>,
     operation_lock: Arc<tokio::sync::RwLock<()>>,
-    label_source: Option<Weak<SeriesMemTable>>,
 }
 
 fn reader_tenant_bytes(reader: &SeriesPartReader) -> Vec<(TenantId, u64)> {
@@ -53,17 +50,7 @@ impl SeriesRegistry {
             inner: RwLock::new(HashMap::new()),
             stored_bytes: RwLock::new(HashMap::new()),
             operation_lock,
-            label_source: None,
         }
-    }
-
-    pub(crate) fn new_with_memtable(
-        operation_lock: Arc<tokio::sync::RwLock<()>>,
-        memtable: &Arc<SeriesMemTable>,
-    ) -> Self {
-        let mut registry = Self::new(operation_lock);
-        registry.label_source = Some(Arc::downgrade(memtable));
-        registry
     }
 
     pub fn operation_lock(&self) -> Arc<tokio::sync::RwLock<()>> {
@@ -83,16 +70,6 @@ impl SeriesRegistry {
         operation_lock: Arc<tokio::sync::RwLock<()>>,
     ) -> Result<Self, String> {
         let registry = Self::new(operation_lock);
-        registry.reload_from_disk(metrics_root)?;
-        Ok(registry)
-    }
-
-    pub(crate) fn load_from_disk_with_memtable(
-        metrics_root: &Path,
-        operation_lock: Arc<tokio::sync::RwLock<()>>,
-        memtable: &Arc<SeriesMemTable>,
-    ) -> Result<Self, String> {
-        let registry = Self::new_with_memtable(operation_lock, memtable);
         registry.reload_from_disk(metrics_root)?;
         Ok(registry)
     }
@@ -149,67 +126,15 @@ impl SeriesRegistry {
         Ok(registry)
     }
 
-    pub(crate) fn load_from_manifest_with_memtable(
-        metrics_root: &Path,
-        manifest: &MetricManifest,
-        operation_lock: Arc<tokio::sync::RwLock<()>>,
-        memtable: &Arc<SeriesMemTable>,
-    ) -> Result<Self, String> {
-        let registry = Self::new_with_memtable(operation_lock, memtable);
-        let mut readers = HashMap::new();
-        for descriptor in &manifest.parts {
-            let dir = metrics_root
-                .join(&descriptor.partition)
-                .join(&descriptor.id);
-            let part = crate::series_part::load_series_part(&dir).map_err(|error| {
-                format!(
-                    "failed to load metric manifest part {}: {error}",
-                    descriptor.id
-                )
-            })?;
-            if part.meta.id != descriptor.id || part.meta.partition != descriptor.partition {
-                return Err(format!(
-                    "cached metric part metadata does not match manifest descriptor {}/{}",
-                    descriptor.partition, descriptor.id
-                ));
-            }
-            let reader = registry.open_part(part, false).map_err(|error| {
-                format!(
-                    "failed to open metric manifest part {}: {error}",
-                    descriptor.id
-                )
-            })?;
-            readers.insert(descriptor.id.clone(), Arc::new(reader));
-        }
-        *registry.stored_bytes.write() = census_of(&readers);
-        *registry.inner.write() = readers;
-        Ok(registry)
-    }
-
-    pub(crate) fn label_source(&self) -> Option<Weak<SeriesMemTable>> {
-        self.label_source.clone()
-    }
-
-    fn open_part_with_source(
-        part: SeriesPart,
-        require_data: bool,
-        source: Option<&Arc<SeriesMemTable>>,
-    ) -> Result<SeriesPartReader, String> {
-        match source {
-            Some(memtable) if require_data => SeriesPartReader::open_with_memtable(part, memtable),
-            Some(memtable) => SeriesPartReader::open_cached_with_memtable(part, memtable),
-            None if require_data => SeriesPartReader::open(part),
-            None => SeriesPartReader::open_cached(part),
-        }
-    }
-
     fn open_part(&self, part: SeriesPart, require_data: bool) -> Result<SeriesPartReader, String> {
-        let source = self.label_source.as_ref().and_then(Weak::upgrade);
-        Self::open_part_with_source(part, require_data, source.as_ref())
+        let _ = self;
+        if require_data {
+            SeriesPartReader::open(part)
+        } else {
+            SeriesPartReader::open_cached(part)
+        }
     }
 
-    /// Registered parts among `ids` whose data body is not local — what a
-    /// read's pin must restore before it can decode.
     pub fn missing_data_ids(
         &self,
         ids: &std::collections::HashSet<String>,
@@ -237,30 +162,8 @@ impl SeriesRegistry {
         Ok(readers)
     }
 
-    pub(crate) fn open_parts_shared(
-        &self,
-        parts: Vec<SeriesPart>,
-    ) -> Result<Vec<(String, Arc<SeriesPartReader>)>, String> {
-        let source = self.label_source.as_ref().and_then(Weak::upgrade);
-        Self::open_parts_with_label_source(parts, source)
-    }
-
-    pub(crate) fn open_parts_with_label_source(
-        parts: Vec<SeriesPart>,
-        source: Option<Arc<SeriesMemTable>>,
-    ) -> Result<Vec<(String, Arc<SeriesPartReader>)>, String> {
-        let mut readers = Vec::with_capacity(parts.len());
-        for part in parts {
-            let id = part.meta.id.clone();
-            let reader = Self::open_part_with_source(part, true, source.as_ref())
-                .map_err(|error| format!("failed to open metric part {id}: {error}"))?;
-            readers.push((id, Arc::new(reader)));
-        }
-        Ok(readers)
-    }
-
     pub fn register(&self, parts: Vec<SeriesPart>) -> Result<Vec<String>, String> {
-        Ok(self.register_opened(self.open_parts_shared(parts)?))
+        Ok(self.register_opened(Self::open_parts(parts)?))
     }
 
     pub fn register_opened(&self, readers: Vec<(String, Arc<SeriesPartReader>)>) -> Vec<String> {

@@ -111,7 +111,7 @@
         )
         .unwrap();
         let catalog = reader.tenant_catalog(&test_tenant());
-        assert_eq!(reader.read_series(&catalog[0]).unwrap().len(), 3);
+        assert_eq!(reader.read_series(catalog.get(0).unwrap().chunk).unwrap().len(), 3);
 
         storage
             .evict_metric_cache(&root, 0, &[parts[0].dir.clone()])

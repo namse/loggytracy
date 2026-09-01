@@ -272,7 +272,7 @@ pub async fn compact_once(
     }
 
     // The visibility transition, atomic against queries exactly as flush's is.
-    let opened = registry.open_parts_shared(new_parts.clone())?;
+    let opened = SeriesRegistry::open_parts(new_parts.clone())?;
     let input_ids: Vec<String> = input_descriptors
         .iter()
         .map(|part| part.id.clone())
@@ -410,11 +410,11 @@ mod tests {
         let mut merged: std::collections::BTreeMap<SeriesLabels, Vec<(i64, f64)>> =
             std::collections::BTreeMap::new();
         for reader in registry.snapshot() {
-            for entry in reader.tenant_catalog(&test_tenant()) {
+            for entry in reader.tenant_catalog(&test_tenant()).iter() {
                 merged
-                    .entry(entry.labels.clone())
+                    .entry(SeriesLabels::from_canonical(entry.labels.to_vec()))
                     .or_default()
-                    .extend(reader.read_series(entry).unwrap());
+                    .extend(reader.read_series(entry.chunk).unwrap());
             }
         }
         for samples in merged.values_mut() {
@@ -505,7 +505,7 @@ mod tests {
         for reader in &inputs {
             expected.extend(
                 reader
-                    .read_series(&reader.tenant_catalog(&test_tenant())[0])
+                    .read_series(reader.tenant_catalog(&test_tenant()).get(0).unwrap().chunk)
                     .unwrap(),
             );
         }
@@ -516,7 +516,7 @@ mod tests {
         let reader = SeriesPartReader::open(parts.into_iter().next().unwrap()).unwrap();
         assert_eq!(
             reader
-                .read_series(&reader.tenant_catalog(&test_tenant())[0])
+                .read_series(reader.tenant_catalog(&test_tenant()).get(0).unwrap().chunk)
                 .unwrap(),
             expected,
             "overlapping samples retain stable timestamp ordering"
@@ -545,11 +545,11 @@ mod tests {
         let mut tenants: std::collections::BTreeMap<SeriesLabels, Vec<(i64, f64)>> =
             std::collections::BTreeMap::new();
         for reader in &inputs {
-            for entry in reader.tenant_catalog(&test_tenant()) {
+            for entry in reader.tenant_catalog(&test_tenant()).iter() {
                 tenants
-                    .entry(entry.labels.clone())
+                    .entry(SeriesLabels::from_canonical(entry.labels.to_vec()))
                     .or_default()
-                    .extend(reader.read_series(entry).unwrap());
+                    .extend(reader.read_series(entry.chunk).unwrap());
             }
         }
         let snapshot = SeriesSnapshot {

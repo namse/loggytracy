@@ -173,8 +173,6 @@ struct SampleOutcome {
     series_buffers_stream: GaugeSeries,
     series_flushing_series: GaugeSeries,
     series_flushing_tenants: GaugeSeries,
-    series_interner_len: GaugeSeries,
-    series_interner_capacity: GaugeSeries,
     rss: GaugeSeries,
     anon: GaugeSeries,
     health_samples: u64,
@@ -1197,14 +1195,6 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
                             elapsed,
                             probe::gauge(&metrics, "signy_series_flushing_tenants"),
                         );
-                        outcome.series_interner_len.push(
-                            elapsed,
-                            probe::gauge(&metrics, "signy_series_label_interner_len"),
-                        );
-                        outcome.series_interner_capacity.push(
-                            elapsed,
-                            probe::gauge(&metrics, "signy_series_label_interner_capacity"),
-                        );
                     }
                     if let Some(healthy) = metrics.get("signy_remote_healthy") {
                         outcome.health_samples += 1;
@@ -1436,14 +1426,6 @@ fn series_memory_report(samples: &SampleOutcome, terminal: &probe::Metrics) -> V
         "flushing_tenants": {
             "summary": samples.series_flushing_tenants.summary(),
             "samples": samples.series_flushing_tenants.points(),
-        },
-        "interner_len": {
-            "summary": samples.series_interner_len.summary(),
-            "samples": samples.series_interner_len.points(),
-        },
-        "interner_capacity": {
-            "summary": samples.series_interner_capacity.summary(),
-            "samples": samples.series_interner_capacity.points(),
         },
         "terminal": {
             "states_len": probe::gauge(terminal, "signy_series_states_len"),

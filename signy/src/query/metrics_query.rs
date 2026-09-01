@@ -225,32 +225,26 @@ see docs/QUERY_API.md"
 /// Whether `<metric>{quantile=...}` series exist for the tenant — the check
 /// behind the summary-backed refusal. Catalog and index reads only.
 fn summary_backed(state: &AppState, tenant: &TenantId, metric: &str) -> bool {
-    let has_quantile = |labels: &SeriesLabels| {
-        labels
-            .pairs()
-            .ok()
-            .map(|pairs| {
-                pairs
-                    .iter()
-                    .any(|(key, _)| key == crate::series::METRIC_NAME_LABEL)
-                    && pairs
-                        .iter()
-                        .any(|(key, value)| key == crate::series::METRIC_NAME_LABEL && value == metric)
-                    && pairs.iter().any(|(key, _)| key == "quantile")
-            })
-            .unwrap_or(false)
+    let has_quantile = |labels: &[u8]| {
+        let mut named = false;
+        let mut quantile = false;
+        for (key, value) in crate::series::canonical_pairs(labels).filter_map(Result::ok) {
+            named |= key == crate::series::METRIC_NAME_LABEL && value == metric;
+            quantile |= key == "quantile";
+        }
+        named && quantile
     };
     state
         .journal
         .series_memtable()
         .series_labels(tenant)
         .iter()
-        .any(&has_quantile)
+        .any(|labels| has_quantile(labels.as_bytes()))
         || state.series_parts.snapshot().iter().any(|reader| {
             reader
                 .tenant_catalog(tenant)
                 .iter()
-                .any(|entry| has_quantile(&entry.labels))
+                .any(|row| has_quantile(row.labels))
         })
 }
 

@@ -1640,7 +1640,7 @@ mod tests {
         let reader = restored.snapshot().into_iter().next().unwrap();
         let catalog = reader.tenant_catalog(&test_tenant());
         assert_eq!(catalog.len(), 1);
-        let stored = reader.read_series(&catalog[0]).unwrap();
+        let stored = reader.read_series(catalog.get(0).unwrap().chunk).unwrap();
         assert_eq!(&stored, live.values().next().unwrap());
         // And the WAL was retired: a replay after the flush puts nothing back.
         let replayed = SeriesMemTable::new();

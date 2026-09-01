@@ -1321,8 +1321,6 @@
         assert!(rendered.contains("signy_series_buffers_inline 1\n"));
         assert!(rendered.contains("signy_series_buffers_stream 0\n"));
         assert!(rendered.contains("signy_series_flushing_series 0\n"));
-        assert!(rendered.contains("signy_series_label_interner_len "));
-        assert!(rendered.contains("signy_series_label_interner_capacity "));
 
         let snapshot = state.journal.series_memtable().begin_flush();
         let rendered = metrics(State(state.clone())).await;

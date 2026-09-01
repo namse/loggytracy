@@ -452,12 +452,7 @@ signy_series_buffers_stream {}\n\
 signy_series_flushing_series {}\n\
 # TYPE signy_series_flushing_tenants gauge\n\
 signy_series_flushing_tenants {}\n\
-# HELP signy_series_label_interner_len Weak label-interner hash entries across shards.\n\
-# TYPE signy_series_label_interner_len gauge\n\
-signy_series_label_interner_len {}\n\
-# HELP signy_series_label_interner_capacity Sum of weak label-interner shard capacities.\n\
-# TYPE signy_series_label_interner_capacity gauge\n\
-signy_series_label_interner_capacity {}\n",
+",
             stats.states_len,
             stats.states_capacity,
             stats.buffers_len,
@@ -467,8 +462,6 @@ signy_series_label_interner_capacity {}\n",
             stats.stream_buffers,
             stats.flushing_series,
             stats.flushing_tenants,
-            stats.interner_len,
-            stats.interner_capacity,
         ));
     }
     body

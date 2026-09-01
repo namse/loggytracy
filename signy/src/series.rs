@@ -20,13 +20,11 @@
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::Mutex;
 use parking_lot::RwLock;
 
 use crate::gorilla;
@@ -49,170 +47,6 @@ impl Borrow<[u8]> for SeriesLabels {
     }
 }
 
-/// A process-local, weak string interner for canonical catalog identities.
-///
-/// Part catalogs often contain the same label set in several parts. Keeping a
-/// separate `Vec<u8>` for each catalog copy made catalog memory grow with the
-/// number of parts, even though all copies represented the same identity. The
-/// interner shares the immutable `Arc<[u8]>` payload while at least one catalog
-/// owner is alive. Active series deliberately do not register here: their
-/// index owns its canonical bytes directly and does not need a process-wide
-/// map entry on the cardinality hot path.
-///
-/// Values are weak on purpose: this is a cache of allocations, not a second
-/// owner of every label ever observed.  Dead entries are removed incrementally
-/// from the shard that receives new identities, so a churn workload does not
-/// turn the optimization into an unbounded label store.  Hashes select a
-/// shard only; equality is still checked against the complete canonical bytes,
-/// so a hash collision can never merge two series.
-struct LabelInterner {
-    shards: Vec<Mutex<LabelInternerShard>>,
-}
-
-struct LabelInternerShard {
-    by_hash: HashMap<u64, std::sync::Weak<[u8]>>,
-    registrations_since_sweep: usize,
-}
-
-const LABEL_INTERNER_SHARDS: usize = 64;
-const LABEL_INTERNER_SWEEP_INTERVAL: usize = 4096;
-
-/// Entries one shard will hold. The pool is a cache of allocations, and a
-/// cache has to be bounded or it becomes the thing it was avoiding: a
-/// cardinality burst retires millions of identities at once, and remembering
-/// each of them costs a bucket of its own — at ten million series the pool
-/// would cost more than the index entries whose retirement filled it. The
-/// bound keeps the hit that pays, a steady population that keeps reporting,
-/// and lets a burst overflow past it. Sixty-four shards of this hold rather
-/// more than the comparison bed's active population.
-const LABEL_INTERNER_SHARD_CAPACITY: usize = 8_192;
-
-static LABEL_INTERNER: OnceLock<LabelInterner> = OnceLock::new();
-
-impl LabelInternerShard {
-    /// Remember one payload, unless this shard is full. A full shard drops
-    /// its dead entries first; if the live ones alone fill it, the caller
-    /// keeps an ordinary unshared `Arc` — correct, merely not deduplicated.
-    fn remember(&mut self, hash: u64, payload: &std::sync::Arc<[u8]>) {
-        // The sweep is paced by attempts, not by insertions. Pacing it by
-        // insertions instead let a full shard sweep on every offer, and a
-        // retirement offers one per flushed series: the 10-million probe spent
-        // its budget walking eight thousand weak pointers six million times
-        // and timed out 1,063 requests to reach 2.3 million fewer series.
-        self.registrations_since_sweep += 1;
-        if self.registrations_since_sweep >= LABEL_INTERNER_SWEEP_INTERVAL {
-            self.registrations_since_sweep = 0;
-            self.by_hash.retain(|_, weak| weak.strong_count() != 0);
-        }
-        if self.by_hash.len() >= LABEL_INTERNER_SHARD_CAPACITY {
-            return;
-        }
-        self.by_hash
-            .insert(hash, std::sync::Arc::downgrade(payload));
-    }
-}
-
-impl LabelInterner {
-    fn global() -> &'static Self {
-        LABEL_INTERNER.get_or_init(|| LabelInterner {
-            shards: (0..LABEL_INTERNER_SHARDS)
-                .map(|_| {
-                    Mutex::new(LabelInternerShard {
-                        by_hash: HashMap::new(),
-                        registrations_since_sweep: 0,
-                    })
-                })
-                .collect(),
-        })
-    }
-
-    fn hash(bytes: &[u8]) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    fn lookup(&self, bytes: &[u8]) -> Option<SeriesLabels> {
-        let hash = Self::hash(bytes);
-        let shard_index = (hash as usize) % self.shards.len();
-        let shard = self.shards[shard_index].lock();
-        // Keep the full byte comparison after the hash lookup.  The hash is a
-        // routing aid, never the series identity.
-        if let Some(weak) = shard.by_hash.get(&hash)
-            && let Some(existing) = weak.upgrade()
-            && existing.as_ref() == bytes
-        {
-            return Some(SeriesLabels(existing));
-        }
-        // A hash collision cannot merge identities. Keeping the existing
-        // entry also means the colliding label remains an ordinary, correctly
-        // comparable Arc without allocating a collision bucket for the
-        // overwhelmingly common case.
-        None
-    }
-
-    /// Intern a label that came from a catalog. The weak pool is deliberately
-    /// populated only by catalog misses, never by active-series admission.
-    fn intern_catalog(&self, labels: SeriesLabels) -> SeriesLabels {
-        if let Some(existing) = self.lookup(&labels.0) {
-            return existing;
-        }
-        let hash = Self::hash(&labels.0);
-        let shard_index = (hash as usize) % self.shards.len();
-        let mut shard = self.shards[shard_index].lock();
-        if let Some(weak) = shard.by_hash.get(&hash)
-            && let Some(existing) = weak.upgrade()
-        {
-            if existing.as_ref() == labels.0.as_ref() {
-                return SeriesLabels(existing);
-            }
-            // A collision is not an identity match; leave the existing entry
-            // intact and keep this label as an ordinary Arc.
-            return labels;
-        }
-        shard.remember(hash, &labels.0);
-        labels
-    }
-
-    /// Reuse an existing catalog allocation, but do not add a fresh active
-    /// series to the pool. This keeps the pool proportional to historical
-    /// catalog-only labels rather than cardinality.
-    fn reuse_catalog_or_self(&self, labels: SeriesLabels) -> SeriesLabels {
-        self.lookup(&labels.0).unwrap_or(labels)
-    }
-
-    fn register_evicted(&self, labels: &SeriesLabels) {
-        let hash = Self::hash(&labels.0);
-        let shard_index = (hash as usize) % self.shards.len();
-        let mut shard = self.shards[shard_index].lock();
-        if let Some(weak) = shard.by_hash.get(&hash)
-            && let Some(existing) = weak.upgrade()
-        {
-            if existing.as_ref() == labels.0.as_ref() {
-                return;
-            }
-            return;
-        }
-        shard.remember(hash, &labels.0);
-    }
-
-    /// Aggregate the weak interner's map population.  The interner is sharded
-    /// only to keep registration contention low; the diagnostic is deliberately
-    /// process-wide and sums the shards so a capacity probe can compare it to
-    /// the series index without exposing a shard dimension.
-    fn stats(&self) -> (usize, usize) {
-        self.shards
-            .iter()
-            .fold((0usize, 0usize), |(len, capacity), shard| {
-                let shard = shard.lock();
-                (
-                    len.saturating_add(shard.by_hash.len()),
-                    capacity.saturating_add(shard.by_hash.capacity()),
-                )
-            })
-    }
-}
-
 impl SeriesLabels {
     /// Canonicalize a pair set. Pairs are sorted by key; on a duplicate key
     /// the *first* occurrence wins, which lets the caller express precedence
@@ -230,29 +64,13 @@ impl SeriesLabels {
         Self(bytes.into())
     }
 
-    /// Rehydrate from stored canonical bytes (a part's catalog). The bytes
-    /// crossed a checksum, not a validator — callers that read them from disk
-    /// decode `pairs()` once to fail early on corruption.
+    /// Rehydrate from stored canonical bytes — a catalog row a selector has
+    /// matched, or a merge head. It does not go through the pool: a mapped
+    /// catalog owns no allocation for the pool to hand back, so registering
+    /// one identity per matched row would be a lock and a hash per row of
+    /// every query, in exchange for nothing.
     pub fn from_canonical(bytes: Vec<u8>) -> Self {
-        Self(bytes.into()).intern()
-    }
-
-    /// Return a copy of this identity whose immutable byte payload is shared
-    /// with any other live copy in this process.  This is intentionally an
-    /// explicit operation rather than part of every `from_pairs` call: label
-    /// normalization is a hot ingest path, while only identities retained by
-    /// the memtable or part catalog need process-wide sharing.
-    pub(crate) fn intern(self) -> Self {
-        LabelInterner::global().intern_catalog(self)
-    }
-
-    pub(crate) fn reuse_catalog_or_self(self) -> Self {
-        LabelInterner::global().reuse_catalog_or_self(self)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shares_storage(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Self(bytes.into())
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -502,8 +320,6 @@ pub struct SeriesMemoryStats {
     pub stream_buffers: usize,
     pub flushing_series: usize,
     pub flushing_tenants: usize,
-    pub interner_len: usize,
-    pub interner_capacity: usize,
 }
 
 // The old 160-byte estimate omitted allocator/container overhead.  The M10
@@ -883,14 +699,6 @@ impl SeriesStates {
         self.shards[shard].get_mut(labels)
     }
 
-    fn get_key_value<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> Option<(&SeriesLabels, &SeriesState)>
-    where
-        SeriesLabels: Borrow<Q>,
-    {
-        let shard = self.shard_for(key);
-        self.shards[shard].get_key_value(key)
-    }
-
     fn insert(&mut self, labels: SeriesLabels, state: SeriesState) -> Option<SeriesState> {
         let shard = self.shard_for(&labels);
         let previous = self.shards[shard].insert(labels, state);
@@ -1097,26 +905,6 @@ impl SeriesMemTable {
     /// tenant index. The returned keys clone only their `Arc` payload, so an
     /// active label does not allocate a second byte buffer. Keeping one read
     /// guard for the batch avoids a lock round-trip per catalog row.
-    pub(crate) fn resolve_live_label_batch(
-        &self,
-        tenant: &TenantId,
-        canonical: &[&[u8]],
-    ) -> Vec<Option<SeriesLabels>> {
-        let inner = self.inner.read();
-        let Some(series) = inner.get(tenant) else {
-            return vec![None; canonical.len()];
-        };
-        canonical
-            .iter()
-            .map(|bytes| {
-                series
-                    .states
-                    .get_key_value(*bytes)
-                    .map(|(labels, _)| labels.clone())
-            })
-            .collect()
-    }
-
     /// Current container populations used by the metric index and its sample
     /// arena.  The snapshot takes the same read locks as query/discovery and
     /// never walks encoded samples, so an operator scrape can inspect the
@@ -1175,7 +963,6 @@ impl SeriesMemTable {
                 )
             })
             .unwrap_or_default();
-        let (interner_len, interner_capacity) = LabelInterner::global().stats();
         SeriesMemoryStats {
             states_len,
             states_capacity,
@@ -1186,8 +973,6 @@ impl SeriesMemTable {
             stream_buffers,
             flushing_series,
             flushing_tenants,
-            interner_len,
-            interner_capacity,
         }
     }
 
@@ -1268,10 +1053,9 @@ impl SeriesMemTable {
                 if tenant_series.states.contains_key(label) {
                     continue;
                 }
-                tenant_series.states.insert(
-                    label.clone().reuse_catalog_or_self(),
-                    SeriesState::default(),
-                );
+                tenant_series
+                    .states
+                    .insert(label.clone(), SeriesState::default());
                 self.counters
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -1479,10 +1263,9 @@ impl SeriesMemTable {
             let mut reserved = 0u64;
             for labels in new_labels {
                 reserved += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
-                tenant_series.states.insert(
-                    (*labels).clone().reuse_catalog_or_self(),
-                    SeriesState::default(),
-                );
+                tenant_series
+                    .states
+                    .insert((*labels).clone(), SeriesState::default());
                 if let Some(admitted_ts) = newest {
                     tenant_series.mark_admitted(labels, admitted_ts);
                 }
@@ -1541,9 +1324,6 @@ impl SeriesMemTable {
             })
             .collect();
         for (labels, buffer_id) in idle {
-            // Keep only a weak hint for catalogs that still own the payload;
-            // the pool never becomes an owner of evicted series.
-            LabelInterner::global().register_evicted(&labels);
             if let Some(state) = tenant_series.states.remove(&labels)
                 && let Some(id) = state.buffer_id.or(buffer_id)
             {
@@ -1593,10 +1373,9 @@ impl SeriesMemTable {
                     .series_created_total
                     .fetch_add(1, Ordering::Relaxed);
                 self.counters.active_series.fetch_add(1, Ordering::Relaxed);
-                tenant_series.states.insert(
-                    labels.clone().reuse_catalog_or_self(),
-                    SeriesState::default(),
-                );
+                tenant_series
+                    .states
+                    .insert(labels.clone(), SeriesState::default());
             }
             let buffer_id = if let Some(id) = tenant_series
                 .states
@@ -1794,10 +1573,6 @@ impl SeriesMemTable {
                 if !retire {
                     continue;
                 }
-                // Keep a weak hint, exactly as the idle sweep does: the
-                // catalog that now owns these bytes can hand them straight
-                // back if the series reports again.
-                LabelInterner::global().register_evicted(labels);
                 if let Some(state) = tenant_series.states.remove(labels)
                     && let Some(id) = state.buffer_id.or(buffer_id)
                 {
@@ -1838,10 +1613,9 @@ impl SeriesMemTable {
             for series in list {
                 if !tenant_series.states.contains_key(&series.labels) {
                     restored_state += series.labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
-                    tenant_series.states.insert(
-                        series.labels.clone().reuse_catalog_or_self(),
-                        SeriesState::default(),
-                    );
+                    tenant_series
+                        .states
+                        .insert(series.labels.clone(), SeriesState::default());
                 }
                 let buffer_id = if let Some(id) = tenant_series
                     .states
@@ -2154,10 +1928,9 @@ mod tests {
         assert_eq!(states.len(), series_labels.len());
         assert!(states.capacity() >= states.len());
         for label in &series_labels {
-            let (stored, state) = states
-                .get_key_value(label.as_bytes())
-                .expect("borrowed canonical bytes find their full key");
-            assert_eq!(stored, label);
+            let state = states
+                .get(label)
+                .expect("a sharded lookup finds the shard its key was routed to");
             assert!(state.last_ts().is_some());
         }
         assert_eq!(states.iter().count(), series_labels.len());
@@ -2199,23 +1972,6 @@ mod tests {
             vec![("k".to_string(), "datapoint".to_string())]
         );
         assert_eq!(labels("up", "a").metric_name().as_deref(), Some("up"));
-    }
-
-    #[test]
-    fn live_canonical_labels_share_their_payload_without_changing_identity() {
-        let labels = labels("up", "a");
-        let retained = labels.clone().intern();
-        let from_part = SeriesLabels::from_canonical(labels.as_bytes().to_vec());
-        assert!(Arc::ptr_eq(&retained.0, &from_part.0));
-        assert_eq!(retained, from_part);
-
-        let different = SeriesLabels::from_pairs(vec![
-            (METRIC_NAME_LABEL.to_string(), "up".to_string()),
-            ("instance".to_string(), "b".to_string()),
-        ])
-        .intern();
-        assert!(!Arc::ptr_eq(&retained.0, &different.0));
-        assert_ne!(retained, different);
     }
 
     #[test]
@@ -2303,8 +2059,6 @@ mod tests {
         assert_eq!(stats.stream_buffers, 1);
         assert_eq!(stats.flushing_series, 0);
         assert_eq!(stats.flushing_tenants, 0);
-        assert!(stats.interner_len > 0);
-        assert!(stats.interner_capacity >= stats.interner_len);
 
         let snapshot = memtable.begin_flush();
         let stats = memtable.memory_stats();
@@ -2758,35 +2512,6 @@ mod tests {
         let results: Vec<_> = canonical_pairs(truncated).collect();
         assert_eq!(results.len(), 1, "the walk stops rather than looping");
         assert!(results[0].is_err());
-    }
-
-    #[test]
-    fn the_label_pool_stops_growing_before_it_costs_more_than_it_saves() {
-        let memtable = SeriesMemTable::new();
-        let burst: Vec<MetricSample> = (0..40_000)
-            .map(|index| {
-                sample(
-                    &labels("queue_depth", &format!("pool-burst-{index}")),
-                    100,
-                    1.0,
-                    SampleKind::Gauge,
-                )
-            })
-            .collect();
-        memtable.insert(burst);
-        let snapshot = memtable.begin_flush();
-        memtable.commit_flush();
-        assert_eq!(memtable.retire_flushed(&snapshot), 40_000);
-
-        // Every retired identity offers itself to the pool. The pool is a
-        // cache of allocations, so it takes what it is sized for and lets the
-        // rest go: an entry per burst series would cost more than the index
-        // buckets the retirement just returned.
-        let (len, _) = LabelInterner::global().stats();
-        assert!(
-            len <= LABEL_INTERNER_SHARDS * LABEL_INTERNER_SHARD_CAPACITY,
-            "the pool grew past its bound: {len} entries"
-        );
     }
 
     #[test]
