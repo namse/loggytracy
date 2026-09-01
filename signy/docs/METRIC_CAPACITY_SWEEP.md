@@ -201,3 +201,60 @@ reduction needed for 10 million series; the next optimization target is the
 per-series canonical label allocation/representation, not more HashMap
 growth tuning. The artifact is under
 `compare/target/metric-capacity-probe-sharded-10m/`.
+
+### Retiring flushed identities from the active index (2026-09-01)
+
+The sharded probe left the active-series index as the limiter, so the index
+stopped keeping series it has no answer for. A gauge or cumulative series that
+has been written to a part holds an entry for one thing, `last_ts`, and that
+reason ends at a part boundary: the read path sorts and de-duplicates across
+parts and the compactor merges their samples by timestamp. Retirement runs
+after the flush's visibility transition — the parts carrying those series are
+registered before their identities leave — and skips a series with samples
+buffered mid-flush, a delta running total, or an admission in flight.
+
+Three fixed 10,000,000-series probes, same 2 GiB Docker memory and memswap
+limit as every row above:
+
+| change | accepted series | anon peak | last state shape |
+|---|---:|---:|---|
+| retirement | 6,985,010 | 2,030 MiB | `states_len=1,050,000`, `interner_len=5,935,010` |
+| bounded pool, as first written | 4,690,010 | 2,017 MiB | `states_len=1,840,000`, `interner_len=524,288` |
+| bounded pool, sweep paced by attempts | **8,340,010** | 2,034 MiB | `states_len=630,000`, `interner_len=524,288` |
+
+The first row is the change working and a second cost appearing in its place.
+The index fell from 6,255,010 states to 1,050,000 — from every series ever
+admitted to only those holding a sample buffer — but retirement offers every
+flushed identity to the weak label pool, so a path that used to run at the
+600-second idle horizon now runs at every flush. The pool took 5,935,010
+entries at a capacity of 7,340,032 and gave back most of the buckets the
+retirement had returned; the run gained 730,000 series where the index had
+released five million entries.
+
+The second row is a loss and is kept for what it cost to find. Bounding the
+pool at 8,192 entries per shard is right, but the first version swept the
+shard's dead entries on every offer once it was full, and a retirement offers
+one per flushed series. The probe measured it end to end: 279 seconds instead
+of 109, 1,063 requests timed out against 938 that answered, and 2.3 million
+fewer series than the unbounded pool it was meant to improve on. Pacing the
+sweep by attempts rather than by insertions makes a full shard decline in
+constant time.
+
+The third row is the state as it stands: **8,340,010 series, 33.3% above the
+6,255,010 the sharded index reached**, with the pool holding exactly its bound
+of 524,288 entries and push latency better than the baseline's (p50 25.1 ms
+against 25.6, p99 406 ms against 702). The measured cost is about 256 bytes of
+anonymous memory per series, against 343 before.
+
+This does not reach the 10-million target and the next limiter is no longer in
+the memtable. With the index holding only buffered series, what remains at the
+failure point is the part catalogs: one `CatalogEntry` per series per part at
+56 bytes, and the canonical labels those entries own — the memtable used to
+share that allocation, and retirement leaves the catalog as its only owner.
+Estimated from the structure rather than measured, that is roughly 1.28 GiB of
+the 2 GiB at this population, so reading `index.bin` as a borrowed mmap is the
+next step and the one that would also bound a residency that currently grows
+with stored parts rather than with active series. The artifacts are under
+`compare/target/metric-capacity-probe-retire-10m/`,
+`compare/target/metric-capacity-probe-pool-10m/` and
+`compare/target/metric-capacity-probe-pool2-10m/`.
