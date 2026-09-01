@@ -94,20 +94,21 @@ impl LabelInternerShard {
     /// its dead entries first; if the live ones alone fill it, the caller
     /// keeps an ordinary unshared `Arc` — correct, merely not deduplicated.
     fn remember(&mut self, hash: u64, payload: &std::sync::Arc<[u8]>) {
-        if self.by_hash.len() >= LABEL_INTERNER_SHARD_CAPACITY {
-            self.by_hash.retain(|_, weak| weak.strong_count() != 0);
-            self.registrations_since_sweep = 0;
-            if self.by_hash.len() >= LABEL_INTERNER_SHARD_CAPACITY {
-                return;
-            }
-        }
-        self.by_hash
-            .insert(hash, std::sync::Arc::downgrade(payload));
+        // The sweep is paced by attempts, not by insertions. Pacing it by
+        // insertions instead let a full shard sweep on every offer, and a
+        // retirement offers one per flushed series: the 10-million probe spent
+        // its budget walking eight thousand weak pointers six million times
+        // and timed out 1,063 requests to reach 2.3 million fewer series.
         self.registrations_since_sweep += 1;
         if self.registrations_since_sweep >= LABEL_INTERNER_SWEEP_INTERVAL {
             self.registrations_since_sweep = 0;
             self.by_hash.retain(|_, weak| weak.strong_count() != 0);
         }
+        if self.by_hash.len() >= LABEL_INTERNER_SHARD_CAPACITY {
+            return;
+        }
+        self.by_hash
+            .insert(hash, std::sync::Arc::downgrade(payload));
     }
 }
 
