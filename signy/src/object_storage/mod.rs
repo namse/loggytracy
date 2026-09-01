@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::part::{self, DATA_FILE, INDEX_FILE, META_FILE, Part};
 use crate::series_part::{
-    SERIES_BLOOM_FILE, SERIES_DATA_FILE, SERIES_INDEX_FILE, SERIES_META_FILE, SeriesPart,
-    SeriesPartReader, discover_series_parts,
+    SERIES_BLOOM_FILE, SERIES_DATA_FILE, SERIES_INDEX_FILE, SERIES_LABELS_FILE, SERIES_META_FILE,
+    SeriesPart, SeriesPartReader, discover_series_parts,
 };
 use crate::trace_part::{
     TRACE_BLOOM_FILE, TRACE_DATA_FILE, TRACE_META_FILE, TracePart, TracePartReader,
@@ -41,15 +41,22 @@ pub const DELETE_REQUEST_PREFIX: &str = "delete_requests";
 const TRACE_PART_FILES: [&str; 3] = [TRACE_DATA_FILE, TRACE_BLOOM_FILE, TRACE_META_FILE];
 const TRACE_CATALOG_FILES: [&str; 2] = [TRACE_BLOOM_FILE, TRACE_META_FILE];
 const METRIC_MANIFEST_FILE: &str = "metric-manifest.json";
-const METRIC_PART_FILES: [&str; 4] = [
+const METRIC_PART_FILES: [&str; 5] = [
     SERIES_DATA_FILE,
     SERIES_INDEX_FILE,
+    SERIES_LABELS_FILE,
     SERIES_BLOOM_FILE,
     SERIES_META_FILE,
 ];
-/// Everything metric selection needs without the body: the catalog, the
-/// label-pair bloom, and the metadata the registry census reads.
-const METRIC_CATALOG_FILES: [&str; 3] = [SERIES_INDEX_FILE, SERIES_BLOOM_FILE, SERIES_META_FILE];
+/// Everything metric selection needs without the body: the catalog rows, the
+/// labels they point at, the label-pair bloom, and the metadata the registry
+/// census reads.
+const METRIC_CATALOG_FILES: [&str; 4] = [
+    SERIES_INDEX_FILE,
+    SERIES_LABELS_FILE,
+    SERIES_BLOOM_FILE,
+    SERIES_META_FILE,
+];
 /// Distinguishes one restore attempt's staging directory from another's.
 ///
 /// The staging directory used to be named for the part alone, which is correct

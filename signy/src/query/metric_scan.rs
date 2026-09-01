@@ -122,8 +122,9 @@ async fn scan_metric_series(
             {
                 continue;
             }
+            let window = reader.window(decode_start_ns, request.end_ns);
             for entry in reader.tenant_catalog(&tenant) {
-                if !entry.overlaps_range(decode_start_ns, request.end_ns) {
+                if !entry.overlaps(window) {
                     continue;
                 }
                 if !metric_labels_match(&entry.labels, &request.metric, &request.filters)? {

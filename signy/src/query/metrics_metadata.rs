@@ -56,8 +56,9 @@ fn discover_series(
         if !reader.part().meta.overlaps_range(start_ns, end_ns) {
             continue;
         }
+        let window = reader.window(start_ns, end_ns);
         for entry in reader.tenant_catalog(tenant) {
-            if !entry.overlaps_range(start_ns, end_ns) {
+            if !entry.overlaps(window) {
                 continue;
             }
             if metric_labels_match(&entry.labels, &params.metric, &params.filters)

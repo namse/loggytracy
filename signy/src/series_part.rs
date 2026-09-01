@@ -34,12 +34,50 @@ use crate::tenant::TenantId;
 
 pub const SERIES_DATA_FILE: &str = "data.bin";
 pub const SERIES_INDEX_FILE: &str = "index.bin";
+pub const SERIES_LABELS_FILE: &str = "labels.bin";
 pub const SERIES_BLOOM_FILE: &str = "series.bloom";
 pub const SERIES_META_FILE: &str = "meta.json";
 
 const SERIES_DATA_MAGIC: &[u8; 4] = b"LMS1";
 const SERIES_INDEX_MAGIC: &[u8; 4] = b"LMI1";
+const SERIES_LABELS_MAGIC: &[u8; 4] = b"LML1";
 const SERIES_BLOOM_MAGIC: &[u8; 4] = b"LMB1";
+
+/// `index.bin` is a fixed-stride array so a reader can address the nth catalog
+/// row without decoding the ones before it, and so selection walks only the
+/// row it needs rather than stepping over inline label payloads. The labels
+/// live in their own file, touched only for a row that survived the time and
+/// name filters.
+///
+/// Header: magic, row count, and the base timestamp the row's millisecond
+/// deltas are measured from. The base is the partition's midnight, which is
+/// known before the first row is written — a part never spans two partitions,
+/// so every sample in it sits inside one day and its offset fits `u32`.
+const SERIES_INDEX_HEADER_BYTES: usize = 16;
+const SERIES_INDEX_ENTRY_BYTES: usize = 28;
+
+/// Midnight UTC of a partition key, in nanoseconds — the base every catalog
+/// row's timestamp delta is relative to.
+fn partition_base_ns(partition: &str) -> Result<i64, String> {
+    chrono::NaiveDate::parse_from_str(partition, "%Y-%m-%d")
+        .map_err(|error| format!("metric partition {partition} is not a date: {error}"))?
+        .and_hms_opt(0, 0, 0)
+        .and_then(|naive| naive.and_utc().timestamp_nanos_opt())
+        .ok_or_else(|| format!("metric partition {partition} is outside the nanosecond range"))
+}
+
+/// Milliseconds from `base`, rounded **outward** so a stored range is never
+/// narrower than the samples it describes. Metadata that cannot answer must
+/// not be able to hide data, which is the rule the bloom follows too.
+fn delta_floor_ms(base: i64, ts_ns: i64) -> u32 {
+    let delta = ts_ns.saturating_sub(base).max(0);
+    (delta / 1_000_000).min(u32::MAX as i64) as u32
+}
+
+fn delta_ceil_ms(base: i64, ts_ns: i64) -> u32 {
+    let delta = ts_ns.saturating_sub(base).max(0);
+    (delta.saturating_add(999_999) / 1_000_000).min(u32::MAX as i64) as u32
+}
 
 /// The false-positive rate of the label-pair bloom. The trace bloom's 1% is
 /// kept: a false positive costs one `index.bin` read, not a scan.
@@ -61,6 +99,7 @@ pub struct SeriesTenantSegment {
 struct SeriesPartIntegrity {
     data_crc32: u32,
     index_crc32: u32,
+    labels_crc32: u32,
     bloom_crc32: u32,
     metadata_crc32: u32,
 }
@@ -120,6 +159,10 @@ impl SeriesPart {
         self.dir.join(SERIES_INDEX_FILE)
     }
 
+    pub fn labels_path(&self) -> PathBuf {
+        self.dir.join(SERIES_LABELS_FILE)
+    }
+
     pub fn bloom_path(&self) -> PathBuf {
         self.dir.join(SERIES_BLOOM_FILE)
     }
@@ -134,15 +177,26 @@ impl SeriesPart {
 pub struct CatalogEntry {
     pub labels: SeriesLabels,
     pub offset: u64,
-    pub length: u64,
-    pub sample_count: u32,
-    pub min_ts_ns: i64,
-    pub max_ts_ns: i64,
+    pub length: u32,
+    /// Inclusive sample range as milliseconds from the part's base, rounded
+    /// outward. Absolute nanoseconds cost sixteen bytes a row and buy nothing
+    /// a part-relative delta does not: a part never leaves its partition, so
+    /// one day is the widest range either end can hold.
+    min_delta_ms: u32,
+    max_delta_ms: u32,
+}
+
+/// A query window expressed in one part's delta space, so a catalog walk
+/// compares two `u32`s per row instead of rebuilding absolute timestamps.
+#[derive(Clone, Copy, Debug)]
+pub struct CatalogWindow {
+    start_delta_ms: u32,
+    end_delta_ms: u32,
 }
 
 impl CatalogEntry {
-    pub fn overlaps_range(&self, start_ns: i64, end_ns: i64) -> bool {
-        self.max_ts_ns >= start_ns && self.min_ts_ns <= end_ns
+    pub fn overlaps(&self, window: CatalogWindow) -> bool {
+        self.max_delta_ms >= window.start_delta_ms && self.min_delta_ms <= window.end_delta_ms
     }
 }
 
@@ -438,11 +492,15 @@ impl MergedSeriesSamples {
 struct StreamingSeriesPartWriter {
     data: BufWriter<fs::File>,
     index: BufWriter<fs::File>,
+    labels: BufWriter<fs::File>,
     data_path: PathBuf,
     index_path: PathBuf,
+    labels_path: PathBuf,
     bloom_path: PathBuf,
     bloom: BloomFilter,
     data_offset: u64,
+    labels_offset: u32,
+    base_ts_ns: i64,
     series_count: u32,
     sample_count: u64,
     part_min: i64,
@@ -455,25 +513,35 @@ struct StreamingSeriesPartWriter {
 }
 
 impl StreamingSeriesPartWriter {
-    fn new(dir: &Path, bloom_items: usize) -> io::Result<Self> {
+    fn new(dir: &Path, partition: &str, bloom_items: usize) -> io::Result<Self> {
+        let base_ts_ns = partition_base_ns(partition).map_err(io::Error::other)?;
         let data_path = dir.join(SERIES_DATA_FILE);
         let index_path = dir.join(SERIES_INDEX_FILE);
+        let labels_path = dir.join(SERIES_LABELS_FILE);
         let bloom_path = dir.join(SERIES_BLOOM_FILE);
         let mut data = BufWriter::new(fs::File::create(&data_path)?);
         data.write_all(SERIES_DATA_MAGIC)?;
         let mut index = BufWriter::new(fs::File::create(&index_path)?);
         index.write_all(SERIES_INDEX_MAGIC)?;
-        // The catalog count is not known until the stream reaches EOF. It is
-        // patched after the bounded writer has flushed its bytes.
+        // The row count is not known until the stream reaches EOF. It is
+        // patched after the bounded writer has flushed its bytes; the base is
+        // the partition's, so it is final before the first row.
         index.write_all(&0u32.to_le_bytes())?;
+        index.write_all(&base_ts_ns.to_le_bytes())?;
+        let mut labels = BufWriter::new(fs::File::create(&labels_path)?);
+        labels.write_all(SERIES_LABELS_MAGIC)?;
         Ok(Self {
             data,
             index,
+            labels,
             data_path,
             index_path,
+            labels_path,
             bloom_path,
             bloom: BloomFilter::with_capacity(bloom_items.max(1), BLOOM_FPP),
             data_offset: SERIES_DATA_MAGIC.len() as u64,
+            labels_offset: 0,
+            base_ts_ns,
             series_count: 0,
             sample_count: 0,
             part_min: i64::MAX,
@@ -563,15 +631,21 @@ impl StreamingSeriesPartWriter {
 
         let labels_len = u32::try_from(labels.as_bytes().len())
             .map_err(|_| io::Error::other("metric labels exceed index field width"))?;
-        let sample_count = u32::try_from(count)
-            .map_err(|_| io::Error::other("metric series exceeds index sample-count width"))?;
+        let chunk_len = u32::try_from(chunk.len())
+            .map_err(|_| io::Error::other("metric chunk exceeds index field width"))?;
+        self.index.write_all(&self.labels_offset.to_le_bytes())?;
         self.index.write_all(&labels_len.to_le_bytes())?;
-        self.index.write_all(labels.as_bytes())?;
         self.index.write_all(&offset.to_le_bytes())?;
-        self.index.write_all(&(chunk.len() as u64).to_le_bytes())?;
-        self.index.write_all(&sample_count.to_le_bytes())?;
-        self.index.write_all(&min_ts.to_le_bytes())?;
-        self.index.write_all(&max_ts.to_le_bytes())?;
+        self.index.write_all(&chunk_len.to_le_bytes())?;
+        self.index
+            .write_all(&delta_floor_ms(self.base_ts_ns, min_ts).to_le_bytes())?;
+        self.index
+            .write_all(&delta_ceil_ms(self.base_ts_ns, max_ts).to_le_bytes())?;
+        self.labels.write_all(labels.as_bytes())?;
+        self.labels_offset = self
+            .labels_offset
+            .checked_add(labels_len)
+            .ok_or_else(|| io::Error::other("metric label region offset overflow"))?;
 
         for (key, value) in labels.pairs().map_err(io::Error::other)? {
             self.bloom.insert(&pair_token(&key, &value));
@@ -597,10 +671,13 @@ impl StreamingSeriesPartWriter {
         self.finish_tenant();
         let data_path = self.data_path.clone();
         let index_path = self.index_path.clone();
+        let labels_path = self.labels_path.clone();
         self.data.flush()?;
         self.index.flush()?;
+        self.labels.flush()?;
         close_writer(self.data, &data_path)?;
         close_writer(self.index, &index_path)?;
+        close_writer(self.labels, &labels_path)?;
 
         let mut index = OpenOptions::new()
             .read(true)
@@ -631,6 +708,7 @@ impl StreamingSeriesPartWriter {
             integrity: SeriesPartIntegrity {
                 data_crc32: crc32_file(&data_path)?,
                 index_crc32: crc32_file(&index_path)?,
+                labels_crc32: crc32_file(&labels_path)?,
                 bloom_crc32: crc32_file(&self.bloom_path)?,
                 metadata_crc32: 0,
             },
@@ -687,7 +765,7 @@ fn write_streaming_series_part_files(
             }
         }
     }
-    let mut writer = StreamingSeriesPartWriter::new(dir, bloom_items)?;
+    let mut writer = StreamingSeriesPartWriter::new(dir, partition, bloom_items)?;
     let mut cursors: Vec<_> = readers.iter().cloned().map(CatalogCursor::new).collect();
     let mut heap = std::collections::BinaryHeap::with_capacity(cursors.len());
     for (stream, cursor) in cursors.iter().enumerate() {
@@ -853,7 +931,7 @@ fn write_streaming_partition_series(
                 .ok_or_else(|| io::Error::other("metric bloom item count overflow"))?;
         }
     }
-    let mut writer = StreamingSeriesPartWriter::new(dir, bloom_items)?;
+    let mut writer = StreamingSeriesPartWriter::new(dir, partition, bloom_items)?;
     for (tenant, series_map) in tenants {
         for (labels, samples) in series_map {
             writer.write_series_values(
@@ -873,10 +951,14 @@ fn write_series_part_files(
     partition: &str,
     tenants: &PartitionSeries,
 ) -> io::Result<()> {
+    let base_ts_ns = partition_base_ns(partition).map_err(io::Error::other)?;
     let mut data = Vec::new();
     data.extend_from_slice(SERIES_DATA_MAGIC);
+    let mut label_region = Vec::new();
+    label_region.extend_from_slice(SERIES_LABELS_MAGIC);
 
     let mut catalog: Vec<CatalogEntry> = Vec::new();
+    let mut label_offsets: Vec<u32> = Vec::new();
     let mut segments: Vec<SeriesTenantSegment> = Vec::new();
     let mut bloom_tokens: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     let mut part_min = i64::MAX;
@@ -903,13 +985,17 @@ fn write_series_part_files(
             let chunk = encoder.close();
             let offset = data.len() as u64;
             data.extend_from_slice(&chunk);
+            let label_offset = u32::try_from(label_region.len() - SERIES_LABELS_MAGIC.len())
+                .map_err(|_| io::Error::other("metric label region offset overflow"))?;
+            label_offsets.push(label_offset);
+            label_region.extend_from_slice(labels.as_bytes());
             catalog.push(CatalogEntry {
                 labels: labels.clone(),
                 offset,
-                length: chunk.len() as u64,
-                sample_count: samples.len() as u32,
-                min_ts_ns: min_ts,
-                max_ts_ns: max_ts,
+                length: u32::try_from(chunk.len())
+                    .map_err(|_| io::Error::other("metric chunk exceeds index field width"))?,
+                min_delta_ms: delta_floor_ms(base_ts_ns, min_ts),
+                max_delta_ms: delta_ceil_ms(base_ts_ns, max_ts),
             });
             for (key, value) in labels.pairs().map_err(io::Error::other)? {
                 bloom_tokens.insert(pair_token(&key, &value));
@@ -937,17 +1023,19 @@ fn write_series_part_files(
     let mut index = Vec::new();
     index.extend_from_slice(SERIES_INDEX_MAGIC);
     index.extend_from_slice(&(catalog.len() as u32).to_le_bytes());
-    for entry in &catalog {
+    index.extend_from_slice(&base_ts_ns.to_le_bytes());
+    for (entry, label_offset) in catalog.iter().zip(&label_offsets) {
+        index.extend_from_slice(&label_offset.to_le_bytes());
         index.extend_from_slice(&(entry.labels.as_bytes().len() as u32).to_le_bytes());
-        index.extend_from_slice(entry.labels.as_bytes());
         index.extend_from_slice(&entry.offset.to_le_bytes());
         index.extend_from_slice(&entry.length.to_le_bytes());
-        index.extend_from_slice(&entry.sample_count.to_le_bytes());
-        index.extend_from_slice(&entry.min_ts_ns.to_le_bytes());
-        index.extend_from_slice(&entry.max_ts_ns.to_le_bytes());
+        index.extend_from_slice(&entry.min_delta_ms.to_le_bytes());
+        index.extend_from_slice(&entry.max_delta_ms.to_le_bytes());
     }
     fs::write(dir.join(SERIES_INDEX_FILE), &index)?;
     sync_file(&dir.join(SERIES_INDEX_FILE))?;
+    fs::write(dir.join(SERIES_LABELS_FILE), &label_region)?;
+    sync_file(&dir.join(SERIES_LABELS_FILE))?;
 
     let mut bloom = BloomFilter::with_capacity(bloom_tokens.len().max(1), BLOOM_FPP);
     for token in &bloom_tokens {
@@ -972,6 +1060,7 @@ fn write_series_part_files(
         integrity: SeriesPartIntegrity {
             data_crc32: crc32fast::hash(&data),
             index_crc32: crc32fast::hash(&index),
+            labels_crc32: crc32fast::hash(&label_region),
             bloom_crc32: crc32fast::hash(&bloom_bytes),
             metadata_crc32: 0,
         },
@@ -1027,6 +1116,7 @@ pub fn load_series_part(dir: &Path) -> Result<SeriesPart, String> {
     for file in [
         SERIES_META_FILE,
         SERIES_INDEX_FILE,
+        SERIES_LABELS_FILE,
         SERIES_BLOOM_FILE,
         SERIES_DATA_FILE,
     ] {
@@ -1059,6 +1149,11 @@ pub fn load_series_part(dir: &Path) -> Result<SeriesPart, String> {
         &dir.join(SERIES_INDEX_FILE),
         meta.integrity.index_crc32,
         "metric index",
+    )?;
+    validate_file_crc(
+        &dir.join(SERIES_LABELS_FILE),
+        meta.integrity.labels_crc32,
+        "metric label region",
     )?;
     validate_file_crc(
         &dir.join(SERIES_BLOOM_FILE),
@@ -1114,6 +1209,7 @@ pub struct SeriesPartReader {
     part: SeriesPart,
     bloom: BloomFilter,
     catalog: Vec<CatalogEntry>,
+    base_ts_ns: i64,
 }
 
 impl SeriesPartReader {
@@ -1160,8 +1256,10 @@ impl SeriesPartReader {
         let bloom_bytes = fs::read(part.bloom_path()).map_err(|error| error.to_string())?;
         let bloom = decode_series_bloom(&bloom_bytes)?;
         let index_bytes = fs::read(part.index_path()).map_err(|error| error.to_string())?;
-        let catalog = decode_catalog_with_memtable(
+        let label_bytes = fs::read(part.labels_path()).map_err(|error| error.to_string())?;
+        let (catalog, base_ts_ns) = decode_catalog_with_memtable(
             &index_bytes,
+            &label_bytes,
             part.meta.series_count as usize,
             &part.meta.tenants,
             memtable,
@@ -1170,7 +1268,18 @@ impl SeriesPartReader {
             part,
             bloom,
             catalog,
+            base_ts_ns,
         })
+    }
+
+    /// Translate an absolute query range into this part's delta space once,
+    /// so the catalog walk that follows compares two `u32`s a row. Both ends
+    /// round outward, matching how the rows themselves were stored.
+    pub fn window(&self, start_ns: i64, end_ns: i64) -> CatalogWindow {
+        CatalogWindow {
+            start_delta_ms: delta_floor_ms(self.base_ts_ns, start_ns),
+            end_delta_ms: delta_ceil_ms(self.base_ts_ns, end_ns),
+        }
     }
 
     pub fn part(&self) -> &SeriesPart {
@@ -1209,21 +1318,13 @@ impl SeriesPartReader {
         let mut file = fs::File::open(self.part.data_path()).map_err(|error| error.to_string())?;
         file.seek(SeekFrom::Start(entry.offset))
             .map_err(|error| error.to_string())?;
-        let length = usize::try_from(entry.length)
-            .map_err(|_| "metric chunk length does not fit in memory".to_string())?;
-        let mut chunk = vec![0u8; length];
+        let mut chunk = vec![0u8; entry.length as usize];
         file.read_exact(&mut chunk)
             .map_err(|error| error.to_string())?;
-        let decoder = gorilla::OwnedDecoder::new(chunk)?;
-        if decoder.declared_count() != entry.sample_count {
-            return Err(format!(
-                "metric chunk in {} declares {} samples, catalog says {}",
-                self.part.meta.id,
-                decoder.declared_count(),
-                entry.sample_count
-            ));
-        }
-        Ok(decoder)
+        // The chunk carries its own sample count in its first four bytes, and
+        // the file carries a checksum. A third copy in the catalog was a row
+        // of every part paying for a cross-check both of those already make.
+        gorilla::OwnedDecoder::new(chunk)
     }
 }
 
@@ -1244,37 +1345,47 @@ fn decode_series_bloom(bytes: &[u8]) -> Result<BloomFilter, String> {
 struct RawCatalogEntry<'a> {
     labels: &'a [u8],
     offset: u64,
-    length: u64,
-    sample_count: u32,
-    min_ts_ns: i64,
-    max_ts_ns: i64,
+    length: u32,
+    min_delta_ms: u32,
+    max_delta_ms: u32,
 }
 
 fn decode_catalog_with_memtable(
-    bytes: &[u8],
+    index_bytes: &[u8],
+    label_bytes: &[u8],
     expected_count: usize,
     segments: &[SeriesTenantSegment],
     memtable: Option<&SeriesMemTable>,
-) -> Result<Vec<CatalogEntry>, String> {
-    if bytes.len() < 8 || &bytes[..4] != SERIES_INDEX_MAGIC {
+) -> Result<(Vec<CatalogEntry>, i64), String> {
+    if index_bytes.len() < SERIES_INDEX_HEADER_BYTES || &index_bytes[..4] != SERIES_INDEX_MAGIC {
         return Err("metric index magic or header mismatch".to_string());
     }
-    let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if label_bytes.len() < SERIES_LABELS_MAGIC.len()
+        || &label_bytes[..SERIES_LABELS_MAGIC.len()] != SERIES_LABELS_MAGIC
+    {
+        return Err("metric label region magic mismatch".to_string());
+    }
+    let label_region = &label_bytes[SERIES_LABELS_MAGIC.len()..];
+    let count = u32::from_le_bytes(index_bytes[4..8].try_into().unwrap()) as usize;
     if count != expected_count {
         return Err(format!(
             "metric index series count mismatch: {count} != {expected_count}"
         ));
     }
-    let mut offset = 8usize;
-    let mut take = |len: usize| -> Result<&[u8], String> {
-        let end = offset
-            .checked_add(len)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| "metric index is truncated".to_string())?;
-        let slice = &bytes[offset..end];
-        offset = end;
-        Ok(slice)
-    };
+    let base_ts_ns = i64::from_le_bytes(index_bytes[8..16].try_into().unwrap());
+    let expected_len = SERIES_INDEX_HEADER_BYTES
+        .checked_add(
+            count
+                .checked_mul(SERIES_INDEX_ENTRY_BYTES)
+                .ok_or_else(|| "metric index row count overflows its byte length".to_string())?,
+        )
+        .ok_or_else(|| "metric index row count overflows its byte length".to_string())?;
+    if index_bytes.len() != expected_len {
+        return Err(format!(
+            "metric index is {} bytes for {count} rows, expected {expected_len}",
+            index_bytes.len()
+        ));
+    }
     if memtable.is_some() {
         let mut next = 0usize;
         for segment in segments {
@@ -1309,21 +1420,22 @@ fn decode_catalog_with_memtable(
         while ordinal < end {
             let batch_end = (ordinal + 4096).min(end);
             let mut batch = Vec::with_capacity(batch_end - ordinal);
-            for _ in ordinal..batch_end {
-                let labels_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
-                let labels = take(labels_len)?;
-                let chunk_offset = u64::from_le_bytes(take(8)?.try_into().unwrap());
-                let chunk_length = u64::from_le_bytes(take(8)?.try_into().unwrap());
-                let sample_count = u32::from_le_bytes(take(4)?.try_into().unwrap());
-                let min_ts_ns = i64::from_le_bytes(take(8)?.try_into().unwrap());
-                let max_ts_ns = i64::from_le_bytes(take(8)?.try_into().unwrap());
+            for row in ordinal..batch_end {
+                let at = SERIES_INDEX_HEADER_BYTES + row * SERIES_INDEX_ENTRY_BYTES;
+                let record = &index_bytes[at..at + SERIES_INDEX_ENTRY_BYTES];
+                let labels_offset = u32::from_le_bytes(record[0..4].try_into().unwrap()) as usize;
+                let labels_len = u32::from_le_bytes(record[4..8].try_into().unwrap()) as usize;
+                let labels = labels_offset
+                    .checked_add(labels_len)
+                    .filter(|end| *end <= label_region.len())
+                    .map(|end| &label_region[labels_offset..end])
+                    .ok_or_else(|| "metric index points past its label region".to_string())?;
                 batch.push(RawCatalogEntry {
                     labels,
-                    offset: chunk_offset,
-                    length: chunk_length,
-                    sample_count,
-                    min_ts_ns,
-                    max_ts_ns,
+                    offset: u64::from_le_bytes(record[8..16].try_into().unwrap()),
+                    length: u32::from_le_bytes(record[16..20].try_into().unwrap()),
+                    min_delta_ms: u32::from_le_bytes(record[20..24].try_into().unwrap()),
+                    max_delta_ms: u32::from_le_bytes(record[24..28].try_into().unwrap()),
                 });
             }
             let borrowed: Vec<&[u8]> = batch.iter().map(|entry| entry.labels).collect();
@@ -1343,18 +1455,14 @@ fn decode_catalog_with_memtable(
                     labels,
                     offset: entry.offset,
                     length: entry.length,
-                    sample_count: entry.sample_count,
-                    min_ts_ns: entry.min_ts_ns,
-                    max_ts_ns: entry.max_ts_ns,
+                    min_delta_ms: entry.min_delta_ms,
+                    max_delta_ms: entry.max_delta_ms,
                 });
             }
             ordinal = batch_end;
         }
     }
-    if offset != bytes.len() {
-        return Err("metric index has trailing bytes".to_string());
-    }
-    Ok(catalog)
+    Ok((catalog, base_ts_ns))
 }
 
 fn metadata_crc32(meta: &SeriesMetaFile) -> Result<u32, String> {
@@ -1429,7 +1537,6 @@ mod tests {
         let reader = SeriesPartReader::open(parts.into_iter().next().unwrap()).unwrap();
         let catalog = reader.tenant_catalog(&test_tenant());
         assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0].sample_count, 3);
         assert_eq!(
             reader.read_series(&catalog[0]).unwrap(),
             vec![
@@ -1694,6 +1801,90 @@ mod tests {
             reader.read_series(&catalog[0]).unwrap(),
             vec![(1_772_000_000_000_000_000, 1.0)],
             "the identity the index dropped is the one the catalog answers with"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_index_is_a_fixed_stride_array_and_the_labels_live_beside_it() {
+        let root = temp_root("fixed-stride");
+        let memtable = SeriesMemTable::new();
+        for index in 0..37 {
+            memtable.insert(vec![sample(
+                "test-tenant",
+                &labels("queue_depth", &format!("row-{index}")),
+                1_772_000_000_000_000_000,
+                1.0,
+            )]);
+        }
+        let parts = flush_series_snapshot(&memtable.begin_flush(), &root).unwrap();
+        let dir = parts[0].dir.clone();
+
+        let index_len = fs::metadata(dir.join(SERIES_INDEX_FILE)).unwrap().len() as usize;
+        assert_eq!(
+            index_len,
+            SERIES_INDEX_HEADER_BYTES + 37 * SERIES_INDEX_ENTRY_BYTES,
+            "a row that is not addressable by ordinal cannot be read from a mapping"
+        );
+
+        // The label payloads are the whole of the other file, so a selection
+        // walk touches 28 bytes a row rather than stepping over them.
+        let labels_len = fs::metadata(dir.join(SERIES_LABELS_FILE)).unwrap().len() as usize;
+        let reader = SeriesPartReader::open(parts.into_iter().next().unwrap()).unwrap();
+        let payload: usize = reader
+            .tenant_catalog(&test_tenant())
+            .iter()
+            .map(|entry| entry.labels.byte_len())
+            .sum();
+        assert_eq!(labels_len, SERIES_LABELS_MAGIC.len() + payload);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_millisecond_row_range_rounds_outward_and_still_prunes() {
+        let root = temp_root("delta-window");
+        let base = partition_base_ns(&partition_of(1_772_000_000_000_000_000)).unwrap();
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "sub-ms");
+        // Half a millisecond past midnight: the stored range is [0, 1] ms, a
+        // superset of the sample's instant rather than a truncation of it.
+        memtable.insert(vec![sample("test-tenant", &series, base + 500_000, 1.0)]);
+        let parts = flush_series_snapshot(&memtable.begin_flush(), &root).unwrap();
+        let reader = SeriesPartReader::open(parts.into_iter().next().unwrap()).unwrap();
+        let entry = &reader.tenant_catalog(&test_tenant())[0];
+
+        assert!(
+            entry.overlaps(reader.window(base + 400_000, base + 600_000)),
+            "a window inside the sample's own millisecond must not prune it away"
+        );
+        assert!(entry.overlaps(reader.window(base, base + 1)));
+        assert!(
+            !entry.overlaps(reader.window(base + 10_000_000_000, base + 20_000_000_000)),
+            "ten seconds later is a real miss and still prunes"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_corrupt_label_region_refuses_to_load() {
+        let memtable = SeriesMemTable::new();
+        memtable.insert(vec![sample(
+            "test-tenant",
+            &labels("queue_depth", "corrupt-labels"),
+            1_772_000_000_000_000_000,
+            1.0,
+        )]);
+        let root = temp_root("corrupt-labels");
+        let parts = flush_series_snapshot(&memtable.begin_flush(), &root).unwrap();
+        let path = parts[0].dir.join(SERIES_LABELS_FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        assert!(
+            load_series_part(&parts[0].dir)
+                .unwrap_err()
+                .contains("checksum")
         );
         std::fs::remove_dir_all(&root).ok();
     }
