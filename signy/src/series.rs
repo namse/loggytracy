@@ -77,7 +77,39 @@ struct LabelInternerShard {
 const LABEL_INTERNER_SHARDS: usize = 64;
 const LABEL_INTERNER_SWEEP_INTERVAL: usize = 4096;
 
+/// Entries one shard will hold. The pool is a cache of allocations, and a
+/// cache has to be bounded or it becomes the thing it was avoiding: a
+/// cardinality burst retires millions of identities at once, and remembering
+/// each of them costs a bucket of its own — at ten million series the pool
+/// would cost more than the index entries whose retirement filled it. The
+/// bound keeps the hit that pays, a steady population that keeps reporting,
+/// and lets a burst overflow past it. Sixty-four shards of this hold rather
+/// more than the comparison bed's active population.
+const LABEL_INTERNER_SHARD_CAPACITY: usize = 8_192;
+
 static LABEL_INTERNER: OnceLock<LabelInterner> = OnceLock::new();
+
+impl LabelInternerShard {
+    /// Remember one payload, unless this shard is full. A full shard drops
+    /// its dead entries first; if the live ones alone fill it, the caller
+    /// keeps an ordinary unshared `Arc` — correct, merely not deduplicated.
+    fn remember(&mut self, hash: u64, payload: &std::sync::Arc<[u8]>) {
+        if self.by_hash.len() >= LABEL_INTERNER_SHARD_CAPACITY {
+            self.by_hash.retain(|_, weak| weak.strong_count() != 0);
+            self.registrations_since_sweep = 0;
+            if self.by_hash.len() >= LABEL_INTERNER_SHARD_CAPACITY {
+                return;
+            }
+        }
+        self.by_hash
+            .insert(hash, std::sync::Arc::downgrade(payload));
+        self.registrations_since_sweep += 1;
+        if self.registrations_since_sweep >= LABEL_INTERNER_SWEEP_INTERVAL {
+            self.registrations_since_sweep = 0;
+            self.by_hash.retain(|_, weak| weak.strong_count() != 0);
+        }
+    }
+}
 
 impl LabelInterner {
     fn global() -> &'static Self {
@@ -137,14 +169,7 @@ impl LabelInterner {
             // intact and keep this label as an ordinary Arc.
             return labels;
         }
-        shard
-            .by_hash
-            .insert(hash, std::sync::Arc::downgrade(&labels.0));
-        shard.registrations_since_sweep += 1;
-        if shard.registrations_since_sweep >= LABEL_INTERNER_SWEEP_INTERVAL {
-            shard.registrations_since_sweep = 0;
-            shard.by_hash.retain(|_, weak| weak.strong_count() != 0);
-        }
+        shard.remember(hash, &labels.0);
         labels
     }
 
@@ -167,14 +192,7 @@ impl LabelInterner {
             }
             return;
         }
-        shard
-            .by_hash
-            .insert(hash, std::sync::Arc::downgrade(&labels.0));
-        shard.registrations_since_sweep += 1;
-        if shard.registrations_since_sweep >= LABEL_INTERNER_SWEEP_INTERVAL {
-            shard.registrations_since_sweep = 0;
-            shard.by_hash.retain(|_, weak| weak.strong_count() != 0);
-        }
+        shard.remember(hash, &labels.0);
     }
 
     /// Aggregate the weak interner's map population.  The interner is sharded
@@ -2653,6 +2671,35 @@ mod tests {
         assert_eq!(error.new_series, 2);
         assert_eq!(memtable.active_series(&first_tenant), 0);
         assert_eq!(memtable.active_series(&second_tenant), 0);
+    }
+
+    #[test]
+    fn the_label_pool_stops_growing_before_it_costs_more_than_it_saves() {
+        let memtable = SeriesMemTable::new();
+        let burst: Vec<MetricSample> = (0..40_000)
+            .map(|index| {
+                sample(
+                    &labels("queue_depth", &format!("pool-burst-{index}")),
+                    100,
+                    1.0,
+                    SampleKind::Gauge,
+                )
+            })
+            .collect();
+        memtable.insert(burst);
+        let snapshot = memtable.begin_flush();
+        memtable.commit_flush();
+        assert_eq!(memtable.retire_flushed(&snapshot), 40_000);
+
+        // Every retired identity offers itself to the pool. The pool is a
+        // cache of allocations, so it takes what it is sized for and lets the
+        // rest go: an entry per burst series would cost more than the index
+        // buckets the retirement just returned.
+        let (len, _) = LabelInterner::global().stats();
+        assert!(
+            len <= LABEL_INTERNER_SHARDS * LABEL_INTERNER_SHARD_CAPACITY,
+            "the pool grew past its bound: {len} entries"
+        );
     }
 
     #[test]
