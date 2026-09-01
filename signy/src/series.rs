@@ -204,6 +204,34 @@ pub enum SampleKind {
     Delta,
 }
 
+/// One histogram observation, kept whole.
+///
+/// The alternative — and what this engine did until now — is to fan a
+/// histogram datapoint out into one `_bucket{le=...}` series per boundary
+/// plus `_sum` and `_count`, which costs `bounds + 3` series for one
+/// instrument. Sixty-seven of them for an exponential histogram at full
+/// resolution, against a `$1` plan whose whole metric allowance is five
+/// hundred series.
+///
+/// The counts are cumulative by boundary — `le` semantics — because that is
+/// what both OTLP histogram shapes reduce to, what `histogram_quantile`
+/// consumes, and what lets the read path synthesize the `_bucket` series a
+/// selector may still ask for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistogramPoint {
+    /// Finite upper bounds, ascending. The implicit `+Inf` bucket is not one
+    /// of these; `count` carries its total. Shared rather than owned: the
+    /// schema repeats across every datapoint of a series, and an exponential
+    /// histogram that rescales keeps its identity and changes this instead of
+    /// minting sixty-seven new series.
+    pub bounds: Arc<[f64]>,
+    /// Cumulative count at each bound in `bounds`, same length and ascending.
+    pub cumulative: Vec<u64>,
+    pub sum: Option<f64>,
+    /// Every observation, including the ones past the last finite bound.
+    pub count: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct MetricSample {
     pub tenant: TenantId,

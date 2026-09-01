@@ -23,7 +23,7 @@ use crate::backpressure::IngestError;
 use crate::config::Config;
 use crate::journal::Journal;
 use crate::otlp_log::normalize_attribute_key;
-use crate::series::{METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
+use crate::series::{HistogramPoint, METRIC_NAME_LABEL, MetricSample, SampleKind, SeriesLabels};
 use crate::tenant::TenantId;
 use crate::trace_ingest::MAX_OTLP_REQUEST_BYTES;
 use axum::http::StatusCode;
@@ -415,70 +415,42 @@ fn filter_request(
     filtered
 }
 
-/// Explicit-bounds histogram → Prometheus-style cumulative `_bucket{le=}`
-/// series plus `+Inf`, `_sum` (when present) and `_count`. OTLP bucket counts
-/// are per-bucket; `le` semantics are cumulative, so a running total converts.
-fn decompose_histogram(
-    tenant: &TenantId,
-    name: &str,
-    point: &HistogramDataPoint,
-    promoted: &[(String, String)],
-    kind: SampleKind,
-    out: &mut Decomposition,
-) -> Result<(), MetricIngestError> {
-    let ts = datapoint_ts(point.time_unix_nano)?;
-    let bucket_base = base_pairs(&format!("{name}_bucket"), &point.attributes, promoted);
+/// Explicit-bounds histogram → one [`HistogramPoint`].
+///
+/// OTLP gives per-bucket counts; `le` semantics are cumulative, so a running
+/// total converts. The `+Inf` bucket is not one of the boundaries — the
+/// point's `count` carries it.
+fn explicit_histogram_point(point: &HistogramDataPoint) -> HistogramPoint {
     let mut running = 0u64;
-    for (index, bound) in point.explicit_bounds.iter().enumerate() {
-        running += point.bucket_counts.get(index).copied().unwrap_or(0);
-        out.push(
-            tenant,
-            with_extra(&bucket_base, "le", format_boundary(*bound)),
-            ts,
-            running as f64,
-            kind,
-        )?;
+    let cumulative = point
+        .explicit_bounds
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            running = running.saturating_add(point.bucket_counts.get(index).copied().unwrap_or(0));
+            running
+        })
+        .collect();
+    HistogramPoint {
+        bounds: point.explicit_bounds.iter().copied().collect(),
+        cumulative,
+        sum: point.sum,
+        count: point.count,
     }
-    let total: u64 = point.bucket_counts.iter().sum();
-    out.push(
-        tenant,
-        with_extra(&bucket_base, "le", "+Inf".to_string()),
-        ts,
-        total as f64,
-        kind,
-    )?;
-    if let Some(sum) = point.sum {
-        let sum_base = base_pairs(&format!("{name}_sum"), &point.attributes, promoted);
-        out.push(tenant, SeriesLabels::from_pairs(sum_base), ts, sum, kind)?;
-    }
-    let count_base = base_pairs(&format!("{name}_count"), &point.attributes, promoted);
-    out.push(
-        tenant,
-        SeriesLabels::from_pairs(count_base),
-        ts,
-        point.count as f64,
-        kind,
-    )?;
-    Ok(())
 }
 
-/// Exponential histogram → the same `_bucket{le=}` shape, downscaled until at
-/// most [`MAX_EXP_HISTOGRAM_BUCKETS`] finite boundaries remain. The zero
-/// bucket and any negative buckets fold into the smallest boundary — the
-/// accepted loss the plan records; latency histograms have no negative half
-/// in practice, and a signed boundary vocabulary would double the surface for
-/// data fn0 never charts.
-fn decompose_exponential(
-    tenant: &TenantId,
-    name: &str,
-    point: &ExponentialHistogramDataPoint,
-    promoted: &[(String, String)],
-    kind: SampleKind,
-    out: &mut Decomposition,
-) -> Result<(), MetricIngestError> {
-    let ts = datapoint_ts(point.time_unix_nano)?;
-    let bucket_base = base_pairs(&format!("{name}_bucket"), &point.attributes, promoted);
-
+/// Exponential histogram → one [`HistogramPoint`], downscaled until at most
+/// [`MAX_EXP_HISTOGRAM_BUCKETS`] finite boundaries remain. The zero bucket and
+/// any negative buckets fold into the smallest boundary — the accepted loss
+/// the plan records; latency histograms have no negative half in practice, and
+/// a signed boundary vocabulary would double the surface for data fn0 never
+/// charts.
+///
+/// The downscale is computed per datapoint from the observed index range, so
+/// a widening range changes the boundaries. Under the `le` fan-out that minted
+/// a fresh set of up to sixty-seven series and abandoned the old one; a point
+/// keeps its series and changes its schema instead.
+fn exponential_histogram_point(point: &ExponentialHistogramDataPoint) -> HistogramPoint {
     let positive: Vec<(i64, u64)> = point
         .positive
         .as_ref()
@@ -497,21 +469,16 @@ fn decompose_exponential(
         .as_ref()
         .map(|buckets| buckets.bucket_counts.iter().sum())
         .unwrap_or(0);
-    let below_smallest = point.zero_count + negative_total;
+    let below_smallest = point.zero_count.saturating_add(negative_total);
 
-    if positive.is_empty() {
-        // All mass is at or below zero: one +Inf bucket carries the count.
-        out.push(
-            tenant,
-            with_extra(&bucket_base, "le", "+Inf".to_string()),
-            ts,
-            point.count as f64,
-            kind,
-        )?;
+    let (bounds, cumulative) = if positive.is_empty() {
+        // All mass is at or below zero: no finite boundary, and the `+Inf`
+        // bucket the count carries answers for everything.
+        (Vec::new(), Vec::new())
     } else {
-        // Downscale: shifting an index right by `d` halves the resolution
-        // (scale − d) exactly — arithmetic shift keeps floor semantics for
-        // negative indices.
+        // Shifting an index right by `d` halves the resolution (scale − d)
+        // exactly — arithmetic shift keeps floor semantics for negative
+        // indices.
         let min_index = positive.iter().map(|(index, _)| *index).min().unwrap();
         let max_index = positive.iter().map(|(index, _)| *index).max().unwrap();
         let mut downscale = 0u32;
@@ -526,31 +493,76 @@ fn decompose_exponential(
             *merged.entry(index >> downscale).or_default() += count;
         }
         let mut running = below_smallest;
+        let mut bounds = Vec::with_capacity(merged.len());
+        let mut cumulative = Vec::with_capacity(merged.len());
         for (index, count) in merged {
-            running += count;
+            running = running.saturating_add(count);
             // The bucket's upper boundary: 2^((index + 1) · 2^−scale).
-            let boundary = 2f64.powf((index + 1) as f64 * 2f64.powi(-scale));
-            out.push(
-                tenant,
-                with_extra(&bucket_base, "le", format_boundary(boundary)),
-                ts,
-                running as f64,
-                kind,
-            )?;
+            bounds.push(2f64.powf((index + 1) as f64 * 2f64.powi(-scale)));
+            cumulative.push(running);
         }
+        (bounds, cumulative)
+    };
+
+    HistogramPoint {
+        bounds: bounds.into(),
+        cumulative,
+        sum: point.sum,
+        count: point.count,
+    }
+}
+
+/// Expand one point into the Prometheus-shaped series a selector can ask for:
+/// cumulative `_bucket{le=...}`, `+Inf`, `_sum` when the producer sent one,
+/// and `_count`.
+///
+/// The `+Inf` bucket answers with the point's declared count. The explicit
+/// path used to answer it with the sum of the bucket counts while `_count`
+/// answered with the declared one — the same number for any conforming
+/// producer, and one number is better than a disagreement.
+struct HistogramNaming<'a> {
+    name: &'a str,
+    attributes: &'a [opentelemetry_proto::tonic::common::v1::KeyValue],
+    promoted: &'a [(String, String)],
+    ts: i64,
+    kind: SampleKind,
+}
+
+fn push_histogram_point(
+    tenant: &TenantId,
+    naming: &HistogramNaming<'_>,
+    point: &HistogramPoint,
+    out: &mut Decomposition,
+) -> Result<(), MetricIngestError> {
+    let HistogramNaming {
+        name,
+        attributes,
+        promoted,
+        ts,
+        kind,
+    } = *naming;
+    let bucket_base = base_pairs(&format!("{name}_bucket"), attributes, promoted);
+    for (bound, cumulative) in point.bounds.iter().zip(&point.cumulative) {
         out.push(
             tenant,
-            with_extra(&bucket_base, "le", "+Inf".to_string()),
+            with_extra(&bucket_base, "le", format_boundary(*bound)),
             ts,
-            point.count as f64,
+            *cumulative as f64,
             kind,
         )?;
     }
+    out.push(
+        tenant,
+        with_extra(&bucket_base, "le", "+Inf".to_string()),
+        ts,
+        point.count as f64,
+        kind,
+    )?;
     if let Some(sum) = point.sum {
-        let sum_base = base_pairs(&format!("{name}_sum"), &point.attributes, promoted);
+        let sum_base = base_pairs(&format!("{name}_sum"), attributes, promoted);
         out.push(tenant, SeriesLabels::from_pairs(sum_base), ts, sum, kind)?;
     }
-    let count_base = base_pairs(&format!("{name}_count"), &point.attributes, promoted);
+    let count_base = base_pairs(&format!("{name}_count"), attributes, promoted);
     out.push(
         tenant,
         SeriesLabels::from_pairs(count_base),
@@ -559,6 +571,42 @@ fn decompose_exponential(
         kind,
     )?;
     Ok(())
+}
+
+fn decompose_histogram(
+    tenant: &TenantId,
+    name: &str,
+    point: &HistogramDataPoint,
+    promoted: &[(String, String)],
+    kind: SampleKind,
+    out: &mut Decomposition,
+) -> Result<(), MetricIngestError> {
+    let naming = HistogramNaming {
+        name,
+        attributes: &point.attributes,
+        promoted,
+        ts: datapoint_ts(point.time_unix_nano)?,
+        kind,
+    };
+    push_histogram_point(tenant, &naming, &explicit_histogram_point(point), out)
+}
+
+fn decompose_exponential(
+    tenant: &TenantId,
+    name: &str,
+    point: &ExponentialHistogramDataPoint,
+    promoted: &[(String, String)],
+    kind: SampleKind,
+    out: &mut Decomposition,
+) -> Result<(), MetricIngestError> {
+    let naming = HistogramNaming {
+        name,
+        attributes: &point.attributes,
+        promoted,
+        ts: datapoint_ts(point.time_unix_nano)?,
+        kind,
+    };
+    push_histogram_point(tenant, &naming, &exponential_histogram_point(point), out)
 }
 
 /// Accepting one OTLP metrics export, independent of how it arrived. The
@@ -958,6 +1006,92 @@ mod tests {
         let cumulative =
             normalize_request(&test_tenant(), &sum(AggregationTemporality::Cumulative)).unwrap();
         assert_eq!(cumulative[0].kind, SampleKind::Cumulative);
+    }
+
+    #[test]
+    fn an_explicit_point_is_cumulative_and_keeps_the_declared_totals() {
+        let point = explicit_histogram_point(&HistogramDataPoint {
+            count: 10,
+            sum: Some(1.25),
+            bucket_counts: vec![3, 4, 2, 1],
+            explicit_bounds: vec![0.005, 0.01, 0.025],
+            ..Default::default()
+        });
+        assert_eq!(&*point.bounds, &[0.005, 0.01, 0.025]);
+        assert_eq!(point.cumulative, vec![3, 7, 9]);
+        assert_eq!(point.sum, Some(1.25));
+        // The last bucket's count lives past the last finite bound, so it is
+        // in `count` and not in `cumulative`.
+        assert_eq!(point.count, 10);
+    }
+
+    fn exponential_point(
+        scale: i32,
+        offset: i32,
+        counts: Vec<u64>,
+        zero: u64,
+        negative: Vec<u64>,
+    ) -> ExponentialHistogramDataPoint {
+        let total: u64 = counts.iter().sum::<u64>() + zero + negative.iter().sum::<u64>();
+        ExponentialHistogramDataPoint {
+            scale,
+            zero_count: zero,
+            count: total,
+            sum: Some(1.0),
+            positive: Some(exponential_histogram_data_point::Buckets {
+                offset,
+                bucket_counts: counts,
+            }),
+            negative: (!negative.is_empty()).then_some(exponential_histogram_data_point::Buckets {
+                offset: 0,
+                bucket_counts: negative.clone(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_exponential_point_downscales_until_it_fits_the_bucket_cap() {
+        let point = exponential_point(0, 0, vec![1; 100], 0, Vec::new());
+        let point = exponential_histogram_point(&point);
+        assert!(
+            point.bounds.len() <= MAX_EXP_HISTOGRAM_BUCKETS,
+            "a hundred populated buckets must not survive the cap: {}",
+            point.bounds.len()
+        );
+        assert_eq!(
+            point.bounds.len(),
+            50,
+            "one halving is enough for a hundred"
+        );
+        assert_eq!(point.bounds.len(), point.cumulative.len());
+        assert_eq!(
+            point.cumulative.last().copied(),
+            Some(100),
+            "downscaling merges counts, it does not drop them"
+        );
+        assert_eq!(point.count, 100);
+    }
+
+    #[test]
+    fn an_exponential_point_folds_the_zero_and_negative_mass_below_its_smallest_bound() {
+        let point = exponential_histogram_point(&exponential_point(0, 0, vec![2], 5, vec![3]));
+        assert_eq!(point.bounds.len(), 1);
+        assert_eq!(
+            point.cumulative,
+            vec![10],
+            "five at zero and three below it are still at or under the first bound"
+        );
+        assert_eq!(point.count, 10);
+    }
+
+    #[test]
+    fn an_exponential_point_with_no_positive_mass_has_no_finite_bound() {
+        let point =
+            exponential_histogram_point(&exponential_point(0, 0, Vec::new(), 4, Vec::new()));
+        assert!(point.bounds.is_empty());
+        assert!(point.cumulative.is_empty());
+        assert_eq!(point.count, 4, "the +Inf bucket answers for all of it");
     }
 
     #[test]
