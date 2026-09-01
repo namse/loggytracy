@@ -317,3 +317,46 @@ consult the bloom (only `pin_metric_parts` does), so every part whose time
 range overlaps has its whole row array read whether or not it can hold the
 metric; and the rows are label-sorted, so an exact `__name__` could binary
 search instead of scan.
+
+### What the product refuses at, after the charge stopped being a guess
+(2026-09-01)
+
+Every row above is probe mode, which bypasses the guards. The number that
+ships is what byte admission does with them on, and until this point the two
+had drifted about thirty-five fold apart: `SERIES_OVERHEAD_BYTES = 320` was
+derived in M10 from a memtable that inlined four dynamic containers in every
+index value and shared its label allocations with part catalogs, and none of
+that had been true for several changes.
+
+The charge is now arithmetic rather than calibration. The payload is the
+allocation a canonical label actually needs — its two reference counts and
+eight-byte rounding included, which `byte_len()` alone had never covered — and
+the containers are read from the maps' own `capacity()` when the gate asks,
+so a rehash that doubles a shard and a retirement that hands one back are both
+visible at the instant they happen. There is no constant left to go stale.
+
+Normal mode, same 2 GiB limit and workload, `SIGNY_MAX_ACTIVE_SERIES` unset so
+byte admission is what decides:
+
+| offered series | accepted | refused | 429s | anon peak | result |
+|---:|---:|---:|---:|---:|---|
+| 2,000,000 | 2,000,013 | 0 | 0 | 179 MiB | pass |
+| 8,000,000 | 8,000,013 | 0 | 0 | 215 MiB | pass |
+| 20,000,000 | 10,690,010 | 9,310,003 | 1,862 | 890 MiB | safe saturation, alive |
+
+For the comparison this campaign started from: on 2026-08-27 the bed offered
+520,288 series, and this engine refused 24,288 datapoints at its 500,000
+count-guard default while peaking at 1,037.8 MiB, against VictoriaMetrics
+accepting all of them at 627.3 MiB. It now takes **eight million without
+refusing anything, at 215 MiB** — a fifth of the memory for fifteen times the
+series — and when it is finally pushed past what it can hold it refuses with
+named 429s and stays alive, which is the behaviour the claim was written
+around.
+
+The last row is the important one and it is not a pass: 20 million offered is
+past the boundary, and 1,862 whole exports were refused. That is the engine
+working as designed rather than a limit to remove. What the three rows
+together say is that the gate and the process now agree — refusal begins at
+about 10.7 million where probe mode reaches 28 million with the guards off,
+so the remaining factor is roughly 2.6x rather than 35x, and it is the shared
+25%-of-budget memtable ceiling rather than a stale per-series constant.
