@@ -55,7 +55,33 @@ const SERIES_BLOOM_MAGIC: &[u8; 4] = b"LMB1";
 /// known before the first row is written — a part never spans two partitions,
 /// so every sample in it sits inside one day and its offset fits `u32`.
 const SERIES_INDEX_HEADER_BYTES: usize = 16;
-const SERIES_INDEX_ENTRY_BYTES: usize = 28;
+const SERIES_INDEX_ENTRY_BYTES: usize = 32;
+
+/// What a row's chunk holds. A scalar series is a Gorilla stream of
+/// `(timestamp, value)`; a histogram series is one instrument's observations,
+/// bucket vectors and all, in the form [`crate::histogram_chunk`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeriesRowKind {
+    Scalar,
+    Histogram,
+}
+
+impl SeriesRowKind {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Scalar => 0,
+            Self::Histogram => 1,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self, String> {
+        match tag {
+            0 => Ok(Self::Scalar),
+            1 => Ok(Self::Histogram),
+            other => Err(format!("metric catalog row has unknown kind {other}")),
+        }
+    }
+}
 
 /// Midnight UTC of a partition key, in nanoseconds — the base every catalog
 /// row's timestamp delta is relative to.
@@ -176,6 +202,7 @@ impl SeriesPart {
 /// One catalog row: a series and where its chunk lives.
 #[derive(Clone, Debug)]
 pub struct CatalogRow<'a> {
+    pub kind: SeriesRowKind,
     /// Canonical label bytes, pointing into the part's mapped label file. A
     /// row becomes an owned [`SeriesLabels`] only once a selector has matched
     /// it; the walk that decides costs no allocation at all.
@@ -244,6 +271,7 @@ impl<'a> CatalogRows<'a> {
         let labels_at = u32::from_le_bytes(record[0..4].try_into().ok()?) as usize;
         let labels_len = u32::from_le_bytes(record[4..8].try_into().ok()?) as usize;
         Some(CatalogRow {
+            kind: SeriesRowKind::from_tag(record[28]).ok()?,
             labels: self.labels.get(labels_at..labels_at + labels_len)?,
             chunk: ChunkRef {
                 offset: u64::from_le_bytes(record[8..16].try_into().ok()?),
@@ -294,16 +322,45 @@ pub fn flush_series_snapshot(
     let mut partitions: BTreeMap<String, PartitionSeries> = BTreeMap::new();
     for (tenant, list) in &snapshot.tenants {
         for series in list {
+            if series.is_histogram() {
+                for (ts, point) in &series.points {
+                    match partitions
+                        .entry(partition_of(*ts))
+                        .or_default()
+                        .entry(tenant.clone())
+                        .or_default()
+                        .entry(series.labels.clone())
+                        .or_insert_with(|| SeriesPayload::Histogram(Vec::new()))
+                    {
+                        SeriesPayload::Histogram(points) => points.push((*ts, point.clone())),
+                        SeriesPayload::Scalar(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "one series cannot be scalar and histogram in one part",
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
             let samples = series.sorted_samples().map_err(io::Error::other)?;
             for (ts, value) in samples {
-                partitions
+                match partitions
                     .entry(partition_of(ts))
                     .or_default()
                     .entry(tenant.clone())
                     .or_default()
                     .entry(series.labels.clone())
-                    .or_default()
-                    .push((ts, value));
+                    .or_insert_with(|| SeriesPayload::Scalar(Vec::new()))
+                {
+                    SeriesPayload::Scalar(values) => values.push((ts, value)),
+                    SeriesPayload::Histogram(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "one series cannot be scalar and histogram in one part",
+                        ));
+                    }
+                }
             }
         }
     }
@@ -434,6 +491,7 @@ impl CatalogCursor {
             // an owned label — at most one per input stream at a time.
             labels: SeriesLabels::from_canonical(row.labels.to_vec()),
             chunk: row.chunk,
+            kind: row.kind,
         })
     }
 
@@ -458,6 +516,7 @@ struct CatalogHead {
     tenant: TenantId,
     labels: SeriesLabels,
     chunk: ChunkRef,
+    kind: SeriesRowKind,
 }
 
 impl PartialEq for CatalogHead {
@@ -514,6 +573,33 @@ impl Ord for SampleHead {
     }
 }
 
+/// One identity's histogram observations across the inputs, merged by
+/// timestamp. Unlike the scalar merge this materializes: a histogram chunk
+/// decodes whole, and one series' points are the unit either way.
+fn merged_series_points(
+    heads: &[CatalogHead],
+) -> io::Result<Vec<(i64, crate::series::HistogramPoint)>> {
+    let mut merged: Vec<(usize, i64, crate::series::HistogramPoint)> = Vec::new();
+    for head in heads {
+        let points = head
+            .reader
+            .read_histogram_points(head.chunk)
+            .map_err(io::Error::other)?;
+        merged.extend(
+            points
+                .into_iter()
+                .map(|(ts, point)| (head.stream, ts, point)),
+        );
+    }
+    // The input stream index breaks a timestamp tie, which is the same rule
+    // the scalar merge follows so a duplicate keeps its input order.
+    merged.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    Ok(merged
+        .into_iter()
+        .map(|(_, ts, point)| (ts, point))
+        .collect())
+}
+
 struct MergedSeriesSamples {
     heap: std::collections::BinaryHeap<SampleHead>,
 }
@@ -552,6 +638,14 @@ impl MergedSeriesSamples {
         }
         Ok(Some(sample))
     }
+}
+
+struct WrittenRow<'a> {
+    kind: SeriesRowKind,
+    chunk: &'a [u8],
+    count: u64,
+    min_ts: i64,
+    max_ts: i64,
 }
 
 struct StreamingSeriesPartWriter {
@@ -668,8 +762,6 @@ impl StreamingSeriesPartWriter {
     where
         I: IntoIterator<Item = io::Result<(i64, f64)>>,
     {
-        self.start_tenant(tenant);
-        let offset = self.data_offset;
         let mut encoder = gorilla::Encoder::new();
         let mut count = 0u64;
         let mut min_ts = i64::MAX;
@@ -687,8 +779,68 @@ impl StreamingSeriesPartWriter {
                 "metric writer encountered an empty series",
             ));
         }
-        let chunk = encoder.close();
-        self.data.write_all(&chunk)?;
+        self.write_row(
+            tenant,
+            labels,
+            WrittenRow {
+                kind: SeriesRowKind::Scalar,
+                chunk: &encoder.close(),
+                count,
+                min_ts,
+                max_ts,
+            },
+        )
+    }
+
+    /// One histogram series: its observations become a single chunk whose
+    /// runs carry the boundary schemas they were counted against.
+    fn write_histogram_series(
+        &mut self,
+        tenant: &TenantId,
+        labels: &SeriesLabels,
+        points: &[(i64, crate::series::HistogramPoint)],
+    ) -> io::Result<()> {
+        if points.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metric writer encountered an empty series",
+            ));
+        }
+        let min_ts = points.iter().map(|(ts, _)| *ts).min().expect("non-empty");
+        let max_ts = points.iter().map(|(ts, _)| *ts).max().expect("non-empty");
+        self.write_row(
+            tenant,
+            labels,
+            WrittenRow {
+                kind: SeriesRowKind::Histogram,
+                chunk: &crate::histogram_chunk::encode(points),
+                count: points.len() as u64,
+                min_ts,
+                max_ts,
+            },
+        )
+    }
+
+    /// What a finished chunk needs recorded about it.
+    ///
+    /// The half both kinds share: append the chunk, append the catalog row
+    /// that points at it, and move the counters the metadata is built from.
+    fn write_row(
+        &mut self,
+        tenant: &TenantId,
+        labels: &SeriesLabels,
+        row: WrittenRow<'_>,
+    ) -> io::Result<()> {
+        let WrittenRow {
+            kind,
+            chunk,
+            count,
+            min_ts,
+            max_ts,
+        } = row;
+        self.start_tenant(tenant);
+        let offset = self.data_offset;
+        self.data.write_all(chunk)?;
         self.data_offset = self
             .data_offset
             .checked_add(chunk.len() as u64)
@@ -706,6 +858,7 @@ impl StreamingSeriesPartWriter {
             .write_all(&delta_floor_ms(self.base_ts_ns, min_ts).to_le_bytes())?;
         self.index
             .write_all(&delta_ceil_ms(self.base_ts_ns, max_ts).to_le_bytes())?;
+        self.index.write_all(&[kind.tag(), 0, 0, 0])?;
         self.labels.write_all(labels.as_bytes())?;
         self.labels_offset = self
             .labels_offset
@@ -849,8 +1002,25 @@ fn write_streaming_series_part_files(
         {
             heads.push(heap.pop().expect("heap head was present"));
         }
-        let mut samples = MergedSeriesSamples::new(&heads)?;
-        writer.write_series(&tenant, &labels, &mut samples)?;
+        if heads
+            .iter()
+            .any(|head| head.kind == SeriesRowKind::Histogram)
+        {
+            if !heads
+                .iter()
+                .all(|head| head.kind == SeriesRowKind::Histogram)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "one series is scalar in one input part and histogram in another",
+                ));
+            }
+            let points = merged_series_points(&heads)?;
+            writer.write_histogram_series(&tenant, &labels, &points)?;
+        } else {
+            let mut samples = MergedSeriesSamples::new(&heads)?;
+            writer.write_series(&tenant, &labels, &mut samples)?;
+        }
         for head in heads {
             let cursor = &mut cursors[head.stream];
             cursor.advance();
@@ -870,7 +1040,31 @@ fn write_streaming_series_part_files(
 
 /// One partition's samples, grouped `tenant -> series -> sorted samples` —
 /// which is exactly the catalog order the files are written in.
-type PartitionSeries = BTreeMap<TenantId, BTreeMap<SeriesLabels, Vec<(i64, f64)>>>;
+/// One series' contribution to a part being written. Both kinds live in the
+/// same map so a tenant's rows stay in label order whatever their shape —
+/// which is the ordering the compactor's k-way merge is built on.
+enum SeriesPayload {
+    Scalar(Vec<(i64, f64)>),
+    Histogram(Vec<(i64, crate::series::HistogramPoint)>),
+}
+
+impl SeriesPayload {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Scalar(samples) => samples.is_empty(),
+            Self::Histogram(points) => points.is_empty(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Scalar(samples) => samples.len(),
+            Self::Histogram(points) => points.len(),
+        }
+    }
+}
+
+type PartitionSeries = BTreeMap<TenantId, BTreeMap<SeriesLabels, SeriesPayload>>;
 
 /// Flush a snapshot in bounded batches of series/sample bytes.
 ///
@@ -900,31 +1094,64 @@ pub fn flush_series_snapshot_chunked(
 
     for (tenant, list) in &snapshot.tenants {
         for series in list {
-            let samples = series.sorted_samples().map_err(io::Error::other)?;
-            if samples.is_empty() {
-                continue;
-            }
-            let mut by_partition: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
-            for sample in samples {
-                by_partition
-                    .entry(partition_of(sample.0))
-                    .or_default()
-                    .push(sample);
-            }
-            for (partition, partition_samples) in by_partition {
+            let by_partition: BTreeMap<String, SeriesPayload> = if series.is_histogram() {
+                let mut split: BTreeMap<String, Vec<(i64, crate::series::HistogramPoint)>> =
+                    BTreeMap::new();
+                for (ts, point) in &series.points {
+                    split
+                        .entry(partition_of(*ts))
+                        .or_default()
+                        .push((*ts, point.clone()));
+                }
+                split
+                    .into_iter()
+                    .map(|(partition, points)| (partition, SeriesPayload::Histogram(points)))
+                    .collect()
+            } else {
+                let samples = series.sorted_samples().map_err(io::Error::other)?;
+                let mut split: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
+                for sample in samples {
+                    split
+                        .entry(partition_of(sample.0))
+                        .or_default()
+                        .push(sample);
+                }
+                split
+                    .into_iter()
+                    .map(|(partition, samples)| (partition, SeriesPayload::Scalar(samples)))
+                    .collect()
+            };
+            for (partition, payload) in by_partition {
+                if payload.is_empty() {
+                    continue;
+                }
                 batch_bytes = batch_bytes.saturating_add(
-                    (partition_samples.len() as u64)
+                    (payload.len() as u64)
                         .saturating_mul(16)
                         .saturating_add(series.labels.byte_len() as u64),
                 );
-                batches
+                let slot = batches
                     .entry(partition)
                     .or_default()
                     .entry(tenant.clone())
                     .or_default()
                     .entry(series.labels.clone())
-                    .or_default()
-                    .extend(partition_samples);
+                    .or_insert_with(|| match payload {
+                        SeriesPayload::Scalar(_) => SeriesPayload::Scalar(Vec::new()),
+                        SeriesPayload::Histogram(_) => SeriesPayload::Histogram(Vec::new()),
+                    });
+                match (slot, payload) {
+                    (SeriesPayload::Scalar(into), SeriesPayload::Scalar(from)) => into.extend(from),
+                    (SeriesPayload::Histogram(into), SeriesPayload::Histogram(from)) => {
+                        into.extend(from)
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "one series cannot be scalar and histogram in one part",
+                        ));
+                    }
+                }
             }
             if batch_bytes >= chunk_bytes {
                 commit_snapshot_batch(&mut batches, metrics_root, &mut parts, &mut committed_dirs)?;
@@ -998,12 +1225,17 @@ fn write_streaming_partition_series(
     }
     let mut writer = StreamingSeriesPartWriter::new(dir, partition, bloom_items)?;
     for (tenant, series_map) in tenants {
-        for (labels, samples) in series_map {
-            writer.write_series_values(
-                tenant,
-                labels,
-                samples.iter().copied().map(Ok::<_, io::Error>),
-            )?;
+        for (labels, payload) in series_map {
+            match payload {
+                SeriesPayload::Scalar(samples) => writer.write_series_values(
+                    tenant,
+                    labels,
+                    samples.iter().copied().map(Ok::<_, io::Error>),
+                )?,
+                SeriesPayload::Histogram(points) => {
+                    writer.write_histogram_series(tenant, labels, points)?
+                }
+            }
         }
     }
     writer.finish(id, partition, dir)
@@ -1029,6 +1261,7 @@ fn write_series_part_files(
         chunk_len: u32,
         min_delta_ms: u32,
         max_delta_ms: u32,
+        kind: SeriesRowKind,
     }
     let mut catalog: Vec<IndexRow> = Vec::new();
     let mut segments: Vec<SeriesTenantSegment> = Vec::new();
@@ -1041,20 +1274,34 @@ fn write_series_part_files(
         let series_start = catalog.len() as u32;
         let segment_bytes_start = data.len() as u64;
         let mut segment_samples = 0u64;
-        for (labels, samples) in series_map {
+        for (labels, payload) in series_map {
             debug_assert!(
-                !samples.is_empty(),
+                !payload.is_empty(),
                 "the partition split never leaves an empty series"
             );
-            let mut encoder = gorilla::Encoder::new();
             let mut min_ts = i64::MAX;
             let mut max_ts = i64::MIN;
-            for (ts, value) in samples {
-                encoder.append(*ts, *value);
-                min_ts = min_ts.min(*ts);
-                max_ts = max_ts.max(*ts);
-            }
-            let chunk = encoder.close();
+            let (kind, chunk) = match payload {
+                SeriesPayload::Scalar(samples) => {
+                    let mut encoder = gorilla::Encoder::new();
+                    for (ts, value) in samples {
+                        encoder.append(*ts, *value);
+                        min_ts = min_ts.min(*ts);
+                        max_ts = max_ts.max(*ts);
+                    }
+                    (SeriesRowKind::Scalar, encoder.close())
+                }
+                SeriesPayload::Histogram(points) => {
+                    for (ts, _) in points {
+                        min_ts = min_ts.min(*ts);
+                        max_ts = max_ts.max(*ts);
+                    }
+                    (
+                        SeriesRowKind::Histogram,
+                        crate::histogram_chunk::encode(points),
+                    )
+                }
+            };
             let offset = data.len() as u64;
             data.extend_from_slice(&chunk);
             let labels_offset = u32::try_from(label_region.len() - SERIES_LABELS_MAGIC.len())
@@ -1069,14 +1316,15 @@ fn write_series_part_files(
                     .map_err(|_| io::Error::other("metric chunk exceeds index field width"))?,
                 min_delta_ms: delta_floor_ms(base_ts_ns, min_ts),
                 max_delta_ms: delta_ceil_ms(base_ts_ns, max_ts),
+                kind,
             });
             for (key, value) in labels.pairs().map_err(io::Error::other)? {
                 bloom_tokens.insert(pair_token(&key, &value));
             }
             part_min = part_min.min(min_ts);
             part_max = part_max.max(max_ts);
-            segment_samples += samples.len() as u64;
-            part_samples += samples.len() as u64;
+            segment_samples += payload.len() as u64;
+            part_samples += payload.len() as u64;
         }
         segments.push(SeriesTenantSegment {
             tenant: tenant.clone(),
@@ -1104,6 +1352,7 @@ fn write_series_part_files(
         index.extend_from_slice(&row.chunk_len.to_le_bytes());
         index.extend_from_slice(&row.min_delta_ms.to_le_bytes());
         index.extend_from_slice(&row.max_delta_ms.to_le_bytes());
+        index.extend_from_slice(&[row.kind.tag(), 0, 0, 0]);
     }
     fs::write(dir.join(SERIES_INDEX_FILE), &index)?;
     sync_file(&dir.join(SERIES_INDEX_FILE))?;
@@ -1369,20 +1618,34 @@ impl SeriesPartReader {
         self.read_series_decoder(chunk)?.collect()
     }
 
-    /// Open one series' chunk as an owned decoder. Keeping the decoder's
-    /// chunk and cursor together lets a compaction merge one sample at a time
-    /// without retaining a `Vec` for every series in the input group.
-    pub fn read_series_decoder(&self, location: ChunkRef) -> Result<gorilla::OwnedDecoder, String> {
+    /// One histogram series' observations. The caller reaches here because
+    /// the row said [`SeriesRowKind::Histogram`]; a scalar chunk decoded this
+    /// way fails rather than answering nonsense.
+    pub fn read_histogram_points(
+        &self,
+        chunk: ChunkRef,
+    ) -> Result<Vec<(i64, crate::series::HistogramPoint)>, String> {
+        crate::histogram_chunk::decode(&self.read_chunk_bytes(chunk)?)
+    }
+
+    fn read_chunk_bytes(&self, location: ChunkRef) -> Result<Vec<u8>, String> {
         let mut file = fs::File::open(self.part.data_path()).map_err(|error| error.to_string())?;
         file.seek(SeekFrom::Start(location.offset))
             .map_err(|error| error.to_string())?;
         let mut chunk = vec![0u8; location.length as usize];
         file.read_exact(&mut chunk)
             .map_err(|error| error.to_string())?;
+        Ok(chunk)
+    }
+
+    /// Open one series' chunk as an owned decoder. Keeping the decoder's
+    /// chunk and cursor together lets a compaction merge one sample at a time
+    /// without retaining a `Vec` for every series in the input group.
+    pub fn read_series_decoder(&self, location: ChunkRef) -> Result<gorilla::OwnedDecoder, String> {
         // The chunk carries its own sample count in its first four bytes, and
         // the file carries a checksum. A third copy in the catalog was a row
         // of every part paying for a cross-check both of those already make.
-        gorilla::OwnedDecoder::new(chunk)
+        gorilla::OwnedDecoder::new(self.read_chunk_bytes(location)?)
     }
 }
 
@@ -1876,6 +2139,140 @@ mod tests {
         let row = reader.tenant_catalog(&test_tenant()).get(0).unwrap();
         assert_eq!(row.labels, series.as_bytes());
         assert_eq!(samples, vec![(1_772_000_000_000_000_000, 7.0)]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn histogram_sample(
+        tenant: &str,
+        series: &SeriesLabels,
+        ts: i64,
+        cumulative: &[u64],
+        count: u64,
+    ) -> MetricSample {
+        MetricSample {
+            tenant: TenantId::parse(tenant).unwrap(),
+            labels: series.clone(),
+            ts_ns: ts,
+            value: MetricValue::Histogram(crate::series::HistogramPoint {
+                bounds: vec![0.005, 0.01].into(),
+                cumulative: cumulative.to_vec(),
+                sum: Some(count as f64),
+                count,
+            }),
+            kind: SampleKind::Cumulative,
+            datapoint_index: 0,
+        }
+    }
+
+    #[test]
+    fn a_histogram_series_round_trips_through_a_part_as_one_row() {
+        let root = temp_root("histogram-roundtrip");
+        let memtable = SeriesMemTable::new();
+        let series = labels("http_request_duration_seconds", "a");
+        memtable.insert(vec![
+            histogram_sample(
+                "test-tenant",
+                &series,
+                1_772_000_000_000_000_000,
+                &[1, 2],
+                3,
+            ),
+            histogram_sample(
+                "test-tenant",
+                &series,
+                1_772_000_010_000_000_000,
+                &[4, 9],
+                11,
+            ),
+        ]);
+        let parts = flush_series_snapshot(&memtable.begin_flush(), &root).unwrap();
+        let reader = SeriesPartReader::open(parts.into_iter().next().unwrap()).unwrap();
+
+        let catalog = reader.tenant_catalog(&test_tenant());
+        assert_eq!(
+            catalog.len(),
+            1,
+            "an instrument that used to be five rows is one"
+        );
+        let row = catalog.get(0).unwrap();
+        assert_eq!(row.kind, SeriesRowKind::Histogram);
+        assert_eq!(row.labels, series.as_bytes());
+        let points = reader.read_histogram_points(row.chunk).unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].1.cumulative, vec![1, 2]);
+        assert_eq!(points[1].1.cumulative, vec![4, 9]);
+        assert_eq!(points[1].1.count, 11);
+        assert_eq!(&*points[1].1.bounds, &[0.005, 0.01]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_part_keeps_scalar_and_histogram_rows_in_one_label_order() {
+        let root = temp_root("histogram-mixed");
+        let memtable = SeriesMemTable::new();
+        let gauge = labels("aaa_queue_depth", "a");
+        let hist = labels("zzz_request_duration", "a");
+        memtable.insert(vec![
+            sample("test-tenant", &gauge, 1_772_000_000_000_000_000, 1.0),
+            histogram_sample("test-tenant", &hist, 1_772_000_000_000_000_000, &[1, 2], 3),
+        ]);
+        let parts = flush_series_snapshot(&memtable.begin_flush(), &root).unwrap();
+        let reader = SeriesPartReader::open(parts.into_iter().next().unwrap()).unwrap();
+
+        let catalog = reader.tenant_catalog(&test_tenant());
+        assert_eq!(catalog.len(), 2);
+        // The compactor's k-way merge is built on label order, so the two
+        // shapes have to interleave rather than being appended in groups.
+        assert_eq!(catalog.get(0).unwrap().kind, SeriesRowKind::Scalar);
+        assert_eq!(catalog.get(1).unwrap().kind, SeriesRowKind::Histogram);
+        assert!(catalog.get(0).unwrap().labels < catalog.get(1).unwrap().labels);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn compaction_merges_one_histogram_series_by_timestamp() {
+        let root = temp_root("histogram-compaction");
+        let series = labels("http_request_duration_seconds", "merged");
+
+        let first = SeriesMemTable::new();
+        first.insert(vec![histogram_sample(
+            "test-tenant",
+            &series,
+            1_772_000_000_000_000_000,
+            &[1, 2],
+            3,
+        )]);
+        let first_parts = flush_series_snapshot(&first.begin_flush(), &root).unwrap();
+
+        let second = SeriesMemTable::new();
+        second.insert(vec![histogram_sample(
+            "test-tenant",
+            &series,
+            1_772_000_010_000_000_000,
+            &[4, 9],
+            11,
+        )]);
+        let second_parts = flush_series_snapshot(&second.begin_flush(), &root).unwrap();
+
+        let inputs: Vec<_> = first_parts
+            .into_iter()
+            .chain(second_parts)
+            .map(|part| std::sync::Arc::new(SeriesPartReader::open(part).unwrap()))
+            .collect();
+        let merged = compact_series_parts(&inputs, &root).unwrap();
+        assert_eq!(merged.len(), 1);
+
+        let reader = SeriesPartReader::open(merged.into_iter().next().unwrap()).unwrap();
+        let catalog = reader.tenant_catalog(&test_tenant());
+        assert_eq!(catalog.len(), 1, "one identity, one row, after the merge");
+        let row = catalog.get(0).unwrap();
+        assert_eq!(row.kind, SeriesRowKind::Histogram);
+        let points = reader.read_histogram_points(row.chunk).unwrap();
+        assert_eq!(
+            points.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![1_772_000_000_000_000_000, 1_772_000_010_000_000_000]
+        );
+        assert_eq!(points[1].1.cumulative, vec![4, 9]);
         std::fs::remove_dir_all(&root).ok();
     }
 
