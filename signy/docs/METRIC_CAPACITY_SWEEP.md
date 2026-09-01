@@ -258,3 +258,62 @@ with stored parts rather than with active series. The artifacts are under
 `compare/target/metric-capacity-probe-retire-10m/`,
 `compare/target/metric-capacity-probe-pool-10m/` and
 `compare/target/metric-capacity-probe-pool2-10m/`.
+
+### Mapping the part catalog (2026-09-01)
+
+Retirement left the part catalogs as the whole of what a stored series costs:
+one row per series per part, each owning an `Arc` to canonical labels, held on
+the heap for as long as the registry held the reader. Three changes moved that
+off the heap without changing what a query can answer.
+
+`index.bin` became a 16-byte header and a fixed-stride 28-byte row array, with
+the label payloads moved into a `labels.bin` beside it. The row also dropped
+what it did not need: `sample_count` duplicated the Gorilla chunk's own header
+under a file that already carries a checksum, the chunk length fits `u32`, and
+absolute nanosecond bounds became milliseconds from the partition's midnight,
+rounded outward so a stored range is never narrower than its samples. Both
+files are then mapped rather than read, and a selector tests a row's label
+bytes in place — a row becomes an owned identity only after it has matched,
+where before every row on the walk allocated two `String`s per label. With no
+catalog-owned allocation left there was nothing for the weak label pool to
+hand back, so the pool and the memtable label source it was built around were
+removed.
+
+Fixed probes at the same 2 GiB Docker memory and memswap limit:
+
+| requested series | accepted | anon peak | result | elapsed | push p50 / p99 |
+|---:|---:|---:|---|---:|---:|
+| 10,000,000 | 10,000,013 | 783 MiB | **pass** | 94 s | 24.7 / 246 ms |
+| 20,000,000 | 20,000,013 | 1,420 MiB | **pass** | 330 s | 30.6 / 1,336 ms |
+| 28,000,000 | 28,000,013 | 1,443 MiB | **pass** | 469 s | 33.4 / 1,400 ms |
+
+**The 10-million gate is met**, at 38% of the budget and with 100% acceptance,
+where the sharded index reached 6,255,010 and retirement reached 8,340,010.
+
+Two things in that table matter more than the gate. Anonymous memory stopped
+tracking series count: 8 million more series between the second and third rows
+cost 23 MiB, about 3 bytes each, because the rows and their labels are no
+longer anonymous at all. And **the boundary stopped being a memory boundary** —
+none of these runs was OOM-killed, and the third still had 600 MiB of headroom.
+What binds now is time. Ingesting 28 million series took five times as long as
+ten million did, and push p99 rose from 246 ms to 1.4 seconds: page cache under
+pressure is reclaimed and re-read, and the selection walk is still linear in
+the rows a query's window covers. That is the trade the mapping makes, and it
+is the same one VictoriaMetrics makes — an engine that gets slower under
+cardinality rather than dying of it.
+
+For scale, the comparison target OOM-killed at 16.8 million series in the same
+container. This engine now accepts 28 million in 1,443 MiB without refusing a
+datapoint. That is a probe-mode number and not a product capacity: the probe
+bypasses the cardinality, memtable-byte, WAL-backlog and in-flight-body guards,
+and normal-mode admission still charges `SERIES_OVERHEAD_BYTES = 320` against a
+memtable ceiling that is a quarter of the declared budget — about 800,000
+series at this container size, which is the calibration this campaign has still
+not done. The artifacts are under
+`compare/target/metric-capacity-probe-mmap-10m/`, `-20m/` and `-28m/`.
+
+The next reductions are known and unmeasured: the selection walk does not
+consult the bloom (only `pin_metric_parts` does), so every part whose time
+range overlaps has its whole row array read whether or not it can hold the
+metric; and the rows are label-sorted, so an exact `__name__` could binary
+search instead of scan.
