@@ -12,6 +12,7 @@ pub mod corpus;
 mod delete_requests;
 mod flush;
 pub mod gorilla;
+pub mod histogram_chunk;
 mod ingest;
 pub mod journal;
 pub mod label_name;
