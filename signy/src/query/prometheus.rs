@@ -370,6 +370,12 @@ signy_series_created_total {}\n\
 horizon (SIGNY_METRIC_SERIES_IDLE_TIMEOUT); their history stays in parts.\n\
 # TYPE signy_series_evicted_idle_total counter\n\
 signy_series_evicted_idle_total {}\n\
+# HELP signy_series_retired_flushed_total Series whose index state left as soon \
+as their samples became durable, rather than at the idle horizon. A gauge or \
+cumulative series needs no index entry once a part holds it; the labels stay \
+resident in that part's catalog.\n\
+# TYPE signy_series_retired_flushed_total counter\n\
+signy_series_retired_flushed_total {}\n\
 # HELP signy_series_rejected_total New series refused at the optional \
 process-wide SIGNY_MAX_ACTIVE_SERIES emergency boundary.\n\
 # TYPE signy_series_rejected_total counter\n\
@@ -395,6 +401,7 @@ signy_metric_memtable_reserved_bytes {}\n",
         counters.active_series.load(Ordering::Relaxed),
         counters.series_created_total.load(Ordering::Relaxed),
         counters.series_evicted_idle_total.load(Ordering::Relaxed),
+        counters.series_retired_flushed_total.load(Ordering::Relaxed),
         counters.series_rejected_total.load(Ordering::Relaxed),
         counters
             .metric_datapoints_rejected_total

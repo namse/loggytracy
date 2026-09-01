@@ -396,6 +396,9 @@ pub struct SeriesCounters {
     pub active_series: AtomicU64,
     pub series_created_total: AtomicU64,
     pub series_evicted_idle_total: AtomicU64,
+    /// Series whose index state was retired the moment their samples became
+    /// durable, rather than at the idle horizon.
+    pub series_retired_flushed_total: AtomicU64,
     /// New series refused by the legacy per-datapoint helper.
     pub series_rejected_total: AtomicU64,
     pub metric_datapoints_rejected_total: AtomicU64,
@@ -752,6 +755,11 @@ impl SeriesBufferStorage {
 
 const SERIES_STATE_SHARDS: usize = 64;
 
+/// Bucket capacity a shard keeps without question. Below this the table is
+/// too small for its allocation to matter and rebuilding it only costs a
+/// rehash.
+const MIN_SHARD_CAPACITY: usize = 64;
+
 /// A layout-sharded series index. Each shard is an ordinary HashMap; shards
 /// are not locks and all callers still hold the tenant-wide memtable lock.
 /// Splitting growth across maps prevents one 7-million-entry rehash from
@@ -824,6 +832,22 @@ impl SeriesStates {
             self.len = self.len.saturating_sub(1);
         }
         previous
+    }
+
+    /// Return bucket capacity a burst has left behind. `HashMap::remove`
+    /// keeps the table it grew, so a retirement that empties an index would
+    /// otherwise hold the cardinality peak's allocation for the process'
+    /// life. The hysteresis is what keeps a steady workload from paying a
+    /// shrink and a regrow on every flush: only a shard holding at least four
+    /// times the entries it needs is rebuilt, and it is rebuilt to twice its
+    /// live population rather than to the minimum.
+    fn shrink_slack(&mut self) {
+        for shard in &mut self.shards {
+            let len = shard.len();
+            if shard.capacity() > len.saturating_mul(4).max(MIN_SHARD_CAPACITY) {
+                shard.shrink_to(len.saturating_mul(2));
+            }
+        }
     }
 
     fn keys(&self) -> impl Iterator<Item = &SeriesLabels> {
@@ -1644,6 +1668,81 @@ impl SeriesMemTable {
     pub fn commit_flush(&self) {
         *self.flushing.write() = None;
         self.flushing_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Drop the index entries of series whose samples have just become
+    /// durable.
+    ///
+    /// A flushed series keeps an index entry for two reasons and no others:
+    /// the delta running total, which nothing on disk can reconstruct, and
+    /// `last_ts`, which routes a late sample into the spill vector of the
+    /// buffer it would otherwise share with in-order ones. The second reason
+    /// ends at a part boundary — the read path sorts and de-duplicates across
+    /// parts, and the compactor merges their samples by timestamp — so a
+    /// gauge or cumulative series that has just been written is holding a
+    /// bucket for nothing. On a cardinality burst that is nearly the whole
+    /// index: the 10-million probe carried 6.25 million states of which at
+    /// most 1.09 million had a sample buffer.
+    ///
+    /// Called after the visibility transition and never inside it. The parts
+    /// carrying these series are registered first, so no query can observe an
+    /// interval where an identity is in neither place, and a burst-sized
+    /// retirement does not stall the queries queued behind the lifecycle
+    /// lock.
+    ///
+    /// What this returns is the bucket, not usually the labels. A catalog
+    /// opened against the live memtable shares its `Arc`, so the canonical
+    /// bytes leave only when the catalog stops owning them too.
+    pub fn retire_flushed(&self, snapshot: &SeriesSnapshot) -> u64 {
+        let mut inner = self.inner.write();
+        let mut freed = 0u64;
+        let mut retired = 0u64;
+        for (tenant, list) in &snapshot.tenants {
+            let Some(tenant_series) = inner.get_mut(tenant) else {
+                continue;
+            };
+            for series in list {
+                let labels = &series.labels;
+                let Some(state) = tenant_series.states.get(labels) else {
+                    continue;
+                };
+                // Three things make an entry more than history. Samples that
+                // arrived while the flush was in flight; a delta total that
+                // storage cannot rebuild; and an admission still in flight —
+                // whatever its reference count, because removing the state a
+                // reservation belongs to would strand it in a map that only
+                // eviction walks, and eviction walks states.
+                let retire = !tenant_series.has_samples(state)
+                    && state.running_total().is_none()
+                    && !tenant_series.reservations.contains_key(labels);
+                let buffer_id = state.buffer_id;
+                if !retire {
+                    continue;
+                }
+                // Keep a weak hint, exactly as the idle sweep does: the
+                // catalog that now owns these bytes can hand them straight
+                // back if the series reports again.
+                LabelInterner::global().register_evicted(labels);
+                if let Some(state) = tenant_series.states.remove(labels)
+                    && let Some(id) = state.buffer_id.or(buffer_id)
+                {
+                    tenant_series.buffers.remove(&id);
+                }
+                freed += labels.byte_len() as u64 + SERIES_OVERHEAD_BYTES;
+                retired += 1;
+            }
+            tenant_series.states.shrink_slack();
+        }
+        saturating_release(&self.inner_bytes, freed);
+        let current = self.counters.active_series.load(Ordering::Relaxed);
+        self.counters
+            .active_series
+            .fetch_sub(retired.min(current), Ordering::Relaxed);
+        self.counters
+            .series_retired_flushed_total
+            .fetch_add(retired, Ordering::Relaxed);
+        drop(inner);
+        retired
     }
 
     pub fn abort_flush(&self, snapshot: Arc<SeriesSnapshot>) {
@@ -2554,6 +2653,178 @@ mod tests {
         assert_eq!(error.new_series, 2);
         assert_eq!(memtable.active_series(&first_tenant), 0);
         assert_eq!(memtable.active_series(&second_tenant), 0);
+    }
+
+    #[test]
+    fn a_flushed_gauge_leaves_the_index_and_takes_its_charge_with_it() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "retired");
+        memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+        assert_eq!(memtable.active_series(&test_tenant()), 1);
+
+        let snapshot = memtable.begin_flush();
+        memtable.commit_flush();
+        assert_eq!(
+            memtable.retire_flushed(&snapshot),
+            1,
+            "a gauge whose samples are durable keeps nothing the index can serve"
+        );
+
+        assert_eq!(memtable.active_series(&test_tenant()), 0);
+        assert!(memtable.series_labels(&test_tenant()).is_empty());
+        assert_eq!(
+            memtable.approximate_size(),
+            0,
+            "the charge leaves with the entry, exactly as the idle sweep's does"
+        );
+        assert!(memtable.is_empty());
+    }
+
+    #[test]
+    fn a_delta_series_keeps_its_index_entry_through_retirement() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("http_requests_total", "delta");
+        memtable.insert(vec![sample(&series, 100, 5.0, SampleKind::Delta)]);
+        let snapshot = memtable.begin_flush();
+        memtable.commit_flush();
+
+        assert_eq!(
+            memtable.retire_flushed(&snapshot),
+            0,
+            "storage cannot rebuild a running total, so its entry is not history"
+        );
+        memtable.insert(vec![sample(&series, 200, 3.0, SampleKind::Delta)]);
+        assert_eq!(
+            memtable.sorted_samples(&test_tenant()).unwrap()[&series],
+            vec![(200, 8.0)],
+            "retiring a delta series would manufacture a counter reset"
+        );
+    }
+
+    #[test]
+    fn a_sample_that_lands_during_the_flush_keeps_its_series_resident() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "concurrent");
+        memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+        let snapshot = memtable.begin_flush();
+        memtable.insert(vec![sample(&series, 200, 2.0, SampleKind::Gauge)]);
+        memtable.commit_flush();
+
+        assert_eq!(memtable.retire_flushed(&snapshot), 0);
+        assert_eq!(
+            memtable.sorted_samples(&test_tenant()).unwrap()[&series],
+            vec![(200, 2.0)],
+            "the sample that arrived mid-flush is still buffered and still owned"
+        );
+    }
+
+    #[test]
+    fn retirement_leaves_a_series_with_an_admission_in_flight_alone() {
+        let memtable = Arc::new(SeriesMemTable::new());
+        let tenant = test_tenant();
+        let series = labels("queue_depth", "in-flight");
+        let pending = sample(&series, 300, 3.0, SampleKind::Gauge);
+        let groups = vec![(&tenant, std::slice::from_ref(&pending))];
+
+        memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+        let snapshot = memtable.begin_flush();
+        memtable.commit_flush();
+        let admission = memtable
+            .admit_request(&groups, None, i64::MIN)
+            .expect("the empty table has room");
+
+        assert_eq!(
+            memtable.retire_flushed(&snapshot),
+            0,
+            "removing the state would strand a reservation in a map only eviction walks"
+        );
+        admission.into_iter().for_each(SeriesAdmission::commit);
+        memtable.insert(vec![pending]);
+        assert_eq!(
+            memtable.sorted_samples(&tenant).unwrap()[&series],
+            vec![(300, 3.0)]
+        );
+    }
+
+    #[test]
+    fn retirement_returns_the_bucket_capacity_a_burst_grew() {
+        let memtable = SeriesMemTable::new();
+        let burst: Vec<MetricSample> = (0..20_000)
+            .map(|index| {
+                sample(
+                    &labels("queue_depth", &format!("burst-{index}")),
+                    100,
+                    1.0,
+                    SampleKind::Gauge,
+                )
+            })
+            .collect();
+        memtable.insert(burst);
+        let grown = memtable.memory_stats().states_capacity;
+        assert!(grown >= 20_000);
+
+        let snapshot = memtable.begin_flush();
+        memtable.commit_flush();
+        assert_eq!(memtable.retire_flushed(&snapshot), 20_000);
+
+        let stats = memtable.memory_stats();
+        assert_eq!(stats.states_len, 0);
+        assert!(
+            stats.states_capacity * 4 < grown,
+            "a burst's table must not outlive the burst: {} of {grown} buckets remain",
+            stats.states_capacity
+        );
+    }
+
+    #[test]
+    fn a_retired_series_that_reports_again_is_charged_exactly_once() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "returning");
+        let state_bytes = (series.byte_len() + SERIES_OVERHEAD_BYTES as usize) as u64;
+
+        memtable.insert(vec![sample(&series, 100, 1.0, SampleKind::Gauge)]);
+        let snapshot = memtable.begin_flush();
+        memtable.commit_flush();
+        memtable.retire_flushed(&snapshot);
+        assert_eq!(memtable.approximate_size(), 0);
+
+        memtable.insert(vec![sample(&series, 200, 2.0, SampleKind::Gauge)]);
+        assert_eq!(memtable.active_series(&test_tenant()), 1);
+        assert_eq!(
+            memtable.approximate_size() as u64,
+            state_bytes + INLINE_SAMPLE_BYTES,
+            "the returning series is a new entry and is charged like one"
+        );
+        assert_eq!(
+            memtable.sorted_samples(&test_tenant()).unwrap()[&series],
+            vec![(200, 2.0)]
+        );
+    }
+
+    #[test]
+    fn a_sample_older_than_a_retired_series_last_flush_is_still_kept() {
+        let memtable = SeriesMemTable::new();
+        let series = labels("queue_depth", "late");
+        memtable.insert(vec![sample(&series, 500, 5.0, SampleKind::Gauge)]);
+        let snapshot = memtable.begin_flush();
+        memtable.commit_flush();
+        memtable.retire_flushed(&snapshot);
+
+        // `last_ts` went with the entry, so this sample opens a fresh buffer
+        // rather than landing in a spill vector. Nothing is lost: it reaches
+        // its own part, and both the read path and the compactor merge parts
+        // by timestamp.
+        memtable.insert(vec![sample(&series, 400, 4.0, SampleKind::Gauge)]);
+        assert_eq!(
+            memtable.sorted_samples(&test_tenant()).unwrap()[&series],
+            vec![(400, 4.0)]
+        );
+        assert_eq!(
+            snapshot.tenants[&test_tenant()][0]
+                .sorted_samples()
+                .unwrap(),
+            vec![(500, 5.0)]
+        );
     }
 
     #[test]

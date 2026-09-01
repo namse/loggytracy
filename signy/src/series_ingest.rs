@@ -1621,8 +1621,8 @@ mod tests {
         assert!(series_memtable.is_empty(), "the samples left for the part");
         assert_eq!(
             series_memtable.active_series(&test_tenant()),
-            1,
-            "the series state survives its samples' flush"
+            0,
+            "the index entry left with the samples: the part below carries the identity"
         );
         assert_eq!(series_registry.part_count(), 1);
         assert!(

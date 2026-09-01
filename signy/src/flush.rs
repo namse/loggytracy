@@ -660,6 +660,14 @@ async fn flush_once(
                 series_memtable.commit_flush();
             }
             let visibility = visibility_started.elapsed();
+            // The index entries these series held are history now: the parts
+            // above are registered, so every label the retirement drops is
+            // reachable from a catalog. Deliberately outside the visibility
+            // lock — a burst-sized retirement is a long walk over the index
+            // and no query should wait behind it. A sample that arrives in
+            // the gap finds its state gone and re-creates it, charged as the
+            // new series it is.
+            series_memtable.retire_flushed(&series_snapshot);
             let advance_started = std::time::Instant::now();
             if let Err(error) = advance_checkpoint(
                 journal,

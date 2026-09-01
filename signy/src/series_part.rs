@@ -1668,6 +1668,37 @@ mod tests {
     }
 
     #[test]
+    fn a_retired_series_is_still_answerable_from_the_catalog_that_owns_it() {
+        let root = temp_root("catalog-outlives-index");
+        let memtable = SeriesMemTable::new();
+        let labels = labels("queue_depth", "retired");
+        memtable.insert(vec![sample(
+            "test-tenant",
+            &labels,
+            1_772_000_000_000_000_000,
+            1.0,
+        )]);
+        let snapshot = memtable.begin_flush();
+        let parts = flush_series_snapshot(&snapshot, &root).unwrap();
+        // The order the flush commits in: the reader is opened while the
+        // index still holds the identity, and only then does it retire.
+        let reader = SeriesPartReader::open_with_memtable(parts[0].clone(), &memtable).unwrap();
+        memtable.commit_flush();
+        assert_eq!(memtable.retire_flushed(&snapshot), 1);
+
+        assert!(memtable.series_labels(&test_tenant()).is_empty());
+        let catalog = reader.tenant_catalog(&test_tenant());
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].labels, labels);
+        assert_eq!(
+            reader.read_series(&catalog[0]).unwrap(),
+            vec![(1_772_000_000_000_000_000, 1.0)],
+            "the identity the index dropped is the one the catalog answers with"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_corrupt_artifact_refuses_to_load() {
         let memtable = SeriesMemTable::new();
         memtable.insert(vec![sample(
