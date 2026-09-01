@@ -31,15 +31,17 @@ use crate::trace_ingest::MAX_OTLP_REQUEST_BYTES;
 use axum::http::StatusCode;
 
 /// Decomposed-sample cap per request. Counted **after** decomposition, since
-/// one histogram datapoint fans out to `bounds + 3` samples — the cap must
-/// bound what the engine actually stores, not what the wire carried. The same
-/// class of constant as `MAX_OTLP_SPANS`.
+/// a histogram datapoint is one sample whatever its resolution, because the
+/// instrument is stored whole — the cap bounds what the engine actually
+/// stores, not what the wire carried. The same class of constant as
+/// `MAX_OTLP_SPANS`.
 pub const MAX_OTLP_METRIC_SAMPLES: usize = 100_000;
 
 /// Exponential histograms are downscaled until at most this many finite
-/// bucket boundaries remain (plus `+Inf`), then stored as ordinary
-/// `_bucket{le=}` series. The loss is boundary-limited quantile precision —
-/// the decision record in `docs/M14_IMPLEMENTATION_PLAN.md` §3.
+/// bucket boundaries remain (plus `+Inf`). The loss is boundary-limited
+/// quantile precision — the decision record in
+/// `docs/M14_IMPLEMENTATION_PLAN.md` §3. It no longer bounds cardinality:
+/// the boundaries are a schema inside one series rather than a series each.
 pub const MAX_EXP_HISTOGRAM_BUCKETS: usize = 64;
 
 /// Resource attributes promoted to series labels, keys normalized by
@@ -118,6 +120,17 @@ impl Decomposition {
         value: f64,
         kind: SampleKind,
     ) -> Result<(), MetricIngestError> {
+        self.push_value(tenant, labels, ts_ns, MetricValue::Scalar(value), kind)
+    }
+
+    fn push_value(
+        &mut self,
+        tenant: &TenantId,
+        labels: SeriesLabels,
+        ts_ns: i64,
+        value: MetricValue,
+        kind: SampleKind,
+    ) -> Result<(), MetricIngestError> {
         if self.samples.len() >= MAX_OTLP_METRIC_SAMPLES {
             return Err(MetricIngestError::TooManySamples);
         }
@@ -125,7 +138,7 @@ impl Decomposition {
             tenant: tenant.clone(),
             labels,
             ts_ns,
-            value: MetricValue::Scalar(value),
+            value,
             kind,
             datapoint_index: self.datapoint,
         });
@@ -514,14 +527,6 @@ fn exponential_histogram_point(point: &ExponentialHistogramDataPoint) -> Histogr
     }
 }
 
-/// Expand one point into the Prometheus-shaped series a selector can ask for:
-/// cumulative `_bucket{le=...}`, `+Inf`, `_sum` when the producer sent one,
-/// and `_count`.
-///
-/// The `+Inf` bucket answers with the point's declared count. The explicit
-/// path used to answer it with the sum of the bucket counts while `_count`
-/// answered with the declared one — the same number for any conforming
-/// producer, and one number is better than a disagreement.
 struct HistogramNaming<'a> {
     name: &'a str,
     attributes: &'a [opentelemetry_proto::tonic::common::v1::KeyValue],
@@ -530,10 +535,16 @@ struct HistogramNaming<'a> {
     kind: SampleKind,
 }
 
+/// One histogram datapoint becomes one sample under the instrument's own
+/// name — no `_bucket` suffix, no `le`, no `_sum` and `_count` beside it.
+/// Those series still exist for anything that asks; they are synthesized when
+/// read (`series::synthesize_histogram_series`) rather than stored, so an
+/// instrument costs one identity in the index, the catalogs and the parts
+/// instead of `bounds + 3`.
 fn push_histogram_point(
     tenant: &TenantId,
     naming: &HistogramNaming<'_>,
-    point: &HistogramPoint,
+    point: HistogramPoint,
     out: &mut Decomposition,
 ) -> Result<(), MetricIngestError> {
     let HistogramNaming {
@@ -543,36 +554,13 @@ fn push_histogram_point(
         ts,
         kind,
     } = *naming;
-    let bucket_base = base_pairs(&format!("{name}_bucket"), attributes, promoted);
-    for (bound, cumulative) in point.bounds.iter().zip(&point.cumulative) {
-        out.push(
-            tenant,
-            with_extra(&bucket_base, "le", format_boundary(*bound)),
-            ts,
-            *cumulative as f64,
-            kind,
-        )?;
-    }
-    out.push(
+    out.push_value(
         tenant,
-        with_extra(&bucket_base, "le", "+Inf".to_string()),
+        SeriesLabels::from_pairs(base_pairs(name, attributes, promoted)),
         ts,
-        point.count as f64,
+        MetricValue::Histogram(point),
         kind,
-    )?;
-    if let Some(sum) = point.sum {
-        let sum_base = base_pairs(&format!("{name}_sum"), attributes, promoted);
-        out.push(tenant, SeriesLabels::from_pairs(sum_base), ts, sum, kind)?;
-    }
-    let count_base = base_pairs(&format!("{name}_count"), attributes, promoted);
-    out.push(
-        tenant,
-        SeriesLabels::from_pairs(count_base),
-        ts,
-        point.count as f64,
-        kind,
-    )?;
-    Ok(())
+    )
 }
 
 fn decompose_histogram(
@@ -590,7 +578,7 @@ fn decompose_histogram(
         ts: datapoint_ts(point.time_unix_nano)?,
         kind,
     };
-    push_histogram_point(tenant, &naming, &explicit_histogram_point(point), out)
+    push_histogram_point(tenant, &naming, explicit_histogram_point(point), out)
 }
 
 fn decompose_exponential(
@@ -608,7 +596,7 @@ fn decompose_exponential(
         ts: datapoint_ts(point.time_unix_nano)?,
         kind,
     };
-    push_histogram_point(tenant, &naming, &exponential_histogram_point(point), out)
+    push_histogram_point(tenant, &naming, exponential_histogram_point(point), out)
 }
 
 /// Accepting one OTLP metrics export, independent of how it arrived. The
@@ -1118,41 +1106,59 @@ mod tests {
             None,
         );
         let samples = normalize_request(&test_tenant(), &request).unwrap();
-        // 3 bounds + Inf + sum + count.
-        assert_eq!(samples.len(), 6);
-        let bucket = |le: &str| {
-            samples
+        // One instrument, one sample. What used to be `3 bounds + Inf + sum +
+        // count` is now the shape inside it, and the read path hands those
+        // back to anything that asks in those terms.
+        assert_eq!(samples.len(), 1);
+        assert_eq!(
+            samples[0].labels.metric_name().as_deref(),
+            Some("http_request_duration_seconds"),
+            "the stored identity is the instrument, without a _bucket suffix"
+        );
+        assert!(label(&samples[0], "le").is_none());
+        let MetricValue::Histogram(point) = &samples[0].value else {
+            panic!("a histogram datapoint decomposes to a histogram value");
+        };
+        assert_eq!(&*point.bounds, &[0.005, 0.01, 0.025]);
+        assert_eq!(point.cumulative, vec![3, 7, 9], "le counts are cumulative");
+        assert_eq!(point.count, 10);
+        assert_eq!(point.sum, Some(1.25));
+
+        // And the series it answers as are exactly what the fan-out wrote.
+        let synthesized =
+            crate::series::synthesize_histogram_series(&samples[0].labels, &[(100, point.clone())])
+                .unwrap();
+        let named = |name: &str| {
+            synthesized
                 .iter()
-                .find(|sample| label(sample, "le").as_deref() == Some(le))
+                .find(|(labels, _)| labels.metric_name().as_deref() == Some(name))
+        };
+        assert_eq!(synthesized.len(), 6, "3 bounds + Inf + sum + count");
+        let bucket = |le: &str| {
+            synthesized
+                .iter()
+                .find(|(labels, _)| {
+                    labels
+                        .pairs()
+                        .unwrap()
+                        .iter()
+                        .any(|(key, value)| key == "le" && value == le)
+                })
+                .map(|(_, samples)| samples[0].1)
                 .unwrap_or_else(|| panic!("bucket le={le} exists"))
         };
-        assert_eq!(bucket("0.005").value.as_scalar(), Some(3.0));
+        assert_eq!(bucket("0.005"), 3.0);
+        assert_eq!(bucket("0.01"), 7.0);
+        assert_eq!(bucket("0.025"), 9.0);
+        assert_eq!(bucket("+Inf"), 10.0);
         assert_eq!(
-            bucket("0.01").value.as_scalar(),
-            Some(7.0),
-            "le counts are cumulative"
+            named("http_request_duration_seconds_sum").unwrap().1[0].1,
+            1.25
         );
-        assert_eq!(bucket("0.025").value.as_scalar(), Some(9.0));
-        assert_eq!(bucket("+Inf").value.as_scalar(), Some(10.0));
         assert_eq!(
-            bucket("0.005").labels.metric_name().as_deref(),
-            Some("http_request_duration_seconds_bucket")
+            named("http_request_duration_seconds_count").unwrap().1[0].1,
+            10.0
         );
-        let sum = samples
-            .iter()
-            .find(|sample| {
-                sample.labels.metric_name().as_deref() == Some("http_request_duration_seconds_sum")
-            })
-            .unwrap();
-        assert_eq!(sum.value.as_scalar(), Some(1.25));
-        let count = samples
-            .iter()
-            .find(|sample| {
-                sample.labels.metric_name().as_deref()
-                    == Some("http_request_duration_seconds_count")
-            })
-            .unwrap();
-        assert_eq!(count.value.as_scalar(), Some(10.0));
         assert!(
             samples
                 .iter()
@@ -1189,42 +1195,29 @@ mod tests {
             None,
         );
         let samples = normalize_request(&test_tenant(), &request).unwrap();
-        let buckets: Vec<&MetricSample> = samples
-            .iter()
-            .filter(|sample| label(sample, "le").is_some())
-            .collect();
-        let finite = buckets
-            .iter()
-            .filter(|sample| label(sample, "le").as_deref() != Some("+Inf"))
-            .count();
+        assert_eq!(samples.len(), 1, "one instrument, whatever its resolution");
+        let MetricValue::Histogram(point) = &samples[0].value else {
+            panic!("an exponential datapoint decomposes to a histogram value");
+        };
         assert!(
-            finite <= MAX_EXP_HISTOGRAM_BUCKETS,
-            "{finite} finite boundaries survived the downscale"
+            point.bounds.len() <= MAX_EXP_HISTOGRAM_BUCKETS,
+            "{} finite boundaries survived the downscale",
+            point.bounds.len()
         );
         assert!(
-            finite >= MAX_EXP_HISTOGRAM_BUCKETS / 2,
+            point.bounds.len() >= MAX_EXP_HISTOGRAM_BUCKETS / 2,
             "one halving, not a collapse"
         );
-        // The smallest bucket absorbed the zero bucket.
-        let mut last = 0.0;
-        for bucket in &buckets {
-            let value = bucket.value.as_scalar().expect("a bucket is a scalar");
-            assert!(value >= last, "le counts stay cumulative");
-            last = value;
+        let mut last = 0u64;
+        for cumulative in &point.cumulative {
+            assert!(*cumulative >= last, "le counts stay cumulative");
+            last = *cumulative;
         }
-        let first = buckets.first().unwrap();
         assert!(
-            first.value.as_scalar().expect("a bucket is a scalar") >= 5.0,
+            point.cumulative[0] >= 5,
             "the zero count folds into the smallest bound"
         );
-        assert_eq!(
-            buckets
-                .last()
-                .and_then(|sample| label(sample, "le"))
-                .as_deref(),
-            Some("+Inf")
-        );
-        assert_eq!(buckets.last().unwrap().value.as_scalar(), Some(205.0));
+        assert_eq!(point.count, 205, "the +Inf bucket is the declared count");
     }
 
     #[test]
@@ -1493,8 +1486,9 @@ mod tests {
             ..Config::default()
         };
         let (ingest, series_memtable, _journal) = ingest_over(config);
-        // 25 000 histogram datapoints × (2 bounds + 3) = 125 000 decomposed
-        // samples: over the cap while the datapoint count alone is not.
+        // A histogram datapoint is one sample now however many boundaries it
+        // has, so the cap is reached by datapoints rather than by resolution:
+        // 125 000 of them, over the cap that 25 000 no longer approaches.
         let point = HistogramDataPoint {
             time_unix_nano: now_ns(),
             count: 1,
@@ -1507,7 +1501,7 @@ mod tests {
             vec![Metric {
                 name: "h".to_string(),
                 data: Some(metric::Data::Histogram(Histogram {
-                    data_points: vec![point; 25_000],
+                    data_points: vec![point; 125_000],
                     aggregation_temporality: AggregationTemporality::Cumulative as i32,
                 })),
                 ..Default::default()
@@ -1580,11 +1574,11 @@ mod tests {
             assert_eq!(kept.value, original.value);
         }
         assert!(
-            refiltered
-                .iter()
-                .any(|sample| sample.labels.metric_name().as_deref()
-                    == Some("http_request_duration_seconds_bucket")),
-            "the whole admitted histogram family survives"
+            refiltered.iter().any(|sample| {
+                sample.labels.metric_name().as_deref() == Some("http_request_duration_seconds")
+                    && matches!(sample.value, MetricValue::Histogram(_))
+            }),
+            "the admitted histogram survives the round trip whole"
         );
     }
 

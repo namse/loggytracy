@@ -47,6 +47,39 @@ pub(crate) struct MetricScanOutcome {
 /// payload reads as no match rather than as an error — these bytes crossed a
 /// checksum and were decoded once when the part opened, so corruption is
 /// caught before a query can see it.
+/// Whether a stored histogram could answer anything this request asked for.
+///
+/// A necessary condition, checked before its points are read: the selector's
+/// metric must be one of the names this instrument answers as, and every
+/// filter that a synthetic series inherits unchanged must already match. `le`
+/// is the exception — it exists only on the series synthesis produces.
+fn histogram_family_candidate(labels: &[u8], request: &MetricScanRequest) -> bool {
+    if let Some(metric) = &request.metric {
+        let Some(base) = crate::series::histogram_base_name(metric) else {
+            return false;
+        };
+        let stored = crate::series::canonical_pairs(labels)
+            .filter_map(Result::ok)
+            .find(|(key, _)| *key == crate::series::METRIC_NAME_LABEL)
+            .map(|(_, value)| value);
+        if stored != Some(base) {
+            return false;
+        }
+    }
+    request
+        .filters
+        .iter()
+        .filter(|filter| filter.key() != "le")
+        .all(|filter| {
+            filter.matches(&|key: &str| {
+                crate::series::canonical_pairs(labels)
+                    .filter_map(Result::ok)
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value)
+            })
+        })
+}
+
 fn metric_labels_match(labels: &[u8], metric: &Option<String>, filters: &[MetricFilter]) -> bool {
     let lookup = |key: &str| {
         crate::series::canonical_pairs(labels)
@@ -106,9 +139,22 @@ async fn scan_metric_series(
         }
         let mut selected: std::collections::BTreeMap<SeriesLabels, Sources> =
             std::collections::BTreeMap::new();
+        // A stored histogram is one identity that answers as many. It is
+        // selected by its own name and gathered by its points; which of the
+        // series it can answer as the selector actually wanted is decided
+        // after they exist.
+        let mut histograms: std::collections::BTreeMap<SeriesLabels, Sources> =
+            std::collections::BTreeMap::new();
         for labels in memtable.series_labels(&tenant) {
             if metric_labels_match(labels.as_bytes(), &request.metric, &request.filters) {
                 selected.entry(labels).or_insert(Sources {
+                    in_memtable: true,
+                    parts: Vec::new(),
+                });
+            } else if histogram_family_candidate(labels.as_bytes(), &request)
+                && !memtable.histogram_points_of(&tenant, &labels).is_empty()
+            {
+                histograms.entry(labels).or_insert(Sources {
                     in_memtable: true,
                     parts: Vec::new(),
                 });
@@ -130,13 +176,24 @@ async fn scan_metric_series(
                 if !row.overlaps(window) {
                     continue;
                 }
-                if !metric_labels_match(row.labels, &request.metric, &request.filters) {
-                    continue;
-                }
+                let into = match row.kind {
+                    crate::series_part::SeriesRowKind::Scalar => {
+                        if !metric_labels_match(row.labels, &request.metric, &request.filters) {
+                            continue;
+                        }
+                        &mut selected
+                    }
+                    crate::series_part::SeriesRowKind::Histogram => {
+                        if !histogram_family_candidate(row.labels, &request) {
+                            continue;
+                        }
+                        &mut histograms
+                    }
+                };
                 // Only a row that matched becomes an owned identity. The walk
-                // above touched the 28-byte row array and nothing else.
+                // above touched the fixed-stride row array and nothing else.
                 let labels = SeriesLabels::from_canonical(row.labels.to_vec());
-                let sources = selected.entry(labels).or_insert(Sources {
+                let sources = into.entry(labels).or_insert(Sources {
                     in_memtable: false,
                     parts: Vec::new(),
                 });
@@ -190,6 +247,49 @@ selector, shorten the window, or coarsen step",
             estimated_bytes = estimated_bytes.saturating_add(samples.len() as u64 * 16);
             memory_reservation.ensure(estimated_bytes)?;
             series.push(MetricSeriesData { labels, samples });
+        }
+
+        // Each stored histogram is expanded once and then asked, per series it
+        // can answer as, whether the selector wanted that one. The expansion
+        // happens after the scalar walk so the caps below see both.
+        for (labels, sources) in histograms {
+            if task_cancellation.load(Ordering::Acquire) {
+                return Err("metric query timed out".to_string());
+            }
+            let mut points = if sources.in_memtable {
+                memtable.histogram_points_of(&tenant, &labels)
+            } else {
+                Vec::new()
+            };
+            for (reader, chunk) in &sources.parts {
+                points.extend(reader.read_histogram_points(*chunk)?);
+            }
+            points.retain(|(ts, _)| *ts >= decode_start_ns && *ts <= request.end_ns);
+            points.sort_by_key(|(ts, _)| *ts);
+            points.dedup_by_key(|(ts, _)| *ts);
+            for (synthetic, mut samples) in
+                crate::series::synthesize_histogram_series(&labels, &points)?
+            {
+                if !metric_labels_match(synthetic.as_bytes(), &request.metric, &request.filters) {
+                    continue;
+                }
+                samples.sort_by_key(|(ts, _)| *ts);
+                if series.len() >= max_series {
+                    return Err(format!(
+                        "metric selection exceeds the maximum of {max_series} series \
+(SIGNY_MAX_METRIC_SERIES_PER_QUERY) — narrow the selector with more attr filters"
+                    ));
+                }
+                decoded_samples += samples.len() as u64;
+                estimated_bytes = estimated_bytes
+                    .saturating_add(samples.len() as u64 * 16)
+                    .saturating_add(synthetic.byte_len() as u64);
+                memory_reservation.ensure(estimated_bytes)?;
+                series.push(MetricSeriesData {
+                    labels: synthetic,
+                    samples,
+                });
+            }
         }
         Ok::<_, String>(MetricScanOutcome {
             series,

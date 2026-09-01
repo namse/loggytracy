@@ -3679,6 +3679,146 @@ fn metric_row_samples(row: &serde_json::Value) -> Vec<(i64, f64)> {
         .collect()
 }
 
+/// Storage holds one identity per instrument; a caller still asks in
+/// Prometheus terms and has to get Prometheus answers.
+fn insert_histogram(
+    state: &AppState,
+    labels: &crate::series::SeriesLabels,
+    points: &[(i64, &[u64], u64)],
+) {
+    state.journal.series_memtable().insert(
+        points
+            .iter()
+            .map(|(ts_ns, cumulative, count)| crate::series::MetricSample {
+                tenant: test_tenant(),
+                labels: labels.clone(),
+                ts_ns: *ts_ns,
+                value: MetricValue::Histogram(crate::series::HistogramPoint {
+                    bounds: vec![0.005, 0.01].into(),
+                    cumulative: cumulative.to_vec(),
+                    sum: Some(*count as f64 * 0.001),
+                    count: *count,
+                }),
+                kind: crate::series::SampleKind::Cumulative,
+                datapoint_index: 0,
+            })
+            .collect(),
+    );
+}
+
+#[tokio::test]
+async fn a_native_histogram_answers_the_bucket_series_a_selector_asks_for() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    let labels = metric_labels("http_request_duration_seconds", &[("instance", "a")]);
+    insert_histogram(
+        &state,
+        &labels,
+        &[
+            (METRIC_ANCHOR_NS, &[1, 2], 3),
+            (METRIC_ANCHOR_NS + METRIC_SECOND_NS, &[4, 9], 11),
+        ],
+    );
+
+    let (status, body) = first_party_get(
+        state.clone(),
+        &format!(
+            "/signy/api/v1/metrics/query?metric=http_request_duration_seconds_bucket\
+&attr=le%3D0.01&start={METRIC_ANCHOR_NS}&end={}&step=1s",
+            METRIC_ANCHOR_NS + METRIC_SECOND_NS
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows: Vec<serde_json::Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("a row is JSON"))
+        .collect();
+    let series: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| row.get("labels").is_some())
+        .collect();
+    assert_eq!(
+        series.len(),
+        1,
+        "one bucket was asked for and one comes back: {body}"
+    );
+    assert_eq!(
+        series[0]["labels"]["le"], "0.01",
+        "the synthetic identity carries the boundary it answers for"
+    );
+    assert_eq!(series[0]["labels"]["instance"], "a");
+    let samples = metric_row_samples(series[0]);
+    assert_eq!(
+        samples.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+        vec![2.0, 9.0],
+        "cumulative counts at le=0.01, read out of a stored histogram"
+    );
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
+#[tokio::test]
+async fn a_native_histogram_answers_its_count_and_its_quantile() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |_| {});
+    let labels = metric_labels("http_request_duration_seconds", &[("instance", "a")]);
+    insert_histogram(
+        &state,
+        &labels,
+        &[
+            (METRIC_ANCHOR_NS, &[0, 0], 0),
+            (METRIC_ANCHOR_NS + METRIC_SECOND_NS, &[10, 20], 20),
+        ],
+    );
+
+    let (status, body) = first_party_get(
+        state.clone(),
+        &format!(
+            "/signy/api/v1/metrics/query?metric=http_request_duration_seconds_count\
+&start={METRIC_ANCHOR_NS}&end={}&step=1s",
+            METRIC_ANCHOR_NS + METRIC_SECOND_NS
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows: Vec<serde_json::Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("a row is JSON"))
+        .collect();
+    let series: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| row.get("labels").is_some())
+        .collect();
+    assert_eq!(series.len(), 1, "the _count series is answerable too: {body}");
+    assert_eq!(
+        metric_row_samples(series[0])
+            .iter()
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>(),
+        vec![0.0, 20.0]
+    );
+
+    // And the quantile route, which folds the bucket family it never stored.
+    let (status, body) = first_party_get(
+        state,
+        &format!(
+            "/signy/api/v1/metrics/quantile?metric=http_request_duration_seconds\
+&q=0.5&start={}&end={}&step=1s&range=1s",
+            METRIC_ANCHOR_NS + METRIC_SECOND_NS,
+            METRIC_ANCHOR_NS + METRIC_SECOND_NS
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("samples"),
+        "a quantile comes back from a stored histogram: {body}"
+    );
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
 #[tokio::test]
 async fn a_metric_route_refuses_an_unknown_parameter_with_its_own_list() {
     let data_dir = temp_dir();

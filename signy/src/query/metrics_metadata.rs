@@ -48,6 +48,17 @@ fn discover_series(
     {
         if metric_labels_match(labels.as_bytes(), &params.metric, &params.filters) {
             series.insert(labels);
+            continue;
+        }
+        // A stored histogram is discoverable under the names it answers as,
+        // not under the one it is stored as: a caller that asks what series
+        // exist has to be told the same thing a query would answer from.
+        let points = state
+            .journal
+            .series_memtable()
+            .histogram_points_of(tenant, &labels);
+        if !points.is_empty() {
+            insert_synthetic(&mut series, &labels, &points, params)?;
         }
     }
     for reader in state.series_parts.snapshot() {
@@ -59,12 +70,40 @@ fn discover_series(
             if !row.overlaps(window) {
                 continue;
             }
-            if metric_labels_match(row.labels, &params.metric, &params.filters) {
-                series.insert(SeriesLabels::from_canonical(row.labels.to_vec()));
+            match row.kind {
+                crate::series_part::SeriesRowKind::Scalar => {
+                    if metric_labels_match(row.labels, &params.metric, &params.filters) {
+                        series.insert(SeriesLabels::from_canonical(row.labels.to_vec()));
+                    }
+                }
+                crate::series_part::SeriesRowKind::Histogram => {
+                    let labels = SeriesLabels::from_canonical(row.labels.to_vec());
+                    let points = reader
+                        .read_histogram_points(row.chunk)
+                        .map_err(ApiError::from_engine)?;
+                    insert_synthetic(&mut series, &labels, &points, params)?;
+                }
             }
         }
     }
     Ok(series)
+}
+
+/// Expand one stored histogram and keep the identities the narrowing wanted.
+fn insert_synthetic(
+    series: &mut std::collections::BTreeSet<SeriesLabels>,
+    labels: &SeriesLabels,
+    points: &[(i64, crate::series::HistogramPoint)],
+    params: &MetricParams,
+) -> Result<(), ApiError> {
+    for (synthetic, _) in crate::series::synthesize_histogram_series(labels, points)
+        .map_err(ApiError::from_engine)?
+    {
+        if metric_labels_match(synthetic.as_bytes(), &params.metric, &params.filters) {
+            series.insert(synthetic);
+        }
+    }
+    Ok(())
 }
 
 struct DiscoveryAnswer {

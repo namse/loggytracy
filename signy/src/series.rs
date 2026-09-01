@@ -270,6 +270,91 @@ impl HistogramPoint {
     }
 }
 
+/// One series a histogram answers as: its synthetic identity and the samples
+/// that identity carries.
+pub type SynthesizedSeries = (SeriesLabels, Vec<(i64, f64)>);
+
+/// The Prometheus-shaped series a stored histogram answers as.
+///
+/// Storage holds one identity per instrument; a selector may still ask for
+/// `<name>_bucket{le=...}`, `<name>_sum` or `<name>_count`, and the comparison
+/// bed asks in exactly those terms because that is what VictoriaMetrics has.
+/// The read path expands rather than the write path fanning out, so the
+/// cardinality is saved where it costs — the index, the catalogs, the parts —
+/// and nothing that could ask is told the series went away.
+///
+/// A point contributes to a bound's series only when that point counted
+/// against it. An exponential histogram that rescaled has runs with different
+/// boundaries, and a bucket that a later run does not have simply stops
+/// reporting, which is what it did when a rescale minted new series.
+pub fn synthesize_histogram_series(
+    base: &SeriesLabels,
+    points: &[(i64, HistogramPoint)],
+) -> Result<Vec<SynthesizedSeries>, String> {
+    let pairs = base.pairs()?;
+    let name = pairs
+        .iter()
+        .find(|(key, _)| key == METRIC_NAME_LABEL)
+        .map(|(_, value)| value.clone())
+        .ok_or("a histogram series has no metric name")?;
+    let without_name: Vec<(String, String)> = pairs
+        .iter()
+        .filter(|(key, _)| key != METRIC_NAME_LABEL)
+        .cloned()
+        .collect();
+    let renamed = |suffix: &str, extra: Option<(&str, &str)>| {
+        let mut pairs = Vec::with_capacity(without_name.len() + 2);
+        pairs.push((METRIC_NAME_LABEL.to_string(), format!("{name}{suffix}")));
+        if let Some((key, value)) = extra {
+            pairs.push((key.to_string(), value.to_string()));
+        }
+        pairs.extend(without_name.iter().cloned());
+        SeriesLabels::from_pairs(pairs)
+    };
+
+    // Ordered so the answer is stable across calls, and by the boundary's
+    // rendered form because that is the label a selector matches on.
+    let mut buckets: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
+    let mut infinite: Vec<(i64, f64)> = Vec::new();
+    let mut sums: Vec<(i64, f64)> = Vec::new();
+    let mut counts: Vec<(i64, f64)> = Vec::new();
+    for (ts_ns, point) in points {
+        for (bound, cumulative) in point.bounds.iter().zip(&point.cumulative) {
+            buckets
+                .entry(crate::series_ingest::format_boundary(*bound))
+                .or_default()
+                .push((*ts_ns, *cumulative as f64));
+        }
+        infinite.push((*ts_ns, point.count as f64));
+        if let Some(sum) = point.sum {
+            sums.push((*ts_ns, sum));
+        }
+        counts.push((*ts_ns, point.count as f64));
+    }
+
+    let mut answer = Vec::with_capacity(buckets.len() + 3);
+    for (le, samples) in buckets {
+        answer.push((renamed("_bucket", Some(("le", &le))), samples));
+    }
+    answer.push((renamed("_bucket", Some(("le", "+Inf"))), infinite));
+    if !sums.is_empty() {
+        answer.push((renamed("_sum", None), sums));
+    }
+    answer.push((renamed("_count", None), counts));
+    Ok(answer)
+}
+
+/// The instrument a synthetic name belongs to, or `None` when the name is not
+/// one a histogram answers as.
+pub fn histogram_base_name(name: &str) -> Option<&str> {
+    for suffix in ["_bucket", "_sum", "_count"] {
+        if let Some(base) = name.strip_suffix(suffix) {
+            return Some(base);
+        }
+    }
+    None
+}
+
 /// What one decomposed datapoint carries. A scalar is a gauge, a counter or
 /// one `le` bucket; a histogram is a whole instrument in one series.
 #[derive(Clone, Debug, PartialEq)]
@@ -2109,6 +2194,37 @@ impl SeriesMemTable {
     /// One series' buffered samples, time-sorted — the per-series read the
     /// executor merges with the part chunks. The open encoder is cloned and
     /// closed rather than disturbed.
+    /// One histogram series' buffered points, flushing generation first.
+    pub fn histogram_points_of(
+        &self,
+        tenant: &TenantId,
+        labels: &SeriesLabels,
+    ) -> Vec<(i64, HistogramPoint)> {
+        let mut points = Vec::new();
+        {
+            let flushing = self.flushing.read();
+            if let Some(snapshot) = flushing.as_ref()
+                && let Some(list) = snapshot.tenants.get(tenant)
+            {
+                for series in list {
+                    if series.labels == *labels {
+                        points.extend(series.points.iter().cloned());
+                    }
+                }
+            }
+        }
+        let inner = self.inner.read();
+        if let Some(series) = inner.get(tenant)
+            && let Some(state) = series.states.get(labels)
+            && let Some(buffer_id) = state.buffer_id
+            && let Some(SeriesBufferStorage::Histogram(histogram)) = series.buffers.get(&buffer_id)
+        {
+            points.extend(histogram.points.iter().cloned());
+        }
+        points.sort_by_key(|(ts, _)| *ts);
+        points
+    }
+
     pub fn sorted_samples_of(
         &self,
         tenant: &TenantId,

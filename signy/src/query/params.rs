@@ -502,6 +502,16 @@ pub(crate) enum MetricFilter {
 }
 
 impl MetricFilter {
+    /// The label this filter is about.
+    pub(crate) fn key(&self) -> &str {
+        match self {
+            Self::Eq { key, .. }
+            | Self::Neq { key, .. }
+            | Self::Re { key, .. }
+            | Self::NRe { key, .. } => key,
+        }
+    }
+
     pub(crate) fn matches<'a>(&self, lookup: &dyn Fn(&str) -> Option<&'a str>) -> bool {
         match self {
             Self::Eq { key, value } => lookup(key).unwrap_or_default() == value.as_str(),
