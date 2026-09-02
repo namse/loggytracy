@@ -46,6 +46,7 @@
 #   SOAK_MEMORY_HIGH=1800M           ./scripts/run_soak_local.sh throttled
 #   SOAK_OBJECT_STORE=off            ./scripts/run_soak_local.sh local-only
 #   SOAK_METRIC_SCRAPE_SECONDS=0     ./scripts/run_soak_local.sh logs-only
+#   SOAK_FEATURES=                   ./scripts/run_soak_local.sh production-allocator
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -95,7 +96,15 @@ BIN="${SOAK_BIN:-$ROOT/target/release/signy}"
 PORT="${SOAK_PORT:-3153}"
 # memprof is on by default: allocator retention over hours is half of what
 # this run exists to observe, and anon/live needs the arena live bytes.
-FEATURES="${SOAK_FEATURES:-memprof}"
+#
+# `SOAK_FEATURES=` (explicitly empty) builds the *production* binary instead,
+# which is a different allocator and not a detail: the memprof build's
+# instrumented wrapper allocates through glibc, and the shipped binary uses
+# mimalloc (`src/main.rs`). An absolute footprint and an arena split cannot be
+# read off the same run, so a question about whether production survives has to
+# be asked of this build. The `-` rather than `:-` is what makes the empty
+# value mean "no features" instead of falling back to the default.
+FEATURES="${SOAK_FEATURES-memprof}"
 # Fail the run while the machine still has room, well before the filesystem
 # is full: retention churn needs headroom to delete into.
 DISK_MIN_AVAIL_KB="${SOAK_DISK_MIN_AVAIL_KB:-$((4 * 1024 * 1024))}"
