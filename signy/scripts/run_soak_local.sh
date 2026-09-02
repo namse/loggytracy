@@ -325,12 +325,27 @@ SIGNY_LOAD_RESULT_PATH="$OUT/load.json" \
 HARNESS_STATUS=$?
 LOAD_STOPPED_AT=$(date +%s.%N)
 
+# The allocator's own report at the two moments worth comparing: with the load
+# on it, and after it has had the settle window to give memory back. Both are
+# pulled only while the server is up, which is the only time they exist.
+capture_allocator() {
+  kill -0 "$SERVER_PID" 2>/dev/null || return 0
+  curl -fsS --max-time 15 "http://127.0.0.1:$PORT/debug/allocator" \
+    >"$OUT/allocator-$1.txt" 2>/dev/null || true
+  curl -fsS --max-time 60 "http://127.0.0.1:$PORT/debug/allocator/profile" \
+    >>"$OUT/allocator-$1.txt" 2>/dev/null || true
+}
+capture_allocator loaded
+
 # The settle window: the load is gone, the server is not. Sampling continues,
 # so the series carries a stretch with no work in it to compare against.
 if [ "$SETTLE" -gt 0 ] 2>/dev/null && kill -0 "$SERVER_PID" 2>/dev/null; then
   echo "settling for ${SETTLE}s with the load stopped"
   sleep "$SETTLE"
+  capture_allocator settled
 fi
+# Heap profiles live in the data directory, which cleanup removes.
+cp -r "$DATA/heap-profiles" "$OUT/" 2>/dev/null || true
 
 # Scraped while the server is still up, which is the only time it can be. The
 # journal writer's phase histograms are cumulative over the run, so one scrape
