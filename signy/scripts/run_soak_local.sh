@@ -108,6 +108,17 @@ FEATURES="${SOAK_FEATURES-memprof}"
 # Fail the run while the machine still has room, well before the filesystem
 # is full: retention churn needs headroom to delete into.
 DISK_MIN_AVAIL_KB="${SOAK_DISK_MIN_AVAIL_KB:-$((4 * 1024 * 1024))}"
+# Seconds to keep sampling after the load stops, with the server still up.
+#
+# This answers the one question every run so far has left open: when nothing is
+# being asked of it any more, does the process give its memory back? If
+# resident falls toward live, what it was holding was freed memory the decay
+# policy had not returned, which is a setting. If it does not fall, the memory
+# is either still live or pinned by fragmentation, which is a defect in what
+# the engine allocates rather than in what the allocator does with it. The runs
+# before this killed the server the moment the harness stopped, so the question
+# had never been put.
+SETTLE="${SOAK_SETTLE_SECONDS:-120}"
 UNIT="soak-$NAME"
 
 if [ "${SOAK_SKIP_BUILD:-0}" != "1" ]; then
@@ -185,8 +196,9 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
 # freeze with zero direct reclaim in it is not a reclaim stall, and the next
 # question is which resource the threads were actually waiting on.
 (
-  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us,active_series,series_memtable,metric_parts,metric_dp_rejected,metric_mem_rejected,metrics_dir,store_dir,proc_rss,alloc_committed,alloc_live,alloc_retained"
+  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us,active_series,series_memtable,metric_parts,metric_dp_rejected,metric_mem_rejected,metrics_dir,store_dir,proc_rss,alloc_committed,alloc_live,alloc_retained,alloc_active,alloc_metadata"
   T0=$(date +%s.%N)
+  echo "$T0" >"$OUT/sampler_t0"
   i=0; du_bytes=0; wal_bytes=0; metrics_bytes=0; store_bytes=0
   while [ -d "$CG" ]; do
     now=$(date +%s.%N)
@@ -239,7 +251,9 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
       $1=="signy_allocator_committed_bytes"{cm=$2}
       $1=="signy_allocator_live_bytes"{lv=$2}
       $1=="signy_allocator_retained_bytes"{rt=$2}
-      END{printf "%d,%d,%d,%d", rs, cm, lv, rt}')
+      $1=="signy_allocator_active_bytes"{ac=$2}
+      $1=="signy_allocator_metadata_bytes"{md=$2}
+      END{printf "%d,%d,%d,%d,%d,%d", rs, cm, lv, rt, ac, md}')
     gg=$(echo "$m" | awk '
       $1=="signy_memtable_bytes"{mt=$2}
       $1=="signy_memtable_buffered_bytes"{mb=$2}
@@ -309,6 +323,14 @@ SIGNY_LOAD_TENANT_RETENTION="$TENANT_RETENTION" \
 SIGNY_LOAD_RESULT_PATH="$OUT/load.json" \
   "$ROOT/target/release/load" >"$OUT/harness.log" 2>&1
 HARNESS_STATUS=$?
+LOAD_STOPPED_AT=$(date +%s.%N)
+
+# The settle window: the load is gone, the server is not. Sampling continues,
+# so the series carries a stretch with no work in it to compare against.
+if [ "$SETTLE" -gt 0 ] 2>/dev/null && kill -0 "$SERVER_PID" 2>/dev/null; then
+  echo "settling for ${SETTLE}s with the load stopped"
+  sleep "$SETTLE"
+fi
 
 # Scraped while the server is still up, which is the only time it can be. The
 # journal writer's phase histograms are cumulative over the run, so one scrape
@@ -365,7 +387,8 @@ GUARD=ok
 16 part_meta mib;17 rg_cache mib;35 data_dir mib;36 wal_file mib;\
 51 metrics_dir mib;52 store_dir mib;46 active_series count;\
 47 series_memtable mib;48 metric_parts count;53 proc_rss mib;\
-54 alloc_committed mib;55 alloc_live mib;56 alloc_retained mib", rows, ";")
+54 alloc_committed mib;55 alloc_live mib;56 alloc_retained mib;\
+57 alloc_active mib;58 alloc_metadata mib", rows, ";")
       printf "%-14s %12s %12s %12s %12s  %s\n", "mib/count", "Q1", "Q2", "Q3", "Q4", "trend"
       for (r = 1; r <= nr; r++) {
         split(rows[r], f, " "); c = f[1] + 0
@@ -470,6 +493,36 @@ GUARD=ok
       if (fparts) printf "  flush rows=%d parts=%d rows/part=%.0f\n", \
                           frows, fparts, frows / fparts
     }' "$OUT/metrics-final.txt" 2>/dev/null
+  # Did stopping the work give the memory back? The window before the load
+  # stopped against the tail of the settle window, on the numbers that decide
+  # it. A resident that falls toward live was holding freed memory the decay
+  # policy had not returned; one that does not fall is holding memory that is
+  # either still live or pinned, and those are the engine's problem rather than
+  # the allocator's.
+  if [ -f "$OUT/sampler_t0" ] && [ "$SETTLE" -gt 0 ] 2>/dev/null; then
+    awk -F, -v t0="$(cat "$OUT/sampler_t0")" -v stopped="$LOAD_STOPPED_AT" -v settle="$SETTLE" '
+      BEGIN { at = stopped - t0; window = 30 }
+      NR>1 {
+        t = $1 + 0
+        if (t > at - window && t <= at) { bn++; ba+=$4; br+=$53; bc+=$54; bl+=$55; bv+=$57 }
+        if (t >= at + settle - window) { an++; aa+=$4; ar+=$53; ac+=$54; al+=$55; av+=$57 }
+      }
+      END {
+        if (!bn || !an) { printf "settle: not enough samples (before=%d after=%d)\n", bn, an; exit }
+        m = 1048576.0
+        printf "settle (%.0fs with the load stopped), mean of 30 s before and 30 s after:\n", settle
+        printf "  %-16s %10s %10s %10s\n", "mib", "loaded", "settled", "returned"
+        printf "  %-16s %10.1f %10.1f %10.1f\n", "anon",      ba/bn/m, aa/an/m, (ba/bn-aa/an)/m
+        printf "  %-16s %10.1f %10.1f %10.1f\n", "proc_rss",  br/bn/m, ar/an/m, (br/bn-ar/an)/m
+        if (bc > 0) printf "  %-16s %10.1f %10.1f %10.1f\n", "alloc_committed", bc/bn/m, ac/an/m, (bc/bn-ac/an)/m
+        if (bl > 0) printf "  %-16s %10.1f %10.1f %10.1f\n", "alloc_live", bl/bn/m, al/an/m, (bl/bn-al/an)/m
+        if (bv > 0) {
+          printf "  %-16s %10.1f %10.1f %10.1f\n", "alloc_active", bv/bn/m, av/an/m, (bv/bn-av/an)/m
+          printf "  fragmentation (active-live) %.1f -> %.1f MiB; awaiting decay (committed-active) %.1f -> %.1f MiB\n", \
+                 (bv/bn-bl/bn)/m, (av/an-al/an)/m, (bc/bn-bv/bn)/m, (ac/an-av/an)/m
+        }
+      }' "$OUT/mem.csv"
+  fi
   # The metric leg, from the harness's own result rather than from the gauges:
   # what was offered, what was kept, and whether every read shape that must
   # return rows kept returning them. `jq` is already a dependency of

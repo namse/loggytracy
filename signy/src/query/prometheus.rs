@@ -52,6 +52,27 @@ pub async fn ready(
 }
 
 
+/// The allocator's own report, as text.
+///
+/// Deliberately not on `/metrics`: it is prose with a per-size-class table in
+/// it, and the question it answers -- which size classes hold the slack -- is
+/// asked once while looking at a problem, not every scrape.
+pub async fn allocator_report() -> String {
+    crate::allocator_stats::report()
+}
+
+/// Write a heap profile next to the data and answer with its path.
+///
+/// The directory is the engine's own, not the caller's: a route that took a
+/// path would be a way to write a file anywhere the process can reach, and the
+/// question this answers does not need one.
+pub async fn allocator_profile(State(state): State<Arc<AppState>>) -> String {
+    match crate::allocator_stats::dump_profile(&state.config.data_dir.join("heap-profiles")) {
+        Ok(path) => format!("wrote {path}\n"),
+        Err(error) => format!("no profile: {error}\n"),
+    }
+}
+
 pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
     let mem = state.memtable.global_stats();
     let disk = state.parts.global_stats();

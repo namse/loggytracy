@@ -22,7 +22,13 @@ memprof = []
 # decay-based allocators taken for the same reason -- glibc's retained free
 # crept until the 2 GiB kill -- and which one this engine should ship is a
 # measurement, not a preference, so both stay buildable on the same rig.
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys"]
+# jemalloc with its sampling heap profiler compiled in. Profiling still has to
+# be turned on at run time (`_RJEM_MALLOC_CONF=prof:true`), so the cost of the
+# feature is the build, not the run. This is the one instrument that names the
+# call stack holding memory rather than the size class -- the last question
+# after the gauges have said how much and the bin table has said what size.
+jemalloc-prof = ["jemalloc", "tikv-jemallocator/profiling", "tikv-jemalloc-ctl/profiling"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -68,6 +74,7 @@ libmimalloc-sys = { version = "0.1", default-features = false, features = ["exte
 # live bytes, which a release-built mimalloc compiles out.
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
+tikv-jemalloc-sys = { version = "0.6", optional = true }
 # The metric catalog is read through a mapping rather than into the heap: a
 # part's rows stay addressable for as long as the part is registered, and page
 # cache the kernel can reclaim is not the same resource as anonymous memory it

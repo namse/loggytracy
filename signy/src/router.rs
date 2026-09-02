@@ -18,6 +18,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let router = Router::new()
         .merge(collect_router())
         .route("/metrics", get(query::metrics))
+        // The allocator's full report, pulled deliberately rather than
+        // scraped: it is a page of text whose per-size-class table is the
+        // evidence for where retained memory sits, and no dashboard wants it
+        // every fifteen seconds.
+        .route("/debug/allocator", get(query::allocator_report))
+        .route("/debug/allocator/profile", get(query::allocator_profile))
         .route("/signy/api/v1/logs", get(query::logs))
         .route("/signy/api/v1/logs/histogram", get(query::logs_histogram))
         .route("/signy/api/v1/logs/attributes", get(query::logs_attributes))

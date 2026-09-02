@@ -2188,6 +2188,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tikv-jemalloc-ctl",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
  "tower",

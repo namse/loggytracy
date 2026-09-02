@@ -56,6 +56,19 @@ pub struct Allocator {
     /// (`stats.allocated`); a release-built mimalloc compiles the counter out,
     /// so it is `None` there and the engine's own gauges are the live side.
     pub live_bytes: Option<u64>,
+    /// Bytes in pages the allocator is currently serving allocations from.
+    /// jemalloc only, and the number that makes the two reasons separable:
+    /// `active - live` is slack inside pages that are in use, which is
+    /// fragmentation and cannot be returned while one live object sits on the
+    /// page; `committed - active` is memory already freed and not yet handed
+    /// back, which is the decay policy and is a setting rather than a defect.
+    pub active_bytes: Option<u64>,
+    /// The allocator's own bookkeeping, which is resident too and belongs to
+    /// neither of the two above.
+    pub metadata_bytes: Option<u64>,
+    /// Total address space mapped. Costs no resident memory by itself; it is
+    /// here so a large `retained` can be read against something.
+    pub mapped_bytes: Option<u64>,
     /// Address space the allocator has not returned to the operating system.
     /// jemalloc only (`stats.retained`).
     pub retained_bytes: Option<u64>,
@@ -130,6 +143,30 @@ itself. Absent under mimalloc, whose in-use counters a release build compiles ou
 signy_allocator_live_bytes {live}\n"
         ));
     }
+    if let Some(active) = allocator.active_bytes {
+        out.push_str(&format!(
+            "# HELP signy_allocator_active_bytes Bytes in pages the allocator is serving \
+allocations from. Against live bytes it separates the two reasons memory is not returned: \
+active minus live is slack inside pages that are in use, which one live object per page is enough \
+to pin, and committed minus active is freed memory the decay policy has not handed back yet.\n\
+# TYPE signy_allocator_active_bytes gauge\n\
+signy_allocator_active_bytes {active}\n"
+        ));
+    }
+    if let Some(metadata) = allocator.metadata_bytes {
+        out.push_str(&format!(
+            "# HELP signy_allocator_metadata_bytes The allocator's own bookkeeping. Resident, and \
+belonging to neither the live nor the retained side.\n\
+# TYPE signy_allocator_metadata_bytes gauge\n\
+signy_allocator_metadata_bytes {metadata}\n"
+        ));
+    }
+    if let Some(mapped) = allocator.mapped_bytes {
+        out.push_str(&format!(
+            "# TYPE signy_allocator_mapped_bytes gauge\n\
+signy_allocator_mapped_bytes {mapped}\n"
+        ));
+    }
     if let Some(retained) = allocator.retained_bytes {
         out.push_str(&format!(
             "# HELP signy_allocator_retained_bytes Address space the allocator has not returned \
@@ -179,6 +216,20 @@ fn kernel_resident() -> (Option<u64>, Option<u64>) {
 mod allocator {
     use super::Allocator;
 
+    pub fn dump_profile(_dir: &std::path::Path) -> Result<String, String> {
+        Err("mimalloc has no heap profiler; build with --features jemalloc-prof".to_string())
+    }
+
+    /// mimalloc's text dump exists (`mi_stats_print`) but a release build
+    /// compiles out everything that would make it worth reading, so this
+    /// says that rather than serving a page of zeroes.
+    pub fn report() -> String {
+        String::from(
+            "mimalloc: no statistics in a release build (MI_STAT=0). Build with \
+--features jemalloc for a per-size-class report.\n",
+        )
+    }
+
     pub fn read() -> Option<Allocator> {
         let mut elapsed_msecs = 0usize;
         let mut user_msecs = 0usize;
@@ -207,8 +258,11 @@ mod allocator {
         Some(Allocator {
             committed_bytes: current_commit as u64,
             peak_committed_bytes: Some(peak_commit as u64),
-            // Needs `MI_STAT > 0`, which a release build compiles out.
+            // All four need `MI_STAT > 0`, which a release build compiles out.
             live_bytes: None,
+            active_bytes: None,
+            metadata_bytes: None,
+            mapped_bytes: None,
             retained_bytes: None,
             major_page_faults: Some(page_faults as u64),
         })
@@ -219,6 +273,70 @@ mod allocator {
 #[cfg(all(not(feature = "memprof"), feature = "jemalloc"))]
 mod allocator {
     use super::Allocator;
+
+    #[cfg(not(feature = "jemalloc-prof"))]
+    pub fn dump_profile(_dir: &std::path::Path) -> Result<String, String> {
+        Err("built without the jemalloc-prof feature".to_string())
+    }
+
+    #[cfg(feature = "jemalloc-prof")]
+    pub fn dump_profile(dir: &std::path::Path) -> Result<String, String> {
+        if !tikv_jemalloc_ctl::profiling::prof::read().unwrap_or(false) {
+            return Err(
+                "profiling is compiled in but off; start with _RJEM_MALLOC_CONF=prof:true"
+                    .to_string(),
+            );
+        }
+        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+        let path = dir.join(format!(
+            "heap-{}.prof",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or(0)
+        ));
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|error| format!("path is not a C string: {error}"))?;
+        // SAFETY: `prof.dump` reads one `*const c_char` from the value it is
+        // given, which is what `write` passes when `T` is that pointer type --
+        // a reference to it would be one level too many, and jemalloc reports
+        // that as a side-effecting failure rather than a type error. The
+        // string outlives the call and the key is NUL-terminated.
+        unsafe {
+            tikv_jemalloc_ctl::raw::write(b"prof.dump\0", c_path.as_ptr())
+                .map_err(|error| format!("prof.dump failed: {error}"))?;
+        }
+        Ok(path.display().to_string())
+    }
+
+    /// jemalloc's own text dump, including the per-bin table.
+    pub fn report() -> String {
+        let mut buffer: Vec<u8> = Vec::new();
+        // SAFETY: the callback is called with a pointer to a NUL-terminated
+        // string that is valid for the duration of the call, and `arg` is the
+        // buffer we pass in. Nothing here unwinds.
+        unsafe extern "C" fn write_cb(arg: *mut std::ffi::c_void, text: *const std::ffi::c_char) {
+            if arg.is_null() || text.is_null() {
+                return;
+            }
+            // SAFETY: `arg` is the `Vec<u8>` handed to `malloc_stats_print`,
+            // and jemalloc calls this synchronously from the same thread.
+            let buffer = unsafe { &mut *(arg as *mut Vec<u8>) };
+            // SAFETY: jemalloc passes a NUL-terminated C string.
+            let text = unsafe { std::ffi::CStr::from_ptr(text) };
+            buffer.extend_from_slice(text.to_bytes());
+        }
+        // SAFETY: `write_cb` matches the expected signature, the buffer
+        // outlives the call, and the options string is NUL-terminated.
+        unsafe {
+            tikv_jemalloc_sys::malloc_stats_print(
+                Some(write_cb),
+                (&raw mut buffer).cast::<std::ffi::c_void>(),
+                c"".as_ptr(),
+            );
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
 
     pub fn read() -> Option<Allocator> {
         // jemalloc's statistics are cached and refreshed by advancing the
@@ -232,6 +350,15 @@ mod allocator {
             // `VmHWM` is beside it and is the peak that matters.
             peak_committed_bytes: None,
             live_bytes: tikv_jemalloc_ctl::stats::allocated::read()
+                .ok()
+                .map(|bytes| bytes as u64),
+            active_bytes: tikv_jemalloc_ctl::stats::active::read()
+                .ok()
+                .map(|bytes| bytes as u64),
+            metadata_bytes: tikv_jemalloc_ctl::stats::metadata::read()
+                .ok()
+                .map(|bytes| bytes as u64),
+            mapped_bytes: tikv_jemalloc_ctl::stats::mapped::read()
                 .ok()
                 .map(|bytes| bytes as u64),
             retained_bytes: tikv_jemalloc_ctl::stats::retained::read()
@@ -253,6 +380,43 @@ mod allocator {
     pub fn read() -> Option<Allocator> {
         None
     }
+
+    /// The instrumented build's own report is `/metrics`' memprof families,
+    /// which attribute live bytes by arena.
+    pub fn report() -> String {
+        String::from("memprof build: see the signy_memprof_* families on /metrics\n")
+    }
+
+    pub fn dump_profile(_dir: &std::path::Path) -> Result<String, String> {
+        Err("the memprof build has no heap profiler; its attribution is on /metrics".to_string())
+    }
+}
+
+/// The allocator's own full report, as text, for the questions a handful of
+/// gauges cannot answer.
+///
+/// The gauges say how much is slack; this says **which size classes** hold it.
+/// jemalloc prints a per-bin table -- regions in use, slabs, utilization -- and
+/// a size class whose utilization is low while its slab count is high is the
+/// shape that pins pages. That is the evidence an argument for arena
+/// allocation needs, and without it the argument is a guess.
+///
+/// Empty in builds that have no such report. Not on the metrics path: it is a
+/// page of text, pulled deliberately, not scraped every fifteen seconds.
+pub fn report() -> String {
+    self::allocator::report()
+}
+
+/// Write a heap profile -- live bytes by allocation stack -- into `dir`.
+///
+/// Returns the path written, or why it could not be. Needs the
+/// `jemalloc-prof` build *and* `_RJEM_MALLOC_CONF=prof:true` at startup; the
+/// error says which is missing rather than failing silently, because a
+/// profiler that quietly does nothing is worse than one that is absent.
+///
+/// The profile is jemalloc's own format, read with `jeprof`.
+pub fn dump_profile(dir: &std::path::Path) -> Result<String, String> {
+    self::allocator::dump_profile(dir)
 }
 
 #[cfg(test)]
