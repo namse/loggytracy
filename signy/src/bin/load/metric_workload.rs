@@ -112,6 +112,26 @@ pub struct Instrument {
     pub first_scrape: usize,
     pub last_scrape: usize,
     seed: u64,
+    /// The live path's running cumulative totals. A real exporter reports a
+    /// running total, and the paced path used to rebuild one by summing every
+    /// increment from scrape zero on every scrape — quadratic, which a bed
+    /// measured in minutes never felt and a soak measured in hours does: at a
+    /// 10 s interval a day is 8,640 scrapes, and the harness starves the
+    /// server of load long before the day ends. The totals are advanced once
+    /// per scrape instead; an instrument minted mid-run pays the catch-up sum
+    /// once, so the values it reports are the ones it always reported.
+    totals: Totals,
+}
+
+/// One instrument's cumulative state on the live path.
+#[derive(Default)]
+struct Totals {
+    /// The last scrape folded in, so a repeated or skipped index cannot
+    /// double-count or leave a hole.
+    advanced_through: Option<usize>,
+    counter: u64,
+    buckets: Vec<u64>,
+    sum: f64,
 }
 
 pub struct MetricCorpus {
@@ -170,6 +190,41 @@ impl Instrument {
     pub fn sum_increment(&self, scrape: usize) -> f64 {
         (draw(self.seed, scrape, 99) % 10_000) as f64 / 100.0
     }
+
+    /// Fold every scrape up to and including `scrape` that is not folded in
+    /// yet. The steady path folds exactly one; an instrument minted at scrape
+    /// N folds N + 1 the first time, which is the same arithmetic the summing
+    /// version did and therefore the same reported totals.
+    fn advance_to(&mut self, scrape: usize) {
+        let from = match self.totals.advanced_through {
+            Some(last) if last >= scrape => return,
+            Some(last) => last + 1,
+            None => 0,
+        };
+        if self.kind == InstrumentKind::Histogram && self.totals.buckets.is_empty() {
+            self.totals.buckets = vec![0; HISTOGRAM_BOUNDS.len() + 1];
+        }
+        for at in from..=scrape {
+            match self.kind {
+                InstrumentKind::Gauge => {}
+                InstrumentKind::Counter => {
+                    self.totals.counter += self.counter_increment(at);
+                }
+                InstrumentKind::Histogram => {
+                    // Taken out and put back so the increment stays defined in
+                    // exactly one place: a second copy of the formula here is
+                    // a second thing to keep in step with the seeded corpus.
+                    let mut buckets = std::mem::take(&mut self.totals.buckets);
+                    for (bucket, total) in buckets.iter_mut().enumerate() {
+                        *total += self.bucket_increment(at, bucket);
+                    }
+                    self.totals.buckets = buckets;
+                    self.totals.sum += self.sum_increment(at);
+                }
+            }
+        }
+        self.totals.advanced_through = Some(scrape);
+    }
 }
 
 fn instrument(
@@ -196,6 +251,7 @@ fn instrument(
         first_scrape: 0,
         last_scrape: usize::MAX,
         seed,
+        totals: Totals::default(),
     }
 }
 
@@ -548,7 +604,7 @@ impl Default for MetricSeedOutcome {
 /// the count in its `partial_success`. signy has no OTLP endpoint left — the
 /// collect route is the whole of its ingest — and names the same count in the
 /// `rejected` field of its own JSON answer.
-fn rejected_datapoints(target: Target, body: &[u8]) -> u64 {
+pub fn rejected_datapoints(target: Target, body: &[u8]) -> u64 {
     if body.is_empty() {
         return 0;
     }
@@ -969,7 +1025,7 @@ mod tests {
         let mut population = LivePopulation::new(7, &verify);
         population.churn(7, verify.churn_replace_per_scrape);
         let bodies = live_scrape_bodies(
-            &population,
+            &mut population,
             3,
             1_772_000_000_000_000_000,
             Some("test-tenant"),
@@ -1011,7 +1067,7 @@ mod tests {
         let mut population = LivePopulation::new(7, &verify);
         population.explode(7, verify.explosion_series);
         let bodies = live_scrape_bodies(
-            &population,
+            &mut population,
             0,
             1_772_000_000_000_000_000,
             Some("test-tenant"),
@@ -1052,6 +1108,52 @@ mod tests {
         assert_eq!(tally.series_offered, 300);
         assert_eq!(tally.series_accepted, 150);
         assert_eq!(tally.series_rejected, 150);
+    }
+
+    #[test]
+    fn running_totals_report_what_summing_from_zero_reported() {
+        // The quadratic version is the specification: whatever a scrape used
+        // to report, the accumulator has to report, including for an
+        // instrument minted in the middle of a run.
+        let labels: [(&str, &str); 2] = [("service", "api"), ("instance", "instance-0")];
+        for kind in [InstrumentKind::Counter, InstrumentKind::Histogram] {
+            let mut live = instrument(7, "m", kind, &labels);
+            for scrape in 0..64 {
+                live.advance_to(scrape);
+                let expected_counter: u64 = (0..=scrape).map(|at| live.counter_increment(at)).sum();
+                let expected_sum: f64 = (0..=scrape).map(|at| live.sum_increment(at)).sum();
+                let expected_buckets: Vec<u64> = (0..HISTOGRAM_BOUNDS.len() + 1)
+                    .map(|bucket| {
+                        (0..=scrape)
+                            .map(|at| live.bucket_increment(at, bucket))
+                            .sum()
+                    })
+                    .collect();
+                match kind {
+                    InstrumentKind::Counter => assert_eq!(live.totals.counter, expected_counter),
+                    InstrumentKind::Histogram => {
+                        assert_eq!(live.totals.buckets, expected_buckets);
+                        assert_eq!(live.totals.sum, expected_sum);
+                    }
+                    InstrumentKind::Gauge => unreachable!(),
+                }
+            }
+            let mut minted_late = instrument(7, "m", kind, &labels);
+            minted_late.advance_to(63);
+            assert_eq!(minted_late.totals.counter, live.totals.counter);
+            assert_eq!(minted_late.totals.buckets, live.totals.buckets);
+            assert_eq!(minted_late.totals.sum, live.totals.sum);
+        }
+    }
+
+    #[test]
+    fn a_repeated_scrape_index_does_not_double_count() {
+        let labels: [(&str, &str); 1] = [("service", "api")];
+        let mut counter = instrument(11, "m", InstrumentKind::Counter, &labels);
+        counter.advance_to(5);
+        let after_five = counter.totals.counter;
+        counter.advance_to(5);
+        assert_eq!(counter.totals.counter, after_five);
     }
 
     #[test]
@@ -1118,7 +1220,7 @@ impl PhaseTally {
         self.datapoints_accepted as f64 / self.datapoints_offered as f64
     }
 
-    fn record(
+    pub fn record(
         &mut self,
         status: u16,
         offered: u64,
@@ -1159,7 +1261,7 @@ pub struct MetricLoadOutcome {
 
 /// One scrape's worth of instruments: the live steady set plus whatever the
 /// churn and explosion phases have added.
-struct LivePopulation {
+pub struct LivePopulation {
     steady: Vec<Instrument>,
     churned: Vec<Instrument>,
     exploded: Vec<Instrument>,
@@ -1168,7 +1270,7 @@ struct LivePopulation {
 }
 
 impl LivePopulation {
-    fn new(seed: u64, verify: &MetricVerify) -> Self {
+    pub fn new(seed: u64, verify: &MetricVerify) -> Self {
         let services = service_names(verify.services);
         let mut steady = Vec::new();
         for service in &services {
@@ -1208,7 +1310,7 @@ impl LivePopulation {
     /// reporting and an equal number of fresh ones appear. Their history stays
     /// in the engine, which is the point — the cost of churn is what the dead
     /// generations leave behind.
-    fn churn(&mut self, seed: u64, count: usize) {
+    pub fn churn(&mut self, seed: u64, count: usize) {
         self.generation += 1;
         self.churned.clear();
         for index in 0..count {
@@ -1262,6 +1364,24 @@ impl LivePopulation {
             .chain(self.churned.iter())
             .chain(self.exploded.iter())
     }
+
+    /// Fold this scrape into every live instrument's cumulative totals.
+    fn advance(&mut self, scrape: usize) {
+        for instrument in self
+            .steady
+            .iter_mut()
+            .chain(self.churned.iter_mut())
+            .chain(self.exploded.iter_mut())
+        {
+            instrument.advance_to(scrape);
+        }
+    }
+
+    /// Distinct series identities this population has minted, which is what
+    /// the engine's own `active_series` gauge is read against.
+    pub fn minted(&self) -> u64 {
+        self.minted
+    }
 }
 
 /// Instruments per request. A real collector batches, and so must this: one
@@ -1275,13 +1395,14 @@ const SCRAPE_CHUNK_INSTRUMENTS: usize = 5_000;
 /// One scrape as OTLP bodies at wall-clock `ts_ns`, plus the datapoints each
 /// carries. Every instrument reports cumulative totals from `scrape`, the same
 /// arithmetic the seeded corpus uses.
-fn live_scrape_bodies(
-    population: &LivePopulation,
+pub fn live_scrape_bodies(
+    population: &mut LivePopulation,
     scrape: usize,
     ts_ns: i64,
     tenant: Option<&str>,
     target: Target,
 ) -> Vec<(Vec<u8>, u64, u64)> {
+    population.advance(scrape);
     let instruments: Vec<&Instrument> = population.instruments().collect();
     instruments
         .chunks(SCRAPE_CHUNK_INSTRUMENTS.max(1))
@@ -1335,9 +1456,7 @@ fn live_scrape_body(
             InstrumentKind::Counter => {
                 // The running total from the run's own start, so a paced
                 // scrape is a cumulative counter like a real exporter's.
-                let total: u64 = (0..=scrape)
-                    .map(|at| instrument.counter_increment(at))
-                    .sum();
+                let total = instrument.totals.counter;
                 sums.entry(instrument.metric.as_str())
                     .or_default()
                     .push(NumberDataPoint {
@@ -1348,14 +1467,8 @@ fn live_scrape_body(
                     });
             }
             InstrumentKind::Histogram => {
-                let mut buckets = vec![0u64; HISTOGRAM_BOUNDS.len() + 1];
-                let mut sum = 0.0;
-                for at in 0..=scrape {
-                    for (bucket, total) in buckets.iter_mut().enumerate() {
-                        *total += instrument.bucket_increment(at, bucket);
-                    }
-                    sum += instrument.sum_increment(at);
-                }
+                let buckets = instrument.totals.buckets.clone();
+                let sum = instrument.totals.sum;
                 let count = buckets.iter().sum();
                 hists
                     .entry(instrument.metric.as_str())
@@ -1485,7 +1598,7 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
             .map(|since| since.as_nanos().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
         for (body, datapoints, series) in
-            live_scrape_bodies(&population, scrape, now_ns, in_body, cfg.target)
+            live_scrape_bodies(&mut population, scrape, now_ns, in_body, cfg.target)
         {
             let sent = Instant::now();
             let result = client

@@ -27,6 +27,7 @@
 mod config;
 mod http;
 mod matrix;
+mod metric_leg;
 mod metric_matrix;
 mod metric_workload;
 mod otlp;
@@ -656,6 +657,25 @@ async fn run_load(cfg: Config) {
         stop.clone(),
         deadline,
     ));
+    // The metric leg rides the *log* corpus's first tenant rather than a
+    // tenant of its own. That is the production shape — one customer sends
+    // three signals — and it is also the only way this run can see the thing
+    // the metrics work left open: the memtable byte budget is shared across
+    // signals with no per-signal floor, so metric pressure and log pressure
+    // meet in one gate or they never meet at all.
+    let metric_ingest = tokio::spawn(metric_leg::metric_ingest_leg(
+        cfg.clone(),
+        corpus.tenant_ids[0].as_str().to_string(),
+        stop.clone(),
+        deadline,
+    ));
+    let metric_query = tokio::spawn(metric_leg::metric_query_leg(
+        cfg.clone(),
+        corpus.tenant_ids[0].as_str().to_string(),
+        stop.clone(),
+        deadline,
+        warmup_end,
+    ));
 
     // The stop condition is checked here rather than in each pacer so that
     // "enough work happened" and "long enough happened" are one decision.
@@ -686,6 +706,8 @@ async fn run_load(cfg: Config) {
     }
     let mut samples = sampler.await.unwrap_or_default();
     let otlp = otlp.await.unwrap_or_default();
+    let metric_ingest = metric_ingest.await.unwrap_or_default();
+    let metric_query = metric_query.await.unwrap_or_default();
     // Read once more after the workload stopped: the sampler exits before the
     // last in-flight requests land, and both `VmHWM` and cgroup `memory.peak`
     // are high-water marks, so the final read is the only one that covers the
@@ -723,6 +745,8 @@ async fn run_load(cfg: Config) {
         query,
         samples,
         otlp,
+        metric_ingest,
+        metric_query,
         start_metrics,
         end_metrics,
         ended_on: if cfg.target_events > 0
@@ -1384,6 +1408,8 @@ struct ReportInputs<'a> {
     query: QueryOutcome,
     samples: SampleOutcome,
     otlp: OtlpOutcome,
+    metric_ingest: metric_leg::MetricIngestOutcome,
+    metric_query: metric_leg::MetricQueryOutcome,
     start_metrics: probe::Metrics,
     end_metrics: probe::Metrics,
     ended_on: &'static str,
@@ -1455,6 +1481,8 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         mut query,
         samples,
         mut otlp,
+        mut metric_ingest,
+        mut metric_query,
         start_metrics,
         end_metrics,
         ended_on,
@@ -1515,6 +1543,114 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         0.0
     };
     let cache_healthy_end = probe::gauge(&end_metrics, "signy_cache_healthy") == 1;
+
+    // The metric leg's own verdict, computed here so the gate below can read
+    // it and the report can carry the evidence either way.
+    let metric_leg_on = cfg.metric_leg_scrape_seconds > 0 || cfg.metric_query_eps > 0.0;
+    let metric_ingest_delivered = metric_ingest.tally.datapoints_accepted > 0;
+    // A shape that must return rows and returned none is the failure a status
+    // gate cannot see: the write path kept accepting and the read path stopped
+    // finding. It is reported per shape rather than as one flag so that which
+    // shape went quiet is in the artifact.
+    let metric_shapes_answered: Vec<String> = metric_leg::METRIC_QUERY_SHAPES
+        .iter()
+        .filter(|shape| shape.must_return_rows())
+        .filter(|shape| {
+            let issued = metric_query
+                .shape_counts
+                .get(shape.name())
+                .copied()
+                .unwrap_or(0);
+            let empty = metric_query
+                .shape_empty
+                .get(shape.name())
+                .copied()
+                .unwrap_or(0);
+            issued > 0 && empty > 0
+        })
+        .map(|shape| shape.name().to_string())
+        .collect();
+    let metric_leg_pass = !metric_leg_on
+        || (metric_ingest_delivered
+            && metric_ingest.tally.errors == 0
+            && metric_query.errors == 0
+            && metric_shapes_answered.is_empty());
+    let metric_report = if !metric_leg_on {
+        json!({ "enabled": false })
+    } else {
+        let mut per_shape = serde_json::Map::new();
+        for shape in metric_leg::METRIC_QUERY_SHAPES {
+            let name = shape.name();
+            let issued = metric_query.shape_counts.get(name).copied().unwrap_or(0);
+            if issued == 0 {
+                continue;
+            }
+            let mut latency = metric_query.per_shape.remove(name).unwrap_or_default();
+            per_shape.insert(
+                name.to_string(),
+                json!({
+                    "issued": issued,
+                    "series_returned": metric_query.shape_rows.get(name).copied().unwrap_or(0),
+                    "empty_answers": metric_query.shape_empty.get(name).copied().unwrap_or(0),
+                    "must_return_rows": shape.must_return_rows(),
+                    "latency_ms": latency.summary(),
+                }),
+            );
+        }
+        json!({
+            "enabled": true,
+            "tenant": corpus.tenant_ids.first().map(|id| id.as_str()),
+            "scrape_interval_seconds": cfg.metric_leg_scrape_seconds,
+            "churn_per_scrape": cfg.metric_leg_churn_per_scrape,
+            "query_eps": cfg.metric_query_eps,
+            "query_window_seconds": cfg.metric_query_window_seconds,
+            "ingest": {
+                "scrapes": metric_ingest.tally.scrapes,
+                "scrapes_late": metric_ingest.scrapes_late,
+                "datapoints_offered": metric_ingest.tally.datapoints_offered,
+                "datapoints_accepted": metric_ingest.tally.datapoints_accepted,
+                "datapoints_rejected": metric_ingest.tally.datapoints_rejected,
+                "requests_refused": metric_ingest.tally.requests_refused,
+                "acceptance": metric_ingest.tally.acceptance(),
+                "series_offered": metric_ingest.series_offered,
+                "errors": metric_ingest.tally.errors,
+                "first_error": metric_ingest.tally.first_error.clone(),
+                "statuses": metric_ingest.tally.statuses.iter()
+                    .map(|(status, count)| (status.to_string(), *count))
+                    .collect::<BTreeMap<_, _>>(),
+                "latency_ms": metric_ingest.tally.latency.summary(),
+            },
+            "queries": {
+                "answered": metric_query.answered,
+                "errors": metric_query.errors,
+                "throttled": metric_query.throttled,
+                "first_error": metric_query.first_error.clone(),
+                "statuses": metric_query.statuses.iter()
+                    .map(|(status, count)| (status.to_string(), *count))
+                    .collect::<BTreeMap<_, _>>(),
+                "response_ms": metric_query.steady.summary(),
+                "per_shape": Value::Object(per_shape),
+            },
+            // What the engine says about its own metric path over the same
+            // window. The leg's counts are what was offered; these are what
+            // was kept, and a soak is the run where the two stop agreeing.
+            "server": {
+                "active_series_end": probe::gauge(&end_metrics, "signy_active_series"),
+                "series_memtable_bytes_end": probe::gauge(&end_metrics, "signy_series_memtable_bytes"),
+                "metric_part_count_end": probe::gauge(&end_metrics, "signy_metric_part_count"),
+                "series_created": delta("signy_series_created_total"),
+                "series_retired_flushed": delta("signy_series_retired_flushed_total"),
+                "series_evicted_idle": delta("signy_series_evicted_idle_total"),
+                "series_rejected": delta("signy_series_rejected_total"),
+                "datapoints_rejected": delta("signy_metric_datapoints_rejected_total"),
+                "samples_rejected": delta("signy_metric_samples_rejected_total"),
+                "cardinality_rejected": delta("signy_metric_cardinality_rejected_total"),
+                "memory_rejected": delta("signy_metric_memory_rejected_total"),
+            },
+            "pass": metric_leg_pass,
+            "shapes_that_answered_nothing": metric_shapes_answered,
+        })
+    };
 
     let targets = json!({
         "push_response_p95_ms": target_row(
@@ -1621,12 +1757,14 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 "restore_probe_rows": query.restore_rows,
                 "restore_probes_with_rows": query.restore_probes_with_rows,
                 "retention_observed": retention_success > 0,
+                "metric_leg": metric_report,
             }),
             signy_delivered
                 && ingest_errors == 0
                 && remote_healthy_fraction >= 0.95
                 && cache_healthy_end
-                && flush_progressing,
+                && flush_progressing
+                && metric_leg_pass,
             signy_delivered,
         ),
         Target::Loki => {

@@ -342,6 +342,27 @@ pub struct Config {
 
     pub otlp_eps: f64,
 
+    /// The load phase's metric leg: seconds between scrapes of a live
+    /// population, `0` for no metric ingest at all.
+    ///
+    /// Off by default, so every run recorded before the leg existed means what
+    /// it meant. The soak turns it on: metrics are the one signal that has
+    /// never been through a long run, and a day is where a per-part cost or a
+    /// catalog that does not retract shows up.
+    pub metric_leg_scrape_seconds: u64,
+    /// Instances replaced per scrape, standing in for a deploy rolling pods.
+    /// `0` keeps the population fixed.
+    pub metric_leg_churn_per_scrape: usize,
+    /// Metric reads per second alongside the log queries. `0` for none.
+    pub metric_query_eps: f64,
+    /// How far back the leg's range shapes ask, in seconds.
+    ///
+    /// A knob rather than a constant because retention is one: a window longer
+    /// than the tenant keeps reads empty, and the leg's empty-answer gate
+    /// would then be firing on the run's own configuration rather than on the
+    /// engine.
+    pub metric_query_window_seconds: i64,
+
     pub verify: Verify,
     pub metric_verify: MetricVerify,
     pub targets: Targets,
@@ -509,6 +530,12 @@ impl Config {
 
             otlp_eps: env_f64("SIGNY_LOAD_OTLP_EPS", 5.0).max(0.0),
 
+            metric_leg_scrape_seconds: env_u64("SIGNY_LOAD_METRIC_LEG_SCRAPE_SECONDS", 0),
+            metric_leg_churn_per_scrape: env_usize("SIGNY_LOAD_METRIC_LEG_CHURN_PER_SCRAPE", 0),
+            metric_query_eps: env_f64("SIGNY_LOAD_METRIC_QUERY_EPS", 0.0).max(0.0),
+            metric_query_window_seconds: env_u64("SIGNY_LOAD_METRIC_QUERY_WINDOW_SECONDS", 900)
+                .max(1) as i64,
+
             verify: Verify {
                 tenant_prefix: env_string("SIGNY_LOAD_VERIFY_TENANT_PREFIX", "verify-tenant"),
                 rows: env_usize("SIGNY_LOAD_VERIFY_ROWS", 120_000).max(1),
@@ -613,6 +640,16 @@ server memory could be watched"
 
     pub fn otlp_interval(&self) -> Option<Duration> {
         (self.otlp_eps > 0.0).then(|| Duration::from_secs_f64(1.0 / self.otlp_eps))
+    }
+
+    /// Seconds between the metric leg's scrapes, or `None` when the leg is off.
+    pub fn metric_leg_interval(&self) -> Option<Duration> {
+        (self.metric_leg_scrape_seconds > 0)
+            .then(|| Duration::from_secs(self.metric_leg_scrape_seconds))
+    }
+
+    pub fn metric_query_interval(&self) -> Option<Duration> {
+        (self.metric_query_eps > 0.0).then(|| Duration::from_secs_f64(1.0 / self.metric_query_eps))
     }
 }
 
