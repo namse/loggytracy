@@ -458,7 +458,7 @@ GUARD=ok
         "memory_rejected=\($leg.server.memory_rejected)",
         "  reads: answered=\($leg.queries.answered) errors=\($leg.queries.errors) throttled=\($leg.queries.throttled)",
         ($leg.queries.per_shape | to_entries[] |
-          "    \(.key | .[0:22]): issued=\(.value.issued) series=\(.value.series_returned) " +
+          "    \(.key | .[0:22]): issued=\(.value.issued) judged=\(.value.judged) series=\(.value.series_returned) " +
           "empty=\(.value.empty_answers) p95=\(.value.latency_ms.response.p95_ms // "-")"),
         (if ($leg.shapes_that_answered_nothing | length) > 0
          then "  SHAPES THAT ANSWERED NOTHING: \($leg.shapes_that_answered_nothing | join(", "))"

@@ -1590,6 +1590,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 name.to_string(),
                 json!({
                     "issued": issued,
+                    "judged": metric_query.shape_judged.get(name).copied().unwrap_or(0),
                     "series_returned": metric_query.shape_rows.get(name).copied().unwrap_or(0),
                     "empty_answers": metric_query.shape_empty.get(name).copied().unwrap_or(0),
                     "must_return_rows": shape.must_return_rows(),

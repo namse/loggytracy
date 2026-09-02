@@ -205,6 +205,10 @@ pub struct MetricQueryOutcome {
     pub steady: LatencyPair,
     pub per_shape: BTreeMap<&'static str, LatencyPair>,
     pub shape_counts: BTreeMap<&'static str, u64>,
+    /// Answers issued past the settling floor, which are the only ones the
+    /// empty-answer count below is taken over. Reported beside it so the two
+    /// numbers share a denominator.
+    pub shape_judged: BTreeMap<&'static str, u64>,
     pub shape_rows: BTreeMap<&'static str, u64>,
     /// Answers that were `200` and carried no series. The gate reads this:
     /// a read path that quietly stops finding what was written answers
@@ -237,6 +241,17 @@ pub async fn metric_query_leg(
     let (header_name, header_value) = cfg.target.read_tenant_header(&tenant);
     let services = service_names(cfg.metric_verify.services);
     let mut intended = Instant::now();
+    // The leg's own settling floor, on top of the run's warmup. At the first
+    // instant there is nothing to find: a `rate` needs two samples inside its
+    // range and a quantile needs a bucket window, so a read issued before the
+    // leg has pushed that much answers empty *correctly*. Counting those would
+    // make the gate fire on the clock rather than on the engine, and a soak
+    // that cries wolf in its first minute is a soak nobody reads the verdict
+    // of.
+    let settled_at = Instant::now()
+        + std::time::Duration::from_secs(
+            2 * cfg.metric_leg_scrape_seconds + cfg.metric_verify.range_seconds.max(0) as u64,
+        );
 
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         tokio::time::sleep_until(intended).await;
@@ -262,7 +277,7 @@ pub async fn metric_query_leg(
             .saturating_duration_since(intended - interval)
             .as_secs_f64()
             * 1000.0;
-        let steady = sent >= warmup_end;
+        let steady = sent >= warmup_end && sent >= settled_at;
 
         match result {
             Ok(response) => {
@@ -272,10 +287,11 @@ pub async fn metric_query_leg(
                         outcome.answered += 1;
                         let rows = ndjson_rows(&response.body);
                         *outcome.shape_rows.entry(shape.name()).or_default() += rows;
-                        if rows == 0 {
-                            *outcome.shape_empty.entry(shape.name()).or_default() += 1;
-                        }
                         if steady {
+                            *outcome.shape_judged.entry(shape.name()).or_default() += 1;
+                            if rows == 0 {
+                                *outcome.shape_empty.entry(shape.name()).or_default() += 1;
+                            }
                             outcome.steady.record(queueing_ms, service_ms);
                             outcome
                                 .per_shape
