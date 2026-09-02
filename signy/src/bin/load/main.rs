@@ -1628,7 +1628,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 "statuses": metric_query.statuses.iter()
                     .map(|(status, count)| (status.to_string(), *count))
                     .collect::<BTreeMap<_, _>>(),
-                "response_ms": metric_query.steady.summary(),
+                "latency_ms": metric_query.steady.summary(),
                 "per_shape": Value::Object(per_shape),
             },
             // What the engine says about its own metric path over the same

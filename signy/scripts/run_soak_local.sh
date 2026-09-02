@@ -21,6 +21,17 @@
 #   * Retention is on (30 m period, 60 s interval, 5 m grace by default) so
 #     parts are deleted, sidecars retract, and the disk reaches a steady state
 #     the run can be judged on.
+#   * All three signals, not one. The log leg is the rate; the metric leg
+#     scrapes a live population onto the *same tenant* and reads it back
+#     through the first-party metric routes. Metrics are the signal no long run
+#     had ever touched, and the one whose storage changed most recently.
+#   * An object store is configured by default (`file://` under the run's own
+#     output directory). Without one the engine never offloads, never retires a
+#     part to the store, and never compacts the WAL -- three production paths a
+#     local-only soak silently skips. What `file://` cannot exercise is the
+#     compare-and-swap: the code declares it a single-process development
+#     backend and takes the overwrite path, so CAS stays a question only a real
+#     provider's startup preflight answers.
 #   * A disk guard fails the run before the root filesystem does.
 #   * The verdict is a set of trends — quarter-by-quarter means — rather than
 #     one peak: a soak passes when the residents stop growing, not when a
@@ -33,6 +44,8 @@
 #   SOAK_RETENTION=off               ./scripts/run_soak_local.sh no-retention
 #   SOAK_SERVER_ENV="MALLOC_ARENA_MAX=1" ./scripts/run_soak_local.sh trimmed
 #   SOAK_MEMORY_HIGH=1800M           ./scripts/run_soak_local.sh throttled
+#   SOAK_OBJECT_STORE=off            ./scripts/run_soak_local.sh local-only
+#   SOAK_METRIC_SCRAPE_SECONDS=0     ./scripts/run_soak_local.sh logs-only
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -60,6 +73,22 @@ case "$RETENTION" in
 esac
 RETENTION_INTERVAL="${SOAK_RETENTION_INTERVAL:-60s}"
 RETENTION_GRACE="${SOAK_RETENTION_GRACE:-5m}"
+# The metric leg. The scrape interval and the query rate are what turn it on;
+# `0` on either turns that half off. The population is 8 services x this many
+# instances x (4 gauges + 4 counters + 1 histogram), so the default offers
+# about 1,150 series -- a real instrument set beside the log rate rather than a
+# cardinality test, which the bed measures separately.
+METRIC_SCRAPE="${SOAK_METRIC_SCRAPE_SECONDS:-10}"
+METRIC_QUERY_EPS="${SOAK_METRIC_QUERY_EPS:-1}"
+METRIC_INSTANCES="${SOAK_METRIC_INSTANCES:-16}"
+METRIC_CHURN="${SOAK_METRIC_CHURN_PER_SCRAPE:-0}"
+# Shorter than the retention period by construction: a window past what the
+# tenant keeps reads empty, and the leg's empty-answer gate would then be
+# firing on this script's configuration rather than on the engine.
+METRIC_WINDOW="${SOAK_METRIC_QUERY_WINDOW_SECONDS:-900}"
+# The object store. `off` reverts to the local-only engine the published soaks
+# ran on, which is the comparison, not the production shape.
+STORE="${SOAK_OBJECT_STORE:-file://$OUT/store}"
 # The comparison bed's seed, so this run's corpus is the bed's corpus.
 SEED="${SOAK_SEED:-1592598566}"
 BIN="${SOAK_BIN:-$ROOT/target/release/signy}"
@@ -82,13 +111,25 @@ DATA="${SOAK_DATA:-$OUT/data}"
 mkdir -p "$DATA"
 SERVER_LOG="$OUT/server.log"
 
+# The store's own directory, so its size can be sampled beside the data dir:
+# with an object store configured the data dir is a cache and a WAL, and the
+# bytes that outlive a part are over here.
+STORE_DIR=""
+STORE_ENV=""
+if [ "$STORE" != "off" ]; then
+  case "$STORE" in
+    file://*) STORE_DIR="${STORE#file://}"; mkdir -p "$STORE_DIR" ;;
+  esac
+  STORE_ENV="SIGNY_OBJECT_STORE_URL=$STORE"
+fi
+
 systemctl --user reset-failed "$UNIT.scope" 2>/dev/null
 
 cleanup() {
   for p in ${SAMPLER_PID:-} ${PROF_PID:-} ${WATCH_PID:-} ${SERVER_PID:-}; do kill "$p" 2>/dev/null; done
   sleep 1
   [ -n "${SERVER_PID:-}" ] && kill -KILL "$SERVER_PID" 2>/dev/null
-  [ "${SOAK_KEEP_DATA:-0}" = "1" ] || rm -rf "$DATA"
+  [ "${SOAK_KEEP_DATA:-0}" = "1" ] || rm -rf "$DATA" ${STORE_DIR:+"$STORE_DIR"}
   systemctl --user reset-failed "$UNIT.scope" 2>/dev/null
 }
 trap cleanup EXIT
@@ -98,6 +139,7 @@ env SIGNY_LISTEN_ADDR="127.0.0.1:$PORT" \
     SIGNY_DATA_DIR="$DATA" \
     SIGNY_RETENTION_INTERVAL="$RETENTION_INTERVAL" \
     SIGNY_RETENTION_GRACE_PERIOD="$RETENTION_GRACE" \
+    ${STORE_ENV:-} \
     ${SOAK_SERVER_ENV:-} \
     systemd-run --user --scope --quiet --unit="$UNIT" \
       -p MemoryMax="$LIMIT" -p MemorySwapMax=0 \
@@ -117,6 +159,7 @@ CG="/sys/fs/cgroup$(cut -d: -f3 "/proc/$SERVER_PID/cgroup")"
 [ -d "$CG" ] || { echo "no cgroup at $CG"; exit 1; }
 echo "cgroup=$CG memory.max=$(cat "$CG/memory.max") memory.high=$(cat "$CG/memory.high") swap.max=$(cat "$CG/memory.swap.max")"
 echo "out=$OUT data=$DATA seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
+echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUERY_EPS"
 
 # The memprof sampler's columns plus the disk: data_dir and journal.wal sizes
 # (du is paid once a minute, the value carried between), and the filesystem's
@@ -133,9 +176,9 @@ echo "out=$OUT data=$DATA seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
 # freeze with zero direct reclaim in it is not a reclaim stall, and the next
 # question is which resource the threads were actually waiting on.
 (
-  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us"
+  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us,active_series,series_memtable,metric_parts,metric_dp_rejected,metric_mem_rejected,metrics_dir,store_dir"
   T0=$(date +%s.%N)
-  i=0; du_bytes=0; wal_bytes=0
+  i=0; du_bytes=0; wal_bytes=0; metrics_bytes=0; store_bytes=0
   while [ -d "$CG" ]; do
     now=$(date +%s.%N)
     cur=$(cat "$CG/memory.current" 2>/dev/null) || break
@@ -147,6 +190,9 @@ echo "out=$OUT data=$DATA seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
     m=$(curl -fsS --max-time 2 "http://127.0.0.1:$PORT/metrics" 2>/dev/null)
     if [ $((i % 60)) -eq 0 ]; then
       du_bytes=$(du -sb "$DATA" 2>/dev/null | cut -f1)
+      metrics_bytes=$(du -sb "$DATA/metrics" 2>/dev/null | cut -f1)
+      store_bytes=0
+      [ -n "$STORE_DIR" ] && store_bytes=$(du -sb "$STORE_DIR" 2>/dev/null | cut -f1)
       wal_bytes=$(find "$DATA" -name 'journal.wal' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
       avail_kb=$(df -k --output=avail "$DATA" 2>/dev/null | tail -1 | tr -d ' ')
       if [ "${avail_kb:-0}" -lt "$DISK_MIN_AVAIL_KB" ]; then
@@ -168,6 +214,13 @@ echo "out=$OUT data=$DATA seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
     rcl="$rcl,$(echo "$psi_io" | awk -F'total=' '
       /^some /{s=$2+0} /^full /{f=$2+0} END{printf "%d,%d", s, f}')"
     rcl="$rcl,$(echo "$psi_cpu" | awk -F'total=' '/^some /{printf "%d", $2+0}')"
+    mx=$(echo "$m" | awk '
+      $1=="signy_active_series"{as=$2}
+      $1=="signy_series_memtable_bytes"{sm=$2}
+      $1=="signy_metric_part_count"{mp=$2}
+      $1=="signy_metric_datapoints_rejected_total"{dr=$2}
+      $1=="signy_metric_memory_rejected_total"{mr=$2}
+      END{printf "%d,%d,%d,%d,%d", as, sm, mp, dr, mr}')
     gg=$(echo "$m" | awk '
       $1=="signy_memtable_bytes"{mt=$2}
       $1=="signy_memtable_buffered_bytes"{mb=$2}
@@ -189,10 +242,11 @@ echo "out=$OUT data=$DATA seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
           v["other"], v["ingest"], v["wal"], v["flush"], v["merge"],
           v["query"], v["sidecar"], v["part_meta"], v["row_group_cache"], h,
           i["arena"], i["mmapped"], i["in_use"], i["free"]}')
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
       "$cur" "$peak" "$cg" "$gg" "${threads:-0}" "$mp" \
-      "$du_bytes" "$wal_bytes" "${avail_kb:-0}" "$rcl"
+      "$du_bytes" "$wal_bytes" "${avail_kb:-0}" "$rcl" \
+      "$mx" "${metrics_bytes:-0}" "${store_bytes:-0}"
     i=$((i + 1))
     sleep 1
   done
@@ -227,6 +281,11 @@ SIGNY_LOAD_TARGET_EPS="$EPS" \
 SIGNY_LOAD_CONNECTIONS="$CONNS" \
 SIGNY_LOAD_QUERY_EPS="$QUERY_EPS" \
 SIGNY_LOAD_OTLP_EPS=0 \
+SIGNY_LOAD_METRIC_LEG_SCRAPE_SECONDS="$METRIC_SCRAPE" \
+SIGNY_LOAD_METRIC_LEG_CHURN_PER_SCRAPE="$METRIC_CHURN" \
+SIGNY_LOAD_METRIC_QUERY_EPS="$METRIC_QUERY_EPS" \
+SIGNY_LOAD_METRIC_QUERY_WINDOW_SECONDS="$METRIC_WINDOW" \
+SIGNY_LOAD_METRIC_INSTANCES="$METRIC_INSTANCES" \
 SIGNY_LOAD_TENANT_RETENTION="$TENANT_RETENTION" \
 SIGNY_LOAD_RESULT_PATH="$OUT/load.json" \
   "$ROOT/target/release/load" >"$OUT/harness.log" 2>&1
@@ -271,8 +330,12 @@ GUARD=ok
     END {
       if (n < 8) { print "too few samples for trends: " n; exit }
       m = 1048576.0
-      nr = split("4 anon;13 wal_backlog;14 parts;15 sidecar;16 part_meta;17 rg_cache;35 data_dir;36 wal_file", rows, ";")
-      printf "%-12s %12s %12s %12s %12s  %s\n", "mib", "Q1", "Q2", "Q3", "Q4", "trend"
+      # column, name, unit. `count` prints as it is; everything else is MiB.
+      nr = split("4 anon mib;13 wal_backlog mib;14 parts count;15 sidecar mib;\
+16 part_meta mib;17 rg_cache mib;35 data_dir mib;36 wal_file mib;\
+51 metrics_dir mib;52 store_dir mib;46 active_series count;\
+47 series_memtable mib;48 metric_parts count", rows, ";")
+      printf "%-14s %12s %12s %12s %12s  %s\n", "mib/count", "Q1", "Q2", "Q3", "Q4", "trend"
       for (r = 1; r <= nr; r++) {
         split(rows[r], f, " "); c = f[1] + 0
         for (q = 0; q < 4; q++) {
@@ -281,10 +344,10 @@ GUARD=ok
           mean[q] = s / (hi - lo + 1)
         }
         trend = (mean[3] > mean[1] * 1.10) ? "GROWING" : "flat"
-        if (c == 14)
-          printf "%-12s %12.0f %12.0f %12.0f %12.0f  %s\n", f[2], mean[0], mean[1], mean[2], mean[3], trend
+        if (f[3] == "count")
+          printf "%-14s %12.0f %12.0f %12.0f %12.0f  %s\n", f[2], mean[0], mean[1], mean[2], mean[3], trend
         else
-          printf "%-12s %12.1f %12.1f %12.1f %12.1f  %s\n", f[2], mean[0]/m, mean[1]/m, mean[2]/m, mean[3]/m, trend
+          printf "%-14s %12.1f %12.1f %12.1f %12.1f  %s\n", f[2], mean[0]/m, mean[1]/m, mean[2]/m, mean[3]/m, trend
       }
       printf "anon_peak_mib=%.1f cgroup_peak_mib=%.1f duration_s=%s samples=%d\n", \
              anon_peak/m, v[3,n]/m, t[n], n
@@ -376,6 +439,56 @@ GUARD=ok
       if (fparts) printf "  flush rows=%d parts=%d rows/part=%.0f\n", \
                           frows, fparts, frows / fparts
     }' "$OUT/metrics-final.txt" 2>/dev/null
+  # The metric leg, from the harness's own result rather than from the gauges:
+  # what was offered, what was kept, and whether every read shape that must
+  # return rows kept returning them. `jq` is already a dependency of
+  # compare/run_metric_capacity.sh; without it the block is skipped rather than
+  # the verdict failing.
+  if command -v jq >/dev/null 2>&1 && [ -f "$OUT/load.json" ]; then
+    jq -r '
+      .behavioral.metric_leg as $leg |
+      if ($leg == null) or ($leg.enabled != true) then "metric leg: off"
+      else
+        "metric leg: pass=\($leg.pass) scrapes=\($leg.ingest.scrapes) late=\($leg.ingest.scrapes_late) " +
+        "datapoints offered=\($leg.ingest.datapoints_offered) accepted=\($leg.ingest.datapoints_accepted) " +
+        "acceptance=\($leg.ingest.acceptance) refused_requests=\($leg.ingest.requests_refused) errors=\($leg.ingest.errors)",
+        "  server: active_series=\($leg.server.active_series_end) metric_parts=\($leg.server.metric_part_count_end) " +
+        "created=\($leg.server.series_created) retired_flushed=\($leg.server.series_retired_flushed) " +
+        "evicted_idle=\($leg.server.series_evicted_idle) cardinality_rejected=\($leg.server.cardinality_rejected) " +
+        "memory_rejected=\($leg.server.memory_rejected)",
+        "  reads: answered=\($leg.queries.answered) errors=\($leg.queries.errors) throttled=\($leg.queries.throttled)",
+        ($leg.queries.per_shape | to_entries[] |
+          "    \(.key | .[0:22]): issued=\(.value.issued) series=\(.value.series_returned) " +
+          "empty=\(.value.empty_answers) p95=\(.value.latency_ms.response.p95_ms // "-")"),
+        (if ($leg.shapes_that_answered_nothing | length) > 0
+         then "  SHAPES THAT ANSWERED NOTHING: \($leg.shapes_that_answered_nothing | join(", "))"
+         else empty end),
+        (if $leg.ingest.first_error then "  first ingest error: \($leg.ingest.first_error)" else empty end),
+        (if $leg.queries.first_error then "  first read error: \($leg.queries.first_error)" else empty end)
+      end' "$OUT/load.json" 2>/dev/null
+
+    # What a retained datapoint costs on disk. An estimate, and labelled one:
+    # the metrics directory holds about `retention` seconds of accepted
+    # datapoints, so this divides the steady directory size by that many. The
+    # mix is printed with it because a gauge point and a histogram point are
+    # not the same point, and this run's ratio is neither one alone.
+    RETENTION_SECONDS=$(awk -v r="$RETENTION" 'BEGIN{
+      if (r ~ /^[0-9]+s$/) { printf "%d", r + 0 }
+      else if (r ~ /^[0-9]+m$/) { printf "%d", (r + 0) * 60 }
+      else if (r ~ /^[0-9]+h$/) { printf "%d", (r + 0) * 3600 }
+      else { print 0 } }')
+    ACCEPTED=$(jq -r '.behavioral.metric_leg.ingest.datapoints_accepted // 0' "$OUT/load.json")
+    ELAPSED=$(jq -r '.run.elapsed_seconds // 0' "$OUT/load.json")
+    awk -F, -v accepted="$ACCEPTED" -v elapsed="$ELAPSED" -v retention="$RETENTION_SECONDS" '
+      NR>1 && ($10+0>0 || $14+0>0) { n++; last = $51 + 0 }
+      END {
+        if (!n || retention <= 0 || elapsed <= 0 || accepted <= 0) exit
+        held = accepted / elapsed * retention
+        if (held <= 0) exit
+        printf "metrics on disk: %.1f MiB holding ~%.0f datapoints, %.0f B/datapoint (mixed instruments)\n", \
+               last / 1048576.0, held, last / held
+      }' "$OUT/mem.csv"
+  fi
   echo "slow batches (>=250 ms), longest first:"
   sed 's/\x1b\[[0-9;]*m//g' "$SERVER_LOG" | grep "journal batch slow" \
     | sed 's/.*records=/records=/' | sort -t= -k4 -rn | head -5
