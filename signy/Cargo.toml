@@ -18,6 +18,11 @@ default = []
 # default and absent from a release build: with it off, `memprof::enter` is an
 # inlined no-op and the process keeps the system allocator.
 memprof = []
+# Build the shipped binary against jemalloc instead of mimalloc. Both are
+# decay-based allocators taken for the same reason -- glibc's retained free
+# crept until the 2 GiB kill -- and which one this engine should ship is a
+# measurement, not a preference, so both stay buildable on the same rig.
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -56,6 +61,13 @@ mimalloc = { version = "0.1", default-features = false }
 # tells a production binary apart from a memprof one: what is resident against
 # what the allocator has committed and not given back.
 libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
+# The other decaying allocator, kept buildable so the two can be compared on
+# one rig rather than argued about. jemalloc held the role from 2026-08-09
+# until mimalloc took it on 2026-08-31, and that swap was never put through a
+# long run. It also answers a question mimalloc cannot: `stats.allocated` is
+# live bytes, which a release-built mimalloc compiles out.
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
 # The metric catalog is read through a mapping rather than into the heap: a
 # part's rows stay addressable for as long as the part is registered, and page
 # cache the kernel can reclaim is not the same resource as anonymous memory it

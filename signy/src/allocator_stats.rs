@@ -43,6 +43,26 @@
 //! named `rss` fed from that call would report committed bytes under the name
 //! of resident ones. That is why the resident numbers below come from `/proc`.
 
+/// What the allocator holds, in the vocabulary both allocators can answer in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Allocator {
+    /// Bytes the allocator holds that cost resident memory: mimalloc's
+    /// `committed`, jemalloc's `resident`. Both count retained free memory,
+    /// which is the point -- the gap against `live_bytes` is the retention.
+    pub committed_bytes: u64,
+    /// High-water mark for the above, where the allocator keeps one.
+    pub peak_committed_bytes: Option<u64>,
+    /// Bytes actually in use by the program. jemalloc reports this
+    /// (`stats.allocated`); a release-built mimalloc compiles the counter out,
+    /// so it is `None` there and the engine's own gauges are the live side.
+    pub live_bytes: Option<u64>,
+    /// Address space the allocator has not returned to the operating system.
+    /// jemalloc only (`stats.retained`).
+    pub retained_bytes: Option<u64>,
+    /// Major faults, where the allocator reports them (mimalloc).
+    pub major_page_faults: Option<u64>,
+}
+
 /// What the process holds, at one instant.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
@@ -50,25 +70,18 @@ pub struct Snapshot {
     pub rss_bytes: Option<u64>,
     /// The kernel's own high-water mark for the above.
     pub peak_rss_bytes: Option<u64>,
-    /// Bytes mimalloc holds from the operating system. `None` in a build whose
-    /// allocator is not mimalloc.
-    pub committed_bytes: Option<u64>,
-    pub peak_committed_bytes: Option<u64>,
-    /// Major faults — the ones that went to disk, so they say reclaim took
-    /// back a page that was wanted again.
-    pub major_page_faults: Option<u64>,
+    /// `None` in a build whose allocator publishes nothing this can read,
+    /// which is the instrumented build.
+    pub allocator: Option<Allocator>,
 }
 
 /// Read both sources.
 pub fn snapshot() -> Snapshot {
     let (rss_bytes, peak_rss_bytes) = kernel_resident();
-    let allocator = self::allocator::committed();
     Snapshot {
         rss_bytes,
         peak_rss_bytes,
-        committed_bytes: allocator.map(|(committed, _, _)| committed),
-        peak_committed_bytes: allocator.map(|(_, peak, _)| peak),
-        major_page_faults: allocator.map(|(_, _, faults)| faults),
+        allocator: self::allocator::read(),
     }
 }
 
@@ -91,23 +104,42 @@ so a peak between two scrapes is not lost.\n\
 signy_process_peak_rss_bytes {peak}\n"
         ));
     }
-    if let Some(committed) = stats.committed_bytes {
-        out.push_str(&format!(
-            "# HELP signy_allocator_committed_bytes Bytes mimalloc holds from the operating \
-system. Subtract what the engine's own gauges account for and the remainder is what the allocator \
-is sitting on -- which is what kills a process whose residents are all flat. Absent in builds \
-whose allocator is not mimalloc.\n\
+    let Some(allocator) = stats.allocator else {
+        return out;
+    };
+    out.push_str(&format!(
+        "# HELP signy_allocator_committed_bytes Bytes the allocator holds that cost resident \
+memory -- mimalloc's committed, jemalloc's resident. It counts retained free memory, so the gap \
+against what is live is what the allocator is sitting on, and that is what kills a process whose \
+own residents are flat.\n\
 # TYPE signy_allocator_committed_bytes gauge\n\
-signy_allocator_committed_bytes {committed}\n"
-        ));
-    }
-    if let Some(peak) = stats.peak_committed_bytes {
+signy_allocator_committed_bytes {}\n",
+        allocator.committed_bytes
+    ));
+    if let Some(peak) = allocator.peak_committed_bytes {
         out.push_str(&format!(
             "# TYPE signy_allocator_peak_committed_bytes gauge\n\
 signy_allocator_peak_committed_bytes {peak}\n"
         ));
     }
-    if let Some(faults) = stats.major_page_faults {
+    if let Some(live) = allocator.live_bytes {
+        out.push_str(&format!(
+            "# HELP signy_allocator_live_bytes Bytes in use by the program, from the allocator \
+itself. Absent under mimalloc, whose in-use counters a release build compiles out.\n\
+# TYPE signy_allocator_live_bytes gauge\n\
+signy_allocator_live_bytes {live}\n"
+        ));
+    }
+    if let Some(retained) = allocator.retained_bytes {
+        out.push_str(&format!(
+            "# HELP signy_allocator_retained_bytes Address space the allocator has not returned \
+to the operating system. It costs no resident memory itself; a large value beside a large \
+committed one says the decay is running and the resident half is still in use.\n\
+# TYPE signy_allocator_retained_bytes gauge\n\
+signy_allocator_retained_bytes {retained}\n"
+        ));
+    }
+    if let Some(faults) = allocator.major_page_faults {
         out.push_str(&format!(
             "# HELP signy_process_major_page_faults_total Faults that went to disk: reclaim took \
 back a page this process wanted again.\n\
@@ -142,10 +174,12 @@ fn kernel_resident() -> (Option<u64>, Option<u64>) {
     (field("VmRSS:"), field("VmHWM:"))
 }
 
-#[cfg(not(feature = "memprof"))]
+/// mimalloc: the default shipped allocator.
+#[cfg(all(not(feature = "memprof"), not(feature = "jemalloc")))]
 mod allocator {
-    /// `(committed, peak_committed, major_page_faults)`.
-    pub fn committed() -> Option<(u64, u64, u64)> {
+    use super::Allocator;
+
+    pub fn read() -> Option<Allocator> {
         let mut elapsed_msecs = 0usize;
         let mut user_msecs = 0usize;
         let mut system_msecs = 0usize;
@@ -170,19 +204,53 @@ mod allocator {
         }
         // `current_rss` and `peak_rss` are deliberately dropped on the floor:
         // see this module's header for what Linux does and does not fill in.
-        Some((
-            current_commit as u64,
-            peak_commit as u64,
-            page_faults as u64,
-        ))
+        Some(Allocator {
+            committed_bytes: current_commit as u64,
+            peak_committed_bytes: Some(peak_commit as u64),
+            // Needs `MI_STAT > 0`, which a release build compiles out.
+            live_bytes: None,
+            retained_bytes: None,
+            major_page_faults: Some(page_faults as u64),
+        })
     }
 }
 
+/// jemalloc, built with `--features jemalloc`.
+#[cfg(all(not(feature = "memprof"), feature = "jemalloc"))]
+mod allocator {
+    use super::Allocator;
+
+    pub fn read() -> Option<Allocator> {
+        // jemalloc's statistics are cached and refreshed by advancing the
+        // epoch; without this every scrape after the first reads the same
+        // numbers, which would look exactly like a heap that stopped moving.
+        let _ = tikv_jemalloc_ctl::epoch::advance();
+        let resident = tikv_jemalloc_ctl::stats::resident::read().ok()?;
+        Some(Allocator {
+            committed_bytes: resident as u64,
+            // jemalloc keeps no high-water mark of its own; the kernel's
+            // `VmHWM` is beside it and is the peak that matters.
+            peak_committed_bytes: None,
+            live_bytes: tikv_jemalloc_ctl::stats::allocated::read()
+                .ok()
+                .map(|bytes| bytes as u64),
+            retained_bytes: tikv_jemalloc_ctl::stats::retained::read()
+                .ok()
+                .map(|bytes| bytes as u64),
+            // Not jemalloc's to report; the kernel's own counter is what the
+            // soak reads for this.
+            major_page_faults: None,
+        })
+    }
+}
+
+/// The instrumented build: its heap is glibc's, and mimalloc's or jemalloc's
+/// counters would describe one nothing in the process allocates from.
 #[cfg(feature = "memprof")]
 mod allocator {
-    /// Nothing: this build's allocator is not mimalloc, and mimalloc's
-    /// counters would describe a heap nothing in the process allocates from.
-    pub fn committed() -> Option<(u64, u64, u64)> {
+    use super::Allocator;
+
+    pub fn read() -> Option<Allocator> {
         None
     }
 }
@@ -211,11 +279,19 @@ mod tests {
         let stats = snapshot();
         let body = render();
         if cfg!(feature = "memprof") {
-            assert!(stats.committed_bytes.is_none(), "{stats:?}");
+            assert!(stats.allocator.is_none(), "{stats:?}");
             assert!(!body.contains("signy_allocator_committed_bytes"), "{body}");
         } else {
-            assert!(stats.committed_bytes.is_some(), "{stats:?}");
+            assert!(stats.allocator.is_some(), "{stats:?}");
             assert!(body.contains("signy_allocator_committed_bytes "), "{body}");
+            // Only jemalloc can say what is live; mimalloc's counter is
+            // compiled out of a release build, and a gauge that is absent is
+            // the honest report of that.
+            assert_eq!(
+                stats.allocator.and_then(|a| a.live_bytes).is_some(),
+                cfg!(feature = "jemalloc"),
+                "{stats:?}"
+            );
         }
     }
 }

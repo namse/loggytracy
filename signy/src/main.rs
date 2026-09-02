@@ -18,9 +18,19 @@ static ALLOCATOR: signy::memprof::ProfilingAllocator = signy::memprof::Profiling
 /// live-byte attribution, and the glibc tuning stays active there, which is
 /// why an arena split and an absolute footprint must not be read off the same
 /// run ([`docs/MEMORY_ATTRIBUTION.md`](../docs/MEMORY_ATTRIBUTION.md)).
-#[cfg(not(feature = "memprof"))]
+#[cfg(all(not(feature = "memprof"), not(feature = "jemalloc")))]
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// The alternative, built with `--features jemalloc`. It is here because
+/// mimalloc's defaults were never put through a long run, jemalloc's were, and
+/// which one this engine should ship is a measurement rather than a
+/// preference. It also answers a question mimalloc cannot: `stats.allocated`
+/// is live bytes, and a release-built mimalloc compiles that counter out, so
+/// the shipped binary can say what it holds but not what of that is in use.
+#[cfg(all(not(feature = "memprof"), feature = "jemalloc"))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // mimalloc runs at its own defaults. The jemalloc sweep it replaces found no
 // setting that beat the defaults (a five-way 600 s sweep on the soak rig,
