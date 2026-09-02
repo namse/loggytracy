@@ -1570,10 +1570,21 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         })
         .map(|shape| shape.name().to_string())
         .collect();
+    // A read leg that judged nothing has not checked anything, and the run
+    // has to say so rather than report the absence as a pass. It is only a
+    // failure when the run outlasted the leg's own settling floor: below that
+    // there is legitimately nothing to judge, and the report carries both
+    // numbers either way.
+    let metric_reads_on = cfg.metric_query_eps > 0.0;
+    let metric_outlasted_settling =
+        elapsed_seconds > metric_query.settling_seconds as f64 && metric_query.answered > 0;
+    let metric_reads_judged =
+        !metric_reads_on || !metric_outlasted_settling || metric_query.judged_total > 0;
     let metric_leg_pass = !metric_leg_on
         || (metric_ingest_delivered
             && metric_ingest.tally.errors == 0
             && metric_query.errors == 0
+            && metric_reads_judged
             && metric_shapes_answered.is_empty());
     let metric_report = if !metric_leg_on {
         json!({ "enabled": false })
@@ -1623,6 +1634,13 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
             },
             "queries": {
                 "answered": metric_query.answered,
+                "judged": metric_query.judged_total,
+                "settling_seconds": metric_query.settling_seconds,
+                "note": if metric_query.judged_total == 0 && metric_reads_on {
+                    "no answer was judged: the run did not outlast the settling floor, so the empty-answer check made no assertion"
+                } else {
+                    "empty answers are counted only past the settling floor, where a rate has two samples and a quantile has a bucket window"
+                },
                 "errors": metric_query.errors,
                 "throttled": metric_query.throttled,
                 "first_error": metric_query.first_error.clone(),

@@ -50,6 +50,12 @@ futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 mimalloc = { version = "0.1", default-features = false }
+# The allocator's own view of what it holds, for the build that actually runs
+# it. `extended` adds FFI declarations only -- it does not change how mimalloc
+# is compiled or how it behaves -- and `mi_process_info` is the one call that
+# tells a production binary apart from a memprof one: what is resident against
+# what the allocator has committed and not given back.
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
 # The metric catalog is read through a mapping rather than into the heap: a
 # part's rows stay addressable for as long as the part is registered, and page
 # cache the kernel can reclaim is not the same resource as anonymous memory it

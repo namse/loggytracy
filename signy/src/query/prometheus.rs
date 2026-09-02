@@ -341,6 +341,7 @@ signy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
     body.push_str(&journal_writer_metrics(&state));
     body.push_str(&series_ladder_metrics(&state));
     body.push_str(&crate::memprof::render());
+    body.push_str(&crate::allocator_stats::render());
     body
 }
 

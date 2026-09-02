@@ -1,4 +1,5 @@
 mod admin;
+pub mod allocator_stats;
 mod app_state;
 mod backpressure;
 pub mod bloom;

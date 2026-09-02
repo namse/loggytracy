@@ -185,7 +185,7 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
 # freeze with zero direct reclaim in it is not a reclaim stall, and the next
 # question is which resource the threads were actually waiting on.
 (
-  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us,active_series,series_memtable,metric_parts,metric_dp_rejected,metric_mem_rejected,metrics_dir,store_dir"
+  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us,active_series,series_memtable,metric_parts,metric_dp_rejected,metric_mem_rejected,metrics_dir,store_dir,proc_rss,alloc_committed"
   T0=$(date +%s.%N)
   i=0; du_bytes=0; wal_bytes=0; metrics_bytes=0; store_bytes=0
   while [ -d "$CG" ]; do
@@ -230,6 +230,14 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
       $1=="signy_metric_datapoints_rejected_total"{dr=$2}
       $1=="signy_metric_memory_rejected_total"{mr=$2}
       END{printf "%d,%d,%d,%d,%d", as, sm, mp, dr, mr}')
+    # Resident against committed, which is the production build's only answer
+    # to "is this process big because it is using memory or because the
+    # allocator kept it". The memprof build publishes the resident half only
+    # and leaves the other at zero.
+    al=$(echo "$m" | awk '
+      $1=="signy_process_rss_bytes"{rs=$2}
+      $1=="signy_allocator_committed_bytes"{cm=$2}
+      END{printf "%d,%d", rs, cm}')
     gg=$(echo "$m" | awk '
       $1=="signy_memtable_bytes"{mt=$2}
       $1=="signy_memtable_buffered_bytes"{mb=$2}
@@ -251,11 +259,11 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
           v["other"], v["ingest"], v["wal"], v["flush"], v["merge"],
           v["query"], v["sidecar"], v["part_meta"], v["row_group_cache"], h,
           i["arena"], i["mmapped"], i["in_use"], i["free"]}')
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
       "$cur" "$peak" "$cg" "$gg" "${threads:-0}" "$mp" \
       "$du_bytes" "$wal_bytes" "${avail_kb:-0}" "$rcl" \
-      "$mx" "${metrics_bytes:-0}" "${store_bytes:-0}"
+      "$mx" "${metrics_bytes:-0}" "${store_bytes:-0}" "$al"
     i=$((i + 1))
     sleep 1
   done
@@ -323,6 +331,11 @@ GUARD=ok
 # Q4 > 1.10 * Q2 — past the warmup, still climbing at the end.
 {
   echo "run=$NAME limit=$LIMIT seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
+  # Which allocator the run measured. An absolute footprint from the memprof
+  # build and one from the shipped build are different numbers about different
+  # heaps, and a verdict that does not say which is a trap for whoever reads it
+  # next.
+  echo "build=${FEATURES:-production} allocator=$([ -n "$FEATURES" ] && echo glibc+memprof || echo mimalloc) store=$STORE"
   echo "alive=$ALIVE harness_status=$HARNESS_STATUS disk_guard=$GUARD"
   # Exit 3 is the harness reporting that nothing it pushed reached storage. The
   # verdict below is trends, and a server that was never given anything to hold
@@ -343,7 +356,8 @@ GUARD=ok
       nr = split("4 anon mib;13 wal_backlog mib;14 parts count;15 sidecar mib;\
 16 part_meta mib;17 rg_cache mib;35 data_dir mib;36 wal_file mib;\
 51 metrics_dir mib;52 store_dir mib;46 active_series count;\
-47 series_memtable mib;48 metric_parts count", rows, ";")
+47 series_memtable mib;48 metric_parts count;53 proc_rss mib;\
+54 alloc_committed mib", rows, ";")
       printf "%-14s %12s %12s %12s %12s  %s\n", "mib/count", "Q1", "Q2", "Q3", "Q4", "trend"
       for (r = 1; r <= nr; r++) {
         split(rows[r], f, " "); c = f[1] + 0

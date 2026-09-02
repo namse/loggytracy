@@ -219,6 +219,12 @@ pub struct MetricQueryOutcome {
     pub throttled: u64,
     pub statuses: BTreeMap<u16, u64>,
     pub first_error: Option<String>,
+    /// Answers issued past the settling floor, across every shape, and the
+    /// floor itself. A run shorter than the floor judges nothing, and a report
+    /// that said `pass` without saying that would be claiming a check it never
+    /// made.
+    pub judged_total: u64,
+    pub settling_seconds: u64,
 }
 
 /// Metric reads at a paced rate, on one connection, cycling the shapes above.
@@ -248,10 +254,10 @@ pub async fn metric_query_leg(
     // make the gate fire on the clock rather than on the engine, and a soak
     // that cries wolf in its first minute is a soak nobody reads the verdict
     // of.
-    let settled_at = Instant::now()
-        + std::time::Duration::from_secs(
-            2 * cfg.metric_leg_scrape_seconds + cfg.metric_verify.range_seconds.max(0) as u64,
-        );
+    let settling_seconds =
+        2 * cfg.metric_leg_scrape_seconds + cfg.metric_verify.range_seconds.max(0) as u64;
+    outcome.settling_seconds = settling_seconds;
+    let settled_at = Instant::now() + std::time::Duration::from_secs(settling_seconds);
 
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         tokio::time::sleep_until(intended).await;
@@ -289,6 +295,7 @@ pub async fn metric_query_leg(
                         *outcome.shape_rows.entry(shape.name()).or_default() += rows;
                         if steady {
                             *outcome.shape_judged.entry(shape.name()).or_default() += 1;
+                            outcome.judged_total += 1;
                             if rows == 0 {
                                 *outcome.shape_empty.entry(shape.name()).or_default() += 1;
                             }
