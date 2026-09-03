@@ -55,6 +55,48 @@ pub fn record_bloom_cache_miss(bytes: u64) {
     BLOOM_CACHE_READ_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The cache's lifecycle, which the hit/miss pair alone cannot describe.
+///
+/// A 90% hit rate reads as a healthy cache. It is also what a cache produces
+/// when it holds a part's blooms for a moment, evicts them under pressure, and
+/// decodes the same part again shortly after — the hits are the queries that
+/// land inside those moments. These separate the two: how long an entry
+/// survives after it is installed, and how soon the part that lost it wants it
+/// back. A short life beside a short gap is thrashing, whatever the hit rate
+/// says, and it means the working set does not fit rather than that the cache
+/// is behaving badly.
+///
+/// `INSTALL_BYTES` is the decoded size, against `READ_BYTES`' raw file size:
+/// what a miss puts into memory, as against what it reads.
+static BLOOM_INSTALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BLOOM_INSTALL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BLOOM_EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BLOOM_RESIDENT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BLOOM_REDECODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BLOOM_REDECODE_GAP_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Nanoseconds since the first call, so a slot can hold two instants in two
+/// atomics without a lock. Zero is "never", which is why the epoch is read
+/// once rather than being the process start.
+fn bloom_clock_nanos() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let epoch = EPOCH.get_or_init(std::time::Instant::now);
+    epoch.elapsed().as_nanos() as u64 + 1
+}
+
+pub fn bloom_cache_lifecycle() -> (u64, u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        BLOOM_INSTALLS.load(Relaxed),
+        BLOOM_INSTALL_BYTES.load(Relaxed),
+        BLOOM_EVICTIONS.load(Relaxed),
+        BLOOM_RESIDENT_NANOS.load(Relaxed),
+        BLOOM_REDECODES.load(Relaxed),
+        BLOOM_REDECODE_GAP_NANOS.load(Relaxed),
+    )
+}
+
 pub fn bloom_cache_counters() -> (u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
@@ -102,6 +144,10 @@ pub fn bloom_cache_bytes() -> u64 {
 pub(crate) struct BloomSlot {
     id: u64,
     data: std::sync::Mutex<Option<Arc<DecodedBlooms>>>,
+    /// When the current entry was installed, and when the last one was
+    /// evicted. Both on [`bloom_clock_nanos`], both zero for "never".
+    installed_at: std::sync::atomic::AtomicU64,
+    evicted_at: std::sync::atomic::AtomicU64,
 }
 
 impl BloomSlot {
@@ -109,6 +155,8 @@ impl BloomSlot {
         Arc::new(Self {
             id: BLOOM_SLOT_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             data: std::sync::Mutex::new(None),
+            installed_at: std::sync::atomic::AtomicU64::new(0),
+            evicted_at: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -132,6 +180,19 @@ impl BloomSlot {
     /// installing slot is never its own victim — a part being queried right
     /// now is by definition the most recently used.
     pub(crate) fn install(self: &Arc<Self>, blooms: Arc<DecodedBlooms>, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = bloom_clock_nanos();
+        BLOOM_INSTALLS.fetch_add(1, Relaxed);
+        BLOOM_INSTALL_BYTES.fetch_add(bytes, Relaxed);
+        // This part lost its blooms and has come back for them: the gap is
+        // how long the eviction bought, and a short one is the definition of
+        // thrashing.
+        let evicted = self.evicted_at.swap(0, Relaxed);
+        if evicted != 0 {
+            BLOOM_REDECODES.fetch_add(1, Relaxed);
+            BLOOM_REDECODE_GAP_NANOS.fetch_add(now.saturating_sub(evicted), Relaxed);
+        }
+        self.installed_at.store(now, Relaxed);
         *self.data.lock().expect("bloom slot poisoned") = Some(blooms);
         let mut victims: Vec<Arc<BloomSlot>> = Vec::new();
         {
@@ -189,6 +250,7 @@ impl BloomSlot {
                 .lock()
                 .expect("bloom registry poisoned");
             if !reg.entries.contains_key(&slot.id) {
+                slot.note_evicted();
                 *data = None;
             }
         }
@@ -197,7 +259,20 @@ impl BloomSlot {
     /// Deterministic removal on reader drop — a merged-away or
     /// retention-deleted part gives its bytes back immediately rather than
     /// waiting to be chosen as a victim.
+    /// Records this slot losing its entry, whichever path took it.
+    fn note_evicted(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = bloom_clock_nanos();
+        let installed = self.installed_at.swap(0, Relaxed);
+        if installed != 0 {
+            BLOOM_EVICTIONS.fetch_add(1, Relaxed);
+            BLOOM_RESIDENT_NANOS.fetch_add(now.saturating_sub(installed), Relaxed);
+            self.evicted_at.store(now, Relaxed);
+        }
+    }
+
     pub(crate) fn remove(&self) {
+        self.note_evicted();
         let mut data = self.data.lock().expect("bloom slot poisoned");
         let mut reg = bloom_cache_registry()
             .lock()

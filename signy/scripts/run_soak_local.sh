@@ -196,7 +196,7 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
 # freeze with zero direct reclaim in it is not a reclaim stall, and the next
 # question is which resource the threads were actually waiting on.
 (
-  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us,active_series,series_memtable,metric_parts,metric_dp_rejected,metric_mem_rejected,metrics_dir,store_dir,proc_rss,alloc_committed,alloc_live,alloc_retained,alloc_active,alloc_metadata,account_in_use,account_budget,account_exhausted,account_deferred,cpu_usec,sidecar_hits,sidecar_misses,sidecar_read_bytes"
+  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us,active_series,series_memtable,metric_parts,metric_dp_rejected,metric_mem_rejected,metrics_dir,store_dir,proc_rss,alloc_committed,alloc_live,alloc_retained,alloc_active,alloc_metadata,account_in_use,account_budget,account_exhausted,account_deferred,cpu_usec,sidecar_hits,sidecar_misses,sidecar_read_bytes,sc_installs,sc_inst_bytes,sc_evictions,sc_resident_ns,sc_redecodes,sc_gap_ns"
   T0=$(date +%s.%N)
   echo "$T0" >"$OUT/sampler_t0"
   i=0; du_bytes=0; wal_bytes=0; metrics_bytes=0; store_bytes=0
@@ -260,7 +260,13 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
       $1=="signy_part_sidecar_hits_total"{h=$2}
       $1=="signy_part_sidecar_misses_total"{ms=$2}
       $1=="signy_part_sidecar_read_bytes_total"{rb=$2}
-      END{printf "%d,%d,%d", h, ms, rb}')
+      $1=="signy_part_sidecar_installs_total"{si=$2}
+      $1=="signy_part_sidecar_installed_bytes_total"{sib=$2}
+      $1=="signy_part_sidecar_evictions_total"{se=$2}
+      $1=="signy_part_sidecar_resident_nanos_total"{srn=$2}
+      $1=="signy_part_sidecar_redecodes_total"{sr=$2}
+      $1=="signy_part_sidecar_redecode_gap_nanos_total"{sgn=$2}
+      END{printf "%d,%d,%d,%d,%d,%d,%d,%d,%d", h, ms, rb, si, sib, se, srn, sr, sgn}')
     ac=$(echo "$m" | awk '
       $1=="signy_memory_account_in_use_bytes"{u=$2}
       $1=="signy_memory_account_budget_bytes"{b=$2}

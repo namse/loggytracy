@@ -548,6 +548,18 @@ fn journal_writer_metrics(state: &AppState) -> String {
     out.push_str(&format!(
         "signy_part_sidecar_read_bytes_total {bloom_read_bytes}\n"
     ));
+    let (installs, install_bytes, evictions, resident_ns, redecodes, gap_ns) =
+        crate::part::bloom_cache_lifecycle();
+    for (name, help, kind, value) in [
+        ("signy_part_sidecar_installs_total", "Decoded bloom sets installed into the cache. One per miss that finished decoding.", "counter", installs),
+        ("signy_part_sidecar_installed_bytes_total", "Decoded bytes those installs added, against sidecar_read_bytes_total's raw file size: what a miss puts in memory as against what it reads.", "counter", install_bytes),
+        ("signy_part_sidecar_evictions_total", "Entries the cache dropped to stay under its budget, or that left with their reader.", "counter", evictions),
+        ("signy_part_sidecar_resident_nanos_total", "Summed time those evicted entries spent resident. Divided by evictions it is how long an install survives -- the number a hit rate cannot give, because a cache that installs, evicts and re-decodes the same part in a loop still serves hits to the queries that land inside each residency.", "counter", resident_ns),
+        ("signy_part_sidecar_redecodes_total", "Installs into a slot that had been evicted before: the same part's blooms decoded again.", "counter", redecodes),
+        ("signy_part_sidecar_redecode_gap_nanos_total", "Summed time between those evictions and the re-decode that followed. Divided by redecodes it is what the eviction bought; a short gap beside a short residency is thrashing, and says the working set does not fit rather than that the cache is misbehaving.", "counter", gap_ns),
+    ] {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"));
+    }
     out.push_str(
         "# HELP signy_memory_account_in_use_bytes Bytes charged to the shared memory account and not yet released: what admitted queries, flushes and compactions have declared they hold right now. Read against signy_memory_account_budget_bytes, this is what an arriving request is admitted or refused on. It is an accounted total and not a heap measurement, so it will sit below process_rss_bytes, which also carries the caches, the memtables and whatever the allocator has not returned.\n\
 # TYPE signy_memory_account_in_use_bytes gauge\n",
