@@ -530,6 +530,24 @@ fn journal_writer_metrics(state: &AppState) -> String {
         "signy_query_memory_exhausted_total {}\n",
         state.memory_account.exhausted()
     ));
+    let (bloom_hits, bloom_misses, bloom_read_bytes) = crate::part::bloom_cache_counters();
+    out.push_str(
+        "# HELP signy_part_sidecar_hits_total Pruning queries that found a part's blooms already resident.\n\
+# TYPE signy_part_sidecar_hits_total counter\n",
+    );
+    out.push_str(&format!("signy_part_sidecar_hits_total {bloom_hits}\n"));
+    out.push_str(
+        "# HELP signy_part_sidecar_misses_total Pruning queries that had to re-read index.bin because the bloom cache had evicted it. Read against hits, this is what sidecar_cache_max_bytes is costing: the resident gauge shows the cache sitting at its ceiling whether it is serving every query or re-reading on every query, and only this pair tells the two apart.\n\
+# TYPE signy_part_sidecar_misses_total counter\n",
+    );
+    out.push_str(&format!("signy_part_sidecar_misses_total {bloom_misses}\n"));
+    out.push_str(
+        "# HELP signy_part_sidecar_read_bytes_total Bytes of index.bin re-read on those misses. Each miss reads the whole file into an owned buffer and drops it after decoding, so the rate of this counter is a rate of large allocate-and-free -- the shape that fills an allocator's dirty page cache without live memory growing.\n\
+# TYPE signy_part_sidecar_read_bytes_total counter\n",
+    );
+    out.push_str(&format!(
+        "signy_part_sidecar_read_bytes_total {bloom_read_bytes}\n"
+    ));
     out.push_str(
         "# HELP signy_memory_account_in_use_bytes Bytes charged to the shared memory account and not yet released: what admitted queries, flushes and compactions have declared they hold right now. Read against signy_memory_account_budget_bytes, this is what an arriving request is admitted or refused on. It is an accounted total and not a heap measurement, so it will sit below process_rss_bytes, which also carries the caches, the memtables and whatever the allocator has not returned.\n\
 # TYPE signy_memory_account_in_use_bytes gauge\n",

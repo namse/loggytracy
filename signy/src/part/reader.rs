@@ -428,6 +428,7 @@ impl PartReader {
     /// least-recently-used blooms if the total is over it.
     fn decoded_blooms(&self) -> Result<Arc<DecodedBlooms>, String> {
         if let Some(blooms) = self.blooms.get() {
+            crate::part::record_bloom_cache_hit();
             return Ok(blooms);
         }
         // Charged to the sidecar arena, not to the faulting query: the
@@ -439,6 +440,7 @@ impl PartReader {
                 self.part.meta.id
             )
         })?;
+        crate::part::record_bloom_cache_miss(index_bytes.len() as u64);
         let bloom_bytes = split_index(&index_bytes)?;
         let decoded = Arc::new(decode_blooms(bloom_bytes, &self.part.meta.row_group_rows)?);
         self.blooms

@@ -30,6 +30,40 @@ static BLOOM_CACHE_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 static BLOOM_CACHE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BLOOM_SLOT_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// What the budget above actually costs, which the resident gauge cannot say.
+///
+/// `signy_part_sidecar_resident_bytes` reports how much is held; these report
+/// how hard it was to hold it. A miss is not free: it re-reads the whole of
+/// `index.bin` into an owned buffer, decodes it, and drops the buffer — so a
+/// cache riding its ceiling turns every pruning query into a large
+/// allocate-and-free, and the bytes counter is what that costs per second.
+/// Without them a soak can see the resident half sitting flat at its cap and
+/// read it as "the cache is working", which is the same picture a cache that
+/// evicts and re-reads on every query paints.
+static BLOOM_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BLOOM_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BLOOM_CACHE_READ_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A pruning query found the blooms already resident.
+pub fn record_bloom_cache_hit() {
+    BLOOM_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A pruning query had to re-read `index.bin`; `bytes` is the whole file.
+pub fn record_bloom_cache_miss(bytes: u64) {
+    BLOOM_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    BLOOM_CACHE_READ_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn bloom_cache_counters() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        BLOOM_CACHE_HITS.load(Relaxed),
+        BLOOM_CACHE_MISSES.load(Relaxed),
+        BLOOM_CACHE_READ_BYTES.load(Relaxed),
+    )
+}
+
 struct BloomCacheEntry {
     slot: std::sync::Weak<BloomSlot>,
     bytes: u64,
