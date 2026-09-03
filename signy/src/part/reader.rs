@@ -386,8 +386,8 @@ impl PartReader {
                 part.meta.id
             ));
         }
-        let index_bytes = fs::read(part.index_path()).map_err(|e| e.to_string())?;
-        let bloom_bytes = split_index(&index_bytes)?;
+        let index_map = map_index_file(&part.index_path())?;
+        let bloom_bytes = split_index(&index_map)?;
         let decoded_blooms = Arc::new(decode_blooms(bloom_bytes, &part.meta.row_group_rows)?);
         let metadata_keys: Vec<String> = part
             .meta
@@ -434,14 +434,14 @@ impl PartReader {
         // Charged to the sidecar arena, not to the faulting query: the
         // blooms outlive it.
         let _arena = crate::memprof::enter(crate::memprof::Arena::Sidecar);
-        let index_bytes = fs::read(self.part.index_path()).map_err(|e| {
+        let index_map = map_index_file(&self.part.index_path()).map_err(|error| {
             format!(
-                "failed to re-read {INDEX_FILE} for part {}: {e}",
+                "failed to re-map {INDEX_FILE} for part {}: {error}",
                 self.part.meta.id
             )
         })?;
-        crate::part::record_bloom_cache_miss(index_bytes.len() as u64);
-        let bloom_bytes = split_index(&index_bytes)?;
+        crate::part::record_bloom_cache_miss(index_map.len() as u64);
+        let bloom_bytes = split_index(&index_map)?;
         let decoded = Arc::new(decode_blooms(bloom_bytes, &self.part.meta.row_group_rows)?);
         self.blooms
             .install(decoded.clone(), bloom_resident_bytes(&decoded));
@@ -2007,6 +2007,36 @@ impl Drop for PartReader {
         // now rather than waiting to be chosen as an eviction victim.
         self.blooms.remove();
     }
+}
+
+/// The bloom sidecar, mapped rather than read.
+///
+/// `fs::read` copied the whole of `index.bin` — 3 MiB on the soak rig — into
+/// an owned buffer, decoded it, and dropped the buffer. That is a large
+/// allocate-and-free per cache miss, and the soak measured what it costs: once
+/// the bloom working set outgrew `sidecar_cache_max_bytes`, misses ran at
+/// ~200/s and re-read **379 MiB/s**, while jemalloc's unreturned dirty pages
+/// went 297 -> 953 MiB with live memory flat. The bytes were already in the
+/// page cache; copying them into the heap produced a second, anonymous
+/// representation whose only role was to be freed.
+///
+/// Mapping removes that copy. The bytes stay file-backed, so the kernel can
+/// reclaim them under pressure and read them again from a file that has not
+/// changed — where an allocator's freed pages are anonymous and, with swap
+/// off, cannot be reclaimed at all. This does not take them out of the
+/// cgroup's accounting; it takes them out of the half of it that an OOM kill
+/// is decided on.
+///
+/// Safety rests on the same invariant `series_part::map_part_file` documents:
+/// a committed part is write-once. `index.bin` is written and fsynced before
+/// the part is published and is never modified in place; retirement and cache
+/// eviction `remove_file` it, and an unlinked file keeps its inode while a
+/// mapping holds it. Nothing truncates a mapped part, which is the case that
+/// would fault a reader.
+fn map_index_file(path: &std::path::Path) -> Result<memmap2::Mmap, String> {
+    let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    // SAFETY: parts are write-once. See the note above.
+    unsafe { memmap2::Mmap::map(&file) }.map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn decode_blooms(buf: &[u8], row_group_rows: &[u32]) -> Result<DecodedBlooms, String> {
