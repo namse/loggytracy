@@ -259,6 +259,29 @@ groups:
             SIGNY_MEMORY_ACCOUNT_BYTES for the two to overlap.
           runbook: docs/RUNBOOK.md#what-to-alert-on
 
+      - alert: SignyBloomCacheThrashing
+        expr: >-
+          increase(signy_part_sidecar_misses_total[15m]) > 0
+            and
+          (increase(signy_part_sidecar_redecode_gap_nanos_total[15m])
+             / clamp_min(increase(signy_part_sidecar_redecodes_total[15m]), 1)) < 1e9
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "signy is decoding the same part's blooms over and over"
+          description: >-
+            Parts are losing their bloom index and asking for it back inside a
+            second, which means the cache is smaller than the working set. The
+            hit rate will look healthy while this fires: hits are the queries
+            that land inside each residency. Before the cache held offsets into
+            a mapped index.bin this shape cost four megabytes per re-decode and
+            was what filled the allocator's dirty pages until the 2 GiB soak was
+            OOM-killed; it is cheap now, so this is a sizing signal rather than
+            an emergency. Read signy_part_sidecar_resident_bytes against
+            SIGNY_SIDECAR_CACHE_MAX_BYTES.
+          runbook: docs/RUNBOOK.md#what-to-alert-on
+
       - alert: SignyQueryQuotaRejecting
         expr: increase(signy_query_quota_rejected_total[15m]) > 0
         for: 15m
