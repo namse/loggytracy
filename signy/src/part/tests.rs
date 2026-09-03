@@ -520,12 +520,12 @@
         valid.extend_from_slice(&encoded);
         valid.extend_from_slice(&0u32.to_le_bytes());
 
-        let decoded = decode_blooms(&valid, rows).unwrap();
-        assert_eq!(decoded.line.len(), 1);
-        assert_eq!(decoded.exact_fields.len(), 1);
-        assert_eq!(decoded.exact_fields[0].len(), 2);
-        assert!(matches!(decoded.exact_fields[0][0], WindowBloom::Filter(_)));
-        assert!(matches!(decoded.exact_fields[0][1], WindowBloom::Absent));
+        let (line, windows) = locate_blooms(&valid, 0, rows).unwrap();
+        assert_eq!(line.len(), 1);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].len(), 2);
+        assert!(matches!(windows[0][0], WindowBloom::Filter(_)));
+        assert!(matches!(windows[0][1], WindowBloom::Absent));
 
         // A token-less group writes a window count of zero, whatever its
         // row count.
@@ -535,11 +535,11 @@
         empty.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
         empty.extend_from_slice(&encoded);
         empty.extend_from_slice(&0u32.to_le_bytes());
-        let decoded = decode_blooms(&empty, rows).unwrap();
-        assert!(decoded.exact_fields[0].is_empty());
+        let (_, windows) = locate_blooms(&empty, 0, rows).unwrap();
+        assert!(windows[0].is_empty());
 
         assert!(
-            decode_blooms(&valid, &[2000, 2000])
+            locate_blooms(&valid, 0, &[2000, 2000])
                 .err()
                 .unwrap()
                 .contains("row group count mismatch")
@@ -547,7 +547,7 @@
 
         // A non-zero window count must match what the row count implies.
         assert!(
-            decode_blooms(&valid, &[5000])
+            locate_blooms(&valid, 0, &[5000])
                 .err()
                 .unwrap()
                 .contains("bloom window count mismatch")
@@ -556,7 +556,7 @@
         let mut trailing = valid.clone();
         trailing.push(0);
         assert!(
-            decode_blooms(&trailing, rows)
+            locate_blooms(&trailing, 0, rows)
                 .err()
                 .unwrap()
                 .contains("trailing bytes")
@@ -565,14 +565,14 @@
         let mut unknown = valid.clone();
         unknown[..4].copy_from_slice(b"XXXX");
         assert!(
-            decode_blooms(&unknown, rows)
+            locate_blooms(&unknown, 0, rows)
                 .err()
                 .unwrap()
                 .contains("magic mismatch")
         );
 
         let truncated = &valid[..valid.len() - 2];
-        assert!(decode_blooms(truncated, rows).is_err());
+        assert!(locate_blooms(truncated, 0, rows).is_err());
 
         // The previous on-disk generation fails loudly rather than decoding
         // wrong: a stale data directory is deleted and re-ingested, per the
@@ -580,7 +580,7 @@
         let mut old = valid.clone();
         old[..4].copy_from_slice(b"BTF4");
         assert!(
-            decode_blooms(&old, rows)
+            locate_blooms(&old, 0, rows)
                 .err()
                 .unwrap()
                 .contains("magic mismatch")
@@ -596,9 +596,9 @@
         saturated.extend_from_slice(&2u32.to_le_bytes());
         saturated.extend_from_slice(&crate::part::SATURATED_WINDOW_SENTINEL.to_le_bytes());
         saturated.extend_from_slice(&0u32.to_le_bytes());
-        let decoded = decode_blooms(&saturated, rows).unwrap();
-        assert!(matches!(decoded.exact_fields[0][0], WindowBloom::Saturated));
-        assert!(matches!(decoded.exact_fields[0][1], WindowBloom::Absent));
+        let (_, windows) = locate_blooms(&saturated, 0, rows).unwrap();
+        assert!(matches!(windows[0][0], WindowBloom::Saturated));
+        assert!(matches!(windows[0][1], WindowBloom::Absent));
     }
 
     /// A wide-JSON window past the token cap is stored saturated: the index
@@ -1197,7 +1197,7 @@
             let on_disk = fs::metadata(part.data_path()).unwrap().len();
             let bloom = fs::metadata(part.index_path()).unwrap().len();
             let reader = PartReader::open(part).expect("open");
-            let resident = bloom_resident_bytes(&reader.decoded_blooms().expect("blooms"));
+            let resident = reader.decoded_blooms().expect("blooms").index_bytes();
             (
                 reader.meta().row_group_count,
                 on_disk,
@@ -3083,10 +3083,8 @@ not by the decode fallback"
         const PROBE: u64 = 1 << 40;
         let tmp = tempfile_dir();
         let part = flush_rows(make_rows(), &tmp, 100).unwrap().remove(0);
-        let index_bytes = fs::read(part.index_path()).unwrap();
-        let bloom_bytes = split_index(&index_bytes).unwrap();
-        let decoded =
-            std::sync::Arc::new(decode_blooms(bloom_bytes, &part.meta.row_group_rows).unwrap());
+        let reader = PartReader::open(part).unwrap();
+        let decoded = reader.decoded_blooms().unwrap();
 
         let slot = BloomSlot::new();
         slot.install(decoded.clone(), PROBE);

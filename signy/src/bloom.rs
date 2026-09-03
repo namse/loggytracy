@@ -37,14 +37,7 @@ impl BloomFilter {
     }
 
     pub fn contains(&self, data: &[u8]) -> bool {
-        let (h1, h2) = hash_pair(data);
-        for i in 0..self.k {
-            let idx = double_hash(h1, h2, i as u64, self.num_bits);
-            if self.bits[idx / 8] & (1 << (idx % 8)) == 0 {
-                return false;
-            }
-        }
-        true
+        bits_contain(&self.bits, self.num_bits, self.k, data)
     }
 
     #[cfg(test)]
@@ -55,16 +48,7 @@ impl BloomFilter {
     }
 
     pub fn might_contain_substr(&self, needle: &str) -> bool {
-        let tris = trigrams(needle);
-        if tris.is_empty() {
-            return true;
-        }
-        for tri in tris {
-            if !self.contains(&tri) {
-                return false;
-            }
-        }
-        true
+        bits_might_contain_substr(&self.bits, self.num_bits, self.k, needle)
     }
 
     #[allow(dead_code)]
@@ -176,6 +160,107 @@ pub const LINE_TRIGRAM_FPP: f64 = 0.01;
 /// The 2 MiB is transient, one row group at a time, and the flush path builds
 /// groups sequentially: at most one of these is live per writer, so the
 /// declared budget sees 2 MiB for flush and 2 MiB for a concurrent merge.
+/// The same filter, borrowed rather than owned.
+///
+/// A stored bloom is a length, three header words and a bitset, laid out
+/// contiguously in `index.bin`. Decoding it copied the bitset into a `Vec` —
+/// and the copy is almost exactly the file: the soak measured a part's 4418
+/// KiB of sidecar becoming 4120 KiB of decoded blooms, a factor of 1.01. So
+/// the owned form bought nothing a slice of the mapping does not already
+/// give, and cost a 4 MiB allocation per cache miss, at 200 misses a second
+/// once the working set outgrew the cache.
+///
+/// [`BloomFilter`] stays as it is: the write path builds bits and needs to own
+/// them. This is what the read path uses, made for the moment of a lookup out
+/// of an offset into a mapping that outlives it, so nothing is cached but the
+/// offsets.
+#[derive(Clone, Copy)]
+pub struct BloomRef<'a> {
+    bits: &'a [u8],
+    num_bits: usize,
+    k: u32,
+}
+
+impl<'a> BloomRef<'a> {
+    /// Reads the header a stored bloom begins with and borrows its bits.
+    ///
+    /// `buf` is the whole encoded filter — what [`BloomFilter::encode`] wrote
+    /// and [`BloomFilter::decode`] parses. Returning the header rather than
+    /// storing it lets a caller keep the three words and drop the bytes.
+    pub fn parse(buf: &'a [u8]) -> Result<Self, String> {
+        let (num_bits, k) = decode_bloom_header(buf)?;
+        Ok(Self {
+            bits: &buf[BLOOM_HEADER_BYTES..],
+            num_bits,
+            k,
+        })
+    }
+
+    /// The same, from a header a caller already read and kept.
+    pub fn from_parts(bits: &'a [u8], num_bits: usize, k: u32) -> Self {
+        Self { bits, num_bits, k }
+    }
+
+    pub fn contains(&self, data: &[u8]) -> bool {
+        bits_contain(self.bits, self.num_bits, self.k, data)
+    }
+
+    pub fn might_contain_substr(&self, needle: &str) -> bool {
+        bits_might_contain_substr(self.bits, self.num_bits, self.k, needle)
+    }
+}
+
+/// Bytes of header before the bitset: magic, `num_bits`, `k`.
+pub const BLOOM_HEADER_BYTES: usize = 12;
+
+/// Validates a stored bloom's header and returns `(num_bits, k)`.
+///
+/// Shared by the owning decoder and the borrowing one so a filter parsed
+/// either way is rejected on exactly the same grounds.
+pub fn decode_bloom_header(buf: &[u8]) -> Result<(usize, u32), String> {
+    if buf.len() < BLOOM_HEADER_BYTES {
+        return Err("bloom buffer too short".to_string());
+    }
+    if &buf[0..4] != MAGIC {
+        return Err("bloom magic mismatch".to_string());
+    }
+    let num_bits = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    let k = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if num_bits == 0 || !num_bits.is_multiple_of(8) {
+        return Err(format!("invalid bloom num_bits {num_bits}"));
+    }
+    let bits_len = num_bits / 8;
+    if buf.len() != BLOOM_HEADER_BYTES + bits_len {
+        return Err(format!(
+            "bloom length mismatch: expected {} got {}",
+            BLOOM_HEADER_BYTES + bits_len,
+            buf.len()
+        ));
+    }
+    Ok((num_bits, k))
+}
+
+/// The lookup itself, over bits the caller owns or borrows.
+fn bits_contain(bits: &[u8], num_bits: usize, k: u32, data: &[u8]) -> bool {
+    let (h1, h2) = hash_pair(data);
+    for i in 0..k {
+        let idx = double_hash(h1, h2, i as u64, num_bits);
+        if bits[idx / 8] & (1 << (idx % 8)) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn bits_might_contain_substr(bits: &[u8], num_bits: usize, k: u32, needle: &str) -> bool {
+    let tris = trigrams(needle);
+    if tris.is_empty() {
+        return true;
+    }
+    tris.into_iter()
+        .all(|tri| bits_contain(bits, num_bits, k, &tri))
+}
+
 pub struct TrigramSet {
     /// One bit per possible trigram, indexed big-endian so that iteration
     /// ascends in the same order a `BTreeSet<[u8; 3]>` would.

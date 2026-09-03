@@ -98,17 +98,73 @@ pub(crate) enum WindowBloom {
     /// The window held more tokens than a filter is allowed to be sized for;
     /// everything is admitted, nothing is pruned.
     Saturated,
-    Filter(BloomFilter),
+    /// Where the window's filter sits in the mapping, and the two header
+    /// words a lookup needs. The bits stay in the file.
+    Filter(BloomLocation),
 }
 
-/// The evictable half of a part's sidecar: what the bloom cache (`bloom_cache.rs`) holds
-/// under its budget and what a re-read of `index.bin` reproduces.
-pub(crate) struct DecodedBlooms {
-    line: Vec<BloomFilter>,
-    /// Per row group, one exact-field sub-bloom per [`BLOOM_WINDOW_ROWS`]-row
-    /// window. An empty outer `Vec` means the group indexed no exact-field
-    /// token at all — no exact-field predicate can match it.
+/// A stored filter's position in `index.bin`, and its header.
+///
+/// Sixteen bytes instead of the bitset they point at. `num_bits` and `k` are
+/// kept rather than re-read on every lookup because they are two words and
+/// the alternative is a bounds check and three loads per probe.
+#[derive(Clone, Copy)]
+pub(crate) struct BloomLocation {
+    offset: u32,
+    len: u32,
+    num_bits: u32,
+    k: u32,
+}
+
+/// The evictable half of a part's sidecar: what the bloom cache
+/// (`bloom_cache.rs`) holds under its budget.
+///
+/// It used to be the decoded filters themselves — every bitset copied out of
+/// `index.bin` into an owned `Vec`. Decoding barely shrinks a bloom, so that
+/// copy was very nearly the file: the soak measured 4418 KiB of sidecar
+/// becoming 4120 KiB of cache, a factor of 1.01. A 122 MiB budget therefore
+/// held about thirty parts against a working set of sixty to two hundred, and
+/// the cache thrashed — mean residency 2.03 s, mean time to the same part
+/// being decoded again 0.144 s, two thirds of installs a part coming back.
+/// Each of those re-decodes allocated four megabytes and freed it seconds
+/// later, at two hundred a second.
+///
+/// So this holds the mapping and the offsets into it. The bits are read
+/// through [`BloomIndex::bloom`] at the moment of a lookup and never copied.
+/// The mapping costs address space rather than resident memory — its pages
+/// fault in on use and the kernel can reclaim them, unlike the anonymous
+/// bytes a decode produced — and what the cache now bounds is an index whose
+/// size is a function of the row-group and window count, not of the data.
+pub(crate) struct BloomIndex {
+    map: Arc<memmap2::Mmap>,
+    /// One per row group: the line bloom, then one entry per
+    /// [`BLOOM_WINDOW_ROWS`]-row window. An empty window vector means the
+    /// group indexed no exact-field token at all.
+    line: Vec<BloomLocation>,
     exact_fields: Vec<Vec<WindowBloom>>,
+}
+
+impl BloomIndex {
+    fn bloom(&self, at: BloomLocation) -> crate::bloom::BloomRef<'_> {
+        let start = at.offset as usize;
+        let end = start + at.len as usize;
+        // Bounds were checked once, against this same mapping, when the index
+        // was built; a part is write-once, so they cannot have moved.
+        crate::bloom::BloomRef::from_parts(
+            &self.map[start..end],
+            at.num_bits as usize,
+            at.k,
+        )
+    }
+
+    /// What the cache charges for this entry: the index, not the blooms.
+    fn index_bytes(&self) -> u64 {
+        let windows: usize = self.exact_fields.iter().map(Vec::len).sum();
+        (std::mem::size_of::<Self>()
+            + self.line.len() * std::mem::size_of::<BloomLocation>()
+            + self.exact_fields.len() * std::mem::size_of::<Vec<WindowBloom>>()
+            + windows * std::mem::size_of::<WindowBloom>()) as u64
+    }
 }
 
 
@@ -386,9 +442,11 @@ impl PartReader {
                 part.meta.id
             ));
         }
-        let index_map = map_index_file(&part.index_path())?;
-        let bloom_bytes = split_index(&index_map)?;
-        let decoded_blooms = Arc::new(decode_blooms(bloom_bytes, &part.meta.row_group_rows)?);
+        let index_map = Arc::new(map_index_file(&part.index_path())?);
+        let decoded_blooms = Arc::new(build_bloom_index(
+            index_map,
+            &part.meta.row_group_rows,
+        )?);
         let metadata_keys: Vec<String> = part
             .meta
             .metadata_columns
@@ -407,10 +465,8 @@ impl PartReader {
         let cache_projection =
             ScanProjection::build(&metadata_keys, &parsed_keys, &ColumnSet::all());
         let blooms = BloomSlot::new();
-        blooms.install(
-            decoded_blooms.clone(),
-            bloom_resident_bytes(&decoded_blooms),
-        );
+        let index_bytes = decoded_blooms.index_bytes();
+        blooms.install(decoded_blooms.clone(), index_bytes);
         Ok(Self {
             part,
             blooms,
@@ -426,7 +482,7 @@ impl PartReader {
     /// re-reads `index.bin` — the same bytes `open` validated by checksum —
     /// and reinstalls them under the global budget, evicting other parts'
     /// least-recently-used blooms if the total is over it.
-    fn decoded_blooms(&self) -> Result<Arc<DecodedBlooms>, String> {
+    fn decoded_blooms(&self) -> Result<Arc<BloomIndex>, String> {
         if let Some(blooms) = self.blooms.get() {
             crate::part::record_bloom_cache_hit();
             return Ok(blooms);
@@ -441,10 +497,13 @@ impl PartReader {
             )
         })?;
         crate::part::record_bloom_cache_miss(index_map.len() as u64);
-        let bloom_bytes = split_index(&index_map)?;
-        let decoded = Arc::new(decode_blooms(bloom_bytes, &self.part.meta.row_group_rows)?);
-        self.blooms
-            .install(decoded.clone(), bloom_resident_bytes(&decoded));
+        let index_map = Arc::new(index_map);
+        let decoded = Arc::new(build_bloom_index(
+            index_map,
+            &self.part.meta.row_group_rows,
+        )?);
+        let bytes = decoded.index_bytes();
+        self.blooms.install(decoded.clone(), bytes);
         Ok(decoded)
     }
 
@@ -1895,15 +1954,16 @@ fn window_rows(scan_limit: Option<usize>, scanned_rows: usize, sink: &dyn RowSin
 }
 
 impl PartReader {
-    fn bloom_prune(&self, blooms: &DecodedBlooms, rg: usize, literals: &[String]) -> bool {
+    fn bloom_prune(&self, blooms: &BloomIndex, rg: usize, literals: &[String]) -> bool {
+        let line = blooms.bloom(blooms.line[rg]);
         literals
             .iter()
-            .all(|literal| blooms.line[rg].might_contain_substr(literal))
+            .all(|literal| line.might_contain_substr(literal))
     }
 
     fn exact_field_bloom_prune(
         &self,
-        blooms: &DecodedBlooms,
+        blooms: &BloomIndex,
         rg: usize,
         exact_fields: &[ExactFieldPredicate],
     ) -> bool {
@@ -1923,7 +1983,7 @@ impl PartReader {
     /// negatives.
     fn exact_field_window_mask(
         &self,
-        blooms: &DecodedBlooms,
+        blooms: &BloomIndex,
         rg: usize,
         exact_fields: &[ExactFieldPredicate],
     ) -> Option<u64> {
@@ -1946,7 +2006,7 @@ impl PartReader {
 
     fn predicate_window_mask(
         &self,
-        blooms: &DecodedBlooms,
+        blooms: &BloomIndex,
         rg: usize,
         predicate: &ExactFieldPredicate,
     ) -> Option<u64> {
@@ -1972,7 +2032,7 @@ impl PartReader {
             let admitted = match bloom {
                 WindowBloom::Absent => false,
                 WindowBloom::Saturated => true,
-                WindowBloom::Filter(filter) => filter.contains(&token),
+                WindowBloom::Filter(at) => blooms.bloom(*at).contains(&token),
             };
             if admitted {
                 mask |= 1u64 << window;
@@ -1980,25 +2040,6 @@ impl PartReader {
         }
         Some(mask)
     }
-}
-
-/// What the decoded blooms cost in memory — the evictable half of the
-/// sidecar, charged to the global bloom-cache budget.
-///
-/// Counts the payloads kept alive — filter bit vectors — rather than the
-/// encoded file sizes, because the encoded form is not what stays resident.
-/// Container and allocator overhead is not modelled; this is a floor.
-fn bloom_resident_bytes(blooms: &DecodedBlooms) -> u64 {
-    let mut total: u64 = 0;
-    for bloom in &blooms.line {
-        total = total.saturating_add(bloom.resident_bytes() as u64);
-    }
-    for window in blooms.exact_fields.iter().flatten() {
-        if let WindowBloom::Filter(filter) = window {
-            total = total.saturating_add(filter.resident_bytes() as u64);
-        }
-    }
-    total
 }
 
 impl Drop for PartReader {
@@ -2039,7 +2080,52 @@ fn map_index_file(path: &std::path::Path) -> Result<memmap2::Mmap, String> {
     unsafe { memmap2::Mmap::map(&file) }.map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn decode_blooms(buf: &[u8], row_group_rows: &[u32]) -> Result<DecodedBlooms, String> {
+/// Byte offset of the bloom section inside `index.bin`: the magic, then the
+/// four-byte length `split_index` reads.
+fn index_bloom_offset(buf: &[u8]) -> Result<usize, String> {
+    let base = crate::part::INDEX_MAGIC.len() + 4;
+    if buf.len() < base {
+        return Err("part index file is truncated".to_string());
+    }
+    Ok(base)
+}
+
+/// Walks `index.bin` once and records where each stored bloom sits.
+///
+/// The same validation the decoder did — magic, row-group count, window count
+/// and its ceiling, no trailing bytes — with the bitsets left in the mapping
+/// instead of copied out. Every location is bounds-checked here so a lookup
+/// can slice without one.
+fn build_bloom_index(
+    map: Arc<memmap2::Mmap>,
+    row_group_rows: &[u32],
+) -> Result<BloomIndex, String> {
+    // `index.bin` is the index header followed by the bloom section;
+    // `split_index` proves the header and hands back that section. The
+    // locations recorded are absolute in the mapping, so `base` carries into
+    // every one.
+    let base = index_bloom_offset(&map)?;
+    let (line, exact_fields) = locate_blooms(split_index(&map)?, base, row_group_rows)?;
+    Ok(BloomIndex {
+        map,
+        line,
+        exact_fields,
+    })
+}
+
+/// Walks the bloom section once and records where each stored bloom sits.
+///
+/// The same validation the decoder did — magic, row-group count, window count
+/// and its ceiling, no trailing bytes — with the bitsets left where they are
+/// instead of copied out. Every location is bounds-checked here so a lookup
+/// can slice without one. Split from the mapping so the framing rules can be
+/// tested on bytes rather than on a file.
+#[allow(clippy::type_complexity)]
+fn locate_blooms(
+    buf: &[u8],
+    base: usize,
+    row_group_rows: &[u32],
+) -> Result<(Vec<BloomLocation>, Vec<Vec<WindowBloom>>), String> {
     let expected_count = row_group_rows.len();
     if buf.len() < 8 {
         return Err("bloom file too short".to_string());
@@ -2057,7 +2143,7 @@ fn decode_blooms(buf: &[u8], row_group_rows: &[u32]) -> Result<DecodedBlooms, St
     let mut line = Vec::with_capacity(count);
     let mut exact_fields = Vec::with_capacity(count);
     for (group, rows) in row_group_rows.iter().enumerate() {
-        line.push(decode_length_prefixed_bloom(buf, &mut pos)?);
+        line.push(locate_length_prefixed_bloom(buf, base, &mut pos)?);
         let window_count = {
             let end = pos
                 .checked_add(4)
@@ -2085,24 +2171,21 @@ expected {expected_windows} windows, found {window_count}"
         }
         let mut windows = Vec::with_capacity(window_count);
         for _ in 0..window_count {
-            windows.push(decode_window_bloom(buf, &mut pos)?);
+            windows.push(locate_window_bloom(buf, base, &mut pos)?);
         }
         exact_fields.push(windows);
     }
     if pos != buf.len() {
         return Err("bloom file has trailing bytes".to_string());
     }
-    Ok(DecodedBlooms {
-        line,
-        exact_fields,
-    })
+    Ok((line, exact_fields))
 }
 
 /// One window slot: a zero length says the window indexed no exact-field
 /// token — a fact the reader prunes on; the saturation sentinel says the
 /// window held more tokens than a filter may be sized for — nothing is
 /// pruned; any other length decodes as an ordinary filter.
-fn decode_window_bloom(buf: &[u8], pos: &mut usize) -> Result<WindowBloom, String> {
+fn locate_window_bloom(buf: &[u8], base: usize, pos: &mut usize) -> Result<WindowBloom, String> {
     match buf.get(*pos..*pos + 4) {
         Some(&[0, 0, 0, 0]) => {
             *pos += 4;
@@ -2114,11 +2197,15 @@ fn decode_window_bloom(buf: &[u8], pos: &mut usize) -> Result<WindowBloom, Strin
             *pos += 4;
             Ok(WindowBloom::Saturated)
         }
-        _ => decode_length_prefixed_bloom(buf, pos).map(WindowBloom::Filter),
+        _ => locate_length_prefixed_bloom(buf, base, pos).map(WindowBloom::Filter),
     }
 }
 
-fn decode_length_prefixed_bloom(buf: &[u8], pos: &mut usize) -> Result<BloomFilter, String> {
+fn locate_length_prefixed_bloom(
+    buf: &[u8],
+    base: usize,
+    pos: &mut usize,
+) -> Result<BloomLocation, String> {
     let length_end = pos
         .checked_add(4)
         .ok_or_else(|| "bloom length overflow".to_string())?;
@@ -2135,8 +2222,19 @@ fn decode_length_prefixed_bloom(buf: &[u8], pos: &mut usize) -> Result<BloomFilt
     let payload = buf
         .get(*pos..payload_end)
         .ok_or_else(|| "bloom payload truncated".to_string())?;
+    // Validates the header on the same grounds the owning decoder used, and
+    // proves the slice below is in range so a lookup needs no check.
+    let (num_bits, k) = crate::bloom::decode_bloom_header(payload)?;
+    let bits_start = *pos + crate::bloom::BLOOM_HEADER_BYTES;
     *pos = payload_end;
-    BloomFilter::decode(payload)
+    Ok(BloomLocation {
+        offset: u32::try_from(base + bits_start)
+            .map_err(|_| "bloom offset exceeds 4 GiB".to_string())?,
+        len: u32::try_from(payload_end - bits_start)
+            .map_err(|_| "bloom payload exceeds 4 GiB".to_string())?,
+        num_bits: u32::try_from(num_bits).map_err(|_| "bloom num_bits overflow".to_string())?,
+        k,
+    })
 }
 
 pub fn group_by_labels(collected: Vec<(SharedLabels, LogEntry)>) -> Vec<StreamResult> {

@@ -143,7 +143,7 @@ pub fn bloom_cache_bytes() -> u64 {
 /// leak.
 pub(crate) struct BloomSlot {
     id: u64,
-    data: std::sync::Mutex<Option<Arc<DecodedBlooms>>>,
+    data: std::sync::Mutex<Option<Arc<BloomIndex>>>,
     /// When the current entry was installed, and when the last one was
     /// evicted. Both on [`bloom_clock_nanos`], both zero for "never".
     installed_at: std::sync::atomic::AtomicU64,
@@ -162,7 +162,7 @@ impl BloomSlot {
 
     /// The resident blooms, touched for LRU — or `None`, meaning the caller
     /// pays the re-read.
-    pub(crate) fn get(&self) -> Option<Arc<DecodedBlooms>> {
+    pub(crate) fn get(&self) -> Option<Arc<BloomIndex>> {
         let data = self.data.lock().expect("bloom slot poisoned").clone()?;
         let mut reg = bloom_cache_registry()
             .lock()
@@ -179,7 +179,7 @@ impl BloomSlot {
     /// is over it, the least-recently-used *other* slots are cleared. The
     /// installing slot is never its own victim — a part being queried right
     /// now is by definition the most recently used.
-    pub(crate) fn install(self: &Arc<Self>, blooms: Arc<DecodedBlooms>, bytes: u64) {
+    pub(crate) fn install(self: &Arc<Self>, blooms: Arc<BloomIndex>, bytes: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let now = bloom_clock_nanos();
         BLOOM_INSTALLS.fetch_add(1, Relaxed);
