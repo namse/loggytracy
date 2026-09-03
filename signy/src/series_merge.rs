@@ -329,14 +329,14 @@ pub async fn compact_loop(
         // Drain the debt this tick found; each pass re-selects, so a burst of
         // small flushes converges instead of compacting once per interval.
         loop {
-            let Some(_background_permit) = config
-                .background_memory_pool
-                .try_reserve(config.merge_max_memory_bytes, config.merge_max_memory_bytes)
+            let Some(_memory_charge) = config
+                .memory_account
+                .try_admit(config.merge_max_memory_bytes)
             else {
-                // Flush owns the shared background budget. Leave the parts in
-                // place and retry the compaction on the next tick rather than
-                // materialising work that cannot be admitted safely.
-                tracing::debug!("metric compaction waiting for background memory");
+                // Queries and flush own the account right now. Leave the parts
+                // in place and retry the compaction on the next tick rather
+                // than materialising work that cannot be admitted safely.
+                tracing::debug!("metric compaction waiting for memory account room");
                 break;
             };
             match compact_once(&registry, &metrics_root, remote_cache.as_deref()).await {

@@ -31,6 +31,11 @@ pub struct LogScanResult {
     pub results: Vec<StreamResult>,
     pub scanned_rows: u64,
     pub scanned_bytes: u64,
+    /// What the pipeline actually materialized, for the caller to reconcile
+    /// against the estimate it was admitted on. Charged for every row that
+    /// survived the pipeline rather than for the rows the sink kept, so it is
+    /// the peak the query passed through and not its result's size.
+    pub materialized_bytes: u64,
 }
 
 /// One log query, with every bound that applies to it.
@@ -50,10 +55,6 @@ pub struct LogScan<'a> {
     scan_budget: Option<usize>,
     max_scan_bytes: Option<u64>,
     max_memory_bytes: Option<u64>,
-    /// This query's slice of the shared pool. The per-query cap above bounds
-    /// one query; the reservation is how all of them together stay inside
-    /// `query_memory_budget_bytes`.
-    memory_reservation: Option<&'a crate::query_memory::QueryMemoryReservation>,
     cancellation: Option<&'a AtomicBool>,
     hidden: Option<HiddenRow<'a>>,
     columns: crate::part::ColumnSet,
@@ -76,7 +77,6 @@ impl<'a> LogScan<'a> {
             scan_budget: None,
             max_scan_bytes: None,
             max_memory_bytes: None,
-            memory_reservation: None,
             cancellation: None,
             hidden: None,
             columns: crate::part::ColumnSet::all(),
@@ -100,14 +100,6 @@ impl<'a> LogScan<'a> {
 
     pub fn max_memory_bytes(mut self, bytes: Option<u64>) -> Self {
         self.max_memory_bytes = bytes;
-        self
-    }
-
-    pub fn memory_reservation(
-        mut self,
-        reservation: Option<&'a crate::query_memory::QueryMemoryReservation>,
-    ) -> Self {
-        self.memory_reservation = reservation;
         self
     }
 
@@ -145,15 +137,16 @@ impl<'a> LogScan<'a> {
             hidden: self.hidden,
             cancellation: self.cancellation,
             max_memory_bytes: self.max_memory_bytes,
-            memory_reservation: self.memory_reservation,
             materialized_memory_bytes: 0,
             rows: TopKRows::new(self.limit, self.forward),
         };
         let (scanned_rows, scanned_bytes) = self.run_into(memtable, parts, &mut sink)?;
+        let materialized_bytes = sink.materialized_memory_bytes;
         Ok(LogScanResult {
             results: sink.rows.into_stream_results(),
             scanned_rows,
             scanned_bytes,
+            materialized_bytes,
         })
     }
 
@@ -241,7 +234,6 @@ struct PipelineSink<'a> {
     hidden: Option<HiddenRow<'a>>,
     cancellation: Option<&'a AtomicBool>,
     max_memory_bytes: Option<u64>,
-    memory_reservation: Option<&'a crate::query_memory::QueryMemoryReservation>,
     /// Charged for every row that survives the pipeline, not for the rows the
     /// sink kept. The bound is on what the query materialized on its way to an
     /// answer, and lowering it to what it *held* would loosen a limit — which is
@@ -319,11 +311,6 @@ impl PipelineSink<'_> {
             return Err(format!(
                 "query exceeds the maximum of {max} materialized bytes"
             ));
-        }
-        // After the per-query cap: a query inside its own cap can still be
-        // refused here when the *shared* pool is spoken for by its peers.
-        if let Some(reservation) = self.memory_reservation {
-            reservation.ensure(self.materialized_memory_bytes)?;
         }
         self.rows.offer(labels, entry);
         Ok(())

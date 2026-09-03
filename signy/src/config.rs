@@ -190,12 +190,6 @@ pub struct Config {
     pub max_query_scan_rows: usize,
     pub max_query_scan_bytes: u64,
     pub max_query_memory_bytes: u64,
-    /// The shared byte budget every query materialization draws from,
-    /// replacing the unenforced `max_concurrent_query_scans ×
-    /// max_query_memory_bytes` product as the aggregate bound. A query still
-    /// carries its own `max_query_memory_bytes` cap; this is what all of them
-    /// together may hold.
-    pub query_memory_budget_bytes: u64,
     /// Byte budget for decoded row groups kept in memory across scans
     /// (`off` disables). A part is immutable, so a group decoded once can
     /// serve every later scan without paying the reader build again; this is
@@ -273,10 +267,22 @@ pub struct Config {
     /// tenant, storage and cgroup limits still apply. This must never be
     /// enabled in a production deployment.
     pub capacity_probe: bool,
-    /// Shared reservation pool for metric flush and metric compaction. The
-    /// operation-specific ceilings still come from `flush_chunk_bytes` and
-    /// `merge_max_memory_bytes`; this handle only coordinates their overlap.
-    pub background_memory_pool: Arc<crate::query_memory::BackgroundMemoryPool>,
+    /// The one account every query, flush and compaction charges what it is
+    /// about to hold, and the budget it is charged against.
+    ///
+    /// It replaced two ceilings that never met: a query pool and a background
+    /// pool, so the process had two limits, no total, and no answer to "how
+    /// much is in use". The operation-specific caps still come from
+    /// `max_query_memory_bytes`, `flush_chunk_bytes` and
+    /// `merge_max_memory_bytes` — each bounds *one* operation; this bounds all
+    /// of them at once, and is what a refusal is decided on.
+    ///
+    /// The budget lives inside the handle rather than beside it as a `u64`,
+    /// because two copies of one number are two copies that can disagree: a
+    /// fixture that set the field and left the handle alone would configure a
+    /// limit the running engine does not use. Read it with
+    /// [`Config::memory_account_budget_bytes`].
+    pub memory_account: Arc<crate::memory_budget::MemoryAccount>,
 }
 
 impl Default for Config {
@@ -330,7 +336,6 @@ impl Default for Config {
             max_query_scan_rows: 5_000_000,
             max_query_scan_bytes: 2 * 1024 * 1024 * 1024,
             max_query_memory_bytes: 512 * 1024 * 1024,
-            query_memory_budget_bytes: 512 * 1024 * 1024,
             row_group_cache_max_bytes: Some(256 * 1024 * 1024),
             sidecar_cache_max_bytes: None,
             max_log_limit: 100_000,
@@ -358,9 +363,9 @@ impl Default for Config {
             memory_budget_bytes: None,
             memory_budget_source: "off (Config::default)".to_string(),
             capacity_probe: false,
-            background_memory_pool: Arc::new(crate::query_memory::BackgroundMemoryPool::new(
-                1024 * 1024 * 1024,
-            )),
+            // The two ceilings this replaced, added: 512 MiB of query pool
+            // plus a gigabyte of background pool were already live at once.
+            memory_account: Arc::new(crate::memory_budget::MemoryAccount::new(1536 * 1024 * 1024)),
         }
     }
 }
@@ -501,9 +506,17 @@ fn derive_defaults_from_budget(defaults: &mut Config, budget_bytes: u64) {
     let merge = (budget_bytes / 4).max(64 * MIB);
     defaults.merge_max_memory_bytes = merge;
     defaults.merge_max_input_bytes = (merge / 2).max(32 * MIB);
-    let query_pool = (budget_bytes / 4).max(crate::query_memory::RESERVATION_CHUNK_BYTES);
-    defaults.query_memory_budget_bytes = query_pool;
-    defaults.max_query_memory_bytes = query_pool;
+    // Half the declared budget is what work in flight may hold at once — the
+    // old query quarter and merge quarter, which were live simultaneously,
+    // now named once. One query may hold half of that, so two full-sized
+    // queries fit beside nothing else and the ordinary mix fits many more.
+    // The floor has to hold the floors below it: merge derives 64 MiB at its
+    // own minimum and flush charges twice a 32 MiB chunk, so an account under
+    // 128 MiB would be a configuration that validates its parts and refuses
+    // their sum. Every derived ceiling is bounded by this one for that reason.
+    let account = (budget_bytes / 2).max(128 * MIB);
+    defaults.memory_account = Arc::new(crate::memory_budget::MemoryAccount::new(account));
+    defaults.max_query_memory_bytes = account / 2;
     defaults.row_group_cache_max_bytes = Some((budget_bytes / 8).max(16 * MIB));
     defaults.sidecar_cache_max_bytes = Some((budget_bytes / 10).max(32 * MIB));
     // A quarter of the declared budget is the shared log/trace/metric
@@ -539,6 +552,13 @@ impl Config {
         let merge_max_memory_bytes = env_positive_u64(
             "SIGNY_MERGE_MAX_MEMORY_BYTES",
             defaults.merge_max_memory_bytes,
+        )?;
+        // Hoisted for the same reason `merge_max_memory_bytes` is: the account
+        // handle below is built from the number, so the number has to exist
+        // before the struct literal that also stores it.
+        let memory_account_budget_bytes = env_positive_u64(
+            "SIGNY_MEMORY_ACCOUNT_BYTES",
+            defaults.memory_account_budget_bytes(),
         )?;
         let config = Self {
             malloc_trim_interval: env_duration(
@@ -685,10 +705,6 @@ impl Config {
                 "SIGNY_MAX_QUERY_SCAN_BYTES",
                 defaults.max_query_scan_bytes,
             )?,
-            query_memory_budget_bytes: env_positive_u64(
-                "SIGNY_QUERY_MEMORY_BUDGET_BYTES",
-                defaults.query_memory_budget_bytes,
-            )?,
             row_group_cache_max_bytes: env_optional_u64(
                 "SIGNY_ROW_GROUP_CACHE_MAX_BYTES",
                 defaults.row_group_cache_max_bytes,
@@ -771,8 +787,8 @@ impl Config {
                 "SIGNY_SHUTDOWN_FLUSH_WARN_AFTER",
                 defaults.shutdown_flush_warn_after,
             )?,
-            background_memory_pool: Arc::new(crate::query_memory::BackgroundMemoryPool::new(
-                merge_max_memory_bytes,
+            memory_account: Arc::new(crate::memory_budget::MemoryAccount::new(
+                memory_account_budget_bytes,
             )),
         };
         config.validate()?;
@@ -781,20 +797,24 @@ impl Config {
 
     /// The most this configuration can have materialized at once, in bytes.
     ///
-    /// The query term used to be `max_concurrent_query_scans ×
-    /// max_query_memory_bytes` — 8 × 512 MiB, four gigabytes no single knob
-    /// mentioned and nothing enforced. It is now the shared pool every scan
-    /// and metric evaluation reserves from, so the term is a budget the
-    /// process actually holds itself to rather than a product it hopes never
-    /// multiplies out.
+    /// One number now, because there is one account. It used to add the query
+    /// pool to `merge_max_memory_bytes` — two ceilings that could both be full
+    /// at once, so the sum was the honest bound while they were separate, and
+    /// an overstatement once merge stopped materialising a whole group
+    /// (todo.md). Sharing one account closes that gap by construction: nothing
+    /// can be held that was not charged here.
     ///
     /// This deliberately excludes resident memtables and caches, which have
     /// their own byte ceilings and are logged beside this value. It is an
-    /// upper bound for simultaneously materialized query/merge work, not a
-    /// complete RSS prediction.
+    /// upper bound for simultaneously materialized query and background work,
+    /// not a complete RSS prediction.
     pub fn peak_materialized_bytes(&self) -> u64 {
-        self.query_memory_budget_bytes
-            .saturating_add(self.merge_max_memory_bytes)
+        self.memory_account_budget_bytes()
+    }
+
+    /// What work in flight may hold at once (`SIGNY_MEMORY_ACCOUNT_BYTES`).
+    pub fn memory_account_budget_bytes(&self) -> u64 {
+        self.memory_account.budget_bytes()
     }
 
     /// Logged once at startup. There is nowhere else an operator learns this.
@@ -804,7 +824,7 @@ impl Config {
             memory_budget_bytes = self.memory_budget_bytes,
             memory_budget_source = %self.memory_budget_source,
             peak_materialized_bytes = self.peak_materialized_bytes(),
-            query_memory_budget_bytes = self.query_memory_budget_bytes,
+            memory_account_budget_bytes = self.memory_account_budget_bytes(),
             row_group_cache_max_bytes = self.row_group_cache_max_bytes,
             sidecar_cache_max_bytes = self.sidecar_cache_max_bytes,
             max_memtable_bytes = self.max_memtable_bytes,
@@ -916,21 +936,39 @@ selected above the read budget can never be merged",
         positive_usize("max_query_scan_rows", self.max_query_scan_rows)?;
         positive_u64("max_query_scan_bytes", self.max_query_scan_bytes)?;
         positive_u64("max_query_memory_bytes", self.max_query_memory_bytes)?;
-        positive_u64("query_memory_budget_bytes", self.query_memory_budget_bytes)?;
+        positive_u64(
+            "memory_account_budget_bytes",
+            self.memory_account_budget_bytes(),
+        )?;
         if let Some(bytes) = self.row_group_cache_max_bytes {
             positive_u64("row_group_cache_max_bytes", bytes)?;
         }
         if let Some(bytes) = self.sidecar_cache_max_bytes {
             positive_u64("sidecar_cache_max_bytes", bytes)?;
         }
-        // Smaller than one reservation chunk and the very first admission
-        // fails: the pool would refuse every query at any load.
-        if self.query_memory_budget_bytes < crate::query_memory::RESERVATION_CHUNK_BYTES {
-            return Err(format!(
-                "query_memory_budget_bytes ({}) must be at least one reservation chunk ({})",
-                self.query_memory_budget_bytes,
-                crate::query_memory::RESERVATION_CHUNK_BYTES
-            ));
+        // Every per-operation ceiling has to fit inside the account, and the
+        // reason is different for each caller. A query asking for more than
+        // the account holds is refused as a permanent `400` — correct, but if
+        // its *own* cap allows it, the instance is configured to reject work
+        // it advertises. Flush and compaction have no client to refuse, so
+        // they would simply postpone on every tick, forever, and the symptom
+        // would be compaction debt that never drains rather than an error
+        // anybody sees. Both are startup mistakes, so both are caught here.
+        for (name, bytes) in [
+            ("max_query_memory_bytes", self.max_query_memory_bytes),
+            ("merge_max_memory_bytes", self.merge_max_memory_bytes),
+            (
+                "flush_chunk_bytes × 2",
+                self.flush_chunk_bytes.saturating_mul(2),
+            ),
+        ] {
+            if bytes > self.memory_account_budget_bytes() {
+                return Err(format!(
+                    "{name} ({bytes}) must not exceed memory_account_budget_bytes ({}): an \
+operation that cannot fit the shared account is refused or postponed on every attempt",
+                    self.memory_account_budget_bytes()
+                ));
+            }
         }
         positive_usize("max_log_limit", self.max_log_limit)?;
         positive_usize("max_histogram_buckets", self.max_histogram_buckets)?;
@@ -1230,7 +1268,7 @@ mod tests {
         derive_defaults_from_budget(&mut config, budget);
         assert_eq!(config.merge_max_memory_bytes, budget / 4);
         assert_eq!(config.merge_max_input_bytes, budget / 8);
-        assert_eq!(config.query_memory_budget_bytes, budget / 4);
+        assert_eq!(config.memory_account_budget_bytes(), budget / 2);
         assert_eq!(config.max_query_memory_bytes, budget / 4);
         assert_eq!(config.row_group_cache_max_bytes, Some(budget / 8));
         assert_eq!(config.sidecar_cache_max_bytes, Some(budget / 10));
@@ -1245,10 +1283,8 @@ mod tests {
         derive_defaults_from_budget(&mut config, 1);
         assert_eq!(config.merge_max_memory_bytes, 64 * 1024 * 1024);
         assert_eq!(config.merge_max_input_bytes, 32 * 1024 * 1024);
-        assert_eq!(
-            config.query_memory_budget_bytes,
-            crate::query_memory::RESERVATION_CHUNK_BYTES
-        );
+        assert_eq!(config.memory_account_budget_bytes(), 128 * 1024 * 1024);
+        assert_eq!(config.max_query_memory_bytes, 64 * 1024 * 1024);
         assert_eq!(config.row_group_cache_max_bytes, Some(16 * 1024 * 1024));
         assert_eq!(config.sidecar_cache_max_bytes, Some(32 * 1024 * 1024));
         assert_eq!(config.max_memtable_bytes, Some(32 * 1024 * 1024));
@@ -1343,32 +1379,70 @@ mod tests {
 
     /// The query term used to be `max_concurrent_query_scans ×
     /// max_query_memory_bytes` — a product no knob mentioned and nothing
-    /// enforced. It is the shared pool now, so the reported peak is a budget
-    /// the process holds itself to, and the scan concurrency no longer
-    /// multiplies into it.
+    /// enforced. Then it was a query pool plus a merge ceiling, two numbers
+    /// added because both could be full at once. It is one account now, so the
+    /// reported peak is the knob itself: nothing can be held that was not
+    /// charged to it, and neither the scan concurrency nor the per-operation
+    /// caps multiply into it.
     #[test]
-    fn the_peak_memory_budget_is_the_pool_plus_the_merge() {
+    fn the_peak_memory_budget_is_the_account_itself() {
         let config = Config {
-            query_memory_budget_bytes: 512 * 1024 * 1024,
             row_group_cache_max_bytes: Some(256 * 1024 * 1024),
             merge_max_memory_bytes: 1024 * 1024 * 1024,
             ..Config::default()
         };
-        assert_eq!(
-            config.peak_materialized_bytes(),
-            1536 * 1024 * 1024,
-            "the shared query pool plus one merge"
-        );
+        assert_eq!(config.peak_materialized_bytes(), 1536 * 1024 * 1024);
 
-        // Concurrency does not move the number any more — that was the hole.
+        // Neither of these moves the number any more — that was the hole.
         let more_concurrent = Config {
             max_concurrent_query_scans: 16,
+            merge_max_memory_bytes: 512 * 1024 * 1024,
             ..config
         };
         assert_eq!(
             more_concurrent.peak_materialized_bytes(),
             1536 * 1024 * 1024
         );
+    }
+
+    /// A per-operation ceiling above the shared account is a startup mistake
+    /// with two different symptoms — a query refused as permanently too large,
+    /// a compaction that postpones on every tick and never drains — so it is
+    /// caught before either can happen.
+    #[test]
+    fn an_operation_ceiling_above_the_account_is_a_config_error() {
+        let base = Config {
+            memory_account: Arc::new(crate::memory_budget::MemoryAccount::new(64 * 1024 * 1024)),
+            max_query_memory_bytes: 32 * 1024 * 1024,
+            merge_max_memory_bytes: 32 * 1024 * 1024,
+            merge_max_input_bytes: 16 * 1024 * 1024,
+            flush_chunk_bytes: 8 * 1024 * 1024,
+            ..Config::default()
+        };
+        base.validate().expect("every ceiling fits the account");
+
+        let too_greedy_query = Config {
+            max_query_memory_bytes: 128 * 1024 * 1024,
+            ..base.clone()
+        };
+        let error = too_greedy_query.validate().expect_err("refused at startup");
+        assert!(error.contains("max_query_memory_bytes"), "{error}");
+
+        let too_greedy_merge = Config {
+            merge_max_memory_bytes: 128 * 1024 * 1024,
+            ..base.clone()
+        };
+        let error = too_greedy_merge.validate().expect_err("refused at startup");
+        assert!(error.contains("merge_max_memory_bytes"), "{error}");
+
+        // Flush charges twice its chunk, so the chunk that breaks the account
+        // is half of it and not all of it.
+        let too_greedy_flush = Config {
+            flush_chunk_bytes: 48 * 1024 * 1024,
+            ..base
+        };
+        let error = too_greedy_flush.validate().expect_err("refused at startup");
+        assert!(error.contains("flush_chunk_bytes"), "{error}");
     }
 
     #[test]

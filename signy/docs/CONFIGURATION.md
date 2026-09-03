@@ -123,7 +123,8 @@ value beside the budget and its source.
 |---|---|---|
 | `MERGE_MAX_MEMORY_BYTES` | 25% | 64 MiB |
 | `MERGE_MAX_INPUT_BYTES` | half the merge budget | 32 MiB |
-| `QUERY_MEMORY_BUDGET_BYTES` and `MAX_QUERY_MEMORY_BYTES` | 25% | 8 MiB |
+| `MEMORY_ACCOUNT_BYTES` | 50% | 128 MiB |
+| `MAX_QUERY_MEMORY_BYTES` | half the account, so 25% | 64 MiB |
 | `ROW_GROUP_CACHE_MAX_BYTES` | 12.5% | 16 MiB |
 | `MAX_MEMTABLE_BYTES` | 25% of the declared budget (256 MiB when the budget is off) | 32 MiB |
 | `SIDECAR_CACHE_MAX_BYTES` | 10% | 32 MiB |
@@ -267,8 +268,8 @@ Small catalog files such as `meta.json` are not evicted; the data body and the b
 | `SIGNY_MAX_QUERY_RANGE` | unset | Maximum requested time range |
 | `SIGNY_MAX_QUERY_SCAN_ROWS` | 5,000,000 | |
 | `SIGNY_MAX_QUERY_SCAN_BYTES` | 2 GiB | |
-| `SIGNY_MAX_QUERY_MEMORY_BYTES` | 512 MiB (budget-derived) | One query's own materialization cap |
-| `SIGNY_QUERY_MEMORY_BUDGET_BYTES` | 512 MiB (minimum 8 MiB; budget-derived) | The shared pool **all** queries together materialize from, reserved incrementally as rows survive the pipeline. A query refused here gets an error naming the pool; before this the aggregate was `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES` and nothing enforced it |
+| `SIGNY_MAX_QUERY_MEMORY_BYTES` | 512 MiB (budget-derived) | One query's own materialization cap, enforced inside the scan. It is the backstop under the estimate below, not the admission decision |
+| `SIGNY_MEMORY_ACCOUNT_BYTES` | 1.5 GiB (budget-derived) | What every query, metric flush and metric compaction may hold **at once**. A request prices what it will materialize before it scans anything — a log query from `limit × the average row its parts recorded`, a metric query from `series × steps` after selection, a trace query from its span ceiling — and is admitted or refused on arrival. Two refusals: it does not fit *right now* is a `429` naming the account and counted in `signy_query_memory_exhausted_total`; it does not fit *at all* is a `400` telling the client to narrow, because a retry can never help. Flush and compaction charge the same account and, having no client to refuse, postpone to the next tick (`signy_memory_account_deferred_total`). `signy_memory_account_in_use_bytes` is the live figure. This replaced two ceilings that never met — a query pool and a background pool — so the process had two limits and no total |
 | `SIGNY_ROW_GROUP_CACHE_MAX_BYTES` | 256 MiB, `off` disables (budget-derived) | Decoded row groups kept across scans. A part is immutable, so a group decoded whole by one scan serves every later scan without paying the reader build again; the budget bounds what stays resident (`signy_row_group_cache_bytes` reports it). Entries die with their part on merge or retirement |
 | `SIGNY_SIDECAR_CACHE_MAX_BYTES` | unbounded (`off`; budget-derived) | Byte cap on the resident blooms of part sidecars, evicted LRU across parts. The blooms are durable in `index.bin`, so an evicted part's next pruning query pays one re-read. Unbounded, residency is ~2 MiB per live part and grows with ingest rate × retention window — the term that killed the first 24-hour soak (`todo.md`) |
 | `SIGNY_MAX_LOG_LIMIT` | 100,000 | Maximum `limit` parameter |
@@ -440,14 +441,19 @@ number for a real workload; the rates above will change and the counts will not.
 
 The query term used to be `MAX_CONCURRENT_QUERY_SCANS × MAX_QUERY_MEMORY_BYTES`
 — 8 × 512 MiB, four gigabytes no single knob mentioned and nothing enforced.
-Queries now reserve from one shared pool, so the table is budgets rather than
-products:
+Then it was a query pool plus a merge ceiling: two numbers added together
+because both could be full at once. It is one account now, so the table is one
+row and the peak is the knob:
 
 | term | default |
 |---|---|
-| `QUERY_MEMORY_BUDGET_BYTES` (every query together) | 512 MiB |
-| `MERGE_MAX_MEMORY_BYTES` (one merge at a time) | 1 GiB |
+| `MEMORY_ACCOUNT_BYTES` (every query, flush and compaction together) | 1.5 GiB |
 | **Peak materialized** | **1.5 GiB** |
+
+`MAX_QUERY_MEMORY_BYTES` (512 MiB) and `MERGE_MAX_MEMORY_BYTES` (1 GiB) still
+cap one operation each, and startup refuses a configuration where either — or
+twice `FLUSH_CHUNK_BYTES` — exceeds the account: an operation that cannot fit
+the shared account is refused or postponed on every attempt it ever makes.
 
 The process logs this number once at startup (`peak_materialized_bytes`), because
 there is nowhere else to learn it. The memtable and the flush chunk sit outside
@@ -470,11 +476,15 @@ shape of query, so the bound above stays an upper bound rather than becoming a
 sizing target — 850 MB with merge running is still the larger figure, and the
 read path is not where this engine's memory goes.
 
-Trace reads are **in** the number: a trace scan reserves from
-`SIGNY_QUERY_MEMORY_BUDGET_BYTES` like every other query — charged from a
-per-span byte estimate as parts accumulate — is span-capped by
-`SIGNY_MAX_TRACE_SPANS`, and is per-query byte-capped by
-`SIGNY_MAX_QUERY_MEMORY_BYTES`. The open note that once stood here (trace
+Trace reads are **in** the number: a trace scan charges
+`SIGNY_MEMORY_ACCOUNT_BYTES` like every other query. Its price is the one
+estimate here with an unmeasured term — a trace part records stored bytes per
+tenant but nothing that says what decoding them costs, so the stored average is
+scaled by a fixed expansion factor and the scan is admitted against its full
+`SIGNY_MAX_TRACE_SPANS` ceiling, then settled back to what it actually held the
+moment it returns. It stays per-query byte-capped by
+`SIGNY_MAX_QUERY_MEMORY_BYTES`, which is what catches an expansion factor that
+turns out to be optimistic. The open note that once stood here (trace
 scans carried only a span count and no byte budget) closed with the
 first-party trace API (issue #7).
 

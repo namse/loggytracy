@@ -1991,12 +1991,21 @@
 /// (`429`), and only an unrecognized error is a fault.
 #[test]
 fn a_refusal_is_never_reported_as_a_server_fault() {
-    use crate::query_memory::EXHAUSTED_PREFIX;
+    use crate::memory_budget::{EXHAUSTED_PREFIX, OVER_BUDGET_PREFIX};
 
     assert_eq!(
-        metric_error_status(&format!("{EXHAUSTED_PREFIX} 322122547 bytes is exhausted")),
+        metric_error_status(&format!(
+            "{EXHAUSTED_PREFIX} 322122547 bytes holds 322122547 in use and this request needs 16"
+        )),
         StatusCode::TOO_MANY_REQUESTS,
         "an instance out of query memory is busy, not broken"
+    );
+    assert_eq!(
+        metric_error_status(&format!(
+            "{OVER_BUDGET_PREFIX} 999999999 bytes, more than the whole instance memory account"
+        )),
+        StatusCode::BAD_REQUEST,
+        "a request larger than the whole account can never be served, so a retry is a lie"
     );
     assert_eq!(
         metric_error_status(&format!("{TENANT_QUOTA_PREFIX}scan rate exceeded")),
@@ -2319,6 +2328,141 @@ async fn first_party_logs_answers_ndjson_with_string_timestamps() {
     assert_eq!(rows[0]["timestamp"], "5000000000");
     assert!(rows[0]["timestamp"].is_string());
     assert_eq!(rows[0]["attributes"]["app"], "api");
+}
+
+/// The log path prices a request from its own shape, not from a fixed cap.
+///
+/// This is what "요청당 필요 메모리 용량" buys over charging every query the
+/// per-query ceiling: two requests differing only in `limit` are two different
+/// prices, so a small query is not made to wait behind the worst case a large
+/// one might reach. The parts here record what their rows materialize into, so
+/// the per-row half of the multiplication is measured rather than assumed.
+#[tokio::test]
+async fn a_log_query_is_priced_from_its_own_limit_and_the_rows_its_parts_recorded() {
+    let data_dir = temp_dir();
+    let parts = Arc::new(PartRegistry::new());
+    parts
+        .register(
+            part::flush_rows(
+                (0..2_000)
+                    .map(|at| Row {
+                        tenant: test_tenant(),
+                        timestamp_ns: 1_000_000 + at,
+                        line: "x".repeat(256),
+                        structured_metadata: vec![("app".to_string(), "api".to_string())],
+                    })
+                    .collect(),
+                &data_dir.join("parts"),
+                256,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let (rows, bytes_per_row) = parts
+        .materialization_estimate(&test_tenant(), &[], &[], part::QueryTimeRange::half_open(0, i64::MAX))
+        .expect("the part records what its rows materialize into");
+    assert_eq!(rows, 2_000);
+    assert!(
+        bytes_per_row >= 256,
+        "a 256-byte line cannot materialize into less than itself: {bytes_per_row}"
+    );
+
+    // Sized in rows of this very data, and above the floors a real
+    // configuration has to clear (`flush_chunk_bytes` alone is 1 MiB).
+    let account_bytes = bytes_per_row * 8_000;
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        memory_account: Arc::new(crate::memory_budget::MemoryAccount::new(account_bytes)),
+        max_query_memory_bytes: account_bytes,
+        merge_max_memory_bytes: account_bytes,
+        merge_max_input_bytes: account_bytes / 2,
+        flush_chunk_bytes: 1024 * 1024,
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("the shape under test is one an operator could actually configure");
+    let state = state_with_config(config, Arc::new(MemTable::new()), parts);
+
+    // Both limits fit an empty account. Leave room for a hundred rows and not
+    // a thousand, and the two requests part company on their own arithmetic:
+    // `limit × bytes_per_row`, nothing else about them differs.
+    let peer = state
+        .memory_account
+        .admit(account_bytes - bytes_per_row * 200)
+        .expect("a peer leaves room for two hundred rows");
+
+    let (status, _, body) = first_party_logs(state.clone(), "start=0&end=9999999&limit=100").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ndjson_rows(&body).len(), 100);
+
+    let (status, _, body) = first_party_logs(state.clone(), "start=0&end=9999999&limit=1000").await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "ten times the rows is ten times the price, against the same free space: {body}"
+    );
+    assert!(body.contains(crate::memory_budget::EXHAUSTED_PREFIX), "{body}");
+
+    drop(peer);
+    let (status, _, body) = first_party_logs(state.clone(), "start=0&end=9999999&limit=1000").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ndjson_rows(&body).len(), 1_000);
+    assert_eq!(
+        state.memory_account.in_use_bytes(),
+        0,
+        "every charge left with its response"
+    );
+}
+
+/// The same query, refused and then served, with only a peer's charge between
+/// the two — which is the whole claim a `429` makes to a client.
+#[tokio::test]
+async fn a_log_query_with_no_room_beside_a_peer_is_a_429_and_recovers() {
+    let data_dir = temp_dir();
+    let labels: Labels = [("app".to_string(), "api".to_string())]
+        .into_iter()
+        .collect();
+    let memtable = Arc::new(MemTable::new());
+    memtable.insert(
+        test_tenant(),
+        with_attributes(
+            labels,
+            vec![LogEntry {
+                timestamp_ns: 5_000_000_000,
+                line: "hello".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        ),
+    );
+    let account_bytes = 4 * 1024 * 1024;
+    let state = state_with_config(
+        Config {
+            data_dir: data_dir.to_path_buf(),
+            memory_account: Arc::new(crate::memory_budget::MemoryAccount::new(account_bytes)),
+            max_query_memory_bytes: account_bytes,
+            merge_max_memory_bytes: account_bytes,
+            flush_chunk_bytes: account_bytes / 2,
+            ..Config::default()
+        },
+        memtable,
+        Arc::new(PartRegistry::new()),
+    );
+
+    let peer = state
+        .memory_account
+        .admit(account_bytes)
+        .expect("a peer takes the whole account");
+    let (status, _, body) = first_party_logs(state.clone(), "start=4&end=7&limit=10").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(body.contains(crate::memory_budget::EXHAUSTED_PREFIX), "{body}");
+    assert_eq!(state.memory_account.exhausted(), 1);
+
+    drop(peer);
+    let (status, _, body) = first_party_logs(state.clone(), "start=4&end=7&limit=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ndjson_rows(&body).len(), 1);
+    assert_eq!(state.memory_account.in_use_bytes(), 0);
 }
 
 #[tokio::test]
@@ -3514,32 +3658,48 @@ async fn trace_attribute_values_respect_the_window_and_are_narrowed_by_filters()
 
 // --- Trace budgets and refusals, end to end ---
 
+/// A busy instance refuses on arrival, and the refusal lifts when the memory
+/// comes back.
+///
+/// The `429` used to be reachable only from inside a scan — a query that had
+/// already read for seconds died partway through — so the test that stood here
+/// filled the pool with the query's own rows. Admission is priced up front
+/// now, which means a single request against an idle instance can never be
+/// throttled: it either fits the whole account or is permanently too large.
+/// So what makes this a `429` is a *peer* holding the account, which is the
+/// only thing that ever really justified telling a client to retry.
 #[tokio::test]
-async fn a_trace_scan_that_finds_no_pool_memory_is_a_429_and_counts_exhaustion() {
+async fn a_trace_scan_that_finds_no_room_in_the_account_is_a_429_and_counts_exhaustion() {
     let data_dir = temp_dir();
-    // One reservation chunk of shared budget; the spans below estimate past it.
-    let state = trace_state(&data_dir, |config| {
-        config.query_memory_budget_bytes = crate::query_memory::RESERVATION_CHUNK_BYTES;
-    });
+    let state = trace_state(&data_dir, |_| {});
     let trace_id = "ab".repeat(16);
-    let spans: Vec<_> = (0..12)
-        .map(|at| {
-            let mut span = trace_span_at(&trace_id, &format!("s{at:02}"), 1_000 + at, ("k", "v"));
-            span.span.name = "n".repeat(1024 * 1024);
-            span
-        })
-        .collect();
-    state.journal.trace_memtable().insert(spans);
+    state
+        .journal
+        .trace_memtable()
+        .insert(vec![trace_span_at(&trace_id, "s0", 1_000, ("k", "v"))]);
+
+    let peer = state
+        .memory_account
+        .admit(state.memory_account.budget_bytes())
+        .expect("a peer takes the whole account");
 
     let (status, body) =
         first_party_get(state.clone(), "/signy/api/v1/traces?start=0&end=10").await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
-    assert!(body.contains(crate::query_memory::EXHAUSTED_PREFIX), "{body}");
+    assert!(body.contains(crate::memory_budget::EXHAUSTED_PREFIX), "{body}");
     assert_eq!(
-        state.query_memory_pool.exhausted(),
+        state.memory_account.exhausted(),
         1,
         "the refusal stays visible after the client was told the right thing"
     );
+
+    // The peer finishes. The identical request now succeeds, which is what
+    // makes `429` — rather than `400` — the honest answer above.
+    drop(peer);
+    let (status, body) =
+        first_party_get(state.clone(), "/signy/api/v1/traces?start=0&end=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(state.memory_account.exhausted(), 1);
 }
 
 #[tokio::test]
@@ -4196,21 +4356,87 @@ async fn a_selection_past_the_point_cap_names_the_steps_that_made_it() {
     assert!(body.contains("coarsen step"), "{body}");
 }
 
+/// The metric surface prices itself after selection rather than before the
+/// scan permit, because its cost is a function of what the selector matched.
+/// The refusal is the same one, from the same account, and it still reaches
+/// the client before a single chunk is decoded.
 #[tokio::test]
-async fn a_metric_scan_that_finds_no_pool_memory_is_a_429_and_counts_exhaustion() {
+async fn a_metric_scan_that_finds_no_room_in_the_account_is_a_429_and_counts_exhaustion() {
     let data_dir = temp_dir();
-    // One reservation chunk of shared budget; the grid below is bounded past
-    // it before a single chunk is decoded.
     let state = metric_state(&data_dir, |config| {
-        config.query_memory_budget_bytes = crate::query_memory::RESERVATION_CHUNK_BYTES;
+        config.memory_account =
+            Arc::new(crate::memory_budget::MemoryAccount::new(32 * 1024 * 1024));
     });
     insert_metric_samples(
         &state,
         &metric_labels("queue_depth", &[("instance", "a")]),
         &[(METRIC_ANCHOR_NS, 1.0)],
     );
-    // 1 000 001 steps at 16 estimated bytes each is 16 MB against an 8 MiB
-    // pool, and stays under the point cap so the refusal is the pool's.
+    // 1 000 001 steps at 16 estimated bytes each is 16 MB, which fits a 32 MiB
+    // account alone and does not fit beside a peer holding 24 MiB of it.
+    let peer = state
+        .memory_account
+        .admit(24 * 1024 * 1024)
+        .expect("a peer takes most of the account");
+
+    let url = format!(
+        "/signy/api/v1/metrics/query?metric=queue_depth&start={METRIC_ANCHOR_NS}\
+&end={}&step=1s",
+        METRIC_ANCHOR_NS + 1_000_000 * METRIC_SECOND_NS
+    );
+    let (status, body) = first_party_get(state.clone(), &url).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(body.contains(crate::memory_budget::EXHAUSTED_PREFIX), "{body}");
+    assert_eq!(
+        state.memory_account.exhausted(),
+        1,
+        "the refusal stays visible after the client was told the right thing"
+    );
+
+    drop(peer);
+    let (status, body) = first_party_get(state.clone(), &url).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        state.memory_account.in_use_bytes(),
+        0,
+        "the charge left with the response"
+    );
+}
+
+/// The other half of the refusal, and the opposite instruction to the client.
+///
+/// A request larger than the whole account is not a busy instance — nothing is
+/// holding anything, and waiting changes nothing — so a `429` would loop a
+/// well-behaved client forever on something that can never succeed. It is a
+/// `400` naming the budget, and it does not move the exhaustion counter, which
+/// exists to say the instance ran out of room for work it was *willing* to do.
+///
+/// The metric surface is where this is reachable. A log or trace query is
+/// priced no higher than `max_query_memory_bytes`, which startup keeps at or
+/// under the account, so one of those always fits an idle instance. A metric
+/// query is priced from `series × steps`, which no per-query byte cap bounds —
+/// only the point cap, which is deliberately far larger.
+#[tokio::test]
+async fn a_metric_query_larger_than_the_whole_account_is_a_400_and_counts_nothing() {
+    let data_dir = temp_dir();
+    let state = metric_state(&data_dir, |config| {
+        config.memory_account = Arc::new(crate::memory_budget::MemoryAccount::new(4 * 1024 * 1024));
+        config.max_query_memory_bytes = 2 * 1024 * 1024;
+        config.merge_max_memory_bytes = 2 * 1024 * 1024;
+        config.merge_max_input_bytes = 1024 * 1024;
+        config.flush_chunk_bytes = 1024 * 1024;
+        config
+            .validate()
+            .expect("the shape under test is one an operator could actually configure");
+    });
+    insert_metric_samples(
+        &state,
+        &metric_labels("queue_depth", &[("instance", "a")]),
+        &[(METRIC_ANCHOR_NS, 1.0)],
+    );
+
+    // 1 000 001 steps at 16 bytes each is 16 MB against a 4 MiB account, and
+    // stays under the point cap so the refusal is the account's.
     let (status, body) = first_party_get(
         state.clone(),
         &format!(
@@ -4220,12 +4446,20 @@ async fn a_metric_scan_that_finds_no_pool_memory_is_a_429_and_counts_exhaustion(
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
-    assert!(body.contains(crate::query_memory::EXHAUSTED_PREFIX), "{body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains(crate::memory_budget::OVER_BUDGET_PREFIX),
+        "{body}"
+    );
     assert_eq!(
-        state.query_memory_pool.exhausted(),
-        1,
-        "the refusal stays visible after the client was told the right thing"
+        state.memory_account.exhausted(),
+        0,
+        "a request too large for any instance is not evidence this one is full"
+    );
+    assert_eq!(
+        state.memory_account.in_use_bytes(),
+        0,
+        "a refusal charges nothing"
     );
 }
 

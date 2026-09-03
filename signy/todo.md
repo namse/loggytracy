@@ -565,8 +565,59 @@ against the batch one), and `3ca3bb8` (the switchover, retiring the split fallba
       on ingest alone before, is green at 95 %; 1536 MiB is still red.** The ingest and settle phase peaks are
       now equal in every passing run — the settle stopped adding anything. Delivered load unchanged at
       19.9 k eps. Numbers and caveats in [`docs/MEMORY_BUDGET_GATE.md`](docs/MEMORY_BUDGET_GATE.md)
-- [ ] **`peak_materialized_bytes` now overstates.** It still adds `merge_max_memory_bytes`, which no longer
+- [x] **`peak_materialized_bytes` now overstates.** It still adds `merge_max_memory_bytes`, which no longer
       bounds a rewrite. Correcting it is a claim about memory and wants its own measurement rather than an edit
+      *Closed structurally rather than by re-measuring, which is why it needed no measurement in the end:* the
+      two terms it added were two pools that could both be full at once, and there is one account now. The
+      number is `SIGNY_MEMORY_ACCOUNT_BYTES` itself — nothing can be held that was not charged to it — so the
+      sum has no second term to overstate. See the pool removal below
+
+## The pools are gone; a request is priced before it runs
+
+Two byte pools stood between work and memory, and neither could answer *how much is in use*. The query pool
+was a semaphore handed out 8 MiB at a time **during** a scan, so a query that had already read for seconds
+could die halfway through; the background pool was a separate counter that flush and metric compaction shared
+with nobody. Two ceilings, no total, and a refusal that arrived after the work rather than before it.
+
+The write path already had the right shape. `IngestGate::admit_body` counted request bodies at admission,
+refused with `429` when the sum would pass a ceiling, and released on `Drop`. The read path is that now:
+
+* **One account** (`memory_budget.rs`). `in_use_bytes` is what admitted work declared and has not released;
+  `admit` is one `fetch_update`. Queries, metric flush and metric compaction all charge it, so the process
+  has a single number instead of two, published as `signy_memory_account_in_use_bytes` against
+  `signy_memory_account_budget_bytes`.
+* **A price per request, computed before the scan.** Logs multiply `limit` by the average row their own parts
+  recorded (`PartMeta::materialized_bytes ÷ row_count`, written at flush time — measured, not assumed), and
+  read it off the catalogs of exactly the parts the pin just fixed. Metrics use `series × steps × 16 + label
+  bytes`, exact and available the moment index-only selection ends. Traces are the one estimate with an
+  unmeasured term: a trace part records stored bytes per tenant and nothing about decode cost, so the stored
+  average is scaled by a fixed expansion factor, the scan is admitted against its full `max_trace_spans`
+  ceiling, and `reconcile` settles it back to the truth when it returns.
+* **Two refusals with opposite instructions.** No room *right now* is `429` (`EXHAUSTED_PREFIX`), counted in
+  `signy_query_memory_exhausted_total`, and it lifts when a peer finishes — a test asserts exactly that
+  sequence, since it is the whole claim the status code makes. No room *at all* is `400`
+  (`OVER_BUDGET_PREFIX`), because telling a client to retry something that can never succeed turns one bad
+  query into an infinite loop of them. Reachable only on the metric surface in a valid configuration: log and
+  trace prices are clamped to `max_query_memory_bytes`, which startup now refuses to let exceed the account.
+* **Admission moved in front of the scan permit** on the log and trace paths. A request that cannot be served
+  no longer queues behind requests that can. Metrics keep the permit first because their price is a function
+  of what the selector matched, and selection is the cheap part.
+* **Nothing asks the account twice.** Every incremental `ensure` call is gone — the sink's, the trace
+  registry's `ByteCharge`, the metric scan's three. `max_query_memory_bytes` stays as the per-query backstop
+  under an estimate that undershoots, and `MemoryCharge::reconcile` corrects the account to what the work
+  really held: upward so an overrun stops hiding from peers, downward so a pessimistic trace admission is not
+  kept from them.
+
+Startup now refuses a configuration whose per-operation ceilings do not fit the account, because the two
+symptoms are silent in different ways — a query permanently `400`s while flush and compaction, having no
+client to refuse, simply postpone on every tick and show up as disk growth an hour later
+(`signy_memory_account_deferred_total`, alerted).
+
+- [ ] **The trace expansion factor is a guess, and the only one left.** Logs and metrics price themselves from
+      recorded numbers; traces scale stored bytes by a constant because `TracePartMeta` has no materialized
+      figure. Measuring it means either recording one at write time — a format change — or sampling decoded
+      spans against their stored extent under load. Until then `max_query_memory_bytes` is what catches an
+      optimistic factor, and `reconcile` keeps the account honest after the fact
 
 ## The languages can ask the same question; two translations were wrong
 

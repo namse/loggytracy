@@ -26,9 +26,11 @@ pub struct AppState {
     /// folds, and sharing slots with either other surface would let one cost
     /// profile starve the others.
     pub metric_scan_semaphore: Arc<tokio::sync::Semaphore>,
-    /// The shared byte budget every query materialization reserves from —
-    /// the aggregate bound the slot×cap product never actually was.
-    pub query_memory_pool: Arc<crate::query_memory::QueryMemoryPool>,
+    /// What this process has committed to work in flight, queries and
+    /// background writers together. A query prices itself against it before it
+    /// scans, so a refusal arrives on the request rather than partway through
+    /// one. Shared with `Config`, which is how flush and compaction reach it.
+    pub memory_account: Arc<crate::memory_budget::MemoryAccount>,
     /// Bounds live tail connections. Held for the life of a socket, unlike the
     /// scan semaphores, which a tail borrows per poll.
     pub tail_semaphore: Arc<tokio::sync::Semaphore>,
@@ -131,9 +133,7 @@ impl AppState {
             metric_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_metric_scans,
             )),
-            query_memory_pool: Arc::new(crate::query_memory::QueryMemoryPool::new(
-                config.query_memory_budget_bytes,
-            )),
+            memory_account: config.memory_account.clone(),
             tail_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_tails)),
             config,
             memtable: dependencies.memtable,

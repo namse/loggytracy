@@ -523,12 +523,36 @@ fn journal_writer_metrics(state: &AppState) -> String {
     );
     out.push_str(&flush_phase_metrics(state));
     out.push_str(
-        "# HELP signy_query_memory_exhausted_total Queries refused because this instance's query memory pool had no room. Distinct from the tenant read quota, which says a tenant asked for more than it was sold, and from a scan-limit refusal, which says the query was too broad: this one says the instance ran out of room for work it was willing to do, and is the read side's counterpart to ingest_throttled.\n\
+        "# HELP signy_query_memory_exhausted_total Requests refused because this instance's memory account had no room. Distinct from the tenant read quota, which says a tenant asked for more than it was sold, from a scan-limit refusal, which says the query was too broad, and from the over-budget 400, which says the request is larger than this instance could ever serve: this one says the instance ran out of room for work it was willing to do, and is the read side's counterpart to ingest_throttled.\n\
 # TYPE signy_query_memory_exhausted_total counter\n",
     );
     out.push_str(&format!(
         "signy_query_memory_exhausted_total {}\n",
-        state.query_memory_pool.exhausted()
+        state.memory_account.exhausted()
+    ));
+    out.push_str(
+        "# HELP signy_memory_account_in_use_bytes Bytes charged to the shared memory account and not yet released: what admitted queries, flushes and compactions have declared they hold right now. Read against signy_memory_account_budget_bytes, this is what an arriving request is admitted or refused on. It is an accounted total and not a heap measurement, so it will sit below process_rss_bytes, which also carries the caches, the memtables and whatever the allocator has not returned.\n\
+# TYPE signy_memory_account_in_use_bytes gauge\n",
+    );
+    out.push_str(&format!(
+        "signy_memory_account_in_use_bytes {}\n",
+        state.memory_account.in_use_bytes()
+    ));
+    out.push_str(
+        "# HELP signy_memory_account_budget_bytes The ceiling the above is admitted against (SIGNY_MEMORY_ACCOUNT_BYTES).\n\
+# TYPE signy_memory_account_budget_bytes gauge\n",
+    );
+    out.push_str(&format!(
+        "signy_memory_account_budget_bytes {}\n",
+        state.memory_account.budget_bytes()
+    ));
+    out.push_str(
+        "# HELP signy_memory_account_deferred_total Background passes -- metric flush and metric compaction -- that found no room in the account and left their input for the next tick. They have no client to refuse, so this is their form of the counter above. Climbing without settling is compaction debt that never drains.\n\
+# TYPE signy_memory_account_deferred_total counter\n",
+    );
+    out.push_str(&format!(
+        "signy_memory_account_deferred_total {}\n",
+        state.memory_account.deferred()
     ));
     out
 }

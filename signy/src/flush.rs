@@ -314,8 +314,7 @@ async fn flush_once(
 
     let row_group_size = config.row_group_size;
     let flush_chunk_bytes = config.flush_chunk_bytes;
-    let background_memory_pool = config.background_memory_pool.clone();
-    let merge_max_memory_bytes = config.merge_max_memory_bytes;
+    let memory_account = config.memory_account.clone();
     let result = match tokio::task::spawn_blocking({
         let parts_root = parts_root.clone();
         let traces_root = config.data_dir.join("traces");
@@ -323,15 +322,16 @@ async fn flush_once(
         move || {
             let _arena = crate::memprof::enter(crate::memprof::Arena::Flush);
             // The metric snapshot builder keeps one bounded batch plus the
-            // current series and writer state. Reserve twice its chunk size
-            // from the pool shared with metric compaction before any part is
-            // written; contention leaves the snapshot untouched for retry.
-            let _metric_flush_permit = if series_snapshot_for_flush.is_empty() {
+            // current series and writer state. Charge twice its chunk size
+            // against the account it shares with queries and compaction before
+            // any part is written; a full account leaves the snapshot
+            // untouched for retry.
+            let _metric_flush_charge = if series_snapshot_for_flush.is_empty() {
                 None
             } else {
                 Some(
-                    background_memory_pool
-                        .try_reserve(flush_chunk_bytes.saturating_mul(2), merge_max_memory_bytes)
+                    memory_account
+                        .try_admit(flush_chunk_bytes.saturating_mul(2))
                         .ok_or_else(|| {
                             std::io::Error::new(
                                 std::io::ErrorKind::WouldBlock,

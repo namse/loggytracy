@@ -476,6 +476,49 @@ falling back to a parked acquisition, which briefly convoys new readers"
         self.inner.read().len()
     }
 
+    /// What a scan over `range` could materialize, as (rows, bytes per row).
+    ///
+    /// The per-row figure is measured, not guessed: every part records the
+    /// memory a full read of it materializes (`PartMeta::materialized_bytes`,
+    /// written at flush time), and dividing by the rows that produced it gives
+    /// this data's own average row. The tenant's share is taken by row
+    /// proportion, since `materialized_bytes` covers the whole part.
+    ///
+    /// This runs over catalog-resident metadata only — the same pruning a
+    /// candidate plan uses, no part body touched — because it exists to price
+    /// a request *before* admitting it. It returns `None` when no part matches
+    /// or when the matched parts record no rows, which is the caller's cue to
+    /// price the memtable's rows alone.
+    pub fn materialization_estimate(
+        &self,
+        tenant: &TenantId,
+        line_filters: &[LineFilter],
+        exact_fields: &[ExactFieldPredicate],
+        range: QueryTimeRange,
+    ) -> Option<(u64, u64)> {
+        let mut rows = 0u64;
+        let mut bytes = 0u64;
+        for reader in self.inner.read().values() {
+            if !reader.may_match_exact_fields(tenant, line_filters, exact_fields, range) {
+                continue;
+            }
+            let meta = reader.meta();
+            let Some(segment) = meta.tenant_segment(tenant) else {
+                continue;
+            };
+            if meta.row_count == 0 {
+                continue;
+            }
+            rows = rows.saturating_add(segment.row_count);
+            // u128 so a large part's `materialized_bytes × row_count` cannot
+            // wrap before the division brings it back into range.
+            let share = (u128::from(meta.materialized_bytes) * u128::from(segment.row_count)
+                / u128::from(meta.row_count)) as u64;
+            bytes = bytes.saturating_add(share);
+        }
+        (rows > 0).then(|| (rows, bytes.div_ceil(rows)))
+    }
+
     /// Every registered part's directory. What eviction walks instead of the
     /// filesystem.
     pub fn part_dirs(&self) -> Vec<std::path::PathBuf> {

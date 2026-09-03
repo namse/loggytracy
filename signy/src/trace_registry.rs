@@ -10,6 +10,19 @@ use crate::tenant::TenantId;
 use crate::trace::TraceSpan;
 use crate::trace_part::{TracePart, TracePartReader, discover_trace_parts};
 
+/// How much larger a decoded span is than its stored bytes.
+///
+/// Stored trace bytes are zstd-compressed Parquet columns; a live `TraceSpan`
+/// is the protobuf message plus every id, name and attribute string owned
+/// separately on the heap. The factor is a deliberately pessimistic round
+/// number rather than a measurement — it prices an admission, and a request
+/// that overshoots it still meets `max_query_memory_bytes` inside the scan.
+const SPAN_DECODE_EXPANSION: u64 = 8;
+
+/// The floor under that estimate: a span costs at least its own struct plus
+/// the two ids, whatever the compression achieved on a run of similar spans.
+pub const MIN_SPAN_BYTES: u64 = 512;
+
 pub struct TraceRegistry {
     inner: RwLock<HashMap<String, Arc<TracePartReader>>>,
     /// Bytes each tenant holds across the registered trace parts, maintained as
@@ -182,6 +195,43 @@ impl TraceRegistry {
         self.inner.read().values().cloned().collect()
     }
 
+    /// What one materialized span of this tenant's costs, in bytes.
+    ///
+    /// Unlike a log part, a trace part records no materialized size — the
+    /// format has a stored byte extent per tenant and nothing that says what
+    /// decoding it costs. So the figure is the stored average
+    /// (`bytes ÷ row_count`, both per tenant, straight out of `meta.json`)
+    /// scaled by [`SPAN_DECODE_EXPANSION`]. That constant is the estimate's
+    /// one unmeasured term, which is why nothing rests on it alone: it prices
+    /// a request for admission, and `max_query_memory_bytes` still refuses the
+    /// scan if the real spans come out larger.
+    ///
+    /// `None` when the tenant has no stored spans, which is the caller's cue
+    /// to price the memtable's spans alone.
+    pub fn average_span_bytes(&self, tenant: &TenantId) -> Option<u64> {
+        let mut rows = 0u64;
+        let mut bytes = 0u64;
+        for reader in self.inner.read().values() {
+            let Some(segment) = reader
+                .part()
+                .meta
+                .tenants
+                .iter()
+                .find(|segment| segment.tenant == *tenant)
+            else {
+                continue;
+            };
+            rows = rows.saturating_add(segment.row_count);
+            bytes = bytes.saturating_add(segment.bytes.len());
+        }
+        (rows > 0).then(|| {
+            bytes
+                .div_ceil(rows)
+                .saturating_mul(SPAN_DECODE_EXPANSION)
+                .max(MIN_SPAN_BYTES)
+        })
+    }
+
     pub fn candidate_part_ids(
         &self,
         tenant: &TenantId,
@@ -259,12 +309,10 @@ impl TraceRegistry {
         trace_id: &str,
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
-        reservation: Option<&crate::query_memory::QueryMemoryReservation>,
     ) -> Result<Vec<TraceSpan>, String> {
         let mut readers = self.snapshot();
         readers.sort_by_key(|reader| reader.part().meta.min_ts_ns);
         let mut spans = Vec::new();
-        let mut charged = ByteCharge::new(reservation);
         for reader in readers {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Err("trace query timed out".to_string());
@@ -281,7 +329,6 @@ impl TraceRegistry {
                 remaining,
                 cancellation,
             )?);
-            charged.ensure(&spans)?;
         }
         spans.sort_by(|left, right| {
             left.start_time_ns
@@ -296,9 +343,8 @@ impl TraceRegistry {
         tenant: &TenantId,
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
-        reservation: Option<&crate::query_memory::QueryMemoryReservation>,
     ) -> Result<Vec<TraceSpan>, String> {
-        self.query_range(tenant, None, scan_limit, cancellation, reservation)
+        self.query_range(tenant, None, scan_limit, cancellation)
     }
 
     /// Every span for the tenant, or only those starting inside `range`.
@@ -308,10 +354,8 @@ impl TraceRegistry {
         range: Option<(i64, i64)>,
         scan_limit: Option<usize>,
         cancellation: Option<&AtomicBool>,
-        reservation: Option<&crate::query_memory::QueryMemoryReservation>,
     ) -> Result<Vec<TraceSpan>, String> {
         let mut spans = Vec::new();
-        let mut charged = ByteCharge::new(reservation);
         for reader in self.snapshot() {
             if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Err("trace query timed out".to_string());
@@ -326,7 +370,6 @@ impl TraceRegistry {
                 None => reader.query_all_limited(tenant, remaining, cancellation)?,
             };
             spans.extend(part_spans);
-            charged.ensure(&spans)?;
         }
         spans.sort_by(|left, right| {
             left.start_time_ns
@@ -338,36 +381,6 @@ impl TraceRegistry {
 
     pub fn part_count(&self) -> usize {
         self.inner.read().len()
-    }
-}
-
-/// Charges a growing span collection against the shared query memory pool at
-/// part granularity — bounded between charges by the span budget the caller
-/// already enforces. Each span is estimated once, however many parts follow.
-struct ByteCharge<'a> {
-    reservation: Option<&'a crate::query_memory::QueryMemoryReservation>,
-    estimated_bytes: u64,
-    counted: usize,
-}
-
-impl<'a> ByteCharge<'a> {
-    fn new(reservation: Option<&'a crate::query_memory::QueryMemoryReservation>) -> Self {
-        Self {
-            reservation,
-            estimated_bytes: 0,
-            counted: 0,
-        }
-    }
-
-    fn ensure(&mut self, spans: &[TraceSpan]) -> Result<(), String> {
-        let Some(reservation) = self.reservation else {
-            return Ok(());
-        };
-        for span in &spans[self.counted..] {
-            self.estimated_bytes += crate::trace::span_query_bytes(span);
-        }
-        self.counted = spans.len();
-        reservation.ensure(self.estimated_bytes)
     }
 }
 

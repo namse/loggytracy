@@ -279,7 +279,7 @@ returns something.
 Unlike the log autocomplete there is no catalog to read: a span's attributes
 live inside its stored payload, so these endpoints answer from a bounded
 window scan and pay the same admission as any trace scan (its scan slots, the
-shared memory pool, the span budget). Keep the window as narrow as the
+shared memory account, the span budget). Keep the window as narrow as the
 dropdown allows.
 
 ## `GET /metrics/query` — the dashboard panel
@@ -467,11 +467,11 @@ Refusals are `application/json`:
 
 | Status | Meaning | Retry? |
 |---|---|---|
-| 400 | The request is malformed or over-broad; the message names the input and the governing limit | No — fix the request |
+| 400 | The request is malformed or over-broad; the message names the input and the governing limit. Includes a request whose materialization would be larger than this instance's whole memory budget (`SIGNY_MEMORY_ACCOUNT_BYTES`) — no wait makes that fit, so it is not a `429` | No — fix the request |
 | 401/403 | Tenant refusals from `X-Tenant-Id` handling ([`MULTI_TENANCY_DESIGN.md`](MULTI_TENANCY_DESIGN.md)). Reads only: an ingest never answers one, because it never reads a tenant off a header | No |
 | 404 | Unknown route (the body lists the real ones) or unknown delete request | No |
 | 413 | The trace holds more spans or bytes than one response may carry (`SIGNY_MAX_TRACE_SPANS`, `SIGNY_MAX_QUERY_MEMORY_BYTES`), or a metric selector matched more than `SIGNY_MAX_METRIC_SERIES_PER_QUERY` series / `SIGNY_MAX_METRIC_POINTS_PER_QUERY` points | No — narrow the request or raise the knob |
-| 429 | Tenant query quota, tail cap, delete cap, or this instance's query memory pool is momentarily full | Yes — these clear on their own |
+| 429 | Tenant query quota, tail cap, delete cap, or this instance's shared memory account is momentarily full. The account is priced before the scan starts, so this arrives on the request rather than partway through it | Yes — these clear on their own |
 | 503 | Draining for shutdown, or a deletion could not be made durable | Yes, against the replacement instance |
 | 504 | The query ran past `SIGNY_MAX_QUERY_RUNTIME` (`SIGNY_MAX_TRACE_QUERY_RUNTIME` on the trace routes, `SIGNY_MAX_METRIC_QUERY_RUNTIME` on the metric ones) | Narrow the range or filters |
 

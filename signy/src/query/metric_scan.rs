@@ -2,8 +2,12 @@
 /// order every read surface uses (`trace_scan.rs` states it): pin — a restore
 /// is network wait and must not hold a scan slot — then a permit from the
 /// metric surface's own semaphore (Gorilla decode plus per-step folds is a
-/// third cost profile), then admission to the shared byte pool, then the
-/// blocking scan under an outer timeout. What is new here is that the cost is
+/// third cost profile), then — uniquely on this surface — selection, and only
+/// then admission to the memory account, because a metric query's cost is a
+/// function of what the selector matched and selection is the cheap part. The
+/// other two surfaces price themselves before the permit; this one cannot,
+/// and does not need to: selection reads catalogs only. What follows is that
+/// the cost is
 /// **bounded before any chunk is decoded**: selection runs over the memtable
 /// index and the part catalogs alone, and a selection past the caps is
 /// refused with the matched count and the knob, never scanned.
@@ -35,7 +39,7 @@ pub(crate) struct MetricScanOutcome {
     pub estimated_bytes: u64,
     /// Held with the series it paid for; the handler drops both together
     /// after the NDJSON body is built (the `QueryExecution` precedent).
-    _memory_reservation: crate::query_memory::QueryMemoryReservation,
+    _memory_charge: crate::memory_budget::MemoryCharge,
 }
 
 /// Whether a series identity passes the request's name and label filters.
@@ -111,15 +115,12 @@ async fn scan_metric_series(
     .await
     .map_err(|_| ApiError::from_engine("metric query timed out".to_string()))?
     .map_err(|error| ApiError::from_engine(format!("metric scan scheduler is closed: {error}")))?;
-    let memory_reservation = tokio::time::timeout(max_runtime, state.query_memory_pool.reserve())
-        .await
-        .map_err(|_| ApiError::from_engine("metric query timed out".to_string()))?
-        .map_err(ApiError::from_engine)?;
 
     let cancellation = Arc::new(AtomicBool::new(false));
     let task_cancellation = cancellation.clone();
     let max_series = state.config.max_metric_series_per_query;
     let max_points = state.config.max_metric_points_per_query;
+    let memory_account = state.memory_account.clone();
     let task_state = state.clone();
     let mut task = tokio::task::spawn_blocking(move || {
         // Keep the permit until the blocking task actually exits; a cancelled
@@ -223,8 +224,12 @@ selector, shorten the window, or coarsen step",
             .keys()
             .map(|labels| labels.byte_len() as u64)
             .sum();
+        // Selection is over, nothing is decoded, and the answer's size is now
+        // known exactly: `series × steps` timestamped doubles plus the labels
+        // that name them. That is the whole admission — a metric query never
+        // asks the account twice.
         let mut estimated_bytes = points.saturating_mul(16).saturating_add(label_bytes);
-        memory_reservation.ensure(estimated_bytes)?;
+        let memory_charge = memory_account.admit(estimated_bytes)?;
 
         let mut series = Vec::with_capacity(selected.len());
         let mut decoded_samples = 0u64;
@@ -245,7 +250,6 @@ selector, shorten the window, or coarsen step",
             samples.dedup_by_key(|(ts, _)| *ts);
             decoded_samples += samples.len() as u64;
             estimated_bytes = estimated_bytes.saturating_add(samples.len() as u64 * 16);
-            memory_reservation.ensure(estimated_bytes)?;
             series.push(MetricSeriesData { labels, samples });
         }
 
@@ -284,18 +288,21 @@ selector, shorten the window, or coarsen step",
                 estimated_bytes = estimated_bytes
                     .saturating_add(samples.len() as u64 * 16)
                     .saturating_add(synthetic.byte_len() as u64);
-                memory_reservation.ensure(estimated_bytes)?;
                 series.push(MetricSeriesData {
                     labels: synthetic,
                     samples,
                 });
             }
         }
+        // Decoding reaches back past the window for windowed folds, so the
+        // samples held can exceed the output points the admission was priced
+        // on. Reconcile before the fold runs on them.
+        memory_charge.reconcile(estimated_bytes);
         Ok::<_, String>(MetricScanOutcome {
             series,
             decoded_samples,
             estimated_bytes,
-            _memory_reservation: memory_reservation,
+            _memory_charge: memory_charge,
         })
     });
 

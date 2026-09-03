@@ -16,11 +16,15 @@ struct QueryExecution {
     results: Vec<StreamResult>,
     scanned_rows: u64,
     scanned_bytes: u64,
-    /// The pool slice backing `results`. Held for as long as the results are
-    /// — the reservation returning to the pool while the rows it paid for
-    /// are still being aggregated or serialized would let the pool admit
-    /// memory that is very much still resident.
-    memory_reservation: Option<crate::query_memory::QueryMemoryReservation>,
+    /// What the pipeline materialized on its way to `results`. Reconciled
+    /// against the charge below, whose estimate was made before any row was
+    /// read and can undershoot.
+    materialized_bytes: u64,
+    /// The account charge backing `results`. Held for as long as the results
+    /// are — releasing it while the rows it paid for are still being
+    /// aggregated or serialized would let the account admit memory that is
+    /// very much still resident.
+    memory_charge: Option<crate::memory_budget::MemoryCharge>,
 }
 
 #[cfg(test)]
@@ -69,7 +73,6 @@ fn unified_query_with_stats_cancellable(
         cancellation,
         None,
         None,
-        None,
         part::ColumnSet::all(),
     )
 }
@@ -89,7 +92,6 @@ fn unified_query_with_stats_cancellable_with_memory(
     cancellation: Option<&AtomicBool>,
     max_memory_bytes: Option<u64>,
     max_scan_bytes: Option<u64>,
-    memory_reservation: Option<&crate::query_memory::QueryMemoryReservation>,
     columns: part::ColumnSet,
 ) -> Result<QueryExecution, String> {
     // The one place every read path meets its rows, which is why the deletion
@@ -110,7 +112,6 @@ fn unified_query_with_stats_cancellable_with_memory(
         .scan_budget(scan_budget)
         .max_scan_bytes(max_scan_bytes)
         .max_memory_bytes(max_memory_bytes)
-        .memory_reservation(memory_reservation)
         .cancellation(cancellation)
         .hidden(&hidden);
     let result = scan.run(&state.memtable, &state.parts)?;
@@ -118,7 +119,8 @@ fn unified_query_with_stats_cancellable_with_memory(
         results: result.results,
         scanned_rows: result.scanned_rows,
         scanned_bytes: result.scanned_bytes,
-        memory_reservation: None,
+        materialized_bytes: result.materialized_bytes,
+        memory_charge: None,
     })
 }
 
@@ -229,6 +231,48 @@ async fn run_unified_query_with_stats_cancellable(
     .await
 }
 
+/// The per-row figure used when no part has been written yet to measure one.
+/// It covers the window between a fresh start and the first flush, and
+/// nothing else.
+const UNMEASURED_ROW_BYTES: u64 = 512;
+
+/// What this log query will need, in bytes, decided before it reads a row.
+///
+/// A log query's answer is at most `limit` rows, and every part records the
+/// memory its rows materialize into, so the two multiply into a real ceiling
+/// rather than a guess: `min(limit, rows reachable) × this data's own average
+/// row`. The parts are already pinned when this runs, so the catalogs it reads
+/// describe exactly the parts the scan will open.
+///
+/// It can still undershoot — one part's rows can be far wider than its part's
+/// average — which is why two things outlive it: `max_query_memory_bytes`
+/// refuses the scan that runs away, and the charge is reconciled to the truth
+/// when the scan returns.
+fn estimated_log_query_bytes(
+    state: &AppState,
+    tenant: &TenantId,
+    parsed: &logql::LogQuery,
+    range: part::QueryTimeRange,
+    limit: usize,
+    cap_bytes: u64,
+) -> u64 {
+    let exact_fields = parsed.exact_field_predicates();
+    let (part_rows, bytes_per_row) = state
+        .parts
+        .materialization_estimate(tenant, &parsed.line_filters, &exact_fields, range)
+        .unwrap_or((0, UNMEASURED_ROW_BYTES));
+    // The memtable holds the same rows the parts will hold, so its bytes are
+    // priced at the same average; what it cannot cheaply give is a row count,
+    // so a non-empty memtable simply stops the stored row count from shrinking
+    // the estimate below what `limit` allows.
+    let reachable_rows = if state.memtable.approximate_size() > 0 {
+        limit as u64
+    } else {
+        part_rows.min(limit as u64)
+    };
+    reachable_rows.saturating_mul(bytes_per_row).min(cap_bytes)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_unified_query_with_stats_cancellable_for_runtime(
     state: Arc<AppState>,
@@ -253,6 +297,20 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
     )
     .await
     .map_err(|_| "query timed out".to_string())??;
+    let max_query_memory_bytes = state.config.max_query_memory_bytes;
+    // Price the request against the account *before* it queues for a scan
+    // slot. The parts are pinned, so this reads the catalogs of exactly what
+    // the scan will read; refusing here costs one metadata pass, while
+    // refusing after the slot would have made a query that can never run wait
+    // behind queries that can.
+    let memory_charge = state.memory_account.admit(estimated_log_query_bytes(
+        &state,
+        &tenant,
+        &parsed,
+        range,
+        limit,
+        max_query_memory_bytes,
+    ))?;
     let scan_permit = match state.query_scan_semaphore.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(tokio::sync::TryAcquireError::Closed) => {
@@ -278,18 +336,8 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
         }
     };
     let scan_occupancy = crate::metrics::ScanOccupancy::enter(state.metrics.clone());
-    // Admission to the shared byte pool, after the scan slot for the same
-    // reason the slot comes after the pin: each stage of admission should
-    // hold only what the previous stages granted while it waits.
-    let memory_reservation = tokio::time::timeout(
-        max_runtime,
-        state.query_memory_pool.reserve(),
-    )
-    .await
-    .map_err(|_| "query timed out".to_string())??;
     let task_cancellation = cancellation.clone();
     let max_query_runtime = max_runtime;
-    let max_query_memory_bytes = state.config.max_query_memory_bytes;
     let mut task = tokio::task::spawn_blocking(move || {
         // Keep the scheduler permit until the blocking task actually exits;
         // cancelling the request must not admit an unbounded second scan while
@@ -309,11 +357,13 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
             Some(task_cancellation.as_ref()),
             Some(max_query_memory_bytes),
             Some(state.config.max_query_scan_bytes),
-            Some(&memory_reservation),
             columns,
         )?;
-        // The reservation leaves with the results it paid for.
-        execution.memory_reservation = Some(memory_reservation);
+        // The estimate was made before a row was read. Correct the account to
+        // what the scan really materialized, then leave with the charge: the
+        // rows are resident until the response body is built.
+        memory_charge.reconcile(execution.materialized_bytes);
+        execution.memory_charge = Some(memory_charge);
         Ok::<_, String>(execution)
     });
     let execution = match tokio::time::timeout(max_query_runtime, &mut task).await {
