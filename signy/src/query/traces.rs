@@ -159,7 +159,7 @@ fn trace_window(
 /// Trace autocomplete answers from a bounded window scan — unlike the log
 /// autocomplete there is no catalog to read instead, because a span's
 /// attributes live inside its stored payload. The scan pays the same
-/// admission as any trace scan (its semaphore, the byte pool, the span
+/// admission as any trace scan (its semaphore, the memory account, the span
 /// budget), and QUERY_API.md says so.
 pub async fn traces_attributes(
     State(state): State<Arc<AppState>>,
