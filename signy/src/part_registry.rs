@@ -484,29 +484,32 @@ falling back to a parked acquisition, which briefly convoys new readers"
     /// this data's own average row. The tenant's share is taken by row
     /// proportion, since `materialized_bytes` covers the whole part.
     ///
-    /// This runs over catalog-resident metadata only — the same pruning a
-    /// candidate plan uses, no part body touched — because it exists to price
-    /// a request *before* admitting it. It returns `None` when no part matches
-    /// or when the matched parts record no rows, which is the caller's cue to
-    /// price the memtable's rows alone.
+    /// It reads `meta.json` alone — the tenant's segment and its timestamps —
+    /// and deliberately does **not** run the bloom pruning a candidate plan
+    /// runs. That pruning decodes every candidate part's blooms, which a heap
+    /// profile of the 2 GiB soak measured at 227 MiB of live bytes and the
+    /// single largest allocator in the process; pricing a request is not worth
+    /// a second pass of it. It costs nothing to skip: blooms decide *which*
+    /// parts hold a matching line, and this needs the average row and a row
+    /// ceiling, neither of which a line filter moves. Skipping it counts more
+    /// parts, so the estimate is looser in the safe direction, and `limit`
+    /// dominates the row term in every case but a nearly empty tenant.
+    ///
+    /// Returns `None` when the tenant owns no rows in the window, which is the
+    /// caller's cue to price the memtable's rows alone.
     pub fn materialization_estimate(
         &self,
         tenant: &TenantId,
-        line_filters: &[LineFilter],
-        exact_fields: &[ExactFieldPredicate],
         range: QueryTimeRange,
     ) -> Option<(u64, u64)> {
         let mut rows = 0u64;
         let mut bytes = 0u64;
         for reader in self.inner.read().values() {
-            if !reader.may_match_exact_fields(tenant, line_filters, exact_fields, range) {
-                continue;
-            }
             let meta = reader.meta();
             let Some(segment) = meta.tenant_segment(tenant) else {
                 continue;
             };
-            if meta.row_count == 0 {
+            if meta.row_count == 0 || !range.overlaps(segment.min_ts_ns, segment.max_ts_ns) {
                 continue;
             }
             rows = rows.saturating_add(segment.row_count);

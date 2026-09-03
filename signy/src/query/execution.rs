@@ -241,8 +241,9 @@ const UNMEASURED_ROW_BYTES: u64 = 512;
 /// A log query's answer is at most `limit` rows, and every part records the
 /// memory its rows materialize into, so the two multiply into a real ceiling
 /// rather than a guess: `min(limit, rows reachable) × this data's own average
-/// row`. The parts are already pinned when this runs, so the catalogs it reads
-/// describe exactly the parts the scan will open.
+/// row`. It reads part metadata only — see
+/// [`crate::part_registry::PartRegistry::materialization_estimate`] for why it
+/// must not reach for the blooms a candidate plan reads.
 ///
 /// It can still undershoot — one part's rows can be far wider than its part's
 /// average — which is why two things outlive it: `max_query_memory_bytes`
@@ -251,15 +252,13 @@ const UNMEASURED_ROW_BYTES: u64 = 512;
 fn estimated_log_query_bytes(
     state: &AppState,
     tenant: &TenantId,
-    parsed: &logql::LogQuery,
     range: part::QueryTimeRange,
     limit: usize,
     cap_bytes: u64,
 ) -> u64 {
-    let exact_fields = parsed.exact_field_predicates();
     let (part_rows, bytes_per_row) = state
         .parts
-        .materialization_estimate(tenant, &parsed.line_filters, &exact_fields, range)
+        .materialization_estimate(tenant, range)
         .unwrap_or((0, UNMEASURED_ROW_BYTES));
     // The memtable holds the same rows the parts will hold, so its bytes are
     // priced at the same average; what it cannot cheaply give is a row count,
@@ -306,7 +305,6 @@ async fn run_unified_query_with_stats_cancellable_for_runtime(
     let memory_charge = state.memory_account.admit(estimated_log_query_bytes(
         &state,
         &tenant,
-        &parsed,
         range,
         limit,
         max_query_memory_bytes,

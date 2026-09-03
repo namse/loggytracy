@@ -2359,7 +2359,7 @@ async fn a_log_query_is_priced_from_its_own_limit_and_the_rows_its_parts_recorde
         )
         .unwrap();
     let (rows, bytes_per_row) = parts
-        .materialization_estimate(&test_tenant(), &[], &[], part::QueryTimeRange::half_open(0, i64::MAX))
+        .materialization_estimate(&test_tenant(), part::QueryTimeRange::half_open(0, i64::MAX))
         .expect("the part records what its rows materialize into");
     assert_eq!(rows, 2_000);
     assert!(
