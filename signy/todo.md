@@ -572,6 +572,58 @@ against the batch one), and `3ca3bb8` (the switchover, retiring the split fallba
       number is `SIGNY_MEMORY_ACCOUNT_BYTES` itself — nothing can be held that was not charged to it — so the
       sum has no second term to overstate. See the pool removal below
 
+## The 2 GiB soak died for four months on a copy of a file (2026-09-03)
+
+A 15-minute soak at 2 GiB / 20 k eps was asked for and did not survive: OOM-killed at
+t=211–576 s on **every** arm — mimalloc v3, jemalloc, and the commit before the memory account.
+Three 900 s runs on mimalloc v3 defaults now finish it, anon peak 1450–1635 MiB against the 2 GiB
+wall, 19.8–20.0 k eps delivered, zero query errors.
+
+**The cause was the bloom cache holding a second copy of `index.bin`.** A stored bloom is a length,
+three header words and a bitset laid out contiguously; decoding it copied the bitset into an owned
+`Vec`, and the copy was almost exactly the file — 4418 KiB of sidecar became 4120 KiB of cache, a
+factor of **1.01**. So a 122 MiB budget held about thirty parts against a working set of sixty to
+two hundred, and the cache thrashed: mean residency **2.03 s**, mean time to the same part being
+decoded again **0.144 s**, two thirds of installs a part coming back, each allocating four megabytes
+and freeing it seconds later at two hundred a second. That is what filled the allocator's
+unreturned dirty pages — 297 → 953 MiB while live memory stayed flat — and the dirty is what the
+kernel could not reclaim with swap off.
+
+`BloomIndex` holds the mapping and the offsets into it; `BloomRef` borrows the bits for the moment
+of a lookup. Installs went 4120 KiB → **1.3 KiB**, re-decodes 6521 → **0**, hit rate 88.3% → **100%**,
+cache resident 122 MiB → **0.6 MiB** while holding 233 parts.
+
+### What it took to find, and every step of it was wrong first
+
+Five hypotheses died to measurement, in order. Each is recorded because the *reason* each was wrong
+is the method:
+
+* **"The allocator."** mimalloc v3 and jemalloc OOM identically. Not an allocator choice.
+* **"Millions of small allocations."** 12.76 M/s at 92 B mean — but slab occupancy went *up* through
+  the explosion (84.7% → 95.2%, nonfull 18% → 6%) and slab growth matched live growth to within
+  4 MiB. Small allocations were being reused perfectly. Killed by measuring
+  `bins.<j>.curslabs/curregs` rather than reasoning about the rate.
+* **"`parse_duration_ns` allocating on its failure path."** Real, 6.45 GiB per 80 s, 4.8% of
+  turnover, and fixed — and peak anon moved 1873 → 1863 MiB, inside run-to-run spread. A genuine
+  hot-path defect that was not the cause, which is a distinction worth keeping separate.
+* **"`canonical_index_values` and the `Vec` growth under it."** 26–47 B allocations, the small side
+  again. Nearly refactored before the slab measurement said the small side was innocent.
+* **"`fs::read` of the sidecar."** The timing was perfect — misses started at t≈190 and dirty went
+  271 → 1122 MiB with them. Mapping it instead moved dirty per GiB of sidecar traffic 111 → 105.
+  A correlation that was real and an effect size that was 5%.
+
+Three methodological errors of mine, each caught by pushing back rather than by more runs:
+`jeprof`'s cumulative column read as if it were flat (`encode_group_blooms` is 24.8% inclusive and
+**1.5%** flat); `--inuse_space` read as turnover, which it cannot be, since the objects a churn
+creates are gone by the sample (`prof_accum:true` and `--alloc_space` are what answer that); and
+time-to-OOM compared across arms in a workload whose part count grows, so the arm that lives longer
+is answering a harder question — matched part count and miss rate is the only honest window.
+
+- [ ] **mimalloc returns almost nothing on settle where jemalloc returns 396 MiB.** Measured on the
+      passing runs: anon 717.6 → 701.9 MiB across the 120 s settle under mimalloc, against
+      1038.6 → 642.8 under jemalloc. Not a problem at these peaks, and not worth a knob, but it is
+      the shape that would decide a tighter budget and no run has asked it directly
+
 ## The pools are gone; a request is priced before it runs
 
 Two byte pools stood between work and memory, and neither could answer *how much is in use*. The query pool
