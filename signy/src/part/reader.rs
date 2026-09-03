@@ -768,6 +768,17 @@ impl PartReader {
             .enabled()
             .then(|| projection.view_in(&self.cache_projection))
             .flatten();
+        // Lookups are for everyone; *fills* are for queries only. A rewrite
+        // reads every group of the parts it is about to delete, so what it
+        // decodes is worth nothing to a later scan — the readers die with the
+        // merge that opened them. Filling from here spent the whole cache
+        // budget on batches no query would ask for, evicting the entries that
+        // were serving one, and — because memprof attributes at allocation and
+        // the cache only retains — parked those bytes under the *merge* tag
+        // (`docs/VISION.md` records the same mis-binding for `query`, where the
+        // gauge is the separator). A merge still reads from the cache: a group
+        // some query already decoded is free to reuse.
+        let fill_cache = row_group_window.is_none();
         // The predicates the part's own columns answer *exactly*: a string
         // equality on a field, read from the `_sm:` column (pushed metadata)
         // and — when the only parser in the pipeline is `| json` over the
@@ -1208,7 +1219,7 @@ impl PartReader {
                 }
                 let reader = builder.build().map_err(|e| e.to_string())?;
                 let mut fill: Option<Vec<RecordBatch>> =
-                    (selection_key.is_some() && fill_layout).then(Vec::new);
+                    (fill_cache && selection_key.is_some() && fill_layout).then(Vec::new);
                 for batch in reader {
                     let batch = batch.map_err(|e| e.to_string())?;
                     if let Some(fill) = &mut fill {
@@ -1280,12 +1291,16 @@ impl PartReader {
                 .map_err(|e| e.to_string())?;
             // Backwards decodes its selection whole before scanning, so the
             // batches are cacheable right here — `RecordBatch` clones are
-            // refcounts, not copies.
+            // refcounts, not copies. Which is also why the shrink happens
+            // before the clone rather than inside `insert`: once the scan below
+            // and the entry both hold a buffer, Arrow declines to shrink it.
             if let Some(key) = selection_key
+                && fill_cache
                 && fill_layout
                 && batches.iter().map(RecordBatch::num_rows).sum::<usize>()
                     == crate::part::selected_rows_of(&key)
             {
+                batches = crate::part::shrink_batches(batches);
                 self.group_cache.insert(row_group, key, batches.clone());
             }
             batches.reverse();

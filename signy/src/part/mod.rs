@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
+use arrow::array::{
+    Array, ArrayRef, AsArray, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
+};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use bytes::Bytes;
 use parquet::arrow::ProjectionMask;

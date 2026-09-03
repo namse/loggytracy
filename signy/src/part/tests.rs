@@ -2502,6 +2502,76 @@ line: format!("plain text row at {ts}"),
         (part, rows)
     }
 
+    /// A rewrite's read leaves the cache alone.
+    ///
+    /// `read_all_rows` is merge's way in, and it passes a row-group window —
+    /// which is what tells the scan its decodes serve nobody: the parts are
+    /// about to be replaced and their readers dropped. Filling from there
+    /// spent the query cache's budget on batches no query would ask for and,
+    /// since memprof attributes at allocation and the cache only retains,
+    /// charged those bytes to the merge arena.
+    #[test]
+    fn a_merge_read_does_not_fill_the_group_cache() {
+        let tmp = tempfile_dir();
+        let (part, rows) = cache_fixture(&tmp);
+        let cached = cache_enabled(part, 1 << 30);
+
+        let read = cached.read_all_rows(None).expect("read every row");
+        assert_eq!(read.len(), rows.len(), "the rewrite must still see them all");
+        assert_eq!(
+            cached.group_cache.resident_bytes_for_test(),
+            0,
+            "a rewrite's read must not spend the query cache's budget"
+        );
+
+        // The same reader still fills for a query: the gate is on the caller,
+        // not on the reader.
+        let full = QueryTimeRange::closed(i64::MIN, i64::MAX);
+        cached
+            .query(&test_tenant(), &[], full, 1000, false)
+            .expect("query");
+        assert!(
+            cached.group_cache.resident_bytes_for_test() > 0,
+            "a query's read still fills"
+        );
+    }
+
+    /// Shrinking hands back Arrow's overshoot and changes nothing else.
+    #[test]
+    fn shrinking_a_batch_keeps_its_rows_and_drops_its_slack() {
+        let mut builder = arrow::array::StringBuilder::with_capacity(8, 1 << 20);
+        for i in 0..8 {
+            builder.append_value(format!("row {i}"));
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new("line", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(builder.finish()) as ArrayRef]).unwrap();
+        let before = batch.get_array_memory_size();
+        let expected: Vec<Option<&str>> = batch.column(0).as_string::<i32>().iter().collect();
+        let expected: Vec<Option<String>> = expected
+            .into_iter()
+            .map(|value| value.map(str::to_string))
+            .collect();
+        let rows = batch.num_rows();
+
+        // Moved in, not cloned: Arrow declines to shrink a shared buffer, so a
+        // surviving handle here would make the assertion below vacuous.
+        let shrunk = shrink_batches(vec![batch]).remove(0);
+        assert_eq!(shrunk.num_rows(), rows);
+        let after: Vec<Option<String>> = shrunk
+            .column(0)
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.map(str::to_string))
+            .collect();
+        assert_eq!(after, expected);
+        assert!(
+            shrunk.get_array_memory_size() < before,
+            "shrinking must return the slack: {before} -> {}",
+            shrunk.get_array_memory_size()
+        );
+    }
+
     /// A cache hit is invisible in the answer: the same queries return the
     /// same rows in the same order before and after the group is cached, in
     /// both directions, matchers and exact-field predicates included.

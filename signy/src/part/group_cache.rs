@@ -298,6 +298,7 @@ impl GroupCache {
             return;
         };
         let _arena = crate::memprof::enter(crate::memprof::Arena::RowGroupCache);
+        let batches = shrink_batches(batches);
         let bytes: u64 = batches
             .iter()
             .map(|batch| batch.get_array_memory_size() as u64)
@@ -385,4 +386,36 @@ fn read_of(group: &CachedGroup) -> CachedGroupRead {
         total_rows: at,
         bytes: group.bytes,
     }
+}
+
+/// Give back the slack Arrow's doubling left in a decoded batch.
+///
+/// Parquet's byte-array decoders grow their value buffer by doubling — a heap
+/// profile names the frame `OffsetBuffer::extend_from_dictionary` — so a batch
+/// arrives holding up to twice the bytes its rows need, and
+/// `get_array_memory_size`, the unit this cache's budget is counted in, charges
+/// the capacity. One `realloc` per column at insert time stops the budget being
+/// spent on the overshoot; the entry is then measured at what it really holds.
+///
+/// Arrow shrinks only an exclusively-owned buffer and makes a shared one a
+/// no-op, which is why the backwards scan shrinks before it clones.
+pub(crate) fn shrink_batches(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let (schema, mut columns, row_count) = batch.into_parts();
+            for column in &mut columns {
+                column.shrink_to_fit();
+            }
+            // No length changed, so the batch that went in is the batch that
+            // comes out; the row count is carried explicitly because a
+            // column-less batch would otherwise lose it.
+            RecordBatch::try_new_with_options(
+                schema,
+                columns,
+                &RecordBatchOptions::new().with_row_count(Some(row_count)),
+            )
+            .expect("shrinking a batch changes no length")
+        })
+        .collect()
 }
