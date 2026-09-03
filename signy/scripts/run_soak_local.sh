@@ -196,7 +196,7 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
 # freeze with zero direct reclaim in it is not a reclaim stall, and the next
 # question is which resource the threads were actually waiting on.
 (
-  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us,active_series,series_memtable,metric_parts,metric_dp_rejected,metric_mem_rejected,metrics_dir,store_dir,proc_rss,alloc_committed,alloc_live,alloc_retained,alloc_active,alloc_metadata"
+  echo "t,current,peak,anon,file,slab,sock,kstack,pgtables,memtable,memtable_buffered,pending_flush,wal_backlog,parts,sidecar,part_meta,rg_cache,query_success,query_errors,threads,mp_other,mp_ingest,mp_wal,mp_flush,mp_merge,mp_query,mp_sidecar,mp_part_meta,mp_rg_cache,mp_header,mi_arena,mi_mmap,mi_inuse,mi_free,data_dir,wal_file,disk_avail_kb,psi_some_us,psi_full_us,pgscan_direct,pgsteal_direct,refault_file,io_some_us,io_full_us,cpu_some_us,active_series,series_memtable,metric_parts,metric_dp_rejected,metric_mem_rejected,metrics_dir,store_dir,proc_rss,alloc_committed,alloc_live,alloc_retained,alloc_active,alloc_metadata,account_in_use,account_budget,account_exhausted,account_deferred"
   T0=$(date +%s.%N)
   echo "$T0" >"$OUT/sampler_t0"
   i=0; du_bytes=0; wal_bytes=0; metrics_bytes=0; store_bytes=0
@@ -246,6 +246,19 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
     # to "is this process big because it is using memory or because the
     # allocator kept it". The memprof build publishes the resident half only
     # and leaves the other at zero.
+    # The shared memory account: what admitted work has declared it holds,
+    # against the ceiling it is admitted on. Distinct from every column beside
+    # it -- those measure the heap, this one measures what the engine *decided*
+    # -- and the pair is the only way to read a 429 back to its cause.
+    # `exhausted` is the client-facing refusal, `deferred` is the same event
+    # for flush and compaction, which have nobody to refuse and postpone
+    # instead.
+    ac=$(echo "$m" | awk '
+      $1=="signy_memory_account_in_use_bytes"{u=$2}
+      $1=="signy_memory_account_budget_bytes"{b=$2}
+      $1=="signy_query_memory_exhausted_total"{e=$2}
+      $1=="signy_memory_account_deferred_total"{d=$2}
+      END{printf "%d,%d,%d,%d", u, b, e, d}')
     al=$(echo "$m" | awk '
       $1=="signy_process_rss_bytes"{rs=$2}
       $1=="signy_allocator_committed_bytes"{cm=$2}
@@ -275,11 +288,11 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
           v["other"], v["ingest"], v["wal"], v["flush"], v["merge"],
           v["query"], v["sidecar"], v["part_meta"], v["row_group_cache"], h,
           i["arena"], i["mmapped"], i["in_use"], i["free"]}')
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
       "$cur" "$peak" "$cg" "$gg" "${threads:-0}" "$mp" \
       "$du_bytes" "$wal_bytes" "${avail_kb:-0}" "$rcl" \
-      "$mx" "${metrics_bytes:-0}" "${store_bytes:-0}" "$al"
+      "$mx" "${metrics_bytes:-0}" "${store_bytes:-0}" "$al" "$ac"
     i=$((i + 1))
     sleep 1
   done
@@ -403,7 +416,8 @@ GUARD=ok
 51 metrics_dir mib;52 store_dir mib;46 active_series count;\
 47 series_memtable mib;48 metric_parts count;53 proc_rss mib;\
 54 alloc_committed mib;55 alloc_live mib;56 alloc_retained mib;\
-57 alloc_active mib;58 alloc_metadata mib", rows, ";")
+57 alloc_active mib;58 alloc_metadata mib;59 account_in_use mib;\
+61 account_exhausted count;62 account_deferred count", rows, ";")
       printf "%-14s %12s %12s %12s %12s  %s\n", "mib/count", "Q1", "Q2", "Q3", "Q4", "trend"
       for (r = 1; r <= nr; r++) {
         split(rows[r], f, " "); c = f[1] + 0

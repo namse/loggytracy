@@ -613,6 +613,51 @@ symptoms are silent in different ways — a query permanently `400`s while flush
 client to refuse, simply postpone on every tick and show up as disk growth an hour later
 (`signy_memory_account_deferred_total`, alerted).
 
+### The soak the change was measured against, and what it found instead (2026-09-03)
+
+Four 2 GiB / 20 k eps / 15 min soak arms, plus the published gate. **The change is not in any of
+it**, and the arm that says so is the one built from its own parent:
+
+| arm | binary | died at | anon peak | committed peak | delivered |
+|---|---|---:|---:|---:|---:|
+| `memory-account` | change, mimalloc | OOM t=576 s | 2019 MiB | 2347 MiB | 19.9 k eps |
+| `baseline-5b5b8cd` | **parent**, mimalloc | OOM t=469 s | 1871 MiB | 2635 MiB | 19.9 k eps |
+| `account-clean` | change, mimalloc | (harness stopped it at t=542 s, still alive) | — | 2671 MiB | — |
+| `jemalloc-arm` | change, jemalloc | OOM t=211 s | 1873 MiB | 897 MiB | — |
+
+anon tracks within noise between the change and its parent at every matched second (t=460:
+1519 vs 1511 MiB), and the parent dies *sooner*. Every arm delivered the offered rate until the
+kill and answered zero query errors.
+
+**The memory account is not where it goes, and the jemalloc arm is what could say so**: a release
+mimalloc compiles its live-bytes counter out, jemalloc does not. `account_in_use` quartile means
+were **1.3 → 9.8 → 5.0 → 3.8 MiB** against a 614 MiB budget, with `exhausted` and `deferred` flat
+at zero for the whole run. No request was refused, no background pass postponed, and the read
+path's whole footprint is a rounding error beside a 1.9 GiB anonymous peak. That is the answer to
+"did admission-by-estimate cost anything" — it did not, and it also did not help, because query
+memory was never the term.
+
+**The published gate still passes, with room.** `memory_gate --budget 2GiB` on the change reads
+`UNDER_BUDGET` at **785.2 MiB, 38.3 % of budget**, 19,951 of 20,000 eps, zero throttling, zero
+query errors, and a settle peak (734.5 MiB) *below* the ingest peak. So the engine is at its
+published state and the soak is asking a harder question, which is what it was built to do.
+
+**What the soak is actually finding, and it is not the allocator.** The arms differ by allocator
+and die the same way, so the shared term is elsewhere. The strongest evidence is a gauge that has
+no business being large: `signy_memtable_bytes` reached **190 MiB with 307 MiB more buffered**
+against the gate's 5.1 MiB peak on the same offered rate. The memtable is a backlog, and it is
+full because flush could not drain it — `visibility_ms` up to 3.6 s, `advance_ms` 1.4 s, journal
+`fsync_ms` 500–2400 ms, `io_full` 8.7–10.5 % of every run. Named gauges sum to ~837 MiB against
+1866 MiB of anon; the rest is what a stalled writer leaves behind.
+
+- [ ] **Re-run the soak on a quiet machine before drawing a conclusion from it.** This rig was
+      sharing a disk with a rust-analyzer at 4.0 GB RSS, a stale `loggytracy` squatting port 3100 at
+      1.38 GB, and a victoria-metrics, on a filesystem 85 % full. The I/O stall numbers above are not
+      the engine's to answer for until that is ruled out, and the 24-hour pass this is being compared
+      against (`soak-24h-lockorder`, 2026-08-12) predates both mimalloc and this machine's current
+      state. Until then the honest statement is: **the gate passes and the soak does not, on a
+      contended host, identically before and after the memory account**
+
 - [ ] **The trace expansion factor is a guess, and the only one left.** Logs and metrics price themselves from
       recorded numbers; traces scale stored bytes by a constant because `TracePartMeta` has no materialized
       figure. Measuring it means either recording one at write time — a format change — or sampling decoded
