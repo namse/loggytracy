@@ -1,7 +1,34 @@
-pub fn parse_duration_ns(input: &str) -> Result<i64, String> {
+/// Why a string is not a duration, without allocating to say so.
+///
+/// It used to be `String`, and the failure path is the common path: every
+/// indexed field value of every written row is speculatively parsed as a
+/// duration by [`canonical_index_values`], and almost none of them are one.
+/// A heap profile of the 2 GiB soak measured the `format!` behind those
+/// refusals at **6.45 GiB allocated in 80 seconds** — 4.8% of the process's
+/// whole allocation turnover, spent building messages nobody reads. The
+/// message belongs to the four call sites that answer a user, and they build
+/// it from this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurationError {
+    Empty,
+    Invalid,
+    OutOfRange,
+}
+
+impl std::fmt::Display for DurationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "empty duration",
+            Self::Invalid => "invalid duration",
+            Self::OutOfRange => "duration is out of range",
+        })
+    }
+}
+
+pub fn parse_duration_ns(input: &str) -> Result<i64, DurationError> {
     let input = input.trim();
     if input.is_empty() {
-        return Err("empty duration".to_string());
+        return Err(DurationError::Empty);
     }
     let mut total = 0i64;
     let mut pos = 0usize;
@@ -13,7 +40,7 @@ pub fn parse_duration_ns(input: &str) -> Result<i64, String> {
             pos += 1;
         }
         if number_start == pos {
-            return Err(format!("invalid duration '{input}'"));
+            return Err(DurationError::Invalid);
         }
         let number = &input[number_start..pos];
         let (unit, multiplier) = [
@@ -29,64 +56,60 @@ pub fn parse_duration_ns(input: &str) -> Result<i64, String> {
         ]
         .into_iter()
         .find(|(unit, _)| input[pos..].starts_with(unit))
-        .ok_or_else(|| format!("invalid duration unit in '{input}'"))?;
+        .ok_or(DurationError::Invalid)?;
         pos += unit.len();
-        let component = decimal_duration_component_ns(number, multiplier, input)?;
+        let component = decimal_duration_component_ns(number, multiplier)?;
         total = total
             .checked_add(component)
-            .ok_or_else(|| format!("duration '{input}' is out of range"))?;
+            .ok_or(DurationError::OutOfRange)?;
     }
     Ok(total)
 }
 
-fn decimal_duration_component_ns(
-    number: &str,
-    multiplier: u128,
-    full_input: &str,
-) -> Result<i64, String> {
+fn decimal_duration_component_ns(number: &str, multiplier: u128) -> Result<i64, DurationError> {
     let (integer, fraction) = match number.split_once('.') {
         Some((integer, fraction)) if !fraction.contains('.') => (integer, fraction),
-        Some(_) => return Err(format!("invalid duration '{full_input}'")),
+        Some(_) => return Err(DurationError::Invalid),
         None => (number, ""),
     };
     if integer.is_empty() && fraction.is_empty() {
-        return Err(format!("invalid duration '{full_input}'"));
+        return Err(DurationError::Invalid);
     }
     if !integer.bytes().all(|byte| byte.is_ascii_digit())
         || !fraction.bytes().all(|byte| byte.is_ascii_digit())
     {
-        return Err(format!("invalid duration '{full_input}'"));
+        return Err(DurationError::Invalid);
     }
 
     let significant_fraction = fraction.trim_end_matches('0');
     let scale = u32::try_from(significant_fraction.len())
-        .map_err(|_| format!("duration '{full_input}' is out of range"))?;
+        .map_err(|_| DurationError::OutOfRange)?;
     let divisor = 10u128
         .checked_pow(scale)
-        .ok_or_else(|| format!("duration '{full_input}' is out of range"))?;
+        .ok_or(DurationError::OutOfRange)?;
     let integer_value = if integer.is_empty() {
         0
     } else {
         integer
             .parse::<u128>()
-            .map_err(|_| format!("duration '{full_input}' is out of range"))?
+            .map_err(|_| DurationError::OutOfRange)?
     };
     let fraction_value = if significant_fraction.is_empty() {
         0
     } else {
         significant_fraction
             .parse::<u128>()
-            .map_err(|_| format!("duration '{full_input}' is out of range"))?
+            .map_err(|_| DurationError::OutOfRange)?
     };
     let decimal_numerator = integer_value
         .checked_mul(divisor)
         .and_then(|value| value.checked_add(fraction_value))
-        .ok_or_else(|| format!("duration '{full_input}' is out of range"))?;
+        .ok_or(DurationError::OutOfRange)?;
     let scaled = decimal_numerator
         .checked_mul(multiplier)
-        .ok_or_else(|| format!("duration '{full_input}' is out of range"))?;
+        .ok_or(DurationError::OutOfRange)?;
     let truncated = scaled / divisor;
-    i64::try_from(truncated).map_err(|_| format!("duration '{full_input}' is out of range"))
+    i64::try_from(truncated).map_err(|_| DurationError::OutOfRange)
 }
 
 /// Merges one parser stage's output into the live field set.
