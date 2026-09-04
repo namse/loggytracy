@@ -8,6 +8,27 @@ use collecty::send::{HttpTransport, Sender};
 use collecty::signal::Signal;
 use tokio::sync::watch;
 
+/// The allocator, and the tagging that may sit over it.
+///
+/// Four builds out of two independent features, which is the point: an
+/// attribution run and the shipped build can be the same memory system.
+/// signy's instrument is hardwired over the system allocator, and the day it
+/// most wanted attribution it had to give it up because the instrumented build
+/// could not hold the rate the shipped one held.
+#[cfg(all(feature = "memprof", feature = "mimalloc"))]
+#[global_allocator]
+static ALLOCATOR: collecty::memprof::TaggedAllocator<mimalloc::MiMalloc> =
+    collecty::memprof::TaggedAllocator::new(mimalloc::MiMalloc);
+
+#[cfg(all(feature = "memprof", not(feature = "mimalloc")))]
+#[global_allocator]
+static ALLOCATOR: collecty::memprof::TaggedAllocator<std::alloc::System> =
+    collecty::memprof::TaggedAllocator::new(std::alloc::System);
+
+#[cfg(all(not(feature = "memprof"), feature = "mimalloc"))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() {
     let config = match Config::from_env() {
@@ -50,6 +71,13 @@ async fn run(config: Config) -> Result<(), String> {
         config.max_request_bytes,
         config.max_inflight_bytes,
     );
+
+    {
+        let gauge = intake.clone();
+        collecty::memprof::start_sampler(collecty::memprof::InflightGauge::new(move || {
+            gauge.inflight_occupied()
+        }));
+    }
 
     let (shutdown, watcher) = watch::channel(false);
     let transport = Arc::new(HttpTransport::new(

@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
+use crate::memprof::{self, Arena};
 use crate::queue::{Queue, Record};
 use crate::signal::Signal;
 use crate::wire;
@@ -38,6 +39,7 @@ const PROTOBUF: &str = "application/x-protobuf";
 pub struct Intake {
     queue: Arc<Queue>,
     inflight: Semaphore,
+    max_inflight_bytes: usize,
     max_request_bytes: usize,
 }
 
@@ -96,12 +98,23 @@ impl Intake {
         Arc::new(Intake {
             queue,
             inflight: Semaphore::new(max_inflight_bytes),
+            max_inflight_bytes,
             max_request_bytes,
         })
     }
 
     pub fn max_request_bytes(&self) -> usize {
         self.max_request_bytes
+    }
+
+    /// Bytes admitted through the gate and not yet appended.
+    ///
+    /// The arena instrument cannot see a request body -- it is allocated on
+    /// hyper's own future, where no synchronous region can be guarded -- but
+    /// the gate has the exact number, so it is reported from here instead of
+    /// estimated from there.
+    pub fn inflight_occupied(&self) -> u64 {
+        (self.max_inflight_bytes - self.inflight.available_permits()) as u64
     }
 
     pub async fn accept(&self, signal: Signal, payload: Bytes) -> Result<(), Refusal> {
@@ -126,6 +139,7 @@ impl Intake {
         // append is still the blocking pool's work.
         let queue = self.queue.clone();
         tokio::task::spawn_blocking(move || {
+            let _tag = memprof::enter(Arena::Intake);
             queue.append(
                 signal,
                 &Record {

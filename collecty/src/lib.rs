@@ -7,6 +7,7 @@
 pub const TENANT_ATTRIBUTE: &str = "tenant.id";
 
 pub mod config;
+pub mod memprof;
 pub mod observe;
 pub mod queue;
 pub mod receive;

@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 pub use identity::SenderId;
 use segment::SegmentWriter;
 
+use crate::memprof::{self, Arena};
 use crate::signal::Signal;
 
 /// Segments are numbered from one so that zero can mean "signy has none of
@@ -131,6 +132,7 @@ pub struct SealedSegment {
 
 impl Queue {
     pub fn open(dir: &Path, limits: QueueLimits, level: i32) -> io::Result<Queue> {
+        let _tag = memprof::enter(Arena::Queue);
         std::fs::create_dir_all(dir)?;
         segment::sweep_temporaries(dir)?;
 
@@ -249,6 +251,7 @@ impl Queue {
     }
 
     pub fn append(&self, signal: Signal, record: &Record) -> io::Result<()> {
+        let _tag = memprof::enter(Arena::Queue);
         let plain_len = record.plain.len() as u64;
         if plain_len > self.limits.max_bytes {
             return Err(io::Error::new(
@@ -307,6 +310,7 @@ impl Queue {
     /// could be hours. Each signal keeps its own age, so a busy one does not
     /// carry a quiet one's records out with it any more.
     pub fn seal_if_due(&self) -> io::Result<()> {
+        let _tag = memprof::enter(Arena::Queue);
         let mut inner = self.inner.lock();
         for signal in Signal::ALL {
             let due = inner.signals[signal.index()]
@@ -323,6 +327,7 @@ impl Queue {
     /// so that the records they hold are on the device rather than left for
     /// the next process to recover.
     pub fn seal(&self) -> io::Result<()> {
+        let _tag = memprof::enter(Arena::Queue);
         let mut inner = self.inner.lock();
         for signal in Signal::ALL {
             self.roll(&mut inner, signal)?;
@@ -358,6 +363,7 @@ impl Queue {
     /// segment. Checking here would mean decompressing every segment twice to
     /// reach the same place.
     pub fn read_segment(&self, signal: Signal, seq: u64) -> io::Result<SealedSegment> {
+        let _tag = memprof::enter(Arena::Send);
         let mut body = Vec::new();
         segment::open_for_read(&self.dirs[signal.index()], seq)?.read_to_end(&mut body)?;
         Ok(SealedSegment { signal, seq, body })

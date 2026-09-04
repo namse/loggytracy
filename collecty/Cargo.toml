@@ -12,6 +12,17 @@ path = "src/lib.rs"
 name = "collecty"
 path = "src/main.rs"
 
+[features]
+default = []
+# The arena instrument of `src/memprof.rs`. Default off: with it off the
+# guards compile to nothing and the process keeps whatever allocator the
+# build selected.
+memprof = []
+# mimalloc as the global allocator. Orthogonal to `memprof` on purpose -- with
+# both on, the tagging wrapper sits over mimalloc, so attribution and the
+# shipped memory system are the same experiment rather than two.
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 http = "1"
@@ -26,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 parking_lot = "0.12"
 crc32fast = "1"
 zstd = "0.13"
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
