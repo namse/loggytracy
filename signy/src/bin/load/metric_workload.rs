@@ -408,7 +408,11 @@ fn tenant_resource(tenant: &str) -> opentelemetry_proto::tonic::resource::v1::Re
     }
 }
 
-pub fn seed_bodies(corpus: &MetricCorpus, tenant: Option<&str>, target: Target) -> Vec<SeedBody> {
+pub fn seed_bodies(
+    corpus: &MetricCorpus,
+    tenant: Option<&str>,
+    wire: crate::config::PushWire,
+) -> Vec<SeedBody> {
     let mut counters: Vec<CounterState> = corpus
         .instruments
         .iter()
@@ -543,7 +547,7 @@ pub fn seed_bodies(corpus: &MetricCorpus, tenant: Option<&str>, target: Target) 
             }],
         };
         bodies.push(SeedBody {
-            bytes: target.wrap_push(request.encode_to_vec()),
+            bytes: wire.wrap(request.encode_to_vec()),
             datapoints,
             decomposed_samples: decomposed,
         });
@@ -640,9 +644,10 @@ fn json_number(body: &[u8], field: &str) -> u64 {
 }
 
 pub async fn run_metric_seed(cfg: &Config, corpus: &MetricCorpus) -> MetricSeedOutcome {
-    let push_headers = cfg.target.push_headers(Signal::Metrics);
+    let wire = cfg.push_wire();
+    let push_headers = wire.headers(Signal::Metrics);
     let target = cfg.target;
-    let Some(push_path) = cfg.target.metric_push_path() else {
+    let Some(push_path) = wire.path(Signal::Metrics) else {
         return MetricSeedOutcome {
             errors: 1,
             first_error: Some(format!(
@@ -652,18 +657,18 @@ pub async fn run_metric_seed(cfg: &Config, corpus: &MetricCorpus) -> MetricSeedO
             ..MetricSeedOutcome::default()
         };
     };
-    let header = cfg.target.push_tenant_header(&corpus.tenant);
+    let header = wire.tenant_header(&corpus.tenant);
     // signy reads the tenant out of the export, the others out of the header,
     // so exactly one of these two carries it.
     let in_body = header.is_none().then_some(corpus.tenant.as_str());
-    let bodies = Arc::new(Mutex::new(seed_bodies(corpus, in_body, cfg.target)));
+    let bodies = Arc::new(Mutex::new(seed_bodies(corpus, in_body, wire)));
     let start = Instant::now();
 
     let workers: Vec<_> = (0..cfg.metric_verify.push_connections)
         .map(|_| {
             let bodies = bodies.clone();
             let header = header.clone();
-            let address = cfg.http_address.clone();
+            let address = cfg.push_address().to_string();
             let timeout = cfg.request_timeout();
             tokio::spawn(async move {
                 let mut client = Client::new(&address, timeout);
@@ -1016,7 +1021,11 @@ mod tests {
 
     /// Every fixture names a tenant, because signy reads one out of the body.
     fn seed_bodies_for_test(corpus: &MetricCorpus) -> Vec<SeedBody> {
-        seed_bodies(corpus, Some("test-tenant"), Target::Loki)
+        seed_bodies(
+            corpus,
+            Some("test-tenant"),
+            crate::config::PushWire::direct(Target::Loki),
+        )
     }
 
     #[test]
@@ -1029,7 +1038,7 @@ mod tests {
             3,
             1_772_000_000_000_000_000,
             Some("test-tenant"),
-            Target::Loki,
+            crate::config::PushWire::direct(Target::Loki),
         );
         let offered: u64 = bodies.iter().map(|(_, datapoints, _)| *datapoints).sum();
         assert_eq!(offered, population.instruments().count() as u64);
@@ -1071,7 +1080,7 @@ mod tests {
             0,
             1_772_000_000_000_000_000,
             Some("test-tenant"),
-            Target::Loki,
+            crate::config::PushWire::direct(Target::Loki),
         );
         assert!(bodies.len() >= 3, "{} bodies", bodies.len());
         for (_, datapoints, _) in &bodies {
@@ -1400,7 +1409,7 @@ pub fn live_scrape_bodies(
     scrape: usize,
     ts_ns: i64,
     tenant: Option<&str>,
-    target: Target,
+    wire: crate::config::PushWire,
 ) -> Vec<(Vec<u8>, u64, u64)> {
     population.advance(scrape);
     let instruments: Vec<&Instrument> = population.instruments().collect();
@@ -1415,7 +1424,7 @@ pub fn live_scrape_bodies(
                     InstrumentKind::Histogram => HISTOGRAM_BOUNDS.len() as u64 + 3,
                 })
                 .sum();
-            (target.wrap_push(payload), datapoints, series)
+            (wire.wrap(payload), datapoints, series)
         })
         .collect()
 }
@@ -1557,8 +1566,9 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
         elapsed_seconds: 0.0,
         series_offered: 0,
     };
-    let push_headers = cfg.target.push_headers(Signal::Metrics);
-    let Some(push_path) = cfg.target.metric_push_path() else {
+    let wire = cfg.push_wire();
+    let push_headers = wire.headers(Signal::Metrics);
+    let Some(push_path) = wire.path(Signal::Metrics) else {
         outcome.phases[0].1.errors = 1;
         outcome.phases[0].1.first_error = Some(format!(
             "target {} has no OTLP metrics ingest",
@@ -1566,9 +1576,9 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
         ));
         return outcome;
     };
-    let header = cfg.target.push_tenant_header(&verify.tenant);
+    let header = wire.tenant_header(&verify.tenant);
     let in_body = header.is_none().then_some(verify.tenant.as_str());
-    let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
+    let mut client = Client::new(cfg.push_address(), cfg.request_timeout());
     let mut population = LivePopulation::new(cfg.seed, verify);
     let interval = std::time::Duration::from_secs(verify.scrape_interval_seconds.max(1) as u64);
     let started = Instant::now();
@@ -1598,7 +1608,7 @@ pub async fn run_metric_load(cfg: &Config) -> MetricLoadOutcome {
             .map(|since| since.as_nanos().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
         for (body, datapoints, series) in
-            live_scrape_bodies(&mut population, scrape, now_ns, in_body, cfg.target)
+            live_scrape_bodies(&mut population, scrape, now_ns, in_body, wire)
         {
             let sent = Instant::now();
             let result = client

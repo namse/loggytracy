@@ -43,7 +43,7 @@ pub struct PushGenerator {
     cursors: Vec<usize>,
     entries_per_push: usize,
     streams_per_push: usize,
-    target: crate::config::Target,
+    wire: crate::config::PushWire,
     arrival: ArrivalOrder,
 }
 
@@ -54,7 +54,7 @@ impl PushGenerator {
         entries_per_push: usize,
         streams_per_push: usize,
         arrival: ArrivalOrder,
-        target: crate::config::Target,
+        wire: crate::config::PushWire,
     ) -> Self {
         let mut streams_by_tenant = vec![Vec::new(); corpus.tenant_ids.len().max(1)];
         for (index, stream) in corpus.streams.iter().enumerate() {
@@ -73,7 +73,7 @@ impl PushGenerator {
             cursors,
             entries_per_push,
             streams_per_push,
-            target,
+            wire,
             arrival,
         }
     }
@@ -136,10 +136,10 @@ impl PushGenerator {
         // for the label mapping it applies. signy reads the tenant out of it,
         // the others out of the header, so exactly one of the two carries it.
         let tenant = corpus.tenant_ids[tenant_index].as_str();
-        let header = self.target.push_tenant_header(tenant);
+        let header = self.wire.tenant_header(tenant);
         let payload = crate::otlp::encode_export_logs(&batch, header.is_none().then_some(tenant));
         let encoded_bytes = payload.len();
-        let bytes = self.target.wrap_push(payload);
+        let bytes = self.wire.wrap(payload);
         PushBody {
             tenant_header: header,
             entries: batch.iter().map(|(_, entries)| entries.len()).sum(),
@@ -531,7 +531,7 @@ mod tests {
                 late_fraction: 0.0,
                 late_max_ms: 0,
             },
-            crate::config::Target::Signy,
+            crate::config::PushWire::direct(crate::config::Target::Signy),
         );
         for _ in 0..16 {
             let body = generator.next_body(1_772_000_000_000_000_000);
@@ -556,7 +556,7 @@ mod tests {
                 late_fraction: 0.0,
                 late_max_ms: 0,
             },
-            crate::config::Target::Signy,
+            crate::config::PushWire::direct(crate::config::Target::Signy),
         );
         let body = ordered.next_body(1_772_000_000_000_000_000);
         assert_eq!(body.out_of_order_entries, 0);
@@ -572,7 +572,7 @@ mod tests {
                 late_fraction: 0.25,
                 late_max_ms: 30_000,
             },
-            crate::config::Target::Signy,
+            crate::config::PushWire::direct(crate::config::Target::Signy),
         );
         let mut out_of_order = 0;
         let mut lateness = 0;

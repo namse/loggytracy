@@ -237,6 +237,86 @@ mimir, got {other:?}"
     }
 }
 
+/// Where a push goes and how it is framed.
+///
+/// The bed's default is straight at the system under test. A collecty in front
+/// is the other way in, and the one production has: the harness then stands
+/// where an application's exporter stands, and the batch signy reads is one a
+/// real collecty built, numbered and resumable. What differs is only the
+/// framing — a bare export on that signal's own path, with no batch frame and
+/// none of the collect route's headers, because collecty never decodes what it
+/// forwards and would refuse anything else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PushWire {
+    pub target: Target,
+    /// Set when pushes go to a collecty rather than to the target itself.
+    pub through_collecty: bool,
+}
+
+impl PushWire {
+    #[cfg(test)]
+    pub fn direct(target: Target) -> Self {
+        Self {
+            target,
+            through_collecty: false,
+        }
+    }
+
+    /// Where this signal's export is POSTed. `None` is the refusal a target
+    /// with no ingest for the signal gives.
+    ///
+    /// collecty serves three paths and nothing else, one per signal, and takes
+    /// every signal the same way — so unlike a target it never answers `None`.
+    pub fn path(self, signal: Signal) -> Option<&'static str> {
+        if self.through_collecty {
+            return Some(match signal {
+                Signal::Logs => "/v1/logs",
+                Signal::Traces => "/v1/traces",
+                Signal::Metrics => "/v1/metrics",
+            });
+        }
+        match signal {
+            Signal::Metrics => self.target.metric_push_path(),
+            Signal::Logs | Signal::Traces => Some(self.target.push_path()),
+        }
+    }
+
+    /// The headers the endpoint needs beyond the content type.
+    ///
+    /// None through a collecty: the compression and the signal are collecty's
+    /// to declare when it ships the segment, and a `Content-Encoding` on the
+    /// way in is refused with `415` — the export has to be plain protobuf for
+    /// collecty to store it without decoding it.
+    pub fn headers(self, signal: Signal) -> &'static [(&'static str, &'static str)] {
+        if self.through_collecty {
+            return &[];
+        }
+        self.target.push_headers(signal)
+    }
+
+    /// One OTLP export, framed the way the endpoint takes it.
+    pub fn wrap(self, payload: Vec<u8>) -> Vec<u8> {
+        if self.through_collecty {
+            return payload;
+        }
+        self.target.wrap_push(payload)
+    }
+
+    /// The header a write names its tenant with, if it has one.
+    ///
+    /// Never one through a collecty. The export names its tenant in the
+    /// `tenant.id` resource attribute exactly as it does on the collect route,
+    /// and it has to: collecty does not read the attribute and could not move
+    /// it into a header, so a run that named the tenant in a header instead
+    /// would have every export dropped on arrival at signy.
+    pub fn tenant_header(self, tenant: &str) -> Option<(&'static str, String)> {
+        if self.through_collecty {
+            return None;
+        }
+        self.target.push_tenant_header(tenant)
+    }
+}
+
 /// What this invocation does.
 ///
 /// `load` is M8's run and is unchanged. `seed` and `matrix` exist because the
@@ -293,6 +373,16 @@ pub struct Config {
     /// probe trials.
     pub capacity_probe: bool,
     pub http_address: String,
+    /// Where pushes go, when that is not `http_address`.
+    ///
+    /// Set to a collecty's OTLP address to drive the whole stack rather than
+    /// the engine alone: writes go there and reads stay on `http_address`,
+    /// because collecty has no read surface and signy has no other way in.
+    pub push_address: Option<String>,
+    /// How long to wait, after the workloads stop, for what the collector
+    /// still holds to reach the engine. Ignored without a collector in front:
+    /// nothing is queued there to wait for.
+    pub drain_seconds: u64,
     pub tier: String,
     pub seed: u64,
     pub duration_seconds: u64,
@@ -470,11 +560,16 @@ pub struct MetricVerify {
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         let duration_seconds = env_u64("SIGNY_LOAD_SECONDS", 60).max(1);
-        Ok(Self {
+        Self {
             target: Target::parse(&env_string("SIGNY_LOAD_TARGET", "signy"))?,
             phase: Phase::parse(&env_string("SIGNY_LOAD_PHASE", "load"))?,
             capacity_probe: env_bool("SIGNY_CAPACITY_PROBE", false),
             http_address: env_string("SIGNY_LOAD_ADDR", "127.0.0.1:3100"),
+            push_address: std::env::var("SIGNY_LOAD_PUSH_ADDR")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            drain_seconds: env_u64("SIGNY_LOAD_DRAIN_SECONDS", 180),
             tier: env_string("SIGNY_LOAD_TIER", "B"),
             seed: env_u64("SIGNY_LOAD_SEED", 0x5eed_2026),
             duration_seconds,
@@ -591,7 +686,23 @@ impl Config {
                 ),
                 min_backlog_samples: env_usize("SIGNY_TARGET_MIN_BACKLOG_SAMPLES", 8).max(2),
             },
-        })
+        }
+        .validated()
+    }
+
+    /// Combinations that cannot mean anything, refused before a run starts
+    /// rather than measured and reported.
+    fn validated(self) -> Result<Self, String> {
+        // A collecty forwards to signy and to nothing else, so pushing through
+        // one while reading from another engine would put the load in one
+        // system and the queries in a different one.
+        if self.push_address.is_some() && self.target != Target::Signy {
+            return Err(format!(
+                "SIGNY_LOAD_PUSH_ADDR names a collecty, which forwards only to signy, but SIGNY_LOAD_TARGET is {}",
+                self.target.name()
+            ));
+        }
+        Ok(self)
     }
 
     /// Where the server's resident memory is read from, or the reason no
@@ -625,6 +736,20 @@ server memory could be watched"
 
     pub fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_seconds)
+    }
+
+    /// Where pushes are sent. The read address unless a collecty stands in
+    /// front, which is the only thing that separates the two.
+    pub fn push_address(&self) -> &str {
+        self.push_address.as_deref().unwrap_or(&self.http_address)
+    }
+
+    /// How pushes are framed, which follows from where they go.
+    pub fn push_wire(&self) -> PushWire {
+        PushWire {
+            target: self.target,
+            through_collecty: self.push_address.is_some(),
+        }
     }
 
     /// Seconds between pushes that hold the offered event rate, or `None` when
@@ -749,6 +874,57 @@ fn env_bool(name: &str, default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Through a collecty the export leaves the harness exactly as an
+    /// application's exporter would send it: bare protobuf, on the signal's own
+    /// path, with no batch frame and no collect headers. Anything else is
+    /// refused at the door — a `Content-Encoding` with `415`, a non-POST with
+    /// `405` — so this is not a preference.
+    #[test]
+    fn a_push_through_a_collecty_is_the_bare_export_on_the_signals_own_path() {
+        let wire = PushWire {
+            target: Target::Signy,
+            through_collecty: true,
+        };
+        assert_eq!(wire.path(Signal::Logs), Some("/v1/logs"));
+        assert_eq!(wire.path(Signal::Traces), Some("/v1/traces"));
+        assert_eq!(wire.path(Signal::Metrics), Some("/v1/metrics"));
+        assert!(wire.headers(Signal::Logs).is_empty());
+        assert!(wire.headers(Signal::Metrics).is_empty());
+        let payload = b"an export".to_vec();
+        assert_eq!(wire.wrap(payload.clone()), payload);
+        // The tenant stays in the body. collecty does not decode what it
+        // forwards, so a header here would reach signy as no tenant at all and
+        // every record would be dropped on arrival.
+        assert_eq!(wire.tenant_header("acme"), None);
+    }
+
+    /// The same wire straight at signy is the collect route's, unchanged by
+    /// the knob existing.
+    #[test]
+    fn a_push_straight_at_signy_is_still_a_one_record_collecty_batch() {
+        let wire = PushWire::direct(Target::Signy);
+        assert_eq!(wire.path(Signal::Logs), Some(COLLECT_PATH));
+        assert_eq!(wire.path(Signal::Metrics), Some(COLLECT_PATH));
+        assert_eq!(
+            wire.headers(Signal::Traces),
+            Signal::Traces.collect_headers()
+        );
+        let framed = wire.wrap(b"an export".to_vec());
+        assert_ne!(framed, b"an export".to_vec());
+        assert_eq!(wire.tenant_header("acme"), None);
+    }
+
+    /// A target with no ingest for a signal still has none through this type:
+    /// the collector is the only thing that takes every signal the same way.
+    #[test]
+    fn a_target_without_metrics_ingest_still_refuses_the_metric_signal() {
+        assert_eq!(PushWire::direct(Target::Loki).path(Signal::Metrics), None);
+        assert_eq!(
+            PushWire::direct(Target::VictoriaLogs).path(Signal::Metrics),
+            None
+        );
+    }
 
     #[test]
     fn mimir_uses_the_native_otlp_metrics_route_and_readiness_probe() {

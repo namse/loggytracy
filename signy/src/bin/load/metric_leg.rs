@@ -67,7 +67,8 @@ pub async fn metric_ingest_leg(
     let Some(interval) = cfg.metric_leg_interval() else {
         return outcome;
     };
-    let Some(push_path) = cfg.target.metric_push_path() else {
+    let wire = cfg.push_wire();
+    let Some(push_path) = wire.path(Signal::Metrics) else {
         outcome.tally.errors = 1;
         outcome.tally.first_error = Some(format!(
             "target {} has no OTLP metrics ingest",
@@ -75,10 +76,10 @@ pub async fn metric_ingest_leg(
         ));
         return outcome;
     };
-    let push_headers = cfg.target.push_headers(Signal::Metrics);
-    let header = cfg.target.push_tenant_header(&tenant);
+    let push_headers = wire.headers(Signal::Metrics);
+    let header = wire.tenant_header(&tenant);
     let in_body = header.is_none().then_some(tenant.as_str());
-    let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
+    let mut client = Client::new(cfg.push_address(), cfg.request_timeout());
     let mut population = LivePopulation::new(cfg.seed, &cfg.metric_verify);
     let mut intended = Instant::now();
 
@@ -99,7 +100,7 @@ pub async fn metric_ingest_leg(
         }
         let now_ns = crate::unix_nanos().min(i64::MAX as u64) as i64;
         for (body, datapoints, series) in
-            live_scrape_bodies(&mut population, scrape, now_ns, in_body, cfg.target)
+            live_scrape_bodies(&mut population, scrape, now_ns, in_body, wire)
         {
             let sent = Instant::now();
             let result = client

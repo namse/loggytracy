@@ -184,7 +184,7 @@ fn seed_bodies(
     corpus: &Corpus,
     entries_per_push: usize,
     tenant: Option<&str>,
-    target: Target,
+    wire: crate::config::PushWire,
 ) -> Vec<SeedBody> {
     let mut bodies = Vec::new();
     for stream in &corpus.streams {
@@ -193,7 +193,7 @@ fn seed_bodies(
             let batch: Vec<(signy::memtable::Labels, Vec<LogEntry>)> =
                 vec![((*stream.labels).clone(), chunk.to_vec())];
             bodies.push(SeedBody {
-                bytes: target.wrap_push(crate::otlp::encode_export_logs(&batch, tenant)),
+                bytes: wire.wrap(crate::otlp::encode_export_logs(&batch, tenant)),
                 rows: chunk.len(),
                 line_bytes,
             });
@@ -203,10 +203,11 @@ fn seed_bodies(
 }
 
 pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
-    let push_path = cfg.target.push_path();
-    let push_headers = cfg.target.push_headers(Signal::Logs);
+    let wire = cfg.push_wire();
+    let push_path = wire.path(Signal::Logs).expect("signy takes logs");
+    let push_headers = wire.headers(Signal::Logs);
     let tenant = corpus.tenant_ids[0].as_str();
-    let header = cfg.target.push_tenant_header(tenant);
+    let header = wire.tenant_header(tenant);
     // signy reads the tenant out of the export, the others out of the header,
     // so exactly one of these two carries it.
     let in_body = header.is_none().then_some(tenant);
@@ -214,7 +215,7 @@ pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
         corpus,
         cfg.verify.entries_per_push,
         in_body,
-        cfg.target,
+        wire,
     )));
     let start = Instant::now();
 
@@ -222,7 +223,7 @@ pub async fn run_seed(cfg: &Config, corpus: &Corpus) -> SeedOutcome {
         .map(|_| {
             let bodies = bodies.clone();
             let header = header.clone();
-            let address = cfg.http_address.clone();
+            let address = cfg.push_address().to_string();
             let timeout = cfg.request_timeout();
             tokio::spawn(async move {
                 let mut client = Client::new(&address, timeout);

@@ -250,6 +250,10 @@ async fn run_metric_verify(cfg: Config) {
         eprintln!("server at {} is not ready: {error}", cfg.http_address);
         std::process::exit(1);
     }
+    if let Err(error) = wait_for_collector(&cfg).await {
+        eprintln!("collector at {} is not answering: {error}", cfg.push_address());
+        std::process::exit(1);
+    }
     let memory_source = cfg.memory_source();
     let corpus = metric_workload::metric_corpus(cfg.seed, &cfg.metric_verify);
     if let Err(error) = onboard_tenants(&cfg, &[corpus.tenant.as_str()]).await {
@@ -451,6 +455,10 @@ async fn run_verify(cfg: Config) {
         eprintln!("server at {} is not ready: {error}", cfg.http_address);
         std::process::exit(1);
     }
+    if let Err(error) = wait_for_collector(&cfg).await {
+        eprintln!("collector at {} is not answering: {error}", cfg.push_address());
+        std::process::exit(1);
+    }
     let memory_source = cfg.memory_source();
     let memory_before = memory_source
         .as_ref()
@@ -603,6 +611,10 @@ async fn run_load(cfg: Config) {
         eprintln!("server at {} is not ready: {error}", cfg.http_address);
         std::process::exit(1);
     }
+    if let Err(error) = wait_for_collector(&cfg).await {
+        eprintln!("collector at {} is not answering: {error}", cfg.push_address());
+        std::process::exit(1);
+    }
     let tenants: Vec<&str> = corpus.tenant_ids.iter().map(|id| id.as_str()).collect();
     if let Err(error) = onboard_tenants(&cfg, &tenants).await {
         eprintln!("{error}");
@@ -732,6 +744,12 @@ async fn run_load(cfg: Config) {
     }
 
     let elapsed_seconds = run_start.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+    // Through a collecty, a `200` means the export is on the collector's disk,
+    // not that signy holds it. Everything still in the queue arrives after the
+    // workloads stop, so the end scrape has to wait for it — otherwise the
+    // accounting below reports a shortfall that is only the harness reading
+    // too early.
+    let collector_drain = drain_backlog(&cfg, &mut probe_client).await;
     let end_metrics = scrape(&mut probe_client).await.unwrap_or_default();
 
     let report = build_report(ReportInputs {
@@ -749,6 +767,7 @@ async fn run_load(cfg: Config) {
         metric_query,
         start_metrics,
         end_metrics,
+        collector_drain,
         ended_on: if cfg.target_events > 0
             && events_accepted.load(Ordering::Relaxed) >= cfg.target_events
         {
@@ -809,6 +828,40 @@ async fn wait_for_ready(cfg: &Config) -> Result<(), String> {
     Err(last)
 }
 
+/// Wait for the collector in front, when there is one.
+///
+/// collecty serves three POST paths and nothing else — no readiness route, and
+/// nothing to ask about its queue from outside — so the check is that it
+/// answers at all. `GET /v1/logs` is refused with `405`, and a refusal from
+/// the process is proof the process is there. Silence is not: a run that
+/// started against a collector still binding its socket would count every
+/// early push as a connection error.
+async fn wait_for_collector(cfg: &Config) -> Result<(), String> {
+    let Some(address) = cfg.push_address.as_deref() else {
+        return Ok(());
+    };
+    let mut client = Client::new(address, Duration::from_secs(5));
+    let mut last = "no attempt made".to_string();
+    for _ in 0..60 {
+        match client
+            .request(&Request {
+                method: "GET",
+                path: "/v1/logs",
+                body: &[],
+                content_type: "",
+                tenant: None,
+                headers: &[],
+            })
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) => last = error,
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(last)
+}
+
 /// Onboard the tenants this run pushes under.
 ///
 /// signy's tenant registry *is* the set of pushed retention policies: a
@@ -857,6 +910,64 @@ async fn onboard_tenants(cfg: &Config, tenants: &[&str]) -> Result<(), String> {
 /// scrapes, VictoriaLogs' server closes idle connections, and the first
 /// request on a dead socket fails before the client notices — measured as a
 /// behavioral gate reading zero rows from an engine that ingested millions.
+/// What waiting for the collector's backlog cost, and whether it was enough.
+#[derive(Default)]
+struct CollectorDrain {
+    /// False when there was nothing to wait for: a run pushing straight at the
+    /// engine has no queue in front of it.
+    waited: bool,
+    seconds: f64,
+    /// True when the arrival counter went quiet before the deadline. False is
+    /// the run saying its end-of-run accounting is short by whatever was still
+    /// in flight, rather than the accounting silently reporting a loss.
+    settled: bool,
+    requests_at_end: u64,
+}
+
+/// Wait for what a collecty still holds to reach signy.
+///
+/// A `200` from a collector means the export is on its disk. The queue drains
+/// on its own schedule after that, so a run that scraped the moment its
+/// workloads stopped would count as missing every record still queued.
+///
+/// The signal is signy's own request counter: one collect request is one
+/// segment, so a counter that has stopped advancing means nothing is arriving
+/// any more. Three quiet polls rather than one, because a sender that has just
+/// been refused is backing off and a single quiet poll cannot tell that from an
+/// empty queue.
+async fn drain_backlog(cfg: &Config, client: &mut Client) -> CollectorDrain {
+    let mut drain = CollectorDrain::default();
+    if cfg.push_address.is_none() || cfg.drain_seconds == 0 {
+        return drain;
+    }
+    drain.waited = true;
+    const QUIET_POLLS: u32 = 3;
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(cfg.drain_seconds);
+    let mut previous = u64::MAX;
+    let mut quiet = 0;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let Some(metrics) = scrape(client).await else {
+            continue;
+        };
+        let arrived = probe::gauge(&metrics, "signy_ingest_requests_total");
+        drain.requests_at_end = arrived;
+        if arrived == previous {
+            quiet += 1;
+            if quiet >= QUIET_POLLS {
+                drain.settled = true;
+                break;
+            }
+        } else {
+            quiet = 0;
+            previous = arrived;
+        }
+    }
+    drain.seconds = started.elapsed().as_secs_f64();
+    drain
+}
+
 async fn scrape(client: &mut Client) -> Option<probe::Metrics> {
     for _ in 0..2 {
         let request = Request {
@@ -896,7 +1007,7 @@ async fn push_pacer(
             late_fraction: cfg.late_fraction,
             late_max_ms: cfg.late_max_ms,
         },
-        cfg.target,
+        cfg.push_wire(),
     );
     let interval = cfg.push_interval();
     let mut intended = Instant::now();
@@ -939,7 +1050,9 @@ async fn push_worker(
     warmup_end: Instant,
     events_accepted: Arc<AtomicU64>,
 ) -> PushOutcome {
-    let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
+    let wire = cfg.push_wire();
+    let push_path = wire.path(Signal::Logs).expect("signy takes logs");
+    let mut client = Client::new(cfg.push_address(), cfg.request_timeout());
     let mut outcome = PushOutcome::default();
     loop {
         let job = {
@@ -956,10 +1069,10 @@ async fn push_worker(
         let result = client
             .request(&Request {
                 method: "POST",
-                path: cfg.target.push_path(),
+                path: push_path,
                 body: &job.body.bytes,
                 content_type: PUSH_CONTENT_TYPE,
-                headers: cfg.target.push_headers(Signal::Logs),
+                headers: wire.headers(Signal::Logs),
                 tenant: job
                     .body
                     .tenant_header
@@ -1287,7 +1400,7 @@ async fn otlp_workload(
     let Some(interval) = cfg.otlp_interval() else {
         return outcome;
     };
-    let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
+    let mut client = Client::new(cfg.push_address(), cfg.request_timeout());
     let mut rng = signy::corpus::Rng::new(cfg.seed ^ OTLP_SEED_SALT);
     let mut intended = Instant::now();
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
@@ -1344,20 +1457,21 @@ async fn send_otlp(
             ..Default::default()
         }],
     };
-    let body = cfg.target.wrap_push(request.encode_to_vec());
+    let wire = cfg.push_wire();
+    let body = wire.wrap(request.encode_to_vec());
     let response = client
         .request(&Request {
             method: "POST",
-            path: cfg.target.push_path(),
+            path: wire.path(Signal::Traces).expect("signy takes traces"),
             body: &body,
             content_type: PUSH_CONTENT_TYPE,
             tenant: None,
-            headers: cfg.target.push_headers(Signal::Traces),
+            headers: wire.headers(Signal::Traces),
         })
         .await?;
     match response.status {
         200 | 204 => Ok(()),
-        status => Err(format!("the collect route answered {status}")),
+        status => Err(format!("the ingest route answered {status}")),
     }
 }
 
@@ -1412,6 +1526,7 @@ struct ReportInputs<'a> {
     metric_query: metric_leg::MetricQueryOutcome,
     start_metrics: probe::Metrics,
     end_metrics: probe::Metrics,
+    collector_drain: CollectorDrain,
     ended_on: &'static str,
 }
 
@@ -1485,6 +1600,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         mut metric_query,
         start_metrics,
         end_metrics,
+        collector_drain,
         ended_on,
     } = inputs;
 
@@ -1499,6 +1615,14 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         &end_metrics,
         "signy_ingest_dropped_resources_total",
     );
+    // Records a batch carried that signy will never accept. Zero on every run:
+    // unlike a dropped resource, which is a tenant this instance does not
+    // serve, this is a record it could not read at all.
+    let collect_dropped_records = delta("signy_collect_dropped_records_total");
+    // Records a collecty sent again that signy already had. Not a failure —
+    // it is the resume working — so it is reported rather than gated. A run
+    // that restarted either side is expected to move it.
+    let collect_skipped_records = delta("signy_collect_skipped_records_total");
     let signy_delivered = push.events_accepted > 0 && dropped_resources == 0;
     let retention_success = delta("signy_retention_success_total");
     let restore_success = delta("signy_remote_restore_success_total");
@@ -1776,10 +1900,25 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 "restore_probe_rows": query.restore_rows,
                 "restore_probes_with_rows": query.restore_probes_with_rows,
                 "retention_observed": retention_success > 0,
+                // The collector in front, when there is one. `settled` is the
+                // gate: a run whose backlog had not arrived by the deadline
+                // cannot say what reached storage, so its accounting is not a
+                // loss report and must not read as one.
+                "ingest_path": if cfg.push_address.is_some() { "collecty" } else { "direct" },
+                "collector_drain": {
+                    "waited": collector_drain.waited,
+                    "settled": collector_drain.settled,
+                    "seconds": collector_drain.seconds,
+                    "ingest_requests_at_end": collector_drain.requests_at_end,
+                },
+                "collect_dropped_records": collect_dropped_records,
+                "collect_skipped_records": collect_skipped_records,
                 "metric_leg": metric_report,
             }),
             signy_delivered
                 && ingest_errors == 0
+                && collect_dropped_records == 0
+                && (!collector_drain.waited || collector_drain.settled)
                 && remote_healthy_fraction >= 0.95
                 && cache_healthy_end
                 && flush_progressing
