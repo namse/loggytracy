@@ -154,6 +154,25 @@ TRACE_EPS="${SOAK_TRACE_EPS:-5}"
 # The feature probe: every read route, every this many seconds, for the whole
 # run. `0` turns it off.
 PROBE_INTERVAL="${SOAK_PROBE_INTERVAL:-300}"
+# The fault schedule: restarts and an outage at fixed fractions of the run.
+#
+# A day of steady state answers half the question. The other half is what
+# happens when a process comes back — whether the WAL replays what it owed,
+# whether the collector's queue drains into the engine that returns, whether a
+# segment already stored is skipped rather than stored twice, and whether the
+# read surface is whole afterwards. None of that is reachable from a run
+# nothing interrupts.
+FAULTS="${SOAK_FAULTS:-on}"
+# How long the engine is left down at the outage step. Long enough for the
+# collector's queue to grow visibly and its sender to back off, short enough
+# not to fill it.
+DOWNTIME="${SOAK_DOWNTIME_SECONDS:-180}"
+# Queries fail while the engine is deliberately down, and the harness's error
+# gate is zero by default -- so a scheduled outage would fail the run on the
+# errors the schedule caused. This is the budget those windows are allowed,
+# applied only when faults are on. The failures stay in the report and the
+# fault log says exactly when each window was.
+FAULT_ERROR_BUDGET="${SOAK_FAULT_ERROR_BUDGET:-0.02}"
 
 if [ "${SOAK_SKIP_BUILD:-0}" != "1" ]; then
   cargo build --manifest-path "$ROOT/Cargo.toml" --release --bin load
@@ -201,18 +220,39 @@ systemctl --user reset-failed "$COLLECTY_UNIT.scope" 2>/dev/null
 
 cleanup() {
   rm -f "$OUT/RUNNING"
-  for p in ${PROBE_PID:-} ${SAMPLER_PID:-} ${QUEUE_SAMPLER_PID:-} ${PROF_PID:-} \
-           ${WATCH_PID:-} ${COLLECTY_PID:-} ${SERVER_PID:-}; do
+  for p in ${PROBE_PID:-} ${FAULT_PID:-} ${SAMPLER_PID:-} ${QUEUE_SAMPLER_PID:-} \
+           ${PROF_PID:-} ${WATCH_PID:-} $(collecty_pid) $(signy_pid); do
     kill "$p" 2>/dev/null
   done
   sleep 1
-  [ -n "${COLLECTY_PID:-}" ] && kill -KILL "$COLLECTY_PID" 2>/dev/null
-  [ -n "${SERVER_PID:-}" ] && kill -KILL "$SERVER_PID" 2>/dev/null
+  # The pid files, not the variables: a restart happened in a background shell
+  # and this one's copies are a generation behind.
+  kill -KILL "$(collecty_pid)" 2>/dev/null
+  kill -KILL "$(signy_pid)" 2>/dev/null
   [ "${SOAK_KEEP_DATA:-0}" = "1" ] || rm -rf "$DATA" "$QUEUE_DIR" ${STORE_DIR:+"$STORE_DIR"}
   systemctl --user reset-failed "$UNIT.scope" 2>/dev/null
   systemctl --user reset-failed "$COLLECTY_UNIT.scope" 2>/dev/null
 }
 trap cleanup EXIT
+
+signy_pid() { cat "$OUT/signy.pid" 2>/dev/null; }
+collecty_pid() { cat "$OUT/collecty.pid" 2>/dev/null; }
+fault_log() { echo "$(date +%s) +$(( $(date +%s) - ${RUN_STARTED:-$(date +%s)} ))s $*" >>"$OUT/faults.log"; }
+
+# Signal a process and wait for it to actually be gone. A restart that reuses
+# the unit name cannot start until the old scope is empty, so returning before
+# the process has exited would race the next start against its own predecessor.
+stop_process() {
+  local pid="$1" signal="$2"
+  [ -n "$pid" ] || return 0
+  kill "-$signal" "$pid" 2>/dev/null
+  for _ in $(seq 1 1200); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.5
+  done
+  kill -KILL "$pid" 2>/dev/null
+  sleep 1
+}
 
 # Both processes start from a function rather than inline, because a soak that
 # never restarts either of them has not been told anything about what happens
@@ -231,6 +271,9 @@ start_signy() {
         ${MEMORY_HIGH:+-p MemoryHigh="$MEMORY_HIGH"} \
         -- "$BIN" >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
+  # Written down as well as held, because the restarts happen in a background
+  # shell whose variables this one never sees.
+  echo "$SERVER_PID" >"$OUT/signy.pid"
   for _ in $(seq 1 600); do
     curl -fsS "http://127.0.0.1:$PORT/ready" >/dev/null 2>&1 && return 0
     kill -0 "$SERVER_PID" 2>/dev/null || { echo "server died before ready"; tail -40 "$SERVER_LOG"; return 1; }
@@ -259,6 +302,7 @@ start_collecty() {
         -p MemoryMax="$COLLECTY_LIMIT" -p MemorySwapMax=0 \
         -- "$COLLECTY_BIN" >>"$COLLECTY_LOG" 2>&1 &
   COLLECTY_PID=$!
+  echo "$COLLECTY_PID" >"$OUT/collecty.pid"
   for _ in $(seq 1 120); do
     curl -s -o /dev/null "http://$COLLECTY_ADDR/v1/logs" && return 0
     kill -0 "$COLLECTY_PID" 2>/dev/null || { echo "collecty died before it listened"; tail -40 "$COLLECTY_LOG"; return 1; }
@@ -482,9 +526,96 @@ if [ "$PROBE_INTERVAL" -gt 0 ] 2>/dev/null; then
 fi
 
 # The harness has a 60 s request timeout, so without this a run whose server
-# was killed mid-soak would sit for minutes producing nothing.
-( while kill -0 "$SERVER_PID" 2>/dev/null; do sleep 1; done; sleep 3; pkill -f 'target/release/load' ) &
+# died mid-soak would sit for minutes producing nothing.
+#
+# It has to tell a death from a scheduled restart, or the first fault would end
+# the run it exists to survive: a stop the schedule is in the middle of raises
+# FAULT_ACTIVE, and a server that is gone for half a minute with no fault to
+# explain it is the case this was written for.
+(
+  gone=0
+  while [ -f "$OUT/RUNNING" ]; do
+    if kill -0 "$(signy_pid)" 2>/dev/null || [ -f "$OUT/FAULT_ACTIVE" ]; then
+      gone=0
+    else
+      gone=$((gone + 1))
+    fi
+    if [ "$gone" -ge 30 ]; then
+      echo "server gone for 30 s with no fault in progress" >"$OUT/SERVER_DIED"
+      pkill -f 'target/release/load'
+      break
+    fi
+    sleep 1
+  done
+) &
 WATCH_PID=$!
+
+RUN_STARTED=$(date +%s)
+
+# The schedule. Fractions of the run rather than wall-clock offsets, so a
+# thirty-minute smoke exercises the same sequence a day does.
+#
+#   10%  the collector restarts. Its queue is the only copy of an acked export
+#        until signy takes it, so this asks whether that survives a stop.
+#   25%  the engine restarts gracefully. The WAL replays, the collector's
+#        backlog drains into it, and a segment it already stored is skipped
+#        rather than stored twice.
+#   40%  the engine is down for DOWNTIME. The collector queues and backs off;
+#        nothing acked may be lost.
+#   55%  the engine is killed outright. This is the crash path -- the WAL
+#        replay that a clean shutdown never exercises.
+#   70%  the engine restarts again, now with hours of parts on disk. Startup is
+#        linear in part count, and this is the end of the line that the earlier
+#        restart is the other end of.
+#
+# The collector is never killed outright. An open segment has not been fsynced,
+# and losing it would be collecty behaving as documented -- a loss window this
+# run cannot then tell apart from a defect.
+if [ "$FAULTS" != "off" ]; then
+  (
+    pct() { echo $(( SECONDS_CAP * $1 / 100 )); }
+    wait_until() {
+      while [ -f "$OUT/RUNNING" ]; do
+        [ $(( $(date +%s) - RUN_STARTED )) -ge "$1" ] && return 0
+        sleep 5
+      done
+      return 1
+    }
+    fault() { touch "$OUT/FAULT_ACTIVE"; fault_log "$@"; }
+    done_fault() { rm -f "$OUT/FAULT_ACTIVE"; fault_log "$@"; }
+
+    if [ "$COLLECTY" != "off" ]; then
+      wait_until "$(pct 10)" || exit 0
+      fault "collecty: SIGTERM"
+      stop_process "$(collecty_pid)" TERM
+      start_collecty && done_fault "collecty: back up" || done_fault "collecty: FAILED TO RESTART"
+    fi
+
+    wait_until "$(pct 25)" || exit 0
+    fault "signy: SIGTERM"
+    stop_process "$(signy_pid)" TERM
+    start_signy && done_fault "signy: back up" || done_fault "signy: FAILED TO RESTART"
+
+    wait_until "$(pct 40)" || exit 0
+    fault "signy: down for ${DOWNTIME}s"
+    stop_process "$(signy_pid)" TERM
+    sleep "$DOWNTIME"
+    start_signy && done_fault "signy: back up after the outage" || done_fault "signy: FAILED TO RESTART"
+
+    wait_until "$(pct 55)" || exit 0
+    fault "signy: SIGKILL"
+    stop_process "$(signy_pid)" KILL
+    start_signy && done_fault "signy: back up after the kill" || done_fault "signy: FAILED TO RESTART"
+
+    wait_until "$(pct 70)" || exit 0
+    fault "signy: SIGTERM with the run's parts on disk"
+    stop_process "$(signy_pid)" TERM
+    start_signy && done_fault "signy: back up" || done_fault "signy: FAILED TO RESTART"
+  ) &
+  FAULT_PID=$!
+fi
+
+[ "$FAULTS" != "off" ] && export SIGNY_TARGET_MAX_ERROR_RATE="$FAULT_ERROR_BUDGET"
 
 SIGNY_LOAD_TARGET=signy \
 SIGNY_LOAD_PHASE=load \
@@ -513,7 +644,7 @@ LOAD_STOPPED_AT=$(date +%s.%N)
 # on it, and after it has had the settle window to give memory back. Both are
 # pulled only while the server is up, which is the only time they exist.
 capture_allocator() {
-  kill -0 "$SERVER_PID" 2>/dev/null || return 0
+  kill -0 "$(signy_pid)" 2>/dev/null || return 0
   curl -fsS --max-time 15 "http://127.0.0.1:$PORT/debug/allocator" \
     >"$OUT/allocator-$1.txt" 2>/dev/null || true
   curl -fsS --max-time 60 "http://127.0.0.1:$PORT/debug/allocator/profile" \
@@ -523,7 +654,7 @@ capture_allocator loaded
 
 # The settle window: the load is gone, the server is not. Sampling continues,
 # so the series carries a stretch with no work in it to compare against.
-if [ "$SETTLE" -gt 0 ] 2>/dev/null && kill -0 "$SERVER_PID" 2>/dev/null; then
+if [ "$SETTLE" -gt 0 ] 2>/dev/null && kill -0 "$(signy_pid)" 2>/dev/null; then
   echo "settling for ${SETTLE}s with the load stopped"
   sleep "$SETTLE"
   capture_allocator settled
@@ -551,7 +682,7 @@ kill "$SAMPLER_PID" 2>/dev/null; SAMPLER_PID=
 kill "${QUEUE_SAMPLER_PID:-}" 2>/dev/null; QUEUE_SAMPLER_PID=
 
 ALIVE=false
-kill -0 "$SERVER_PID" 2>/dev/null && ALIVE=true
+kill -0 "$(signy_pid)" 2>/dev/null && ALIVE=true
 GUARD=ok
 [ -f "$OUT/DISK_GUARD" ] && GUARD="tripped: $(cat "$OUT/DISK_GUARD")"
 
@@ -780,6 +911,13 @@ GUARD=ok
                last / 1048576.0, held, last / held
       }' "$OUT/mem.csv"
   fi
+  if [ -f "$OUT/faults.log" ]; then
+    echo "faults (error budget for their windows: $FAULT_ERROR_BUDGET):"
+    sed 's/^/  /' "$OUT/faults.log"
+    grep -q "FAILED TO RESTART" "$OUT/faults.log" && echo "  A PROCESS DID NOT COME BACK"
+  fi
+  [ -f "$OUT/SERVER_DIED" ] && echo "watchdog: $(cat "$OUT/SERVER_DIED")"
+
   # The trace leg's read-back, and the wait for the collector's queue. Both are
   # booleans about whether this run can be believed: a trace that did not come
   # back is a wrong answer, and accounting taken before the backlog arrived is
@@ -789,6 +927,7 @@ GUARD=ok
       "traces: sent=\(.traces.sent) spans=\(.traces.spans_sent) errors=\(.traces.errors) " +
       "readback pass=\(.traces.readback.pass) verified=\(.traces.readback.verified) " +
       "missing=\(.traces.readback.missing) short=\(.traces.readback.short) " +
+      "unreachable=\(.traces.readback.unreachable) retried=\(.traces.readback.retried) " +
       "search_empty=\(.traces.readback.search_empty)/\(.traces.readback.search_probes)",
       (if .traces.readback.first_error then "  first trace error: \(.traces.readback.first_error)" else empty end)
     else empty end,
@@ -806,7 +945,7 @@ GUARD=ok
       NR>1 {
         name = $3; ok = $6
         seen[name] = 1
-        if (!(name in order)) order[name] = ++n, byindex[n] = name
+        if (!(name in order)) { order[name] = ++n; byindex[n] = name }
         if (ok == 1) pass[name]++
         else if (ok == "skip") skip[name]++
         else {
@@ -857,10 +996,16 @@ GUARD=ok
     printf "  %-28s %s\n" "queue_dropped_segments (0)" "$(collecty_metric collecty_queue_dropped_segments_total)"
     printf "  %-28s %s\n" "queue_bytes" "$(collecty_metric collecty_queue_bytes)"
     # What the harness got a 2xx for, against what the collector recorded.
-    # They do not have to be equal: collecty's own metric exports are records
-    # it appends too, one per report interval, and they are the difference.
+    #
+    # These are not expected to be equal and a difference is not a loss. The
+    # counters above are read out of the last self-report collecty managed to
+    # ship, so they trail the run by up to one report interval; and its own
+    # metric exports are records it appended too, so they push the other way.
+    # What must be exactly zero is `refused` and `dropped` -- those are the
+    # counters that mean bytes were thrown away.
     EXPORTS=$(jq -r '.exports_accepted // 0' "$OUT/load.json" 2>/dev/null)
     printf "  %-28s %s\n" "harness exports (2xx)" "${EXPORTS:-0}"
+    echo "  (the counters above trail by up to one 30s report interval)"
   fi
 
   # The collector's memory and backlog over the run. Quarters, like the engine's

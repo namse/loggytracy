@@ -201,6 +201,13 @@ struct OtlpOutcome {
     verified: u64,
     missing: u64,
     short: u64,
+    /// Probes that could not be made: the read address did not answer at all.
+    /// Not a wrong answer — a soak takes the engine down on purpose — so it is
+    /// counted and reported rather than failed.
+    unreachable: u64,
+    /// Traces asked for again after a 404, because a backlog can put one behind
+    /// the probe's lag.
+    retried: u64,
     /// Set when the run was long enough for a sent trace to come back. A run
     /// that stopped before the first probe was due proves nothing about the
     /// read path, and must not read as if it had.
@@ -1456,8 +1463,14 @@ async fn otlp_workload(
         if let Some((at, _)) = pending.front()
             && at.elapsed() >= lag
         {
-            let (_, trace) = pending.pop_front().expect("the front was just read");
-            verify_trace(&mut reader, &read_tenant, &trace, &mut outcome).await;
+            let (_, mut trace) = pending.pop_front().expect("the front was just read");
+            if verify_trace(&mut reader, &read_tenant, &trace, &mut outcome).await
+                == TraceProbe::AskAgain
+            {
+                outcome.retried += 1;
+                trace.attempts += 1;
+                pending.push_back((Instant::now(), trace));
+            }
             // Every tenth read-back also asks the question a console opens
             // with: what traces are there at all. It shares the probe's pacing
             // so it cannot become a workload of its own.
@@ -1474,6 +1487,22 @@ async fn otlp_workload(
 struct SentTrace {
     id: String,
     spans: u64,
+    /// How many times it has been asked for and answered 404.
+    ///
+    /// One 404 is not yet a miss when a collector stands in front: the export
+    /// is on the collector's disk the moment it is acked, and a backlog — a
+    /// restart, a signy that was down for a few minutes — can put it behind
+    /// the probe's lag. A second 404 a lag later is the miss.
+    attempts: u32,
+}
+
+/// What the caller should do with a trace after one probe.
+#[derive(PartialEq, Eq)]
+enum TraceProbe {
+    Done,
+    /// A first 404 or an unanswered read: ask once more a lag later, because a
+    /// backlog in front of the engine is not the engine losing a trace.
+    AskAgain,
 }
 
 /// Read one trace back by id and check every span it was sent came back.
@@ -1487,7 +1516,7 @@ async fn verify_trace(
     read_tenant: &(&'static str, String),
     trace: &SentTrace,
     outcome: &mut OtlpOutcome,
-) {
+) -> TraceProbe {
     outcome.verify_attempts += 1;
     let path = format!("/signy/api/v1/traces/{}", trace.id);
     let response = reader
@@ -1518,22 +1547,33 @@ async fn verify_trace(
                     )
                 });
             }
+            TraceProbe::Done
         }
+        Ok(response) if response.status == 404 && trace.attempts == 0 => TraceProbe::AskAgain,
         Ok(response) if response.status == 404 => {
             outcome.missing += 1;
             outcome
                 .first_verify_error
-                .get_or_insert_with(|| format!("trace {} was not found", trace.id));
+                .get_or_insert_with(|| format!("trace {} was not found twice", trace.id));
+            TraceProbe::Done
         }
         Ok(response) => {
             outcome.missing += 1;
             outcome.first_verify_error.get_or_insert_with(|| {
                 format!("the timeline route answered {}", response.status)
             });
+            TraceProbe::Done
         }
-        Err(error) => {
-            outcome.missing += 1;
-            outcome.first_verify_error.get_or_insert(error);
+        // The read address did not answer. A soak stops the engine on purpose,
+        // so this says nothing about whether the trace is stored, and asking
+        // again once is the only honest thing to do with it.
+        Err(_) if trace.attempts == 0 => {
+            outcome.unreachable += 1;
+            TraceProbe::AskAgain
+        }
+        Err(_) => {
+            outcome.unreachable += 1;
+            TraceProbe::Done
         }
     }
 }
@@ -1631,6 +1671,7 @@ async fn send_otlp(
     let sent = SentTrace {
         id: trace_id.iter().map(|byte| format!("{byte:02x}")).collect(),
         spans: spans.len() as u64,
+        attempts: 0,
     };
     let request = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
@@ -2397,6 +2438,8 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
             "verified": otlp.verified,
             "missing": otlp.missing,
             "short": otlp.short,
+            "unreachable": otlp.unreachable,
+            "retried": otlp.retried,
             "search_probes": otlp.search_probes,
             "search_empty": otlp.search_empty,
             "first_error": otlp.first_verify_error,

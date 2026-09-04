@@ -47,9 +47,11 @@ ROUNDS="${PROBE_ROUNDS:-0}"
 # of the engine rather than of this script's guess.
 METRIC="${PROBE_METRIC:-http_requests_total}"
 HISTOGRAM="${PROBE_HISTOGRAM:-http_request_duration_seconds}"
-# How long the tail is held open. Long enough to see rows at any ingest rate,
-# short enough not to hold one of SIGNY_MAX_CONCURRENT_TAILS for a round.
-TAIL_SECONDS="${PROBE_TAIL_SECONDS:-6}"
+# How long the tail is held open. Past the ~15 s keep-alive on purpose: on a
+# tenant with nothing arriving, the heartbeat is the only thing that proves the
+# stream is alive, and a window shorter than it would fail every round after the
+# load stops.
+TAIL_SECONDS="${PROBE_TAIL_SECONDS:-18}"
 # Rounds between deletion-surface probes. Not every round: a request the engine
 # promotes to `processed` before the probe withdraws it can no longer be
 # withdrawn and stays in the tenant's listing for good, and a tenant may hold
@@ -62,6 +64,22 @@ BODY=$(mktemp); HEAD=$(mktemp)
 trap 'rm -f "$BODY" "$HEAD"' EXIT
 [ -f "$CSV" ] || echo "round,t,probe,status,rows,ok,detail" >"$CSV"
 
+# A tenant is served when a retention policy has been pushed for it, and the
+# load harness pushes those for its own tenants as it starts. This probe is
+# started first, so without this wait its first round asks every route about a
+# tenant that does not exist yet and records the whole surface as broken.
+wait_for_tenant() {
+  local waited=0
+  while [ "$waited" -lt "${PROBE_TENANT_WAIT:-600}" ]; do
+    if [ "$(req GET "$API/admin/tenants/$TENANT/retention")" = "200" ]; then
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "tenant $TENANT was never onboarded; probing anyway"
+}
+
 T0=$(date +%s)
 ROUND=0
 PASS=0
@@ -72,12 +90,27 @@ SKIP=0
 # when nothing answered -- which is a failure the same as a 500 and has to be
 # distinguishable from one in the file.
 req() {
-  local method="$1" url="$2" tenant="${3:-$TENANT}"
-  curl -sS -o "$BODY" -D "$HEAD" -w '%{http_code}' \
-    --max-time 30 -X "$method" -H "X-Tenant-Id: $tenant" "$url" 2>/dev/null || echo "000"
+  local method="$1" url="$2" tenant="${3:-$TENANT}" code
+  # Emptied first: a curl that cannot connect leaves the previous probe's body
+  # in place, and the failure would then be recorded with another route's
+  # answer as its evidence.
+  : >"$BODY"
+  # No `|| echo`: curl prints `000` for a connection that never happened and
+  # exits non-zero as well, so a fallback echo would put two codes in the
+  # substitution and a newline in the middle of a CSV row.
+  code=$(curl -sS -o "$BODY" -D "$HEAD" -w '%{http_code}' \
+    --max-time 30 -X "$method" -H "X-Tenant-Id: $tenant" "$url" 2>/dev/null)
+  echo "${code:-000}"
 }
 
-rows() { grep -c . "$BODY" 2>/dev/null || echo 0; }
+# Non-empty lines in the last body. awk rather than `grep -c`, which exits 1 on
+# a count of zero and would put a second line in the substitution — a newline in
+# the middle of a CSV row, which reads back as a row of its own.
+rows() {
+  local n
+  n=$(awk 'NF { n++ } END { print n + 0 }' "$BODY" 2>/dev/null)
+  echo "${n:-0}"
+}
 
 # Record one probe. `ok` is the caller's verdict; `detail` is whatever makes a
 # failure diagnosable a day later without the server still being up.
@@ -120,7 +153,26 @@ round() {
 
   # --- liveness -----------------------------------------------------------
   status=$(req GET "$BASE/ready")
-  [ "$status" = "200" ] && record ready "$status" 0 1 || record ready "$status" 0 0
+  if [ "$status" != "200" ]; then
+    # The engine is not answering. Every route would fail, and recording
+    # twenty-eight failures would say the surface broke when what happened is
+    # that the process was down -- which `ready` above already records, and
+    # which the run's fault log explains. So the rest of the round is skipped.
+    record ready "$status" 0 0 "the engine did not answer /ready"
+    for route in metrics logs logs_filtered logs_histogram logs_attributes \
+                 logs_attribute_values logs_tail delete_submit delete_list \
+                 delete_cancel traces_search traces_by_id traces_attributes \
+                 traces_attribute_values metrics_names metrics_labels \
+                 metrics_label_values metrics_series metrics_query \
+                 metrics_instant metrics_quantile admin_list \
+                 admin_retention_get admin_usage admin_retention_put \
+                 admin_retention_delete unknown_route; do
+      record "$route" skipped 0 skip "the engine was not ready"
+    done
+    echo "round $ROUND at +$(( $(date +%s) - T0 ))s: engine not ready, round skipped"
+    return
+  fi
+  record ready "$status" 0 1
   status=$(req GET "$BASE/metrics")
   if [ "$status" = "200" ] && grep -q '^signy_ingest_requests_total' "$BODY"; then
     record metrics "$status" "$(rows)" 1
@@ -254,9 +306,11 @@ round() {
   expect admin_usage "$status" 1
 
   # The half of the lifecycle that writes, on a tenant of this probe's own.
+  : >"$BODY"
   status=$(curl -sS -o "$BODY" -w '%{http_code}' --max-time 30 \
     -X PUT -H 'Content-Type: application/json' \
-    -d '{"retention":"1h"}' "$API/admin/tenants/$ADMIN_TENANT/retention" 2>/dev/null || echo 000)
+    -d '{"retention":"1h"}' "$API/admin/tenants/$ADMIN_TENANT/retention" 2>/dev/null)
+  status="${status:-000}"
   if [ "$status" = "200" ] || [ "$status" = "204" ]; then
     record admin_retention_put "$status" 0 1
     status=$(req DELETE "$API/admin/tenants/$ADMIN_TENANT/retention" "$ADMIN_TENANT")
@@ -278,6 +332,8 @@ round() {
 
   echo "round $ROUND at +$(( $(date +%s) - T0 ))s: $PASS ok, $FAIL failed, $SKIP skipped"
 }
+
+wait_for_tenant
 
 while true; do
   round
