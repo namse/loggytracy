@@ -1,33 +1,37 @@
 # CLAUDE.md
 
-## 저장소 구조
+## Repository layout
 
-이 저장소는 obsy이고, 제품 이름이다. 그 안에 컴포넌트가 하나씩 들어간다.
+This repository is obsy, which is the product name. Each component lives in a
+directory under it.
 
-- `signy/` — 저장·질의 엔진. 크레이트 루트가 여기이므로 빌드와 테스트는
-  `cd signy && cargo test`로 한다
-- `collecty/` — collector. OTLP/HTTP로 받아 zstd로 압축해 append-only 디스크
-  큐에 쌓고, 모아서 signy로 보낸다. 빌드와 테스트는 `cd collecty && cargo test`
+- `signy/` — the storage and query engine. The crate root is here, so build and
+  test with `cd signy && cargo test`
+- `collecty/` — the collector. Takes OTLP/HTTP, compresses with zstd into an
+  append-only disk queue, and forwards batches to signy. Build and test with
+  `cd collecty && cargo test`
 
-루트에는 Cargo workspace가 없다. 컴포넌트마다 자기 `Cargo.lock`과
-`rust-toolchain.toml`을 들고 따로 빌드한다. obsy는 빌드·런타임에 등장하지 않는
-이름이다: 바이너리, 크레이트, env 접두사, 메트릭 패밀리, 이미지 이름은 전부
-컴포넌트 이름을 쓴다.
+There is no Cargo workspace at the root. Each component carries its own
+`Cargo.lock` and `rust-toolchain.toml` and builds separately. obsy is a name
+that never appears at build or run time: binaries, crates, env prefixes, metric
+families and image names all use the component's name.
 
-## 커밋 메시지
+## Commit messages
 
-짧은 영어로 쓴다. 형식은 `<area>: <동사원형> <목적어>`.
+Short, in English. The form is `<area>: <verb> <object>`.
 
-- subject는 50자 이내, 길어도 72자를 넘기지 않는다
-- 소문자로 시작하고 마침표를 붙이지 않는다
-- 명령형 현재시제를 쓴다 (`add`, `fix`, `remove`, `move`)
-- subject에 서술문을 여러 개 이어붙이지 않는다. 이유나 배경은 body에 쓴다
-- body는 필요할 때만 쓰고, subject와 빈 줄로 띄운다
+- keep the subject under 50 characters, and never past 72
+- start lower case, no trailing period
+- imperative present tense (`add`, `fix`, `remove`, `move`)
+- do not chain several statements into the subject; reasons and background go
+  in the body
+- write a body only when it is needed, separated from the subject by a blank
+  line
 
-area는 코드가 사는 곳을 쓴다: `metrics`, `logs`, `traces`, `wal`, `manifest`,
-`compaction`, `query`, `api`, `bench`, `ci`, `docs`.
+The area is where the code lives: `metrics`, `logs`, `traces`, `wal`,
+`manifest`, `compaction`, `query`, `api`, `bench`, `ci`, `docs`.
 
-예시:
+Examples:
 
 ```
 metrics: add read API routes
@@ -35,7 +39,7 @@ bench: fail closed on unknown digest class
 wal: retire segments only after checkpoint
 ```
 
-body가 필요한 경우:
+When a body is warranted:
 
 ```
 metrics: fix series state accounting on abort
