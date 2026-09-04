@@ -71,7 +71,6 @@ pub struct Queue {
     dirs: [PathBuf; Signal::ALL.len()],
     sender: SenderId,
     limits: QueueLimits,
-    level: i32,
     inner: Mutex<Inner>,
     appended: Notify,
 }
@@ -225,7 +224,6 @@ impl Queue {
             dirs,
             sender,
             limits,
-            level,
             inner: Mutex::new(Inner {
                 signals: signals
                     .try_into()
@@ -423,8 +421,9 @@ impl Queue {
             + 1;
 
         // Closing writes out what the encoder held and forces the lot to the
-        // device, so the segment's true size is only known here.
-        let bytes = queue.active.finish()?;
+        // device, so the segment's true size is only known here. The
+        // compressor comes back out with it and opens the next segment.
+        let (bytes, encoder) = queue.active.finish()?;
         let back = queue
             .segments
             .back_mut()
@@ -433,7 +432,7 @@ impl Queue {
         back.bytes = bytes;
         back.stamp = stamp;
 
-        queue.active = SegmentWriter::create(&self.dirs[signal.index()], next, self.level)?;
+        queue.active = SegmentWriter::reusing(&self.dirs[signal.index()], next, encoder)?;
         queue.active_since = None;
         queue.segments.push_back(Held {
             seq: next,

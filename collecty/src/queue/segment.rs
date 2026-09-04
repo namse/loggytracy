@@ -26,9 +26,17 @@ pub struct SegmentFile {
 /// so what the file holds trails what has been accepted. Nothing forces that
 /// gap shut before the segment closes — `finish` is the only durability point
 /// the queue has, and it is the same moment the segment becomes sendable.
+///
+/// The compressor outlives the segment. `finish` hands it back and the next
+/// segment takes it: a zstd level 3 context is 3.5 MiB, it is allocated
+/// through C `malloc` where neither the queue's accounting nor the process's
+/// choice of Rust allocator reaches it, and a segment rolls as often as once
+/// a second per signal.
 pub struct SegmentWriter {
-    encoder: Option<zstd::stream::write::Encoder<'static, Counted>>,
+    inner: Option<Stream>,
 }
+
+type Stream = zstd::stream::zio::Writer<Counted, zstd::stream::raw::Encoder<'static>>;
 
 /// The segment file, counting what the encoder has actually handed it.
 ///
@@ -52,7 +60,21 @@ impl Write for Counted {
 }
 
 impl SegmentWriter {
+    /// A signal's first segment, which is the only one that builds a
+    /// compressor.
     pub fn create(dir: &Path, seq: u64, level: i32) -> io::Result<SegmentWriter> {
+        SegmentWriter::reusing(dir, seq, zstd::stream::raw::Encoder::new(level)?)
+    }
+
+    /// The next segment, on the compressor the last one finished with. The
+    /// session is reset; the level and every other parameter are kept.
+    pub fn reusing(
+        dir: &Path,
+        seq: u64,
+        mut encoder: zstd::stream::raw::Encoder<'static>,
+    ) -> io::Result<SegmentWriter> {
+        use zstd::stream::raw::Operation;
+        encoder.reinit()?;
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -61,28 +83,34 @@ impl SegmentWriter {
         file.sync_all()?;
         sync_dir(dir)?;
         Ok(SegmentWriter {
-            encoder: Some(encoder(file, level)?),
+            inner: Some(zstd::stream::zio::Writer::new(
+                Counted { file, written: 0 },
+                encoder,
+            )),
         })
     }
 
     pub fn write_all(&mut self, plain: &[u8]) -> io::Result<()> {
-        self.encoder.as_mut().ok_or_else(closed)?.write_all(plain)
+        self.inner.as_mut().ok_or_else(closed)?.write_all(plain)
     }
 
     /// What the file holds. Behind what has been accepted by whatever the
     /// encoder is still holding, and caught up by `finish`.
     pub fn written(&self) -> u64 {
-        self.encoder
+        self.inner
             .as_ref()
-            .map(|encoder| encoder.get_ref().written)
+            .map(|stream| stream.writer().written)
             .unwrap_or(0)
     }
 
-    /// Close the stream and force it to the device.
-    pub fn finish(&mut self) -> io::Result<u64> {
-        let counted = self.encoder.take().ok_or_else(closed)?.finish()?;
+    /// Close the stream, force it to the device, and hand the compressor back
+    /// for the next segment.
+    pub fn finish(&mut self) -> io::Result<(u64, zstd::stream::raw::Encoder<'static>)> {
+        let mut stream = self.inner.take().ok_or_else(closed)?;
+        stream.finish()?;
+        let (counted, encoder) = stream.into_inner();
         counted.file.sync_all()?;
-        Ok(counted.written)
+        Ok((counted.written, encoder))
     }
 }
 

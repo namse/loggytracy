@@ -126,6 +126,48 @@ fn a_segment_compresses_across_its_records() {
     );
 }
 
+/// The compressor outlives the segment, so the second segment is written by a
+/// context that has already compressed the first. What it produces has to be
+/// what a fresh context would have produced, or reuse would be a format change
+/// dressed as an optimization.
+#[test]
+fn a_segment_written_by_a_reused_compressor_is_byte_for_byte_a_fresh_one() {
+    let scratch = Scratch::new("reused-compressor");
+    let queue = open(&scratch, eager());
+
+    let first = lines(64);
+    for body in &first {
+        queue.append(Signal::Logs, body).expect("an append");
+    }
+    queue.seal_if_due().expect("a seal");
+
+    // The same compressor now opens the second segment.
+    let second = lines(64);
+    for body in &second {
+        queue.append(Signal::Logs, body).expect("an append");
+    }
+    queue.seal_if_due().expect("a seal");
+
+    // A fresh *streaming* compressor, which is what the queue used to build
+    // per segment. Not `zstd::bulk::compress`: that knows the whole input up
+    // front and records its size in the frame header, which is a byte the
+    // queue's stream never writes.
+    let mut fresh = zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL).expect("an encoder");
+    for body in &second {
+        std::io::Write::write_all(&mut fresh, &wire::frame_record(body)).expect("a frame");
+    }
+    let fresh = fresh.finish().expect("a stream");
+
+    let written = queue.read_segment(Signal::Logs, 2).expect("a segment").body;
+    assert_eq!(
+        written,
+        fresh,
+        "a reused compressor wrote {} bytes where a fresh one writes {}",
+        written.len(),
+        fresh.len()
+    );
+}
+
 /// The open segment is being appended to, so it is never offered. This is what
 /// removes the one place a reader and a writer shared a file.
 #[test]
