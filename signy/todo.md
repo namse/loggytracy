@@ -702,13 +702,19 @@ full because flush could not drain it — `visibility_ms` up to 3.6 s, `advance_
 `fsync_ms` 500–2400 ms, `io_full` 8.7–10.5 % of every run. Named gauges sum to ~837 MiB against
 1866 MiB of anon; the rest is what a stalled writer leaves behind.
 
-- [ ] **Re-run the soak on a quiet machine before drawing a conclusion from it.** This rig was
+- [x] **Re-run the soak on a quiet machine before drawing a conclusion from it.** This rig was
       sharing a disk with a rust-analyzer at 4.0 GB RSS, a stale `loggytracy` squatting port 3100 at
       1.38 GB, and a victoria-metrics, on a filesystem 85 % full. The I/O stall numbers above are not
       the engine's to answer for until that is ruled out, and the 24-hour pass this is being compared
       against (`soak-24h-lockorder`, 2026-08-12) predates both mimalloc and this machine's current
       state. Until then the honest statement is: **the gate passes and the soak does not, on a
       contended host, identically before and after the memory account**
+
+      *The host never had to be quieted: the cause was in the engine.* The bloom cache was holding a
+      copy of `index.bin`, thrashing, and re-decoding four megabytes two hundred times a second — see
+      the section below. On the same contended host, three 900 s runs at 2 GiB now finish with anon
+      peaking 1450–1635 MiB. Whether a quiet host would do better is now a question about margins
+      rather than about whether the soak can pass at all
 
 - [ ] **The trace expansion factor is a guess, and the only one left.** Logs and metrics price themselves from
       recorded numbers; traces scale stored bytes by a constant because `TracePartMeta` has no materialized
@@ -2764,9 +2770,19 @@ only thing that can say whether a fix worked, so it landed before them and it la
       smaller instead of merging oftener. At 2 GiB the derived cap is 322 MiB and the engine survived
       the workload that killed it, anon peak 1480 MiB; the merge arena under the cap was not itself
       re-measured (the surviving run is a production build), which a memprof soak can still do
-- [ ] **Sidecars inside the budget.** They are outside it on purpose today (`part/reader.rs:77-81`), so resident
+- [x] **Sidecars inside the budget.** They are outside it on purpose today (`part/reader.rs:77-81`), so resident
       memory grows with part count unbounded. Make them LRU-evictable — they are already durable in `index.bin`.
       Sized from the measured ~240 kB per part, not from a share
+
+      Done twice over, and the second time is the one that mattered. LRU eviction under
+      `SIDECAR_CACHE_MAX_BYTES` bounded the total — and then the eviction itself became the problem,
+      because what the cache held was a near-exact copy of the file (x1.01) at four megabytes a part.
+      A 122 MiB budget held about thirty parts against a working set of sixty to two hundred, and the
+      re-decode loop that produced filled the allocator faster than it could return pages. The cache
+      holds offsets into a mapped `index.bin` now (`58a58eb`): 1.3 kB per part, 0.6 MiB resident
+      across 233 parts, zero misses. The budget still exists and no longer binds — which is what
+      "inside the budget" was asking for, reached by making the thing small rather than by evicting
+      it harder
 - [x] **Stop materializing `PartMeta::streams`** (`part/mod.rs:231`, `part/metadata.rs:172-176`) — every distinct
       label set in every open part, held as live `String`s. Measured ~140 kB per part
 
