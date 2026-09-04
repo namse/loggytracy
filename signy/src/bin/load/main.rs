@@ -1825,6 +1825,22 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
     let traces_pass = otlp.missing == 0
         && otlp.short == 0
         && (!otlp.verification_expected || otlp.verified > 0);
+    // Every OTLP export this run got a 2xx for, across the three signals.
+    //
+    // The one number a collector's own `collecty_records_appended_total` can be
+    // read against: both count exports, and neither counts entries. It sits at
+    // the top of the report because reconciling the two is a shell's job at the
+    // end of a soak, and digging it out of three nested status maps with grep
+    // is not.
+    let accepted = |statuses: &BTreeMap<u16, u64>| -> u64 {
+        statuses
+            .iter()
+            .filter(|(status, _)| (200..300).contains(*status))
+            .map(|(_, count)| *count)
+            .sum()
+    };
+    let exports_accepted =
+        accepted(&push.statuses) + accepted(&metric_ingest.tally.statuses) + otlp.sent;
     let signy_delivered = push.events_accepted > 0 && dropped_resources == 0;
     let retention_success = delta("signy_retention_success_total");
     let restore_success = delta("signy_remote_restore_success_total");
@@ -2215,6 +2231,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         "numeric_pass": numeric_pass,
         "behavioral_pass": behavioral_pass,
         "load_delivered": delivered,
+        "exports_accepted": exports_accepted,
         "targets": targets,
         "behavioral": behavioral,
         "run": {

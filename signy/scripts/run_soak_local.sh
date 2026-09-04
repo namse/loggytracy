@@ -121,10 +121,49 @@ DISK_MIN_AVAIL_KB="${SOAK_DISK_MIN_AVAIL_KB:-$((4 * 1024 * 1024))}"
 SETTLE="${SOAK_SETTLE_SECONDS:-120}"
 UNIT="soak-$NAME"
 
+# The collector in front. `off` reverts to the shape every published soak ran
+# in — the harness framing its own collecty batch and posting it to the collect
+# route — which measures the engine and skips the only ingest path production
+# has. On, the harness stands where an application's exporter stands and
+# collecty's intake, its disk queue, its retries and its resume are under load
+# for the first time.
+COLLECTY="${SOAK_COLLECTY:-on}"
+COLLECTY_PORT="${SOAK_COLLECTY_PORT:-4397}"
+COLLECTY_BIN="${SOAK_COLLECTY_BIN:-$ROOT/../collecty/target/release/collecty}"
+# collecty's own cage. Its resident is supposed to be a function of its
+# configured ceilings and nothing else — not of how far behind signy is, which
+# lives on disk — and that claim has never been measured over hours. Small on
+# purpose: a cage at the claim is what turns the claim into a test.
+COLLECTY_LIMIT="${SOAK_COLLECTY_LIMIT:-256M}"
+# The three ceilings that decide collecty's footprint, left at their defaults
+# so the run measures the shipped configuration rather than a tuned one.
+COLLECTY_INFLIGHT="${SOAK_COLLECTY_INFLIGHT:-64MiB}"
+COLLECTY_QUEUE_MAX="${SOAK_COLLECTY_QUEUE_MAX:-1GiB}"
+COLLECTY_SEGMENT="${SOAK_COLLECTY_SEGMENT:-8MiB}"
+COLLECTY_UNIT="soak-collecty-$NAME"
+# The tenant collecty files its own metrics under. The load harness's first
+# corpus tenant, so the collector's counters land where this run's queries can
+# read them — an export naming a tenant the instance does not serve is dropped
+# on arrival and said nothing about, so an unserved tenant here would silently
+# delete the collector's own evidence.
+COLLECTY_TENANT="${SOAK_COLLECTY_TENANT:-load-tenant-000}"
+# The trace leg. Off in every soak so far, and its read routes have never been
+# crossed by a long run at all — see the harness's trace read-back, which this
+# turns on with it.
+TRACE_EPS="${SOAK_TRACE_EPS:-5}"
+# The feature probe: every read route, every this many seconds, for the whole
+# run. `0` turns it off.
+PROBE_INTERVAL="${SOAK_PROBE_INTERVAL:-300}"
+
 if [ "${SOAK_SKIP_BUILD:-0}" != "1" ]; then
   cargo build --manifest-path "$ROOT/Cargo.toml" --release --bin load
   [ -n "${SOAK_BIN:-}" ] || cargo build --manifest-path "$ROOT/Cargo.toml" --release \
     --bin signy ${FEATURES:+--features "$FEATURES"}
+  if [ "$COLLECTY" != "off" ] && [ -z "${SOAK_COLLECTY_BIN:-}" ]; then
+    # Its own crate, its own lockfile and its own toolchain: there is no
+    # workspace at the root, so this is a second build and not another target.
+    cargo build --manifest-path "$ROOT/../collecty/Cargo.toml" --release --bin collecty
+  fi
 fi
 
 DATA="${SOAK_DATA:-$OUT/data}"
@@ -143,43 +182,109 @@ if [ "$STORE" != "off" ]; then
   STORE_ENV="SIGNY_OBJECT_STORE_URL=$STORE"
 fi
 
+# collecty's queue. Its own directory, sampled beside signy's: what is here is
+# what signy has not taken yet, and it is the only copy of an acknowledged
+# export until signy does.
+QUEUE_DIR="$OUT/collecty"
+COLLECTY_LOG="$OUT/collecty.log"
+COLLECTY_ADDR="127.0.0.1:$COLLECTY_PORT"
+# What sends the harness's writes through the collector. Unset, the harness
+# frames its own batch and posts it to the collect route, which is what every
+# published soak measured. Exported rather than put in the invocation's
+# assignment prefix: an expansion there is a command name, not an assignment.
+if [ "$COLLECTY" != "off" ]; then
+  export SIGNY_LOAD_PUSH_ADDR="$COLLECTY_ADDR"
+fi
+
 systemctl --user reset-failed "$UNIT.scope" 2>/dev/null
+systemctl --user reset-failed "$COLLECTY_UNIT.scope" 2>/dev/null
 
 cleanup() {
-  for p in ${SAMPLER_PID:-} ${PROF_PID:-} ${WATCH_PID:-} ${SERVER_PID:-}; do kill "$p" 2>/dev/null; done
+  rm -f "$OUT/RUNNING"
+  for p in ${PROBE_PID:-} ${SAMPLER_PID:-} ${QUEUE_SAMPLER_PID:-} ${PROF_PID:-} \
+           ${WATCH_PID:-} ${COLLECTY_PID:-} ${SERVER_PID:-}; do
+    kill "$p" 2>/dev/null
+  done
   sleep 1
+  [ -n "${COLLECTY_PID:-}" ] && kill -KILL "$COLLECTY_PID" 2>/dev/null
   [ -n "${SERVER_PID:-}" ] && kill -KILL "$SERVER_PID" 2>/dev/null
-  [ "${SOAK_KEEP_DATA:-0}" = "1" ] || rm -rf "$DATA" ${STORE_DIR:+"$STORE_DIR"}
+  [ "${SOAK_KEEP_DATA:-0}" = "1" ] || rm -rf "$DATA" "$QUEUE_DIR" ${STORE_DIR:+"$STORE_DIR"}
   systemctl --user reset-failed "$UNIT.scope" 2>/dev/null
+  systemctl --user reset-failed "$COLLECTY_UNIT.scope" 2>/dev/null
 }
 trap cleanup EXIT
 
-# shellcheck disable=SC2086
-env SIGNY_LISTEN_ADDR="127.0.0.1:$PORT" \
-    SIGNY_DATA_DIR="$DATA" \
-    SIGNY_RETENTION_INTERVAL="$RETENTION_INTERVAL" \
-    SIGNY_RETENTION_GRACE_PERIOD="$RETENTION_GRACE" \
-    ${STORE_ENV:-} \
-    ${SOAK_SERVER_ENV:-} \
-    systemd-run --user --scope --quiet --unit="$UNIT" \
-      -p MemoryMax="$LIMIT" -p MemorySwapMax=0 \
-      ${MEMORY_HIGH:+-p MemoryHigh="$MEMORY_HIGH"} \
-      -- "$BIN" >"$SERVER_LOG" 2>&1 &
-SERVER_PID=$!
+# Both processes start from a function rather than inline, because a soak that
+# never restarts either of them has not been told anything about what happens
+# when one of them comes back — which is most of what a day is for.
+start_signy() {
+  systemctl --user reset-failed "$UNIT.scope" 2>/dev/null
+  # shellcheck disable=SC2086
+  env SIGNY_LISTEN_ADDR="127.0.0.1:$PORT" \
+      SIGNY_DATA_DIR="$DATA" \
+      SIGNY_RETENTION_INTERVAL="$RETENTION_INTERVAL" \
+      SIGNY_RETENTION_GRACE_PERIOD="$RETENTION_GRACE" \
+      ${STORE_ENV:-} \
+      ${SOAK_SERVER_ENV:-} \
+      systemd-run --user --scope --quiet --unit="$UNIT" \
+        -p MemoryMax="$LIMIT" -p MemorySwapMax=0 \
+        ${MEMORY_HIGH:+-p MemoryHigh="$MEMORY_HIGH"} \
+        -- "$BIN" >>"$SERVER_LOG" 2>&1 &
+  SERVER_PID=$!
+  for _ in $(seq 1 600); do
+    curl -fsS "http://127.0.0.1:$PORT/ready" >/dev/null 2>&1 && return 0
+    kill -0 "$SERVER_PID" 2>/dev/null || { echo "server died before ready"; tail -40 "$SERVER_LOG"; return 1; }
+    sleep 0.5
+  done
+  echo "server did not become ready"
+  return 1
+}
 
-for _ in $(seq 1 180); do
-  curl -fsS "http://127.0.0.1:$PORT/ready" >/dev/null 2>&1 && break
-  kill -0 "$SERVER_PID" 2>/dev/null || { echo "server died before ready"; cat "$SERVER_LOG"; exit 1; }
-  sleep 0.5
-done
+# collecty answers no readiness route and publishes no metrics port — its own
+# counters travel through its queue as ordinary OTLP — so "up" is a refusal
+# from the process. `GET /v1/logs` is 405, and a 405 is proof.
+start_collecty() {
+  [ "$COLLECTY" = "off" ] && return 0
+  systemctl --user reset-failed "$COLLECTY_UNIT.scope" 2>/dev/null
+  mkdir -p "$QUEUE_DIR"
+  env COLLECTY_LISTEN_ADDR="$COLLECTY_ADDR" \
+      COLLECTY_DATA_DIR="$QUEUE_DIR" \
+      COLLECTY_SIGNY_URL="http://127.0.0.1:$PORT" \
+      COLLECTY_MAX_INFLIGHT_BYTES="$COLLECTY_INFLIGHT" \
+      COLLECTY_QUEUE_MAX_BYTES="$COLLECTY_QUEUE_MAX" \
+      COLLECTY_QUEUE_SEGMENT_BYTES="$COLLECTY_SEGMENT" \
+      COLLECTY_TENANT="$COLLECTY_TENANT" \
+      COLLECTY_REPORT_INTERVAL="30s" \
+      systemd-run --user --scope --quiet --unit="$COLLECTY_UNIT" \
+        -p MemoryMax="$COLLECTY_LIMIT" -p MemorySwapMax=0 \
+        -- "$COLLECTY_BIN" >>"$COLLECTY_LOG" 2>&1 &
+  COLLECTY_PID=$!
+  for _ in $(seq 1 120); do
+    curl -s -o /dev/null "http://$COLLECTY_ADDR/v1/logs" && return 0
+    kill -0 "$COLLECTY_PID" 2>/dev/null || { echo "collecty died before it listened"; tail -40 "$COLLECTY_LOG"; return 1; }
+    sleep 0.5
+  done
+  echo "collecty never answered"
+  return 1
+}
+
+touch "$OUT/RUNNING"
+start_signy || exit 1
+start_collecty || exit 1
+
 # Read from the server's own process rather than derived from this shell's:
 # where systemd places a user scope depends on the manager, and a wrong guess
 # here would silently sample an empty cgroup.
 CG="/sys/fs/cgroup$(cut -d: -f3 "/proc/$SERVER_PID/cgroup")"
 [ -d "$CG" ] || { echo "no cgroup at $CG"; exit 1; }
+COLLECTY_CG=""
+if [ "$COLLECTY" != "off" ]; then
+  COLLECTY_CG="/sys/fs/cgroup$(cut -d: -f3 "/proc/$COLLECTY_PID/cgroup")"
+fi
 echo "cgroup=$CG memory.max=$(cat "$CG/memory.max") memory.high=$(cat "$CG/memory.high") swap.max=$(cat "$CG/memory.swap.max")"
 echo "out=$OUT data=$DATA seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
 echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUERY_EPS"
+echo "collecty=$COLLECTY addr=$COLLECTY_ADDR limit=$COLLECTY_LIMIT trace_eps=$TRACE_EPS probe=${PROBE_INTERVAL}s"
 
 # The memprof sampler's columns plus the disk: data_dir and journal.wal sizes
 # (du is paid once a minute, the value carried between), and the filesystem's
@@ -200,9 +305,13 @@ echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUER
   T0=$(date +%s.%N)
   echo "$T0" >"$OUT/sampler_t0"
   i=0; du_bytes=0; wal_bytes=0; metrics_bytes=0; store_bytes=0
-  while [ -d "$CG" ]; do
+  # The run's own flag rather than the cgroup's existence: a restart takes the
+  # scope down and brings it back at the same path, and a sampler that exited
+  # on the gap would end the series at the first fault instead of measuring
+  # what came after it.
+  while [ -f "$OUT/RUNNING" ]; do
     now=$(date +%s.%N)
-    cur=$(cat "$CG/memory.current" 2>/dev/null) || break
+    cur=$(cat "$CG/memory.current" 2>/dev/null) || { sleep 1; continue; }
     peak=$(cat "$CG/memory.peak" 2>/dev/null)
     st=$(cat "$CG/memory.stat" 2>/dev/null)
     psi=$(cat "$CG/memory.pressure" 2>/dev/null)
@@ -329,6 +438,49 @@ SAMPLER_PID=$!
 ) >"$OUT/memprof.txt" 2>/dev/null &
 PROF_PID=$!
 
+# The collector's own series, kept apart from mem.csv rather than added to its
+# seventy columns: its verdict is a different question with a different shape.
+#
+# Three numbers answer it. `anon` against its cage is whether the documented
+# footprint — the in-flight ceiling plus a batch buffer plus the runtime — is
+# what it actually costs, which nothing has ever measured over hours. `queue`
+# is how far behind signy is, and it is also the only copy of an acknowledged
+# export until signy takes it, so a queue that grows and does not come back
+# down is data at risk rather than a slow sender. `segments` never falls below
+# three: each signal holds one open.
+if [ "$COLLECTY" != "off" ]; then
+  (
+    echo "t,anon,current,peak,queue_bytes,segments,rss"
+    T0=$(cat "$OUT/sampler_t0" 2>/dev/null || date +%s.%N)
+    while [ -f "$OUT/RUNNING" ]; do
+      now=$(date +%s.%N)
+      anon=$(awk '$1=="anon"{print $2}' "$COLLECTY_CG/memory.stat" 2>/dev/null)
+      cur=$(cat "$COLLECTY_CG/memory.current" 2>/dev/null)
+      peak=$(cat "$COLLECTY_CG/memory.peak" 2>/dev/null)
+      queue=$(du -sb "$QUEUE_DIR" 2>/dev/null | cut -f1)
+      segments=$(find "$QUEUE_DIR" -type f -name '*.seg' 2>/dev/null | wc -l)
+      rss=$(awk '/^VmRSS:/{print $2 * 1024}' \
+        "/proc/$(head -1 "$COLLECTY_CG/cgroup.procs" 2>/dev/null)/status" 2>/dev/null)
+      printf '%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
+        "${anon:-0}" "${cur:-0}" "${peak:-0}" "${queue:-0}" "${segments:-0}" "${rss:-0}"
+      sleep 5
+    done
+  ) >"$OUT/collecty.csv" 2>/dev/null &
+  QUEUE_SAMPLER_PID=$!
+fi
+
+# The feature probe. Every read route in docs/QUERY_API.md, on its own clock,
+# for the whole run — see scripts/soak_probe.sh for why the memory trends below
+# are not an answer to "does it still work".
+if [ "$PROBE_INTERVAL" -gt 0 ] 2>/dev/null; then
+  PROBE_ADDR="127.0.0.1:$PORT" \
+  PROBE_INTERVAL="$PROBE_INTERVAL" \
+  PROBE_TENANT="$COLLECTY_TENANT" \
+    "$ROOT/scripts/soak_probe.sh" "$OUT" >"$OUT/probe.log" 2>&1 &
+  PROBE_PID=$!
+fi
+
 # The harness has a 60 s request timeout, so without this a run whose server
 # was killed mid-soak would sit for minutes producing nothing.
 ( while kill -0 "$SERVER_PID" 2>/dev/null; do sleep 1; done; sleep 3; pkill -f 'target/release/load' ) &
@@ -345,7 +497,7 @@ SIGNY_LOAD_EVENTS=0 \
 SIGNY_LOAD_TARGET_EPS="$EPS" \
 SIGNY_LOAD_CONNECTIONS="$CONNS" \
 SIGNY_LOAD_QUERY_EPS="$QUERY_EPS" \
-SIGNY_LOAD_OTLP_EPS=0 \
+SIGNY_LOAD_OTLP_EPS="$TRACE_EPS" \
 SIGNY_LOAD_METRIC_LEG_SCRAPE_SECONDS="$METRIC_SCRAPE" \
 SIGNY_LOAD_METRIC_LEG_CHURN_PER_SCRAPE="$METRIC_CHURN" \
 SIGNY_LOAD_METRIC_QUERY_EPS="$METRIC_QUERY_EPS" \
@@ -388,8 +540,15 @@ curl -fsS --max-time 5 "http://127.0.0.1:$PORT/metrics" >"$OUT/metrics-final.txt
 
 kill "$WATCH_PID" 2>/dev/null; WATCH_PID=
 kill "$PROF_PID" 2>/dev/null; PROF_PID=
+kill "${PROBE_PID:-}" 2>/dev/null; PROBE_PID=
+sleep 2
+# The flag the two samplers loop on. Dropping it is how they stop, and it has
+# to come down before they are signalled or a restarted scope would keep one
+# of them alive past the run.
+rm -f "$OUT/RUNNING"
 sleep 2
 kill "$SAMPLER_PID" 2>/dev/null; SAMPLER_PID=
+kill "${QUEUE_SAMPLER_PID:-}" 2>/dev/null; QUEUE_SAMPLER_PID=
 
 ALIVE=false
 kill -0 "$SERVER_PID" 2>/dev/null && ALIVE=true
@@ -621,6 +780,119 @@ GUARD=ok
                last / 1048576.0, held, last / held
       }' "$OUT/mem.csv"
   fi
+  # The trace leg's read-back, and the wait for the collector's queue. Both are
+  # booleans about whether this run can be believed: a trace that did not come
+  # back is a wrong answer, and accounting taken before the backlog arrived is
+  # not accounting at all.
+  jq -r '
+    if .traces then
+      "traces: sent=\(.traces.sent) spans=\(.traces.spans_sent) errors=\(.traces.errors) " +
+      "readback pass=\(.traces.readback.pass) verified=\(.traces.readback.verified) " +
+      "missing=\(.traces.readback.missing) short=\(.traces.readback.short) " +
+      "search_empty=\(.traces.readback.search_empty)/\(.traces.readback.search_probes)",
+      (if .traces.readback.first_error then "  first trace error: \(.traces.readback.first_error)" else empty end)
+    else empty end,
+    if .behavioral.collector_drain then
+      "collector drain: path=\(.behavioral.ingest_path) waited=\(.behavioral.collector_drain.waited) " +
+      "settled=\(.behavioral.collector_drain.settled) seconds=\(.behavioral.collector_drain.seconds | floor) " +
+      "collect_dropped=\(.behavioral.collect_dropped_records) skipped=\(.behavioral.collect_skipped_records)"
+    else empty end' "$OUT/load.json" 2>/dev/null
+
+  # The feature probe's whole point: a route that answered for twenty-three
+  # hours and stopped is a failure, and a mean would hide it. So this is per
+  # route, with the round a failure first appeared in.
+  if [ -f "$OUT/probe.csv" ]; then
+    awk -F, '
+      NR>1 {
+        name = $3; ok = $6
+        seen[name] = 1
+        if (!(name in order)) order[name] = ++n, byindex[n] = name
+        if (ok == 1) pass[name]++
+        else if (ok == "skip") skip[name]++
+        else {
+          fail[name]++
+          if (!(name in firstfail)) {
+            firstfail[name] = $1
+            detail = $7; for (f = 8; f <= NF; f++) detail = detail "," $f
+            why[name] = $4 " " substr(detail, 1, 60)
+          }
+        }
+        if ($1 + 0 > rounds) rounds = $1 + 0
+      }
+      END {
+        if (!n) exit
+        printf "feature probe: %d rounds over the run\n", rounds
+        printf "  %-26s %6s %6s %6s  %s\n", "route", "ok", "fail", "skip", "first failure"
+        for (i = 1; i <= n; i++) {
+          name = byindex[i]
+          printf "  %-26s %6d %6d %6d  %s\n", name, pass[name], fail[name], skip[name], \
+                 (name in firstfail) ? "round " firstfail[name] ": " why[name] : "-"
+          if (fail[name]) failed++
+        }
+        printf "probe verdict: %s (%d routes with a failure)\n", \
+               failed ? "ROUTES FAILED" : "every route answered every round", failed + 0
+      }' "$OUT/probe.csv"
+  fi
+
+  # The collector's own accounting, read back out of signy — which is where it
+  # lives: collecty has no metrics port, its counters travel through its own
+  # queue as ordinary OTLP. Reading them here therefore also proves that path.
+  #
+  # `refused` and `dropped` are the two that must be zero. Any movement in
+  # either is data thrown away: refused is signy declining a segment, dropped
+  # is the queue full and unlinking the oldest.
+  if [ "$COLLECTY" != "off" ] && [ "$ALIVE" = true ]; then
+    collecty_metric() {
+      curl -fsS --max-time 10 -H "X-Tenant-Id: $COLLECTY_TENANT" \
+        "http://127.0.0.1:$PORT/signy/api/v1/metrics/instant?metric=$1" 2>/dev/null \
+        | head -1 | jq -r '.value // "-"' 2>/dev/null
+      }
+    echo "collecty (counters read back through signy, tenant $COLLECTY_TENANT):"
+    printf "  %-28s %s\n" "records_appended" "$(collecty_metric collecty_records_appended_total)"
+    printf "  %-28s %s\n" "segments_sent" "$(collecty_metric collecty_segments_sent_total)"
+    printf "  %-28s %s\n" "bytes_appended" "$(collecty_metric collecty_bytes_appended_total)"
+    printf "  %-28s %s\n" "bytes_sent" "$(collecty_metric collecty_bytes_sent_total)"
+    printf "  %-28s %s\n" "send_retries" "$(collecty_metric collecty_send_retries_total)"
+    printf "  %-28s %s\n" "segments_refused (must be 0)" "$(collecty_metric collecty_segments_refused_total)"
+    printf "  %-28s %s\n" "queue_dropped_segments (0)" "$(collecty_metric collecty_queue_dropped_segments_total)"
+    printf "  %-28s %s\n" "queue_bytes" "$(collecty_metric collecty_queue_bytes)"
+    # What the harness got a 2xx for, against what the collector recorded.
+    # They do not have to be equal: collecty's own metric exports are records
+    # it appends too, one per report interval, and they are the difference.
+    EXPORTS=$(jq -r '.exports_accepted // 0' "$OUT/load.json" 2>/dev/null)
+    printf "  %-28s %s\n" "harness exports (2xx)" "${EXPORTS:-0}"
+  fi
+
+  # The collector's memory and backlog over the run. Quarters, like the engine's
+  # trends above and for the same reason: what matters is whether either is
+  # still climbing at the end.
+  if [ -f "$OUT/collecty.csv" ]; then
+    awk -F, '
+      NR>1 && $2+0 > 0 { n++; for (c = 2; c <= 7; c++) v[c,n] = $c + 0 }
+      END {
+        if (n < 8) { print "collecty: too few samples for a trend: " n; exit }
+        m = 1048576.0
+        nr = split("2 anon mib;3 current mib;5 queue mib;6 segments count;7 rss mib", rows, ";")
+        printf "collecty trends:\n"
+        printf "  %-12s %12s %12s %12s %12s  %s\n", "mib/count", "Q1", "Q2", "Q3", "Q4", "trend"
+        for (r = 1; r <= nr; r++) {
+          split(rows[r], f, " "); c = f[1] + 0
+          for (q = 0; q < 4; q++) {
+            lo = int(n * q / 4) + 1; hi = int(n * (q + 1) / 4); s = 0
+            for (k = lo; k <= hi; k++) s += v[c,k]
+            mean[q] = s / (hi - lo + 1)
+          }
+          trend = (mean[3] > mean[1] * 1.10) ? "GROWING" : "flat"
+          if (f[3] == "count")
+            printf "  %-12s %12.0f %12.0f %12.0f %12.0f  %s\n", f[2], mean[0], mean[1], mean[2], mean[3], trend
+          else
+            printf "  %-12s %12.1f %12.1f %12.1f %12.1f  %s\n", f[2], mean[0]/m, mean[1]/m, mean[2]/m, mean[3]/m, trend
+        }
+        peak = 0; for (k = 1; k <= n; k++) if (v[4,k] > peak) peak = v[4,k]
+        printf "  peak=%.1f MiB against its cage; samples=%d\n", peak/m, n
+      }' "$OUT/collecty.csv"
+  fi
+
   echo "slow batches (>=250 ms), longest first:"
   sed 's/\x1b\[[0-9;]*m//g' "$SERVER_LOG" | grep "journal batch slow" \
     | sed 's/.*records=/records=/' | sort -t= -k4 -rn | head -5
