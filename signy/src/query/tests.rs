@@ -2332,7 +2332,7 @@ async fn first_party_logs_answers_ndjson_with_string_timestamps() {
 
 /// The log path prices a request from its own shape, not from a fixed cap.
 ///
-/// This is what "요청당 필요 메모리 용량" buys over charging every query the
+/// This is what pricing each request buys over charging every query the
 /// per-query ceiling: two requests differing only in `limit` are two different
 /// prices, so a small query is not made to wait behind the worst case a large
 /// one might reach. The parts here record what their rows materialize into, so

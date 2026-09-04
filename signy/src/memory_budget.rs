@@ -97,8 +97,9 @@ impl MemoryAccount {
         self.budget_bytes
     }
 
-    /// Bytes charged and not yet released. This is "현재 사용중" — the figure
-    /// an admission decision is made against and the one `/metrics` publishes.
+    /// Bytes charged and not yet released: what work in flight has declared it
+    /// holds right now. This is the figure an admission decision is made
+    /// against and the one `/metrics` publishes.
     pub fn in_use_bytes(&self) -> u64 {
         self.in_use_bytes.load(Ordering::Relaxed)
     }
