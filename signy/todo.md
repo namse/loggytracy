@@ -1513,6 +1513,50 @@ The polish order, each item a measurement or a bound, none a feature:
       side: `413`/`400` stay `INVALID_ARGUMENT` and acquire no `RetryInfo` even when a producer
       attaches one.
 
+### The soak measured the engine and called it the stack (2026-09-04)
+
+The 24-hour run above is the engine's day, not the product's. Three gaps, each of which would have
+let a broken shipped path finish a soak with a clean verdict:
+
+1. **collecty was never in it.** The harness framed its own one-record collecty batch and posted it
+   to the collect route, so the collector's intake, its zstd, its segment rotation, its disk queue,
+   its retry and — the one that decides whether a crash duplicates data — the
+   `x-collecty-sender`/`x-collecty-segment` resume had never carried load for a minute, let alone a
+   day.
+2. **The trace leg was off** (`SIGNY_LOAD_OTLP_EPS=0`), and even on it only wrote. The four trace
+   read routes had never been asked anything by any load run, so an engine that stored no spans at
+   all would have passed.
+3. **Eleven read routes were never exercised.** The harness drives six log query shapes and five
+   metric ones. The autocompletes, the tail, the deletion surface, the trace timeline and the admin
+   lifecycle were outside every run, and the soak's verdict is memory trends, which say nothing
+   about whether a route still answers.
+
+What was built for it, all of it in place and smoke-tested on 2026-09-04:
+
+- `SIGNY_LOAD_PUSH_ADDR` splits the harness's two addresses — writes to a collecty as the bare
+  export on the signal's own path, reads to signy, which has the only read surface. A `200` then
+  means the collector has the export, not the engine, so the run waits for the queue to drain
+  before it scrapes its end metrics and **fails if that wait did not settle**: accounting taken
+  before the backlog arrives reads as loss.
+- The trace leg keeps every tenth trace it exports and asks for it by id a lag later; the span
+  count has to match. A first 404 is asked again rather than counted, because a backlog in front of
+  the engine is not the engine losing a trace.
+- `scripts/soak_probe.sh` walks the whole surface in `docs/QUERY_API.md` plus the admin routes every
+  five minutes and writes a row per probe per round. The artifact is a per-route success table over
+  the run — which is what "everything still works" has to mean to mean anything.
+- The rig restarts the collector, restarts the engine, takes it down for minutes, kills it outright,
+  and restarts it again with the run's parts on disk, at fractions of the run. The collector is
+  never killed outright: an open segment has not been fsynced, so losing it would be collecty
+  behaving as documented and this run could not then tell that from a defect.
+
+Open, and the reason the 24-hour run exists rather than a fix: **collecty's resident grew through
+every smoke** — 11 → 64 MiB over five minutes at 2 k eps, peak 70 MiB — and its own documentation
+says its footprint is a function of its configured ceilings and nothing else. Five minutes cannot
+tell allocator warm-up from a leak. The soak samples it every five seconds beside the engine's, and
+the trend over a day is the answer. **Measure before tuning it**: the two knobs that bound the
+biggest term (`COLLECTY_MAX_INFLIGHT_BYTES`, `COLLECTY_QUEUE_SEGMENT_BYTES`) are configuration, not
+code, and which term is actually large is not yet known.
+
 ### The soak rig is built, and its first four minutes contradicted the gates (2026-08-08)
 
 `scripts/run_soak_local.sh` is the deliverable: the memprof rig pointed at hours — a native

@@ -114,6 +114,42 @@ against an older one:
   [`LOAD_RESULTS.md`](LOAD_RESULTS.md) and [`COMPARISON.md`](COMPARISON.md)
   still describe the older wire.
 
+### Through a collecty, since 2026-09-04
+
+The framing above is the harness standing in for a collector. `SIGNY_LOAD_PUSH_ADDR`
+is the other way: writes go to a real collecty at that address as the bare
+export on the signal's own path (`/v1/logs`, `/v1/traces`, `/v1/metrics`),
+reads stay on `SIGNY_LOAD_ADDR`, and the batch signy reads is one collecty
+built — numbered, resumable, and compressed by the collector rather than by the
+harness. Unset, nothing changes.
+
+What that adds to a run, and none of it was ever under load before:
+
+- collecty's intake, its zstd, its segment rotation and its disk queue
+- the sender's retry and backoff against an engine that is slow or gone
+- the `x-collecty-sender` / `x-collecty-segment` resume, which is what stops a
+  resend after a crash from being stored twice
+
+What it costs the reading of a result:
+
+- **A `200` no longer means the engine has the export.** It means the collector
+  has it on disk. The run therefore waits for the queue to reach signy before
+  it scrapes its end metrics (`SIGNY_LOAD_DRAIN_SECONDS`, 180 s) and reports
+  whether that wait settled. Accounting taken before it did is not a loss
+  report, and the gate says so.
+- **Push latency is the collector's, not the engine's.** It is the time to get
+  an export onto collecty's disk. An engine push p95 and a collector push p95
+  are different measurements.
+- **`wire_bytes` is the export**, uncompressed: the compression happens inside
+  collecty now, where the harness cannot see it. The ratio a run through a
+  collecty achieves is `collecty_bytes_appended_total` against
+  `collecty_bytes_sent_total`, read back out of signy.
+
+The trace leg has a read-back to go with it. Every tenth exported trace is kept
+and asked for by id a lag later (`SIGNY_LOAD_TRACE_VERIFY_LAG_SECONDS`, 60 s),
+and the span count has to match; a first 404 is asked again rather than counted,
+because a backlog in front of the engine is not the engine losing a trace.
+
 ---
 
 ## What is not validated (remaining risks)
