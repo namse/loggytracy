@@ -146,23 +146,166 @@ instrument is for.
 
 ## 4. The experiments
 
-Each one is its own commit, and each records **which hypothesis it confirmed or
-rejected**, not only how many megabytes moved. A step that measures worse is
-kept here rather than reverted quietly.
+Each is a 300 s run at 204 exports/s of a 41,656 byte mean over 8 connections,
+plus 5 trace exports a second and a scrape every ten seconds, in a 256 MiB
+cage, followed by a 60 s settle. `scripts/run_mem_local.sh` is the one command;
+every row is that command with one thing changed. Peak anon is the cgroup's,
+which is what an OOM kill is decided on; the arena columns are the collector's
+own view and are never the verdict.
 
-| # | change | what it would prove |
+The rig is calibrated against what the 24-hour soak's collector actually
+received, read out of its own queue reports: 205 exports/s of a 41,785 byte
+mean. The one thing that does not match is the compression ratio — 3.63x here
+against the soak's 4.87x — so a segment here is larger than production's, which
+errs towards more memory pressure rather than less.
+
+### The instrumented series
+
+Each row is the previous row's code plus one change, all on glibc unless the
+row says otherwise.
+
+| # | change | peak anon | peak tagged live | libc retained | untagged in use | threads | allocated |
+|---|---|---|---|---|---|---|---|
+| 2 | baseline | **69.5 MiB** | 3.7 | 53.7 | 4.0 | 26 | 7.5 GB |
+| 3 | `MALLOC_ARENA_MAX=1` *(diagnosis only)* | **16.2** | 3.9 | 6.1 | 7.5 | 24 | 7.5 GB |
+| 4 | one spool thread, not the blocking pool | **26.1** | 3.8 | 16.6 | 7.4 | 16 | 7.4 GB |
+| 5 | mimalloc *(rejected)* | **54.1** | 3.8 | 1.9 | 7.9 | 16 | 7.4 GB |
+| 5b | mimalloc, `MIMALLOC_PURGE_DELAY=0` *(rejected)* | **35.7** | — | 5.4 | — | 16 | — |
+| 6 | the framing copy removed | **21.8** | 1.4 | 18.0 | 7.4 | 16 | 4.9 GB |
+| 7 | the compressor reused across segments | **18.8** | 3.8 | 9.4 | **0.4** | 16 | 4.9 GB |
+| 8 | the segment read sized from the file | **18.8** | 5.3 | 10.8 | 0.5 | 16 | 4.9 GB |
+
+Every run accepted 33,424 eps with no failures, so none of these numbers was
+bought by refusing load.
+
+**The shipped build, which carries no instrument, is the number that ships:
+60.7 MiB at the baseline and 18.5 MiB after the series — a 70 % reduction at
+33,424 eps accepted with no failures either side.** The instrument costs about
+9 MiB of the instrumented baseline's 69.5 — 14 %, against signy's instrument
+being the difference between finishing a run and being killed in it, which is
+what making the tagging independent of the allocator bought.
+
+### What each row established
+
+* **The footprint was never the collector's data.** At the baseline, peak live
+  bytes are 3.7 MiB inside a 69.5 MiB anonymous footprint — **5 %**. signy's
+  equivalent measurement found 39.7 %. Whatever collecty is holding, it is not
+  telemetry in flight.
+* **It was threads times arenas.** `MALLOC_ARENA_MAX=1` takes the same run to
+  16.2 MiB with identical allocation volume, identical live bytes and identical
+  throughput. That is a diagnosis and not a fix, because it is a setting a
+  deployment would have to know to apply.
+* **The structural fix recovers most of it.** `Queue::append` takes the queue's
+  lock as its first act, so dispatching each append to the blocking pool bought
+  no parallelism and cost a thread — and therefore an arena — per concurrent
+  export. One spool thread: 69.5 → 26.1 MiB, threads 26 → 16.
+* **mimalloc is the wrong allocator here, which is the opposite of signy's
+  answer and the result most likely to be "corrected" by someone harmonizing
+  the two.** It doubled the footprint at its defaults and was still worse than
+  glibc with an eager purge. signy chose it for a workload holding hundreds of
+  live megabytes across hundreds of millions of allocations a run; collecty
+  holds one or two megabytes across a million, and an allocator that keeps
+  arenas warm for that has nothing to keep them warm for.
+* **A third of everything allocated was one needless copy.** `frame_record`
+  built a second buffer per export whose only difference was four bytes in
+  front, and both were alive at once: 7.4 → 4.9 GB allocated, peak live
+  3.8 → 1.4 MiB.
+* **The compressor was the C-side term, and moving it moved the C-side
+  column.** `libc_in_use` minus the tagged total is where an allocation that
+  does not go through the Rust allocator shows up. Reusing one context per
+  signal instead of building one per segment took that column from 7.4 MiB to
+  0.4 MiB. This is the row that most needed a column of its own to be
+  believable, and it is why the instrument reports one.
+* **Sizing the segment read measured nothing at steady state**, and is kept for
+  a reason the steady state cannot show. See the drain below.
+
+### The drain, which is its own experiment
+
+The sink is taken away for 60 s at t=120 and comes back; the backlog goes to
+disk and then drains. Both runs are the shipped build, and both built the same
+backlog, so this compares like with like:
+
+| | before every fix | after them |
 |---|---|---|
-| 1 | budget declared | above |
-| 2 | baseline, glibc, instrumented | tagged live vs `mallinfo2` vs cgroup anon, and the thread count beside them |
-| 3 | `MALLOC_ARENA_MAX=1` | diagnosis only: how much of the gap is per-thread arenas |
-| 4 | one spool thread instead of `spawn_blocking` | structural, still on glibc, directly comparable to 2 |
-| 5 | mimalloc | the allocator as a shipping choice, judged after the structure is fixed rather than before |
-| 6 | `frame_record`'s copy removed | in-flight live bytes halved |
-| 7 | zstd context reused across segments | whether `libc_in_use − tagged_live` falls, which is where a C-side allocation lives |
-| 8 | segment read buffer reused | the drain step above |
-| 9 | in-flight gate charged as the body arrives | separate scaling test: connections 8 → 64 → 256 at a fixed rate, peak must plateau |
-| 10 | outage and drain, repeated | separate scaling test: the step must go to zero |
+| backlog at its peak | 199 MB | 198 MB |
+| anon before the outage | 59.4 MiB | 15.9 MiB |
+| anon after the drain finished | 105.8 MiB | 23.7 MiB |
+| **permanent step** | **+46.4 MiB** | **+7.8 MiB** |
+| peak anon | 105.8 MiB | 23.7 MiB |
 
-Nine and ten are deliberately not judged on the same run as the rest. Both fix
-a *shape* rather than a quantity, and on a fixed-connection, no-fault workload
-both would measure approximately zero and look worthless.
+**The step is 83 % smaller and it is not gone.** A drained backlog still leaves
+about 4 % of what passed through it resident, against 23 % before. The
+24-hour soak measured 2–3 % in production, on a collector whose signy had gone
+away completely rather than refusing quickly; the two are not directly
+comparable and the like-for-like pair above is the one to read.
+
+### The connection sweep, which is its own experiment
+
+Fixed byte rate, only the connection count varies, 120 s runs on the shipped
+build:
+
+| connections | peak anon | in-flight bytes the gate saw | peak live (instrumented) |
+|---|---|---|---|
+| 8 | 17.9 MiB | 0.08 MiB | 1.4 MiB |
+| 64 | 40.3 MiB | — | — |
+| 256 | 72.4 MiB | 9.69 MiB | **34.2 MiB** |
+
+**Invariant 2 fails, and the instrument says why.** At 256 connections the
+collector holds 34.2 MiB of live bytes at peak while its in-flight gate reports
+9.69 MiB. The gap is request bodies that have been read into memory but not yet
+charged: `route` collects the whole body and only then does `accept` acquire
+the semaphore, so `COLLECTY_MAX_INFLIGHT_BYTES` bounds what is past the gate
+and not what is buffered before it. Peak memory is therefore a function of how
+many clients there are, not of the ceiling the operator declared. With the
+16 MiB request ceiling the defaults allow, 64 connections could buffer a
+gigabyte against a 64 MiB declared ceiling.
+
+One hypothesis about this was measured and **rejected**: hyper's 400 kB
+per-connection read buffer is not the term. Capping it at 64 kB moved 256
+connections from 72.4 to 75.1 MiB, which is nothing, and the change was
+reverted rather than kept for looking plausible.
+
+**The fix is not in this series, deliberately.** Charging the gate as bytes
+arrive — rather than trusting a `Content-Length` that a chunked body need not
+send and may misstate — means a request can hold permits it acquired
+incrementally while waiting for more, and a set of requests that all hold some
+and all need more is a deadlock. Avoiding it means refusing a request that
+cannot get its bytes within some bound, which is a new `503` on a path that
+has never refused for this reason. That is a product decision about what
+collecty does to a client, not a memory tweak, and it should be made
+deliberately.
+
+### Against the budget
+
+| | declared | shipped build, measured |
+|---|---|---|
+| steady state | ≤ 64 MiB | **18.5 MiB** at 8 connections, 300 s |
+| peak | ≤ 128 MiB | **18.5 MiB**, from 60.7 before the series |
+| not a function of time | — | the 13-hour trace predates every fix; unretested |
+| not a function of connections | — | **fails**: 17.9 → 72.4 MiB from 8 to 256 |
+| not a function of past backlog | — | **improved, not met**: +7.8 MiB per 198 MB drained |
+
+Two things this series has not established and which need their own runs:
+whether the growth over hours is gone (the only evidence for it is 13 hours of
+a build that no longer exists), and whether any of it changes under a corpus
+that compresses like production's rather than 25 % worse.
+
+### A trap this rig fell into first
+
+The first drain run put its queue under `/tmp`, which is tmpfs. Those pages are
+shmem, they are charged to the cage, and with swap off they cannot be
+reclaimed, so a backlog the collector is designed to put on disk filled the
+cage and the kernel killed the process at 190 MB of queue with anon flat at
+65 MiB. Worse, the rig reported that run `MEASURED`: it read `memory.events`
+once, at the end, by which time the scope was gone and the OOM counter with it.
+
+Both are fixed — the runner refuses a queue directory on tmpfs, samples the OOM
+counter throughout, and fails a run whose process stopped early — and both are
+recorded because a gate that can report a kill as a pass is the same class of
+failure signy's `NOT_MEASURED` rule exists for.
+
+**On a real filesystem the page cache is reclaimable and the process survives**,
+but `memory.current` still reached 255.9 MiB of the 256 MiB cage while anon was
+105.8. A sidecar sized to its collector's heap will meet its limit through the
+queue's page cache long before the queue's own 1 GiB budget is reached. That is
+a deployment fact `CONFIGURATION.md` does not currently state.

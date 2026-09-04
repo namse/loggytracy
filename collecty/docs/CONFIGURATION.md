@@ -47,9 +47,26 @@ side. Configure the exporting SDK, not collecty.
 | `COLLECTY_MAX_REQUEST_BYTES` | `16MiB` | Largest single export accepted. Matches signy's own ceiling so an export that collecty takes is one signy can take. Refused with `413` before the body is buffered when the request declares its length, and while reading when it does not |
 | `COLLECTY_MAX_INFLIGHT_BYTES` | `64MiB` | Total bytes of exports being compressed and written at once. A request waits for room rather than being refused. Must be at least `COLLECTY_MAX_REQUEST_BYTES`, or a large export could never be admitted |
 
-Resident memory is roughly this ceiling plus one batch buffer plus the
-runtime. It is not affected by how far behind signy is — that backlog lives on
-disk.
+Resident memory is **not** roughly this ceiling. Measured, at 204 exports/s of
+41 kB over 8 connections, the collector's anonymous footprint is about 18 MiB
+while the declared ceiling is 64 MiB and the bytes actually in flight are under
+a megabyte. [`MEMORY.md`](MEMORY.md) is the measurement and the three things it
+found that this sentence used to get wrong:
+
+- **It is a function of how many clients there are.** 18 MiB over 8
+  connections, 72 MiB over 256, at the same byte rate. A body is read into
+  memory before the in-flight gate charges it, so `COLLECTY_MAX_INFLIGHT_BYTES`
+  bounds what is past the gate and not what is buffered before it.
+- **A backlog that has drained leaves some of itself behind**, about 4 % of
+  what passed through, so it is affected by how far behind signy has been even
+  though the backlog itself is on disk.
+- **The disk backlog is charged to a container's memory limit as page cache.**
+  A collector in a 256 MiB container reached 256 MiB of `memory.current` with a
+  190 MB queue and 106 MiB of heap. On a real filesystem those pages are
+  reclaimable and the process survives; on tmpfs they are not and it is killed.
+  **Size a container against `COLLECTY_QUEUE_MAX_BYTES`, not against the
+  heap**, or set the queue budget to something the container can hold. The
+  default queue budget is 1 GiB.
 
 ## What bounds disk
 

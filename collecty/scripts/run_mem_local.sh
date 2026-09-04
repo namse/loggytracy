@@ -19,7 +19,9 @@ set -uo pipefail
 
 NAME="${1:?usage: run_mem_local.sh <name>}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="$ROOT/target/mem/$NAME"
+# Overridable so a build from a worktree can still put its queue on a real
+# filesystem: see the tmpfs check below for why that is not a detail.
+OUT="${MEM_OUT:-$ROOT/target/mem}/$NAME"
 
 SECONDS_CAP="${MEM_SECONDS:-300}"
 SETTLE="${MEM_SETTLE:-60}"
@@ -49,6 +51,11 @@ QUEUE_MAX="${MEM_QUEUE_MAX:-1GiB}"
 SEGMENT="${MEM_SEGMENT:-8MiB}"
 UNIT="collecty-mem-$NAME"
 
+# A scope that failed -- an OOM kill, say -- stays registered under its name
+# and systemd-run then refuses to reuse it, which surfaces as a cgroup that
+# never appears rather than as anything about the last run.
+systemctl --user reset-failed "$UNIT.scope" 2>/dev/null
+
 rm -rf "$OUT"; mkdir -p "$OUT"
 QUEUE_DIR="$OUT/queue"
 
@@ -69,6 +76,17 @@ require systemd-run
 require systemctl
 [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ] || {
   echo "NOT_MEASURED: cgroup v2 is not mounted, so nothing would be limited"; exit 4; }
+
+# The queue has to be on a real filesystem. tmpfs pages are shmem, they are
+# charged to the writing cgroup, and with swap off they cannot be reclaimed --
+# so a backlog the collector is designed to put on disk instead fills the cage
+# and the kernel kills the process. That is not a memory result, it is the
+# measurement destroying itself, and it took one wasted run to find.
+FSTYPE=$(stat -fc %T "$(dirname "$OUT")" 2>/dev/null || stat -fc %T "$ROOT")
+[ "$FSTYPE" = "tmpfs" ] && {
+  echo "NOT_MEASURED: $OUT is on tmpfs; its queue would be charged to the cage as shmem"
+  echo "              set MEM_OUT to a directory on a real filesystem"
+  exit 4; }
 
 echo "building (features: ${FEATURES:-none})"
 if [ -n "$FEATURES" ]; then
@@ -120,17 +138,19 @@ grep -q "accepting OTLP" "$OUT/collecty.log" || { echo "NOT_MEASURED: collecty n
 
 touch "$OUT/RUNNING"
 (
-  echo "t,anon,current,peak,queue_bytes,segments"
+  echo "t,anon,current,peak,queue_bytes,segments,oom_kills,alive"
   T0=$(date +%s.%N)
   while [ -f "$OUT/RUNNING" ]; do
     now=$(date +%s.%N)
     anon=$(awk '$1=="anon"{print $2}' "$CGROUP/memory.stat" 2>/dev/null)
-    printf '%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
       "${anon:-0}" "$(cat "$CGROUP/memory.current" 2>/dev/null)" \
       "$(cat "$CGROUP/memory.peak" 2>/dev/null)" \
       "$(du -sb "$QUEUE_DIR" 2>/dev/null | cut -f1)" \
-      "$(find "$QUEUE_DIR" -name '*.seg' 2>/dev/null | wc -l)"
+      "$(find "$QUEUE_DIR" -name '*.seg' 2>/dev/null | wc -l)" \
+      "$(awk '$1=="oom_kill"{print $2}' "$CGROUP/memory.events" 2>/dev/null)" \
+      "$(kill -0 "$COLLECTY_PID" 2>/dev/null && echo 1 || echo 0)"
     sleep 0.25
   done
 ) >"$OUT/cgroup.csv" 2>/dev/null &
@@ -158,7 +178,10 @@ sleep "$SETTLE"
 rm -f "$OUT/RUNNING"
 sleep 0.5
 
-KILLED=$(awk '$1=="oom_kill"{print $2}' "$CGROUP/memory.events" 2>/dev/null)
+# From the samples, which were taken while the scope still existed. Read here
+# instead, it would be read after the scope may already be gone -- which is how
+# a run that the kernel killed first reported itself MEASURED.
+KILLED=$(awk -F, 'NR>1 && $7+0>k {k=$7} END {print k+0}' "$OUT/cgroup.csv" 2>/dev/null)
 kill -TERM "$COLLECTY_PID" 2>/dev/null
 sleep 2
 
@@ -179,6 +202,20 @@ cg = rows("cgroup.csv")
 mp = rows("memprof.csv")
 anon = [float(r["anon"]) for r in cg if r["anon"].isdigit()]
 result = {"name": os.path.basename(out), "limit": limit, "oom_kills": killed}
+
+# The collector has to have been alive for the whole run. A trace that stops
+# early is a crash, and a crash is not a budget result.
+alive = [r for r in cg if r.get("alive") == "1"]
+if cg and alive:
+    result["alive_until"] = round(float(alive[-1]["t"]), 1)
+    result["run_until"] = round(float(cg[-1]["t"]), 1)
+    if result["run_until"] - result["alive_until"] > 5.0:
+        result["died_early"] = True
+
+if cg:
+    current = [float(r["current"]) for r in cg if r["current"].isdigit()]
+    if current:
+        result["peak_current_mib"] = round(max(current) / MiB, 1)
 
 if not anon:
     result["verdict"] = "NOT_MEASURED"
@@ -227,6 +264,12 @@ if "verdict" not in result:
     accepted = load.get("accepted_exports", 0)
     if killed:
         result["verdict"] = "OOM_KILLED"
+    elif result.get("died_early"):
+        result["verdict"] = "NOT_MEASURED"
+        result["reason"] = (
+            f"the collector stopped at t={result['alive_until']}s "
+            f"of a {result['run_until']}s run"
+        )
     elif rig_status != 0 or offered == 0:
         result["verdict"] = "NOT_MEASURED"
         result["reason"] = "the load did not run"
