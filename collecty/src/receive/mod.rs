@@ -26,6 +26,10 @@ use crate::wire;
 
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
+/// Jobs that may be waiting for the spool thread. Deep enough that a burst
+/// does not serialize on the channel and shallow enough to be nothing: the
+/// bytes are already bounded by the in-flight gate.
+const SPOOL_DEPTH: usize = 256;
 /// Loopback, because a bind address is now the whole of the access control.
 /// A deployment that needs to take exports from other containers says so.
 pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:4318";
@@ -37,10 +41,60 @@ pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:4318";
 const PROTOBUF: &str = "application/x-protobuf";
 
 pub struct Intake {
-    queue: Arc<Queue>,
+    spool: Spool,
     inflight: Semaphore,
     max_inflight_bytes: usize,
     max_request_bytes: usize,
+}
+
+/// One export on its way to the queue, and where the answer goes.
+struct Job {
+    signal: Signal,
+    payload: Bytes,
+    reply: tokio::sync::oneshot::Sender<io::Result<()>>,
+}
+
+/// The one thread that appends.
+///
+/// `Queue::append` takes the queue's lock as its first act, so every append is
+/// serialized whichever thread runs it. Handing each one to the blocking pool
+/// therefore bought no parallelism at all, and cost a thread per concurrent
+/// export -- tokio will spawn up to 512 of them. Under glibc a thread that
+/// allocates is given an arena of its own, and an arena keeps whatever it grew
+/// to: `docs/MEMORY.md` measured that term at three quarters of the footprint
+/// by taking it away with `MALLOC_ARENA_MAX=1`.
+///
+/// So the appends go to one thread that owns the queue, which is what the lock
+/// already made them. The channel is bounded, but the bound that matters is
+/// still the in-flight gate: this one only stops an unbounded queue of jobs
+/// forming behind a stalled disk.
+struct Spool {
+    jobs: tokio::sync::mpsc::Sender<Job>,
+}
+
+impl Spool {
+    fn new(queue: Arc<Queue>) -> Spool {
+        let (jobs, mut inbox) = tokio::sync::mpsc::channel::<Job>(SPOOL_DEPTH);
+        std::thread::Builder::new()
+            .name("spool".to_string())
+            .spawn(move || {
+                while let Some(job) = inbox.blocking_recv() {
+                    let _tag = memprof::enter(Arena::Intake);
+                    let outcome = queue.append(
+                        job.signal,
+                        &Record {
+                            plain: wire::frame_record(&job.payload),
+                        },
+                    );
+                    // A caller that has gone away is a client that hung up
+                    // between the append and the answer. The record is in the
+                    // segment either way.
+                    let _ = job.reply.send(outcome);
+                }
+            })
+            .expect("the spool thread starts");
+        Spool { jobs }
+    }
 }
 
 /// Why an export was not taken, in the vocabulary of the status code it
@@ -96,7 +150,7 @@ impl Intake {
             "an in-flight ceiling below the request ceiling would refuse every large request forever"
         );
         Arc::new(Intake {
-            queue,
+            spool: Spool::new(queue),
             inflight: Semaphore::new(max_inflight_bytes),
             max_inflight_bytes,
             max_request_bytes,
@@ -135,21 +189,20 @@ impl Intake {
             .await
             .map_err(|_| Refusal::ShuttingDown)?;
 
-        // Framing is nothing, but the queue compresses inside its lock, so the
-        // append is still the blocking pool's work.
-        let queue = self.queue.clone();
-        tokio::task::spawn_blocking(move || {
-            let _tag = memprof::enter(Arena::Intake);
-            queue.append(
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.spool
+            .jobs
+            .send(Job {
                 signal,
-                &Record {
-                    plain: wire::frame_record(&payload),
-                },
-            )
-        })
-        .await
-        .map_err(|error| Refusal::Failed(format!("the spool task did not finish: {error}")))?
-        .map_err(spool_failure)
+                payload,
+                reply,
+            })
+            .await
+            .map_err(|_| Refusal::ShuttingDown)?;
+        answer
+            .await
+            .map_err(|_| Refusal::Failed("the spool thread stopped".to_string()))?
+            .map_err(spool_failure)
     }
 }
 

@@ -49,6 +49,8 @@ struct Args {
     outage_at: Option<u64>,
     outage_for: u64,
     report: Option<String>,
+    trace_eps: f64,
+    metric_every: f64,
 }
 
 fn args() -> Args {
@@ -62,6 +64,12 @@ fn args() -> Args {
         outage_at: None,
         outage_for: 180,
         report: None,
+        // The soak's own shape: a low trace rate and a scrape every ten
+        // seconds. Both matter to memory out of all proportion to their
+        // bytes -- a signal that never fills a segment still rolls one every
+        // `COLLECTY_SEGMENT_MAX_AGE`, and every roll builds a compressor.
+        trace_eps: 5.0,
+        metric_every: 10.0,
     };
     let mut raw = std::env::args().skip(1);
     while let Some(flag) = raw.next() {
@@ -80,6 +88,8 @@ fn args() -> Args {
             "--outage-at" => args.outage_at = Some(value().parse().expect("a number")),
             "--outage-for" => args.outage_for = value().parse().expect("a number"),
             "--report" => args.report = Some(value()),
+            "--trace-eps" => args.trace_eps = value().parse().expect("a number"),
+            "--metric-every" => args.metric_every = value().parse().expect("a number"),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -96,32 +106,94 @@ fn attribute(key: &str, value: &str) -> KeyValue {
     }
 }
 
-/// One export, distinct from every other. The shape is `examples/recompress.rs`'s,
-/// which is the shape the queue's own benches use, so a segment here compresses
-/// like a segment there.
+/// Deterministic, so two runs compare. xorshift64* is enough entropy for a
+/// corpus and costs nothing.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+
+    fn hex(&mut self, digits: usize) -> String {
+        let mut out = String::with_capacity(digits);
+        while out.len() < digits {
+            out.push_str(&format!("{:016x}", self.next()));
+        }
+        out.truncate(digits);
+        out
+    }
+}
+
+/// One export, distinct from every other, and **as compressible as production
+/// is**.
+///
+/// The corpus this replaced was four repeated line templates, which zstd took
+/// at 22x. The collector the 24-hour soak ran achieved 4.87x on the load
+/// harness's corpus, and the ratio is not cosmetic: it decides how large a
+/// segment is, which decides the size of the buffer the send path allocates
+/// per delivery and how often a compressor is built and dropped. A corpus that
+/// compresses four times too well measures a collector shipping segments an
+/// eighth of the real size.
 fn export(records: usize, batch: usize) -> Vec<u8> {
     let lines = [
-        "GET /v1/checkout 200 in 31ms",
-        "connection reset by peer while reading upstream",
-        "cache miss for key user:8172:profile, falling back to postgres",
-        "retrying publish attempt 2 of 5 after 400ms",
+        "GET /v1/checkout 200 in {}ms",
+        "connection reset by peer while reading upstream {}",
+        "cache miss for key user:{}:profile, falling back to postgres",
+        "retrying publish attempt {} of 5 after 400ms",
+        "POST /v1/orders 201 in {}ms",
+        "slow query took {}ms: select * from orders where tenant_id = $1",
+        "rate limit bucket {} refilled",
+        "worker {} picked up job from queue",
     ];
+    let routes = [
+        "/v1/checkout",
+        "/v1/orders",
+        "/v1/orders/{id}",
+        "/v1/payments",
+        "/healthz",
+        "/v1/users/{id}/profile",
+    ];
+    let services = ["checkout", "orders", "payments", "gateway"];
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ batch as u64);
     let log_records = (0..records)
         .map(|index| {
             let seq = batch * records + index;
+            let template = lines[rng.below(lines.len())];
+            let body = template.replace("{}", &rng.below(9999).to_string());
             LogRecord {
                 time_unix_nano: 1_700_000_000_000_000_000 + seq as u64 * 1_000_000,
                 severity_number: 9,
                 severity_text: "INFO".to_string(),
                 body: Some(AnyValue {
                     value: Some(any_value::Value::StringValue(format!(
-                        "{} request_id=req-{seq:08}",
-                        lines[seq % lines.len()]
+                        "{body} request_id={} trace_id={}",
+                        rng.hex(16),
+                        rng.hex(32)
                     ))),
                 }),
                 attributes: vec![
-                    attribute("http.route", "/v1/checkout"),
-                    attribute("net.peer.name", &format!("upstream-{}", seq % 8)),
+                    attribute("http.route", routes[rng.below(routes.len())]),
+                    attribute(
+                        "net.peer.ip",
+                        &format!(
+                            "10.{}.{}.{}",
+                            rng.below(256),
+                            rng.below(256),
+                            rng.below(256)
+                        ),
+                    ),
+                    attribute("user.id", &format!("user-{}", rng.below(1_000_000))),
+                    attribute("span.id", &rng.hex(16)),
                 ],
                 ..Default::default()
             }
@@ -132,8 +204,9 @@ fn export(records: usize, batch: usize) -> Vec<u8> {
         resource_logs: vec![ResourceLogs {
             resource: Some(Resource {
                 attributes: vec![
-                    attribute("service.name", "checkout"),
+                    attribute("service.name", services[batch % services.len()]),
                     attribute("deployment.environment", "production"),
+                    attribute("host.name", &format!("node-{:03}", batch % 64)),
                 ],
                 ..Default::default()
             }),
@@ -204,6 +277,7 @@ async fn sink(
 /// `MEMORY.md` §4 varies exactly this number, so it has to mean what it says.
 async fn drive(
     address: String,
+    path: &'static str,
     bodies: Arc<Vec<Vec<u8>>>,
     mut offset: usize,
     period: Duration,
@@ -237,7 +311,7 @@ async fn drive(
         offset += 1;
         let request = Request::builder()
             .method(Method::POST)
-            .uri(format!("http://{address}/v1/logs"))
+            .uri(format!("http://{address}{path}"))
             .header(http::header::HOST, address.as_str())
             .header(http::header::CONTENT_TYPE, "application/x-protobuf")
             .body(Full::new(Bytes::from(body.clone())))
@@ -305,12 +379,31 @@ async fn main() {
             .collect(),
     );
     let body_bytes: usize = bodies.iter().map(|body| body.len()).sum();
+    // What a segment would achieve on this corpus. Printed because it decides
+    // segment size, and segment size is what the send path allocates per
+    // delivery: a corpus that compresses too well measures the wrong
+    // collector. The 24-hour soak's collector achieved 4.87x.
+    let sample: Vec<u8> = bodies
+        .iter()
+        .take(64)
+        .flat_map(|body| {
+            let mut framed = (body.len() as u32).to_le_bytes().to_vec();
+            framed.extend_from_slice(body);
+            framed
+        })
+        .collect();
+    let ratio = sample.len() as f64
+        / zstd::encode_all(sample.as_slice(), 3).expect("the sample compresses").len() as f64;
     eprintln!(
-        "memrig: {} exports/s of {} records, mean body {} B, {} connections, {} s",
+        "memrig: {} exports/s of {} records, mean body {} B, zstd(3) {:.2}x, {} connections, \
+{} trace eps, a scrape every {}s, {} s",
         exports_per_second as u64,
         args.records_per_export,
         body_bytes / bodies.len(),
+        ratio,
         args.connections,
+        args.trace_eps,
+        args.metric_every,
         args.seconds,
     );
 
@@ -332,10 +425,11 @@ async fn main() {
         });
     }
 
-    let workers: Vec<_> = (0..args.connections)
+    let mut workers: Vec<_> = (0..args.connections)
         .map(|index| {
             tokio::spawn(drive(
                 args.collecty.clone(),
+                "/v1/logs",
                 bodies.clone(),
                 index * 97,
                 period,
@@ -344,6 +438,35 @@ async fn main() {
             ))
         })
         .collect();
+
+    // The other two signals, on their own connections and their own rates.
+    // They carry almost no bytes and they are not optional: each keeps a
+    // segment open that rolls on age rather than size, which is a compressor
+    // built and dropped every second per signal.
+    let small: Arc<Vec<Vec<u8>>> = Arc::new((0..64).map(|batch| export(2, batch + 9000)).collect());
+    if args.trace_eps > 0.0 {
+        workers.push(tokio::spawn(drive(
+            args.collecty.clone(),
+            "/v1/traces",
+            small.clone(),
+            3,
+            Duration::from_secs_f64((2.0 / args.trace_eps).max(0.001)),
+            until,
+            counts.clone(),
+        )));
+    }
+    if args.metric_every > 0.0 {
+        workers.push(tokio::spawn(drive(
+            args.collecty.clone(),
+            "/v1/metrics",
+            small.clone(),
+            7,
+            Duration::from_secs_f64(args.metric_every),
+            until,
+            counts.clone(),
+        )));
+    }
+
     for worker in workers {
         let _ = worker.await;
     }
