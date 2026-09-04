@@ -65,6 +65,14 @@ pub fn tenant_attribute(tenant: &str) -> KeyValue {
     string_attribute(TENANT_ATTRIBUTE.to_string(), tenant)
 }
 
+/// The service a span's resource claims to be, which is what the trace search
+/// filters and groups on. Without it every trace the leg sends is a trace of
+/// nothing in particular, and the search probe cannot ask a question a console
+/// would ask.
+pub fn service_attribute(service: &str) -> KeyValue {
+    string_attribute(resource_attribute_name("app"), service)
+}
+
 fn string_attribute(key: String, value: &str) -> KeyValue {
     KeyValue {
         key,

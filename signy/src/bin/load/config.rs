@@ -383,6 +383,15 @@ pub struct Config {
     /// still holds to reach the engine. Ignored without a collector in front:
     /// nothing is queued there to wait for.
     pub drain_seconds: u64,
+    /// How long a trace is left alone before the leg reads it back. It has to
+    /// cover the whole write path — a collecty's segment age, the send, the
+    /// journal — because a probe that runs too early reports a miss the engine
+    /// never made.
+    pub trace_verify_lag_seconds: u64,
+    /// One trace in this many is kept for the read-back probe. Every one would
+    /// double the leg's traffic and turn a garnish into a second query
+    /// workload.
+    pub trace_verify_sample: u64,
     pub tier: String,
     pub seed: u64,
     pub duration_seconds: u64,
@@ -570,6 +579,8 @@ impl Config {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             drain_seconds: env_u64("SIGNY_LOAD_DRAIN_SECONDS", 180),
+            trace_verify_lag_seconds: env_u64("SIGNY_LOAD_TRACE_VERIFY_LAG_SECONDS", 60),
+            trace_verify_sample: env_u64("SIGNY_LOAD_TRACE_VERIFY_SAMPLE", 10).max(1),
             tier: env_string("SIGNY_LOAD_TIER", "B"),
             seed: env_u64("SIGNY_LOAD_SEED", 0x5eed_2026),
             duration_seconds,

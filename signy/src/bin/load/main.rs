@@ -189,8 +189,25 @@ struct SampleOutcome {
 struct OtlpOutcome {
     latency: LatencyPair,
     sent: u64,
+    spans_sent: u64,
     errors: u64,
     connected: bool,
+    /// Traces read back by id after they were sent, and what came of it.
+    ///
+    /// `missing` is a trace the timeline route answered 404 for; `short` is one
+    /// it answered with fewer spans than were exported. Both are wrong answers
+    /// rather than slow ones, so both fail the run.
+    verify_attempts: u64,
+    verified: u64,
+    missing: u64,
+    short: u64,
+    /// Set when the run was long enough for a sent trace to come back. A run
+    /// that stopped before the first probe was due proves nothing about the
+    /// read path, and must not read as if it had.
+    verification_expected: bool,
+    search_probes: u64,
+    search_empty: u64,
+    first_verify_error: Option<String>,
 }
 
 #[tokio::main]
@@ -1401,7 +1418,16 @@ async fn otlp_workload(
         return outcome;
     };
     let mut client = Client::new(cfg.push_address(), cfg.request_timeout());
+    let mut reader = Client::new(&cfg.http_address, cfg.request_timeout());
     let mut rng = signy::corpus::Rng::new(cfg.seed ^ OTLP_SEED_SALT);
+    let read_tenant = Target::Signy.read_tenant_header(&tenant);
+    let lag = Duration::from_secs(cfg.trace_verify_lag_seconds);
+    outcome.verification_expected = deadline.saturating_duration_since(Instant::now()) > lag * 2;
+    // Traces waiting out their lag before being read back. Bounded because a
+    // read path that stopped answering must not turn into unbounded memory in
+    // the harness measuring it.
+    let mut pending: std::collections::VecDeque<(Instant, SentTrace)> =
+        std::collections::VecDeque::new();
     let mut intended = Instant::now();
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         tokio::time::sleep_until(intended).await;
@@ -1413,26 +1439,199 @@ async fn otlp_workload(
             duration_ms(done.saturating_duration_since(sent)),
         );
         match result {
-            Ok(()) => {
+            Ok(trace) => {
                 outcome.sent += 1;
+                outcome.spans_sent += trace.spans;
                 outcome.connected = true;
+                if outcome.sent % cfg.trace_verify_sample == 0 && pending.len() < 256 {
+                    pending.push_back((done, trace));
+                }
             }
             Err(_) => outcome.errors += 1,
+        }
+
+        // One probe per turn at most: this leg is a garnish on the log
+        // workload and reading back faster than that would make it a second
+        // query workload competing with the one being measured.
+        if let Some((at, _)) = pending.front()
+            && at.elapsed() >= lag
+        {
+            let (_, trace) = pending.pop_front().expect("the front was just read");
+            verify_trace(&mut reader, &read_tenant, &trace, &mut outcome).await;
+            // Every tenth read-back also asks the question a console opens
+            // with: what traces are there at all. It shares the probe's pacing
+            // so it cannot become a workload of its own.
+            if outcome.verify_attempts % 10 == 1 {
+                search_traces(&mut reader, &read_tenant, &mut outcome).await;
+            }
         }
         intended += interval;
     }
     outcome
 }
 
+/// A trace this run exported, kept so it can be asked for again.
+struct SentTrace {
+    id: String,
+    spans: u64,
+}
+
+/// Read one trace back by id and check every span it was sent came back.
+///
+/// The timeline route answers 404 both for a trace that was never stored and
+/// for one retention has taken, and the engine cannot tell those apart — which
+/// is why the probe waits only its lag and never longer than a retention
+/// period.
+async fn verify_trace(
+    reader: &mut Client,
+    read_tenant: &(&'static str, String),
+    trace: &SentTrace,
+    outcome: &mut OtlpOutcome,
+) {
+    outcome.verify_attempts += 1;
+    let path = format!("/signy/api/v1/traces/{}", trace.id);
+    let response = reader
+        .request(&Request {
+            method: "GET",
+            path: &path,
+            body: &[],
+            content_type: "",
+            tenant: Some((read_tenant.0, read_tenant.1.as_str())),
+            headers: &[],
+        })
+        .await;
+    match response {
+        Ok(response) if response.status == 200 => {
+            let spans = response
+                .body
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .count() as u64;
+            if spans >= trace.spans {
+                outcome.verified += 1;
+            } else {
+                outcome.short += 1;
+                outcome.first_verify_error.get_or_insert_with(|| {
+                    format!(
+                        "trace {} came back with {spans} of {} spans",
+                        trace.id, trace.spans
+                    )
+                });
+            }
+        }
+        Ok(response) if response.status == 404 => {
+            outcome.missing += 1;
+            outcome
+                .first_verify_error
+                .get_or_insert_with(|| format!("trace {} was not found", trace.id));
+        }
+        Ok(response) => {
+            outcome.missing += 1;
+            outcome.first_verify_error.get_or_insert_with(|| {
+                format!("the timeline route answered {}", response.status)
+            });
+        }
+        Err(error) => {
+            outcome.missing += 1;
+            outcome.first_verify_error.get_or_insert(error);
+        }
+    }
+}
+
+/// The search route over the window the leg has been writing into.
+///
+/// An empty answer is recorded rather than failed: the window can legitimately
+/// hold nothing at the very start of a run. A search that never answers with
+/// anything across a whole soak is what the counts are there to show.
+async fn search_traces(
+    reader: &mut Client,
+    read_tenant: &(&'static str, String),
+    outcome: &mut OtlpOutcome,
+) {
+    outcome.search_probes += 1;
+    let response = reader
+        .request(&Request {
+            method: "GET",
+            path: "/signy/api/v1/traces?start=-5m&limit=20",
+            body: &[],
+            content_type: "",
+            tenant: Some((read_tenant.0, read_tenant.1.as_str())),
+            headers: &[],
+        })
+        .await;
+    match response {
+        Ok(response) if response.status == 200 => {
+            if response.body.iter().all(|byte| byte.is_ascii_whitespace()) {
+                outcome.search_empty += 1;
+            }
+        }
+        Ok(response) => {
+            outcome.search_empty += 1;
+            outcome.first_verify_error.get_or_insert_with(|| {
+                format!("the trace search answered {}", response.status)
+            });
+        }
+        Err(error) => {
+            outcome.search_empty += 1;
+            outcome.first_verify_error.get_or_insert(error);
+        }
+    }
+}
+
+/// The service the leg's spans claim, so the search probe can ask for a
+/// service the way a console does.
+const TRACE_SERVICE: &str = "load-trace";
+
+/// One trace: a root and two children, rather than a lone span.
+///
+/// A single span would prove storage and retrieval and nothing else. Three
+/// spans with a parent between them are what the timeline route is for, and
+/// they are what makes a short answer — a trace that came back missing one of
+/// its spans — a thing this run can see at all.
 async fn send_otlp(
     client: &mut Client,
     cfg: &Config,
     tenant: &str,
     rng: &mut signy::corpus::Rng,
-) -> Result<(), String> {
+) -> Result<SentTrace, String> {
     let now = unix_nanos();
     let trace_id = rng.next_u64().to_be_bytes().repeat(2);
-    let span_id = rng.next_u64().to_be_bytes().to_vec();
+    let root_id = rng.next_u64().to_be_bytes().to_vec();
+    let spans = vec![
+        Span {
+            trace_id: trace_id.clone(),
+            span_id: root_id.clone(),
+            name: "GET /load".to_string(),
+            kind: 2,
+            start_time_unix_nano: now,
+            end_time_unix_nano: now.saturating_add(3_000_000),
+            ..Default::default()
+        },
+        Span {
+            trace_id: trace_id.clone(),
+            span_id: rng.next_u64().to_be_bytes().to_vec(),
+            parent_span_id: root_id.clone(),
+            name: "store.write".to_string(),
+            kind: 3,
+            start_time_unix_nano: now.saturating_add(200_000),
+            end_time_unix_nano: now.saturating_add(1_400_000),
+            ..Default::default()
+        },
+        Span {
+            trace_id: trace_id.clone(),
+            span_id: rng.next_u64().to_be_bytes().to_vec(),
+            parent_span_id: root_id,
+            name: "encode".to_string(),
+            kind: 1,
+            start_time_unix_nano: now.saturating_add(1_500_000),
+            end_time_unix_nano: now.saturating_add(2_600_000),
+            ..Default::default()
+        },
+    ];
+    let sent = SentTrace {
+        id: trace_id.iter().map(|byte| format!("{byte:02x}")).collect(),
+        spans: spans.len() as u64,
+    };
     let request = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
             // The same tenancy gate the log path goes through: signy reads the
@@ -1440,18 +1639,14 @@ async fn send_otlp(
             // and the trace leg records latency for spans the server threw
             // away.
             resource: Some(opentelemetry_proto::tonic::resource::v1::Resource {
-                attributes: vec![crate::otlp::tenant_attribute(tenant)],
+                attributes: vec![
+                    crate::otlp::tenant_attribute(tenant),
+                    crate::otlp::service_attribute(TRACE_SERVICE),
+                ],
                 ..Default::default()
             }),
             scope_spans: vec![ScopeSpans {
-                spans: vec![Span {
-                    trace_id,
-                    span_id,
-                    name: "load-span".to_string(),
-                    start_time_unix_nano: now,
-                    end_time_unix_nano: now.saturating_add(1_000_000),
-                    ..Default::default()
-                }],
+                spans,
                 ..Default::default()
             }],
             ..Default::default()
@@ -1470,7 +1665,7 @@ async fn send_otlp(
         })
         .await?;
     match response.status {
-        200 | 204 => Ok(()),
+        200 | 204 => Ok(sent),
         status => Err(format!("the ingest route answered {status}")),
     }
 }
@@ -1623,6 +1818,13 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
     // it is the resume working — so it is reported rather than gated. A run
     // that restarted either side is expected to move it.
     let collect_skipped_records = delta("signy_collect_skipped_records_total");
+    // A trace read back by id after it was written is the only end-to-end
+    // check the trace path has ever had: every earlier run wrote spans and
+    // asked nothing about them afterwards. A run too short for a probe to come
+    // due proves nothing either way, and says so rather than passing.
+    let traces_pass = otlp.missing == 0
+        && otlp.short == 0
+        && (!otlp.verification_expected || otlp.verified > 0);
     let signy_delivered = push.events_accepted > 0 && dropped_resources == 0;
     let retention_success = delta("signy_retention_success_total");
     let restore_success = delta("signy_remote_restore_success_total");
@@ -1922,6 +2124,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 && remote_healthy_fraction >= 0.95
                 && cache_healthy_end
                 && flush_progressing
+                && traces_pass
                 && metric_leg_pass,
             signy_delivered,
         ),
@@ -2167,8 +2370,20 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
     report["traces"] = json!({
         "connected": otlp.connected,
         "sent": otlp.sent,
+        "spans_sent": otlp.spans_sent,
         "errors": otlp.errors,
         "latency_ms": otlp.latency.summary(),
+        "readback": {
+            "pass": traces_pass,
+            "expected": otlp.verification_expected,
+            "attempts": otlp.verify_attempts,
+            "verified": otlp.verified,
+            "missing": otlp.missing,
+            "short": otlp.short,
+            "search_probes": otlp.search_probes,
+            "search_empty": otlp.search_empty,
+            "first_error": otlp.first_verify_error,
+        },
     });
     report["corpus"] = json!({
         "streams": corpus.streams.len(),
