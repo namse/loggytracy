@@ -20,7 +20,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::memprof::{self, Arena};
-use crate::queue::{Queue, Record};
+use crate::queue::Queue;
 use crate::signal::Signal;
 use crate::wire;
 
@@ -80,12 +80,7 @@ impl Spool {
             .spawn(move || {
                 while let Some(job) = inbox.blocking_recv() {
                     let _tag = memprof::enter(Arena::Intake);
-                    let outcome = queue.append(
-                        job.signal,
-                        &Record {
-                            plain: wire::frame_record(&job.payload),
-                        },
-                    );
+                    let outcome = queue.append(job.signal, &job.payload);
                     // A caller that has gone away is a client that hung up
                     // between the append and the answer. The record is in the
                     // segment either way.

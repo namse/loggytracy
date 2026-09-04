@@ -112,12 +112,6 @@ struct Held {
     stamp: u64,
 }
 
-/// One record on its way into a segment: a length and an OTLP export.
-/// Uncompressed — the segment compresses.
-pub struct Record {
-    pub plain: Vec<u8>,
-}
-
 /// A closed segment, ready to be shipped whole.
 ///
 /// `body` is the file, byte for byte. One zstd stream over every record the
@@ -250,9 +244,15 @@ impl Queue {
         self.sender
     }
 
-    pub fn append(&self, signal: Signal, record: &Record) -> io::Result<()> {
+    /// Append one OTLP export to its signal's open segment.
+    ///
+    /// The four byte length goes in front of it here, as two writes into the
+    /// encoder, rather than by building a buffer that is the header followed
+    /// by a copy of the export. The copy was a second allocation the size of
+    /// every export that arrives, alive at the same time as the first.
+    pub fn append(&self, signal: Signal, payload: &[u8]) -> io::Result<()> {
         let _tag = memprof::enter(Arena::Queue);
-        let plain_len = record.plain.len() as u64;
+        let plain_len = (crate::wire::RECORD_HEADER_BYTES + payload.len()) as u64;
         if plain_len > self.limits.max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -282,7 +282,10 @@ impl Queue {
         }
 
         let queue = &mut inner.signals[signal.index()];
-        queue.active.write_all(&record.plain)?;
+        queue
+            .active
+            .write_all(&(payload.len() as u32).to_le_bytes())?;
+        queue.active.write_all(payload)?;
         if queue.active_since.is_none() {
             queue.active_since = Some(Instant::now());
         }

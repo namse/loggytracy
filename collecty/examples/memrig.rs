@@ -393,7 +393,9 @@ async fn main() {
         })
         .collect();
     let ratio = sample.len() as f64
-        / zstd::encode_all(sample.as_slice(), 3).expect("the sample compresses").len() as f64;
+        / zstd::encode_all(sample.as_slice(), 3)
+            .expect("the sample compresses")
+            .len() as f64;
     eprintln!(
         "memrig: {} exports/s of {} records, mean body {} B, zstd(3) {:.2}x, {} connections, \
 {} trace eps, a scrape every {}s, {} s",

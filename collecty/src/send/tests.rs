@@ -4,7 +4,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 
 use super::*;
-use crate::queue::{Queue, QueueLimits, Record};
+use crate::queue::{Queue, QueueLimits};
 use crate::signal::Signal;
 use crate::test_support::Scratch;
 
@@ -67,23 +67,14 @@ fn queue_with(scratch: &Scratch, bodies: &[Vec<u8>]) -> Arc<Queue> {
     let queue =
         Arc::new(Queue::open(scratch.path(), eager(), crate::wire::ZSTD_LEVEL).expect("a queue"));
     for body in bodies {
-        queue
-            .append(
-                Signal::Logs,
-                &Record {
-                    plain: body.clone(),
-                },
-            )
-            .expect("an append");
+        queue.append(Signal::Logs, body).expect("an append");
         queue.seal_if_due().expect("a seal");
     }
     queue
 }
 
 fn records(count: usize) -> Vec<Vec<u8>> {
-    (0..count)
-        .map(|index| crate::wire::frame_record(&[index as u8; 32]))
-        .collect()
+    (0..count).map(|index| vec![index as u8; 32]).collect()
 }
 
 async fn deliver_all<T: Transport>(sender: &Sender<T>, queue: &Queue) {
@@ -211,9 +202,7 @@ async fn the_run_loop_closes_the_open_segment_and_ships_it() {
     let queue =
         Arc::new(Queue::open(scratch.path(), eager(), crate::wire::ZSTD_LEVEL).expect("a queue"));
     for body in records(3) {
-        queue
-            .append(Signal::Logs, &Record { plain: body })
-            .expect("an append");
+        queue.append(Signal::Logs, &body).expect("an append");
     }
     let transport = Scripted::new(|_| Outcome::Accepted(0));
     let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
