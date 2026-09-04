@@ -112,8 +112,9 @@ rows() {
   echo "${n:-0}"
 }
 
-# Record one probe. `ok` is the caller's verdict; `detail` is whatever makes a
-# failure diagnosable a day later without the server still being up.
+# Record one probe. `detail` is whatever makes a failure diagnosable a day
+# later without the server still being up.
+#
 # `ok` is 1, 0, or `skip`. Skipped is its own state and not a quiet failure:
 # a probe this round deliberately did not run says nothing about the route, and
 # folding it into either column would make the end-of-run table a lie.
@@ -129,15 +130,49 @@ record() {
   esac
 }
 
-# The common case: a 200 whose body has at least $3 lines.
-expect() {
-  local name="$1" status="$2" want="${3:-1}"
-  local got; got=$(rows)
-  if [ "$status" = "200" ] && [ "$got" -ge "$want" ]; then
-    record "$name" "$status" "$got" 1
-  else
-    record "$name" "$status" "$got" 0 "$(head -c 200 "$BODY" | tr -d '\n')"
-  fi
+# Every probe asks twice before it calls a route broken.
+#
+# A restart lands in the middle of a round often enough to matter -- the engine
+# is back in about a second -- and recording fourteen route failures for one
+# scheduled restart would drown the thing this file exists to show. A route
+# that is actually broken fails both asks.
+#
+# probe_get: a 200 whose body has at least $3 non-empty lines, and optionally
+# contains $4.
+probe_get() {
+  local name="$1" url="$2" want="${3:-1}" want_text="${4:-}"
+  local status got attempt
+  for attempt in 1 2; do
+    status=$(req GET "$url")
+    got=$(rows)
+    if [ "$status" = "200" ] && [ "$got" -ge "$want" ] \
+       && { [ -z "$want_text" ] || grep -q "$want_text" "$BODY"; }; then
+      record "$name" "$status" "$got" 1 \
+        "$([ "$attempt" = 2 ] && echo 'answered on the second ask')"
+      return
+    fi
+    [ "$attempt" = 1 ] && sleep 2
+  done
+  local why="$(head -c 160 "$BODY" | tr -d '\n')"
+  [ -n "$want_text" ] && [ "$status" = "200" ] && why="does not contain $want_text"
+  record "$name" "$status" "$got" 0 "$why"
+}
+
+# probe_status: the status code is the whole of the check. For routes whose
+# answer may legitimately be empty, and for the fallback's 404.
+probe_status() {
+  local name="$1" url="$2" want="${3:-200}"
+  local status attempt
+  for attempt in 1 2; do
+    status=$(req GET "$url")
+    if [ "$status" = "$want" ]; then
+      record "$name" "$status" "$(rows)" 1 \
+        "$([ "$attempt" = 2 ] && echo 'answered on the second ask')"
+      return
+    fi
+    [ "$attempt" = 1 ] && sleep 2
+  done
+  record "$name" "$status" "$(rows)" 0 "expected $want: $(head -c 140 "$BODY" | tr -d '\n')"
 }
 
 # The first value of a JSON string field, off the first NDJSON line. The bodies
@@ -173,34 +208,21 @@ round() {
     return
   fi
   record ready "$status" 0 1
-  status=$(req GET "$BASE/metrics")
-  if [ "$status" = "200" ] && grep -q '^signy_ingest_requests_total' "$BODY"; then
-    record metrics "$status" "$(rows)" 1
-  else
-    record metrics "$status" "$(rows)" 0 "no signy_ingest_requests_total"
-  fi
+  probe_get metrics "$BASE/metrics" 1 '^signy_ingest_requests_total'
 
   # --- logs ---------------------------------------------------------------
-  status=$(req GET "$API/logs?start=-5m&limit=5")
-  expect logs "$status" 1
+  probe_get logs "$API/logs?start=-5m&limit=5" 1
 
-  # The filtering grammar rather than the route: a line filter, an attribute
-  # matcher, a parser and a direction in one request. An empty answer is
-  # legitimate here -- the filters may match nothing in the window -- so this
-  # one is gated on the status alone.
-  status=$(req GET "$API/logs?start=-5m&limit=5&parse=logfmt&direction=forward&contains=e")
-  [ "$status" = "200" ] && record logs_filtered "$status" "$(rows)" 1 \
-    || record logs_filtered "$status" "$(rows)" 0 "$(head -c 200 "$BODY" | tr -d '\n')"
+  # The filtering grammar rather than the route: a line filter, a parser and a
+  # direction in one request. An empty answer is legitimate here -- the filters
+  # may match nothing in the window -- so this one is gated on the status.
+  probe_status logs_filtered "$API/logs?start=-5m&limit=5&parse=logfmt&direction=forward&contains=e"
 
-  status=$(req GET "$API/logs/histogram?start=-15m&bucket=1m")
-  expect logs_histogram "$status" 1
-
-  status=$(req GET "$API/logs/attributes?start=-5m")
-  expect logs_attributes "$status" 1
+  probe_get logs_histogram "$API/logs/histogram?start=-15m&bucket=1m" 1
+  probe_get logs_attributes "$API/logs/attributes?start=-5m" 1
   key=$(field key)
   if [ -n "$key" ]; then
-    status=$(req GET "$API/logs/attributes/$key/values?start=-5m")
-    expect logs_attribute_values "$status" 1
+    probe_get logs_attribute_values "$API/logs/attributes/$key/values?start=-5m" 1
   else
     record logs_attribute_values skipped 0 skip "the keys probe offered none"
   fi
@@ -208,11 +230,16 @@ round() {
   # The tail is a stream, so it is timed out on purpose and whatever arrived is
   # the answer. A heartbeat counts: it is the route proving it is streaming on a
   # tenant that happens to be quiet.
-  curl -sN --max-time "$TAIL_SECONDS" -H "X-Tenant-Id: $TENANT" \
-    "$API/logs/tail?limit=10" >"$BODY" 2>/dev/null
-  tailed=$(rows)
+  tailed=0
+  for attempt in 1 2; do
+    : >"$BODY"
+    curl -sN --max-time "$TAIL_SECONDS" -H "X-Tenant-Id: $TENANT" \
+      "$API/logs/tail?limit=10" >"$BODY" 2>/dev/null
+    tailed=$(rows)
+    [ "$tailed" -ge 1 ] && break
+  done
   [ "$tailed" -ge 1 ] && record logs_tail stream "$tailed" 1 \
-    || record logs_tail stream "$tailed" 0 "nothing in ${TAIL_SECONDS}s"
+    || record logs_tail stream "$tailed" 0 "nothing in ${TAIL_SECONDS}s, twice"
 
   # --- deletion surface ---------------------------------------------------
   # Deliberately a selector nothing matches. Submitting, listing and cancelling
@@ -227,8 +254,7 @@ round() {
   status=$(req POST "$API/logs/delete?attr=service_name=__probe_no_such_service__&start=-2m")
   if [ "$status" = "204" ]; then
     record delete_submit "$status" 0 1
-    status=$(req GET "$API/logs/delete")
-    expect delete_list "$status" 1
+    probe_get delete_list "$API/logs/delete" 1
     id=$(field request_id)
     [ -n "$id" ] || id=$(head -1 "$BODY" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
     if [ -n "$id" ]; then
@@ -253,57 +279,41 @@ round() {
   fi
 
   # --- traces -------------------------------------------------------------
-  status=$(req GET "$API/traces?start=-5m&limit=5")
-  expect traces_search "$status" 1
+  probe_get traces_search "$API/traces?start=-5m&limit=5" 1
   trace=$(field trace_id)
   if [ -n "$trace" ]; then
-    status=$(req GET "$API/traces/$trace")
-    expect traces_by_id "$status" 1
+    probe_get traces_by_id "$API/traces/$trace" 1
   else
     record traces_by_id skipped 0 skip "the search returned no trace to fetch"
   fi
-  status=$(req GET "$API/traces/attributes?start=-5m")
-  expect traces_attributes "$status" 1
+  probe_get traces_attributes "$API/traces/attributes?start=-5m" 1
   key=$(field key)
   if [ -n "$key" ]; then
-    status=$(req GET "$API/traces/attributes/$key/values?start=-5m")
-    expect traces_attribute_values "$status" 1
+    probe_get traces_attribute_values "$API/traces/attributes/$key/values?start=-5m" 1
   else
     record traces_attribute_values skipped 0 skip "the keys probe offered none"
   fi
 
   # --- metrics ------------------------------------------------------------
-  status=$(req GET "$API/metrics/names?start=-5m")
-  expect metrics_names "$status" 1
-  status=$(req GET "$API/metrics/labels?start=-5m&metric=$METRIC")
-  expect metrics_labels "$status" 1
+  probe_get metrics_names "$API/metrics/names?start=-5m" 1
+  probe_get metrics_labels "$API/metrics/labels?start=-5m&metric=$METRIC" 1
   key=$(field key)
   if [ -n "$key" ]; then
-    status=$(req GET "$API/metrics/labels/$key/values?start=-5m&metric=$METRIC")
-    expect metrics_label_values "$status" 1
+    probe_get metrics_label_values "$API/metrics/labels/$key/values?start=-5m&metric=$METRIC" 1
   else
     record metrics_label_values skipped 0 skip "the keys probe offered none"
   fi
-  status=$(req GET "$API/metrics/series?metric=$METRIC&start=-5m&limit=5")
-  expect metrics_series "$status" 1
-  status=$(req GET "$API/metrics/query?metric=$METRIC&start=-5m&step=30s&func=rate&range=60s&agg=sum&by=service")
-  expect metrics_query "$status" 1
-  status=$(req GET "$API/metrics/instant?metric=$METRIC&func=rate&range=60s&agg=max")
-  expect metrics_instant "$status" 1
-  status=$(req GET "$API/metrics/quantile?metric=$HISTOGRAM&q=0.99&start=-5m&step=30s&range=60s")
-  expect metrics_quantile "$status" 1
+  probe_get metrics_series "$API/metrics/series?metric=$METRIC&start=-5m&limit=5" 1
+  probe_get metrics_query \
+    "$API/metrics/query?metric=$METRIC&start=-5m&step=30s&func=rate&range=60s&agg=sum&by=service" 1
+  probe_get metrics_instant "$API/metrics/instant?metric=$METRIC&func=rate&range=60s&agg=max" 1
+  probe_get metrics_quantile \
+    "$API/metrics/quantile?metric=$HISTOGRAM&q=0.99&start=-5m&step=30s&range=60s" 1
 
   # --- admin --------------------------------------------------------------
-  status=$(req GET "$API/admin/tenants")
-  if [ "$status" = "200" ] && grep -q "$TENANT" "$BODY"; then
-    record admin_list "$status" "$(rows)" 1
-  else
-    record admin_list "$status" "$(rows)" 0 "the listing does not name $TENANT"
-  fi
-  status=$(req GET "$API/admin/tenants/$TENANT/retention")
-  expect admin_retention_get "$status" 1
-  status=$(req GET "$API/admin/tenants/$TENANT/usage")
-  expect admin_usage "$status" 1
+  probe_get admin_list "$API/admin/tenants" 1 "$TENANT"
+  probe_get admin_retention_get "$API/admin/tenants/$TENANT/retention" 1
+  probe_get admin_usage "$API/admin/tenants/$TENANT/usage" 1
 
   # The half of the lifecycle that writes, on a tenant of this probe's own.
   : >"$BODY"
@@ -326,9 +336,7 @@ round() {
   # A 404 that lists the real routes is a feature of the API, and a router that
   # started answering something else would be a regression nothing else here
   # would catch.
-  status=$(req GET "$API/no-such-route")
-  [ "$status" = "404" ] && record unknown_route "$status" 0 1 \
-    || record unknown_route "$status" 0 0 "expected 404"
+  probe_status unknown_route "$API/no-such-route" 404
 
   echo "round $ROUND at +$(( $(date +%s) - T0 ))s: $PASS ok, $FAIL failed, $SKIP skipped"
 }

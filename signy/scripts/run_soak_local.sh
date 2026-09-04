@@ -971,6 +971,13 @@ GUARD=ok
         printf "probe verdict: %s (%d routes with a failure)\n", \
                failed ? "ROUTES FAILED" : "every route answered every round", failed + 0
       }' "$OUT/probe.csv"
+    # Every failing row verbatim, because the fault log above is on the same
+    # clock and most of what a soak's probe failures turn out to be is a
+    # scheduled restart landing inside a round.
+    if awk -F, '$6 == 0' "$OUT/probe.csv" | head -1 | grep -q .; then
+      echo "  failing probes (t is seconds from the probe's start):"
+      awk -F, '$6 == 0' "$OUT/probe.csv" | head -20 | sed 's/^/    /'
+    fi
   fi
 
   # The collector's own accounting, read back out of signy — which is where it
