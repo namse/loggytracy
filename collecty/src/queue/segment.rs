@@ -118,6 +118,17 @@ pub fn open_for_read(dir: &Path, seq: u64) -> io::Result<File> {
     File::open(path(dir, seq))
 }
 
+/// A whole segment, in one buffer the size of the file.
+///
+/// `std::fs::read` asks the file how big it is and allocates that once. A
+/// `Vec` grown by `read_to_end` instead reallocates and copies its way up in
+/// doublings -- eight of them for a megabyte segment -- and a drain reads
+/// segments back to back as fast as the far end takes them, so those are
+/// exactly the transient large blocks a heap is left holding afterwards.
+pub fn read_whole(dir: &Path, seq: u64) -> io::Result<Vec<u8>> {
+    std::fs::read(path(dir, seq))
+}
+
 pub fn remove(dir: &Path, seq: u64) -> io::Result<()> {
     std::fs::remove_file(path(dir, seq))
 }

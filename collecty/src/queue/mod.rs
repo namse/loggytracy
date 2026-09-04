@@ -4,7 +4,7 @@ mod segment;
 mod tests;
 
 use std::collections::VecDeque;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -365,8 +365,7 @@ impl Queue {
     /// reach the same place.
     pub fn read_segment(&self, signal: Signal, seq: u64) -> io::Result<SealedSegment> {
         let _tag = memprof::enter(Arena::Send);
-        let mut body = Vec::new();
-        segment::open_for_read(&self.dirs[signal.index()], seq)?.read_to_end(&mut body)?;
+        let body = segment::read_whole(&self.dirs[signal.index()], seq)?;
         Ok(SealedSegment { signal, seq, body })
     }
 
