@@ -1549,13 +1549,27 @@ What was built for it, all of it in place and smoke-tested on 2026-09-04:
   never killed outright: an open segment has not been fsynced, so losing it would be collecty
   behaving as documented and this run could not then tell that from a defect.
 
-Open, and the reason the 24-hour run exists rather than a fix: **collecty's resident grew through
-every smoke** — 11 → 64 MiB over five minutes at 2 k eps, peak 70 MiB — and its own documentation
-says its footprint is a function of its configured ceilings and nothing else. Five minutes cannot
-tell allocator warm-up from a leak. The soak samples it every five seconds beside the engine's, and
-the trend over a day is the answer. **Measure before tuning it**: the two knobs that bound the
-biggest term (`COLLECTY_MAX_INFLIGHT_BYTES`, `COLLECTY_QUEUE_SEGMENT_BYTES`) are configuration, not
-code, and which term is actually large is not yet known.
+Two findings out of the half-hour rehearsal at the real rate (`premeasure`, 20 k eps, 2 GiB,
+retention 30 m, no faults), both of which decide how the day is run:
+
+- **collecty converges, it does not leak.** Quarter means 69 → 97 → 106 → **111 MiB**, peak 122,
+  and the growth rate fell 28.6 → 10.9 → 6.6 → 1.4 MiB/min across the run. It is above what
+  `CONFIGURATION.md` implies — the configured ceilings are 64 MiB in flight plus an 8 MiB segment —
+  and the gap has the shape of allocator retention rather than a buffer: collecty builds and drops
+  a zstd context per closed segment, on a glibc heap with one arena per worker thread. So the first
+  lever is `MALLOC_ARENA_MAX`, then `COLLECTY_MAX_INFLIGHT_BYTES`, and neither is code. Measured,
+  not tuned: 122 MiB is the number to beat.
+- **The memprof build cannot hold 2 GiB at this rate for half an hour.** OOM-killed at t=1797 s,
+  anon peak 1957 MiB, cgroup peak 2050 against a 2048 limit, final anon/live **3.15**. That is the
+  instrumented glibc build, not the shipped one — `src/main.rs` ships mimalloc — so a day has to be
+  run with `SOAK_FEATURES=` (production) and the memory attribution columns given up. Worth
+  recording as its own result: the instrumentation's own footprint is the difference between
+  finishing and being killed at this rate.
+
+And one that is what the whole exercise was for: **every route answered every round.** Six probe
+rounds over the half hour, twenty-eight routes each, zero failures — the first time the tail, the
+autocompletes, the deletion surface, the trace timeline and the admin lifecycle have been asked
+anything by a run longer than a test.
 
 ### The soak rig is built, and its first four minutes contradicted the gates (2026-08-08)
 
