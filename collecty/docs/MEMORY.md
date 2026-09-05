@@ -159,10 +159,28 @@ mean. The one thing that does not match is the compression ratio — 3.63x here
 against the soak's 4.87x — so a segment here is larger than production's, which
 errs towards more memory pressure rather than less.
 
+### Two baselines, and which is which
+
+Every number below belongs to one of two builds of the same code, and they are
+named here because otherwise the series has two baselines and no way to tell
+them apart:
+
+| | build | what it is for | at the start | at the end |
+|---|---|---|---|---|
+| `baseline` | `--features memprof` | attribution: the arena, `mallinfo2` and thread columns only exist here | 69.5 MiB | — |
+| `baseline-shipped` | default features | the number that ships; carries no instrument | 60.7 MiB | **18.5 MiB** (`final-shipped`) |
+
+Same load, same cage, same 300 s. **The instrument costs about 9 MiB — 14 %** —
+so an instrumented row is never comparable with a shipped one, and the series
+below is instrumented throughout so that its rows are comparable with each
+other.
+
+Those are also the directory names each run leaves under `target/mem/`.
+
 ### The instrumented series
 
 Each row is the previous row's code plus one change, all on glibc unless the
-row says otherwise.
+row says otherwise, and all on the `baseline` (instrumented) build.
 
 | # | change | peak anon | peak tagged live | libc retained | untagged in use | threads | allocated |
 |---|---|---|---|---|---|---|---|
@@ -178,12 +196,11 @@ row says otherwise.
 Every run accepted 33,424 eps with no failures, so none of these numbers was
 bought by refusing load.
 
-**The shipped build, which carries no instrument, is the number that ships:
-60.7 MiB at the baseline and 18.5 MiB after the series — a 70 % reduction at
-33,424 eps accepted with no failures either side.** The instrument costs about
-9 MiB of the instrumented baseline's 69.5 — 14 %, against signy's instrument
-being the difference between finishing a run and being killed in it, which is
-what making the tagging independent of the allocator bought.
+**The shipped build goes 60.7 → 18.5 MiB, a 70 % reduction**, at 33,424 eps
+accepted with no failures either side. That the instrumented build could be run
+at all for every row of this series — signy's could not, and the day it most
+wanted attribution it had to give it up — is what making the tagging
+independent of the allocator bought.
 
 ### What each row established
 
@@ -193,8 +210,30 @@ what making the tagging independent of the allocator bought.
   telemetry in flight.
 * **It was threads times arenas.** `MALLOC_ARENA_MAX=1` takes the same run to
   16.2 MiB with identical allocation volume, identical live bytes and identical
-  throughput. That is a diagnosis and not a fix, because it is a setting a
-  deployment would have to know to apply.
+  throughput.
+
+  **That row is the smallest number in this document and it is deliberately not
+  what collecty ships. Three reasons, because someone will otherwise read the
+  table and ask why 16.2 lost to 18.5.**
+
+  1. **They are not the same experiment.** 16.2 MiB is the *old* dispatch with
+     one arena; 18.5 MiB is the *new* dispatch with the allocator left alone.
+     "Capping arenas beats fixing the dispatch" is not what those two rows say,
+     and the run that would say it — `MALLOC_ARENA_MAX=1` on top of the spool
+     thread — has not been made. It is one six-minute run and it is worth
+     making.
+  2. **It is an environment variable, so it is a property of a deployment
+     rather than of the collector.** A footprint that depends on an operator
+     knowing to set `MALLOC_ARENA_MAX` is one that is wrong everywhere it is
+     forgotten, and it is wrong silently. The structural fix is true in every
+     deployment including the ones that never read this document.
+  3. **It has a measured cost elsewhere.** signy tried the same setting and it
+     re-inflicted the backlog that had made it non-default there: the WAL
+     backlog climbed 2.9 → 50.7 MiB while the default's stayed near 1.4. One
+     arena serializes allocation across threads, which is the whole point of it.
+     collecty now does nearly all of its allocating on one thread, so that cost
+     may be small here — but "may be" is not a measurement, which is reason 1
+     again.
 * **The structural fix recovers most of it.** `Queue::append` takes the queue's
   lock as its first act, so dispatching each append to the blocking pool bought
   no parallelism and cost a thread — and therefore an arena — per concurrent
@@ -265,15 +304,36 @@ per-connection read buffer is not the term. Capping it at 64 kB moved 256
 connections from 72.4 to 75.1 MiB, which is nothing, and the change was
 reverted rather than kept for looking plausible.
 
-**The fix is not in this series, deliberately.** Charging the gate as bytes
-arrive — rather than trusting a `Content-Length` that a chunked body need not
-send and may misstate — means a request can hold permits it acquired
-incrementally while waiting for more, and a set of requests that all hold some
-and all need more is a deadlock. Avoiding it means refusing a request that
-cannot get its bytes within some bound, which is a new `503` on a path that
-has never refused for this reason. That is a product decision about what
-collecty does to a client, not a memory tweak, and it should be made
-deliberately.
+**The fix is not in this series, deliberately — but it is smaller than this
+document first claimed.**
+
+Charging the gate incrementally, a chunk at a time as bytes arrive, does
+deadlock: a set of requests that each hold some permits and each need more can
+all wait on each other. That much stands. What does *not* follow, and what an
+earlier draft of this section wrongly concluded, is that avoiding the deadlock
+requires a new `503`.
+
+**Reserving the whole request up front is deadlock-free and refuses nothing.**
+Acquire before reading a byte of the body: `Content-Length` when the request
+declares a valid one, `COLLECTY_MAX_REQUEST_BYTES` when it does not; poll the
+body only once the permit is held; release when the export is appended. Every
+request acquires all-or-nothing, so no request can hold permits while waiting
+for permits, and tokio's semaphore is FIFO-fair, so the waiter at the head is
+always the next served. Under pressure a body simply waits to be read, which is
+backpressure the way the gate already documents it — "a request waits for room
+rather than being refused".
+
+What it costs is utilization rather than correctness. A chunked sender that
+declares no length reserves the 16 MiB ceiling whatever it actually sends, so
+the 64 MiB default admits four of those at once; a sender that declares its
+length — which every OTLP exporter this collector has met does — reserves
+exactly what it sends, and 64 MiB holds about sixteen hundred exports of the
+size measured here.
+
+So the decision left is about latency: a client whose body sits unread until
+room appears may hit its own timeout, and that is a product decision about what
+collecty does to a slow-consumed client. It is not a decision about whether to
+start refusing.
 
 ### Against the budget
 
@@ -285,10 +345,27 @@ deliberately.
 | not a function of connections | — | **fails**: 17.9 → 72.4 MiB from 8 to 256 |
 | not a function of past backlog | — | **improved, not met**: +7.8 MiB per 198 MB drained |
 
-Two things this series has not established and which need their own runs:
-whether the growth over hours is gone (the only evidence for it is 13 hours of
-a build that no longer exists), and whether any of it changes under a corpus
-that compresses like production's rather than 25 % worse.
+**What this series has not established, in the order it is being answered.**
+
+1. **Whether the ratchet over hours is gone.** Every row above is five minutes
+   long. The only evidence that collecty grows with time is thirteen hours of a
+   build that no longer exists, and reducing a cause is not the same as
+   removing an effect — this is the question the whole series is for, and it is
+   the one none of its rows answers. A fault-free multi-hour run on the new
+   build is running for exactly this, with faults deliberately left out: the
+   drain step already has its own answer above, and mixing it in would
+   contaminate the time slope, which is the only thing that run is asked to
+   decide.
+2. **Whether it holds on a corpus that compresses like production's.** This
+   rig achieves 3.63x where the soak's collector achieved 4.87x, so its
+   segments are larger than production's. That errs towards more memory
+   pressure rather than less, but it has not been shown to err only that way.
+3. **What to do about connection scaling**, which is a policy decision and is
+   set out above.
+
+And one cheap run that would close a question this document opens rather than
+answers: `MALLOC_ARENA_MAX=1` **on top of** the spool thread, which is the
+comparison the arena row cannot make.
 
 ### A trap this rig fell into first
 
