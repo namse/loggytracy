@@ -423,6 +423,55 @@ that closes a segment, which under the old shape ran on a worker while holding
 the queue's lock — so an append waited exactly as long and nothing counted it.
 The instrument is new; the wait is not.
 
+### One runtime thread, measured and not taken
+
+With no filesystem syscall left on the runtime, one worker becomes possible.
+Four runs, laid out **A B B A** so that each arm takes a turn at being first
+and last and a drift in time cancels rather than accumulates:
+
+| | two workers | `current_thread` |
+|---|---|---|
+| CPU over the 360 s | 17.2, 17.1 s | **15.9, 16.1 s** |
+| steady p50 | 1.28, 1.27 ms | **1.41, 1.45 ms** |
+| steady p95 | 2.71, 2.66 ms | **2.99, 2.86 ms** |
+| anon before the outage | 9.9, 7.4 | 10.2, 10.0 |
+| draining, over 100 ms | 0.07, 0.00 % | 0.07, 0.17 % |
+| accepted | 100 % | 100 % |
+
+**The CPU is real and the latency cost is real.** Both `current_thread` runs
+came in under both two-worker runs, which their placement rules out as
+position; and both are about 10 % slower at the median and at p95, which the
+two-worker arm's own stability rules out as drift. One runtime thread queues
+what two absorbed.
+
+**It is not taken, because of what the absolute numbers are.** 17.15 against
+16.00 CPU-seconds over 360 is 0.048 against 0.044 of a core: this collector is
+nowhere near CPU-bound, and 6.7 % of very little is being bought with 10 % of
+the body of every ordinary request. What that CPU is worth in money on a FaaS
+bill has not been established either.
+
+**And one thread has no headroom to give.** Two workers absorb a rise in load;
+one saturates and then p50, p95 and p99 climb together. That p50 and p95 moved
+at all at this rate — where the runtime is idle almost all of the time — is a
+small signal in that direction.
+
+**What would settle it is a saturation experiment**, which this is not: the
+offered rate at 1x, 2x, 4x and 8x against both runtimes, looking for where
+latency and accepted exports start to come apart. If the knee is in the same
+place for both, 6.7 % of CPU is worth taking.
+
+**The tail is not evidence either way.** Over 100 ms reads 0.07 / 0.00 %
+against 0.07 / 0.17 %, which is too few samples to separate — no repeatable
+regression was observed, which is not the same as none being there. The
+page-fault risk this experiment was watching for — a mapped segment first
+touched on the sole runtime thread, during a drain that reads 200 MB of them —
+did not show up at this rate.
+
+**Memory could not be judged at all.** The two-worker arm's own runs are 9.9
+and 7.4 MiB of anon before the outage, 2.5 MiB apart on identical code, so a
+1.5 MiB difference between arms is inside the noise of one of them. Nothing
+about the allocator is claimed from this.
+
 ### The connection sweep, which is its own experiment
 
 Fixed byte rate, only the connection count varies, 120 s runs on the shipped
