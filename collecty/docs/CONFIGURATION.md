@@ -96,6 +96,14 @@ accepted. With the threshold at 48 MiB — less than a quarter of the backlog �
 it peaked at 47.6 MiB on the same terms. That usage stayed under the threshold
 in these runs is how well reclaim kept up, not a guarantee the setting offers.
 
+**The resident set does not follow the backlog.** A 900 s outage building
+**2 GiB** of queue across 266 segments, same 96 MiB threshold: resident page
+cache peaked at **82 MiB** — the same as it was for a 205 MiB backlog — and
+stayed between 71 and 80 MiB for the eight minutes the queue was over a
+gibibyte, with 249,098 of 249,098 exports accepted, nothing dropped, and 0.48
+seconds of stall in 23 minutes. Ten times the durable backlog is not ten times
+the memory.
+
 It is this cheap because the queue's pages are clean: a segment is `fsync`ed
 when it closes, so no more than one open segment per signal is ever dirty and
 reclaim never has to write anything back to take a page.

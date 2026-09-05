@@ -588,6 +588,37 @@ a cache does, but it leaves no headroom to read and no signal to alert on.
 turns the container's memory into a number that means something.
 [`CONFIGURATION.md`](CONFIGURATION.md) now says so.
 
+**Ten times the backlog, the same resident set.** The run above builds about
+200 MiB. A 900 s outage building **2,095 MiB** across 266 segments, threshold
+still at 96 MiB, 23 minutes end to end:
+
+| | 205 MiB backlog | **2,095 MiB backlog** |
+|---|---|---|
+| page cache resident, peak | 83.6 MiB | **82.0 MiB** |
+| `memory.current`, peak | 95.9 MiB | 96.1 MiB |
+| anon, peak | 8.5 MiB | 10.5 MiB |
+| dirty / writeback, peak | 8.0 / 8.0 MiB | 8.0 / 8.0 MiB |
+| `high` / `max` / `oom` events | 501 / 0 / 0 | 8,062 / 0 / 0 |
+| PSI stalled | 0.15 s of 360 | 0.48 s of 1,380 |
+| accepted | 62,286 / 62,286 | **249,098 / 249,098** |
+| dropped | 0 | 0 |
+
+For the 480 seconds the backlog was over a gibibyte, resident file pages stayed
+between 71 and 80 MiB and `memory.current` between 87 and 96 — flat, while the
+queue on disk went on growing to ten times that. The collector was stalled for
+under half a second in twenty-three minutes and delivered 2.84 GB with nothing
+dropped.
+
+`memory.current` peaked at 96.1 MiB against a 96 MiB threshold, which is the
+point about `memory.high` made concrete: it is where reclaim starts, not a wall.
+Reclaim kept it within a rounding error of the line anyway, and `memory.max`
+was never in the story.
+
+The drain moved 2,095 MiB in about 6 seconds once the sink came back. That is a
+number about this rig — the sink is in the same process as the load generator —
+and not about a network, but it says the backlog is not something the send path
+struggles to get rid of.
+
 One kernel, one filesystem, one disk. What generalises is the mechanism — clean
 pages, inactive list — rather than the numbers.
 
@@ -658,7 +689,7 @@ start refusing.
 | not a function of time | — | the 13-hour trace predates every fix; unretested |
 | not a function of connections | — | **fails**: 17.9 → 72.4 MiB from 8 to 256 |
 | not a function of past backlog | — | **met in the rig**: within half a megabyte on eight of nine drains since the segment was mapped; one ended 1.9 MiB up |
-| the cage, which is not the heap | — | `memory.current` follows the backlog unless `memory.high` is set; with it, 205 MiB of queue sits in 84 MiB of cache for 0.15 s of stall |
+| the cage, which is not the heap | — | `memory.current` follows the backlog unless `memory.high` is set; with it, 2,095 MiB of queue sits in 82 MiB of cache for 0.48 s of stall in 23 minutes |
 
 **What this series has not established, in the order it is being answered.**
 
