@@ -365,6 +365,64 @@ should become once the seal, the `fsync` and the rest of the queue's
 filesystem work belong to the spool thread — one runtime thread and one disk
 thread, which is a shape that suits a sidecar.
 
+### The queue's files, off the runtime and onto threads of their own
+
+The sender called `seal_if_due`, `read_segment` and `commit` straight from its
+task. None of those is asynchronous — an `fsync` returns when the device says
+so — and a stall on a tokio worker is not one task waiting but every task on
+that worker waiting. That is survivable with a worker per core and it is the
+thing that decides whether one worker is possible at all.
+
+Two shapes were measured, two runs each, on the same drain:
+
+* **one thread for all of it.** Appends already ran on the spool thread;
+  sealing, reading and committing joined them.
+* **reads in a lane of their own.** `append`, `seal` and `commit` all take the
+  queue's lock and so were serial with each other before any of this;
+  `read_segment` takes no lock and ran beside an append. The first shape gave
+  that up, the second gives it back, and both keep the runtime free of
+  filesystem syscalls.
+
+| | on the runtime | one thread | reads apart |
+|---|---|---|---|
+| anon before the outage | 9.9, 9.5 | 7.9, 8.5 | 8.4, 8.3 |
+| anon after the drain | 9.5, 9.3 | 7.5, 8.4 | 10.3, 7.9 |
+| CPU over the 360 s | 17.6, 17.0 s | 17.1, 16.9 s | 17.1, 17.0 s |
+| accepted | 100 % | 100 % | 100 % |
+| draining, over 100 ms | 0.00, 0.03 % | 0.26, 0.20 % | 0.06, 0.03 % |
+| write lane p99 wait | — | 16–33 ms | 33–65 ms |
+| read lane p99 wait | — | — | **256 µs**, never more than one waiting |
+
+**A drift control, and what it took back.** Those columns were run in the order
+they appear, over about two hours, and the last thing this experiment did was
+re-run the *first* column again at the end. It came back **worse than either
+of the others on every cut** — steady over 50 ms at 1.28 % against 0.06 and
+0.52 % for the same binary two hours earlier, draining over 100 ms at 0.23 %
+against 0.00 and 0.03 %. The machine drifted, and a comparison laid out in
+time order cannot tell that from a change.
+
+So the middle column is **not** the regression it first looked like: its
+draining 0.26 / 0.20 % sits beside the contemporaneous baseline's 0.23 %, not
+beside the two-hour-old 0.00 / 0.03 %. What survives is the comparison between
+the two shapes, because the third column ran *after* the second and drift does
+not run backwards: separating the reads is better than sharing one queue, and
+better than a baseline re-run beside it. The rest of the first reading was the
+machine.
+
+**Every A/B from here interleaves its runs** — A, B, A, B — rather than
+running one arm and then the other.
+
+**Memory did not drift**, which is why it can still be read straight off the
+table: the baseline's anon was 9.9 at the start and 9.9 at the end, against
+8.3–8.5 for either threaded shape. One of the seven runs in this section ended
+a drain 1.9 MiB above where it started, where the other six ended within half
+a megabyte; it is recorded rather than explained.
+
+**The write lane waits, and it always did.** Its p99 of 33–65 ms is the `fsync`
+that closes a segment, which under the old shape ran on a worker while holding
+the queue's lock — so an append waited exactly as long and nothing counted it.
+The instrument is new; the wait is not.
+
 ### The connection sweep, which is its own experiment
 
 Fixed byte rate, only the connection count varies, 120 s runs on the shipped
@@ -431,7 +489,7 @@ start refusing.
 | | | both predate the mapped segment, whose drain runs sat at 8.7 MiB before the outage; a steady run has not been repeated on it |
 | not a function of time | — | the 13-hour trace predates every fix; unretested |
 | not a function of connections | — | **fails**: 17.9 → 72.4 MiB from 8 to 256 |
-| not a function of past backlog | — | **met in the rig**: −0.1 MiB per ~215 MB drained, twice |
+| not a function of past backlog | — | **met in the rig**: within half a megabyte on eight of nine drains since the segment was mapped; one ended 1.9 MiB up |
 
 **What this series has not established, in the order it is being answered.**
 
