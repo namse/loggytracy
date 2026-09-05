@@ -183,7 +183,11 @@ sleep 0.5
 # From the samples, which were taken while the scope still existed. Read here
 # instead, it would be read after the scope may already be gone -- which is how
 # a run that the kernel killed first reported itself MEASURED.
-KILLED=$(awk -F, 'NR>1 && $7+0>k {k=$7} END {print k+0}' "$OUT/cgroup.csv" 2>/dev/null)
+# By the header's name and not by a column number: adding a column to the
+# sampler once silently turned the queue's size into an OOM count, and the
+# run reported OOM_KILLED with nothing killed.
+KILLED=$(awk -F, 'NR==1 {for (i = 1; i <= NF; i++) if ($i == "oom_kills") c = i; next}
+                  c && $c+0 > k {k = $c} END {print k+0}' "$OUT/cgroup.csv" 2>/dev/null)
 kill -TERM "$COLLECTY_PID" 2>/dev/null
 sleep 2
 
