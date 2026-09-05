@@ -527,6 +527,67 @@ same accounting hole the connection sweep found. At 41 kB there was nothing to
 fix and there is now nothing to lose: one small `Vec` of frame pointers stands
 where a second copy of the body used to be.
 
+### What the kernel does about the queue's page cache
+
+Anon went from 60.7 MiB to about 8 and the cage's peak never moved: 200–230
+MiB of a 256 MiB limit, nearly all of it the queue's own file pages. Before
+changing any policy about that, the question is what the kernel can take back
+and what taking it back costs — so `memory.high` is set below `memory.max` and
+the same outage is run against it. Crossing `memory.high` makes the kernel
+reclaim this cgroup and hold it up while it does; crossing `memory.max` is
+where the OOM killer starts.
+
+| `memory.high` | queue on disk | page cache resident | `memory.current` peak | `high` events | `max` | `oom` | PSI stalled | accepted |
+|---|---|---|---|---|---|---|---|---|
+| unset | 213.6 | 213.6 | 231.3 | 0 | 0 | 0 | 0 s | 100 % |
+| 192 MiB | 138.7 | 138.7 | 152.2 | 0 | 0 | 0 | 0 s | 100 % |
+| 96 MiB | 205.4 | **83.6** | **95.9** | 501 | 0 | 0 | 0.15 s | 100 % |
+| 96 MiB | 194.1 | **83.5** | **95.3** | 463 | 0 | 0 | 0.05 s | 100 % |
+| 48 MiB | 141.2 | **35.1** | **47.6** | 436 | 0 | 0 | 0.12 s | 100 % |
+
+MiB throughout; PSI is total stall in a 360 s run.
+
+**The disk queue and the resident page cache are already separate things.**
+Told to stay under 96 MiB while writing a 205 MiB backlog, the collector stays
+under 96 MiB: the kernel takes the pages back five hundred times and the
+workload is stopped for 0.15 seconds out of 360. Told to stay under 48 — under
+a quarter of the backlog — it does that too. Every export is accepted in every
+row, `memory.max` is never reached, nothing is killed, and no latency figure
+orders itself by the setting: p50 runs 1.20–1.28 ms and draining p99 19–31 ms
+across all five with the unthrottled run in the middle of both ranges.
+
+**The 192 MiB row is not a result.** That run's backlog only reached 138.7 MiB,
+so the throttle was never crossed and its `high` count is zero. The backlog
+comes out either ~140 or ~205 MiB depending on whether the sender's backoff —
+up to 30 s — happens to straddle the sink's return.
+
+**Why reclaim is this cheap here is structural.** Every page of the queue is
+clean almost as soon as it is written: a segment is `fsync`ed when it closes,
+so at most one open segment per signal is dirty, and the dirty and writeback
+columns never exceed 8 MiB in any run. Reclaim never has to write anything
+back to take a page. The cache is also entirely on the inactive list — 213.6
+MiB of 213.6 in the unthrottled run, with the active list at zero — which is
+the list reclaim takes from first.
+
+**So neither of the two things this was going to lead to is needed.** Admission
+control tying the disk queue to a RAM budget would be answering a question the
+kernel already answers, and it would answer it wrongly: a durable backlog of
+5 GiB with 30 MiB resident is a correct state, not a violation. Dropping the
+pages by hand after a seal — `POSIX_FADV_DONTNEED`, which the seal's `fsync`
+would make legal — would buy the same separation while paying for it in reads
+at drain time, and there is nothing left to buy.
+
+**What comes out of this is a deployment fact rather than a change.** Left
+alone, `memory.current` rises to whatever the backlog is, because nothing asked
+the kernel to stop it — that is not danger, it is an unbounded cache doing what
+a cache does, but it leaves no headroom to read and no signal to alert on.
+`memory.high` below `memory.max` costs a fraction of a second per outage and
+turns the container's memory into a number that means something.
+[`CONFIGURATION.md`](CONFIGURATION.md) now says so.
+
+One kernel, one filesystem, one disk. What generalises is the mechanism — clean
+pages, inactive list — rather than the numbers.
+
 ### The connection sweep, which is its own experiment
 
 Fixed byte rate, only the connection count varies, 120 s runs on the shipped
@@ -594,6 +655,7 @@ start refusing.
 | not a function of time | — | the 13-hour trace predates every fix; unretested |
 | not a function of connections | — | **fails**: 17.9 → 72.4 MiB from 8 to 256 |
 | not a function of past backlog | — | **met in the rig**: within half a megabyte on eight of nine drains since the segment was mapped; one ended 1.9 MiB up |
+| the cage, which is not the heap | — | `memory.current` follows the backlog unless `memory.high` is set; with it, 205 MiB of queue sits in 84 MiB of cache for 0.15 s of stall |
 
 **What this series has not established, in the order it is being answered.**
 

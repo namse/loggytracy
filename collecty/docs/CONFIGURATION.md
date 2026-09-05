@@ -48,25 +48,54 @@ side. Configure the exporting SDK, not collecty.
 | `COLLECTY_MAX_INFLIGHT_BYTES` | `64MiB` | Total bytes of exports being compressed and written at once. A request waits for room rather than being refused. Must be at least `COLLECTY_MAX_REQUEST_BYTES`, or a large export could never be admitted |
 
 Resident memory is **not** roughly this ceiling. Measured, at 204 exports/s of
-41 kB over 8 connections, the collector's anonymous footprint is about 18 MiB
-while the declared ceiling is 64 MiB and the bytes actually in flight are under
-a megabyte. [`MEMORY.md`](MEMORY.md) is the measurement and the three things it
-found that this sentence used to get wrong:
+41 kB over 8 connections, the collector's anonymous footprint is 8–10 MiB while
+the declared ceiling is 64 MiB and the bytes actually in flight are under a
+megabyte. [`MEMORY.md`](MEMORY.md) is the measurement. What it found:
 
-- **It is a function of how many clients there are.** 18 MiB over 8
-  connections, 72 MiB over 256, at the same byte rate. A body is read into
-  memory before the in-flight gate charges it, so `COLLECTY_MAX_INFLIGHT_BYTES`
-  bounds what is past the gate and not what is buffered before it.
-- **A backlog that has drained leaves some of itself behind**, about 4 % of
-  what passed through, so it is affected by how far behind signy has been even
-  though the backlog itself is on disk.
-- **The disk backlog is charged to a container's memory limit as page cache.**
-  A collector in a 256 MiB container reached 256 MiB of `memory.current` with a
-  190 MB queue and 106 MiB of heap. On a real filesystem those pages are
-  reclaimable and the process survives; on tmpfs they are not and it is killed.
-  **Size a container against `COLLECTY_QUEUE_MAX_BYTES`, not against the
-  heap**, or set the queue budget to something the container can hold. The
-  default queue budget is 1 GiB.
+- **A drained backlog no longer leaves itself behind.** It used to leave about
+  4 % of what passed through, because the send path allocated a buffer the size
+  of every segment; segments are mapped now and a drain ends where it started.
+- **It is still a function of how many clients there are.** 18 MiB over 8
+  connections, 72 MiB over 256, at the same byte rate, on a build predating
+  most of the reductions above. A body is read into memory before the in-flight
+  gate charges it, so `COLLECTY_MAX_INFLIGHT_BYTES` bounds what is past the
+  gate and not what is buffered before it.
+- **The disk backlog is charged to a container's memory limit as page cache**,
+  and unless the container says otherwise it stays there: a 200 MB backlog is
+  200 MiB of `memory.current`, which in a 256 MiB container leaves nothing to
+  read. That is a cache and not a leak — see the next section — but it is worth
+  bounding.
+- **A queue directory on tmpfs is not a queue.** Those pages are shmem, they
+  are charged to the container, and with swap off they cannot be reclaimed at
+  all, so a backlog the collector is designed to put on disk fills the limit
+  and the process is killed. Put the data directory on a real filesystem.
+
+### Set `memory.high` below the container's limit
+
+The one piece of container configuration worth stating outright, because
+without it a healthy collector looks like a container about to die:
+
+```
+MemoryMax=256M
+MemoryHigh=96M       # systemd; cgroup v2 memory.high
+```
+
+Crossing `memory.high` makes the kernel reclaim this cgroup rather than kill
+anything; crossing `memory.max` is where the OOM killer starts. Measured, over
+the same 60 s outage: writing a **205 MiB** backlog under a 96 MiB throttle
+keeps `memory.current` at **95.9 MiB** with **83.6 MiB** of it page cache, the
+kernel reclaiming five hundred times, the workload stalled for **0.15 seconds
+out of 360**, and every export accepted. Under a 48 MiB throttle — less than a
+quarter of the backlog — it holds at 47.6 MiB on the same terms.
+
+It is this cheap because the queue's pages are clean: a segment is `fsync`ed
+when it closes, so no more than one open segment per signal is ever dirty and
+reclaim never has to write anything back to take a page.
+
+So **size the container against the collector's own footprint plus the
+headroom you want to see, and set `memory.high` to it** — not against
+`COLLECTY_QUEUE_MAX_BYTES`, which is a disk budget. A 5 GiB durable backlog
+with 30 MiB resident is a correct state.
 
 ## What bounds disk
 
