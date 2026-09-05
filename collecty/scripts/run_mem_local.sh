@@ -166,6 +166,7 @@ echo "load: ${EPS} eps over ${CONNECTIONS} connections for ${SECONDS_CAP}s, cage
   --collecty "127.0.0.1:$COLLECTY_PORT" --sink "127.0.0.1:$SINK_PORT" \
   --eps "$EPS" --connections "$CONNECTIONS" --seconds "$SECONDS_CAP" \
   --records-per-export "$RECORDS" --report "$OUT/rig.json" \
+  --latency-csv "$OUT/latency.csv" \
   --trace-eps "$TRACE_EPS" --metric-every "$METRIC_EVERY" \
   "${OUTAGE_FLAGS[@]}" >"$OUT/rig.log" 2>&1 &
 RIG_PID=$!
@@ -237,6 +238,15 @@ if cg:
     cpu = [float(r["cpu_usec"]) for r in cg if r.get("cpu_usec", "").isdigit()]
     if cpu and max(cpu) > 0:
         result["cpu_seconds"] = round((max(cpu) - min(cpu)) / 1e6, 1)
+    # How deep the backlog got. The queue is the collector's answer to a sink
+    # that is away, so a run that changed the footprint by holding less of one
+    # is a different experiment, and this is the column that says so.
+    depth = [float(r["queue_bytes"]) for r in cg if r.get("queue_bytes", "").isdigit()]
+    if depth:
+        result["peak_queue_mib"] = round(max(depth) / MiB, 1)
+    held = [int(r["segments"]) for r in cg if r.get("segments", "").isdigit()]
+    if held:
+        result["peak_segments"] = max(held)
 
 # A drain is three phases and one number cannot hold them: what the collector
 # sat at before the sink went away, what it reached while the backlog came

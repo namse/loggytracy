@@ -19,6 +19,14 @@
 //! which is how the drain step of `MEMORY.md` §3 is reproduced without
 //! stopping a process: collecty sees refusals, backs off, builds a backlog on
 //! disk, and then drains it as fast as the sink will take it.
+//!
+//! Every export is timed from the client's side -- the request going out to
+//! the response saying it was taken -- because that is the number an exporter
+//! sitting beside collecty actually experiences, and a change that halves the
+//! footprint while pushing the tail from 20 ms to 800 ms is not a change worth
+//! having. `--latency-csv` writes every sample so a tail can be looked at
+//! again later; the report keeps percentiles and a histogram beside them,
+//! because a single p99 cannot say what shape the tail took.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -49,6 +57,7 @@ struct Args {
     outage_at: Option<u64>,
     outage_for: u64,
     report: Option<String>,
+    latency_csv: Option<String>,
     trace_eps: f64,
     metric_every: f64,
 }
@@ -64,6 +73,7 @@ fn args() -> Args {
         outage_at: None,
         outage_for: 180,
         report: None,
+        latency_csv: None,
         // The soak's own shape: a low trace rate and a scrape every ten
         // seconds. Both matter to memory out of all proportion to their
         // bytes -- a signal that never fills a segment still rolls one every
@@ -88,6 +98,7 @@ fn args() -> Args {
             "--outage-at" => args.outage_at = Some(value().parse().expect("a number")),
             "--outage-for" => args.outage_for = value().parse().expect("a number"),
             "--report" => args.report = Some(value()),
+            "--latency-csv" => args.latency_csv = Some(value()),
             "--trace-eps" => args.trace_eps = value().parse().expect("a number"),
             "--metric-every" => args.metric_every = value().parse().expect("a number"),
             other => panic!("unknown flag {other}"),
@@ -271,6 +282,69 @@ async fn sink(
         .unwrap())
 }
 
+/// One export, timed from the client's side.
+///
+/// `micros` is the request going out to the response coming back, which is
+/// what the exporter beside collecty waits for. `t` is when it went out, so
+/// the outage window can be cut out at report time rather than guessed at:
+/// while the sink is away the far end is refusing and the backlog policy
+/// decides what ingest feels, which is a different experiment from how many
+/// threads the runtime has.
+struct Sample {
+    t: f32,
+    micros: u32,
+    path: &'static str,
+    ok: bool,
+}
+
+/// Percentiles and the histogram they came from.
+///
+/// The histogram is kept because a p99 on its own cannot say what the tail
+/// did: doubling and a long thin tail read the same in one number and are not
+/// the same regression. Buckets are powers of two in microseconds, which is
+/// one `leading_zeros` per sample and fine enough to see a shape.
+fn latency_json(samples: &[&Sample]) -> String {
+    if samples.is_empty() {
+        return "null".to_string();
+    }
+    let mut micros: Vec<u32> = samples.iter().map(|s| s.micros).collect();
+    micros.sort_unstable();
+    let at = |q: f64| -> u32 {
+        let index = ((micros.len() as f64 - 1.0) * q).round() as usize;
+        micros[index]
+    };
+    // 33 and not 32: a sample at `u32::MAX` has no leading zeros and lands in
+    // the last bucket, which would be one past the end of a 32-wide array.
+    let mut buckets = [0u64; 33];
+    for value in &micros {
+        buckets[(32 - value.max(&1).leading_zeros()) as usize] += 1;
+    }
+    let hist: Vec<String> = buckets
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 0)
+        .map(|(index, count)| format!("[{}, {}]", 1u64 << index, count))
+        .collect();
+    format!(
+        "{{\"count\": {}, \"p50_us\": {}, \"p95_us\": {}, \"p99_us\": {}, \
+\"max_us\": {}, \"hist_le_us\": [{}]}}",
+        micros.len(),
+        at(0.50),
+        at(0.95),
+        at(0.99),
+        micros[micros.len() - 1],
+        hist.join(", ")
+    )
+}
+
+/// When the run started and when it stops. Together because a sample is timed
+/// against the first and the loop ends on the second.
+#[derive(Clone, Copy)]
+struct Window {
+    started: Instant,
+    until: Instant,
+}
+
 /// One worker, one TCP connection, its own share of the rate.
 ///
 /// A connection of its own rather than a pooled client: the scaling test of
@@ -281,13 +355,14 @@ async fn drive(
     bodies: Arc<Vec<Vec<u8>>>,
     mut offset: usize,
     period: Duration,
-    until: Instant,
+    window: Window,
     counts: Arc<Counts>,
-) {
+) -> Vec<Sample> {
+    let mut samples = Vec::new();
     let mut sender: Option<hyper::client::conn::http1::SendRequest<Full<Bytes>>> = None;
     let mut ticker = tokio::time::interval(period);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
-    while Instant::now() < until {
+    while Instant::now() < window.until {
         ticker.tick().await;
         if sender.as_ref().is_none_or(|s| s.is_closed()) {
             let Ok(stream) = TcpStream::connect(&address).await else {
@@ -318,7 +393,8 @@ async fn drive(
             .expect("a well-formed export");
 
         counts.offered.fetch_add(1, Ordering::Relaxed);
-        match sender
+        let sent = Instant::now();
+        let ok = match sender
             .as_mut()
             .expect("connected")
             .send_request(request)
@@ -326,19 +402,32 @@ async fn drive(
         {
             Ok(response) => {
                 let status = response.status();
+                // The answer is not the answer until its body is done with:
+                // collecty's success is an empty body, but a refusal carries
+                // text, and stopping at the status would time them differently.
                 let _ = response.into_body().collect().await;
                 if status.is_success() {
                     counts.accepted.fetch_add(1, Ordering::Relaxed);
+                    true
                 } else {
                     counts.failed.fetch_add(1, Ordering::Relaxed);
+                    false
                 }
             }
             Err(_) => {
                 counts.failed.fetch_add(1, Ordering::Relaxed);
                 sender = None;
+                false
             }
-        }
+        };
+        samples.push(Sample {
+            t: sent.duration_since(window.started).as_secs_f32(),
+            micros: sent.elapsed().as_micros().min(u32::MAX as u128) as u32,
+            path,
+            ok,
+        });
     }
+    samples
 }
 
 #[tokio::main]
@@ -410,7 +499,10 @@ async fn main() {
     );
 
     let started = Instant::now();
-    let until = started + Duration::from_secs(args.seconds);
+    let window = Window {
+        started,
+        until: started + Duration::from_secs(args.seconds),
+    };
     let per_worker = exports_per_second / args.connections as f64;
     let period = Duration::from_secs_f64(1.0 / per_worker);
 
@@ -435,7 +527,7 @@ async fn main() {
                 bodies.clone(),
                 index * 97,
                 period,
-                until,
+                window,
                 counts.clone(),
             ))
         })
@@ -453,7 +545,7 @@ async fn main() {
             small.clone(),
             3,
             Duration::from_secs_f64((2.0 / args.trace_eps).max(0.001)),
-            until,
+            window,
             counts.clone(),
         )));
     }
@@ -464,29 +556,77 @@ async fn main() {
             small.clone(),
             7,
             Duration::from_secs_f64(args.metric_every),
-            until,
+            window,
             counts.clone(),
         )));
     }
 
+    let mut samples = Vec::new();
     for worker in workers {
-        let _ = worker.await;
+        if let Ok(mut theirs) = worker.await {
+            samples.append(&mut theirs);
+        }
     }
+    samples.sort_by(|a, b| a.t.total_cmp(&b.t));
 
     let elapsed = started.elapsed().as_secs_f64();
     let offered = counts.offered.load(Ordering::Relaxed);
     let accepted = counts.accepted.load(Ordering::Relaxed);
+
+    if let Some(path) = &args.latency_csv {
+        let mut csv = String::from("t,path,micros,ok\n");
+        for sample in &samples {
+            csv.push_str(&format!(
+                "{:.3},{},{},{}\n",
+                sample.t,
+                sample.path,
+                sample.micros,
+                if sample.ok { 1 } else { 0 }
+            ));
+        }
+        let _ = std::fs::write(path, csv);
+    }
+
+    // Only `/v1/logs`, which is the load. The other two signals are there for
+    // what they do to segments and compressors, and folding a handful of them
+    // per second into a percentile would say nothing about either.
+    //
+    // Split at the outage, because during it the sink is refusing, the queue
+    // is filling and what ingest feels is the backlog policy rather than the
+    // runtime. Mixing the windows would let a change to one hide in the other.
+    let phase_of = |t: f32| -> &'static str {
+        match args.outage_at {
+            Some(at) if t < at as f32 => "steady",
+            Some(at) if t < (at + args.outage_for) as f32 => "outage",
+            Some(_) => "draining",
+            None => "steady",
+        }
+    };
+    let phases = ["steady", "outage", "draining"];
+    let latency: Vec<String> = phases
+        .iter()
+        .map(|phase| {
+            let of_phase: Vec<&Sample> = samples
+                .iter()
+                .filter(|s| s.path == "/v1/logs" && phase_of(s.t) == *phase)
+                .collect();
+            format!("    \"{phase}\": {}", latency_json(&of_phase))
+        })
+        .collect();
+
     let report = format!(
         "{{\n  \"seconds\": {elapsed:.2},\n  \"offered_exports\": {offered},\n  \
 \"accepted_exports\": {accepted},\n  \"failed_exports\": {},\n  \
 \"offered_eps\": {:.0},\n  \"accepted_eps\": {:.0},\n  \
-\"sink_requests\": {},\n  \"sink_bytes\": {},\n  \"sink_refused\": {}\n}}\n",
+\"sink_requests\": {},\n  \"sink_bytes\": {},\n  \"sink_refused\": {},\n  \
+\"ingest_latency\": {{\n{}\n  }}\n}}\n",
         counts.failed.load(Ordering::Relaxed),
         offered as f64 * args.records_per_export as f64 / elapsed,
         accepted as f64 * args.records_per_export as f64 / elapsed,
         counts.sink_requests.load(Ordering::Relaxed),
         counts.sink_bytes.load(Ordering::Relaxed),
         counts.sink_refused.load(Ordering::Relaxed),
+        latency.join(",\n"),
     );
     print!("{report}");
     if let Some(path) = args.report {
