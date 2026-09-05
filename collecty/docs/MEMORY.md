@@ -412,11 +412,17 @@ machine.
 **Every A/B from here interleaves its runs** — A, B, A, B — rather than
 running one arm and then the other.
 
-**Memory did not drift**, which is why it can still be read straight off the
-table: the baseline's anon was 9.9 at the start and 9.9 at the end, against
-8.3–8.5 for either threaded shape. One of the seven runs in this section ended
-a drain 1.9 MiB above where it started, where the other six ended within half
-a megabyte; it is recorded rather than explained.
+**Memory did not drift within this section** — the baseline's anon was 9.9 at
+the start and 9.9 at the end — and both threaded shapes came in at 8.3–8.5,
+so about a megabyte and a half lower. **That is an observation and not a
+result.** The section below runs the same two-worker code four more times and
+gets 7.4 as well as 9.9, a spread wider than the gap being read here, so what
+this table supports is *around one to two megabytes lower, seen twice each*,
+and nothing about why.
+
+One of the seven runs in this section ended a drain 1.9 MiB above where it
+started, where the other six ended within half a megabyte; it is recorded
+rather than explained.
 
 **The write lane waits, and it always did.** Its p99 of 33–65 ms is the `fsync`
 that closes a segment, which under the old shape ran on a worker while holding

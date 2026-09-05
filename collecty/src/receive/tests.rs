@@ -249,6 +249,73 @@ async fn a_body_that_arrives_in_pieces_is_one_record_again() {
     harness.stop().await;
 }
 
+/// The same, but the client stops halfway through.
+struct FailsPartway(std::vec::IntoIter<Bytes>);
+
+impl hyper::body::Body for FailsPartway {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        std::task::Poll::Ready(Some(match self.0.next() {
+            Some(piece) => Ok(hyper::body::Frame::data(piece)),
+            None => Err(std::io::Error::other("the client went away mid-body")),
+        }))
+    }
+}
+
+/// An export that never finished arriving is not half an export.
+///
+/// Reading the body frame by frame could have meant queueing what turned up
+/// and then discovering the rest was never coming, which would put a truncated
+/// protobuf into a segment for signy to refuse -- and it refuses whole
+/// segments. The frames are held until the body ends, so a body that ends
+/// badly is a request that queued nothing.
+#[tokio::test]
+async fn a_body_that_stops_halfway_queues_nothing() {
+    let harness = Harness::start("receive-truncated", DEFAULT_MAX_REQUEST_BYTES).await;
+    let lost = logs("an export that never arrived in full").encode_to_vec();
+    let pieces: Vec<Bytes> = lost.chunks(16).map(Bytes::copy_from_slice).collect();
+    assert!(
+        pieces.len() > 1,
+        "some of it has to arrive before the rest does not"
+    );
+
+    let client = Client::builder(TokioExecutor::new()).build_http::<FailsPartway>();
+    let outcome = client
+        .request(
+            http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{}/v1/logs", harness.addr))
+                .header(CONTENT_TYPE, "application/x-protobuf")
+                .body(FailsPartway(pieces.into_iter()))
+                .expect("a well-formed request"),
+        )
+        .await;
+    // Not a vacuous test: the request has to have failed rather than never
+    // been made, or the body was never read and there was nothing to be
+    // partial about.
+    assert!(
+        !matches!(&outcome, Ok(response) if response.status().is_success()),
+        "a truncated export was answered as a success"
+    );
+
+    // An export that does arrive, afterwards. It is here so that the check
+    // below is not just a check made too early: whatever the truncated one
+    // left behind would be in front of this one.
+    let kept = logs("an export that did arrive").encode_to_vec();
+    assert_eq!(
+        harness.export("/v1/logs", kept.clone()).await,
+        StatusCode::OK
+    );
+
+    assert_eq!(harness.records(), vec![(Signal::Logs, kept)]);
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn every_signal_lands_in_a_segment_of_its_own() {
     let harness = Harness::start("receive-signals", DEFAULT_MAX_REQUEST_BYTES).await;
