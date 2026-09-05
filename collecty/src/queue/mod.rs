@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
@@ -120,7 +121,7 @@ struct Held {
 pub struct SealedSegment {
     pub signal: Signal,
     pub seq: u64,
-    pub body: Vec<u8>,
+    pub body: Bytes,
 }
 
 impl Queue {
@@ -365,7 +366,7 @@ impl Queue {
     /// reach the same place.
     pub fn read_segment(&self, signal: Signal, seq: u64) -> io::Result<SealedSegment> {
         let _tag = memprof::enter(Arena::Send);
-        let body = segment::read_whole(&self.dirs[signal.index()], seq)?;
+        let body = segment::map_whole(&self.dirs[signal.index()], seq)?;
         Ok(SealedSegment { signal, seq, body })
     }
 

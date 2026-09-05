@@ -3,6 +3,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use bytes::Bytes;
+use memmap2::Mmap;
+
 const SEGMENT_SUFFIX: &str = ".seg";
 const TEMPORARY_SUFFIX: &str = ".tmp";
 
@@ -118,15 +121,36 @@ pub fn open_for_read(dir: &Path, seq: u64) -> io::Result<File> {
     File::open(path(dir, seq))
 }
 
-/// A whole segment, in one buffer the size of the file.
+/// A whole segment, mapped rather than read.
 ///
-/// `std::fs::read` asks the file how big it is and allocates that once. A
-/// `Vec` grown by `read_to_end` instead reallocates and copies its way up in
-/// doublings -- eight of them for a megabyte segment -- and a drain reads
-/// segments back to back as fast as the far end takes them, so those are
-/// exactly the transient large blocks a heap is left holding afterwards.
-pub fn read_whole(dir: &Path, seq: u64) -> io::Result<Vec<u8>> {
-    std::fs::read(path(dir, seq))
+/// A sealed segment is the wire body byte for byte, so the file already is the
+/// buffer and the send path can hand its pages to hyper untouched. Reading it
+/// instead allocates the file's size on the heap and copies the page cache
+/// into it, and a drain does that back to back as fast as the far end takes
+/// segments. Those multi-megabyte transients are what a glibc arena ends up
+/// sized by: `docs/MEMORY.md` measured 198 MB drained leaving +7.8 MiB
+/// resident afterwards, against under 1 MiB of anything live.
+///
+/// The bytes move rather than disappear -- they are page cache now, which a
+/// cgroup counts too -- so what this saves outright is the copy and the
+/// allocation, and what it saves in the cage is whatever the kernel is willing
+/// to reclaim. Both are `memory.current`'s to answer, not anon's.
+///
+/// An empty file cannot be mapped. A sealed segment is never empty, since zstd
+/// writes a frame epilogue, but a crash can leave one behind, and answering
+/// with no bytes retires it where an error would have the sender retry it
+/// forever.
+pub fn map_whole(dir: &Path, seq: u64) -> io::Result<Bytes> {
+    let file = File::open(path(dir, seq))?;
+    if file.metadata()?.len() == 0 {
+        return Ok(Bytes::new());
+    }
+    // SAFETY: a sealed segment is immutable for as long as the queue holds it.
+    // Nothing writes to it after `finish`, and the only other thing that ever
+    // happens to it is being unlinked once signy has it, which leaves the
+    // mapping intact. The directory is the queue's own.
+    let map = unsafe { Mmap::map(&file)? };
+    Ok(Bytes::from_owner(map))
 }
 
 pub fn remove(dir: &Path, seq: u64) -> io::Result<()> {

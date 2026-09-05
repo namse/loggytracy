@@ -149,7 +149,6 @@ impl<T: Transport> Sender<T> {
     ) {
         let SealedSegment { signal, seq, body } = segment;
         let bytes = body.len() as u64;
-        let body = Bytes::from(body);
 
         let mut backoff = self.config.retry_initial;
         loop {

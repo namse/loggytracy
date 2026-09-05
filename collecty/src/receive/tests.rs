@@ -139,7 +139,7 @@ impl Harness {
 
     /// What the sender would ship: every open segment closed, then read whole,
     /// oldest first.
-    fn sealed(&self) -> Vec<(Signal, Vec<u8>)> {
+    fn sealed(&self) -> Vec<(Signal, Bytes)> {
         self.queue.seal_if_due().expect("a seal");
         let mut bodies = Vec::new();
         while let Some((signal, seq)) = self.queue.oldest_sealed() {
