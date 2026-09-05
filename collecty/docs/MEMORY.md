@@ -336,18 +336,26 @@ Same drain, two runs each, on the mapped build:
 | steady p99 | 24.1, 27.2 ms | 24.2, 40.7 ms |
 | accepted | 62,286 / 62,286 | 62,286 / 62,286 |
 
-**Two megabytes and a little CPU for nothing measurable.** Anon is about 18 %
-lower and the two configurations' ranges do not meet; CPU is lower rather than
-higher; p50 and p95 move by less than a tenth of a millisecond.
+**Two megabytes, and no cost that two runs can find.** Taking the means, and
+keeping the three memory numbers apart because they are three different
+things: anon before the outage falls 12.05 → 9.70 MiB (−19.5 %), anon after
+the drain 12.0 → 9.4 MiB (−21.7 %), and `memory.current` after settling 12.75
+→ 11.7 MiB (−8.2 %). None of these is RSS, which this rig does not sample on
+the shipped build. The anon ranges do not meet. CPU came out lower rather than
+higher, which two runs each is enough to read as *no penalty* and not enough
+to read as an improvement. p50 and p95 move by less than a tenth of a
+millisecond.
 
-**The p99 row says 27 against 41 and that is not a regression.** This is why
+**The p99 row says 27 against 41 ms, and what the samples support is that
+there is no evidence of a regression — not that there is none.** This is why
 the samples are kept. In the steady window the share of exports over 10 ms is
-2.26 / 2.61 % against 2.71 / 2.57 %, over 50 ms is 0.29 / 0.06 % against
-0.06 / 0.52 %, and the worst sample is 384 ms on a one-per-core run and 302 ms
-on a two-worker one. The tail is a handful of outliers in either
-configuration, both configurations straddle each other on every cut, and two
-runs cannot separate them. What would be a regression — the body of the
-distribution moving — did not happen.
+2.26 / 2.61 % against 2.71 / 2.57 %, and over 50 ms 0.29 / 0.06 % against
+0.06 / 0.52 %: the two configurations straddle each other on both cuts, so
+the tail is a handful of outliers in either and two runs cannot separate them.
+The single worst sample of a run — 384 ms against 302 ms — carries almost no
+information about a tail and is in the table only because it is what `max`
+means. What would be a regression, the body of the distribution moving, did
+not happen.
 
 **One worker is the next step and not this one.** The sender still calls
 `Queue::seal_if_due` on this runtime, and that closes a segment and `fsync`s
