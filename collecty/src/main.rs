@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use collecty::config::Config;
 use collecty::observe::Reporter;
-use collecty::queue::Queue;
+use collecty::queue::{Queue, Spool};
 use collecty::receive::{self, Intake};
 use collecty::send::{HttpTransport, Sender};
 use collecty::signal::Signal;
@@ -78,10 +78,12 @@ async fn run(config: Config) -> Result<(), String> {
             .map_err(|error| format!("cannot open the queue at {dir:?}: {error}"))?,
     );
 
+    let spool = Spool::new(queue.clone());
+
     let listener =
         receive::bind(config.listen_addr).map_err(|error| format!("cannot serve OTLP: {error}"))?;
     let intake = Intake::new(
-        queue.clone(),
+        spool.clone(),
         config.max_request_bytes,
         config.max_inflight_bytes,
     );
@@ -99,8 +101,13 @@ async fn run(config: Config) -> Result<(), String> {
         config.send_timeout,
     ));
 
-    let sender = Sender::new(queue.clone(), transport, config.sender);
-    let reporter = Reporter::new(queue.clone(), sender.stats(), config.tenant.clone());
+    let sender = Sender::new(queue.clone(), spool.clone(), transport, config.sender);
+    let reporter = Reporter::new(
+        queue.clone(),
+        sender.stats(),
+        spool.clone(),
+        config.tenant.clone(),
+    );
     let sending = {
         let watcher = watcher.clone();
         tokio::spawn(async move { sender.run(watcher).await })
@@ -136,8 +143,17 @@ async fn run(config: Config) -> Result<(), String> {
     // The only `fsync` the queue has is the one that closes a segment, so
     // leaving without closing the open one would leave its records to be
     // recovered rather than simply read.
-    if let Err(error) = queue.seal() {
-        tracing::error!(%error, "the open segment could not be closed on the way out");
+    //
+    // Through the spool like everything else, and awaited: the reply arrives
+    // after the `fsync` has returned, so the records are on the device before
+    // this function does. Nothing joins the thread afterwards because nothing
+    // needs to -- durability is the reply, not the thread ending.
+    match spool.seal().await {
+        Ok(Err(error)) => {
+            tracing::error!(%error, "the open segment could not be closed on the way out")
+        }
+        Err(gone) => tracing::error!(%gone, "the open segment could not be closed on the way out"),
+        Ok(Ok(())) => {}
     }
     served.map_err(|error| format!("the OTLP listener stopped: {error}"))
 }

@@ -11,7 +11,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 
-use crate::queue::Queue;
+use crate::queue::{Queue, Spool};
 use crate::send::SenderStats;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -118,15 +118,22 @@ const FAMILIES: &[Family] = &[
 pub struct Reporter {
     queue: Arc<Queue>,
     stats: Arc<SenderStats>,
+    spool: Spool,
     started_unix_nanos: u64,
     tenant: Option<String>,
 }
 
 impl Reporter {
-    pub fn new(queue: Arc<Queue>, stats: Arc<SenderStats>, tenant: Option<String>) -> Reporter {
+    pub fn new(
+        queue: Arc<Queue>,
+        stats: Arc<SenderStats>,
+        spool: Spool,
+        tenant: Option<String>,
+    ) -> Reporter {
         Reporter {
             queue,
             stats,
+            spool,
             started_unix_nanos: unix_nanos(),
             tenant,
         }
@@ -165,8 +172,19 @@ impl Reporter {
         ))
     }
 
+    /// The queue's own numbers, and how the one thread behind them is coping.
+    ///
+    /// Every file operation the queue has is serial on the spool thread now,
+    /// so what matters is not only that the queue is keeping up but whether
+    /// anything is waiting behind an `fsync` to find out. The wait figures are
+    /// cumulative, so a run's last line covers the run.
     pub fn log(&self, observed: &Observation) {
+        let spool = self.spool.report();
         tracing::info!(
+            spool_requests = spool.requests,
+            spool_max_depth = spool.max_depth,
+            spool_wait_p99_us = spool.wait_p99_us,
+            spool_wait_max_us = spool.wait_max_us,
             queued_bytes = observed.queued_bytes,
             segments = observed.segments,
             appended_records = observed.appended_records,
@@ -326,7 +344,8 @@ mod tests {
             )
             .expect("a queue"),
         );
-        let reporter = Reporter::new(queue, Arc::new(SenderStats::default()), None);
+        let spool = Spool::new(queue.clone());
+        let reporter = Reporter::new(queue, Arc::new(SenderStats::default()), spool, None);
         assert!(reporter.export(&reporter.observe()).is_none());
     }
 

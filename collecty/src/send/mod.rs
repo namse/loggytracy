@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::sync::watch;
 
-use crate::queue::{Queue, SealedSegment, SenderId};
+use crate::queue::{Queue, SealedSegment, SenderId, Spool};
 use crate::signal::Signal;
 
 pub use transport::HttpTransport;
@@ -81,15 +81,26 @@ pub struct SenderStats {
 
 pub struct Sender<T> {
     queue: Arc<Queue>,
+    /// Every file this sender touches, it touches through here. Closing a
+    /// segment, opening one and unlinking one are all syscalls that return
+    /// when the device says so, and none of them belongs on a runtime that is
+    /// also accepting connections.
+    spool: Spool,
     transport: Arc<T>,
     config: SenderConfig,
     stats: Arc<SenderStats>,
 }
 
 impl<T: Transport> Sender<T> {
-    pub fn new(queue: Arc<Queue>, transport: Arc<T>, config: SenderConfig) -> Sender<T> {
+    pub fn new(
+        queue: Arc<Queue>,
+        spool: Spool,
+        transport: Arc<T>,
+        config: SenderConfig,
+    ) -> Sender<T> {
         Sender {
             queue,
+            spool,
             transport,
             config,
             stats: Arc::new(SenderStats::default()),
@@ -104,8 +115,15 @@ impl<T: Transport> Sender<T> {
         while !*shutdown.borrow() {
             // Before looking for work: a quiet host would otherwise hold its
             // records until a segment filled.
-            if let Err(error) = self.queue.seal_if_due() {
-                tracing::error!(%error, "an open segment could not be closed");
+            match self.spool.seal_if_due().await {
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "an open segment could not be closed");
+                }
+                Err(gone) => {
+                    tracing::error!(%gone, "an open segment could not be closed");
+                    return;
+                }
+                Ok(Ok(())) => {}
             }
 
             let Some((signal, seq)) = self.queue.oldest_sealed() else {
@@ -117,10 +135,7 @@ impl<T: Transport> Sender<T> {
                 continue;
             };
 
-            let queue = self.queue.clone();
-            let segment =
-                tokio::task::spawn_blocking(move || queue.read_segment(signal, seq)).await;
-            let segment = match segment {
+            let segment = match self.spool.read_segment(signal, seq).await {
                 Ok(Ok(segment)) => segment,
                 Ok(Err(error)) => {
                     tracing::error!(
@@ -132,9 +147,9 @@ impl<T: Transport> Sender<T> {
                     tokio::time::sleep(self.config.retry_initial).await;
                     continue;
                 }
-                Err(error) => {
-                    tracing::error!(%error, "the segment reader did not finish");
-                    continue;
+                Err(gone) => {
+                    tracing::error!(%gone, "the segment could not be read");
+                    return;
                 }
             };
 
@@ -165,7 +180,7 @@ impl<T: Transport> Sender<T> {
                 Outcome::Accepted(stored) => {
                     self.stats.sent_segments.fetch_add(1, Ordering::Relaxed);
                     self.stats.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
-                    self.commit(signal, stored.max(seq));
+                    self.commit(signal, stored.max(seq)).await;
                     return;
                 }
                 // Permanent for this segment's shape rather than its content:
@@ -182,7 +197,7 @@ impl<T: Transport> Sender<T> {
                     );
                     self.stats.refused_segments.fetch_add(1, Ordering::Relaxed);
                     self.stats.refused_bytes.fetch_add(bytes, Ordering::Relaxed);
-                    self.commit(signal, seq);
+                    self.commit(signal, seq).await;
                     return;
                 }
                 Outcome::Retry(reason) => {
@@ -204,9 +219,11 @@ impl<T: Transport> Sender<T> {
         }
     }
 
-    fn commit(&self, signal: Signal, acked: u64) {
-        if let Err(error) = self.queue.commit(signal, acked) {
-            tracing::error!(%error, "the cursor could not be advanced");
+    async fn commit(&self, signal: Signal, acked: u64) {
+        match self.spool.commit(signal, acked).await {
+            Ok(Err(error)) => tracing::error!(%error, "the cursor could not be advanced"),
+            Err(gone) => tracing::error!(%gone, "the cursor could not be advanced"),
+            Ok(Ok(())) => {}
         }
     }
 }

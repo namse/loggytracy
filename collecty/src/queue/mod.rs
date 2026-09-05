@@ -1,5 +1,6 @@
 mod identity;
 mod segment;
+mod spool;
 #[cfg(test)]
 mod tests;
 
@@ -14,6 +15,7 @@ use tokio::sync::Notify;
 
 pub use identity::SenderId;
 use segment::SegmentWriter;
+pub use spool::{Gone, Spool, SpoolReport};
 
 use crate::memprof::{self, Arena};
 use crate::signal::Signal;

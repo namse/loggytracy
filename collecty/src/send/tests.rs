@@ -4,6 +4,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 
 use super::*;
+use crate::queue::Spool;
 use crate::queue::{Queue, QueueLimits};
 use crate::signal::Signal;
 use crate::test_support::Scratch;
@@ -92,7 +93,12 @@ async fn a_delivered_segment_advances_the_cursor_and_unlinks_the_file() {
     let scratch = Scratch::new("send-ok");
     let queue = queue_with(&scratch, &records(3));
     let transport = Scripted::new(|_| Outcome::Accepted(0));
-    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
+    let sender = Sender::new(
+        queue.clone(),
+        Spool::new(queue.clone()),
+        transport.clone(),
+        SenderConfig::default(),
+    );
 
     deliver_all(&sender, &queue).await;
 
@@ -122,7 +128,12 @@ async fn a_retried_segment_is_sent_whole_again() {
             Outcome::Accepted(0)
         }
     });
-    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
+    let sender = Sender::new(
+        queue.clone(),
+        Spool::new(queue.clone()),
+        transport.clone(),
+        SenderConfig::default(),
+    );
 
     tokio::time::pause();
     deliver_all(&sender, &queue).await;
@@ -159,7 +170,12 @@ async fn a_refused_segment_is_dropped_whole_and_counted() {
             Outcome::Accepted(0)
         }
     });
-    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
+    let sender = Sender::new(
+        queue.clone(),
+        Spool::new(queue.clone()),
+        transport.clone(),
+        SenderConfig::default(),
+    );
 
     deliver_all(&sender, &queue).await;
 
@@ -177,7 +193,12 @@ async fn shutdown_stops_a_retry_loop_without_advancing_the_cursor() {
     let scratch = Scratch::new("send-stop");
     let queue = queue_with(&scratch, &records(1));
     let transport = Scripted::new(|_| Outcome::Retry("signy is down".to_string()));
-    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
+    let sender = Sender::new(
+        queue.clone(),
+        Spool::new(queue.clone()),
+        transport.clone(),
+        SenderConfig::default(),
+    );
 
     let (tx, mut rx) = watch::channel(false);
     let (signal, seq) = queue.oldest_sealed().expect("a closed segment");
@@ -196,7 +217,12 @@ async fn shutdown_stops_a_retry_loop_without_advancing_the_cursor() {
     assert_eq!(sender.stats().sent_segments.load(Ordering::Relaxed), 0);
 }
 
-#[tokio::test(start_paused = true)]
+/// Real time, not a paused clock. The run loop now waits on the spool thread,
+/// and a paused runtime that sees every task blocked on another OS thread
+/// decides it is idle and jumps the clock to the next timer -- which here is
+/// the one that stops the loop, so it would stop before it had shipped
+/// anything. The stop is waited for instead of timed.
+#[tokio::test]
 async fn the_run_loop_closes_the_open_segment_and_ships_it() {
     let scratch = Scratch::new("send-run");
     let queue =
@@ -205,11 +231,19 @@ async fn the_run_loop_closes_the_open_segment_and_ships_it() {
         queue.append(Signal::Logs, &body).expect("an append");
     }
     let transport = Scripted::new(|_| Outcome::Accepted(0));
-    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
+    let sender = Sender::new(
+        queue.clone(),
+        Spool::new(queue.clone()),
+        transport.clone(),
+        SenderConfig::default(),
+    );
 
     let (tx, rx) = watch::channel(false);
-    let stop = async move {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    let stop = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while transport.segments().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         let _ = tx.send(true);
     };
     tokio::join!(sender.run(rx), stop);
@@ -229,7 +263,12 @@ async fn an_answer_beyond_the_segment_clears_everything_under_it() {
     let scratch = Scratch::new("send-ahead");
     let queue = queue_with(&scratch, &records(3));
     let transport = Scripted::new(|_| Outcome::Accepted(3));
-    let sender = Sender::new(queue.clone(), transport.clone(), SenderConfig::default());
+    let sender = Sender::new(
+        queue.clone(),
+        Spool::new(queue.clone()),
+        transport.clone(),
+        SenderConfig::default(),
+    );
 
     deliver_all(&sender, &queue).await;
 

@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 
 use super::*;
 use crate::queue::QueueLimits;
+use crate::queue::{Queue, Spool};
 use crate::test_support::Scratch;
 
 /// The tests take what the sender would take, so the open segment has to close
@@ -74,7 +75,11 @@ impl Harness {
         // whatever else is listening on this machine.
         let listener = bind("127.0.0.1:0".parse().expect("a literal address")).expect("a listener");
         let addr = listener.local_addr().expect("a bound address");
-        let intake = Intake::new(queue.clone(), max_request_bytes, DEFAULT_MAX_INFLIGHT_BYTES);
+        let intake = Intake::new(
+            Spool::new(queue.clone()),
+            max_request_bytes,
+            DEFAULT_MAX_INFLIGHT_BYTES,
+        );
         let (tx, rx) = oneshot::channel();
         let server = tokio::spawn(serve(intake, listener, async move {
             let _ = rx.await;
@@ -281,7 +286,7 @@ async fn a_payload_over_the_ceiling_is_refused_off_the_http_path_too() {
         )
         .expect("a queue"),
     );
-    let intake = Intake::new(queue.clone(), 64, DEFAULT_MAX_INFLIGHT_BYTES);
+    let intake = Intake::new(Spool::new(queue.clone()), 64, DEFAULT_MAX_INFLIGHT_BYTES);
 
     let refusal = intake
         .accept(Signal::Logs, bytes::Bytes::from(vec![0u8; 128]))
