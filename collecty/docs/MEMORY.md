@@ -691,27 +691,71 @@ start refusing.
 | not a function of past backlog | — | **met in the rig**: within half a megabyte on eight of nine drains since the segment was mapped; one ended 1.9 MiB up |
 | the cage, which is not the heap | — | `memory.current` follows the backlog unless `memory.high` is set; with it, 2,095 MiB of queue sits in 82 MiB of cache for 0.48 s of stall in 23 minutes |
 
-**What this series has not established, in the order it is being answered.**
+**What this series has not established.**
 
-1. **Whether the ratchet over hours is gone.** Every row above is five minutes
-   long. The only evidence that collecty grows with time is thirteen hours of a
-   build that no longer exists, and reducing a cause is not the same as
-   removing an effect — this is the question the whole series is for, and it is
-   the one none of its rows answers. A fault-free multi-hour run on the new
-   build is running for exactly this, with faults deliberately left out: the
-   drain step already has its own answer above, and mixing it in would
-   contaminate the time slope, which is the only thing that run is asked to
-   decide.
+1. **Whether the ratchet over hours is gone.** Every run above is minutes, and
+   the longest is twenty-three. The only evidence that collecty grows with time
+   is thirteen hours of a build that no longer exists, and reducing a cause is
+   not the same as removing an effect. This is the one question the series was
+   for and the one none of its rows answers. It is a soak's to answer, and the
+   next section says what that soak has to show.
 2. **Whether it holds on a corpus that compresses like production's.** This
    rig achieves 3.63x where the soak's collector achieved 4.87x, so its
    segments are larger than production's. That errs towards more memory
    pressure rather than less, but it has not been shown to err only that way.
-3. **What to do about connection scaling**, which is a policy decision and is
+3. **Whether the reclaim result travels.** One kernel, one filesystem, one
+   disk. What should generalise is the mechanism — a segment is `fsync`ed when
+   it closes, so its pages are clean and on the inactive list, and reclaim can
+   drop them without writing anything — not the 82 MiB.
+4. **What to do about connection scaling**, which is a policy decision and is
    set out above.
 
-And one cheap run that would close a question this document opens rather than
+And two runs that would close questions this document opens rather than
 answers: `MALLOC_ARENA_MAX=1` **on top of** the spool thread, which is the
-comparison the arena row cannot make.
+comparison the arena row cannot make; and the saturation sweep that would
+decide `current_thread`.
+
+### What the soak has to show
+
+The optimisation is finished. What is left is a full-system soak of a day,
+with **every setting fixed for its whole length** — changing the allocator,
+the worker count or `memory.high` partway through spends the run.
+
+The vehicle is `signy/scripts/run_soak_local.sh`, which already runs collecty
+in a cage of its own beside signy, on disk, with a fault schedule. Run it with
+collecty's cage at the recommended pair — `memory.max` 256 MiB, `memory.high`
+96 MiB.
+
+**It is not looking for another optimisation.** It is looking for a slope. The
+shape to want is anon that rises and falls with the workload around a level
+baseline; the shape that fails is a staircase, where each outage leaves the
+floor a little higher than it found it. That is the failure the 13-hour trace
+showed on the old build and the one every fix above was aimed at.
+
+| | passes | fails |
+|---|---|---|
+| anon | flat baseline across quarters | rises quarter on quarter |
+| `memory.current` | swings with load, baseline level | baseline climbs |
+| `memory.events` `oom` / `oom_kill` | 0 | anything |
+| `memory.events` `max` | 0 | anything, and `high` is fine |
+| PSI | steady per outage, not accumulating | growing stall per fault |
+| accepted | 100 % | any refusal that is not a declared limit |
+| `dropped_bytes` | 0 | anything, since the queue is 1 GiB |
+| queue after a drain | back to its pre-outage level | a floor that creeps up |
+| p50 / p95 | flat across quarters | worse late than early |
+| threads, file descriptors | flat | either one growing |
+
+**Several outages, not one.** A day of clean traffic exercises none of the
+paths this document spent itself on. The value is in repeating
+outage → backlog → recovery → drain enough times to see whether the cycle
+leaves anything behind, which is exactly what a single drain cannot say.
+
+**Three things the soak script does not sample for collecty yet**, all of them
+on the list above: `memory.events` and `memory.pressure` for collecty's own
+cage, its thread and file-descriptor counts, and a `memory.high` for it at all
+— the script sets one for signy only. Its fault schedule also has one outage
+rather than several. `collecty/scripts/run_mem_local.sh` samples all of the
+first group and is where to take them from.
 
 ### A trap this rig fell into first
 
