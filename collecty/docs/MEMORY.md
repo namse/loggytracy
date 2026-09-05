@@ -142,6 +142,9 @@ bytes that stayed are that buffer, its `Bytes`, the compressor churn beside it,
 or the allocator declining to return any of them is exactly what the arena
 instrument is for.
 
+**It was the buffer.** Mapping the segment instead of reading it takes the
+step to zero, twice — the drain below.
+
 ---
 
 ## 4. The experiments
@@ -261,22 +264,55 @@ independent of the allocator bought.
 ### The drain, which is its own experiment
 
 The sink is taken away for 60 s at t=120 and comes back; the backlog goes to
-disk and then drains. Both runs are the shipped build, and both built the same
-backlog, so this compares like with like:
+disk and then drains. Every run is the shipped build and every one built a
+backlog of about 200 MB, so this compares like with like. The last two builds
+were run twice, because half a megabyte is not a difference one run can tell
+from noise:
 
-| | before every fix | after them |
-|---|---|---|
-| backlog at its peak | 199 MB | 198 MB |
-| anon before the outage | 59.4 MiB | 15.9 MiB |
-| anon after the drain finished | 105.8 MiB | 23.7 MiB |
-| **permanent step** | **+46.4 MiB** | **+7.8 MiB** |
-| peak anon | 105.8 MiB | 23.7 MiB |
+| | before every fix | reading the segment | mapping it |
+|---|---|---|---|
+| runs | 1 | 3 | 2 |
+| anon before the outage | 59.4 | 15.9, 17.5, 18.2 | **9.7, 7.6** |
+| anon after the drain finished | 105.8 | 23.7, 23.6, 23.2 | **9.6, 7.5** |
+| **permanent step** | **+46.4** | **+7.8, +6.1, +5.0** | **−0.1, −0.1** |
+| `memory.current` after settling | — | 25.3, 26.0 | **10.7, 9.9** |
+| page cache at its peak | — | 202.5, 141.6 | 208.9, 200.4 |
+| CPU over the 360 s | — | 17.3, 17.6 s | 18.1, 18.2 s |
 
-**The step is 83 % smaller and it is not gone.** A drained backlog still leaves
-about 4 % of what passed through it resident, against 23 % before. The
-24-hour soak measured 2–3 % in production, on a collector whose signy had gone
-away completely rather than refusing quickly; the two are not directly
-comparable and the like-for-like pair above is the one to read.
+All MiB except the CPU row. The first column predates the sampler that reports
+the last three.
+
+**The step is gone.** A sealed segment is the wire body byte for byte, so
+`Bytes::from_owner` over a mapping hands hyper the file's own pages and nothing
+on the send path allocates per segment any more. Twice the drain ended
+*below* where it started, which is what a queue that leaves nothing behind
+looks like once ordinary jitter is allowed for.
+
+**The steady state fell with it, which was not the prediction.** 17.9 MiB
+before the outage on average against 8.7 after — the per-segment buffer was
+sizing the arena in the steady state too, at the ~1/s a quiet host rolls
+segments at, and not only in the burst a drain makes of it.
+
+**It is a smaller heap and not a relabel.** Mapping a file moves bytes from
+anon into page cache, and a cgroup counts both, so the win had to be checked
+against `memory.current` rather than declared from anon. The page cache peak is
+the same either way — that is the backlog on disk, which both builds wrote —
+and `memory.current` after settling went 25.6 → 10.3 MiB. The bytes were
+removed, not moved.
+
+**What it costs is CPU: about 4 %, and it reproduces.** 17.3 and 17.6 s against
+18.1 and 18.2 s, ranges that do not overlap. A read copies out of the page
+cache in one bulk move; a mapping takes a minor fault per page instead, and a
+drain touches every page of 200 MB. It is kept because the memory result is
+large, reproducible and structural while the CPU cost is small — but it is a
+cost, and `MAP_POPULATE` or a sequential `madvise` is the obvious thing to try
+against it.
+
+**What it does not fix is the cage.** `memory.current` still peaked at 215–229
+MiB of the 256 MiB limit, and that is the queue's own page cache during the
+outage, unchanged. A sidecar is still sized by the backlog it is allowed to
+build and not by its heap, which is the deployment fact §3's tmpfs trap ends
+on.
 
 ### The connection sweep, which is its own experiment
 
@@ -341,9 +377,10 @@ start refusing.
 |---|---|---|
 | steady state | ≤ 64 MiB | **18.5 MiB** at 8 connections, 300 s |
 | peak | ≤ 128 MiB | **18.5 MiB**, from 60.7 before the series |
+| | | both predate the mapped segment, whose drain runs sat at 8.7 MiB before the outage; a steady run has not been repeated on it |
 | not a function of time | — | the 13-hour trace predates every fix; unretested |
 | not a function of connections | — | **fails**: 17.9 → 72.4 MiB from 8 to 256 |
-| not a function of past backlog | — | **improved, not met**: +7.8 MiB per 198 MB drained |
+| not a function of past backlog | — | **met in the rig**: −0.1 MiB per ~215 MB drained, twice |
 
 **What this series has not established, in the order it is being answered.**
 
