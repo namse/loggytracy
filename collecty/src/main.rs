@@ -29,7 +29,21 @@ static ALLOCATOR: collecty::memprof::TaggedAllocator<std::alloc::System> =
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
+/// Two, and not one per core.
+///
+/// Nothing on this runtime is CPU-heavy: compression and every write to the
+/// queue belong to the spool thread, and what is left is accepting
+/// connections, reading bodies and shipping segments. A worker per core was
+/// therefore a thread per core doing almost nothing, and under glibc a thread
+/// that allocates is given an arena of its own -- which `docs/MEMORY.md`
+/// measured at three quarters of the footprint before the spool thread took
+/// the appends off the blocking pool.
+///
+/// Not one, yet. The sender still calls `Queue::seal_if_due` on this runtime
+/// and that closes a segment and `fsync`s it, so a single worker would stop
+/// accepting, polling and timing out for as long as the disk took. One worker
+/// is what this should become once no blocking work is left here.
+#[tokio::main(worker_threads = 2)]
 async fn main() {
     let config = match Config::from_env() {
         Ok(config) => config,

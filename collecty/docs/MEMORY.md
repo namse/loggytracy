@@ -301,7 +301,8 @@ and `memory.current` after settling went 25.6 → 10.3 MiB. The bytes were
 removed, not moved.
 
 **What it costs is CPU: about 4 %, and it reproduces.** 17.3 and 17.6 s against
-18.1 and 18.2 s, ranges that do not overlap. A read copies out of the page
+18.1, 18.2, 17.8 and 18.2 s over four runs of the mapped build, ranges that do
+not overlap. A read copies out of the page
 cache in one bulk move; a mapping takes a minor fault per page instead, and a
 drain touches every page of 200 MB. It is kept because the memory result is
 large, reproducible and structural while the CPU cost is small — but it is a
@@ -313,6 +314,48 @@ MiB of the 256 MiB limit, and that is the queue's own page cache during the
 outage, unchanged. A sidecar is still sized by the backlog it is allowed to
 build and not by its heap, which is the deployment fact §3's tmpfs trap ends
 on.
+
+### Two worker threads instead of one per core
+
+Nothing left on the tokio runtime is CPU-heavy. Compression and every write to
+the queue belong to the spool thread, and what remains is accepting
+connections, reading bodies and shipping segments — so a worker per core was
+twelve threads doing almost nothing on this machine, and a thread that
+allocates is an arena that keeps whatever it grew to.
+
+Same drain, two runs each, on the mapped build:
+
+| | one per core | two |
+|---|---|---|
+| anon before the outage | 12.7, 11.4 | **9.9, 9.5** |
+| anon after the drain | 12.8, 11.2 | **9.5, 9.3** |
+| `memory.current` after settling | 13.5, 12.0 | 12.0, 11.4 |
+| CPU over the 360 s | 17.8, 18.2 s | **17.6, 17.0 s** |
+| steady p50 | 1.26, 1.26 ms | 1.31, 1.28 ms |
+| steady p95 | 2.61, 2.72 ms | 2.78, 2.67 ms |
+| steady p99 | 24.1, 27.2 ms | 24.2, 40.7 ms |
+| accepted | 62,286 / 62,286 | 62,286 / 62,286 |
+
+**Two megabytes and a little CPU for nothing measurable.** Anon is about 18 %
+lower and the two configurations' ranges do not meet; CPU is lower rather than
+higher; p50 and p95 move by less than a tenth of a millisecond.
+
+**The p99 row says 27 against 41 and that is not a regression.** This is why
+the samples are kept. In the steady window the share of exports over 10 ms is
+2.26 / 2.61 % against 2.71 / 2.57 %, over 50 ms is 0.29 / 0.06 % against
+0.06 / 0.52 %, and the worst sample is 384 ms on a one-per-core run and 302 ms
+on a two-worker one. The tail is a handful of outliers in either
+configuration, both configurations straddle each other on every cut, and two
+runs cannot separate them. What would be a regression — the body of the
+distribution moving — did not happen.
+
+**One worker is the next step and not this one.** The sender still calls
+`Queue::seal_if_due` on this runtime, and that closes a segment and `fsync`s
+it, so a single worker would stop accepting connections, polling them and
+firing timers for as long as the disk took. `current_thread` is what this
+should become once the seal, the `fsync` and the rest of the queue's
+filesystem work belong to the spool thread — one runtime thread and one disk
+thread, which is a shape that suits a sidecar.
 
 ### The connection sweep, which is its own experiment
 
