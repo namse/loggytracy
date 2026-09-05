@@ -138,15 +138,17 @@ grep -q "accepting OTLP" "$OUT/collecty.log" || { echo "NOT_MEASURED: collecty n
 
 touch "$OUT/RUNNING"
 (
-  echo "t,anon,current,peak,queue_bytes,segments,oom_kills,alive"
+  echo "t,anon,file,current,peak,cpu_usec,queue_bytes,segments,oom_kills,alive"
   T0=$(date +%s.%N)
   while [ -f "$OUT/RUNNING" ]; do
     now=$(date +%s.%N)
     anon=$(awk '$1=="anon"{print $2}' "$CGROUP/memory.stat" 2>/dev/null)
-    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    file=$(awk '$1=="file"{print $2}' "$CGROUP/memory.stat" 2>/dev/null)
+    cpu=$(awk -F'[ ]' '$1=="usage_usec"{print $2}' "$CGROUP/cpu.stat" 2>/dev/null)
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
-      "${anon:-0}" "$(cat "$CGROUP/memory.current" 2>/dev/null)" \
-      "$(cat "$CGROUP/memory.peak" 2>/dev/null)" \
+      "${anon:-0}" "${file:-0}" "$(cat "$CGROUP/memory.current" 2>/dev/null)" \
+      "$(cat "$CGROUP/memory.peak" 2>/dev/null)" "${cpu:-0}" \
       "$(du -sb "$QUEUE_DIR" 2>/dev/null | cut -f1)" \
       "$(find "$QUEUE_DIR" -name '*.seg' 2>/dev/null | wc -l)" \
       "$(awk '$1=="oom_kill"{print $2}' "$CGROUP/memory.events" 2>/dev/null)" \
@@ -185,10 +187,11 @@ KILLED=$(awk -F, 'NR>1 && $7+0>k {k=$7} END {print k+0}' "$OUT/cgroup.csv" 2>/de
 kill -TERM "$COLLECTY_PID" 2>/dev/null
 sleep 2
 
-python3 - "$OUT" "$LIMIT" "${KILLED:-0}" "$RIG_STATUS" <<'PY'
+python3 - "$OUT" "$LIMIT" "${KILLED:-0}" "$RIG_STATUS" "${OUTAGE_AT:-0}" <<'PY'
 import csv, json, sys, os
 
 out, limit, killed, rig_status = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+outage_at = float(sys.argv[5])
 MiB = 1048576.0
 
 def rows(name):
@@ -216,6 +219,30 @@ if cg:
     current = [float(r["current"]) for r in cg if r["current"].isdigit()]
     if current:
         result["peak_current_mib"] = round(max(current) / MiB, 1)
+        result["final_current_mib"] = round(current[-1] / MiB, 1)
+    # The queue is on disk, so its pages are page cache, and a cgroup counts
+    # those. A sidecar meets its limit through this long before it meets it
+    # through the heap: `docs/MEMORY.md` §3 has a run that reached 255.9 MiB of
+    # a 256 MiB cage with anon at 105.8.
+    cache = [float(r["file"]) for r in cg if r.get("file", "").isdigit()]
+    if cache:
+        result["peak_file_mib"] = round(max(cache) / MiB, 1)
+        result["final_file_mib"] = round(cache[-1] / MiB, 1)
+    # What the whole scope spent, sampled from the cgroup rather than from the
+    # process, so it counts every thread including the ones tokio made.
+    cpu = [float(r["cpu_usec"]) for r in cg if r.get("cpu_usec", "").isdigit()]
+    if cpu and max(cpu) > 0:
+        result["cpu_seconds"] = round((max(cpu) - min(cpu)) / 1e6, 1)
+
+# A drain is three phases and one number cannot hold them: what the collector
+# sat at before the sink went away, what it reached while the backlog came
+# back out, and what it kept once everything was gone. The step between the
+# first and the last is the one `docs/MEMORY.md` calls permanent.
+if cg and outage_at > 0:
+    before = [r for r in cg if float(r["t"]) <= outage_at]
+    if before:
+        result["pre_outage_anon_mib"] = round(float(before[-1]["anon"]) / MiB, 1)
+        result["pre_outage_current_mib"] = round(float(before[-1]["current"]) / MiB, 1)
 
 if not anon:
     result["verdict"] = "NOT_MEASURED"
