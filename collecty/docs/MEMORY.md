@@ -548,10 +548,13 @@ where the OOM killer starts.
 MiB throughout; PSI is total stall in a 360 s run.
 
 **The disk queue and the resident page cache are already separate things.**
-Told to stay under 96 MiB while writing a 205 MiB backlog, the collector stays
-under 96 MiB: the kernel takes the pages back five hundred times and the
-workload is stopped for 0.15 seconds out of 360. Told to stay under 48 — under
-a quarter of the backlog — it does that too. Every export is accepted in every
+With the threshold at 96 MiB and a 205 MiB backlog being written, usage peaks
+at 95.9: the kernel takes the pages back five hundred times and the workload is
+stopped for 0.15 seconds out of 360. At a threshold of 48 — under a quarter of
+the backlog — the same, at 47.6. `memory.high` does not cap anything, so those
+peaks are how well reclaim kept up rather than a bound it enforced; what the
+setting does is make the kernel start early enough that `memory.max` stays out
+of the story. Every export is accepted in every
 row, `memory.max` is never reached, nothing is killed, and no latency figure
 orders itself by the setting: p50 runs 1.20–1.28 ms and draining p99 19–31 ms
 across all five with the unthrottled run in the middle of both ranges.

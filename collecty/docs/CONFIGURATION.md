@@ -80,13 +80,21 @@ MemoryMax=256M
 MemoryHigh=96M       # systemd; cgroup v2 memory.high
 ```
 
-Crossing `memory.high` makes the kernel reclaim this cgroup rather than kill
-anything; crossing `memory.max` is where the OOM killer starts. Measured, over
-the same 60 s outage: writing a **205 MiB** backlog under a 96 MiB throttle
-keeps `memory.current` at **95.9 MiB** with **83.6 MiB** of it page cache, the
-kernel reclaiming five hundred times, the workload stalled for **0.15 seconds
-out of 360**, and every export accepted. Under a 48 MiB throttle — less than a
-quarter of the backlog — it holds at 47.6 MiB on the same terms.
+These are two different kinds of number. `memory.high` is where the kernel
+starts reclaiming this cgroup and holding it up while it does — a pressure
+threshold, **not a ceiling**: usage can go above it, and what happens then is
+more reclaim and more throttling rather than a refusal. `memory.max` is the
+ceiling, and the OOM killer is what enforces it. So `memory.high` is the
+setting that keeps a container off its limit, and `memory.max` is what is left
+if that does not work.
+
+It works cheaply here. Measured over a 60 s outage: writing a **205 MiB**
+backlog with the threshold at 96 MiB, `memory.current` peaked at **95.9 MiB**
+with **83.6 MiB** of it page cache, the kernel reclaiming five hundred times,
+the workload stalled for **0.15 seconds out of 360**, and every export
+accepted. With the threshold at 48 MiB — less than a quarter of the backlog —
+it peaked at 47.6 MiB on the same terms. That usage stayed under the threshold
+in these runs is how well reclaim kept up, not a guarantee the setting offers.
 
 It is this cheap because the queue's pages are clean: a segment is `fsync`ed
 when it closes, so no more than one open segment per signal is ever dirty and
