@@ -18,11 +18,21 @@
 //! waiting. That is survivable with a worker per core and it is not survivable
 //! with one.
 //!
-//! What this costs is that a segment read now queues behind whatever the
-//! thread is already doing, where the blocking pool would have run it beside
-//! an append. Appends and seals were already serial with each other through
-//! the queue's lock, so the reads are the new thing, and `SpoolReport` is here
-//! to say how long anything waited.
+//! There are two threads and not one, and which work goes where is decided by
+//! what was already serial. `append`, `seal` and `commit` all take the queue's
+//! lock, so they waited for each other before this module existed and putting
+//! them in one queue changes nothing. `read_segment` takes no lock: it opens a
+//! sealed file and maps it, and it ran beside an append happily.
+//!
+//! Putting the reads in with the writes was measured and undone. A drain runs
+//! reads back to back at whatever rate the far end takes them, so ingest ended
+//! up behind them in one FIFO -- and not because the FIFO filled, which never
+//! got past 10 of 256, but because one slow file operation at the head makes
+//! every short append behind it wait. In the draining window that took exports
+//! over 100 ms from 0.02 % to 0.23 % and produced the first ones over 500 ms
+//! this rig has seen. So reads have a lane of their own, which is the
+//! concurrency the collector had before any of this, and `SpoolReport` says
+//! what each lane waited.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,7 +56,7 @@ const DEPTH: usize = 256;
 /// stalling, which a mean is exactly the wrong shape to show.
 const BUCKETS: usize = 33;
 
-/// What one request asked for, and where the answer goes.
+/// What one write asked for, and where the answer goes.
 enum Work {
     Append {
         signal: Signal,
@@ -59,11 +69,6 @@ enum Work {
     Seal {
         reply: oneshot::Sender<io::Result<()>>,
     },
-    Read {
-        signal: Signal,
-        seq: u64,
-        reply: oneshot::Sender<io::Result<SealedSegment>>,
-    },
     Commit {
         signal: Signal,
         acked: u64,
@@ -75,6 +80,14 @@ struct Job {
     /// When it was handed over, so the thread can say how long it sat.
     at: Instant,
     work: Work,
+}
+
+/// One segment to open and map. Its own type because it is its own lane.
+struct ReadJob {
+    at: Instant,
+    signal: Signal,
+    seq: u64,
+    reply: oneshot::Sender<io::Result<SealedSegment>>,
 }
 
 struct Counters {
@@ -93,9 +106,9 @@ impl Default for Counters {
     }
 }
 
-/// How the spool thread is keeping up.
+/// How one lane is keeping up.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct SpoolReport {
+pub struct LaneReport {
     pub requests: u64,
     /// The most that were ever waiting at once, out of [`DEPTH`].
     pub max_depth: u64,
@@ -104,11 +117,19 @@ pub struct SpoolReport {
     pub wait_max_us: u64,
 }
 
-/// The handle every caller holds. Cloning it is cloning a channel sender.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SpoolReport {
+    pub writes: LaneReport,
+    pub reads: LaneReport,
+}
+
+/// The handle every caller holds. Cloning it is cloning two channel senders.
 #[derive(Clone)]
 pub struct Spool {
     jobs: mpsc::Sender<Job>,
     counters: Arc<Counters>,
+    reads: mpsc::Sender<ReadJob>,
+    read_counters: Arc<Counters>,
 }
 
 /// The spool thread is gone, which only happens on the way out.
@@ -126,6 +147,7 @@ impl Spool {
         let (jobs, mut inbox) = mpsc::channel::<Job>(DEPTH);
         let counters = Arc::new(Counters::default());
         let theirs = counters.clone();
+        let reading = queue.clone();
         std::thread::Builder::new()
             .name("spool".to_string())
             .spawn(move || {
@@ -149,9 +171,6 @@ impl Spool {
                         Work::Seal { reply } => {
                             let _ = reply.send(queue.seal());
                         }
-                        Work::Read { signal, seq, reply } => {
-                            let _ = reply.send(queue.read_segment(signal, seq));
-                        }
                         Work::Commit {
                             signal,
                             acked,
@@ -163,11 +182,33 @@ impl Spool {
                 }
             })
             .expect("the spool thread starts");
-        Spool { jobs, counters }
+
+        let (reads, mut inbox) = mpsc::channel::<ReadJob>(DEPTH);
+        let read_counters = Arc::new(Counters::default());
+        let theirs = read_counters.clone();
+        std::thread::Builder::new()
+            .name("reader".to_string())
+            .spawn(move || {
+                while let Some(job) = inbox.blocking_recv() {
+                    theirs.waited(job.at.elapsed().as_micros());
+                    let _ = job.reply.send(reading.read_segment(job.signal, job.seq));
+                }
+            })
+            .expect("the reader thread starts");
+
+        Spool {
+            jobs,
+            counters,
+            reads,
+            read_counters,
+        }
     }
 
     pub fn report(&self) -> SpoolReport {
-        self.counters.report()
+        SpoolReport {
+            writes: self.counters.report(),
+            reads: self.read_counters.report(),
+        }
     }
 
     pub async fn append(&self, signal: Signal, payload: Bytes) -> Result<io::Result<()>, Gone> {
@@ -187,12 +228,26 @@ impl Spool {
         self.ask(|reply| Work::Seal { reply }).await
     }
 
+    /// On the reader's lane, so a drain reading segments back to back does not
+    /// put every append behind it. Nothing here takes the queue's lock.
     pub async fn read_segment(
         &self,
         signal: Signal,
         seq: u64,
     ) -> Result<io::Result<SealedSegment>, Gone> {
-        self.ask(|reply| Work::Read { signal, seq, reply }).await
+        let (reply, answer) = oneshot::channel();
+        self.read_counters
+            .depth((DEPTH - self.reads.capacity()) as u64 + 1);
+        self.reads
+            .send(ReadJob {
+                at: Instant::now(),
+                signal,
+                seq,
+                reply,
+            })
+            .await
+            .map_err(|_| Gone)?;
+        answer.await.map_err(|_| Gone)
     }
 
     pub async fn commit(&self, signal: Signal, acked: u64) -> Result<io::Result<()>, Gone> {
@@ -238,7 +293,7 @@ impl Counters {
         self.requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn report(&self) -> SpoolReport {
+    fn report(&self) -> LaneReport {
         let counts: Vec<u64> = self
             .waits
             .iter()
@@ -259,7 +314,7 @@ impl Counters {
                 p99 = upper;
             }
         }
-        SpoolReport {
+        LaneReport {
             requests: self.requests.load(Ordering::Relaxed),
             max_depth: self.max_depth.load(Ordering::Relaxed),
             wait_p99_us: p99,

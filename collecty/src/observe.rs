@@ -174,17 +174,23 @@ impl Reporter {
 
     /// The queue's own numbers, and how the one thread behind them is coping.
     ///
-    /// Every file operation the queue has is serial on the spool thread now,
-    /// so what matters is not only that the queue is keeping up but whether
-    /// anything is waiting behind an `fsync` to find out. The wait figures are
-    /// cumulative, so a run's last line covers the run.
+    /// The queue's files are handled by two threads: one for everything that
+    /// takes the queue's lock, one for reading segments back out. Both are
+    /// reported, because what went wrong when they were one thread was not the
+    /// channel filling — it never got near — but short work waiting behind
+    /// long work in the same queue. The wait figures are cumulative, so a
+    /// run's last line covers the run.
     pub fn log(&self, observed: &Observation) {
         let spool = self.spool.report();
         tracing::info!(
-            spool_requests = spool.requests,
-            spool_max_depth = spool.max_depth,
-            spool_wait_p99_us = spool.wait_p99_us,
-            spool_wait_max_us = spool.wait_max_us,
+            spool_requests = spool.writes.requests,
+            spool_max_depth = spool.writes.max_depth,
+            spool_wait_p99_us = spool.writes.wait_p99_us,
+            spool_wait_max_us = spool.writes.wait_max_us,
+            reader_requests = spool.reads.requests,
+            reader_max_depth = spool.reads.max_depth,
+            reader_wait_p99_us = spool.reads.wait_p99_us,
+            reader_wait_max_us = spool.reads.wait_max_us,
             queued_bytes = observed.queued_bytes,
             segments = observed.segments,
             appended_records = observed.appended_records,
