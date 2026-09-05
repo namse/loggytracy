@@ -135,6 +135,15 @@ COLLECTY_BIN="${SOAK_COLLECTY_BIN:-$ROOT/../collecty/target/release/collecty}"
 # lives on disk — and that claim has never been measured over hours. Small on
 # purpose: a cage at the claim is what turns the claim into a test.
 COLLECTY_LIMIT="${SOAK_COLLECTY_LIMIT:-256M}"
+# And the threshold below it, which is the recommended deployment pair --
+# collecty/docs/CONFIGURATION.md. `memory.high` is where the kernel starts
+# reclaiming this cgroup rather than killing anything, and collecty's cage is
+# mostly its own queue's page cache: clean, on the inactive list, and cheap to
+# take back. Measured there at 2 GiB of backlog against a 96 MiB threshold,
+# resident page cache held at 82 MiB for 0.48 s of stall in 23 minutes. Without
+# it `memory.current` simply follows the backlog, and a soak that never asks
+# the kernel to reclaim never finds out whether it can.
+COLLECTY_HIGH="${SOAK_COLLECTY_HIGH:-96M}"
 # The three ceilings that decide collecty's footprint, left at their defaults
 # so the run measures the shipped configuration rather than a tuned one.
 COLLECTY_INFLIGHT="${SOAK_COLLECTY_INFLIGHT:-64MiB}"
@@ -167,6 +176,12 @@ FAULTS="${SOAK_FAULTS:-on}"
 # collector's queue to grow visibly and its sender to back off, short enough
 # not to fill it.
 DOWNTIME="${SOAK_DOWNTIME_SECONDS:-180}"
+# How many of those outages there are. One says a drain works; several say
+# whether the cycle -- outage, backlog, recovery, drain -- leaves anything
+# behind, and that is the question a day-long run exists to answer. The extras
+# are spread through the last third, after the named faults have had their
+# turn, and stop short of the end so the last one has room to drain.
+OUTAGES="${SOAK_OUTAGES:-3}"
 # Queries fail while the engine is deliberately down, and the harness's error
 # gate is zero by default -- so a scheduled outage would fail the run on the
 # errors the schedule caused. This is the budget those windows are allowed,
@@ -300,6 +315,7 @@ start_collecty() {
       COLLECTY_REPORT_INTERVAL="30s" \
       systemd-run --user --scope --quiet --unit="$COLLECTY_UNIT" \
         -p MemoryMax="$COLLECTY_LIMIT" -p MemorySwapMax=0 \
+        ${COLLECTY_HIGH:+-p MemoryHigh="$COLLECTY_HIGH"} \
         -- "$COLLECTY_BIN" >>"$COLLECTY_LOG" 2>&1 &
   COLLECTY_PID=$!
   echo "$COLLECTY_PID" >"$OUT/collecty.pid"
@@ -326,6 +342,13 @@ if [ "$COLLECTY" != "off" ]; then
   COLLECTY_CG="/sys/fs/cgroup$(cut -d: -f3 "/proc/$COLLECTY_PID/cgroup")"
 fi
 echo "cgroup=$CG memory.max=$(cat "$CG/memory.max") memory.high=$(cat "$CG/memory.high") swap.max=$(cat "$CG/memory.swap.max")"
+if [ -n "$COLLECTY_CG" ]; then
+  echo "collecty cgroup=$COLLECTY_CG memory.max=$(cat "$COLLECTY_CG/memory.max") memory.high=$(cat "$COLLECTY_CG/memory.high")"
+  WANT_HIGH=$(numfmt --from=iec "${COLLECTY_HIGH%B}" 2>/dev/null || echo 0)
+  GOT_HIGH=$(cat "$COLLECTY_CG/memory.high" 2>/dev/null)
+  [ -z "$COLLECTY_HIGH" ] || [ "$GOT_HIGH" = "$WANT_HIGH" ] || {
+    echo "collecty memory.high is $GOT_HIGH, asked for $WANT_HIGH"; exit 1; }
+fi
 echo "out=$OUT data=$DATA seconds=$SECONDS_CAP eps=$EPS retention=$RETENTION"
 echo "store=$STORE metric_scrape=${METRIC_SCRAPE}s metric_query_eps=$METRIC_QUERY_EPS"
 echo "collecty=$COLLECTY addr=$COLLECTY_ADDR limit=$COLLECTY_LIMIT trace_eps=$TRACE_EPS probe=${PROBE_INTERVAL}s"
@@ -494,20 +517,38 @@ PROF_PID=$!
 # three: each signal holds one open.
 if [ "$COLLECTY" != "off" ]; then
   (
-    echo "t,anon,current,peak,queue_bytes,segments,rss"
+    echo "t,anon,current,peak,queue_bytes,segments,rss,file,file_dirty,file_writeback,threads,fds,ev_high,ev_max,ev_oom,oom_kills,psi_some_us,psi_full_us"
     T0=$(cat "$OUT/sampler_t0" 2>/dev/null || date +%s.%N)
     while [ -f "$OUT/RUNNING" ]; do
       now=$(date +%s.%N)
-      anon=$(awk '$1=="anon"{print $2}' "$COLLECTY_CG/memory.stat" 2>/dev/null)
+      mem=$(awk '$1=="anon"{a=$2} $1=="file"{f=$2} $1=="file_dirty"{d=$2}
+                 $1=="file_writeback"{w=$2}
+                 END{printf "%d,%d,%d,%d", a, f, d, w}' \
+                "$COLLECTY_CG/memory.stat" 2>/dev/null)
       cur=$(cat "$COLLECTY_CG/memory.current" 2>/dev/null)
       peak=$(cat "$COLLECTY_CG/memory.peak" 2>/dev/null)
       queue=$(du -sb "$QUEUE_DIR" 2>/dev/null | cut -f1)
       segments=$(find "$QUEUE_DIR" -type f -name '*.seg' 2>/dev/null | wc -l)
-      rss=$(awk '/^VmRSS:/{print $2 * 1024}' \
-        "/proc/$(head -1 "$COLLECTY_CG/cgroup.procs" 2>/dev/null)/status" 2>/dev/null)
-      printf '%s,%s,%s,%s,%s,%s,%s\n' \
+      # Threads and open descriptors are on the pass list beside memory: a
+      # collector that leaks either ratchets just as surely and a memory
+      # column will not show it.
+      pid=$(head -1 "$COLLECTY_CG/cgroup.procs" 2>/dev/null)
+      rss=$(awk '/^VmRSS:/{print $2 * 1024}' "/proc/$pid/status" 2>/dev/null)
+      threads=$(awk '/^Threads:/{print $2}' "/proc/$pid/status" 2>/dev/null)
+      fds=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)
+      # Whether the kernel had to push back, and what it cost. `high` counting
+      # up with `max` and `oom` at zero is the throttle doing its job; PSI is
+      # how long the collector was stopped while it did.
+      events=$(awk '$1=="high"{h=$2} $1=="max"{m=$2} $1=="oom"{o=$2}
+                    $1=="oom_kill"{k=$2} END{printf "%d,%d,%d,%d", h, m, o, k}' \
+                   "$COLLECTY_CG/memory.events.local" 2>/dev/null)
+      psi=$(awk '{for (n = 1; n <= NF; n++) if ($n ~ /^total=/) { sub("total=", "", $n)
+                    if ($1 == "some") s = $n; else if ($1 == "full") u = $n }}
+                 END{printf "%d,%d", s, u}' "$COLLECTY_CG/memory.pressure" 2>/dev/null)
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
-        "${anon:-0}" "${cur:-0}" "${peak:-0}" "${queue:-0}" "${segments:-0}" "${rss:-0}"
+        "${mem%%,*}" "${cur:-0}" "${peak:-0}" "${queue:-0}" "${segments:-0}" "${rss:-0}" \
+        "${mem#*,}" "${threads:-0},${fds:-0}" "${events:-0,0,0,0},${psi:-0,0}"
       sleep 5
     done
   ) >"$OUT/collecty.csv" 2>/dev/null &
@@ -568,6 +609,9 @@ RUN_STARTED=$(date +%s)
 #        linear in part count, and this is the end of the line that the earlier
 #        restart is the other end of.
 #
+# and then SOAK_OUTAGES-1 more outages spread through what is left, because a
+# single drain cannot say whether repeating the cycle leaves a floor behind.
+#
 # The collector is never killed outright. An open segment has not been fsynced,
 # and losing it would be collecty behaving as documented -- a loss window this
 # run cannot then tell apart from a defect.
@@ -611,6 +655,21 @@ if [ "$FAULTS" != "off" ]; then
     fault "signy: SIGTERM with the run's parts on disk"
     stop_process "$(signy_pid)" TERM
     start_signy && done_fault "signy: back up" || done_fault "signy: FAILED TO RESTART"
+
+    # The outage again, and again. Evenly through 70%-98%, so the last one
+    # still has a fifth of the tail to drain into.
+    extra=$(( OUTAGES > 1 ? OUTAGES - 1 : 0 ))
+    round=1
+    while [ "$round" -le "$extra" ]; do
+      wait_until "$(pct $(( 70 + round * 28 / (extra + 1) )))" || exit 0
+      fault "signy: down for ${DOWNTIME}s (outage $(( round + 1 )) of $OUTAGES)"
+      stop_process "$(signy_pid)" TERM
+      sleep "$DOWNTIME"
+      start_signy \
+        && done_fault "signy: back up after outage $(( round + 1 ))" \
+        || done_fault "signy: FAILED TO RESTART"
+      round=$(( round + 1 ))
+    done
   ) &
   FAULT_PID=$!
 fi
@@ -1020,11 +1079,12 @@ GUARD=ok
   # still climbing at the end.
   if [ -f "$OUT/collecty.csv" ]; then
     awk -F, '
-      NR>1 && $2+0 > 0 { n++; for (c = 2; c <= 7; c++) v[c,n] = $c + 0 }
+      NR>1 && $2+0 > 0 { n++; for (c = 2; c <= 18; c++) v[c,n] = $c + 0 }
       END {
         if (n < 8) { print "collecty: too few samples for a trend: " n; exit }
         m = 1048576.0
-        nr = split("2 anon mib;3 current mib;5 queue mib;6 segments count;7 rss mib", rows, ";")
+        nr = split("2 anon mib;3 current mib;8 file mib;5 queue mib;6 segments count;\
+7 rss mib;11 threads count;12 fds count", rows, ";")
         printf "collecty trends:\n"
         printf "  %-12s %12s %12s %12s %12s  %s\n", "mib/count", "Q1", "Q2", "Q3", "Q4", "trend"
         for (r = 1; r <= nr; r++) {
@@ -1042,6 +1102,19 @@ GUARD=ok
         }
         peak = 0; for (k = 1; k <= n; k++) if (v[4,k] > peak) peak = v[4,k]
         printf "  peak=%.1f MiB against its cage; samples=%d\n", peak/m, n
+        # What the kernel did about the cage and what it cost. `high` counting
+        # up is the throttle working. `max`, `oom` and `oom_kill` must be zero,
+        # and PSI is the total time the collector was stopped for reclaim --
+        # what matters is that it does not climb with every outage.
+        printf "  reclaim: high=%d max=%d oom=%d oom_kill=%d psi_some=%.2fs psi_full=%.2fs\n", \
+          v[13,n], v[14,n], v[15,n], v[16,n], (v[17,n] - v[17,1]) / 1e6, (v[18,n] - v[18,1]) / 1e6
+        dirty = 0; wb = 0
+        for (k = 1; k <= n; k++) {
+          if (v[9,k] > dirty) dirty = v[9,k]
+          if (v[10,k] > wb) wb = v[10,k]
+        }
+        printf "  cache: peak dirty=%.1f MiB writeback=%.1f MiB (reclaim is cheap while these are small)\n", \
+          dirty/m, wb/m
       }' "$OUT/collecty.csv"
   fi
 

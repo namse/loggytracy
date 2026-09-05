@@ -750,12 +750,32 @@ paths this document spent itself on. The value is in repeating
 outage → backlog → recovery → drain enough times to see whether the cycle
 leaves anything behind, which is exactly what a single drain cannot say.
 
-**Three things the soak script does not sample for collecty yet**, all of them
-on the list above: `memory.events` and `memory.pressure` for collecty's own
-cage, its thread and file-descriptor counts, and a `memory.high` for it at all
-— the script sets one for signy only. Its fault schedule also has one outage
-rather than several. `collecty/scripts/run_mem_local.sh` samples all of the
-first group and is where to take them from.
+**The soak script now carries all of it.** `SOAK_COLLECTY_HIGH` puts a
+`memory.high` on collecty's cage (96 MiB by default, and the run stops if it
+did not take); `collecty.csv` gained `file`, `file_dirty`, `file_writeback`,
+`threads`, `fds`, `ev_high`, `ev_max`, `ev_oom`, `oom_kills`, `psi_some_us` and
+`psi_full_us`, all appended after the existing columns so the report's
+positions still hold; the trend table gained `file`, `threads` and `fds` rows
+and two summary lines; and `SOAK_OUTAGES` (3 by default) repeats the outage
+through the last third of the run.
+
+A fifteen-minute smoke ran the whole thing — `memory.high` applied and crossed,
+3,131 `high` events with `max`, `oom` and `oom_kill` at zero, 0.94 s of PSI,
+threads flat at 5, descriptors flat at 24, three outages each followed by a
+recovery, nothing dropped or refused, and the report's existing sections
+unchanged.
+
+**Two things about that smoke that a day-long run has to be read differently
+from.** Its queue never returned to baseline: it drains whenever signy is up —
+105 → 63 MiB in one fault-free window while still ingesting — but its faults
+are 45 to 90 seconds apart, and clearing an outage takes longer than that. The
+numbers to size a real schedule with: ingest is about 1.6 MB/s compressed, the
+queue drains net at 0.3–0.7 MB/s while ingesting, so a 180 s outage builds
+roughly 280 MB and needs seven to sixteen minutes of quiet to clear. In a
+day-long run the faults are hours apart and there is room; in a fifteen-minute
+one there is not. And every memory row came out `GROWING`, which at that length
+is the ramp from an empty process being read as a slope: the quarter-on-quarter
+trend needs a run long enough that its first quarter is a steady state.
 
 ### A trap this rig fell into first
 
