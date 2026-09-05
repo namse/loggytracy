@@ -37,6 +37,11 @@ RECORDS="${MEM_RECORDS:-161}"
 TRACE_EPS="${MEM_TRACE_EPS:-5}"
 METRIC_EVERY="${MEM_METRIC_EVERY:-10}"
 LIMIT="${MEM_LIMIT:-256M}"
+# The throttle below the limit. Crossing `memory.high` makes the kernel
+# reclaim this cgroup and hold the writer up while it does; crossing
+# `memory.max` is where the OOM killer comes in. Unset by default, because
+# every run before this one had it unset.
+HIGH="${MEM_HIGH:-}"
 # `-` and not `:-`: MEM_FEATURES="" means the shipped build, which is a
 # different experiment from not saying which build to use.
 FEATURES="${MEM_FEATURES-memprof}"
@@ -109,7 +114,7 @@ env COLLECTY_DATA_DIR="$OUT" \
     COLLECTY_MEMPROF_INTERVAL_MS=250 \
     ${MEM_ENV:-} \
     systemd-run --user --scope --quiet --unit="$UNIT" \
-      -p MemoryMax="$LIMIT" -p MemorySwapMax=0 \
+      -p MemoryMax="$LIMIT" -p MemorySwapMax=0 ${HIGH:+-p MemoryHigh="$HIGH"} \
       "$ROOT/target/release/collecty" >"$OUT/collecty.log" 2>&1 &
 COLLECTY_PID=$!
 
@@ -129,6 +134,12 @@ WANT=$(numfmt --from=iec "${LIMIT%B}" 2>/dev/null || echo 0)
 GOT=$(cat "$CGROUP/memory.max")
 [ "$GOT" = "$WANT" ] || { echo "NOT_MEASURED: memory.max is $GOT, asked for $WANT"; exit 4; }
 [ "$(cat "$CGROUP/memory.swap.max")" = "0" ] || { echo "NOT_MEASURED: swap is not off"; exit 4; }
+if [ -n "$HIGH" ]; then
+  WANT_HIGH=$(numfmt --from=iec "${HIGH%B}" 2>/dev/null || echo 0)
+  GOT_HIGH=$(cat "$CGROUP/memory.high")
+  [ "$GOT_HIGH" = "$WANT_HIGH" ] || {
+    echo "NOT_MEASURED: memory.high is $GOT_HIGH, asked for $WANT_HIGH"; exit 4; }
+fi
 
 for _ in $(seq 1 50); do
   grep -q "accepting OTLP" "$OUT/collecty.log" 2>/dev/null && break
@@ -138,20 +149,36 @@ grep -q "accepting OTLP" "$OUT/collecty.log" || { echo "NOT_MEASURED: collecty n
 
 touch "$OUT/RUNNING"
 (
-  echo "t,anon,file,current,peak,cpu_usec,queue_bytes,segments,oom_kills,alive"
+  # Anon is the collector. The rest is the queue on disk, which a cgroup
+  # charges to whoever wrote it: how much of it is cache, how much of that is
+  # still dirty or in writeback and therefore not reclaimable yet, and how it
+  # splits between the inactive list reclaim takes first and the active one it
+  # does not. `memory.events.local` says whether the kernel ever had to push
+  # back, and `memory.pressure` -- PSI -- says what that cost the workload,
+  # which "memory is high" on its own cannot.
+  echo "t,anon,file,file_dirty,file_writeback,inactive_file,active_file,current,peak,cpu_usec,psi_some_us,psi_full_us,ev_high,ev_max,ev_oom,oom_kills,queue_bytes,segments,alive"
   T0=$(date +%s.%N)
   while [ -f "$OUT/RUNNING" ]; do
     now=$(date +%s.%N)
-    anon=$(awk '$1=="anon"{print $2}' "$CGROUP/memory.stat" 2>/dev/null)
-    file=$(awk '$1=="file"{print $2}' "$CGROUP/memory.stat" 2>/dev/null)
-    cpu=$(awk -F'[ ]' '$1=="usage_usec"{print $2}' "$CGROUP/cpu.stat" 2>/dev/null)
+    mem=$(awk '$1=="anon"{a=$2} $1=="file"{f=$2} $1=="file_dirty"{d=$2}
+               $1=="file_writeback"{w=$2} $1=="inactive_file"{i=$2}
+               $1=="active_file"{c=$2}
+               END{printf "%d,%d,%d,%d,%d,%d", a, f, d, w, i, c}' \
+             "$CGROUP/memory.stat" 2>/dev/null)
+    psi=$(awk '{for (n = 1; n <= NF; n++) if ($n ~ /^total=/) { sub("total=", "", $n)
+                  if ($1 == "some") s = $n; else if ($1 == "full") u = $n }}
+               END{printf "%d,%d", s, u}' "$CGROUP/memory.pressure" 2>/dev/null)
+    events=$(awk '$1=="high"{h=$2} $1=="max"{m=$2} $1=="oom"{o=$2}
+                  $1=="oom_kill"{k=$2} END{printf "%d,%d,%d,%d", h, m, o, k}' \
+                 "$CGROUP/memory.events.local" 2>/dev/null)
+    cpu=$(awk '$1=="usage_usec"{print $2}' "$CGROUP/cpu.stat" 2>/dev/null)
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.2f", a-b}')" \
-      "${anon:-0}" "${file:-0}" "$(cat "$CGROUP/memory.current" 2>/dev/null)" \
+      "${mem:-0,0,0,0,0,0}" "$(cat "$CGROUP/memory.current" 2>/dev/null)" \
       "$(cat "$CGROUP/memory.peak" 2>/dev/null)" "${cpu:-0}" \
+      "${psi:-0,0}" "${events:-0,0,0,0}" \
       "$(du -sb "$QUEUE_DIR" 2>/dev/null | cut -f1)" \
       "$(find "$QUEUE_DIR" -name '*.seg' 2>/dev/null | wc -l)" \
-      "$(awk '$1=="oom_kill"{print $2}' "$CGROUP/memory.events" 2>/dev/null)" \
       "$(kill -0 "$COLLECTY_PID" 2>/dev/null && echo 1 || echo 0)"
     sleep 0.25
   done
@@ -161,7 +188,7 @@ SAMPLER_PID=$!
 OUTAGE_FLAGS=()
 [ -n "$OUTAGE_AT" ] && OUTAGE_FLAGS=(--outage-at "$OUTAGE_AT" --outage-for "$OUTAGE_FOR")
 
-echo "load: ${EPS} eps over ${CONNECTIONS} connections for ${SECONDS_CAP}s, cage $LIMIT"
+echo "load: ${EPS} eps over ${CONNECTIONS} connections for ${SECONDS_CAP}s, cage $LIMIT${HIGH:+, throttle $HIGH}"
 "$ROOT/target/release/examples/memrig" \
   --collecty "127.0.0.1:$COLLECTY_PORT" --sink "127.0.0.1:$SINK_PORT" \
   --eps "$EPS" --connections "$CONNECTIONS" --seconds "$SECONDS_CAP" \
@@ -247,6 +274,29 @@ if cg:
     held = [int(r["segments"]) for r in cg if r.get("segments", "").isdigit()]
     if held:
         result["peak_segments"] = max(held)
+
+    # What the kernel had to do about all that cache, and what it cost.
+    # `high` counting up without `max` or `oom` is the throttle working; PSI
+    # is how long the workload was stopped while it worked.
+    def column(name):
+        return [int(r[name]) for r in cg if r.get(name, "").isdigit()]
+
+    reclaim = {}
+    for field in ("file_dirty", "file_writeback", "inactive_file", "active_file"):
+        values = column(field)
+        if values:
+            reclaim[f"peak_{field}_mib"] = round(max(values) / MiB, 1)
+            reclaim[f"final_{field}_mib"] = round(values[-1] / MiB, 1)
+    for field in ("ev_high", "ev_max", "ev_oom"):
+        values = column(field)
+        if values:
+            reclaim[field] = max(values)
+    for field, name in (("psi_some_us", "psi_some_seconds"), ("psi_full_us", "psi_full_seconds")):
+        values = column(field)
+        if values:
+            reclaim[name] = round((max(values) - min(values)) / 1e6, 2)
+    if reclaim:
+        result["reclaim"] = reclaim
 
 # A drain is three phases and one number cannot hold them: what the collector
 # sat at before the sink went away, what it reached while the backlog came
