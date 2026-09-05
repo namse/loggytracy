@@ -472,6 +472,55 @@ and 7.4 MiB of anon before the outage, 2.5 MiB apart on identical code, so a
 1.5 MiB difference between arms is inside the noise of one of them. Nothing
 about the allocator is claimed from this.
 
+### The second copy of a body, which was only there for large ones
+
+`route` used `collect().to_bytes()`: gather the body's frames, then join them.
+The join is a fresh allocation the size of the whole export and a copy of every
+byte into it, and nothing downstream wants them joined — the queue writes a
+four byte length and then the payload into the encoder, which does not care
+where one piece ends and the next begins. So the frames now go to the queue as
+they arrive.
+
+**At the corpus every other row of this document uses, it measures exactly
+nothing.** Four shipped runs laid out A B B A, and an instrumented pair:
+
+| | joined | in pieces |
+|---|---|---|
+| bytes allocated | 4.2 GB | 4.2 GB |
+| allocations | 1.1 M | 1.1 M |
+| CPU | 17.1, 17.1 s | 17.6, 17.2 s |
+| anon before the outage | 7.9, 9.8 | 8.2, 8.6 |
+
+Identical, because a 41 kB body arrives in **one** frame and joining one buffer
+copies nothing. An earlier reading of this document's 1.9 bytes allocated per
+byte appended blamed this join for half of it; that was wrong, and the join was
+not costing anything at this size.
+
+**At ten times the body it is the change it was supposed to be.** Same byte
+rate, same everything, 1,610 records per export instead of 161, so a body is
+415 kB and spans frames:
+
+| | joined | in pieces |
+|---|---|---|
+| bytes allocated | 5.3 GB | **4.1 GB** |
+| peak anon | 19.4 MiB | **16.9 MiB** |
+| heap held free at the end | 5.6 MiB | **1.4 MiB** |
+| peak `memory.current` | 230.6 MiB | 221.1 MiB |
+| CPU | 12.8 s | 12.6 s |
+
+The allocation figure is a count of what the workload asked for and is the
+solid one; anon and CPU are one run each and anon has shown a 2.5 MiB spread
+elsewhere in this document, so read the first row and treat the second as
+agreeing with it rather than as its own result.
+
+**Which makes this a change for the deployments that batch.** A collector's
+request ceiling is 16 MiB and an exporter that fills even a fraction of it
+sends a body that cannot arrive in one piece — and every byte of it was being
+allocated and copied a second time, outside the in-flight gate, which is the
+same accounting hole the connection sweep found. At 41 kB there was nothing to
+fix and there is now nothing to lose: one small `Vec` of frame pointers stands
+where a second copy of the body used to be.
+
 ### The connection sweep, which is its own experiment
 
 Fixed byte rate, only the connection count varies, 120 s runs on the shipped
