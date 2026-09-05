@@ -19,6 +19,30 @@ fn eager() -> QueueLimits {
     }
 }
 
+/// A record written in pieces is the record written whole.
+///
+/// `route` hands the queue the frames hyper read rather than joining them
+/// first, so the frame boundaries have to leave no trace: the length in front
+/// is the total, and the pieces follow it in order.
+#[test]
+fn a_record_written_in_pieces_is_the_same_record() {
+    let scratch = Scratch::new("append-pieces");
+    let queue = open(&scratch, eager());
+    let body: Vec<u8> = (0..5000u32).map(|byte| byte as u8).collect();
+
+    queue.append(Signal::Logs, &body).expect("one write");
+    let pieces: Vec<bytes::Bytes> = body
+        .chunks(333)
+        .map(bytes::Bytes::copy_from_slice)
+        .collect();
+    assert!(pieces.len() > 3, "the record has to arrive in pieces");
+    queue
+        .append_chunks(Signal::Logs, &pieces)
+        .expect("many writes");
+
+    assert_eq!(drain(&queue), vec![body.clone(), body]);
+}
+
 fn path_of(scratch: &Scratch, signal: Signal, seq: u64) -> std::path::PathBuf {
     scratch
         .path()

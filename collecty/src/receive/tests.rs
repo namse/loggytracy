@@ -195,6 +195,60 @@ async fn an_export_is_stored_as_a_frame_that_decompresses_to_the_request() {
 
 /// Three exports, three segments: nothing shares a segment with another
 /// signal, and the order they arrived in is the order they are sent in.
+/// A body arriving as several frames, which is what a body of any size
+/// actually does. `route` no longer joins them into one buffer, so the thing
+/// that could break is the order or a dropped piece, and the record on disk
+/// says whether either happened.
+struct InPieces(std::vec::IntoIter<Bytes>);
+
+impl hyper::body::Body for InPieces {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        std::task::Poll::Ready(
+            self.0
+                .next()
+                .map(|piece| Ok(hyper::body::Frame::data(piece))),
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_body_that_arrives_in_pieces_is_one_record_again() {
+    let harness = Harness::start("receive-pieces", DEFAULT_MAX_REQUEST_BYTES).await;
+    // Long enough to be worth cutting up, and cut unevenly so that no piece
+    // boundary lines up with anything the record format cares about.
+    let export =
+        logs(&"a log line that is long enough to be worth cutting up. ".repeat(64)).encode_to_vec();
+    let pieces: Vec<Bytes> = export.chunks(777).map(Bytes::copy_from_slice).collect();
+    assert!(pieces.len() > 3, "the body has to arrive in several pieces");
+
+    let client = Client::builder(TokioExecutor::new()).build_http::<InPieces>();
+    let response = client
+        .request(
+            http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{}/v1/logs", harness.addr))
+                .header(CONTENT_TYPE, "application/x-protobuf")
+                .body(InPieces(pieces.into_iter()))
+                .expect("a well-formed request"),
+        )
+        .await
+        .expect("an answer");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        harness.records(),
+        vec![(Signal::Logs, export)],
+        "the record is the export, byte for byte and in order"
+    );
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn every_signal_lands_in_a_segment_of_its_own() {
     let harness = Harness::start("receive-signals", DEFAULT_MAX_REQUEST_BYTES).await;
@@ -289,7 +343,7 @@ async fn a_payload_over_the_ceiling_is_refused_off_the_http_path_too() {
     let intake = Intake::new(Spool::new(queue.clone()), 64, DEFAULT_MAX_INFLIGHT_BYTES);
 
     let refusal = intake
-        .accept(Signal::Logs, bytes::Bytes::from(vec![0u8; 128]))
+        .accept(Signal::Logs, vec![bytes::Bytes::from(vec![0u8; 128])])
         .await
         .expect_err("a refusal");
 

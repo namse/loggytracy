@@ -247,13 +247,39 @@ impl Queue {
 
     /// Append one OTLP export to its signal's open segment.
     ///
-    /// The four byte length goes in front of it here, as two writes into the
+    /// The four byte length goes in front of it here, as writes into the
     /// encoder, rather than by building a buffer that is the header followed
     /// by a copy of the export. The copy was a second allocation the size of
     /// every export that arrives, alive at the same time as the first.
     pub fn append(&self, signal: Signal, payload: &[u8]) -> io::Result<()> {
+        self.write_record(signal, payload.len(), |segment| segment.write_all(payload))
+    }
+
+    /// The same record, arriving as the pieces hyper read it in.
+    ///
+    /// A body is a run of frames and the encoder does not care where one ends,
+    /// so there is nothing for a contiguous buffer to be for. Making one meant
+    /// allocating the whole export a second time and copying every byte of it
+    /// into the new place, per request, and the pieces are written here in
+    /// order instead.
+    pub fn append_chunks(&self, signal: Signal, chunks: &[Bytes]) -> io::Result<()> {
+        let bytes = chunks.iter().map(|chunk| chunk.len()).sum();
+        self.write_record(signal, bytes, |segment| {
+            for chunk in chunks {
+                segment.write_all(chunk)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn write_record(
+        &self,
+        signal: Signal,
+        bytes: usize,
+        write: impl FnOnce(&mut SegmentWriter) -> io::Result<()>,
+    ) -> io::Result<()> {
         let _tag = memprof::enter(Arena::Queue);
-        let plain_len = (crate::wire::RECORD_HEADER_BYTES + payload.len()) as u64;
+        let plain_len = (crate::wire::RECORD_HEADER_BYTES + bytes) as u64;
         if plain_len > self.limits.max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -283,10 +309,8 @@ impl Queue {
         }
 
         let queue = &mut inner.signals[signal.index()];
-        queue
-            .active
-            .write_all(&(payload.len() as u32).to_le_bytes())?;
-        queue.active.write_all(payload)?;
+        queue.active.write_all(&(bytes as u32).to_le_bytes())?;
+        write(&mut queue.active)?;
         if queue.active_since.is_none() {
             queue.active_since = Some(Instant::now());
         }

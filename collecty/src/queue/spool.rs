@@ -60,7 +60,7 @@ const BUCKETS: usize = 33;
 enum Work {
     Append {
         signal: Signal,
-        payload: Bytes,
+        chunks: Vec<Bytes>,
         reply: oneshot::Sender<io::Result<()>>,
     },
     SealIfDue {
@@ -156,14 +156,14 @@ impl Spool {
                     match job.work {
                         Work::Append {
                             signal,
-                            payload,
+                            chunks,
                             reply,
                         } => {
                             let _tag = memprof::enter(Arena::Intake);
                             // A caller that has gone away is a client that
                             // hung up between the append and the answer. The
                             // record is in the segment either way.
-                            let _ = reply.send(queue.append(signal, &payload));
+                            let _ = reply.send(queue.append_chunks(signal, &chunks));
                         }
                         Work::SealIfDue { reply } => {
                             let _ = reply.send(queue.seal_if_due());
@@ -211,10 +211,11 @@ impl Spool {
         }
     }
 
-    pub async fn append(&self, signal: Signal, payload: Bytes) -> Result<io::Result<()>, Gone> {
+    /// The export as it arrived, in the pieces it arrived in.
+    pub async fn append(&self, signal: Signal, chunks: Vec<Bytes>) -> Result<io::Result<()>, Gone> {
         self.ask(|reply| Work::Append {
             signal,
-            payload,
+            chunks,
             reply,
         })
         .await

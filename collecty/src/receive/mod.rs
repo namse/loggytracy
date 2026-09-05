@@ -112,8 +112,14 @@ impl Intake {
         (self.max_inflight_bytes - self.inflight.available_permits()) as u64
     }
 
-    pub async fn accept(&self, signal: Signal, payload: Bytes) -> Result<(), Refusal> {
-        let plain_len = payload.len();
+    /// One export, in the pieces hyper read it in.
+    ///
+    /// Not one contiguous buffer: the queue writes the pieces into the encoder
+    /// in order and nothing between here and the segment needs them joined, so
+    /// joining them was an allocation the size of the export and a copy of
+    /// every byte, per request.
+    pub async fn accept(&self, signal: Signal, chunks: Vec<Bytes>) -> Result<(), Refusal> {
+        let plain_len: usize = chunks.iter().map(|chunk| chunk.len()).sum();
         if plain_len > self.max_request_bytes {
             return Err(Refusal::TooLarge {
                 bytes: plain_len,
@@ -131,7 +137,7 @@ impl Intake {
             .map_err(|_| Refusal::ShuttingDown)?;
 
         self.spool
-            .append(signal, payload)
+            .append(signal, chunks)
             .await
             .map_err(|_| Refusal::ShuttingDown)?
             .map_err(spool_failure)
@@ -236,17 +242,27 @@ async fn route(intake: Arc<Intake>, request: Request<Incoming>) -> Response<Full
         );
     }
 
-    let payload = match Limited::new(request.into_body(), limit).collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+    // Frame by frame rather than `collect().to_bytes()`. Collecting gathers
+    // the frames and then joins them, which for a body that arrived in more
+    // than one piece is a fresh allocation the size of the whole export and a
+    // copy of every byte into it -- and nothing downstream wants them joined.
+    let mut body = Limited::new(request.into_body(), limit);
+    let mut chunks: Vec<Bytes> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
             return text(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format_args!("an OTLP export may not exceed {limit} bytes"),
             );
+        };
+        // Trailers carry no export. A body that is all trailers is an empty
+        // one, which `accept` answers for without queueing anything.
+        if let Ok(data) = frame.into_data() {
+            chunks.push(data);
         }
-    };
+    }
 
-    match intake.accept(signal, payload).await {
+    match intake.accept(signal, chunks).await {
         Ok(()) => accepted(),
         Err(refusal) => {
             let status = refusal.status();

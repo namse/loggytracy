@@ -193,7 +193,7 @@ async fn report_loop(
             continue;
         };
         if let Err(refusal) = intake
-            .accept(Signal::Metrics, bytes::Bytes::from(export))
+            .accept(Signal::Metrics, vec![bytes::Bytes::from(export)])
             .await
         {
             tracing::warn!(%refusal, "collecty could not queue its own metrics");
